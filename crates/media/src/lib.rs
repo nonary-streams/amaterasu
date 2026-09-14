@@ -1,0 +1,215 @@
+//! Draft media interfaces. Buffers are borrowed for one synchronous callback.
+//! No Rust allocator, collection, or reference crosses a module boundary.
+use amaterasu_abi::{NativeInterface, STATUS_INVALID_ARGUMENT, Status};
+use std::{ffi::c_void, mem::size_of};
+
+mod audio;
+pub use audio::*;
+mod audio_encoder;
+pub use audio_encoder::*;
+mod control;
+pub use control::*;
+mod geometry;
+pub use geometry::*;
+mod transport;
+pub use transport::*;
+
+pub const INTERFACE_MAJOR: u32 = 1;
+pub const INTERFACE_MINOR: u32 = 0;
+pub const CAPTURE_INTERFACE_MINOR: u32 = 1;
+pub const PIXEL_BGRA8: u32 = 1;
+pub const PIXEL_NV12: u32 = 2;
+pub const CODEC_H264: u32 = 1;
+pub const FLAG_KEYFRAME: u32 = 1;
+pub const FLAG_END_OF_STREAM: u32 = 2;
+/// Last fragment of one complete coded picture. Earlier fragments share its
+/// sequence and timestamp. This is separate from end-of-stream.
+pub const FLAG_END_OF_ACCESS_UNIT: u32 = 4;
+pub const MEDIA_PENDING: Status = 10;
+pub const MEDIA_BUSY: Status = 11;
+pub const MEDIA_CLOSED: Status = 12;
+pub const MEDIA_UNSUPPORTED: Status = 13;
+pub const MEDIA_BACKEND_ERROR: Status = 14;
+pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
+
+/// BGRA uses one plane; NV12 uses contiguous Y then interleaved UV planes with
+/// the same stride. Timestamps are microseconds from the producer's stream epoch.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub stride: u32,
+    pub data: *const u8,
+    pub len: usize,
+    pub timestamp_us: u64,
+    pub sequence: u64,
+}
+
+impl CpuFrame {
+    /// Checks metadata only. A valid shape does not establish pointer validity.
+    pub fn validate(&self) -> Result<(), Status> {
+        let expected = frame_size(self.width, self.height, self.format, self.stride)?;
+        if self.data.is_null() || self.len != expected {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// The allocation must contain `len` initialized bytes, remain alive for the
+    /// returned borrow, and not be mutated while that borrow exists.
+    pub unsafe fn bytes(&self) -> Result<&[u8], Status> {
+        self.validate()?;
+        // SAFETY: the caller supplies the allocation and its borrowing guarantee.
+        Ok(unsafe { std::slice::from_raw_parts(self.data, self.len) })
+    }
+}
+
+pub fn frame_size(width: u32, height: u32, format: u32, stride: u32) -> Result<usize, Status> {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    let (minimum_stride, rows) = match format {
+        PIXEL_BGRA8 => (width.checked_mul(4), Some(height)),
+        PIXEL_NV12 if width.is_multiple_of(2) && height.is_multiple_of(2) => {
+            (Some(width), height.checked_add(height / 2))
+        }
+        _ => return Err(STATUS_INVALID_ARGUMENT),
+    };
+    if stride < minimum_stride.ok_or(STATUS_INVALID_ARGUMENT)? {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    let size = (stride as usize)
+        .checked_mul(rows.ok_or(STATUS_INVALID_ARGUMENT)? as usize)
+        .filter(|size| *size <= MAX_FRAME_BYTES)
+        .ok_or(STATUS_INVALID_ARGUMENT)?;
+    Ok(size)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameSink {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const CpuFrame) -> Status,
+}
+
+impl FrameSink {
+    /// # Safety
+    /// The sink context/callback and frame allocation must remain valid until
+    /// this call returns. The callback must not retain the borrowed frame bytes.
+    pub unsafe fn send(&self, frame: &CpuFrame) -> Status {
+        if let Err(status) = frame.validate() {
+            return status;
+        }
+        // SAFETY: callback lifetime and frame ownership are guaranteed by caller.
+        unsafe { (self.write)(self.context, frame) }
+    }
+}
+
+/// H.264 packets use Annex B start codes, not AVCC length prefixes. An encoder
+/// may emit several packets for one submitted sequence. The final fragment sets
+/// FLAG_END_OF_ACCESS_UNIT. EOS carries no bytes and cannot terminate a partial AU.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EncodedPacket {
+    pub codec: u32,
+    pub flags: u32,
+    pub data: *const u8,
+    pub len: usize,
+    pub timestamp_us: u64,
+    pub sequence: u64,
+}
+
+impl EncodedPacket {
+    pub fn validate(&self) -> Result<(), Status> {
+        if self.codec != CODEC_H264
+            || self.flags & !(FLAG_KEYFRAME | FLAG_END_OF_STREAM | FLAG_END_OF_ACCESS_UNIT) != 0
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        if self.flags & FLAG_END_OF_STREAM != 0 {
+            if self.len != 0 || self.flags != FLAG_END_OF_STREAM {
+                return Err(STATUS_INVALID_ARGUMENT);
+            }
+        } else if self.len == 0 || self.len > MAX_PACKET_BYTES || self.data.is_null() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// A nonempty packet must point to `len` initialized bytes that outlive the
+    /// returned borrow. No writer may mutate those bytes during this borrow.
+    pub unsafe fn bytes(&self) -> Result<&[u8], Status> {
+        self.validate()?;
+        if self.len == 0 {
+            return Ok(&[]);
+        }
+        // SAFETY: nonempty allocation validity and lifetime are caller obligations.
+        Ok(unsafe { std::slice::from_raw_parts(self.data, self.len) })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PacketSink {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const EncodedPacket) -> Status,
+}
+
+impl PacketSink {
+    /// # Safety
+    /// Callback/context and packet data must remain valid for this call. The
+    /// callback must copy anything it needs after returning.
+    pub unsafe fn send(&self, packet: &EncodedPacket) -> Status {
+        if let Err(status) = packet.validate() {
+            return status;
+        }
+        // SAFETY: the caller guarantees callback and packet lifetimes.
+        unsafe { (self.write)(self.context, packet) }
+    }
+}
+
+#[repr(C)]
+pub struct CaptureApi {
+    pub base: NativeInterface,
+    /// At most one frame callback; MEDIA_PENDING means no frame is ready.
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+    /// Returns physical desktop geometry for the currently owned capture stream.
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+}
+
+/// The v1.0 prefix retained so consumers can bind older capture providers
+/// without reading the optional v1.1 geometry callback past their table.
+#[repr(C)]
+pub struct CaptureApiPrefix {
+    pub base: NativeInterface,
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+}
+
+pub const CAPTURE_API_V1_0_SIZE: u32 = size_of::<CaptureApiPrefix>() as u32;
+
+#[repr(C)]
+pub struct EncoderApi {
+    pub base: NativeInterface,
+    /// STATUS_OK means copied/accepted. MEDIA_BUSY accepts nothing; retry later.
+    pub submit: unsafe extern "C" fn(*mut c_void, u64, *const CpuFrame, u32) -> Status,
+    /// At most one packet callback. A rejected sink must not consume its packet.
+    pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
+    /// Stops accepting input and flushes queued packets before one EOS marker.
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+}
+
+/// Encoded output from an owned capture-to-encode stream. Configuration and
+/// lifecycle remain on the control service; consumers only receive packets here.
+#[repr(C)]
+pub struct VideoApi {
+    pub base: NativeInterface,
+    pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
+}
+
+#[cfg(test)]
+mod tests;

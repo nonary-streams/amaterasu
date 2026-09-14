@@ -1,0 +1,462 @@
+//! Moonlight Gen7 HTTP/XML adapter. This layer never performs TLS or PIN approval.
+mod applications;
+mod cleanup;
+mod pairing;
+mod query;
+mod streaming;
+pub(crate) mod xml;
+
+use crate::launch::{Controller as LaunchController, PeerIdentity};
+use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
+use query::Query;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
+
+pub struct Request {
+    pub method: String,
+    pub target: String,
+    pub body: Vec<u8>,
+}
+
+pub struct RequestContext {
+    pub secure: bool,
+    pub remote: IpAddr,
+    pub peer_certificate: Option<Vec<u8>>,
+    /// Set only after the transport verifies TLS possession and checks this
+    /// certificate against the live committed pairing authority for this request.
+    pub peer_trusted: bool,
+}
+
+impl RequestContext {
+    fn trusted(&self) -> bool {
+        self.secure
+            && self.peer_trusted
+            && self
+                .peer_certificate
+                .as_ref()
+                .is_some_and(|certificate| !certificate.is_empty())
+    }
+
+    fn identity(&self) -> Result<PeerIdentity, &'static str> {
+        if !self.trusted() {
+            return Err("authenticated paired TLS is required");
+        }
+        PeerIdentity::new(
+            self.remote,
+            self.peer_certificate
+                .clone()
+                .ok_or("missing peer certificate")?,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct Reply {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
+    pub requires_paired_tls: bool,
+}
+
+impl Reply {
+    pub fn authorize(self, paired: bool) -> Self {
+        if self.requires_paired_tls && !paired {
+            xml::error(401, "paired TLS authorization was revoked")
+        } else {
+            self
+        }
+    }
+}
+
+pub struct RouterConfig {
+    pub hostname: String,
+    pub http_port: u16,
+    pub https_port: u16,
+}
+
+pub struct Router {
+    config: RouterConfig,
+    launches: LaunchController,
+    transcripts: BTreeMap<String, pairing::Transcript>,
+    jobs: BTreeMap<u64, Job>,
+    cancellations: BTreeMap<u64, Instant>,
+    next_job: u64,
+    next_call: u64,
+}
+
+struct Job {
+    connection: Option<u64>,
+    purpose: Purpose,
+    call: Call,
+    deadline: Instant,
+    applications: Option<applications::Applications>,
+}
+
+enum Call {
+    Ready { payload: Value, not_before: Instant },
+    Waiting { request: u64 },
+}
+
+#[derive(Clone)]
+enum Purpose {
+    Identity {
+        paired: bool,
+        peer: Option<PeerIdentity>,
+    },
+    Begin {
+        client: String,
+    },
+    Certificate {
+        client: String,
+    },
+    Phase {
+        client: String,
+        phase: pairing::Phase,
+    },
+    Cleanup,
+    Applications,
+}
+
+const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
+const MAX_JOBS: usize = 32;
+const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
+
+impl Router {
+    pub fn new(config: RouterConfig, launches: LaunchController) -> Self {
+        Self {
+            config,
+            launches,
+            transcripts: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
+            next_job: 0,
+            next_call: 0,
+        }
+    }
+
+    pub fn dispatch(
+        &mut self,
+        connection: u64,
+        request: Request,
+        peer: RequestContext,
+        runtime: &RuntimeClient,
+    ) -> Option<Reply> {
+        self.dispatch_with(connection, request, peer, Instant::now(), &mut |command| {
+            runtime.send_ephemeral(command)
+        })
+    }
+
+    fn dispatch_with(
+        &mut self,
+        connection: u64,
+        request: Request,
+        peer: RequestContext,
+        now: Instant,
+        _send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> Option<Reply> {
+        if request.method != "GET" || !request.body.is_empty() {
+            return Some(xml::error(405, "only bodyless GET requests are supported"));
+        }
+        let query = match Query::parse(&request.target) {
+            Ok(query) => query,
+            Err(error) => return Some(xml::error(400, error)),
+        };
+        let trusted = peer.trusted();
+        match query.path.as_str() {
+            "/serverinfo" => {
+                if peer.secure && !trusted {
+                    return Some(xml::error(401, "client certificate is not paired"));
+                }
+                self.queue(
+                    connection.into(),
+                    Purpose::Identity {
+                        paired: trusted,
+                        peer: peer.identity().ok(),
+                    },
+                    json!({"action":"identity"}),
+                    now + SERVICE_TIMEOUT,
+                    now,
+                )
+                .err()
+                .map(|error| xml::error(503, error))
+            }
+            "/pair" => self.pair(connection, query, &peer, now),
+            "/applist" => self.applications(connection, trusted, now),
+            "/launch" => {
+                if !trusted {
+                    Some(xml::error(401, "authenticated paired TLS is required"))
+                } else {
+                    let request = match streaming::launch_request(&query) {
+                        Ok(request) => request,
+                        Err(error) => return Some(xml::error(400, error)),
+                    };
+                    let identity = match peer.identity() {
+                        Ok(identity) => identity,
+                        Err(error) => return Some(xml::error(401, error)),
+                    };
+                    self.launches.launch(connection, request, identity, now)
+                }
+            }
+            "/cancel" => {
+                if !trusted {
+                    return Some(xml::error(401, "authenticated paired TLS is required"));
+                }
+                if let Err(error) = query.require_only(&["uniqueid", "uuid"]) {
+                    return Some(xml::error(400, error));
+                }
+                let identity = match peer.identity() {
+                    Ok(identity) => identity,
+                    Err(error) => return Some(xml::error(401, error)),
+                };
+                self.launches.cancel(connection, &identity, now)
+            }
+            "/resume" | "/unpair" => {
+                if trusted {
+                    Some(xml::error(
+                        501,
+                        "this Moonlight operation is not implemented",
+                    ))
+                } else {
+                    Some(xml::error(401, "authenticated paired TLS is required"))
+                }
+            }
+            _ => Some(xml::error(404, "unknown Moonlight route")),
+        }
+    }
+
+    fn queue(
+        &mut self,
+        connection: Option<u64>,
+        purpose: Purpose,
+        payload: Value,
+        deadline: Instant,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        if self.jobs.len() + self.cancellations.len() >= MAX_JOBS {
+            return Err("request capacity exhausted");
+        }
+        self.next_job = self
+            .next_job
+            .checked_add(1)
+            .ok_or("request identifier exhausted")?;
+        self.jobs.insert(
+            self.next_job,
+            Job {
+                connection,
+                applications: matches!(purpose, Purpose::Applications)
+                    .then(applications::Applications::new),
+                purpose,
+                call: Call::Ready {
+                    payload,
+                    not_before: now,
+                },
+                deadline,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn poll(&mut self, runtime: &RuntimeClient) -> Vec<(u64, Reply)> {
+        self.poll_with(Instant::now(), &mut |command| {
+            runtime.send_ephemeral(command)
+        })
+    }
+
+    fn poll_with(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> Vec<(u64, Reply)> {
+        self.poll_cancellations(now, send);
+        let mut replies = self.launches.poll(now, send);
+        let keys: Vec<_> = self.jobs.keys().copied().collect();
+        for key in keys {
+            let Some(mut job) = self.jobs.remove(&key) else {
+                continue;
+            };
+            if now >= job.deadline {
+                self.expire_job(job, now, send, &mut replies);
+                continue;
+            }
+            let Some(result) = self.advance_call(&mut job, now, send) else {
+                self.jobs.insert(key, job);
+                continue;
+            };
+            let continued = if matches!(job.purpose, Purpose::Applications) {
+                self.resolve_applications(job, result, now, &mut replies)
+            } else {
+                self.resolve(job, result, now, &mut replies)
+            };
+            if let Some(job) = continued {
+                self.jobs.insert(key, job);
+            }
+        }
+        let expired: Vec<_> = self
+            .transcripts
+            .iter()
+            .filter(|(_, transcript)| now >= transcript.deadline)
+            .map(|(client, _)| client.clone())
+            .collect();
+        for client in expired {
+            self.abort_transcript(&client, now);
+        }
+        replies
+    }
+
+    fn advance_call(
+        &mut self,
+        job: &mut Job,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> Option<Result<Value, String>> {
+        match &job.call {
+            Call::Ready { not_before, .. } if now < *not_before => None,
+            Call::Ready { payload, .. } => {
+                let Some(sequence) = self.next_call.checked_add(1) else {
+                    return Some(Err("request identifier exhausted".into()));
+                };
+                self.next_call = sequence;
+                let timeout_ms = job
+                    .deadline
+                    .saturating_duration_since(now)
+                    .min(SERVICE_TIMEOUT)
+                    .as_millis()
+                    .max(1) as u64;
+                match send(Command::Request {
+                    service: job.purpose.service().into(),
+                    payload: payload.clone(),
+                    timeout_ms,
+                    operation_id: format!("nvhttp-wire-{sequence}"),
+                    parent: None,
+                }) {
+                    Ok(Response::Accepted { id }) => {
+                        job.call = Call::Waiting { request: id };
+                        None
+                    }
+                    response => Some(Err(response_code(&response).into())),
+                }
+            }
+            Call::Waiting { request } => match send(Command::TakeResult { request: *request }) {
+                Ok(Response::Pending) => None,
+                Ok(Response::Result { payload }) => Some(Ok(payload)),
+                response => {
+                    if !cleanup::released(&response) {
+                        self.retire_request(*request, now, send);
+                    }
+                    Some(Err(response_code(&response).into()))
+                }
+            },
+        }
+    }
+
+    pub fn cancel(&mut self, connection: u64, runtime: &RuntimeClient) {
+        self.cancel_with(connection, Instant::now(), &mut |command| {
+            runtime.send_ephemeral(command)
+        });
+    }
+
+    fn cancel_with(
+        &mut self,
+        connection: u64,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) {
+        self.launches.connection_closed(connection, now);
+        let keys: Vec<_> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.connection == Some(connection))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            let mut job = self.jobs.remove(&key).expect("selected connection job");
+            job.connection = None;
+            // A begin result contains the only pairing ID. Keep draining it so
+            // a committed begin can be cancelled after the socket disappeared.
+            if matches!(job.purpose, Purpose::Begin { .. })
+                && matches!(job.call, Call::Waiting { .. })
+            {
+                self.jobs.insert(key, job);
+            } else {
+                self.expire_job(job, now, send, &mut Vec::new());
+            }
+        }
+    }
+
+    pub fn reply_delivered(&mut self, connection: u64) {
+        self.launches.reply_delivered(connection, Instant::now());
+    }
+
+    pub fn revoke_untrusted(&mut self, trusted: impl FnMut(&[u8]) -> bool) -> Vec<u64> {
+        self.launches.revoke_untrusted(Instant::now(), trusted)
+    }
+
+    pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+        self.launches
+            .shutdown(&mut |command| runtime.send_ephemeral(command));
+    }
+
+    fn expire_job(
+        &mut self,
+        job: Job,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
+        if let Call::Waiting { request } = job.call {
+            self.retire_request(request, now, send);
+        }
+        if let Some(client) = job.purpose.client() {
+            self.abort_transcript(client, now);
+        }
+        if let Some(connection) = job.connection {
+            replies.push((connection, xml::error(504, "request expired")));
+        }
+    }
+
+    fn abort_transcript(&mut self, client: &str, now: Instant) {
+        if let Some(transcript) = self.transcripts.remove(client)
+            && let Some(pairing_id) = transcript.pairing_id
+        {
+            let _ = self.queue(
+                None,
+                Purpose::Cleanup,
+                json!({"action":"cancel","pairing_id":pairing_id}),
+                now + SERVICE_TIMEOUT,
+                now,
+            );
+        }
+    }
+}
+
+impl Purpose {
+    fn service(&self) -> &'static str {
+        if matches!(self, Self::Applications) {
+            applications::CATALOG_SERVICE
+        } else {
+            PAIRING_SERVICE
+        }
+    }
+
+    fn client(&self) -> Option<&str> {
+        match self {
+            Self::Begin { client } | Self::Certificate { client } | Self::Phase { client, .. } => {
+                Some(client)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn response_code(response: &ModuleResult<Response>) -> &str {
+    match response {
+        Ok(Response::Error { code, .. }) => code,
+        _ => "runtime_error",
+    }
+}
+
+#[cfg(test)]
+mod tests;

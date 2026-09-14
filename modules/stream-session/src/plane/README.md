@@ -1,0 +1,44 @@
+# Native media plane
+
+The pipeline opens and closes all provider resources under the stream-session
+principal. `Plane` retains five SDK native bindings and copies borrowed callback
+output before returning. Callbacks never invoke another provider. No pointer into
+provider storage survives its callback, and partial binding failure releases all
+bindings acquired so far.
+
+`tick` reads up to four authenticated control records first. Closed or failed
+control delivery stops media forwarding. Initial authentication is a pipeline
+precondition; an empty authenticated control queue is normal. Records preserve the
+message kind, authenticated sequence and bounded body for the pipeline's typed
+parser. Channel and delivery metadata confer no authority. Unknown messages are
+not represented as executed actions.
+
+Each video tick reads at most four fragments. The assembler accepts only one
+sequence and timestamp until `FLAG_END_OF_ACCESS_UNIT`; it combines keyframe flags
+and forwards a complete access unit immediately. A different sequence, different
+timestamp, or EOS before the marker fails visibly. It never guesses boundaries
+from later frames. One assembly is capped at 8 MiB and 1,024 fragments; a copied
+incoming fragment can temporarily add another 8 MiB. The encoder must declare a
+real access-unit boundary through the ABI flag.
+
+Audio requires 48 kHz stereo interleaved f32 or i16 PCM. No rate conversion or
+channel remix is invented. At most one PCM frame and one encoded Opus packet are
+retained by the plane, each bounded by the media ABI. Up to four encoded packets
+are read per tick. Busy transport output stops further polling of that media path;
+busy PCM submission retains the same input and stops capture reads while encoder
+output can still be drained. All retries preserve bytes and metadata.
+
+`stop` disables new PCM capture. Previously accepted pending PCM is submitted
+before encoder drain. The pipeline separately requests video drain and may close
+capture after stopping the plane. Both provider EOS markers must be accepted by
+the media transport before the plane calls transport drain. `is_drained` means
+that drain was accepted, not that UDP packets were delivered: the pipeline still
+checks transport queue status before dropping the plane and closing providers.
+Failures are sticky and require pipeline cleanup.
+
+Tests use fake backends and actual C interface tables through a mock SDK runtime.
+They cover immediate fragment assembly, missing boundaries, memory/count bounds,
+blocked output, retained PCM on stop, EOS ordering, closed control gating,
+callback byte ownership, duplicate callbacks, inconsistent callback status, and
+complete/partial binding release. They do not qualify capture hardware or a real
+Moonlight streaming session.

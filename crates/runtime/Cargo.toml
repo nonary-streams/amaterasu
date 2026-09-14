@@ -1,0 +1,16 @@
+[package]
+name = "amaterasu-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+amaterasu-abi.workspace = true
+amaterasu-contracts.workspace = true
+serde_json.workspace = true
+[lints]
+workspace = true
+
+[dev-dependencies]
+amaterasu-module-sdk.workspace = true

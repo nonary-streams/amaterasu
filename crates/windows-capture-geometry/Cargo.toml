@@ -1,0 +1,14 @@
+[package]
+name = "amaterasu-windows-capture-geometry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-media.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Devices_Display", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_UI_HiDpi"] }
+
+[lints]
+workspace = true

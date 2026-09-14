@@ -1,0 +1,5 @@
+/target/
+/.local/
+*.dSYM/
+__pycache__/
+*.pyc

@@ -1,0 +1,162 @@
+use super::{LaunchRequest, PeerIdentity};
+use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
+use std::{collections::VecDeque, time::Instant};
+
+use super::{call::Call, workflow::Phase};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Starting,
+    AwaitingDelivery,
+    Ready,
+    Stopping,
+    Stopped,
+    Failed,
+    CleanupFailed,
+}
+
+impl State {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    LaunchApplication,
+    OpenRtsp,
+    AwaitingDelivery,
+    Live,
+    Cleanup,
+    VerifyRtspCleanup,
+    VerifyApplicationCleanup,
+    Terminal,
+}
+
+pub struct Record {
+    pub id: u64,
+    pub peer: PeerIdentity,
+    pub request: LaunchRequest,
+    pub application_operation: String,
+    pub rtsp_operation: String,
+    pub connect_data: u32,
+    pub application_requested: bool,
+    pub application_launch: Option<u64>,
+    pub rtsp_requested: bool,
+    pub rtsp_ticket: Option<u64>,
+    pub rtsp_url: Option<String>,
+    pub rtsp_cleanup_blocked: bool,
+    pub application_cleanup_blocked: bool,
+    pub state: State,
+    pub stage: Stage,
+    pub adopted: bool,
+    pub revoked: bool,
+    pub launch_connection: Option<u64>,
+    pub cancel_connection: Option<u64>,
+    pub deadline: Instant,
+    pub next_monitor: Instant,
+    pub monitor_application_next: bool,
+    pub failure: Option<&'static str>,
+    pub cleanup_error: Option<&'static str>,
+    pub uncertain: VecDeque<(Phase, Call)>,
+    pub retrying_uncertainty: bool,
+    pub rtsp_reconcile: Option<Phase>,
+    pub application_reconcile: Option<Phase>,
+}
+
+impl Record {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u64,
+        peer: PeerIdentity,
+        request: LaunchRequest,
+        application_operation: String,
+        rtsp_operation: String,
+        connect_data: u32,
+        connection: u64,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            id,
+            peer,
+            request,
+            application_operation,
+            rtsp_operation,
+            connect_data,
+            application_requested: false,
+            application_launch: None,
+            rtsp_requested: false,
+            rtsp_ticket: None,
+            rtsp_url: None,
+            rtsp_cleanup_blocked: false,
+            application_cleanup_blocked: false,
+            state: State::Starting,
+            stage: Stage::LaunchApplication,
+            adopted: false,
+            revoked: false,
+            launch_connection: Some(connection),
+            cancel_connection: None,
+            deadline,
+            next_monitor: deadline,
+            monitor_application_next: true,
+            failure: None,
+            cleanup_error: None,
+            uncertain: VecDeque::new(),
+            retrying_uncertainty: false,
+            rtsp_reconcile: None,
+            application_reconcile: None,
+        }
+    }
+
+    pub fn operation_prefix(&self) -> &str {
+        &self.rtsp_operation
+    }
+
+    pub fn request_cleanup(&mut self, failure: Option<&'static str>, deadline: Instant) {
+        if let Some(failure) = failure {
+            self.failure.get_or_insert(failure);
+        }
+        let already_stopping = self.state == State::Stopping;
+        self.state = State::Stopping;
+        self.stage = Stage::Cleanup;
+        if !already_stopping {
+            self.deadline = deadline;
+        }
+        self.cleanup_error = None;
+    }
+
+    pub fn fail_cleanup(&mut self, error: &'static str) {
+        self.state = State::CleanupFailed;
+        self.cleanup_error = Some(error);
+    }
+
+    pub fn finish_cleanup(&mut self) {
+        debug_assert!(self.uncertain.is_empty());
+        self.state = if self.failure.is_some() {
+            State::Failed
+        } else {
+            State::Stopped
+        };
+        self.stage = Stage::Terminal;
+        self.cleanup_error = None;
+    }
+
+    pub fn monitored(&mut self, now: Instant) {
+        self.next_monitor = now + MONITOR_INTERVAL;
+        self.monitor_application_next = !self.monitor_application_next;
+    }
+
+    pub fn retry_cleanup(&mut self, now: Instant) -> Option<(Phase, Call)> {
+        self.state = State::Stopping;
+        self.stage = Stage::Cleanup;
+        self.cleanup_error = None;
+        self.rtsp_cleanup_blocked = false;
+        self.application_cleanup_blocked = false;
+        self.deadline = now + CLEANUP_DEADLINE;
+        self.retrying_uncertainty = true;
+        self.uncertain.pop_front().map(|(phase, mut call)| {
+            call.retry_settlement();
+            (phase, call)
+        })
+    }
+}

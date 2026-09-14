@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abi",
+    "crates/media",
+    "crates/windows-capture-geometry",
+    "crates/identity",
+    "crates/gamestream",
+    "crates/contracts",
+    "crates/runtime",
+    "crates/package",
+    "crates/storage",
+    "crates/module-sdk",
+    "crates/host",
+    "crates/release",
+    "fixtures/echo",
+    "fixtures/media-probe",
+    "fixtures/stream-source",
+    "fixtures/input-probe",
+    "modules/state",
+    "modules/session",
+    "modules/configuration",
+    "modules/catalog",
+    "modules/application",
+    "modules/diagnostics",
+    "modules/steam",
+    "modules/authentication",
+    "modules/management",
+    "modules/pairing",
+    "modules/nvhttp",
+    "modules/display",
+    "modules/launch",
+    "modules/input",
+    "modules/virtual-display",
+    "modules/capture-dxgi",
+    "modules/capture-wgc",
+    "modules/audio",
+    "modules/audio-encode",
+    "modules/media-transport",
+    "modules/control-transport",
+    "modules/stream-session",
+    "modules/rtsp",
+    "modules/encode",
+    "modules/video",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+version = "0.1.0"
+
+[workspace.dependencies]
+amaterasu-abi = { path = "crates/abi" }
+amaterasu-media = { path = "crates/media" }
+amaterasu-windows-capture-geometry = { path = "crates/windows-capture-geometry" }
+amaterasu-identity = { path = "crates/identity" }
+amaterasu-gamestream = { path = "crates/gamestream" }
+amaterasu-contracts = { path = "crates/contracts" }
+amaterasu-package = { path = "crates/package" }
+amaterasu-module-sdk = { path = "crates/module-sdk" }
+amaterasu-storage = { path = "crates/storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+getrandom = "0.3"
+httparse = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

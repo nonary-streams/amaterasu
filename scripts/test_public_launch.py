@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Paired HTTPS launch through a signed application/RTSP/media composition.
+
+Uses a controlled child and synthetic video. This is protocol/lifecycle evidence,
+not hardware capture, decoded H.264, display restoration or full Moonlight parity.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+from pathlib import Path
+import secrets
+import socket
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
+
+from test_component_updates import CARGO, ComponentHarness, run
+from test_host_service import Console
+from test_nvhttp import FIXTURES, get, pair, successful, tls_context, wait_for
+from test_rtsp import PeerDiscovery, RtspClient, announcement
+from test_stream_session import (
+    collect,
+    expected_video,
+    start_client,
+    stop_client,
+    verify_audio,
+    verify_video,
+)
+
+SOURCE = "test.stream-source/1"
+
+
+def launch_query(key, app_id="1", key_id=17):
+    return {
+        "appid": app_id,
+        "mode": "16x16x30",
+        "rikey": key.hex(),
+        "rikeyid": str(key_id),
+        "additionalStates": "1",
+        "sops": "0",
+        "localAudioPlayMode": "0",
+        "surroundAudioInfo": "196610",
+        "remoteControllersBitmap": "0",
+        "gcmap": "0",
+        "gcpersist": "0",
+        "corever": "1",
+    }
+
+
+def child_running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def wait_until(predicate, message, seconds=5):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError(message)
+
+
+def capture_idle(console, baseline, *, opened_delta=0):
+    status = console.request(SOURCE, {"action": "status"})
+    return all(
+        status[medium]["active"] == 0
+        and status[medium]["opened"] == baseline[medium]["opened"] + opened_delta
+        and status[medium]["closed"] == baseline[medium]["closed"] + opened_delta
+        for medium in ("video", "audio")
+    )
+
+
+def media_complete(console, baseline):
+    status = console.request(SOURCE, {"action": "status"})
+    return (
+        status["video"]["frames"] == baseline["video"]["frames"] + 8
+        and status["audio"]["frames"] == baseline["audio"]["frames"] + 8
+        and status["video"]["force_idr"] > baseline["video"]["force_idr"]
+    )
+
+
+def create_application(console, marker, revision, lifetime):
+    code = (
+        f"from pathlib import Path; import os,time; "
+        f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep({lifetime!r})"
+    )
+    created = console.request(
+        "amaterasu.catalog/1",
+        {
+            "action": "create",
+            "expected_revision": revision,
+            "entry": {
+                "name": "Controlled streaming process",
+                "launch": {
+                    "kind": "executable",
+                    "program": sys.executable,
+                    "arguments": ["-c", code],
+                },
+            },
+        },
+    )
+    expected_id = f"app-{revision + 1:016x}"
+    assert created["ok"] and created["id"] == expected_id, created
+    return str(revision + 1)
+
+
+def require_launch_denied(base, query, context=None, expected=401):
+    try:
+        status, _ = get(base, "/launch", query, context)
+    except OSError:
+        assert expected == 401
+        return
+    assert status == expected, status
+
+
+def exercise_rejected_launches(console, http, https, paired, marker):
+    marker.unlink(missing_ok=True)
+    baseline = console.request(SOURCE, {"action": "status"})
+    request = launch_query(secrets.token_bytes(16))
+    require_launch_denied(http, request)
+    require_launch_denied(https, request, tls_context(None))
+    require_launch_denied(https, dict(request, owner="attacker"), paired, expected=400)
+    time.sleep(0.1)
+    assert not marker.exists(), "rejected launch started the catalog executable"
+    assert capture_idle(console, baseline), "rejected launch changed capture state"
+
+
+def exercise_natural_exit(console, https, context, marker, app_id, key_id):
+    marker.unlink(missing_ok=True)
+    baseline = console.request(SOURCE, {"action": "status"})
+    query = launch_query(secrets.token_bytes(16), app_id, key_id)
+    opened = successful(get(https, "/launch", query, context))
+    assert opened.findtext("sessionUrl0", "").startswith("rtspenc://")
+    wait_until(
+        lambda: marker.exists() and marker.read_text().isdigit(),
+        "short application did not start",
+    )
+    pid = int(marker.read_text())
+    wait_until(lambda: not child_running(pid), "natural application exit was not reaped", 8)
+
+    def exit_observed():
+        server = successful(
+            get(https, "/serverinfo", {"uniqueid": "public-launch"}, context)
+        )
+        return (
+            server.findtext("state") == "AMATERASU_SERVER_FREE"
+            and server.findtext("currentgame") == "0"
+        )
+
+    wait_until(exit_observed, "NVHTTP did not finish natural-exit cleanup", 8)
+    cancelled = successful(get(https, "/cancel", context=context))
+    assert cancelled.findtext("gamesession") == "0"
+    assert capture_idle(console, baseline), "natural exit opened or retained capture"
+
+
+def other_paired_context(console, directory):
+    key = serialization.load_pem_private_key((FIXTURES / "client-key.pem").read_bytes(), None)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Other paired launch owner")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    path = directory / "other-cert.pem"
+    path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    imported = console.request(
+        "amaterasu.pairing/1",
+        {
+            "action": "import_client",
+            "client_id": "other-launch-owner",
+            "name": "Other owner",
+            "certificate_pem": path.read_text(),
+        },
+    )
+    assert imported["ok"], imported
+    context = tls_context(None)
+    context.load_cert_chain(path, FIXTURES / "client-key.pem")
+    return context
+
+
+def exercise_stream(
+    console,
+    https,
+    context,
+    other,
+    marker,
+    oracle,
+    directory,
+    stop_mode,
+    certificate_id,
+    key_id,
+):
+    marker.unlink(missing_ok=True)
+    baseline = console.request(SOURCE, {"action": "status"})
+    key = secrets.token_bytes(16)
+    query = launch_query(key, key_id=key_id)
+    opened = successful(get(https, "/launch", query, context))
+    url = opened.findtext("sessionUrl0")
+    assert url and url.startswith("rtspenc://"), url
+    wait_until(
+        lambda: marker.exists() and marker.read_text().isdigit(),
+        "application did not start",
+    )
+    pid = int(marker.read_text())
+    assert child_running(pid)
+    retry = successful(get(https, "/launch", query, context))
+    assert retry.findtext("sessionUrl0") == url, "launch retry replaced ticket"
+    assert int(marker.read_text()) == pid, "launch retry spawned another process"
+    foreign_status, foreign = get(https, "/cancel", context=other)
+    assert foreign_status == 403, (foreign_status, foreign.attrib)
+    assert foreign.get("status_message") == "stream is owned by another client"
+    assert child_running(pid), "another paired certificate cancelled launch"
+    after_foreign_cancel = successful(get(https, "/launch", query, context))
+    assert after_foreign_cancel.findtext("sessionUrl0") == url
+    assert int(marker.read_text()) == pid, "foreign cancel or retry replaced the process"
+
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as video,
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as audio,
+    ):
+        video.bind(("127.0.0.1", 0))
+        audio.bind(("127.0.0.1", 0))
+        association = PeerDiscovery(video, audio)
+        target = urlsplit(url)
+        client = RtspClient(f"{target.hostname}:{target.port}", url, key)
+        ports = client.setup(association.on_setup)
+        client.transact(
+            "ANNOUNCE",
+            "streamid=control/13/0",
+            {"Content-Type": "application/sdp"},
+            announcement(),
+        )
+        client.transact("PLAY", "/")
+        control = start_client(
+            oracle,
+            directory,
+            {"control_local": f"127.0.0.1:{ports['control']}"},
+            key,
+            ports["connect_data"],
+        )
+        try:
+            association.finish(console, baseline)
+            wait_until(
+                lambda: media_complete(console, baseline),
+                "stream did not produce media and an IDR request",
+                3,
+            )
+            if stop_mode == "teardown":
+                client.transact("TEARDOWN", "/")
+            elif stop_mode == "cancel":
+                successful(get(https, "/cancel", context=context))
+            else:
+                revoked = console.request(
+                    "amaterasu.pairing/1",
+                    {"action": "unpair", "certificate_id": certificate_id},
+                )
+                assert revoked["ok"], revoked
+            wait_until(
+                lambda: not child_running(pid),
+                "stream cleanup left its application running",
+            )
+            wait_until(
+                lambda: capture_idle(console, baseline, opened_delta=1),
+                "stream cleanup did not close each capture provider exactly once",
+            )
+            verify_video(collect(video, ("127.0.0.1", ports["video"])), key, expected_video)
+            verify_audio(collect(audio, ("127.0.0.1", ports["audio"])), key, key_id)
+        finally:
+            stop_client(control)
+            association.close()
+
+
+def main():
+    oracle = Path(os.environ["AMATERASU_ENET_CLIENT_ORACLE"]).resolve(strict=True)
+    run(CARGO, "build", "--workspace", "--offline", "--locked")
+    with tempfile.TemporaryDirectory(prefix="amaterasu-public-launch-") as temporary:
+        directory = Path(temporary)
+        harness = ComponentHarness(directory)
+        path = harness.root / "bootstrap.json"
+        bootstrap = json.loads(path.read_text())
+        settings = bootstrap["policy"]["settings"]
+        settings["amaterasu.catalog"]["export_principals"] = {
+            "amaterasu.nvhttp": "amaterasu.console"
+        }
+        settings["amaterasu.nvhttp"] = {
+            "enabled": True, "http_bind": "127.0.0.1:0", "https_bind": "127.0.0.1:0",
+            "streaming": {
+                "capture": {
+                    "capture_provider": "dxgi", "output": "synthetic-display",
+                    "encoder": 0, "audio_endpoint": "default",
+                },
+                "profile": {
+                    "max_width": 16, "max_height": 16, "max_fps": 30,
+                    "bitrate_kbps": 1000, "max_reference_frames": 1,
+                    "packet_size": 1024, "fec_percentage": 20,
+                    "min_parity_shards": 2, "max_fec_blocks": 1,
+                    "packet_ms": 10, "audio_bitrate": 128000,
+                    "encrypt_video": True, "encrypt_audio": True,
+                    "permit_legacy_audio_iv_wrap": False,
+                },
+            },
+        }
+        settings["amaterasu.rtsp"] = {
+            "enabled": True,
+            "bind": "127.0.0.1:0",
+            "allowed_principals": ["amaterasu.nvhttp"],
+        }
+        settings["amaterasu.stream-session"] = {
+            "enabled": True,
+            "allowed_principals": ["amaterasu.rtsp"],
+        }
+        settings["amaterasu.audio-encode"] = {"enabled": True}
+        for component in ("media-transport", "control-transport"):
+            settings[f"amaterasu.{component}"] = {
+                "enabled": True,
+                "allowed_principals": ["amaterasu.stream-session"],
+            }
+        path.write_text(json.dumps(bootstrap))
+        package = directory / "package"
+        run(harness.publisher, "pack-stream-probe", harness.root, harness.artifacts, package, "1")
+        harness.stage(package)
+        console = Console(harness)
+        try:
+            imported = console.request(
+                "amaterasu.pairing/1",
+                {
+                    "action": "import_identity",
+                    "certificate_pem": (FIXTURES / "host-cert.pem").read_text(),
+                    "private_key_pem": (FIXTURES / "host-key.pem").read_text(),
+                },
+            )
+            assert imported["ok"], imported
+            state = wait_for(
+                console,
+                "amaterasu.nvhttp/1",
+                {"action": "status"},
+                lambda value: value.get("tls_ready"),
+            )
+            http, https = "http://" + state["http_address"], "https://" + state["https_address"]
+            certificate_id = pair(console, http)
+            context = tls_context()
+            other = other_paired_context(console, directory)
+            marker = directory / "application.pid"
+            short_marker = directory / "short-application.pid"
+            create_application(console, marker, 0, 60)
+            short_app = create_application(console, short_marker, 1, 3)
+            exercise_rejected_launches(console, http, https, context, marker)
+            exercise_natural_exit(console, https, context, short_marker, short_app, 17)
+            # key_id is an IV salt, not session identity. Fresh AES keys may
+            # legitimately reuse it, so every session deliberately uses 17.
+            for mode in ("teardown", "cancel", "revoke"):
+                exercise_stream(
+                    console, https, context, other, marker, oracle, directory,
+                    mode, certificate_id, 17,
+                )
+            marker.unlink(missing_ok=True)
+            require_launch_denied(https, launch_query(secrets.token_bytes(16)), context)
+            assert not marker.exists(), "revoked certificate launched an application"
+            console.eof()
+        finally:
+            console.close()
+    print(
+        "Passed: paired HTTPS exported application launch, owned retry/cancel, "
+        "encrypted RTSP and discovered UDP media, TEARDOWN and "
+        "certificate-revocation cleanup of capture and controlled child. "
+        "Hardware and full client parity remain unqualified."
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+[package]
+name = "amaterasu-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[dependencies]
+amaterasu-abi.workspace = true
+[lints]
+workspace = true

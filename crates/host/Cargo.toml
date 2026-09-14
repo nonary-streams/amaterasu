@@ -1,0 +1,17 @@
+[package]
+name = "amaterasu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-abi.workspace = true
+amaterasu-contracts.workspace = true
+amaterasu-package.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
+

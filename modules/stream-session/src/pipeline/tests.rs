@@ -1,0 +1,358 @@
+mod armed;
+mod harness;
+mod input;
+use super::*;
+use harness::*;
+
+#[test]
+fn fixed_media_response_without_readiness_fields_remains_compatible() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["media_ready"], true);
+    assert_eq!(prepared["peer_discovery"], false);
+    assert_eq!(prepared["video_peer_port"], 51_001);
+    assert_eq!(prepared["audio_peer_port"], 51_002);
+    assert!(host.pipeline.records[&id].media_ready);
+}
+
+#[test]
+fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["packet_bytes"], 160);
+    assert_eq!(prepared["wire_audio_bytes"], 176);
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(host.plane.borrow().ticks, 0);
+    assert!(!prepared.to_string().contains("00112233"));
+    let media = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service())
+        .unwrap();
+    assert_eq!(media.payload["audio"]["wire_payload_bytes"], 176);
+    let active = host.response(2, start(id));
+    assert_eq!(active["state"], "active");
+    assert_eq!(host.broker.leases(), 2);
+    let record = &host.pipeline.records[&id];
+    assert_eq!(
+        record.audio_endpoint.as_deref(),
+        Some("resolved-canonical-endpoint")
+    );
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.payload["action"] == "acquire")
+            .all(|call| call.payload["mode"] == "shared")
+    );
+    host.broker.video_close_polls = 3;
+    let stopped = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "stopped");
+    assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.broker.leases(), 0);
+    assert_eq!(host.plane.borrow().dropped, 1);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| matches!(
+                call.payload["action"].as_str(),
+                Some("close" | "drain" | "stop" | "finish_stop")
+            ))
+            .all(|call| call.parent.is_none())
+    );
+    let final_lookup = host
+        .broker
+        .calls
+        .iter()
+        .rposition(|call| {
+            call.service == Resource::Video.service() && call.payload["action"] == "lookup"
+        })
+        .unwrap();
+    let release = host
+        .broker
+        .calls
+        .iter()
+        .position(|call| call.payload["action"] == "finish_stop")
+        .unwrap();
+    assert!(release > final_lookup);
+}
+
+#[test]
+fn start_forwards_required_reference_frame_limit_to_video() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["configuration"]["max_reference_frames"] = json!(1);
+    assert_eq!(host.response(2, configuration)["state"], "active");
+    let video = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(video.payload["configuration"]["max_reference_frames"], 1);
+}
+
+#[test]
+fn caller_isolation_retry_conflicts_and_terminal_tombstones() {
+    let mut host = Harness::new();
+    let first = host.response(1, prepare());
+    let id = first["session"].as_u64().unwrap();
+    let count = host.broker.live_components();
+    assert_eq!(host.response(2, prepare())["session"], id);
+    assert_eq!(host.broker.live_components(), count);
+    let mut changed = prepare();
+    changed["audio_port"] = json!(51003);
+    assert_eq!(host.response(3, changed)["code"], "operation_conflict");
+    host.broker
+        .enqueue(4, "foreign", json!({"action":"status","session":id}));
+    host.idle();
+    assert_eq!(host.broker.replies[&4]["code"], "session_not_found");
+    assert_eq!(
+        host.response(5, json!({"action":"close","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.response(6, prepare())["state"], "stopped");
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn unauthenticated_start_is_retryable_without_hardware_or_new_allocations() {
+    let mut host = Harness::new();
+    host.broker.authenticated = false;
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(
+        host.response(2, start(id))["code"],
+        "control_not_authenticated"
+    );
+    assert_eq!(host.pipeline.records[&id].state, State::Prepared);
+    assert_eq!(host.broker.live_components(), 3);
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service())
+    );
+    host.broker.authenticated = true;
+    assert_eq!(host.response(3, start(id))["state"], "active");
+}
+
+#[test]
+fn prepared_deadline_runs_cleanup_under_continuous_status_traffic() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.now += 6000;
+    for request in 2..50 {
+        host.broker
+            .enqueue(request, "owner", json!({"action":"status","session":id}));
+    }
+    host.idle();
+    assert!(host.pipeline.records[&id].state.terminal());
+    assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.pipeline.records[&id].error, Some("prepare_expired"));
+}
+
+#[test]
+fn lost_admission_and_take_result_before_or_after_commit_are_reconciled() {
+    for fault in [
+        Fault::Admission,
+        Fault::BeforeMutation,
+        Fault::AfterMutation,
+    ] {
+        let mut host = Harness::new();
+        host.broker.fault = Some((Resource::Media.service(), fault));
+        let result = host.response(1, prepare());
+        assert_eq!(result["state"], "failed");
+        assert_eq!(host.broker.live_components(), 0);
+        assert_eq!(host.broker.leases(), 0);
+        let cancel = host
+            .broker
+            .commands
+            .iter()
+            .position(|command| matches!(command, Command::Cancel { .. }))
+            .unwrap();
+        let lookup = host.broker.commands.iter().position(|command| matches!(command, Command::Request { service, payload, .. } if service == &Resource::Media.service() && payload["action"]=="lookup")).unwrap();
+        assert!(cancel < lookup);
+    }
+}
+
+#[test]
+fn unconfirmed_cancellation_retains_resources_for_explicit_stop_retry() {
+    let mut host = Harness::new();
+    host.broker.fault = Some((Resource::Media.service(), Fault::AfterMutation));
+    host.broker.fail_cancel = true;
+    let failed = host.response(1, prepare());
+    let id = failed["session"].as_u64().unwrap();
+    assert_eq!(failed["state"], "cleanup_failed");
+    assert!(host.pipeline.records[&id].uncertain.is_some());
+    assert!(host.broker.live_components() > 0);
+    host.broker.fail_cancel = false;
+    assert_eq!(
+        host.response(2, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn failed_close_keeps_lease_until_stop_retry_confirms_release() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.fail_close = Some(Resource::AudioCapture.service());
+    let failed = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(failed["state"], "cleanup_failed");
+    assert_eq!(host.broker.leases(), 2);
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.payload["action"] == "finish_stop")
+    );
+    host.broker.fail_close = None;
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.leases(), 0);
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn incompatible_capture_format_rolls_back_all_components_and_leases() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.broker.format_rate = 44100;
+    let reply = host.response(2, start(id));
+    assert_eq!(reply["state"], "failed");
+    assert_eq!(reply["error"], "unsupported_audio_format");
+    assert_eq!(host.broker.live_components(), 0);
+    assert_eq!(host.broker.leases(), 0);
+    assert_eq!(host.plane.borrow().ticks, 0);
+}
+
+#[test]
+fn cancelled_parent_and_lost_success_completion_release_allocations() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    host.tick();
+    host.tick();
+    host.broker.cancel_parent(1);
+    host.idle();
+    assert_eq!(host.broker.live_components(), 0);
+    assert!(
+        host.pipeline
+            .records
+            .values()
+            .all(|record| record.state.terminal())
+    );
+    let mut host = Harness::new();
+    host.broker.fail_completion = true;
+    host.broker.enqueue(1, "owner", prepare());
+    host.idle();
+    assert_eq!(host.broker.live_components(), 0);
+    assert!(
+        host.pipeline
+            .records
+            .values()
+            .all(|record| record.state.terminal())
+    );
+}
+
+#[test]
+fn host_direction_termination_is_rejected_and_idr_is_coalesced() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.response(2, start(id));
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(crate::plane::ControlRecord {
+            message_type: 0x0109,
+            payload: vec![0; 4],
+            sequence: 3,
+        });
+    host.tick();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.pipeline.records[&id].rejected_controls, 1);
+    for sequence in 4..8 {
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(crate::plane::ControlRecord {
+                message_type: 0x0302,
+                payload: vec![0, 0],
+                sequence,
+            });
+    }
+    host.idle();
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.payload["action"] == "force_idr")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn continuous_idr_control_cannot_starve_explicit_stop() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.response(2, start(id));
+    host.broker
+        .enqueue(3, "owner", json!({"action":"stop","session":id}));
+    for sequence in 0..200 {
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(crate::plane::ControlRecord {
+                message_type: 0x0302,
+                payload: vec![0, 0],
+                sequence,
+            });
+        host.tick();
+        if host.broker.replies.contains_key(&3) {
+            break;
+        }
+    }
+    assert_eq!(host.broker.replies[&3]["state"], "stopped");
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn unload_releases_bindings_without_claiming_asynchronous_provider_cleanup() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    host.response(2, start(id));
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert_eq!(host.plane.borrow().dropped, 1);
+    assert_eq!(host.broker.leases(), 2);
+    assert_eq!(host.broker.live_components(), 5);
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    host.tick();
+    host.tick();
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(
+        host.broker
+            .commands
+            .iter()
+            .all(|command| !matches!(command, Command::Request { .. } | Command::Cancel { .. }))
+    );
+    assert_eq!(host.broker.live_components(), 0);
+}

@@ -1,0 +1,13 @@
+[package]
+name = "amaterasu-gamestream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ring = "0.17.14"
+aes = { version = "0.8.4", features = ["zeroize"] }
+cbc = { version = "0.1.2", default-features = false, features = ["block-padding"] }
+
+[lints]
+workspace = true

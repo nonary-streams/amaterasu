@@ -1,0 +1,22 @@
+[package]
+name = "amaterasu-capture-wgc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+amaterasu-windows-capture-geometry.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Foundation", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture"] }
+
+[lints]
+workspace = true

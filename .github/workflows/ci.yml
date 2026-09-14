@@ -1,0 +1,36 @@
+name: Rust components
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  components:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: python scripts/test_component_updates.py
+      - run: python scripts/test_platform_modules.py
+      - run: python scripts/test_host_service.py
+      - run: python scripts/test_management_api.py
+      - name: C ABI layout
+        if: runner.os != 'Windows'
+        run: cc -std=c11 -Wall -Wextra -Werror -Isdk/include scripts/check_abi.c -o target/check-abi && target/check-abi
+      - name: Media C ABI layout
+        if: runner.os != 'Windows'
+        run: cc -std=c11 -Wall -Wextra -Werror -fsyntax-only -Isdk/include sdk/tests/media_layout.c

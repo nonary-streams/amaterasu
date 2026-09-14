@@ -1,0 +1,1101 @@
+{
+  "reference_commit": "aa292c4cb097f22beab19d6ebf0307367f9bf449",
+  "meaning": "Route declarations only; does not prove endpoint semantics or compatibility.",
+  "routes": [
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5534,
+      "surface": "server",
+      "method": "GET",
+      "pattern": "^/(assets|images)/.+$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5535,
+      "surface": "server",
+      "method": "GET",
+      "pattern": "^/v2/(assets|images)/.+$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5572,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/pin$",
+      "handler": "savePin",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5573,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/apps$",
+      "handler": "getApps",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5574,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/logs$",
+      "handler": "getLogs",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5575,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/browse$",
+      "handler": "browseDirectory",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5576,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/csrf-token$",
+      "handler": "getCSRFToken",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5577,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/apps$",
+      "handler": "saveApp",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5579,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/apps/rtx_hdr/live$",
+      "handler": "updateAppRtxHdrLive",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5581,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/config$",
+      "handler": "getConfig",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5582,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/config$",
+      "handler": "saveConfig",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5585,
+      "surface": "management",
+      "method": "PATCH",
+      "pattern": "^/api/config$",
+      "handler": "patchConfig",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5586,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/metadata$",
+      "handler": "getMetadata",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5587,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/configLocale$",
+      "handler": "getLocale",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5588,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/restart$",
+      "handler": "restart",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5589,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/reset-display-device-persistence$",
+      "handler": "resetDisplayDevicePersistence",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5591,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/display/terminate_virtual$",
+      "handler": "postTerminateVirtualDisplay",
+      "preprocessor_context": [
+        "#if defined(_WIN32)"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5592,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/display/export_golden$",
+      "handler": "postExportGoldenDisplay",
+      "preprocessor_context": [
+        "#if defined(_WIN32)"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5593,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/display/golden_status$",
+      "handler": "getGoldenStatus",
+      "preprocessor_context": [
+        "#if defined(_WIN32)"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5594,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/display/golden$",
+      "handler": "deleteGolden",
+      "preprocessor_context": [
+        "#if defined(_WIN32)"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5596,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/password$",
+      "handler": "savePassword",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5597,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/display-devices$",
+      "handler": "getDisplayDevices",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5599,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/framegen/edid-refresh$",
+      "handler": "getFramegenEdidRefresh",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5600,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/health/vigem$",
+      "handler": "getVigemHealth",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5601,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/health/vulkan-hdr-layer$",
+      "handler": "getVulkanHdrLayerHealth",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5602,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/health/vulkan-hdr-layer/register$",
+      "handler": "postVulkanHdrLayerRegister",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5603,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/health/crashdump$",
+      "handler": "getCrashDumpStatus",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5604,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/health/crashdump/dismiss$",
+      "handler": "postCrashDumpDismiss",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5606,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/apps/([A-Fa-f0-9-]+)/cover$",
+      "handler": "getAppCover",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5607,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/apps/([A-Fa-f0-9-]+)/icon$",
+      "handler": "getAppIcon",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5608,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/apps/([A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12})$",
+      "handler": "deleteApp",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5609,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/apps/([0-9]+)$",
+      "handler": "deleteApp",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5610,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/clients/unpair-all$",
+      "handler": "unpairAll",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5611,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/clients/list$",
+      "handler": "getClients",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5612,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/clients/display-layout$",
+      "handler": "getClientDisplayLayout",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5613,
+      "surface": "management",
+      "method": "PUT",
+      "pattern": "^/api/clients/display-layout$",
+      "handler": "putClientDisplayLayout",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5614,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/clients/hdr-profiles$",
+      "handler": "getHdrProfiles",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5615,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/clients/update$",
+      "handler": "updateClient",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5616,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/clients/unpair$",
+      "handler": "unpair",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5617,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/clients/disconnect$",
+      "handler": "disconnectClient",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5618,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/apps/close$",
+      "handler": "closeApp",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5619,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/session/status$",
+      "handler": "getSessionStatus",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5620,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/host/stats$",
+      "handler": "getHostStats",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5621,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/host/info$",
+      "handler": "getHostInfo",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5622,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/rtsp/sessions$",
+      "handler": "listRTSPSessions",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5623,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/capabilities$",
+      "handler": "getWebRTCCapabilities",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5624,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/sessions$",
+      "handler": "listWebRTCSessions",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5625,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/history/sessions$",
+      "handler": "listSessionHistory",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5626,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/history/sessions/active$",
+      "handler": "getActiveSessionHistory",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5627,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/history/sessions/([A-Fa-f0-9-]+)$",
+      "handler": "getSessionHistoryDetail",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5628,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/history/sessions/([A-Fa-f0-9-]+)$",
+      "handler": "deleteSessionHistory",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5629,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/webrtc/sessions$",
+      "handler": "createWebRTCSession",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5630,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)$",
+      "handler": "getWebRTCSession",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5631,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)$",
+      "handler": "deleteWebRTCSession",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5632,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)/offer$",
+      "handler": "postWebRTCOffer",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5633,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)/answer$",
+      "handler": "getWebRTCAnswer",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5634,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)/ice$",
+      "handler": "getWebRTCIce",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5635,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)/ice$",
+      "handler": "postWebRTCIce",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5636,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/sessions/([A-Fa-f0-9-]+)/ice/stream$",
+      "handler": "getWebRTCIceStream",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5637,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/webrtc/cert$",
+      "handler": "getWebRTCCert",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5639,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/covers/upload$",
+      "handler": "uploadCover",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5640,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/covers/([0-9]+)$",
+      "handler": "getCover",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5641,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/vigembus/status$",
+      "handler": "getViGEmBusStatus",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5642,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/vigembus/install$",
+      "handler": "installViGEmBus",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5643,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/apps/purge_autosync$",
+      "handler": "purgeAutoSyncedApps",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5645,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/frame-limiter/status$",
+      "handler": "getFrameLimiterStatus",
+      "preprocessor_context": [
+        "#if defined(_WIN32) || defined(__linux__)"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5647,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/steam/status$",
+      "handler": "getSteamStatus",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5648,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/steam/games$",
+      "handler": "getSteamGames",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5649,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/steam/force_sync$",
+      "handler": "postSteamForceSync",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5650,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/steam/launch$",
+      "handler": "postSteamLaunch",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5652,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/lutris/status$",
+      "handler": "getLutrisStatus",
+      "preprocessor_context": [
+        "#ifdef __linux__"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5653,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/lutris/games$",
+      "handler": "getLutrisGames",
+      "preprocessor_context": [
+        "#ifdef __linux__"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5654,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/lutris/force_sync$",
+      "handler": "postLutrisForceSync",
+      "preprocessor_context": [
+        "#ifdef __linux__"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5655,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/lutris/launch$",
+      "handler": "postLutrisLaunch",
+      "preprocessor_context": [
+        "#ifdef __linux__"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5658,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/playnite/status$",
+      "handler": "getPlayniteStatus",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5659,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/rtss/status$",
+      "handler": "getRtssStatus",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5660,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/lossless_scaling/status$",
+      "handler": "getLosslessScalingStatus",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5661,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/playnite/install$",
+      "handler": "installPlaynite",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5662,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/playnite/uninstall$",
+      "handler": "uninstallPlaynite",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5663,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/playnite/games$",
+      "handler": "getPlayniteGames",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5664,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/playnite/categories$",
+      "handler": "getPlayniteCategories",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5665,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/playnite/force_sync$",
+      "handler": "postPlayniteForceSync",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5666,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/playnite/cover$",
+      "handler": "postPlayniteCover",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5667,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/playnite/launch$",
+      "handler": "postPlayniteLaunch",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5671,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/logs/export$",
+      "handler": "downloadPlayniteLogs",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5672,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/logs/export_crash/manifest$",
+      "handler": "getCrashBundleManifest",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5673,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/logs/export_crash$",
+      "handler": "downloadCrashBundle",
+      "preprocessor_context": [
+        "#ifdef _WIN32"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5675,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/logs/export$",
+      "handler": "downloadLogs",
+      "preprocessor_context": [
+        "#ifdef _WIN32; #else"
+      ]
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5677,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/token$",
+      "handler": "generateApiToken",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5678,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/tokens$",
+      "handler": "listApiTokens",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5679,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/token/routes$",
+      "handler": "listApiTokenRoutes",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5680,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/token/([a-fA-F0-9]+)$",
+      "handler": "revokeApiToken",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5681,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/auth/login$",
+      "handler": "loginUser",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5682,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/auth/refresh$",
+      "handler": "refreshSession",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5683,
+      "surface": "management",
+      "method": "POST",
+      "pattern": "^/api/auth/logout$",
+      "handler": "logoutUser",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5684,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/auth/status$",
+      "handler": "authStatus",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5685,
+      "surface": "management",
+      "method": "GET",
+      "pattern": "^/api/auth/sessions$",
+      "handler": "listSessions",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/confighttp.cpp",
+      "line": 5686,
+      "surface": "management",
+      "method": "DELETE",
+      "pattern": "^/api/auth/sessions/([A-Fa-f0-9]+)$",
+      "handler": "revokeSession",
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5536,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/serverinfo$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5541,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/pair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5544,
+      "surface": "https_server",
+      "method": "POST",
+      "pattern": "^/pair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5547,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/unpair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5548,
+      "surface": "https_server",
+      "method": "POST",
+      "pattern": "^/unpair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5549,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/applist$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5554,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/appasset$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5555,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/launch$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5563,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/resume$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5571,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/cancel$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5577,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/bitrate$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5578,
+      "surface": "https_server",
+      "method": "GET",
+      "pattern": "^/api/abr/capabilities$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5587,
+      "surface": "http_server",
+      "method": "GET",
+      "pattern": "^/serverinfo$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5592,
+      "surface": "http_server",
+      "method": "GET",
+      "pattern": "^/pair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5595,
+      "surface": "http_server",
+      "method": "POST",
+      "pattern": "^/pair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5598,
+      "surface": "http_server",
+      "method": "GET",
+      "pattern": "^/unpair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    },
+    {
+      "source": "src/nvhttp.cpp",
+      "line": 5599,
+      "surface": "http_server",
+      "method": "POST",
+      "pattern": "^/unpair/?$",
+      "handler": null,
+      "preprocessor_context": []
+    }
+  ]
+}

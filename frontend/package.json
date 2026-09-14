@@ -1,0 +1,14 @@
+{
+  "name": "amaterasu-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independently replaceable Amaterasu management frontend",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
