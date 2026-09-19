@@ -142,6 +142,77 @@ impl Backend {
 fn entry(name: &str) -> Value {
     json!({"name":name,"launch":{"kind":"application","path":"/Applications/Game.app"}})
 }
+
+#[test]
+fn preparation_and_undo_are_canonically_persisted_across_reload() {
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut backend = Backend::default();
+    let created = backend.run(
+        &mut Pipeline::default(),
+        json!({
+            "action": "create",
+            "expected_revision": 0,
+            "entry": {
+                "name": "Prepared game",
+                "launch": {
+                    "kind": "executable",
+                    "program": "/games/prepared",
+                    "preparation": [
+                        {
+                            "run": {"executable": executable.clone()},
+                            "undo": {"executable": executable.clone(), "args": ["restore"]}
+                        },
+                        {"run": {"executable": executable.clone(), "timeout_ms": 30_000}}
+                    ]
+                }
+            }
+        }),
+    );
+    assert_eq!(created["ok"], true);
+
+    let canonical = json!([
+        {
+            "run": {
+                "executable": executable.clone(),
+                "args": [],
+                "environment": {},
+                "cwd": null,
+                "timeout_ms": 10_000
+            },
+            "undo": {
+                "executable": executable.clone(),
+                "args": ["restore"],
+                "environment": {},
+                "cwd": null,
+                "timeout_ms": 10_000
+            }
+        },
+        {
+            "run": {
+                "executable": executable.clone(),
+                "args": [],
+                "environment": {},
+                "cwd": null,
+                "timeout_ms": 30_000
+            },
+            "undo": null
+        }
+    ]);
+    let stored = backend.entries["app-0000000000000001"].clone();
+    assert_eq!(stored["launch"]["preparation"], canonical);
+    assert_eq!(created["entry"], stored);
+
+    let reloaded = backend.run(
+        &mut Pipeline::default(),
+        json!({"action":"get","id":"app-0000000000000001"}),
+    );
+    assert_eq!(reloaded["entry"], stored);
+    assert_eq!(reloaded["entry"]["launch"]["preparation"], canonical);
+}
+
 #[test]
 fn ten_thousand_entries_use_single_entry_commits_and_bounded_pages() {
     let mut backend = Backend::default();

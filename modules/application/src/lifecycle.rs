@@ -181,6 +181,7 @@ impl CommandFailure {
 
 enum CommandPoll {
     Running,
+    Blocked(CommandFailure),
     Finished(Result<(), CommandFailure>),
 }
 
@@ -232,15 +233,16 @@ impl CommandTask {
                     self.outcome = Some(CommandFailure::new(CommandFailureKind::TimedOut));
                 }
                 Ok(false) => return CommandPoll::Running,
-                Err(error) => self.outcome = Some(CommandFailure::containment(&error)),
+                Err(error) => {
+                    return CommandPoll::Blocked(CommandFailure::containment(&error));
+                }
             }
         }
         if self.stop_requested_at.is_none() {
             match self.child.request_stop() {
                 Ok(()) => self.stop_requested_at = Some(now),
                 Err(error) => {
-                    self.outcome = Some(CommandFailure::containment(&error));
-                    return CommandPoll::Running;
+                    return CommandPoll::Blocked(CommandFailure::containment(&error));
                 }
             }
             return CommandPoll::Running;
@@ -253,8 +255,7 @@ impl CommandTask {
             match self.child.force_stop() {
                 Ok(()) => self.force_requested = true,
                 Err(error) => {
-                    self.outcome = Some(CommandFailure::containment(&error));
-                    return CommandPoll::Running;
+                    return CommandPoll::Blocked(CommandFailure::containment(&error));
                 }
             }
             return CommandPoll::Running;
@@ -277,14 +278,10 @@ impl CommandTask {
                 if now.saturating_duration_since(stop_requested_at)
                     >= COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT =>
             {
-                self.outcome = Some(CommandFailure::new(CommandFailureKind::ContainmentFailed));
-                CommandPoll::Running
+                CommandPoll::Blocked(CommandFailure::new(CommandFailureKind::ContainmentFailed))
             }
             Ok(None) => CommandPoll::Running,
-            Err(error) => {
-                self.outcome = Some(CommandFailure::containment(&error));
-                CommandPoll::Running
-            }
+            Err(error) => CommandPoll::Blocked(CommandFailure::containment(&error)),
         }
     }
 }
@@ -369,10 +366,6 @@ impl ApplicationLifecycle {
         })
     }
 
-    pub(crate) fn is_preparing(&self) -> bool {
-        self.phase == Phase::Preparing
-    }
-
     pub(crate) fn is_ready(&self) -> bool {
         self.phase == Phase::Ready
     }
@@ -394,11 +387,17 @@ impl ApplicationLifecycle {
     pub(crate) fn tick(&mut self, now: Instant) {
         if let Some(active) = &mut self.active {
             let purpose = active.purpose;
-            let CommandPoll::Finished(result) = active.task.poll(now) else {
-                return;
-            };
-            self.active = None;
-            self.finish_command(purpose, result);
+            match active.task.poll(now) {
+                CommandPoll::Running => return,
+                CommandPoll::Blocked(failure) => {
+                    self.block_command(purpose, failure);
+                    return;
+                }
+                CommandPoll::Finished(result) => {
+                    self.active = None;
+                    self.finish_command(purpose, result);
+                }
+            }
         }
         match self.phase {
             Phase::Preparing => self.start_next_preparation(now),
@@ -483,6 +482,23 @@ impl ApplicationLifecycle {
                 }
             },
         }
+    }
+
+    fn block_command(&mut self, purpose: CommandPurpose, failure: CommandFailure) {
+        let (phase, index) = match purpose {
+            CommandPurpose::Preparation(index) => ("preparation", index),
+            CommandPurpose::Undo(index) => ("undo", index),
+        };
+        let failure = failure.at(phase, index);
+        if matches!(purpose, CommandPurpose::Preparation(_)) && self.preparation.failure.is_none() {
+            self.preparation.failure = Some(failure.clone());
+            if let Some(active) = &mut self.active {
+                active.task.cancel();
+            }
+        }
+        self.cleanup.failures = vec![failure];
+        self.cleanup.state = CleanupState::Failed;
+        self.phase = Phase::CleanupFailed;
     }
 
     fn complete_undo(&mut self, index: usize) {

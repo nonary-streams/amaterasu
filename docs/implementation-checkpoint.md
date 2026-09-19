@@ -1,50 +1,51 @@
-# Paused implementation checkpoint
+# Completed application lifecycle checkpoint
 
-Implementation was paused at the user's request on 2026-09-13. This is a WIP
-checkpoint, not a release or a claim of completed parity.
+The application, catalog and launch lifecycle increment was resumed and completed
+on 2026-09-19. This checkpoint records the implemented contract and its local
+verification; it is not a release or a claim of complete Vibeshine parity.
 
-## Last verified increment
+## Implemented contract
 
-Capture geometry integration passed 630 Rust tests (the workspace run plus the
-final video-module rerun), host and Windows/Linux strict Clippy, formatting,
-Windows/Linux all-target compilation, and six signed integration suites:
-input, native media, RTSP, stream session, public launch, and platform services.
-The parity ledger records the evidence and outstanding hardware/client gates.
-These results predate the unfinished application changes below.
+- `modules/application` advances literal-argv preparation and reverse undo across
+  managed ticks, with explicit command deadlines and retained process ownership.
+- `modules/catalog` validates and stores the canonical preparation configuration,
+  including defaults, bounds and rejection of unknown nested fields.
+- `modules/launch` forwards canonical preparation, waits for application startup
+  or failure, and retains the session lease until application cleanup is terminal.
+- `scripts/test_launch_workflow.py` covers ordered preparation, reverse undo and
+  failed-preparation rollback through the signed catalog/session/application
+  composition.
 
-## Interrupted work
-
-- `modules/application`: literal-argv preparation and reverse undo commands,
-  advanced across ticks with retained child ownership and deadlines.
-- `modules/catalog`: canonical storage/validation of preparation configuration.
-- `modules/launch`: forwarding canonical preparation, waiting for preparation,
-  and retaining session ownership until application cleanup finishes.
-- `scripts/test_launch_workflow.py`: signed ordered-preparation/reverse-undo and
-  failed-preparation rollback coverage. Added tests have not been run.
-
-The agreed application wire contract adds optional `preparation: []` to launch.
-Each of at most eight steps contains `run` and optional `undo` commands. A command
+The application wire contract adds optional `preparation: []` to launch. Each of
+at most eight steps contains `run` and an optional `undo` command. A command
 contains `executable`, optional `args`, `environment`, `cwd`, and `timeout_ms`
 (default 10000, allowed 1 through 30000). Commands use literal argv and a cleared,
-explicit environment. Every successfully spawned run owes its paired undo,
-including failed or cancelled runs with possible side effects. Undo runs in
-reverse order after contained process trees have settled.
+explicit environment.
 
-Planned application states are `preparing`, `running`, `stopping`,
-`cleanup_failed`, and terminal `exited`, `launch_failed`, or `cancelled`.
-Failed cleanup retains pending undo for explicit retry; it must not release the
-session lease or report terminal completion. Long commands must never sleep or
+Application states are `preparing`, `running`, `stopping`, `cleanup_failed`, and
+terminal `exited`, `launch_failed`, or `cancelled`. Every successfully spawned
+preparation command with a configured undo owes that undo, even if the command
+later fails or cancellation arrives. Undo starts only after the contained
+application process tree has settled and runs in reverse order. Failed cleanup
+retains the pending undo for explicit retry; launch therefore keeps the session
+lease and does not report terminal completion. Command polling does not sleep or
 wait in the shared managed-module tick.
 
-## Resume verification
+## Verification
 
-At pause, `cargo check --workspace --all-targets --offline --locked` fails because
-application lifecycle integration is incomplete, including an unresolved
-`crate::lifecycle` import and launch patterns missing the new `preparation` field.
-The diagnostic log is `/private/tmp/amaterasu-paused-check.log` (temporary local
-evidence, not included in Git). Inspect the current source before resuming.
+The completed increment passed the focused application, catalog and launch test
+suites, the locked full Rust workspace, strict workspace Clippy and formatting.
+The signed launch workflow passed its catalog-backed preparation and rollback
+cases. The platform-module regression passed with asynchronous application
+termination and terminal-state polling. Affected application code also passed
+Windows MSVC and Linux GNU cross-target checks and strict Clippy; these compile
+checks do not establish runtime or hardware compatibility.
 
-Finish the application, catalog, and launch contract together; run focused
-lifecycle/ownership tests and the new signed launch workflow, then repeat the
-appropriate workspace, cross-target, and signed regressions. Do not interpret
-the earlier geometry test results as validation of this unfinished increment.
+## Remaining parity work
+
+Preparation and cleanup obligations are retained by the live application service,
+not durably reconstructed after a host crash or component reload. Windows graceful
+quit, launcher handoff, reconnect/resume, durable cleanup watchers, production
+per-application policy and Windows/Linux runtime qualification remain open. See
+the [parity ledger](parity.md) for the broader display, input, media and real-client
+acceptance gates.

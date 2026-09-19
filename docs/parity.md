@@ -1,9 +1,8 @@
 # Vibeshine parity ledger
 
-Implementation is paused at the user's request. The current WIP checkpoint
-contains unfinished application lifecycle changes and does not compile; see
-[checkpoint and resume notes](implementation-checkpoint.md). Verification below
-describes the last completed capture-geometry increment, before those changes.
+The ordered application-preparation increment was completed on 2026-09-19; see
+the [implementation checkpoint](implementation-checkpoint.md). This advances the
+foundation but does not claim full application or streaming-host parity.
 
 Reference: sibling checkout commit `aa292c4cb097f22beab19d6ebf0307367f9bf449`.
 This initial ledger names the known feature domains and acceptance gates. A full
@@ -48,7 +47,7 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Audio | Implemented Windows WASAPI loopback, native PCM delivery and independently packaged Opus encoding; hardware unqualified | Real capture-to-encoder-to-transport qualification, clock synchronization, resampling, surround, endpoint roles and persistent recovery |
 | Keyboard/mouse | Implemented authenticated session dispatch, captured-monitor coordinate validation, expiring input leases, Windows SendInput and Linux uinput backends; hardware unqualified | Native multi-monitor/mixed-DPI qualification, layout-change continuity, layouts/text, desktop ownership and crash-surviving release cleanup |
 | Controller input | Pending | Supported profiles, VHF/other backends, rumble, force feedback and adaptive triggers |
-| Application lifecycle | Implemented process containment and catalog/session launch workflow | Windows/Linux runtime qualification, session integration, Windows graceful quit, preparation/undo commands, launcher handoff, resume and surviving cleanup watchers |
+| Application lifecycle | Implemented process containment, catalog/session launch, ordered preparation, reverse undo and retained cleanup failures | Windows/Linux runtime qualification, Windows graceful quit, launcher handoff, resume, durable restart reconciliation and crash-surviving cleanup watchers |
 | Library/catalog | Implemented scalable manual catalog and authorized name/ID export; 10k durable entries tested | Artwork, provider reconciliation, legacy aliases and per-app overrides |
 | Steam/Playnite/Lutris | Implemented explicit-root Steam discovery | Session-user discovery, sync/reconciliation, artwork, launch behavior, Playnite/Lutris providers and cleanup |
 | Activity detection | Pending | Foreground/fullscreen/overlay handling without alt-tab capture stalls |
@@ -73,11 +72,15 @@ claim those hardware-specific regressions are fixed in this new project.
 
 ## Current verification evidence
 
-Latest local verification: 630 Rust tests passed (workspace run followed by the
-final video-module rerun; 3 intentional subprocess helpers and
-6 external-oracle/network tests ignored in the default run). The GameStream suite
-also passed all 101 tests with separately compiled pinned C oracles, including
-all six normally ignored compatibility gates. Strict host workspace Clippy and formatting pass.
+The completed application lifecycle increment passed its focused application,
+catalog and launch suites, the locked full Rust workspace, strict workspace
+Clippy and formatting. The signed launch workflow and platform-module regression
+also passed with the integrated changes. The earlier capture-geometry verification
+recorded 630 passing Rust tests (the workspace run followed by the final video
+module rerun; 3 intentional subprocess helpers and 6 external-oracle/network
+tests ignored in the default run). The GameStream suite also passed all 101 tests
+with separately compiled pinned C oracles, including all six normally ignored
+compatibility gates.
 Full workspace all-target
 checks pass for Windows MSVC and Linux GNU, including the TLS transport and ring's
 target C/assembly compilation and bundled Opus ELF/COFF static archives. Strict
@@ -127,7 +130,9 @@ and hardware behavior.
 - `scripts/test_launch_workflow.py` launches a real controlled executable from the
   management catalog through the launch/session/application libraries. It checks
   idempotent retries, scoped access, caller isolation, rejection of executable
-  overrides, explicit stop with observed child exit, and natural-exit lease cleanup.
+  overrides, ordered preparation, reverse undo, failed-preparation rollback,
+  explicit stop with observed child exit, and natural-exit lease cleanup. Launch
+  retains the session lease while application cleanup is still pending or failed.
   This coordinates application sessions; it does not start streaming or capture.
 - `scripts/test_management_domains.py` exercises pairing PIN approval, public host
   identity, client unpairing and denied transport/key-management routes over HTTP.
@@ -358,8 +363,8 @@ The failed initial platform activation remains recorded in
 - The ticket API supports fixed client media ports or token-based UDP destination
   discovery. SETUP's client-port placeholder is never destination authorization.
   The listener is encrypted-only and explicitly bound; no wildcard address is returned
-  as a usable URL. Application preparation, display restoration, input dispatch
-  and hardware/client playback remain open.
+  as a usable URL. Display restoration, broader input profiles and hardware/client
+  playback remain open.
 
 
 Latest combined verification logs are
@@ -431,10 +436,11 @@ regression logs use
   display optimization (`sops=1`), HDR, surround, local-audio and controller
   forwarding requests are rejected before application effects. Other wire profile
   parameters still come from installed policy and must match ANNOUNCE. Resume,
-  complete client negotiation, display/application preparation and restoration,
-  OS input, durable restart/reload reconciliation and real client playback remain
-  required. Startup streaming advertisement describes configuration, not a hardware
-  capability probe. Development listeners and streaming remain disabled by default.
+  complete client negotiation, display optimization and restoration, broader
+  per-application policy, OS input, durable restart/reload reconciliation and real
+  client playback remain required. Startup streaming advertisement describes
+  configuration, not a hardware capability probe. Development listeners and
+  streaming remain disabled by default.
 
 Public-launch workspace and Clippy evidence is in
 `/private/tmp/amaterasu-public-launch-workspace-tests-final.log` and

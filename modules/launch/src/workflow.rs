@@ -12,12 +12,14 @@ pub enum Step {
     CreateSession,
     Acquire,
     Spawn,
+    AwaitApplication,
     Activate,
     Monitor,
     FindSession,
     FindProcess,
     StopSession,
     Terminate,
+    AwaitTermination,
     Finish,
 }
 #[derive(Clone)]
@@ -93,14 +95,14 @@ impl Workflow {
                 let executable = record.executable.as_ref().ok_or("invalid_workflow")?;
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"environment":environment}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::Activate => (
                 SESSION,
                 json!({"action":"activate","session_id":session.ok_or("invalid_workflow")?}),
             ),
-            Step::Monitor => (
+            Step::AwaitApplication | Step::Monitor | Step::AwaitTermination => (
                 APPLICATION,
                 json!({"action":"status","process_id":record.process_id.ok_or("invalid_workflow")?}),
             ),

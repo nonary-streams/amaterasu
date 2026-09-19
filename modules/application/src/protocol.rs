@@ -123,7 +123,7 @@ fn valid_path(value: &str) -> bool {
         && Path::new(value).is_absolute()
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum ProcessState {
     Preparing,
@@ -142,7 +142,7 @@ pub(crate) enum ProcessState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalOutcome {
     Exited,

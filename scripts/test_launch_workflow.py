@@ -89,13 +89,10 @@ def create_lifecycle_app(api, bearer, directory, revision, *, fail_preparation=F
             "undo": lifecycle_command(trace, "undo-two", delay=0.2),
         },
     ]
-    program = f"""import time
-from pathlib import Path
-
-with Path({str(trace)!r}).open("a") as output:
-    output.write("application\\n")
-time.sleep(30)
-"""
+    program = (
+        "import time; from pathlib import Path; "
+        f"Path({str(trace)!r}).open('a').write('application\\n'); time.sleep(30)"
+    )
     created = post(api, "/v1/catalog/create", {
         "expected_revision": revision,
         "entry": {

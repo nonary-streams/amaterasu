@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import sys
+import time
 
 from test_component_updates import CARGO, ComponentHarness, run
 
@@ -194,20 +196,62 @@ def test_application_process(harness: PlatformHarness) -> None:
             key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR") if key in os.environ
         },
     }
-    launched, repeated, conflict, terminated, status = harness.requests(
-        "amaterasu.application/1",
-        launch,
-        launch,
-        dict(launch, args=["-c", "pass"]),
-        {"action": "terminate", "process_id": 1},
-        {"action": "status", "process_id": 1},
+    process = subprocess.Popen(
+        [str(harness.host), "serve", str(harness.root)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
     )
-    assert launched["ok"] and launched["process"]["state"] == "running", launched
-    assert launched["process"]["pid"] > 0, launched
-    assert repeated["process"]["pid"] == launched["process"]["pid"], repeated
-    assert not conflict["ok"] and conflict["code"] == "operation_conflict", conflict
-    assert terminated["ok"] and terminated["process"]["state"] == "exited", terminated
-    assert status["process"]["state"] == "exited", status
+    sequence = 0
+
+    def request(payload: dict) -> dict:
+        nonlocal sequence
+        sequence += 1
+        command = {
+            "op": "request",
+            "service": "amaterasu.application/1",
+            "payload": payload,
+            "timeout_ms": 2000,
+            "operation_id": f"platform.application.{sequence}",
+        }
+        process.stdin.write(json.dumps(command) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        assert line, process.stderr.read()
+        response = json.loads(line)
+        assert response["kind"] == "result", response
+        return response["payload"]
+
+    try:
+        launched = request(launch)
+        repeated = request(launch)
+        conflict = request(dict(launch, args=["-c", "pass"]))
+        terminated = request({"action": "terminate", "process_id": 1})
+        assert launched["ok"] and launched["process"]["state"] == "running", launched
+        assert launched["process"]["pid"] > 0, launched
+        assert repeated["process"]["pid"] == launched["process"]["pid"], repeated
+        assert not conflict["ok"] and conflict["code"] == "operation_conflict", conflict
+        assert terminated["ok"] and terminated["process"]["state"] == "stopping", terminated
+
+        deadline = time.monotonic() + 3
+        while True:
+            status = request({"action": "status", "process_id": 1})
+            if status["process"]["state"] == "cancelled":
+                break
+            assert status["process"]["state"] == "stopping", status
+            assert time.monotonic() < deadline, status
+            time.sleep(0.02)
+    finally:
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            return_code = process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait(timeout=8)
+        assert return_code == 0, process.stderr.read()
 
 
 def configure_steam_fixture(harness: PlatformHarness) -> None:

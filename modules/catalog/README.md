@@ -19,8 +19,9 @@ one active request. Restart reloads data from state rather than an in-memory cac
 
 ## JSON API
 
-Unknown fields are rejected. Optional fields may be absent or null unless noted.
-Read an empty catalog to obtain revision 0:
+Unknown fields are rejected at every nesting level. Nullable fields may be absent
+or null. Defaulted arrays and maps may be absent but do not accept null. Read an
+empty catalog to obtain revision 0:
 
 ```json
 {"action":"list","limit":20}
@@ -31,6 +32,27 @@ Create a manual entry:
 ```json
 {"action":"create","expected_revision":0,"entry":{"name":"Example Game","description":"Local game","tags":["arcade"],"launch":{"kind":"executable","program":"/opt/games/example","arguments":["--fullscreen"],"working_directory":"/opt/games"}}}
 ```
+
+Executable entries can include ordered preparation and paired undo commands:
+
+```json
+{"action":"create","expected_revision":0,"entry":{"name":"Prepared Game","launch":{"kind":"executable","program":"/opt/games/example","preparation":[{"run":{"executable":"/opt/games/configure","args":["enable"],"environment":{"PROFILE":"game"},"cwd":"/opt/games","timeout_ms":10000},"undo":{"executable":"/opt/games/configure","args":["disable"],"environment":{"PROFILE":"game"},"cwd":"/opt/games","timeout_ms":10000}}]}}}
+```
+
+The catalog entry is the canonical source of this lifecycle metadata. Preparation
+cannot be supplied separately by a launch request. The catalog stores and returns
+the commands but never executes them. The application lifecycle consumer runs
+`run` commands in order and owes each successfully spawned command's optional
+`undo`, including a run that may have had side effects before failing. Owed undo
+commands run in reverse order after the application process tree settles.
+
+`preparation` defaults to no steps and is omitted from canonical serialization
+when empty. Within a command, absent `args`, `environment`, `cwd`, and `timeout_ms`
+canonicalize to `[]`, `{}`, `null`, and `10000`; an absent `undo` canonicalizes to
+`null`. Paths and argument strings are retained literally and are not filesystem-
+canonicalized or shell-parsed. Create and update responses contain the same
+normalized metadata committed to state, and ordinary reads, launch resolution,
+restart reloads, and legacy migration preserve it.
 
 Success includes `ok`, catalog `revision`, generated `id` (initially
 `app-0000000000000001`) and `entry`. IDs are opaque, caller-local, monotonically
@@ -82,6 +104,24 @@ platforms: no filesystem existence, executable type, bundle validity, network
 access, environment expansion, shell parsing or launch authorization is implied.
 Arguments remain literal metadata. This module never launches applications.
 
+Preparation is available only for executable entries. At most eight steps are
+allowed. Each step requires one `run` command and may contain one `undo` command.
+Each command has these limits:
+
+- `executable` and optional `cwd` are native absolute paths of 1–1,024 bytes
+  without NUL. `.bat` and `.cmd` executables are rejected case-insensitively;
+  choose an interpreter explicitly when needed.
+- `args` contains at most 64 literal values, each at most 1,024 bytes and without
+  NUL, with at most 8,192 bytes combined.
+- `environment` contains at most 32 explicit keys. Keys are 1–128 ASCII
+  alphanumeric/underscore bytes and unique ignoring ASCII case; values are at
+  most 1,024 bytes without NUL; keys and values total at most 4,096 bytes. The
+  lifecycle consumer clears its inherited environment before applying this map.
+- `timeout_ms` is 1–30,000 milliseconds and defaults to 10,000.
+
+These commands are trusted native-code launch metadata, not a sandbox or a shell
+script interface. Their encoded bytes also count toward the entry-size limit.
+
 Each entry must fit **11,950 serialized bytes** (including escaped strings).
 There is no 12 KB whole-catalog limit. Up to **100,000 entries per caller** are
 supported, subject to the state's 16 MiB per-leaf bound. Automated tests exercise
@@ -113,7 +153,7 @@ only as behavioral references for durable identity and manual launch metadata.
 No source was copied or translated. This implementation does not yet provide
 provider discovery/import (Steam, Playnite, Lutris), legacy IDs/aliases, portable
 UUIDs, artwork loading/fingerprints, provider identifiers, per-application config
-overrides, desktop entries, shell commands, prep/undo hooks, environment overlays,
+overrides, desktop entries, shell-command launch forms, environment overlays,
 launch/session integration or migration from Vibeshine data. These remain explicit
 parity requirements. There is no cross-caller aggregation API.
 

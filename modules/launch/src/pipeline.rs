@@ -386,21 +386,32 @@ impl Pipeline {
                 }
                 job.step = Step::Spawn;
             }
-            Step::Spawn => {
-                let process = match responses::process(&payload, record) {
+            Step::Spawn | Step::AwaitApplication => {
+                let (process, state) = match responses::process(&payload, record) {
                     Ok(process) => process,
                     Err(code) => return self.dependency_failed(job, code, send),
                 };
-                record.process_id = process["process_id"].as_u64();
-                match payload["process"]["state"].as_str() {
-                    Some("running") => job.step = Step::Activate,
-                    Some("exited") => job.begin_cleanup(record, Outcome::Completed, None),
-                    Some("launch_failed") => job.begin_cleanup(
+                if job.step == Step::Spawn {
+                    record.process_id = process["process_id"].as_u64();
+                }
+                match state {
+                    ApplicationState::Preparing | ApplicationState::Stopping => {
+                        job.step = Step::AwaitApplication;
+                    }
+                    ApplicationState::Running => job.step = Step::Activate,
+                    ApplicationState::Exited => job.begin_cleanup(record, Outcome::Completed, None),
+                    ApplicationState::LaunchFailed => job.begin_cleanup(
                         record,
                         Outcome::Failed,
                         Some("application_launch_failed"),
                     ),
-                    _ => return self.dependency_failed(job, "invalid_application_response", send),
+                    ApplicationState::Cancelled => {
+                        job.begin_cleanup(record, Outcome::Cancelled, Some("application_cancelled"))
+                    }
+                    ApplicationState::CleanupFailed(outcome) => {
+                        apply_application_outcome(record, outcome);
+                        return self.cleanup_failed(job, "application_cleanup_failed", send);
+                    }
                 }
             }
             Step::Activate => {
@@ -412,16 +423,31 @@ impl Pipeline {
                 record.state = State::Active;
                 return self.deliver_activation(job, send);
             }
-            Step::Monitor => match responses::process(&payload, record)
-                .ok()
-                .and_then(|process| process["state"].as_str())
-            {
-                Some("running") => return Ok(()),
-                Some("exited" | "launch_failed") => {
-                    job.begin_cleanup(record, Outcome::Completed, None)
+            Step::Monitor => {
+                let (_, state) = match responses::process(&payload, record) {
+                    Ok(process) => process,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                match state {
+                    ApplicationState::Running | ApplicationState::Stopping => return Ok(()),
+                    ApplicationState::Exited => job.begin_cleanup(record, Outcome::Completed, None),
+                    ApplicationState::LaunchFailed => job.begin_cleanup(
+                        record,
+                        Outcome::Failed,
+                        Some("application_launch_failed"),
+                    ),
+                    ApplicationState::Cancelled => {
+                        job.begin_cleanup(record, Outcome::Cancelled, Some("application_cancelled"))
+                    }
+                    ApplicationState::CleanupFailed(outcome) => {
+                        apply_application_outcome(record, outcome);
+                        return self.cleanup_failed(job, "application_cleanup_failed", send);
+                    }
+                    ApplicationState::Preparing => {
+                        return self.dependency_failed(job, "invalid_application_response", send);
+                    }
                 }
-                _ => return self.dependency_failed(job, "invalid_application_response", send),
-            },
+            }
             _ => return Err("invalid launch workflow".into()),
         }
         self.retain(job)
@@ -454,7 +480,7 @@ impl Pipeline {
             }
             Step::FindProcess => {
                 if payload["ok"] == true {
-                    let process = match responses::process(&payload, record) {
+                    let (process, _) = match responses::process(&payload, record) {
                         Ok(process) => process,
                         Err(code) => return self.cleanup_failed(job, code, send),
                     };
@@ -478,15 +504,26 @@ impl Pipeline {
                     Step::Finish
                 };
             }
-            Step::Terminate => {
-                if payload["ok"] != true
-                    || !responses::process(&payload, record).is_ok_and(|process| {
-                        matches!(process["state"].as_str(), Some("exited" | "launch_failed"))
-                    })
-                {
+            Step::Terminate | Step::AwaitTermination => {
+                if payload["ok"] != true {
                     return self.cleanup_failed(job, "process_termination_failed", send);
                 }
-                job.step = Step::Finish;
+                let (_, state) = match responses::process(&payload, record) {
+                    Ok(process) => process,
+                    Err(code) => return self.cleanup_failed(job, code, send),
+                };
+                match state {
+                    ApplicationState::Exited
+                    | ApplicationState::LaunchFailed
+                    | ApplicationState::Cancelled => job.step = Step::Finish,
+                    ApplicationState::Stopping => job.step = Step::AwaitTermination,
+                    ApplicationState::CleanupFailed(_) => {
+                        return self.cleanup_failed(job, "application_cleanup_failed", send);
+                    }
+                    ApplicationState::Preparing | ApplicationState::Running => {
+                        return self.cleanup_failed(job, "process_termination_failed", send);
+                    }
+                }
             }
             Step::Finish => {
                 if payload["ok"] != true
@@ -637,6 +674,15 @@ fn complete(
         Response::Ok => Ok(()),
         Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
         _ => Err("launch completion failed".into()),
+    }
+}
+
+fn apply_application_outcome(record: &mut crate::records::Record, outcome: ApplicationOutcome) {
+    record.cleanup_outcome = outcome.launch_outcome();
+    match outcome {
+        ApplicationOutcome::Exited => {}
+        ApplicationOutcome::LaunchFailed => record.failure = Some("application_launch_failed"),
+        ApplicationOutcome::Cancelled => record.failure = Some("application_cancelled"),
     }
 }
 

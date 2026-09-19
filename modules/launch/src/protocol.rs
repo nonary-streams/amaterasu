@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+const MAX_PREPARATION_STEPS: usize = 8;
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
+const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -63,17 +69,48 @@ pub enum CatalogLaunch {
         program: String,
         #[serde(default)]
         arguments: Vec<String>,
+        #[serde(default)]
         working_directory: Option<String>,
+        #[serde(default)]
+        preparation: Vec<PreparationStep>,
     },
     Application {
         path: String,
     },
 }
-#[derive(Clone)]
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationStep {
+    pub run: ConfiguredCommand,
+    #[serde(default)]
+    pub undo: Option<ConfiguredCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredCommand {
+    pub executable: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default = "default_command_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_command_timeout_ms() -> u64 {
+    DEFAULT_COMMAND_TIMEOUT_MS
+}
+
+#[derive(Clone, Debug)]
 pub struct Executable {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
+    pub preparation: Vec<PreparationStep>,
 }
 impl Executable {
     pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
@@ -84,12 +121,14 @@ impl Executable {
                 program,
                 arguments,
                 working_directory,
+                preparation,
             } => {
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
                     || working_directory
                         .as_deref()
                         .is_some_and(|cwd| !valid_native_path(cwd))
+                    || !valid_preparation(&preparation)
                 {
                     return Err("unsupported_launch_spec");
                 }
@@ -97,6 +136,7 @@ impl Executable {
                     program,
                     arguments,
                     working_directory,
+                    preparation,
                 })
             }
             CatalogLaunch::Application { path } => {
@@ -128,6 +168,34 @@ pub enum Outcome {
     Cancelled,
     Failed,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationOutcome {
+    Exited,
+    LaunchFailed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationState {
+    Preparing,
+    Running,
+    Stopping,
+    CleanupFailed(ApplicationOutcome),
+    Exited,
+    LaunchFailed,
+    Cancelled,
+}
+
+impl ApplicationOutcome {
+    pub fn launch_outcome(self) -> Outcome {
+        match self {
+            Self::Exited => Outcome::Completed,
+            Self::LaunchFailed => Outcome::Failed,
+            Self::Cancelled => Outcome::Cancelled,
+        }
+    }
+}
 impl Outcome {
     pub fn state(self) -> State {
         match self {
@@ -151,11 +219,11 @@ pub fn error(code: &str) -> Value {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    pub environment: std::collections::BTreeMap<String, String>,
+    pub environment: BTreeMap<String, String>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        let mut keys = std::collections::BTreeSet::new();
+        let mut keys = BTreeSet::new();
         if self.environment.len() > 32 {
             return Err("invalid_launch_settings");
         }
@@ -197,7 +265,7 @@ pub fn valid_catalog_principal(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 fn valid_native_path(value: &str) -> bool {
-    std::path::Path::new(value).is_absolute() && value.len() <= 1024 && !value.contains('\0')
+    Path::new(value).is_absolute() && value.len() <= 1024 && !value.contains('\0')
 }
 fn valid_arguments(arguments: &[String]) -> bool {
     arguments.len() <= 64
@@ -214,4 +282,102 @@ fn valid_environment_binding(key: &str, value: &str) -> bool {
         && key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn valid_preparation(steps: &[PreparationStep]) -> bool {
+    steps.len() <= MAX_PREPARATION_STEPS
+        && steps.iter().all(|step| {
+            valid_configured_command(&step.run)
+                && step.undo.as_ref().is_none_or(valid_configured_command)
+        })
+}
+
+fn valid_configured_command(command: &ConfiguredCommand) -> bool {
+    if !valid_native_path(&command.executable)
+        || command
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| !valid_native_path(cwd))
+        || !valid_arguments(&command.args)
+        || !(1..=MAX_COMMAND_TIMEOUT_MS).contains(&command.timeout_ms)
+        || command.environment.len() > 32
+        || command
+            .environment
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            > 4096
+    {
+        return false;
+    }
+    if Path::new(&command.executable)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+        })
+    {
+        return false;
+    }
+    let mut keys = BTreeSet::new();
+    command.environment.iter().all(|(key, value)| {
+        valid_environment_binding(key, value) && keys.insert(key.to_ascii_uppercase())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog_launch(preparation: Value) -> Value {
+        json!({
+            "kind":"executable",
+            "program":std::env::current_exe().unwrap(),
+            "arguments":[],
+            "working_directory":null,
+            "preparation":preparation,
+        })
+    }
+
+    #[test]
+    fn catalog_preparation_is_strict_and_applies_defaults() {
+        let executable = Executable::from_catalog(&catalog_launch(json!([{
+            "run":{"executable":std::env::current_exe().unwrap()},
+        }])))
+        .unwrap();
+        let command = &executable.preparation[0].run;
+        assert_eq!(command.timeout_ms, DEFAULT_COMMAND_TIMEOUT_MS);
+        assert!(command.args.is_empty());
+        assert!(command.environment.is_empty());
+        assert!(command.cwd.is_none());
+        assert!(executable.preparation[0].undo.is_none());
+
+        let mut unknown = catalog_launch(json!([{
+            "run":{"executable":std::env::current_exe().unwrap(),"shell":true},
+        }]));
+        assert_eq!(
+            Executable::from_catalog(&unknown).unwrap_err(),
+            "invalid_catalog_response"
+        );
+        unknown["preparation"][0] = json!({"run":{"executable":"relative"}});
+        assert_eq!(
+            Executable::from_catalog(&unknown).unwrap_err(),
+            "unsupported_launch_spec"
+        );
+    }
+
+    #[test]
+    fn catalog_preparation_rejects_ambiguous_environment_and_command_bounds() {
+        let invalid = [
+            json!([{"run":{"executable":std::env::current_exe().unwrap(),"timeout_ms":0}}]),
+            json!([{"run":{"executable":std::env::current_exe().unwrap(),"environment":{"Path":"one","PATH":"two"}}}]),
+            json!([{"run":{"executable":std::env::current_exe().unwrap(),"args":vec!["argument";65]}}]),
+        ];
+        for preparation in invalid {
+            assert_eq!(
+                Executable::from_catalog(&catalog_launch(preparation)).unwrap_err(),
+                "unsupported_launch_spec"
+            );
+        }
+    }
 }

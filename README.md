@@ -9,9 +9,10 @@ The runtime supports permission-scoped requests, bounded events, and ordered
 hooks. The shell loads independently built native libraries, verifies signed
 packages, probes their lifecycle in a subprocess, and recovers failed activation.
 Persistent state, schema-validated configuration, session/resource coordination,
-a scalable manual application catalog, process-tree management, diagnostics,
-local Steam discovery, authentication, and a protected loopback management API
-are implemented as separate libraries. The echo module remains a test fixture.
+a scalable manual application catalog, tick-driven application preparation and
+process-tree cleanup, diagnostics, local Steam discovery, authentication, and a
+protected loopback management API are implemented as separate libraries. The
+echo module remains a test fixture.
 Software Opus encoding and UDP media delivery are independently packaged. A
 shared Rust protocol library handles RTSP/SDP parsing, audio/video packetization,
 FEC, ENet reliability and media/control encryption. An authenticated streaming session coordinator still
@@ -53,7 +54,8 @@ rejection, and unsigned mode. It does not install services or touch hardware.
 The platform integration script exercises persistence across process restarts,
 configuration validation, caller namespaces, session lease ownership, catalog
 CRUD, diagnostic retention, and controlled child-process launch/termination using
-the actual dynamically loaded libraries.
+the actual dynamically loaded libraries. The launch workflow integration also
+checks ordered preparation, reverse undo, and failed-preparation rollback.
 
 ## Try a component
 
@@ -85,8 +87,8 @@ The application service executes explicit programs under the host's account and
 requires a trusted service grant. Its children are terminated when the short-lived
 probe exits. Catalog storage supports up to 100,000 entries using atomic sharded
 collections; 10,000-entry persistence and pagination are tested. Diagnostics is
-in-memory. These limits and the unfinished application lifecycle
-features are documented in the module READMEs.
+in-memory. These limits and the remaining application lifecycle parity gaps are
+documented in the module READMEs.
 
 ## Code map
 
@@ -108,7 +110,7 @@ features are documented in the module READMEs.
 | `modules/configuration` | Caller-owned schemas, validation and asynchronous state persistence |
 | `modules/session` | Session lifecycle, shared/exclusive resource leases and snapshots |
 | `modules/catalog` | Durable manual entries, stable IDs, search and revision-bound pagination |
-| `modules/application` | Caller-owned process groups/Jobs, launch idempotency, status and termination |
+| `modules/application` | Caller-owned process groups/Jobs, tick-driven preparation, reverse undo, status and termination |
 | `modules/diagnostics` | Caller-scoped bounded records, retention cursors and counters |
 | `modules/steam` | Incremental local library discovery and bounded snapshot pagination |
 | `modules/authentication` | Durable password credentials, sessions, scoped tokens and revocation |

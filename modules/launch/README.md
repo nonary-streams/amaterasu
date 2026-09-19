@@ -19,15 +19,25 @@ Requests are strict JSON:
 ```
 
 Callers cannot override the executable, arguments, environment, working directory,
-process ID, session ID, lease resource, or catalog owner. Only catalog entries
-with `launch.kind:"executable"` are supported. The application provider receives
-the catalog program, argument array, and optional working directory. Bundle/URI
-`application` entries, command preparation/undo, detached launchers, and streaming
-startup remain unsupported. Paths must be absolute on the current native host
-and fit application limits (1024-byte program/cwd, 64 arguments, 1024 bytes each,
-8192 total argument bytes); a catalog entry valid as cross-platform metadata may
-still be unsupported on this host. The application provider enforces its remaining
-native launch constraints, including rejection of implicit batch executables.
+process ID, session ID, lease resource, preparation commands, or catalog owner.
+Only catalog entries with `launch.kind:"executable"` are supported. The application
+provider receives the catalog program, argument array, optional working directory,
+and canonical catalog preparation plan. Bundle/URI `application` entries, detached
+launchers, and streaming startup remain unsupported. Paths must be absolute on the
+current native host and fit application limits (1024-byte program/cwd, 64 arguments,
+1024 bytes each, 8192 total argument bytes); a catalog entry valid as cross-platform
+metadata may still be unsupported on this host. The application provider enforces
+its remaining native launch constraints, including rejection of implicit batch
+executables.
+
+A preparation plan contains at most eight ordered `run` commands with optional
+paired `undo` commands. Each command uses literal argv, a cleared explicit
+environment, an optional native working directory, and a 1–30000 ms timeout
+(10000 ms by default). Command paths, arguments, and environments use the same
+native application bounds. Launch parses and validates the resolved catalog plan,
+fills protocol defaults, and forwards it without accepting request-level additions
+or overrides. The application runs preparation before the main executable and owes
+reverse-order undo for every run command it started.
 
 Catalog lookup uses `resolve_launch` with the original runtime parent. Catalog
 accepts this action only from configured launch principals and selects the
@@ -101,22 +111,27 @@ and `next_offset`. Foreign/missing IDs both return `launch_not_found`.
 record, allowing a caller to reconcile a lost launch response without scanning.
 
 Stop first moves the coordination session toward stopping, terminates the owned
-application tree, then finishes the session and releases leases. If termination
-cannot be confirmed, the session lease remains held and the record reports
-`cleanup_failed`. Retrying stop repeats safe owned cleanup and can resolve a
-transient failure. The provider attempts process termination even when session
-stop fails, and requires the final session response to confirm stopped state
-and no remaining leases. It never claims the resource is free solely because
-an OS kill was requested.
+application tree, and polls while the application reports `stopping` and runs its
+reverse-order undo. Only application states `exited`, `launch_failed`, and
+`cancelled` are terminal; only then does launch finish the session and release its
+leases. If termination or application undo cannot be confirmed, the session lease
+remains held and the record reports `cleanup_failed`. Application
+`cleanup_failed` includes the intended terminal outcome and retains pending undo;
+an explicit launch `stop` retries it and preserves that outcome. The provider
+attempts process termination even when session stop fails, and requires the final
+session response to confirm stopped state and no remaining leases. It never claims
+the resource is free solely because an OS kill was requested.
 
-Natural process exits trigger the same session cleanup. Monitoring rotates among
-active launches and gets a turn after at most eight received requests, so
-continuous status/list traffic cannot indefinitely starve it. One dependency
-workflow runs at a time; dependency requests have at most five-second deadlines,
-normal startup respects the caller's capped 30-second deadline, and rollback has
-a separate 20-second budget. Long-running dependencies can delay unrelated
-requests within those bounds. Cleanup failures retain ownership metadata and
-require stop retry; they are not silently discarded.
+Launch waits through application `preparing` and does not activate the coordination
+session until the application reports `running`. Preparation failure and natural
+process exit can report `stopping` while undo runs; launch keeps the lease and polls
+until the terminal outcome is known. Monitoring rotates among active launches and
+gets a turn after at most eight received requests, so continuous status/list traffic
+cannot indefinitely starve it. One dependency workflow runs at a time; dependency
+requests have at most five-second deadlines, normal startup respects the caller's
+capped 30-second deadline, and rollback has a separate 20-second budget. Long-running
+dependencies can delay unrelated requests within those bounds. Cleanup failures
+retain ownership metadata and require stop retry; they are not silently discarded.
 
 A cancelled or lost dependency result may hide an already committed session
 or process. Before reconciling an unexpected or failed result fetch, the module
@@ -151,6 +166,7 @@ harness modeling session/application contracts. They cover idempotency, foreign
 ownership, ordered teardown, exclusive lease contention, natural exits under
 continuous ingress, cancellation after committed mutations, lost transport
 results before and after spawn, cancellation/release failure with retained leases,
-cancellation at activation completion, exported-owner lease contention and
-lookup, and retry after a termination failure. Full dynamic-provider/HTTP
-integration is tested separately by the host.
+cancellation at activation completion, canonical preparation forwarding,
+preparing/stopping waits, cleanup-failed outcome retention and retry,
+exported-owner lease contention and lookup, and retry after a termination failure.
+Full dynamic-provider/HTTP integration is tested separately by the host.

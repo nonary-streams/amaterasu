@@ -1,5 +1,6 @@
 //! Application process-tree ownership for trusted administrative callers.
 mod containment;
+mod lifecycle;
 mod processes;
 mod protocol;
 pub use processes::ProcessManager;

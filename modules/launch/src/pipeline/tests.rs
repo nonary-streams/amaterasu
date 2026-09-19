@@ -14,6 +14,11 @@ struct TestProcess {
     operation: String,
     child: Option<Child>,
     state: &'static str,
+    preparation_terminal: Option<&'static str>,
+    pending_terminal: &'static str,
+    preparing_statuses: usize,
+    stopping_statuses: usize,
+    fail_stopping_cleanup_once: bool,
 }
 #[derive(Default)]
 struct Harness {
@@ -36,6 +41,12 @@ struct Harness {
     fail_cancel: bool,
     fail_release: bool,
     released: usize,
+    catalog_preparation: Option<Value>,
+    application_preparing_statuses: usize,
+    preparation_terminal: Option<&'static str>,
+    application_stopping_statuses: usize,
+    fail_application_cleanup_once: bool,
+    fail_automatic_cleanup_once: bool,
 }
 impl Harness {
     fn new() -> Self {
@@ -59,6 +70,12 @@ impl Harness {
             fail_cancel: false,
             fail_release: false,
             released: 0,
+            catalog_preparation: None,
+            application_preparing_statuses: 0,
+            preparation_terminal: None,
+            application_stopping_statuses: 0,
+            fail_application_cleanup_once: false,
+            fail_automatic_cleanup_once: false,
         }
     }
     fn session_reply(session: &TestSession) -> Value {
@@ -126,7 +143,11 @@ impl Harness {
         Self::session_reply(&self.sessions[index])
     }
     fn process_reply(process: &TestProcess) -> Value {
-        json!({"ok":true,"process":{"process_id":process.id,"operation_id":process.operation,"state":process.state}})
+        let mut reply = json!({"ok":true,"process":{"process_id":process.id,"operation_id":process.operation,"state":process.state}});
+        if process.state == "cleanup_failed" {
+            reply["process"]["outcome"] = json!(process.pending_terminal);
+        }
+        reply
     }
     fn application(&mut self, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap();
@@ -155,7 +176,18 @@ impl Harness {
                 id: self.processes.len() as u64 + 1,
                 operation: payload["operation_id"].as_str().unwrap().into(),
                 child: Some(child),
-                state: "running",
+                state: if self.application_preparing_statuses > 0
+                    || self.preparation_terminal.is_some()
+                {
+                    "preparing"
+                } else {
+                    "running"
+                },
+                preparation_terminal: self.preparation_terminal,
+                pending_terminal: "exited",
+                preparing_statuses: self.application_preparing_statuses,
+                stopping_statuses: self.application_stopping_statuses,
+                fail_stopping_cleanup_once: self.fail_automatic_cleanup_once,
             });
             return Self::process_reply(self.processes.last().unwrap());
         }
@@ -167,6 +199,8 @@ impl Harness {
                 .map(Self::process_reply)
                 .unwrap_or(json!({"ok":false,"code":"process_not_found"}));
         }
+        let stopping_statuses = self.application_stopping_statuses;
+        let fail_cleanup = self.fail_application_cleanup_once;
         let process = self
             .processes
             .iter_mut()
@@ -177,14 +211,47 @@ impl Harness {
                 if self.fail_terminate {
                     return json!({"ok":false,"code":"process_kill_failed"});
                 }
+                if matches!(process.state, "exited" | "launch_failed" | "cancelled") {
+                    return Self::process_reply(process);
+                }
                 if let Some(mut child) = process.child.take() {
                     let _ = child.kill();
                     child.wait().unwrap();
                 }
-                process.state = "exited";
+                if process.state != "cleanup_failed" {
+                    process.pending_terminal = "cancelled";
+                }
+                if fail_cleanup {
+                    self.fail_application_cleanup_once = false;
+                    process.state = "cleanup_failed";
+                } else if stopping_statuses > 0 {
+                    process.state = "stopping";
+                    process.stopping_statuses = stopping_statuses;
+                } else {
+                    process.state = process.pending_terminal;
+                }
             }
             "status" => {
-                if let Some(child) = &mut process.child
+                if process.state == "preparing" {
+                    if process.preparing_statuses > 0 {
+                        process.preparing_statuses -= 1;
+                    } else if let Some(terminal) = process.preparation_terminal.take() {
+                        process.pending_terminal = terminal;
+                        process.state = "stopping";
+                    } else {
+                        process.state = "running";
+                    }
+                } else if process.state == "stopping" {
+                    if process.stopping_statuses > 0 {
+                        process.stopping_statuses -= 1;
+                    } else if process.fail_stopping_cleanup_once {
+                        process.fail_stopping_cleanup_once = false;
+                        process.state = "cleanup_failed";
+                    } else {
+                        process.state = process.pending_terminal;
+                    }
+                } else if process.state == "running"
+                    && let Some(child) = &mut process.child
                     && child.try_wait().unwrap().is_some()
                 {
                     process.child = None;
@@ -239,6 +306,9 @@ impl Harness {
                             "pipeline::tests::controlled_process"
                         };
                         let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":{"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}}});
+                        if let Some(preparation) = &self.catalog_preparation {
+                            reply["entry"]["launch"]["preparation"] = preparation.clone();
+                        }
                         if action == "resolve_exported_launch" {
                             reply["catalog_owner"] = json!("management");
                         }
@@ -361,6 +431,185 @@ fn controlled_process() {
 #[test]
 #[ignore = "test subprocess entrypoint"]
 fn exiting_process() {}
+
+#[test]
+fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
+    let mut harness = Harness::new();
+    let command = std::env::current_exe().unwrap();
+    harness.catalog_preparation = Some(json!([{"run":{"executable":command}}]));
+    harness.application_preparing_statuses = 2;
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", launch("prepared"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(service, _, _)| service == crate::workflow::APPLICATION)
+        .map(|(_, payload, _)| payload)
+        .collect();
+    assert_eq!(application[0]["action"], "launch");
+    assert_eq!(
+        application[0]["preparation"],
+        json!([{
+            "run":{
+                "executable":command,
+                "args":[],
+                "environment":{},
+                "cwd":null,
+                "timeout_ms":10_000,
+            },
+            "undo":null,
+        }])
+    );
+    assert_eq!(
+        application
+            .iter()
+            .filter(|payload| payload["action"] == "status")
+            .count(),
+        3
+    );
+    let activate = harness
+        .commands
+        .iter()
+        .position(|(_, payload, _)| payload["action"] == "activate")
+        .unwrap();
+    let last_status = harness
+        .commands
+        .iter()
+        .rposition(|(_, payload, _)| payload["action"] == "status")
+        .unwrap();
+    assert!(activate > last_status);
+}
+
+#[test]
+fn preparation_failure_waits_through_stopping_before_releasing_the_lease() {
+    let mut harness = Harness::new();
+    harness.application_preparing_statuses = 1;
+    harness.preparation_terminal = Some("launch_failed");
+    harness.application_stopping_statuses = 2;
+    let mut pipeline = pipeline();
+
+    let failed = harness.request(&mut pipeline, "alice", launch("preparation-failed"));
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    assert_eq!(failed["launch"]["failure"], "application_launch_failed");
+    assert!(harness.sessions[0].lease.is_none());
+    let finish = harness
+        .commands
+        .iter()
+        .position(|(_, payload, _)| payload["action"] == "fail")
+        .unwrap();
+    let final_status = harness
+        .commands
+        .iter()
+        .rposition(|(_, payload, _)| payload["action"] == "status")
+        .unwrap();
+    assert!(finish > final_status);
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| payload["action"] == "activate")
+    );
+}
+
+#[test]
+fn stop_waits_for_application_undo_before_finishing_the_session() {
+    let mut harness = Harness::new();
+    harness.application_stopping_statuses = 2;
+    let mut pipeline = pipeline();
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", launch("slow-undo"))["launch"]["state"],
+        "active"
+    );
+
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    let cleanup: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(_, _, parent)| parent.is_none())
+        .map(|(_, payload, _)| payload["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        cleanup,
+        vec![
+            "stop",
+            "terminate",
+            "status",
+            "status",
+            "status",
+            "finish_stop"
+        ]
+    );
+    assert!(harness.sessions[0].lease.is_none());
+}
+
+#[test]
+fn application_cleanup_failure_holds_the_lease_until_explicit_stop_retry() {
+    let mut harness = Harness::new();
+    harness.fail_application_cleanup_once = true;
+    let mut pipeline = pipeline();
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", launch("undo-retry"))["launch"]["state"],
+        "active"
+    );
+
+    let blocked = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(blocked["launch"]["state"], "cleanup_failed", "{blocked}");
+    assert_eq!(
+        blocked["launch"]["cleanup_error"],
+        "application_cleanup_failed"
+    );
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| payload["action"] == "finish_stop")
+    );
+
+    let recovered = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(recovered["launch"]["state"], "stopped", "{recovered}");
+    assert!(harness.sessions[0].lease.is_none());
+}
+
+#[test]
+fn autonomous_cleanup_failure_preserves_application_outcome_for_retry() {
+    let mut harness = Harness::new();
+    harness.preparation_terminal = Some("launch_failed");
+    harness.fail_automatic_cleanup_once = true;
+    let mut pipeline = pipeline();
+
+    let blocked = harness.request(&mut pipeline, "alice", launch("failed-undo"));
+    assert_eq!(blocked["launch"]["state"], "cleanup_failed", "{blocked}");
+    assert_eq!(blocked["launch"]["failure"], "application_launch_failed");
+    assert_eq!(
+        blocked["launch"]["cleanup_error"],
+        "application_cleanup_failed"
+    );
+    assert!(harness.sessions[0].lease.is_some());
+
+    let recovered = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(recovered["launch"]["state"], "failed", "{recovered}");
+    assert!(harness.sessions[0].lease.is_none());
+}
 
 #[test]
 fn real_process_launch_retry_owner_isolation_and_ordered_stop() {

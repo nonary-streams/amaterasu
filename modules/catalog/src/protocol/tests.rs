@@ -1,7 +1,38 @@
 use super::*;
 
 fn entry(name: &str) -> Entry {
-    serde_json::from_value(json!({"name":name,"launch":{"kind":"executable","program":"/usr/bin/game","arguments":[]}})).unwrap()
+    serde_json::from_value(json!({
+        "name": name,
+        "launch": {
+            "kind": "executable",
+            "program": "/usr/bin/game",
+            "arguments": []
+        }
+    }))
+    .unwrap()
+}
+
+fn command_path() -> String {
+    std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn prepared_entry(preparation: Vec<Value>) -> Entry {
+    serde_json::from_value(json!({
+        "name": "Prepared game",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/prepared",
+            "preparation": preparation
+        }
+    }))
+    .unwrap()
+}
+
+fn preparation_step() -> Value {
+    json!({"run":{"executable":command_path()}})
 }
 
 fn create(document: Document, name: &str) -> Document {
@@ -108,6 +139,7 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
             program: program.into(),
             arguments: vec!["--literal=$HOME".into()],
             working_directory: None,
+            preparation: Vec::new(),
         };
         game.validate().unwrap();
     }
@@ -121,4 +153,148 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
     let mut document = create(Document::default(), "Game");
     document.next_id = 1;
     assert!(document.validate().is_err());
+}
+
+#[test]
+fn preparation_defaults_serialize_as_canonical_metadata() {
+    let executable = command_path();
+    let game = prepared_entry(vec![json!({
+        "run": {"executable": executable.clone()},
+        "undo": {
+            "executable": executable.clone(),
+            "args": ["restore"],
+            "environment": {"MODE": "safe"},
+            "cwd": executable.clone(),
+            "timeout_ms": 1
+        }
+    })]);
+    game.validate().unwrap();
+
+    let encoded = serde_json::to_value(&game).unwrap();
+    assert_eq!(
+        encoded["launch"]["preparation"],
+        json!([{
+            "run": {
+                "executable": executable.clone(),
+                "args": [],
+                "environment": {},
+                "cwd": null,
+                "timeout_ms": 10_000
+            },
+            "undo": {
+                "executable": executable.clone(),
+                "args": ["restore"],
+                "environment": {"MODE": "safe"},
+                "cwd": executable.clone(),
+                "timeout_ms": 1
+            }
+        }])
+    );
+
+    let unprepared = serde_json::to_value(entry("Unprepared game")).unwrap();
+    assert!(unprepared["launch"].get("preparation").is_none());
+}
+
+#[test]
+fn preparation_rejects_unknown_fields_at_every_nested_level() {
+    let mut launch = json!({
+        "name": "Game",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/game",
+            "preparation": [preparation_step()]
+        }
+    });
+    launch["launch"]["unexpected"] = true.into();
+    assert!(serde_json::from_value::<Entry>(launch).is_err());
+
+    let mut step = preparation_step();
+    step["unexpected"] = true.into();
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name": "Game",
+            "launch": {
+                "kind": "executable",
+                "program": "/games/game",
+                "preparation": [step]
+            }
+        }))
+        .is_err()
+    );
+
+    let mut run = preparation_step();
+    run["run"]["unexpected"] = true.into();
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name": "Game",
+            "launch": {
+                "kind": "executable",
+                "program": "/games/game",
+                "preparation": [run]
+            }
+        }))
+        .is_err()
+    );
+
+    let mut undo = preparation_step();
+    undo["undo"] = json!({"executable":command_path(),"unexpected":true});
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name": "Game",
+            "launch": {
+                "kind": "executable",
+                "program": "/games/game",
+                "preparation": [undo]
+            }
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn preparation_and_command_bounds_are_enforced_for_run_and_undo() {
+    let step = preparation_step();
+    prepared_entry(vec![step.clone(); 8]).validate().unwrap();
+    assert_eq!(
+        prepared_entry(vec![step.clone(); 9]).validate(),
+        Err("at most 8 preparation steps are allowed")
+    );
+
+    for timeout_ms in [1, 30_000] {
+        let mut bounded = step.clone();
+        bounded["run"]["timeout_ms"] = timeout_ms.into();
+        prepared_entry(vec![bounded]).validate().unwrap();
+    }
+    for (target, timeout_ms) in [("run", 0), ("undo", 30_001)] {
+        let mut unbounded = step.clone();
+        unbounded[target] = json!({"executable":command_path(),"timeout_ms":timeout_ms});
+        assert_eq!(
+            prepared_entry(vec![unbounded]).validate(),
+            Err("command timeout exceeds bounds")
+        );
+    }
+
+    let mut too_many_args = step.clone();
+    too_many_args["run"]["args"] = json!(vec!["argument"; 65]);
+    assert_eq!(
+        prepared_entry(vec![too_many_args]).validate(),
+        Err("command arguments exceed bounds")
+    );
+
+    let environment: serde_json::Map<String, Value> = (0..33)
+        .map(|index| (format!("KEY_{index}"), json!("value")))
+        .collect();
+    let mut too_many_environment_entries = step.clone();
+    too_many_environment_entries["run"]["environment"] = environment.into();
+    assert_eq!(
+        prepared_entry(vec![too_many_environment_entries]).validate(),
+        Err("command environment exceeds bounds")
+    );
+
+    let mut ambiguous_environment = step;
+    ambiguous_environment["run"]["environment"] = json!({"PATH":"one","Path":"two"});
+    assert_eq!(
+        prepared_entry(vec![ambiguous_environment]).validate(),
+        Err("command environment names are ambiguous")
+    );
 }
