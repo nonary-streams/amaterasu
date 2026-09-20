@@ -359,6 +359,70 @@ fn malformed_password_hash_and_unbounded_cost_fail_closed() {
 }
 
 #[test]
+fn readiness_status_reports_only_verifier_presence() {
+    let mut pipeline = Pipeline::new(settings());
+    let mut state = StateHarness::new();
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "management",
+            json!({"action":"status"}),
+            1_700_000_000
+        ),
+        json!({"ok":true,"verifier_available":false})
+    );
+}
+
+#[test]
+fn successful_legacy_password_proof_upgrades_the_durable_verifier() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let salt = "AbCdEfGhIjKlMnOp";
+    let password = "correct horse battery staple";
+    let legacy_hash = crate::crypto::token_digest(&format!("{password}{salt}"));
+    state.stored = Some(json!({
+        "credential": {
+            "username": "Admin",
+            "password_hash": legacy_hash,
+            "legacy_salt": salt,
+            "case_insensitive_username": true
+        },
+        "tokens": []
+    }));
+
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"login","username":"ADMIN","password":"wrong"}),
+            100,
+        )["code"],
+        "unauthorized"
+    );
+    let response = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password}),
+        100,
+    );
+    assert_eq!(response["ok"], true);
+    let credential = &state.stored.as_ref().unwrap()["credential"];
+    assert!(credential.get("legacy_salt").is_none());
+    assert!(crate::crypto::valid_password_hash(
+        credential["password_hash"].as_str().unwrap()
+    ));
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"verify","bearer":response["bearer"],"required_scopes":[]}),
+            101,
+        )["ok"],
+        true
+    );
+}
+
+#[test]
 fn token_capacity_and_scopes_cannot_be_extended_by_payload_identity() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());

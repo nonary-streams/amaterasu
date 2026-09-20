@@ -2,6 +2,7 @@
 mod crypto;
 mod engine;
 mod identity;
+pub mod migration;
 mod pipeline;
 mod protocol;
 mod transcript;

@@ -4,7 +4,7 @@ mod native;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
-pub use amaterasu_contracts::{Command, Response};
+pub use amaterasu_contracts::{Command, Response, RuntimeHostContext};
 
 pub type ModuleResult<T> = Result<T, String>;
 
@@ -47,6 +47,25 @@ impl RuntimeClient {
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             unexpected => Err(format!("unexpected runtime response: {unexpected:?}")),
         }
+    }
+
+    /// Returns the state location chosen by the trusted host for this worker.
+    /// The control-plane runtime exposes it only to the state module; callers
+    /// cannot substitute a JSON setting or a package-supplied path.
+    pub fn runtime_state_root(&self) -> ModuleResult<std::path::PathBuf> {
+        let Response::Result { payload } = self.send(Command::GetHostContext {})? else {
+            return Err("host context request did not return a result".into());
+        };
+        let context: RuntimeHostContext = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid host context: {error}"))?;
+        if context.schema != 1 {
+            return Err("host context schema is incompatible".into());
+        }
+        let root = context
+            .state_root
+            .filter(|root| !root.is_empty())
+            .ok_or("host did not provide a runtime state root")?;
+        Ok(root.into())
     }
 
     /// For internal calls with unique operation IDs that will never be retried

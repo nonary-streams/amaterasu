@@ -146,6 +146,59 @@ fn development_policy_keeps_stream_session_disabled_and_console_non_native() {
 }
 
 #[test]
+fn installer_policy_enables_only_the_loopback_control_plane() {
+    let policy = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+
+    assert!(!policy.principals.contains_key("amaterasu.console"));
+    assert!(!policy.settings.contains_key("amaterasu.state"));
+    assert_eq!(
+        policy.settings["amaterasu.management"],
+        json!({
+            "enabled": true,
+            "bind": "127.0.0.1:47990",
+            "allowed_origins": [],
+            "web": {"directory": "__WEB__", "trusted_keys": {"installer-release": "11".repeat(32)}},
+        })
+    );
+    let nvhttp = &policy.settings["amaterasu.nvhttp"];
+    assert_eq!(nvhttp["enabled"], true);
+    assert_eq!(nvhttp["http_bind"], "127.0.0.1:47989");
+    assert_eq!(nvhttp["https_bind"], "127.0.0.1:47984");
+    assert_eq!(nvhttp["allow_remote"], false);
+    assert!(nvhttp.get("streaming").is_none());
+    assert_eq!(
+        policy.settings["amaterasu.pairing"]["transport_principals"],
+        json!(["amaterasu.nvhttp"])
+    );
+    assert_eq!(
+        policy.settings["amaterasu.authentication"]["administrator_principals"],
+        json!(["amaterasu.management"])
+    );
+    assert_eq!(
+        policy.settings["amaterasu.catalog"]["export_principals"],
+        json!({"amaterasu.nvhttp": "amaterasu.management"})
+    );
+    for component in [
+        "amaterasu.capture-dxgi",
+        "amaterasu.capture-wgc",
+        "amaterasu.audio",
+        "amaterasu.audio-encode",
+        "amaterasu.encode",
+        "amaterasu.video",
+        "amaterasu.media-transport",
+        "amaterasu.control-transport",
+        "amaterasu.stream-session",
+        "amaterasu.rtsp",
+        "amaterasu.virtual-display",
+    ] {
+        assert_eq!(policy.settings[component]["enabled"], false, "{component}");
+    }
+}
+
+#[test]
 fn public_launch_packages_preserve_transitive_delegation_and_identity_only_native_access() {
     for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
         let adapter = profile

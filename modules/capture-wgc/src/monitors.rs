@@ -1,9 +1,9 @@
 use crate::model::{CaptureError, CaptureResult, Output};
+use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
-use windows::core::BOOL;
 
 pub struct Monitor {
     pub handle: HMONITOR,

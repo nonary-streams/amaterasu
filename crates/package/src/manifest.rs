@@ -21,6 +21,11 @@ pub struct ComponentManifest {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
     pub schema: u32,
+    /// Version of the host-to-module context contract required by this set.
+    /// Missing in legacy manifests, which production hosts reject rather than
+    /// letting a module select a process state path from policy settings.
+    #[serde(default)]
+    pub host_context_schema: u32,
     pub project: String,
     pub sequence: u64,
     pub expires_unix: u64,

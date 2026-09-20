@@ -32,6 +32,7 @@ impl TestPackage {
         };
         let manifest = ReleaseManifest {
             schema: 1,
+            host_context_schema: 1,
             project: "amaterasu".into(),
             sequence: 5,
             expires_unix: unix_timestamp() + 3600,

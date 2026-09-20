@@ -3,6 +3,13 @@
 `amaterasu probe ROOT [CONTROL_MESSAGE_JSON]` runs the existing bounded lifecycle
 probe. `amaterasu serve ROOT` keeps the independently loaded native modules alive
 in a supervised worker until stdin EOF or an explicit shutdown command.
+`amaterasu service ROOT` starts the same verified development lifecycle without
+accepting console commands. On Windows it registers the `Amaterasu` SCM service
+entry point and stops on SERVICE_CONTROL_STOP or SERVICE_CONTROL_SHUTDOWN. Its
+loaded runtime runs in the active WTS interactive user session, never on the
+Session 0 service desktop. Logoff, disconnect, and user switches terminate that
+worker; the SCM service waits for the next active session. When launched outside
+the SCM, stdin EOF is a test-only stop signal.
 
 The development console accepts one `amaterasu-contracts` command per JSON line
 on stdin and returns one contract response per line on stdout, in order. Unlike
@@ -59,11 +66,16 @@ own module. Native module faults may leave external effects; host supervision is
 not transactional rollback or a native-code sandbox.
 
 EOF/shutdown destroys modules in reverse load order and then their runtime. A
-hung teardown is killed after the deadline and exits with an error. Forced host
-termination, operating-system service integration, signal-driven graceful stop,
-production service accounts, socket authentication and production unattended
-restart policy remain unimplemented. `serve` rejects non-development bootstrap
-configuration; it is not an installed production service.
+hung teardown is killed after the deadline and exits with an error. The
+development console still rejects production roots, but the Windows SCM path
+loads a signed production set in the active WTS user session. Before that worker
+starts, SCM derives a SID-specific state root from its token, validates that no
+reparse point is involved, and grants exactly that SID plus LocalSystem and
+Administrators access. A machine-private migration seed is consumed once by the
+first SID; later accounts receive isolated empty state rather than a copied
+administrator verifier or pairing identity. The signed package manifest must
+declare host-context schema 1, so legacy packages that could choose a state
+directory through policy are rejected.
 
 Run `python3 scripts/test_host_service.py` for real signed-module subprocess tests
 of multi-request session state, durable restart, application cleanup on EOF,

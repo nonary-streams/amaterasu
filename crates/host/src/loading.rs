@@ -27,6 +27,7 @@ impl LoadedComponents {
     pub fn load(
         directory: &Path,
         package: &VerifiedPackage,
+        state_root: &Path,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
         let runtime_component = package
@@ -35,8 +36,12 @@ impl LoadedComponents {
             .iter()
             .find(|component| component.runtime)
             .ok_or("package has no runtime")?;
+        let state_root = validated_state_root(state_root)?;
+        let mut runtime_config = package.runtime_config.clone();
+        runtime_config.host_context.schema = 1;
+        runtime_config.host_context.state_root = Some(state_root.to_string_lossy().into_owned());
         let configuration =
-            serde_json::to_vec(&package.runtime_config).map_err(|error| error.to_string())?;
+            serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
         progress(1)?;
@@ -72,6 +77,45 @@ impl LoadedComponents {
 
     pub fn console_endpoint(&mut self) -> PackageResult<HostApi> {
         self.runtime.endpoint("amaterasu.console")
+    }
+}
+
+/// The host accepts only an existing, canonical directory supplied by its SCM
+/// boundary. This prevents a module package from redirecting durable state
+/// through a relative path or a reparse point.
+fn validated_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
+    if !path.is_absolute() {
+        return Err("runtime state root must be absolute".into());
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("runtime state root is not a real directory".into());
+    }
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if !same_path(&canonical, path) {
+        return Err("runtime state root contains a reparse point".into());
+    }
+    Ok(canonical)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let left = left.to_string_lossy();
+        let right = right.to_string_lossy();
+        left.strip_prefix(r"\\?\")
+            .unwrap_or(&left)
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(
+                &right
+                    .strip_prefix(r"\\?\")
+                    .unwrap_or(&right)
+                    .replace('/', "\\"),
+            )
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
     }
 }
 

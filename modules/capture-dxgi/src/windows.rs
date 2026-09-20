@@ -1,14 +1,16 @@
 use super::{Backend, CaptureSession};
-use crate::model::{CaptureError, CaptureResult, Frame, Output, copy_bgra_rows, frame_layout};
+use crate::model::{copy_bgra_rows, frame_layout, CaptureError, CaptureResult, Frame, Output};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
-use amaterasu_windows_capture_geometry::{GeometryError, SelectedOutput, resolve_with};
+use amaterasu_windows_capture_geometry::{
+    resolve_with, with_verified_physical_topology, GeometryError, SelectedOutput,
+};
 use std::time::Instant;
+use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::Interface;
 
 pub struct WindowsBackend;
 
@@ -25,10 +27,12 @@ impl Backend for WindowsBackend {
     }
 
     fn enumerate(&self) -> CaptureResult<Vec<Output>> {
-        Ok(enumerate_outputs()?
-            .into_iter()
-            .map(|output| output.metadata)
-            .collect())
+        with_verified_physical_topology(|| {
+            enumerate_outputs()
+                .map(|outputs| outputs.into_iter().map(|output| output.metadata).collect())
+                .map_err(|_| GeometryError::Unavailable("DXGI output enumeration failed"))
+        })
+        .map_err(capture_geometry_error)
     }
 
     fn open(&self, id: &str) -> CaptureResult<Box<dyn CaptureSession>> {

@@ -7,9 +7,14 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "amaterasu-pairing-import"
+path = "src/bin/amaterasu-pairing-import.rs"
+
 [dependencies]
 amaterasu-module-sdk.workspace = true
 amaterasu-identity.workspace = true
+amaterasu-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, features = ["oid"] }

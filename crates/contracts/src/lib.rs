@@ -54,6 +54,24 @@ pub struct RuntimeConfig {
     pub hooks: BTreeMap<String, HookSpec>,
     #[serde(default)]
     pub settings: BTreeMap<String, Value>,
+    /// Host-owned runtime facts are never serialized into a signed package
+    /// policy. The host injects this context only after the selected package
+    /// has been verified.
+    #[serde(default)]
+    pub host_context: RuntimeHostContext,
+}
+
+/// Facts supplied by the trusted host for one worker process.
+///
+/// `state_root` is intentionally separate from module settings: a release
+/// policy may choose modules and grants, but it must not choose where a
+/// user-token process persists state.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHostContext {
+    pub schema: u32,
+    #[serde(default)]
+    pub state_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +91,9 @@ pub enum Command {
         binding: u64,
     },
     GetSettings {},
+    /// Returns host-owned context only to the state service. This prevents a
+    /// module policy from impersonating a host decision through `GetSettings`.
+    GetHostContext {},
     Register {
         service: String,
     },

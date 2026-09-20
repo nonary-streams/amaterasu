@@ -1,5 +1,6 @@
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, RootLock, read_json, write_json_atomically,
+    ActivationState, BootstrapConfig, PackageResult, RootLock, VerificationPolicy,
+    package_directory, read_json, unix_timestamp, verify_package, write_json_atomically,
 };
 use std::io::BufReader;
 use std::path::Path;
@@ -19,12 +20,10 @@ pub fn probe(root: &Path, input: Option<&str>) -> PackageResult<Option<String>> 
 
 pub(crate) fn select_active(root: &Path) -> PackageResult<String> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
-    if !bootstrap.development {
-        return Err(
-            "this executable currently supports development probe and console modes only".into(),
-        );
-    }
     if bootstrap.allow_unsigned {
+        if !bootstrap.development {
+            return Err("production bootstrap cannot permit unsigned packages".into());
+        }
         eprintln!("UNSIGNED MODULE MODE: native modules run with this process's privileges");
     }
 
@@ -32,14 +31,38 @@ pub(crate) fn select_active(root: &Path) -> PackageResult<String> {
     let mut selection: ActivationState = read_json(&selection_path)?;
     recover_interrupted_trial(&selection_path, &mut selection)?;
 
-    if let Some(candidate) = selection.pending.clone() {
+    if !bootstrap.development && selection.pending.is_some() {
+        return Err(
+            "production package activation must be completed by authenticated provisioning".into(),
+        );
+    }
+
+    if bootstrap.development
+        && let Some(candidate) = selection.pending.clone()
+    {
         probe_candidate(root, &selection_path, &mut selection, candidate)?;
     }
     let active = selection
         .active
         .as_ref()
         .ok_or("no active or pending component set")?;
-    Ok(active.clone())
+    let active = active.clone();
+    if !bootstrap.development {
+        let package = verify_package(
+            &package_directory(root, &active)?,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: selection.highest_sequence,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )?;
+        if !package.signed || package.digest != active || package.manifest.host_context_schema != 1
+        {
+            return Err("production active package is not an authenticated selection".into());
+        }
+    }
+    Ok(active)
 }
 
 fn recover_interrupted_trial(path: &Path, selection: &mut ActivationState) -> PackageResult<()> {

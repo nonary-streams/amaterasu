@@ -3,6 +3,11 @@ name = "amaterasu-package"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[[bin]]
+name = "amaterasu-migration"
+path = "src/bin/amaterasu-migration.rs"
+
 [dependencies]
 amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true

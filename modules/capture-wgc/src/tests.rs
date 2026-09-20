@@ -505,3 +505,26 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(binding.read(stream, &mut Vec::new()), MEDIA_CLOSED);
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an attached Windows display and Windows Graphics Capture access"]
+fn native_enumeration_and_open_report_the_same_physical_output_rectangle() {
+    let backend = crate::backend::NativeBackend::new(None);
+    let output = backend
+        .enumerate()
+        .unwrap()
+        .into_iter()
+        .find(|output| output.attached)
+        .expect("test requires an attached WGC output");
+    let mut session = backend.open(&output.id).unwrap();
+    let geometry = session
+        .geometry()
+        .unwrap()
+        .expect("verified WGC output geometry");
+
+    assert_eq!(geometry.output.left, output.left);
+    assert_eq!(geometry.output.top, output.top);
+    assert_eq!(geometry.output.width, output.width);
+    assert_eq!(geometry.output.height, output.height);
+}

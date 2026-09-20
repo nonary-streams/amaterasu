@@ -1,23 +1,22 @@
 use crate::{
+    model::{unavailable, CcdSnapshot, DisplaySnapshot, Topology},
     CaptureSelection, GeometryError, SelectedOutput,
-    model::{CcdSnapshot, DisplaySnapshot, Topology, unavailable},
 };
 use amaterasu_media::DesktopRect;
 use std::collections::BTreeMap;
+use windows::core::BOOL;
 use windows::Win32::{
     Devices::Display::*,
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LPARAM, RECT},
     Graphics::{
-        Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1},
+        Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND},
         Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW},
     },
     UI::HiDpi::{
-        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT,
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetThreadDpiAwarenessContext,
-        SetThreadDpiAwarenessContext,
+        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     },
 };
-use windows::core::BOOL;
 
 const MAX_DISPLAYS: usize = 64;
 
@@ -27,9 +26,29 @@ pub fn resolve_with<T>(
     expected_target: Option<&str>,
     select: impl FnOnce() -> Result<(SelectedOutput, T), GeometryError>,
 ) -> Result<(CaptureSelection, T), GeometryError> {
+    let (topology, (selected, retained)) = with_physical_topology(select)?;
+    topology
+        .resolve(&selected, expected_target)
+        .map(|selection| (selection, retained))
+}
+
+/// Runs an output enumeration while Windows reports physical, per-monitor
+/// coordinates and confirms that GDI, DXGI, and CCD agree on the active
+/// topology. Capture providers must use this for their public enumeration as
+/// well as their open path; otherwise a DPI-unaware module thread can publish
+/// logical dimensions that disagree with the physical capture session.
+pub fn with_verified_physical_topology<T>(
+    enumerate: impl FnOnce() -> Result<T, GeometryError>,
+) -> Result<T, GeometryError> {
+    with_physical_topology(enumerate).map(|(_, value)| value)
+}
+
+fn with_physical_topology<T>(
+    operation: impl FnOnce() -> Result<T, GeometryError>,
+) -> Result<(Topology, T), GeometryError> {
     with_physical_coordinates(|| {
         let ccd_before = enumerate_ccd()?;
-        let (selected, retained) = select()?;
+        let value = operation()?;
         let gdi = enumerate_gdi()?;
         let dxgi = enumerate_dxgi()?;
         let ccd_after = enumerate_ccd()?;
@@ -39,9 +58,7 @@ pub fn resolve_with<T>(
             ));
         }
         let topology = Topology::reconcile(gdi, dxgi, ccd_after)?;
-        topology
-            .resolve(&selected, expected_target)
-            .map(|selection| (selection, retained))
+        Ok((topology, value))
     })
 }
 

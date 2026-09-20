@@ -57,6 +57,15 @@ impl Broker {
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({})),
             },
+            Command::GetHostContext {} => {
+                if caller != "amaterasu.state" {
+                    return errors::permission_denied();
+                }
+                Response::Result {
+                    payload: serde_json::to_value(&self.configuration.host_context)
+                        .expect("host context is serializable"),
+                }
+            }
             Command::Register { service } => {
                 self.requests.register_service(caller, grants, service)
             }

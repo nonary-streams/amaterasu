@@ -13,7 +13,8 @@ use crate::loading::LoadedComponents;
 
 pub fn run(root: &Path, digest: &str, input: Option<&str>) -> PackageResult<()> {
     let mut startup_progress = send_startup_progress;
-    let mut components = load_components(root, digest, &mut startup_progress)?;
+    let state_root = development_state_root(root)?;
+    let mut components = load_components(root, digest, &state_root, &mut startup_progress)?;
     components.tick()?;
     components.health()?;
     send_line("READY")?;
@@ -106,11 +107,12 @@ fn send_line(line: &str) -> PackageResult<()> {
 fn load_components(
     root: &Path,
     digest: &str,
+    state_root: &Path,
     progress: &mut dyn FnMut(StartupProgress) -> PackageResult<()>,
 ) -> PackageResult<LoadedComponents> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
-    if !bootstrap.development {
-        return Err("installed production service mode is not implemented".into());
+    if !bootstrap.development && bootstrap.allow_unsigned {
+        return Err("production bootstrap cannot permit unsigned packages".into());
     }
     let directory = package_directory(root, digest)?;
     let package = {
@@ -137,7 +139,25 @@ fn load_components(
     }
 
     let mut loaded = |index| progress(StartupProgress::Component(index));
-    LoadedComponents::load(&directory, &package, &mut loaded)
+    if !bootstrap.development && !package.signed {
+        return Err("production service requires a signed package".into());
+    }
+    if !bootstrap.development && package.manifest.host_context_schema != 1 {
+        return Err("production package has an incompatible host context ABI".into());
+    }
+    LoadedComponents::load(&directory, &package, state_root, &mut loaded)
+}
+
+/// Console and probe modes retain an isolated development root. Production
+/// workers receive a state root from the SCM token boundary instead.
+fn development_state_root(root: &Path) -> PackageResult<std::path::PathBuf> {
+    let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
+    if !bootstrap.development {
+        return Err("production packages must be started by the SCM service".into());
+    }
+    let state_root = root.join("data").join("state");
+    amaterasu_package::create_private_directory(&state_root)?;
+    state_root.canonicalize().map_err(|error| error.to_string())
 }
 
 enum StartupProgress {
@@ -157,7 +177,8 @@ fn send_startup_progress(progress: StartupProgress) -> PackageResult<()> {
 /// Development process lifetime; product behavior remains in loaded libraries.
 pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
     let mut startup_progress = send_startup_progress;
-    let mut components = load_components(root, digest, &mut startup_progress)?;
+    let state_root = development_state_root(root)?;
+    let mut components = load_components(root, digest, &state_root, &mut startup_progress)?;
     let endpoint = components.console_endpoint()?;
     let input = crate::protocol::lines(std::io::stdin());
     components.tick()?;
@@ -185,6 +206,25 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
+    }
+}
+
+/// Interactive-session worker lifetime. The SCM supervisor owns process
+/// creation and termination; this user-token process never accepts console
+/// commands or receives a privileged service handle.
+pub fn serve_interactive(root: &Path, digest: &str, state_root: &Path) -> PackageResult<()> {
+    // Its stdout is a single inherited, write-only pipe to the Session 0
+    // supervisor. It carries the exact bounded startup proof and is not a
+    // console or a capability channel.
+    let mut startup_progress = |_| Ok(());
+    let mut components = load_components(root, digest, state_root, &mut startup_progress)?;
+    components.tick()?;
+    components.health()?;
+    send_line("READY")?;
+    loop {
+        components.tick()?;
+        components.health()?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 

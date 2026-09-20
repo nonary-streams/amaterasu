@@ -7,13 +7,19 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "amaterasu-authentication-import"
+path = "src/bin/amaterasu-authentication-import.rs"
+
 [dependencies]
 amaterasu-module-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
+amaterasu-storage.workspace = true
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+subtle = "2.6"
 
 [lints]
 workspace = true

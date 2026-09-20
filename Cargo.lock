@@ -69,11 +69,13 @@ name = "amaterasu-authentication"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "amaterasu-storage",
  "argon2",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
 ]
 
 [[package]]
@@ -256,6 +258,7 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -316,6 +319,7 @@ dependencies = [
  "aes",
  "amaterasu-identity",
  "amaterasu-module-sdk",
+ "amaterasu-storage",
  "getrandom 0.3.4",
  "rand_chacha",
  "rand_core",
@@ -334,6 +338,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-package",
+ "amaterasu-storage",
  "ed25519-dalek",
  "getrandom 0.3.4",
  "serde",

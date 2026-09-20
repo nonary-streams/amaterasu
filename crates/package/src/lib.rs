@@ -5,7 +5,10 @@
 
 mod dependencies;
 mod digest;
+pub mod handoff;
+pub mod importer;
 mod manifest;
+pub mod migration;
 mod staging;
 mod storage;
 mod verification;
@@ -16,7 +19,8 @@ pub use digest::{decode_hex, encode_hex, random_identifier, sha256};
 pub use manifest::*;
 pub use staging::{package_directory, stage_package};
 pub use storage::{
-    RootLock, create_private_directory, read_bounded, read_json, write_json_atomically,
+    RootLock, create_machine_private_directory, create_private_directory, read_bounded, read_json,
+    write_json_atomically,
 };
 pub use verification::{
     VerificationPolicy, verify_detached_signature, verify_package, verify_package_with_progress,

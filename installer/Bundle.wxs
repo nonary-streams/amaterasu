@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension">
+  <!--
+    Burn owns the cross-product transaction. The MSI handles only Amaterasu
+    files, migration, readiness, and a reversible service handoff; it never
+    removes a predecessor MSI. The vital retirement package is deliberately
+    last so a failure restores the captured legacy service before Burn rolls
+    the Amaterasu MSI back.
+  -->
+  <Bundle Name="Amaterasu Setup"
+          Version="$(var.ProductVersion)"
+          Manufacturer="Amaterasu Project"
+          UpgradeCode="{0F75AEE0-2AE3-4B38-AD50-1D252F0FBE04}">
+    <!-- WixStdBA accepts `AmaterasuDataRoot=...` only because this variable is
+         explicitly overridable. A forthcoming elevated helper validates that
+         chosen root before the MSI or either helper performs machine changes. -->
+    <Variable Name="AmaterasuDataRoot"
+              Type="string"
+              Value="C:\ProgramData\Amaterasu"
+              Persisted="yes"
+              bal:Overridable="yes" />
+    <BootstrapperApplicationRef Id="WixStandardBootstrapperApplication.RtfLicense">
+      <bal:WixStandardBootstrapperApplication
+          LicenseFile="$(var.ProjectDir)\installer\license.rtf"
+          SuppressOptionsUI="yes" />
+    </BootstrapperApplicationRef>
+
+    <Chain>
+      <!-- Burn assigns this package's LogPathVariable once per run. The helper
+           hashes it into a short-lived SYSTEM-private marker, so the token is
+           never a static bundle payload or a caller-controlled MSI bypass. On
+           rollback/uninstall, cancellation removes only a matching marker. -->
+      <ExePackage Id="PrepareBundleUpgrade"
+                  SourceFile="$(var.MigrationToolPath)"
+                  InstallCommand="prepare-bundle-upgrade --runtime &quot;[AmaterasuDataRoot]\runtime&quot; --nonce &quot;[BundlePrepareLog]&quot;"
+                  UninstallCommand="cancel-bundle-upgrade --runtime &quot;[AmaterasuDataRoot]\runtime&quot; --nonce &quot;[BundlePrepareLog]&quot;"
+                  LogPathVariable="BundlePrepareLog"
+                  Vital="yes"
+                  Permanent="no" />
+
+      <!-- This identifies the bundle flow for sequencing only. It is not an
+           authority grant; the elevated prepare package writes the distinct,
+           private transaction marker that authorizes predecessor handoff. -->
+      <MsiPackage Id="AmaterasuMsi"
+                  SourceFile="$(var.MsiPath)"
+                  Vital="yes"
+                  DisplayInternalUI="no">
+        <MsiProperty Name="AMATERASU_BUNDLE_COORDINATED" Value="1" />
+        <MsiProperty Name="AMATERASU_DATA" Value="[AmaterasuDataRoot]" />
+        <MsiProperty Name="AMATERASU_BUNDLE_TOKEN" Value="[BundlePrepareLog]" />
+      </MsiPackage>
+
+      <!-- The helper validates captured fixed-family MSI registrations, runs
+           only MSI product-code uninstalls, verifies removal, and restores the
+           recorded predecessor service on any failure. It finalizes handoff
+           state only after every verified retirement succeeds. -->
+      <ExePackage Id="RetirePredecessor"
+                  SourceFile="$(var.MigrationToolPath)"
+                  InstallCommand="retire-predecessor --runtime &quot;[AmaterasuDataRoot]\runtime&quot;"
+                  Vital="yes"
+                  Permanent="yes" />
+
+      <!-- Retirement is irreversible. A post-retirement journal cleanup
+           failure must not ask Burn to roll Amaterasu back into a port claimed
+           by no predecessor. The cleanup is therefore non-vital and permanent:
+           its strict, harmless journal remains recoverable for later cleanup.
+      -->
+      <ExePackage Id="FinalizeProvisionJournal"
+                  SourceFile="$(var.ReleaseToolPath)"
+                  InstallCommand="finalize-installer-provision &quot;[AmaterasuDataRoot]\runtime&quot;"
+                  Vital="no"
+                  Permanent="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

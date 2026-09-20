@@ -267,3 +267,28 @@ TLS signing to this native identity API. `scripts/test_nvhttp.py` verifies the
 complete transcript, TLS 1.2/1.3, exact host certificate identity, persisted pairing
 and revocation through real loaded libraries. An actual Moonlight application and
 end-to-end streaming remain unqualified.
+
+## Legacy host migration
+
+The public `migration` API accepts only the current default
+Sunshine/Vibeshine pairing layout: one state file containing
+`root.uniqueid` and `root.named_devices`, plus
+`credentials/cakey.pem` and `credentials/cacert.pem`. A configured `pkey` or
+`cert` is accepted only when its canonical regular file remains beneath the
+supplied predecessor root; absolute paths, traversal, links, and conflicts are
+rejected. It reads a supplied predecessor root without following links, checks the
+self-signed RSA host certificate and its PKCS#8 private-key ownership, and
+validates each enabled paired-client certificate before returning an opaque
+import object. Malformed, conflicting, old `devices`-format, alternate-key,
+or over-capacity sources fail closed.
+
+`seed_pairing_state` holds the normal state-root lock and writes the pairing
+module's ordinary caller namespace in the same versioned format as the state
+module. It writes only an empty namespace and leaves any existing Amaterasu
+pairing state untouched. Its errors are fixed codes; neither API exposes
+legacy key, certificate, or credential contents.
+
+The installer process boundary is the sibling executable
+`amaterasu-pairing-import.exe`: `validate --source SOURCE` performs no writes,
+and `seed --source DATA_ROOT/legacy-imports/PRODUCT --state STATE_ROOT` commits
+only validated data. Its output contains only fixed status words.

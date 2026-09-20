@@ -115,6 +115,10 @@ impl Engine {
         self.sessions
             .retain(|_, session| Some(&session.credential_digest) == credential_digest.as_ref());
         match operation {
+            Operation::Status {} => Ok(Change::Read(json!({
+                "ok": true,
+                "verifier_available": document.credential.is_some(),
+            }))),
             Operation::Setup { username, password } => Self::setup(document, username, password),
             Operation::ChangePassword { password } => Self::change_password(document, password),
             Operation::ListSessions { offset, limit } => self.list_sessions(offset, limit),
@@ -123,7 +127,7 @@ impl Engine {
                 Ok(Change::Read(json!({"ok":true})))
             }
             Operation::Login { username, password } => {
-                self.login(&document, username, password, now)
+                self.login(document, username, password, now)
             }
             Operation::Verify {
                 bearer,
@@ -155,6 +159,8 @@ impl Engine {
         document.credential = Some(Credential {
             username,
             password_hash: crypto::hash_password(&password)?,
+            legacy_salt: None,
+            case_insensitive_username: false,
         });
         Self::write(document, json!({"ok":true}))
     }
@@ -162,6 +168,7 @@ impl Engine {
     fn change_password(mut document: Document, password: String) -> Result<Change, &'static str> {
         let credential = document.credential.as_mut().ok_or("not_initialized")?;
         credential.password_hash = crypto::hash_password(&password)?;
+        credential.legacy_salt = None;
         document.validate().map_err(|_| "resource_limit")?;
         Ok(Change::Write {
             document,
@@ -182,14 +189,24 @@ impl Engine {
 
     fn login(
         &mut self,
-        document: &Document,
+        mut document: Document,
         username: String,
         password: String,
         now: u64,
     ) -> Result<Change, &'static str> {
         let credential = document.credential.as_ref().ok_or("unauthorized")?;
-        let valid_password = crypto::verify_password(&password, &credential.password_hash);
-        if !valid_password || username != credential.username {
+        let valid_username = if credential.case_insensitive_username {
+            username.eq_ignore_ascii_case(&credential.username)
+        } else {
+            username == credential.username
+        };
+        let valid_password = match &credential.legacy_salt {
+            Some(salt) => {
+                crypto::verify_legacy_password(&password, salt, &credential.password_hash)
+            }
+            None => crypto::verify_password(&password, &credential.password_hash),
+        };
+        if !valid_password || !valid_username {
             return Err("unauthorized");
         }
         if self.sessions.len() >= 128 {
@@ -199,6 +216,19 @@ impl Engine {
         let expires_at = now.checked_add(SESSION_SECONDS).ok_or("clock_failure")?;
         let scopes = self.settings.allowed_scopes.clone();
         let response = json!({"ok":true,"bearer":bearer,"kind":"administrator_session","subject":username,"scopes":scopes,"expires_at":expires_at});
+        let upgraded = credential.legacy_salt.is_some();
+        if upgraded {
+            let credential = document
+                .credential
+                .as_mut()
+                .expect("credential checked above");
+            credential.password_hash = crypto::hash_password(&password)?;
+            credential.legacy_salt = None;
+        }
+        let credential = document
+            .credential
+            .as_ref()
+            .expect("credential checked above");
         self.sessions.insert(
             digest,
             Session {
@@ -208,7 +238,20 @@ impl Engine {
                 expires_at,
             },
         );
-        Ok(Change::Read(response))
+        if upgraded {
+            document.validate().map_err(|_| "resource_limit")?;
+            Ok(Change::Write {
+                document,
+                response,
+                // A failed write completes with an error, so no bearer is
+                // returned. On the next loaded document, the session binding
+                // below removes this tentative session if the old verifier is
+                // still present. A committed conversion retains this session.
+                invalidate_sessions: false,
+            })
+        } else {
+            Ok(Change::Read(response))
+        }
     }
 
     fn verify(

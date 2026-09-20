@@ -432,7 +432,11 @@ const MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_media_probe",
     provides: &["test.media-probe/1"],
     calls: &[
+        "amaterasu.capture-dxgi/1",
+        "amaterasu.capture-wgc/1",
         "amaterasu.audio-encode/1",
+        "amaterasu.encode/1",
+        "amaterasu.video/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
     ],
@@ -466,6 +470,9 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_management",
     provides: &["amaterasu.management/1"],
     calls: &[
+        // Loopback `/healthz` asks this component's fixed, status-only
+        // operation to drive bounded checks of its imported dependencies.
+        "amaterasu.management/1",
         "amaterasu.authentication/1",
         "amaterasu.state/1",
         "amaterasu.catalog/1",
@@ -675,6 +682,105 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
         ),
     ]);
     Ok(policy)
+}
+
+/// Policy embedded in the signed installer seed.
+///
+/// This is deliberately separate from [`development_policy`]: an installed
+/// host must not inherit the development console, generated development key,
+/// or its all-disabled media defaults.  The initial production surface is
+/// intentionally narrow.  It exposes management and Moonlight-compatible
+/// control only on loopback, while leaving hardware-dependent media disabled
+/// until a signed, machine-qualified media policy is available.
+pub fn installer_policy(
+    web_directory: &str,
+    trusted_keys: BTreeMap<String, String>,
+) -> RuntimeConfig {
+    let mut policy = RuntimeConfig::default();
+    for component in PackageProfile::Platform.components() {
+        if component.id != RUNTIME_ID {
+            policy
+                .principals
+                .insert(component.id.into(), component.grants());
+        }
+    }
+
+    policy.settings = BTreeMap::from([
+        (
+            "amaterasu.management".into(),
+            json!({
+                "enabled": true,
+                "bind": "127.0.0.1:47990",
+                "allowed_origins": [],
+                "web": {"directory": web_directory, "trusted_keys": trusted_keys},
+            }),
+        ),
+        (
+            "amaterasu.nvhttp".into(),
+            json!({
+                "enabled": true,
+                "http_bind": "127.0.0.1:47989",
+                "https_bind": "127.0.0.1:47984",
+                "allow_remote": false,
+                "hostname": "Amaterasu",
+            }),
+        ),
+        (
+            "amaterasu.catalog".into(),
+            json!({
+                "launch_principals": ["amaterasu.launch"],
+                "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+            }),
+        ),
+        (
+            "amaterasu.authentication".into(),
+            json!({
+                "administrator_principals": ["amaterasu.management"],
+                "allowed_scopes": [
+                    "catalog.read", "catalog.write", "configuration.read", "configuration.write",
+                    "session.read", "session.write", "application.read", "application.launch",
+                    "application.terminate", "steam.read", "steam.refresh", "diagnostics.read",
+                    "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
+                ],
+            }),
+        ),
+        (
+            "amaterasu.pairing".into(),
+            json!({
+                "administrator_principals": ["amaterasu.management"],
+                "transport_principals": ["amaterasu.nvhttp"],
+            }),
+        ),
+        ("amaterasu.input".into(), json!({"allow_injection": false})),
+        ("amaterasu.display".into(), json!({"allow_mutation": false})),
+        (
+            "amaterasu.virtual-display".into(),
+            json!({"enabled": false}),
+        ),
+        ("amaterasu.capture-dxgi".into(), json!({"enabled": false})),
+        ("amaterasu.capture-wgc".into(), json!({"enabled": false})),
+        ("amaterasu.audio".into(), json!({"enabled": false})),
+        ("amaterasu.audio-encode".into(), json!({"enabled": false})),
+        ("amaterasu.encode".into(), json!({"enabled": false})),
+        ("amaterasu.video".into(), json!({"enabled": false})),
+        (
+            "amaterasu.media-transport".into(),
+            json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
+        ),
+        (
+            "amaterasu.control-transport".into(),
+            json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
+        ),
+        (
+            "amaterasu.stream-session".into(),
+            json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
+        ),
+        (
+            "amaterasu.rtsp".into(),
+            json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
+        ),
+    ]);
+    policy
 }
 
 fn names(values: &[&str]) -> BTreeSet<String> {

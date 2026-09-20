@@ -1,5 +1,6 @@
 //! Integration fixture: binds media tables and exercises software Opus without hardware.
 mod control;
+mod hardware;
 mod opus;
 mod transport;
 
@@ -15,6 +16,7 @@ struct Probe {
     runtime: RuntimeClient,
     opus: Option<opus::OpusProbe>,
     control: Option<control::ControlProbe>,
+    hardware: Option<hardware::HardwareVideoProbe>,
     transport: Option<transport::TransportProbe>,
 }
 
@@ -27,6 +29,7 @@ impl ManagedModule for Probe {
             runtime,
             opus: None,
             control: None,
+            hardware: None,
             transport: None,
         })
     }
@@ -34,6 +37,12 @@ impl ManagedModule for Probe {
         if let Some(probe) = &mut self.control {
             if probe.tick(&self.runtime)? {
                 self.control = None;
+            }
+            return Ok(());
+        }
+        if let Some(probe) = &mut self.hardware {
+            if probe.tick(&self.runtime)? {
+                self.hardware = None;
             }
             return Ok(());
         }
@@ -78,6 +87,19 @@ impl ManagedModule for Probe {
                         &self.runtime,
                         id,
                         payload,
+                    )?);
+                    return Ok(());
+                }
+                let provider = match payload["action"].as_str() {
+                    Some("hardware_video") => Some(hardware::Provider::Dxgi),
+                    Some("hardware_video_wgc") => Some(hardware::Provider::Wgc),
+                    _ => None,
+                };
+                if let Some(provider) = provider {
+                    self.hardware = Some(hardware::HardwareVideoProbe::start(
+                        &self.runtime,
+                        id,
+                        provider,
                     )?);
                     return Ok(());
                 }

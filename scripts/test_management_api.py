@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import socket
 import tempfile
+import time
+import xml.etree.ElementTree as ET
 
 from test_component_updates import CARGO, run
 from test_host_service import Console
@@ -14,6 +16,7 @@ from test_platform_modules import PlatformHarness
 
 ORIGIN = "http://127.0.0.1:3000"
 PASSWORD = "test-password-for-local-api-only"
+PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
 
 
 class Api:
@@ -52,6 +55,43 @@ def test_auth_and_crud(console, api):
         "action": "setup", "username": "administrator", "password": PASSWORD,
     })
     assert setup["ok"], setup
+    identity = console.request("amaterasu.pairing/1", {
+        "action": "import_identity",
+        "certificate_pem": (PAIRING_FIXTURES / "host-cert.pem").read_text(),
+        "private_key_pem": (PAIRING_FIXTURES / "host-key.pem").read_text(),
+    })
+    assert identity["ok"], identity
+    health = api.raw(
+        f"GET /healthz HTTP/1.1\r\nHost: {api.host}:{api.port}\r\nConnection: close\r\n\r\n"
+    )
+    head, body = health.split(b"\r\n\r\n", 1)
+    assert head.startswith(b"HTTP/1.1 200"), health
+    status = json.loads(body)
+    assert status == {
+        "ok": True,
+        "authentication_verifier": True,
+        "catalog_loaded": True,
+        "pairing_identity": True,
+    }, status
+    deadline = time.monotonic() + 5
+    nvhttp = None
+    while time.monotonic() < deadline:
+        candidate = console.request("amaterasu.nvhttp/1", {"action": "status"})
+        if candidate.get("tls_ready"):
+            nvhttp = candidate
+            break
+        time.sleep(0.025)
+    assert nvhttp is not None, "NVHTTP never consumed the imported pairing identity"
+    host, port = nvhttp["http_address"].rsplit(":", 1)
+    connection = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        connection.request("GET", "/serverinfo")
+        response = connection.getresponse()
+        server_info = ET.fromstring(response.read())
+    finally:
+        connection.close()
+    assert response.status == 200 and server_info.get("status_code") == "200"
+    assert server_info.findtext("uniqueid"), "NVHTTP did not consume the pairing identity"
     status, failure, _ = api.post("/v1/catalog/list")
     assert status == 401 and not failure["ok"], failure
     status, failure, _ = api.post("/v1/auth/setup", {"username": "attacker", "password": PASSWORD})
@@ -115,6 +155,13 @@ def main():
         bootstrap = json.loads(bootstrap_path.read_text())
         bootstrap["policy"]["settings"]["amaterasu.management"] = {
             "enabled": True, "bind": "127.0.0.1:0", "allowed_origins": [ORIGIN],
+        }
+        bootstrap["policy"]["settings"]["amaterasu.nvhttp"] = {
+            "enabled": True,
+            "http_bind": "127.0.0.1:0",
+            "https_bind": "127.0.0.1:0",
+            "allow_remote": False,
+            "hostname": "Amaterasu-test",
         }
         bootstrap_path.write_text(json.dumps(bootstrap))
         harness.stage(harness.package(1))

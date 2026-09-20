@@ -60,6 +60,32 @@ fn test_broker() -> Broker {
     );
     broker
 }
+
+#[test]
+fn host_state_context_is_available_only_to_the_state_service() {
+    let mut configuration = RuntimeConfig::default();
+    configuration
+        .principals
+        .insert("amaterasu.state".into(), Grants::default());
+    configuration
+        .principals
+        .insert("other".into(), Grants::default());
+    configuration.host_context = RuntimeHostContext {
+        schema: 1,
+        state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
+    };
+    let mut broker = Broker::new(configuration).unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("amaterasu.state", Command::GetHostContext {})
+    else {
+        panic!("state service did not receive host context");
+    };
+    assert_eq!(payload["schema"], 1);
+    assert!(matches!(
+        broker.dispatch("other", Command::GetHostContext {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+}
 fn request(operation: &str) -> Command {
     Command::Request {
         service: "echo/1".into(),

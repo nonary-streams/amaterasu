@@ -1,4 +1,5 @@
-use crate::model::{CaptureError, CaptureResult, Frame, copy_bgra_rows, frame_layout};
+use crate::model::{copy_bgra_rows, frame_layout, CaptureError, CaptureResult, Frame};
+use windows::core::Interface;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -6,7 +7,6 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
-use windows::core::Interface;
 
 pub struct Readback {
     device: ID3D11Device,

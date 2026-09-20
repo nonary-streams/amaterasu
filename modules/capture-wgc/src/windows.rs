@@ -1,15 +1,18 @@
 use super::{Backend, CaptureSession};
-use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout};
+use crate::model::{frame_layout, CaptureError, CaptureResult, Frame, Output};
 use crate::worker::{FrameSource, Worker};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
-use amaterasu_windows_capture_geometry::{GeometryError, SelectedOutput, resolve_with};
+use amaterasu_windows_capture_geometry::{
+    resolve_with, with_verified_physical_topology, GeometryError, SelectedOutput,
+};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::Instant;
+use windows::core::{IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -18,14 +21,13 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
-use windows::core::{IInspectable, Interface};
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
 #[path = "monitors.rs"]
 mod monitors;
 #[path = "readback.rs"]
 mod readback;
-use readback::{Readback, native_error};
+use readback::{native_error, Readback};
 
 pub struct WindowsBackend {
     capture_cursor: Option<bool>,
@@ -43,10 +45,17 @@ impl Backend for WindowsBackend {
     }
 
     fn enumerate(&self) -> CaptureResult<Vec<Output>> {
-        Ok(monitors::enumerate()?
-            .into_iter()
-            .map(|monitor| monitor.metadata)
-            .collect())
+        with_verified_physical_topology(|| {
+            monitors::enumerate()
+                .map(|monitors| {
+                    monitors
+                        .into_iter()
+                        .map(|monitor| monitor.metadata)
+                        .collect()
+                })
+                .map_err(|_| GeometryError::Unavailable("GDI monitor enumeration failed"))
+        })
+        .map_err(capture_geometry_error)
     }
 
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>> {

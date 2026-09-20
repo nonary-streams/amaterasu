@@ -36,6 +36,9 @@ impl Settings {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// A non-secret readiness result for the trusted management principal.
+    /// It deliberately reveals neither usernames nor credential material.
+    Status {},
     Setup {
         username: String,
         password: String,
@@ -76,6 +79,7 @@ pub enum Operation {
 impl Operation {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
+            Self::Status {} => true,
             Self::Setup { username, password } => {
                 identifier(username, 64) && (12..=256).contains(&password.len())
             }
@@ -134,6 +138,10 @@ pub struct Document {
 pub struct Credential {
     pub username: String,
     pub password_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_salt: Option<String>,
+    #[serde(default)]
+    pub case_insensitive_username: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -155,7 +163,13 @@ impl Document {
         }
         if let Some(credential) = &self.credential {
             if !identifier(&credential.username, 64)
-                || !crate::crypto::valid_password_hash(&credential.password_hash)
+                || !match &credential.legacy_salt {
+                    Some(salt) => {
+                        crate::crypto::valid_legacy_salt(salt)
+                            && crate::crypto::valid_legacy_password_hash(&credential.password_hash)
+                    }
+                    None => crate::crypto::valid_password_hash(&credential.password_hash),
+                }
             {
                 return Err("invalid_state");
             }

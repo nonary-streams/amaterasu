@@ -1,6 +1,7 @@
 use argon2::password_hash::SaltString;
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 fn password_hasher() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default())
@@ -46,6 +47,32 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
             .verify_password(password.as_bytes(), &hash)
             .is_ok()
     })
+}
+
+/// Verifies the sole predecessor format accepted by migration: lowercase
+/// SHA-256 hex of the UTF-8 password followed by a 16-byte ASCII salt.
+pub fn verify_legacy_password(password: &str, salt: &str, expected: &str) -> bool {
+    if !valid_legacy_password_hash(expected) || !valid_legacy_salt(salt) {
+        return false;
+    }
+    let mut digest = Sha256::new();
+    digest.update(password.as_bytes());
+    digest.update(salt.as_bytes());
+    hexadecimal(&digest.finalize())
+        .as_bytes()
+        .ct_eq(expected.as_bytes())
+        .into()
+}
+
+pub fn valid_legacy_password_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn valid_legacy_salt(value: &str) -> bool {
+    value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 pub fn issue_bearer() -> Result<(String, String), &'static str> {

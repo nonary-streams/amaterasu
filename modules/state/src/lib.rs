@@ -5,17 +5,10 @@ mod snapshot;
 mod store;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
-use serde::Deserialize;
 use store::StateStore;
 
 const SERVICE: &str = "amaterasu.state/1";
 const REQUESTS_PER_TICK: usize = 16;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Settings {
-    data_directory: String,
-}
 
 struct StateModule {
     runtime: RuntimeClient,
@@ -24,15 +17,7 @@ struct StateModule {
 
 impl ManagedModule for StateModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
-            return Err("state module could not obtain startup settings".into());
-        };
-        let settings: Settings = serde_json::from_value(payload)
-            .map_err(|error| format!("invalid state settings: {error}"))?;
-        if settings.data_directory.is_empty() {
-            return Err("state data_directory must not be empty".into());
-        }
-        let store = StateStore::open(settings.data_directory.into())?;
+        let store = StateStore::open(runtime.runtime_state_root()?)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

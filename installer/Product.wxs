@@ -1,0 +1,301 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <!--
+    The Amaterasu UpgradeCode is stable across this product's major upgrades.
+    The two related-product searches are intentionally detection-only. A legacy
+    host is not removed until Amaterasu can consume its listener, pairing, and
+    application configuration and can run as a service itself.
+  -->
+  <Product Id="*"
+           Name="Amaterasu"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Amaterasu Project"
+           UpgradeCode="{51B3E91F-BB86-4EF3-9A9D-AED8610C8E47}">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64"
+             Description="Amaterasu development host and migration tools" />
+
+    <!-- This public transport property is not an authorization boundary: any
+         direct MSI caller can set it. The bundle's elevated transaction marker
+         is the required authority for predecessor handoff; it is wired by the
+         companion helper rather than inferred from this property. -->
+    <Property Id="AMATERASU_BUNDLE_COORDINATED" Secure="yes" />
+    <!-- Burn supplies an opaque, per-run coordination token. Its default is
+         only a direct-install gate value: without a SYSTEM-private marker it
+         authorizes nothing. Hidden keeps the Bundle-provided token out of MSI
+         logs and all deferred action data remains hidden as well. -->
+    <Property Id="AMATERASU_BUNDLE_TOKEN" Value="amaterasu-direct-gate" Secure="yes" Hidden="yes" />
+
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of Amaterasu is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Vibeshine and Vibepollo publish distinct stable upgrade families. -->
+    <Upgrade Id="{C2C36624-2D9C-4AFD-9C79-6B7861AE4A0D}">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="yes"
+                      Property="VIBESHINE_UPGRADE_DETECTED" />
+    </Upgrade>
+    <Upgrade Id="{E3FA501A-85F8-4187-85A7-D6E6BDC7EDA1}">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="yes"
+                      Property="VIBEPOLO_UPGRADE_DETECTED" />
+    </Upgrade>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Amaterasu" />
+      </Directory>
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="AMATERASU_DATA" Name="Amaterasu" />
+      </Directory>
+    </Directory>
+
+    <Feature Id="ProductFeature" Title="Amaterasu" Level="1">
+      <ComponentGroupRef Id="InstallerSeed" />
+      <ComponentRef Id="HostExecutable" />
+      <ComponentRef Id="MigrationTool" />
+      <ComponentRef Id="PairingImportTool" />
+      <ComponentRef Id="AuthenticationImportTool" />
+      <ComponentRef Id="ReleaseTool" />
+      <ComponentRef Id="DataDirectory" />
+    </Feature>
+
+    <!-- These checks deliberately run from the MSI Binary table, before any
+         product file is installed. That keeps a caller-provided directory or
+         coordination property from influencing a deferred SYSTEM action. -->
+    <Binary Id="MigrationGuardBinary" SourceFile="$(var.StageDir)\tools\amaterasu-migration.exe" />
+    <CustomAction Id="SetValidateInstallerPaths"
+                  Property="ValidateInstallerPaths"
+                  Value="validate-installer-paths --install-folder &quot;[INSTALLFOLDER].&quot; --data-root &quot;[AMATERASU_DATA].&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="ValidateInstallerPaths"
+                  BinaryKey="MigrationGuardBinary"
+                  ExeCommand="[CustomActionData]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="SetRequireNoPredecessor"
+                  Property="RequireNoPredecessor"
+                  Value="require-no-predecessor --runtime &quot;[AMATERASU_DATA]runtime&quot; --nonce &quot;[AMATERASU_BUNDLE_TOKEN]&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="RequireNoPredecessor"
+                  BinaryKey="MigrationGuardBinary"
+                  ExeCommand="[CustomActionData]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+
+    <!-- Kept public for isolated install verification. Production defaults to
+         the machine Program Files directory and is never populated with a
+         configuration path from an untrusted legacy file. -->
+    <CustomAction Id="SetLegacyProgramFiles"
+                  Property="LEGACY_PROGRAM_FILES"
+                  Value="[ProgramFiles64Folder]"
+                  Execute="immediate" />
+    <CustomAction Id="SetImportLegacyConfiguration"
+                  Property="ImportLegacyConfiguration"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; import --destination &quot;[AMATERASU_DATA].&quot; --runtime &quot;[AMATERASU_DATA]runtime&quot; --program-files &quot;[LEGACY_PROGRAM_FILES].&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="ImportLegacyConfiguration"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- WixQuietExec is used instead of a type-18 file action. Windows
+         Installer rejected the latter with 1721 before the Rust program had
+         started on current Windows builds. The deferred action receives only
+         paths generated by MSI directory properties; HideTarget also keeps
+         those machine paths out of ordinary verbose logs. -->
+    <CustomAction Id="SetProvisionInstallerRuntime"
+                  Property="ProvisionInstallerRuntime"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; install-installer &quot;[INSTALLFOLDER]tools\bootstrap-template.json&quot; &quot;[INSTALLFOLDER]tools\package&quot; &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="ProvisionInstallerRuntime"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- The release helper consumes an authenticated journal. It is a rollback
+         action, not an uninstall cleanup: it can remove only unchanged files
+         created by this installation attempt and preserves preexisting data. -->
+    <CustomAction Id="SetRollbackProvisionInstallerRuntime"
+                  Property="RollbackProvisionInstallerRuntime"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; unprovision-if-created &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="RollbackProvisionInstallerRuntime"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- This is deliberately scheduled only after the product-owned readiness
+         and predecessor-handoff checkpoint is added below. SCM's started state
+         alone is not a streaming readiness signal. -->
+    <CustomAction Id="SetFinalizeInstallerProvision"
+                  Property="FinalizeInstallerProvision"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; finalize-installer-provision &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="FinalizeInstallerProvision"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- This asks the installed host to validate its live service marker. It
+         does not acquire the runtime lock or start a competing probe worker. -->
+    <CustomAction Id="SetVerifyAmaterasuServiceReady"
+                  Property="VerifyAmaterasuServiceReady"
+                  Value="&quot;[INSTALLFOLDER]amaterasu.exe&quot; service-ready &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="VerifyAmaterasuServiceReady"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- SCM running only proves the supervisor exists. The operational probe
+         reaches the selected interactive worker's loopback management health
+         and NVHTTP server-info endpoints, requiring imported administrator,
+         catalog, and pairing state before any predecessor can be retired. -->
+    <CustomAction Id="SetVerifyAmaterasuOperationalReady"
+                  Property="VerifyAmaterasuOperationalReady"
+                  Value="&quot;[INSTALLFOLDER]amaterasu.exe&quot; operational-ready &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="VerifyAmaterasuOperationalReady"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <!-- Handoff accepts no service or path supplied by MSI. The migration
+         tool reads only its validated, fixed-family handoff state. Its rollback
+         action is scheduled immediately before the forward mutation so MSI
+         stops Amaterasu before restoring the predecessor on failure. -->
+    <CustomAction Id="SetRollbackPredecessorHandoff"
+                  Property="RollbackPredecessorHandoff"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; rollback-predecessor-handoff --runtime &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="RollbackPredecessorHandoff"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="SetHandoffPredecessor"
+                  Property="HandoffPredecessor"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; handoff-predecessor --runtime &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="HandoffPredecessor"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="SetFinalizePredecessorHandoff"
+                  Property="FinalizePredecessorHandoff"
+                  Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; finalize-predecessor-handoff --runtime &quot;[AMATERASU_DATA]runtime&quot;"
+                  Execute="immediate"
+                  HideTarget="yes" />
+    <CustomAction Id="FinalizePredecessorHandoff"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+
+    <InstallExecuteSequence>
+      <!-- No mutable product file or service work occurs before these elevated
+           Binary-table guards. The marker-aware predecessor check is always
+           evaluated; AMATERASU_BUNDLE_COORDINATED never bypasses it. -->
+      <Custom Action="SetValidateInstallerPaths" After="InstallInitialize">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="ValidateInstallerPaths" After="SetValidateInstallerPaths">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetRequireNoPredecessor" After="ValidateInstallerPaths">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="RequireNoPredecessor" Before="InstallFiles">NOT Installed AND NOT REMOVE</Custom>
+      <!-- The installed migration program is available from this point onward. -->
+      <Custom Action="SetLegacyProgramFiles" After="InstallFiles">NOT Installed AND NOT REMOVE AND NOT LEGACY_PROGRAM_FILES</Custom>
+      <Custom Action="SetProvisionInstallerRuntime" After="SetLegacyProgramFiles">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetRollbackProvisionInstallerRuntime" After="SetProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="RollbackProvisionInstallerRuntime" After="SetRollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="ProvisionInstallerRuntime" After="RollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetImportLegacyConfiguration" After="ProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="ImportLegacyConfiguration" After="SetImportLegacyConfiguration">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetRollbackPredecessorHandoff" After="ImportLegacyConfiguration">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="RollbackPredecessorHandoff" After="SetRollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="SetHandoffPredecessor" After="RollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="HandoffPredecessor" Before="StartServices">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="SetVerifyAmaterasuServiceReady" After="StartServices">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="VerifyAmaterasuServiceReady" After="SetVerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetVerifyAmaterasuOperationalReady" After="VerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="VerifyAmaterasuOperationalReady" After="SetVerifyAmaterasuOperationalReady">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="SetFinalizePredecessorHandoff" After="VerifyAmaterasuOperationalReady">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="FinalizePredecessorHandoff" After="SetFinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="SetFinalizeInstallerProvision" After="FinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+      <Custom Action="FinalizeInstallerProvision" After="SetFinalizeInstallerProvision">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+    </InstallExecuteSequence>
+  </Product>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Directory Id="MIGRATIONTOOLS" Name="tools">
+        <Component Id="MigrationTool" Guid="*" Win64="yes">
+          <File Id="MigrationToolExe" Source="$(var.StageDir)\tools\amaterasu-migration.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="PairingImportTool" Guid="*" Win64="yes">
+          <File Id="PairingImportExe" Source="$(var.StageDir)\tools\amaterasu-pairing-import.exe" />
+        </Component>
+        <Component Id="AuthenticationImportTool" Guid="*" Win64="yes">
+          <File Id="AuthenticationImportExe" Source="$(var.StageDir)\tools\amaterasu-authentication-import.exe" />
+        </Component>
+        <Component Id="ReleaseTool" Guid="*" Win64="yes">
+          <File Id="ReleaseToolExe" Source="$(var.StageDir)\tools\amaterasu-release.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+      <Component Id="HostExecutable" Guid="*" Win64="yes">
+        <File Id="HostExe" Source="$(var.StageDir)\amaterasu.exe" KeyPath="yes" />
+        <ServiceInstall Id="AmaterasuServiceInstall" Name="Amaterasu"
+                        DisplayName="Amaterasu Service" Type="ownProcess" Start="auto"
+                        ErrorControl="normal" Arguments="service &quot;[AMATERASU_DATA]runtime&quot;" />
+        <ServiceControl Id="AmaterasuServiceControl" Name="Amaterasu" Start="install"
+                        Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="AMATERASU_DATA">
+      <Component Id="DataDirectory" Guid="*" Win64="yes">
+        <!-- The provisioner owns this mutable root. Do not use CreateFolder:
+             MSI would otherwise schedule FolderRemove on uninstall, while
+             runtime state and migration backups must remain recoverable. -->
+        <RegistryValue Root="HKLM" Key="Software\Amaterasu" Name="DataDirectory"
+                       Type="string" Value="[AMATERASU_DATA]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

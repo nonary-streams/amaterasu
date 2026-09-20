@@ -106,6 +106,7 @@ enum Stage {
     Dispatching {
         request_id: u64,
         login: bool,
+        operational_health: bool,
     },
     Writing {
         bytes: Vec<u8>,
@@ -135,9 +136,11 @@ impl Connection {
                 request_id,
                 request,
             } => self.verify_result(runtime, request_id, request, operation)?,
-            Stage::Dispatching { request_id, login } => {
-                self.service_result(runtime, request_id, login)?
-            }
+            Stage::Dispatching {
+                request_id,
+                login,
+                operational_health,
+            } => self.service_result(runtime, request_id, login, operational_health)?,
             Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
             Stage::Closed => {}
         }
@@ -228,12 +231,21 @@ impl Connection {
         runtime: &RuntimeClient,
         request_id: u64,
         login: bool,
+        operational_health: bool,
     ) -> ModuleResult<()> {
         match runtime.send_ephemeral(Command::TakeResult {
             request: request_id,
         })? {
-            Response::Pending => self.stage = Stage::Dispatching { request_id, login },
-            Response::Result { payload } => self.respond(service_status(&payload, login), payload),
+            Response::Pending => {
+                self.stage = Stage::Dispatching {
+                    request_id,
+                    login,
+                    operational_health,
+                }
+            }
+            Response::Result { payload } => {
+                self.respond(service_status(&payload, login, operational_health), payload)
+            }
             _ => self.fail(503, "service_unavailable"),
         }
         Ok(())
@@ -277,7 +289,20 @@ impl Connection {
             };
             return Ok(());
         }
-        if request.preflight {
+        if matches!(request.target, RequestTarget::OperationalHealth) {
+            if let Some(request_id) = self.submit(
+                runtime,
+                crate::SERVICE,
+                json!({"action":"operational_health"}),
+                operation,
+            )? {
+                self.stage = Stage::Dispatching {
+                    request_id,
+                    login: false,
+                    operational_health: true,
+                };
+            }
+        } else if request.preflight {
             self.respond(204, Value::Null);
         } else if let Some(scope) = request_scope(&request) {
             let payload =
@@ -308,6 +333,7 @@ impl Connection {
             self.stage = Stage::Dispatching {
                 request_id,
                 login: route.scope.is_none(),
+                operational_health: false,
             };
         }
         Ok(())
@@ -367,6 +393,7 @@ fn request_scope(request: &http::Request) -> Option<&'static str> {
     match &request.target {
         RequestTarget::Api(route) => route.scope,
         RequestTarget::Asset(_) => None,
+        RequestTarget::OperationalHealth => None,
     }
 }
 
@@ -379,7 +406,14 @@ fn authorized(payload: &Value, required_scope: Option<&str>) -> bool {
             .is_some_and(|scopes| scopes.iter().any(|scope| scope.as_str() == required_scope))
 }
 
-fn service_status(payload: &Value, login: bool) -> u16 {
+fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16 {
+    if operational_health {
+        return if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+            200
+        } else {
+            503
+        };
+    }
     if !login || payload.get("ok").and_then(Value::as_bool) == Some(true) {
         return 200;
     }

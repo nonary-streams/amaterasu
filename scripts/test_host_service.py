@@ -219,6 +219,25 @@ def test_oversized_input_shuts_down(harness):
         console.close()
 
 
+def test_service_mode_holds_root_until_controlled_stop(harness):
+    process = subprocess.Popen(
+        [str(harness.host), "service", str(harness.root)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.5)
+        assert process.poll() is None, process.stderr.read()
+        replacement = harness.package(2)
+        run(harness.publisher, "stage", harness.root, replacement, expect_success=False)
+        process.stdin.close()
+        assert process.wait(timeout=8) == 0, process.stderr.read()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=8)
+
+
 def main():
     run(CARGO, "build", "--workspace", "--offline")
     with tempfile.TemporaryDirectory(prefix="amaterasu-host-") as temporary:
@@ -229,8 +248,9 @@ def main():
         test_idle_watchdog_and_restart_budget(harness)
         test_stopped_worker_large_pipe_write_is_bounded(harness)
         test_oversized_input_shuts_down(harness)
+        test_service_mode_holds_root_until_controlled_stop(harness)
     print("Passed: persistent host workflows, durable restart, invalid input isolation,")
-    print("EOF child cleanup, explicit shutdown, crash recovery without mutation replay, watchdog/restart budget, bounded input.")
+    print("EOF child cleanup, SCM-compatible service EOF stop, explicit shutdown, crash recovery without mutation replay, watchdog/restart budget, bounded input.")
 
 
 if __name__ == "__main__":

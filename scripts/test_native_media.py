@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import tempfile
 import json
+import os
 import secrets
 import socket
 import struct
+import subprocess
+import sys
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -180,7 +183,49 @@ def test_udp_transport(console, encrypted):
             key,
             key_id,
             [bytes.fromhex(value) for value in result["expected_audio_hex"]],
-        )
+    )
+
+
+def request_hardware_video(console, action):
+    """The real capture/encoder pipeline has a bounded, longer qualification deadline."""
+    console.sequence += 1
+    console.send({
+        "op": "request",
+        "service": "test.media-probe/1",
+        "payload": {"action": action},
+        "timeout_ms": 15_000,
+        "operation_id": f"native-hardware-video-{console.sequence}",
+    })
+    response = console.receive()
+    assert response["kind"] == "result", (response, "".join(console.errors))
+    return response["payload"]
+
+
+def start_capture_stimulus():
+    """Make short-lived, self-owned desktop changes for Duplication capture.
+
+    This is used only with AMATERASU_HARDWARE_VIDEO=1. It does not inject input,
+    modify display settings, or interact with another application.
+    """
+    source = r'''
+import tkinter as tk
+root = tk.Tk()
+root.overrideredirect(True)
+root.geometry("96x96+0+0")
+root.attributes("-topmost", True)
+canvas = tk.Canvas(root, width=96, height=96, highlightthickness=0)
+canvas.pack()
+index = 0
+colors = ("#d22", "#2d2", "#22d", "#dd2")
+def paint():
+    global index
+    canvas.configure(background=colors[index % len(colors)])
+    index += 1
+    root.after(80, paint)
+paint()
+root.mainloop()
+'''
+    return subprocess.Popen([sys.executable, "-c", source])
 
 
 def main():
@@ -195,11 +240,22 @@ def main():
             "allow_remote": False,
             "allowed_principals": ["amaterasu.media-probe"],
         }
+        if os.environ.get("AMATERASU_HARDWARE_VIDEO") == "1":
+            # This remains an explicit, dev-signed qualification opt-in. The
+            # production seed cannot contain media-probe or these settings.
+            bootstrap["policy"]["settings"]["amaterasu.capture-dxgi"] = {"enabled": True}
+            bootstrap["policy"]["settings"]["amaterasu.capture-wgc"] = {"enabled": True}
+            bootstrap["policy"]["settings"]["amaterasu.encode"] = {"enabled": True}
+            bootstrap["policy"]["settings"]["amaterasu.video"] = {
+                "enabled": True,
+                "capture_providers": ["dxgi", "wgc"],
+            }
         bootstrap_path.write_text(json.dumps(bootstrap))
         package = Path(temporary) / "media-probe"
         run(harness.publisher, "pack-media-probe", harness.root, harness.artifacts, package, "1")
         harness.stage(package)
         console = Console(harness)
+        stimulus = None
         try:
             for command in [
                 {"op": "native_register", "service": "amaterasu.capture-dxgi/1", "factory": 1},
@@ -230,10 +286,21 @@ def main():
             assert encoded["ok"] and encoded["packets"] == 2, encoded
             assert encoded["decoded_frames"] == 960 and encoded["encoded_bytes"] > 0, encoded
             assert encoded["retry_preserved"] and encoded["eos_once"], encoded
+            if os.environ.get("AMATERASU_HARDWARE_VIDEO") == "1":
+                stimulus = start_capture_stimulus()
+                hardware = request_hardware_video(console, "hardware_video")
+                wgc = request_hardware_video(console, "hardware_video_wgc")
+                assert hardware["ok"] or wgc["ok"], (hardware, wgc)
+                qualified = hardware if hardware["ok"] else wgc
+                assert qualified["access_units"] >= 3 and qualified["keyframe"], qualified
+                assert qualified["annex_b"] and qualified["bytes"] > 0, qualified
             test_udp_transport(console, encrypted=False)
             test_udp_transport(console, encrypted=True)
             console.eof()
         finally:
+            if stimulus is not None:
+                stimulus.terminate()
+                stimulus.wait(timeout=5)
             console.close()
     print(
         "Passed: signed media native binding, absent-stream isolation, denied console "

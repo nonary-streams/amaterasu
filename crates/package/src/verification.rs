@@ -205,6 +205,9 @@ fn resolve_runtime_grants(
         principals: BTreeMap::new(),
         hooks: bootstrap.policy.hooks.clone(),
         settings: BTreeMap::new(),
+        // A package policy is deliberately unable to specify process-local
+        // host facts. The host injects those after package verification.
+        host_context: Default::default(),
     };
 
     for component in components.iter().filter(|component| !component.runtime) {

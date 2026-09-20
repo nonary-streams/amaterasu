@@ -50,6 +50,84 @@ pub fn create_private_directory(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// Creates a directory for machine-owned installer data. On Windows its DACL
+/// is protected and grants only LocalSystem and Administrators; descendants
+/// inherit the same boundary for migration backups and transaction journals.
+pub fn create_machine_private_directory(path: &Path) -> StorageResult<()> {
+    create_private_directory(path)?;
+    #[cfg(windows)]
+    if running_as_local_system()? {
+        set_machine_private_dacl(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn running_as_local_system() -> StorageResult<bool> {
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetUserNameW(buffer: *mut u16, length: *mut u32) -> i32;
+    }
+    let mut buffer = [0u16; 256];
+    let mut length = buffer.len() as u32;
+    // SAFETY: buffer is writable and its capacity is supplied in UTF-16 units.
+    if unsafe { GetUserNameW(buffer.as_mut_ptr(), &mut length) } == 0 || length == 0 {
+        return Err("current account could not be determined".into());
+    }
+    Ok(String::from_utf16_lossy(&buffer[..length as usize - 1]).eq_ignore_ascii_case("SYSTEM"))
+}
+
+#[cfg(windows)]
+fn set_machine_private_dacl(path: &Path) -> StorageResult<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            source: *const u16,
+            revision: u32,
+            descriptor: *mut *mut c_void,
+            length: *mut u32,
+        ) -> i32;
+        fn SetFileSecurityW(path: *const u16, information: u32, descriptor: *const c_void) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    let mut length = 0u32;
+    // SAFETY: both buffers are NUL-terminated and remain live for these calls.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            &mut length,
+        )
+    } == 0
+        || descriptor.is_null()
+    {
+        return Err("machine-private ACL could not be constructed".into());
+    }
+    // SAFETY: descriptor is allocated by the preceding Windows API call.
+    let applied =
+        unsafe { SetFileSecurityW(target.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+    unsafe { LocalFree(descriptor) };
+    if applied == 0 {
+        return Err("machine-private ACL could not be applied".into());
+    }
+    Ok(())
+}
+
 pub fn write_json_atomically(path: &Path, value: &impl Serialize) -> StorageResult<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     write_atomically(path, &bytes)

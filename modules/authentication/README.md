@@ -60,6 +60,19 @@ session by `session_id`. Session IDs are digest metadata, never reusable bearer
 secrets; listings omit credential fingerprints. Frontends cannot administer
 sessions by merely presenting a login bearer.
 
+## Legacy administrator migration
+
+`amaterasu-authentication-import.exe` accepts only the current legacy
+`username`, `password`, and 16-character alphanumeric `salt` record, where
+`password` is lowercase SHA-256 hex of password followed by salt. It rejects
+ambiguous, external, malformed, or API-token-bearing records. Its `seed` mode
+writes the ordinary authentication state namespace only when empty. The retained
+legacy verifier is constant-time checked at login and, after the first successful
+password proof, is replaced in the same durable write with the native Argon2id
+credential. Passwords and verifier values are never printed. The installer must
+call `validate` before takeover and call `seed` only on the copied
+`DATA_ROOT/legacy-imports/PRODUCT` source.
+
 Successful login returns `ok`, `bearer`, `kind:"administrator_session"`, `subject`
 (the administrator username), `scopes`, and `expires_at` (Unix seconds). Sessions
 receive the configured scope set, last 900 seconds, and are held only in memory

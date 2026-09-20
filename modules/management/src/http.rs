@@ -11,6 +11,11 @@ pub const MAX_RESPONSE: usize = 24_000;
 pub enum RequestTarget {
     Api(Route),
     Asset(String),
+    /// A deliberately tiny loopback-only readiness surface. It has no
+    /// credentials, identifiers, or mutable operations and exists solely for
+    /// the installer to establish that the selected interactive worker is
+    /// consuming its imported control-plane state.
+    OperationalHealth,
 }
 
 pub struct Request {
@@ -102,6 +107,18 @@ fn asset_request(
     header_end: usize,
     input_length: usize,
 ) -> Result<Request, Failure> {
+    if path == "/healthz" {
+        if fields.content_length.is_some_and(|length| length != "0") || input_length != header_end {
+            return Err(Failure::new(400, "asset_body_forbidden"));
+        }
+        return Ok(Request {
+            target: RequestTarget::OperationalHealth,
+            payload: Value::Null,
+            bearer: None,
+            origin: fields.origin.map(str::to_owned),
+            preflight: false,
+        });
+    }
     if path.starts_with("/v1/") {
         return Err(Failure::new(405, "method_not_allowed"));
     }
@@ -366,6 +383,25 @@ mod tests {
                 parse(bytes.as_bytes(), HOST, &[]).err().unwrap().status,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn operational_health_is_a_fixed_bodyless_get_not_an_asset_or_api_route() {
+        let request = format!("GET /healthz HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+        let parsed = parse(request.as_bytes(), HOST, &[]).unwrap().unwrap();
+        assert!(matches!(parsed.target, RequestTarget::OperationalHealth));
+        assert!(parsed.bearer.is_none());
+        assert!(parsed.payload.is_null());
+        let query = format!("GET /healthz?x=1 HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+        assert_eq!(
+            parse(query.as_bytes(), HOST, &[]).err().unwrap().status,
+            404
+        );
+        for path in ["/healthz/extra", "/healthz-extra"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+            let parsed = parse(request.as_bytes(), HOST, &[]).unwrap().unwrap();
+            assert!(matches!(parsed.target, RequestTarget::Asset(_)));
         }
     }
 
