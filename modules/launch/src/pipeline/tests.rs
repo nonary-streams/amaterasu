@@ -48,6 +48,7 @@ struct Harness {
     fail_release: bool,
     released: usize,
     catalog_preparation: Option<Value>,
+    catalog_exclude_global_prep_cmd: Option<bool>,
     catalog_working_directory: Option<String>,
     catalog_auto_detach: Option<bool>,
     catalog_wait_all: Option<bool>,
@@ -96,6 +97,7 @@ impl Harness {
             fail_release: false,
             released: 0,
             catalog_preparation: None,
+            catalog_exclude_global_prep_cmd: None,
             catalog_working_directory: None,
             catalog_auto_detach: None,
             catalog_wait_all: None,
@@ -476,6 +478,9 @@ impl Harness {
                         if let Some(preparation) = &self.catalog_preparation {
                             reply["entry"]["launch"]["preparation"] = preparation.clone();
                         }
+                        if let Some(exclude) = self.catalog_exclude_global_prep_cmd {
+                            reply["entry"]["exclude_global_prep_cmd"] = json!(exclude);
+                        }
                         if let Some(working_directory) = &self.catalog_working_directory {
                             reply["entry"]["launch"]["working_directory"] =
                                 json!(working_directory);
@@ -686,6 +691,120 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
         .rposition(|(_, payload, _)| payload["action"] == "status")
         .unwrap();
     assert!(activate > last_status);
+}
+
+#[test]
+fn global_preparation_is_snapshotted_and_prepended_before_catalog_steps() {
+    let mut harness = Harness::new();
+    let command = std::env::current_exe().unwrap();
+    let command_text = command.to_string_lossy().into_owned();
+    harness.catalog_preparation = Some(json!([{
+        "run":{"executable":command_text,"args":["app"]},
+    }]));
+    let global = json!([{
+        "run":{"executable":command,"args":["global"]},
+    }]);
+    let mut request = launch("global-preparation");
+    request["global_preparation"] = global.clone();
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", request.clone());
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("launch workflow sends the merged preparation sequence");
+    assert_eq!(
+        application_launch["preparation"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        application_launch["preparation"][0]["run"]["args"],
+        json!(["global"])
+    );
+    assert_eq!(
+        application_launch["preparation"][1]["run"]["args"],
+        json!(["app"])
+    );
+    assert_eq!(
+        pipeline.records.values[&1].global_preparation[0].run.args,
+        ["global"]
+    );
+
+    // A retry with a changed global setting cannot reuse the old launch ID.
+    request["global_preparation"][0]["run"]["args"] = json!(["changed"]);
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", request)["code"],
+        "operation_conflict"
+    );
+}
+
+#[test]
+fn per_application_exclusion_keeps_app_preparation_and_skips_global_steps() {
+    let mut harness = Harness::new();
+    harness.catalog_exclude_global_prep_cmd = Some(true);
+    harness.catalog_preparation = Some(json!([{
+        "run":{"executable":std::env::current_exe().unwrap(),"args":["app"]},
+    }]));
+    let mut request = launch("global-preparation-excluded");
+    request["global_preparation"] = json!([{
+        "run":{"executable":std::env::current_exe().unwrap(),"args":["global"]},
+    }]);
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", request);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("excluded app still launches");
+    assert_eq!(
+        application_launch["preparation"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        application_launch["preparation"][0]["run"]["args"],
+        json!(["app"])
+    );
+}
+
+#[test]
+fn global_preparation_rejects_oversized_inputs_and_merged_sequences() {
+    let mut pipeline = pipeline();
+    let mut harness = Harness::new();
+    let command = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let too_many = vec![json!({"run":{"executable":command}}); 9];
+    let mut request = launch("global-preparation-input-limit");
+    request["global_preparation"] = json!(too_many);
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", request)["code"],
+        "preparation_limit_exceeded"
+    );
+    assert!(pipeline.records.values.is_empty());
+
+    let app_steps = (0..8)
+        .map(|_| json!({"run":{"executable":command}}))
+        .collect::<Vec<_>>();
+    harness.catalog_preparation = Some(json!(app_steps));
+    let mut request = launch("global-preparation-merged-limit");
+    request["global_preparation"] = json!([{
+        "run":{"executable":command},
+    }]);
+    let failed = harness.request(&mut pipeline, "alice", request);
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    assert_eq!(failed["launch"]["failure"], "preparation_limit_exceeded");
+    assert!(harness.sessions.is_empty());
 }
 
 #[test]

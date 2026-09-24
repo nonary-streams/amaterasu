@@ -121,12 +121,14 @@ impl Pipeline {
             Operation::Launch {
                 operation_id,
                 app_id,
+                global_preparation,
             } => match self.records.start(
                 caller,
                 initiator,
                 operation_id,
                 app_id,
                 CatalogSelection::Initiator,
+                global_preparation,
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
@@ -138,12 +140,14 @@ impl Pipeline {
             Operation::LaunchExport {
                 operation_id,
                 app_id,
+                global_preparation,
             } => match self.records.start(
                 caller,
                 initiator,
                 operation_id,
                 app_id,
                 CatalogSelection::Exported,
+                global_preparation,
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
@@ -377,7 +381,10 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
-                match LaunchTarget::from_catalog_entry(&payload["entry"]) {
+                match LaunchTarget::from_catalog_entry(
+                    &payload["entry"],
+                    &record.global_preparation,
+                ) {
                     Ok(target) => record.target = Some(target),
                     Err(code) => return self.dependency_failed(job, code, send),
                 }

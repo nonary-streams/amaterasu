@@ -187,6 +187,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
+                Vec::new(),
             )
             .unwrap();
         records.values.get_mut(&id).unwrap().process_id = Some(3);

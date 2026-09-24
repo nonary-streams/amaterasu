@@ -968,6 +968,44 @@ fn failed_preparation_rolls_back_the_started_step_and_prior_steps() {
 }
 
 #[test]
+fn merged_global_preparation_failure_rolls_back_before_app_preparation() {
+    let directory = test_directory("merged-global-preparation-failure");
+    let trace = directory.join("events");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("merged-global-preparation-failure", "sleep");
+    request["preparation"] = json!([
+        {
+            "run":lifecycle_command(&trace, "global-prepare-one", "trace"),
+            "undo":lifecycle_command(&trace, "global-undo-one", "trace"),
+        },
+        {
+            "run":lifecycle_command(&trace, "global-prepare-fail", "trace_fail"),
+            "undo":lifecycle_command(&trace, "global-undo-fail", "trace"),
+        },
+        {
+            "run":lifecycle_command(&trace, "app-prepare-never-runs", "trace"),
+            "undo":lifecycle_command(&trace, "app-undo-never-runs", "trace"),
+        },
+    ]);
+
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let failed = wait_for_state(&mut manager, "alice", id, "launch_failed");
+    assert_eq!(failed["process"]["preparation"]["completed"], 1);
+    assert_eq!(failed["process"]["preparation"]["failure"]["step"], 1);
+    assert_eq!(
+        trace_events(&trace),
+        [
+            "global-prepare-one",
+            "global-prepare-fail",
+            "global-undo-fail",
+            "global-undo-one",
+        ]
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn cancellation_settles_an_active_preparation_before_undo() {
     let directory = test_directory("cancel-preparation");
     let trace = directory.join("events");

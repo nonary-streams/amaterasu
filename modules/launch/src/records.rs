@@ -1,4 +1,4 @@
-use crate::protocol::{ApplicationConfigOverrides, LaunchTarget, Outcome, State};
+use crate::protocol::{ApplicationConfigOverrides, LaunchTarget, Outcome, PreparationStep, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +36,9 @@ pub struct Record {
     pub resource: Option<String>,
     #[serde(skip)]
     pub target: Option<LaunchTarget>,
+    /// Launch-time global preparation snapshot retained for idempotency and retries.
+    #[serde(skip)]
+    pub global_preparation: Vec<PreparationStep>,
     #[serde(skip)]
     pub provider_ticket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +84,7 @@ impl Records {
         operation_id: String,
         app_id: String,
         catalog_selection: CatalogSelection,
+        global_preparation: Vec<PreparationStep>,
     ) -> Result<(u64, bool), &'static str> {
         if let Some(record) = self
             .values
@@ -97,7 +101,10 @@ impl Records {
                         && record.catalog_initiator == initiator
                 }
             };
-            return if record.app_id == app_id && same_catalog {
+            return if record.app_id == app_id
+                && same_catalog
+                && record.global_preparation == global_preparation
+            {
                 Ok((record.launch_id, false))
             } else {
                 Err("operation_conflict")
@@ -140,6 +147,7 @@ impl Records {
                 process_operation: key,
                 resource,
                 target: None,
+                global_preparation,
                 provider_ticket: None,
                 config_overrides: None,
                 session_requested: false,

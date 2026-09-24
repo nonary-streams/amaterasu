@@ -11,7 +11,7 @@ Requests are strict JSON:
 
 ```json
 {"action":"launch","operation_id":"living-room-1","app_id":"app-0000000000000001"}
-{"action":"launch_export","operation_id":"moonlight-1","app_id":"app-0000000000000001"}
+{"action":"launch_export","operation_id":"moonlight-1","app_id":"app-0000000000000001","global_preparation":[]}
 {"action":"lookup","operation_id":"moonlight-1"}
 {"action":"status","launch_id":1}
 {"action":"stop","launch_id":1}
@@ -19,7 +19,10 @@ Requests are strict JSON:
 ```
 
 Callers cannot override the executable, arguments, environment, working directory,
-process ID, session ID, lease resource, preparation commands, or catalog owner.
+process ID, session ID, lease resource, or catalog owner. A host settings bridge
+may include a `global_preparation` snapshot on either launch action; omitted means
+an empty list. The snapshot uses the same structured command format and validation
+as catalog preparation.
 Catalog entries with `launch.kind:"executable"` use the application provider's
 native process path. Fixed-owner Playnite entries use the typed `launch.kind:"playnite"`
 target and a validated Playnite GUID; launch sends that ID to the Playnite extension
@@ -32,16 +35,31 @@ enforces its remaining native launch constraints, including rejection of implici
 batch executables.
 
 A preparation plan contains at most eight ordered `run` commands with optional
-paired `undo` commands. Each command uses literal argv, a cleared explicit
+paired `undo` commands. Global steps are prepended to catalog steps unless the
+resolved catalog entry has `exclude_global_prep_cmd:true` (missing means false);
+that flag skips only global steps. The legacy spelling
+`exclude-global-prep-cmd` is accepted as an alias, but supplying both spellings
+is invalid. The combined plan also has an eight-step maximum and exceeds that
+limit with `preparation_limit_exceeded` before acquiring a session lease. Each
+command uses literal argv, a cleared explicit
 environment, an optional native working directory, and a 1–30000 ms timeout
 (10000 ms by default). Command paths, arguments, and environments use the same
-native application bounds. Launch parses and validates the resolved catalog plan,
-applies private process defaults only where the catalog has no per-application
-value (`auto_detach:true`, `wait_all:true`, `exit_timeout_seconds:5`), and forwards
-the resolved plan without accepting request-level additions or overrides. Explicit
-catalog values reach the application provider. Typed Playnite catalog targets default
-to a separate 10-second exit timeout. The application runs preparation before the
-main executable and owes reverse-order undo for every run command it started.
+native application bounds. Launch snapshots the supplied global list in the
+idempotency record, parses and validates the resolved catalog plan, and forwards
+the merged plan to the application provider. Reusing an operation ID with a
+different global list returns `operation_conflict`. It applies private process
+defaults only where the catalog has no per-application value (`auto_detach:true`,
+`wait_all:true`, `exit_timeout_seconds:5`). Typed Playnite targets default to a
+separate 10-second exit timeout. Playnite has no preparation lifecycle input yet;
+when global steps are present, launch returns
+`global_preparation_unsupported_target` unless the catalog entry explicitly
+excludes them. The application runs preparation before the main executable and
+owes reverse-order undo for every run command it started.
+
+This payload does not implement Vibeshine's raw `do`/`undo` command strings,
+per-command `elevated`, or `$()` environment interpolation. A settings bridge must
+map configured commands to this explicit executable/argv model; these semantics
+remain a parity gap.
 
 Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
 (default 10 seconds, maximum 300); they contain no request-controlled path or

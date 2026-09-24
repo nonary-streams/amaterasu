@@ -261,6 +261,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
+                Vec::new(),
             )
             .unwrap();
         let record = records.values.get_mut(&launch_id).unwrap();
@@ -287,6 +288,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
+                Vec::new(),
             )
             .unwrap();
         let record = records.values.get_mut(&launch_id).unwrap();
