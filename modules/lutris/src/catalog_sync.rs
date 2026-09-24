@@ -3,6 +3,7 @@
 use crate::discovery::Snapshot;
 use crate::settings::ProductSettings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -18,10 +19,13 @@ const MAX_BATCH_BYTES: usize = 12_000;
 const MAX_RETRY_TICKS: u32 = 64;
 const MAX_RETRIES: u8 = 8;
 const MAX_CONFLICT_RESTARTS: u8 = 3;
+const INVENTORY_PAGE_SIZE: usize = 32;
+const MAX_INVENTORY_ENTRIES: usize = 100_000;
 static SYNC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
+    Inventory,
     Begin,
     Batch,
     Finish,
@@ -39,7 +43,13 @@ struct Transaction {
     source_revision: u64,
     settings_epoch: u64,
     remove_stale: bool,
+    base_batches: Vec<SnapshotBatch>,
     batches: Vec<SnapshotBatch>,
+    name_exclusions: Vec<String>,
+    inventory: Vec<CatalogInventoryEntry>,
+    inventory_total_count: Option<usize>,
+    inventory_after: Option<String>,
+    collection_revision: Option<u64>,
     generation: Option<u64>,
     catalog_revision: Option<u64>,
     sequence: u64,
@@ -73,25 +83,48 @@ struct PreparedSnapshot {
     selection_remove_source_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogInventoryEntry {
+    source_id: String,
+    added_at_unix: Option<i64>,
+    #[serde(rename = "source_flags")]
+    _source_flags: u32,
+    attached: bool,
+    entry_name: Option<String>,
+}
+
 impl Transaction {
     fn new(
         source_revision: u64,
         settings_epoch: u64,
         remove_stale: bool,
         batches: Vec<SnapshotBatch>,
+        name_exclusions: Vec<String>,
     ) -> Self {
         let sync_id = new_sync_id(source_revision);
+        let stage = if name_exclusions.is_empty() {
+            Stage::Begin
+        } else {
+            Stage::Inventory
+        };
         let mut transaction = Self {
             sync_id,
             source_revision,
             settings_epoch,
             remove_stale,
+            base_batches: batches.clone(),
             batches,
+            name_exclusions,
+            inventory: Vec::new(),
+            inventory_total_count: None,
+            inventory_after: None,
+            collection_revision: None,
             generation: None,
             catalog_revision: None,
             sequence: 0,
             batch_index: 0,
-            stage: Stage::Begin,
+            stage,
             call: Call::Submit,
             retries: 0,
             conflicts: 0,
@@ -105,10 +138,18 @@ impl Transaction {
 
     fn payload(&self) -> Value {
         match self.stage {
+            Stage::Inventory => json!({
+                "action":"provider_snapshot_inventory",
+                "after":self.inventory_after,
+                "expected_collection_revision":self.collection_revision,
+                "limit":INVENTORY_PAGE_SIZE,
+                "include_entry_names":true,
+            }),
             Stage::Begin => json!({
                 "action":"provider_snapshot_begin",
                 "sync_id":self.sync_id,
                 "source_revision":self.source_revision,
+                "expected_collection_revision":self.collection_revision,
             }),
             Stage::Batch => json!({
                 "action":"provider_snapshot_batch",
@@ -150,7 +191,16 @@ impl Transaction {
         self.catalog_revision = None;
         self.sequence = 0;
         self.batch_index = 0;
-        self.stage = Stage::Begin;
+        self.batches.clone_from(&self.base_batches);
+        self.inventory.clear();
+        self.inventory_total_count = None;
+        self.inventory_after = None;
+        self.collection_revision = None;
+        self.stage = if self.name_exclusions.is_empty() {
+            Stage::Begin
+        } else {
+            Stage::Inventory
+        };
         self.call = Call::Submit;
         self.retries = 0;
         self.operation_sequence = 0;
@@ -185,6 +235,9 @@ impl Transaction {
             }
             return Err(format!("{code}: {message}"));
         }
+        if self.stage == Stage::Inventory {
+            return self.consume_inventory_page(response);
+        }
         let revision = response
             .get("revision")
             .and_then(Value::as_u64)
@@ -194,6 +247,7 @@ impl Transaction {
             .and_then(Value::as_u64)
             .ok_or("catalog response omitted generation")?;
         match self.stage {
+            Stage::Inventory => unreachable!("inventory responses are handled separately"),
             Stage::Begin => {
                 let next_sequence = response
                     .get("next_sequence")
@@ -250,6 +304,137 @@ impl Transaction {
         self.operation_id = operation_id;
         Ok(false)
     }
+
+    fn consume_inventory_page(&mut self, response: &Value) -> Result<bool, String> {
+        let collection_revision = response
+            .get("collection_revision")
+            .and_then(Value::as_u64)
+            .ok_or("catalog inventory omitted collection_revision")?;
+        if self
+            .collection_revision
+            .is_some_and(|current| current != collection_revision)
+        {
+            return self.restart_after_inventory_conflict();
+        }
+        let total_count = response
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count <= MAX_INVENTORY_ENTRIES)
+            .ok_or("catalog inventory total_count is invalid")?;
+        if self
+            .inventory_total_count
+            .is_some_and(|previous| previous != total_count)
+        {
+            return self.restart_after_inventory_conflict();
+        }
+        let entries = response
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or("catalog inventory omitted entries")?;
+        if entries.len() > INVENTORY_PAGE_SIZE
+            || self.inventory.len().saturating_add(entries.len()) > total_count
+        {
+            return Err("catalog inventory page exceeded its declared bounds".into());
+        }
+        let mut previous = self.inventory_after.clone().unwrap_or_default();
+        for value in entries {
+            let entry: CatalogInventoryEntry = serde_json::from_value(value.clone())
+                .map_err(|_| "catalog inventory entry is malformed")?;
+            let valid_source_id = entry
+                .source_id
+                .parse::<i64>()
+                .ok()
+                .is_some_and(|id| id > 0 && id.to_string() == entry.source_id);
+            if entry.source_id.len() > 96
+                || !valid_source_id
+                || entry.source_id <= previous
+                || entry
+                    .added_at_unix
+                    .is_some_and(|timestamp| !(0..=253_402_300_799).contains(&timestamp))
+                || (entry.attached
+                    && entry
+                        .entry_name
+                        .as_deref()
+                        .is_none_or(|name| name.trim().is_empty() || !printable_text(name, 160)))
+                || (!entry.attached && entry.entry_name.is_some())
+            {
+                return Err("catalog inventory entry is invalid or unsorted".into());
+            }
+            previous = entry.source_id.clone();
+            self.inventory.push(entry);
+        }
+        self.collection_revision = Some(collection_revision);
+        self.inventory_total_count = Some(total_count);
+        match response.get("next_after") {
+            Some(Value::String(next_after)) => {
+                if entries.len() != INVENTORY_PAGE_SIZE
+                    || entries
+                        .last()
+                        .and_then(|entry| entry.get("source_id"))
+                        .and_then(Value::as_str)
+                        != Some(next_after)
+                    || self.inventory.len() >= total_count
+                {
+                    return Err("catalog inventory continuation is inconsistent".into());
+                }
+                self.inventory_after = Some(next_after.clone());
+            }
+            Some(Value::Null) => {
+                if self.inventory.len() != total_count {
+                    return Err("catalog inventory ended before total_count".into());
+                }
+                self.add_name_exclusion_removals()?;
+                self.inventory_after = None;
+                self.stage = Stage::Begin;
+            }
+            _ => return Err("catalog inventory next_after is malformed".into()),
+        }
+        self.call = Call::Submit;
+        let operation_id = self.next_operation_id();
+        self.operation_id = operation_id;
+        Ok(false)
+    }
+
+    fn add_name_exclusion_removals(&mut self) -> Result<(), String> {
+        let already_in_snapshot = self
+            .base_batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.get("source_id").and_then(Value::as_str))
+                    .chain(batch.selection_remove_source_ids.iter().map(String::as_str))
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let removals = self
+            .inventory
+            .iter()
+            .filter(|entry| {
+                entry.attached
+                    && !already_in_snapshot.contains(&entry.source_id)
+                    && entry.entry_name.as_deref().is_some_and(|name| {
+                        self.name_exclusions
+                            .iter()
+                            .any(|excluded| excluded.eq_ignore_ascii_case(name))
+                    })
+            })
+            .map(|entry| entry.source_id.clone())
+            .collect::<Vec<_>>();
+        self.batches.clone_from(&self.base_batches);
+        append_selection_removals(&mut self.batches, removals)
+    }
+
+    fn restart_after_inventory_conflict(&mut self) -> Result<bool, String> {
+        if self.conflicts >= MAX_CONFLICT_RESTARTS {
+            return Err("catalog inventory revision kept changing".into());
+        }
+        self.conflicts += 1;
+        self.restart();
+        Ok(false)
+    }
 }
 
 #[derive(Default)]
@@ -275,6 +460,16 @@ impl CatalogSync {
         let prepared = prepare_snapshot(snapshot, settings, steam_app_ids)?;
         let count = prepared.entries.len();
         let batches = batch_snapshot(prepared)?;
+        let name_exclusions = settings
+            .exclude_games
+            .iter()
+            .filter_map(|exclusion| match exclusion {
+                crate::settings::Exclusion::Metadata(metadata) if metadata.id.is_empty() => {
+                    Some(metadata.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
         self.last_import_count = count;
         self.skipped_steam_count = snapshot
             .games
@@ -293,6 +488,7 @@ impl CatalogSync {
             settings_epoch,
             settings.autosync_remove_uninstalled,
             batches,
+            name_exclusions,
         ));
         Ok(count)
     }
@@ -678,6 +874,49 @@ fn snapshot_batch_fits(batch: &SnapshotBatch) -> bool {
         .is_ok_and(|bytes| bytes.len() <= MAX_BATCH_BYTES)
 }
 
+fn append_selection_removals(
+    batches: &mut Vec<SnapshotBatch>,
+    source_ids: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    let mut seen = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .entries
+                .iter()
+                .filter_map(|entry| entry.get("source_id").and_then(Value::as_str))
+                .chain(batch.selection_remove_source_ids.iter().map(String::as_str))
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    for source_id in source_ids {
+        if !seen.insert(source_id.clone()) {
+            continue;
+        }
+        let mut candidate = batches.last().cloned().unwrap_or_default();
+        candidate
+            .selection_remove_source_ids
+            .push(source_id.clone());
+        if snapshot_batch_fits(&candidate) {
+            if let Some(last) = batches.last_mut() {
+                *last = candidate;
+            } else {
+                batches.push(candidate);
+            }
+            continue;
+        }
+
+        let mut batch = SnapshotBatch::default();
+        batch.selection_remove_source_ids.push(source_id);
+        if !snapshot_batch_fits(&batch) {
+            return Err("Lutris cleanup intent exceeds the batch payload limit".into());
+        }
+        batches.push(batch);
+    }
+    Ok(())
+}
+
 fn new_sync_id(source_revision: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -814,7 +1053,7 @@ mod tests {
 
     #[test]
     fn catalog_finish_honors_stale_removal_setting() {
-        let mut transaction = Transaction::new(2, 1, false, Vec::new());
+        let mut transaction = Transaction::new(2, 1, false, Vec::new(), Vec::new());
         transaction.generation = Some(3);
         transaction.catalog_revision = Some(8);
         transaction.stage = Stage::Finish;
@@ -878,7 +1117,7 @@ mod tests {
         assert_eq!(submitted_selection_removals, ["2", "3"]);
         assert!(!submitted_selection_removals.contains(&"88"));
 
-        let mut transaction = Transaction::new(2, 1, false, batches);
+        let mut transaction = Transaction::new(2, 1, false, batches, Vec::new());
         transaction.generation = Some(3);
         transaction.catalog_revision = Some(8);
         transaction.stage = Stage::Batch;
@@ -928,7 +1167,7 @@ mod tests {
         assert_eq!(prepared.entries[0]["source_id"], "5");
 
         let batches = batch_snapshot(prepared).unwrap();
-        let mut transaction = Transaction::new(7, 1, false, batches);
+        let mut transaction = Transaction::new(7, 1, false, batches, Vec::new());
         transaction.generation = Some(2);
         transaction.catalog_revision = Some(9);
         transaction.stage = Stage::Batch;
@@ -964,5 +1203,112 @@ mod tests {
             .flat_map(|batch| batch.selection_remove_source_ids.iter().map(String::as_str))
             .collect::<Vec<_>>();
         assert_eq!(submitted, ["99"]);
+    }
+
+    #[test]
+    fn name_exclusions_remove_only_attached_absent_rows_at_the_inventory_revision() {
+        let settings = ProductSettings {
+            autosync_remove_uninstalled: false,
+            exclude_games: vec![Exclusion::Metadata(ExclusionMetadata {
+                id: String::new(),
+                name: "Legacy title".into(),
+            })],
+            ..ProductSettings::default()
+        };
+        let mut catalog = CatalogSync::default();
+        catalog
+            .start(
+                &snapshot(vec![game(1, "Renamed title", "wine", "", "")]),
+                &settings,
+                &BTreeSet::new(),
+                4,
+                9,
+            )
+            .unwrap();
+        let transaction = catalog.transaction.as_mut().unwrap();
+        assert_eq!(
+            transaction.payload()["action"],
+            "provider_snapshot_inventory"
+        );
+        assert_eq!(transaction.payload()["include_entry_names"], true);
+
+        assert!(!transaction
+            .consume(&json!({
+                "ok":true,
+                "collection_revision":42,
+                "total_count":3,
+                "entries":[
+                    {"source_id":"1","added_at_unix":1,"source_flags":0,"attached":true,"entry_name":"Legacy title"},
+                    {"source_id":"2","added_at_unix":1,"source_flags":0,"attached":true,"entry_name":"LEGACY TITLE"},
+                    {"source_id":"3","added_at_unix":1,"source_flags":0,"attached":false,"entry_name":null}
+                ],
+                "next_after":null
+            }))
+            .unwrap());
+        assert_eq!(transaction.stage, Stage::Begin);
+        let begin = transaction.payload();
+        assert_eq!(begin["expected_collection_revision"], 42);
+
+        assert!(
+            !transaction
+                .consume(&json!({"ok":true,"revision":8,"generation":2,"next_sequence":0}))
+                .unwrap()
+        );
+        let batch = transaction.payload();
+        assert_eq!(batch["action"], "provider_snapshot_batch");
+        assert_eq!(batch["entries"][0]["source_id"], "1");
+        assert_eq!(batch["selection_remove_source_ids"], json!(["2"]));
+    }
+
+    #[test]
+    fn inventory_revision_conflict_restarts_before_applying_old_names() {
+        let settings = ProductSettings {
+            exclude_games: vec![Exclusion::Metadata(ExclusionMetadata {
+                id: String::new(),
+                name: "Legacy title".into(),
+            })],
+            ..ProductSettings::default()
+        };
+        let mut catalog = CatalogSync::default();
+        catalog
+            .start(
+                &snapshot(vec![game(1, "Current", "wine", "", "")]),
+                &settings,
+                &BTreeSet::new(),
+                1,
+                2,
+            )
+            .unwrap();
+        let transaction = catalog.transaction.as_mut().unwrap();
+        transaction
+            .consume(&json!({
+                "ok":true,
+                "collection_revision":7,
+                "total_count":1,
+                "entries":[{"source_id":"99","added_at_unix":1,"source_flags":0,"attached":true,"entry_name":"Legacy title"}],
+                "next_after":null
+            }))
+            .unwrap();
+        assert_eq!(transaction.payload()["expected_collection_revision"], 7);
+
+        transaction
+            .consume(&json!({
+                "ok":false,
+                "error":{"code":"revision_conflict","message":"catalog changed"}
+            }))
+            .unwrap();
+        assert_eq!(transaction.stage, Stage::Inventory);
+        assert!(transaction.inventory.is_empty());
+        assert!(transaction.collection_revision.is_none());
+        assert!(transaction.batches.iter().all(|batch| {
+            !batch
+                .selection_remove_source_ids
+                .iter()
+                .any(|id| id == "99")
+        }));
+        assert_eq!(
+            transaction.payload()["action"],
+            "provider_snapshot_inventory"
+        );
     }
 }

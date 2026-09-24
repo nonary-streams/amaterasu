@@ -59,6 +59,8 @@ pub enum Operation {
         after: Option<String>,
         expected_collection_revision: Option<u64>,
         limit: Option<usize>,
+        #[serde(default)]
+        include_entry_names: bool,
     },
     ProviderSnapshotBatch {
         sync_id: String,

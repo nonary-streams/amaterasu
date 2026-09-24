@@ -96,9 +96,17 @@ struct ProviderScan {
     after: Option<String>,
     scanned: usize,
     fingerprints: BTreeMap<String, String>,
+    entry_names: BTreeMap<String, String>,
     entry_ids: BTreeSet<String>,
     markers: BTreeMap<String, Marker>,
     provider_state: Option<SnapshotState>,
+}
+
+struct ProviderInventoryRequest {
+    after: Option<String>,
+    expected_collection_revision: Option<u64>,
+    limit: usize,
+    include_entry_names: bool,
 }
 
 #[derive(Clone)]
@@ -111,6 +119,7 @@ struct ProviderSession {
     provider_count: u64,
     entry_ids: BTreeSet<String>,
     fingerprints: BTreeMap<String, String>,
+    entry_names: BTreeMap<String, String>,
     markers: BTreeMap<String, Marker>,
     seen_source_ids: BTreeSet<String>,
     state: SnapshotState,
@@ -184,14 +193,6 @@ impl Pipeline {
         initiator: &str,
         operation: Operation,
     ) -> Result<(String, Option<String>, Operation), Value> {
-        if matches!(operation, Operation::ProviderSnapshotInventory { .. })
-            && caller != PLAYNITE_IMPORTER
-        {
-            return Err(error(
-                "permission_denied",
-                "provider inventory is reserved for the fixed Playnite importer",
-            ));
-        }
         if matches!(operation, Operation::ProviderPlayniteFullscreenEntry { .. })
             && caller != PLAYNITE_IMPORTER
         {
@@ -462,6 +463,7 @@ impl Pipeline {
             provider_count: scan.provider_count,
             entry_ids: scan.entry_ids,
             fingerprints: scan.fingerprints,
+            entry_names: scan.entry_names,
             markers: scan.markers,
             seen_source_ids,
             state,
@@ -473,24 +475,15 @@ impl Pipeline {
         &mut self,
         context: Context,
         session: ProviderSession,
-        after: Option<String>,
-        expected_collection_revision: Option<u64>,
-        limit: usize,
+        request: ProviderInventoryRequest,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        if session.caller != PLAYNITE_IMPORTER {
-            return complete(
-                send,
-                context.request_id,
-                error(
-                    "permission_denied",
-                    "inventory is only available to Playnite",
-                ),
-            );
-        }
-        if !(1..=32).contains(&limit)
-            || after.as_ref().is_some_and(|value| !valid_source_id(value))
-            || after.is_some() != expected_collection_revision.is_some()
+        if !(1..=32).contains(&request.limit)
+            || request
+                .after
+                .as_ref()
+                .is_some_and(|value| !valid_source_id(value))
+            || request.after.is_some() != request.expected_collection_revision.is_some()
         {
             return complete(
                 send,
@@ -498,7 +491,7 @@ impl Pipeline {
                 error("invalid_request", "provider inventory cursor is invalid"),
             );
         }
-        if let Some(expected) = expected_collection_revision
+        if let Some(expected) = request.expected_collection_revision
             && expected != session.collection_revision
         {
             return complete(
@@ -508,7 +501,7 @@ impl Pipeline {
             );
         }
 
-        let after = after.as_deref().unwrap_or_default();
+        let after = request.after.as_deref().unwrap_or_default();
         let mut markers: Vec<_> = session
             .markers
             .values()
@@ -516,17 +509,32 @@ impl Pipeline {
             .collect();
         markers.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         let total_count = markers.len();
-        let has_more = markers.len() > limit;
+        let has_more = markers.len() > request.limit;
         let entries: Vec<_> = markers
             .iter()
-            .take(limit)
+            .take(request.limit)
             .map(|marker| {
-                json!({
+                let attached = !marker.detached
+                    && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint);
+                let mut row = json!({
                     "source_id":marker.source_id,
                     "added_at_unix":marker.added_at_unix,
                     "source_flags":marker.source_flags,
-                    "attached":!marker.detached && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint),
-                })
+                    "attached":attached,
+                });
+                if request.include_entry_names {
+                    row["entry_name"] = if attached {
+                        session
+                            .entry_names
+                            .get(&marker.entry_id)
+                            .cloned()
+                            .map(Value::String)
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                }
+                row
             })
             .collect();
         let next_after = if has_more {
@@ -573,12 +581,16 @@ impl Pipeline {
                 after,
                 expected_collection_revision,
                 limit,
+                include_entry_names,
             } => self.provider_inventory_page(
                 context,
                 session,
-                after,
-                expected_collection_revision,
-                limit.unwrap_or(32),
+                ProviderInventoryRequest {
+                    after,
+                    expected_collection_revision,
+                    limit: limit.unwrap_or(32),
+                    include_entry_names,
+                },
                 send,
             ),
             Operation::ProviderSnapshotBatch {
@@ -2049,6 +2061,7 @@ impl Pipeline {
                     after: None,
                     scanned: 0,
                     fingerprints: BTreeMap::new(),
+                    entry_names: BTreeMap::new(),
                     entry_ids: BTreeSet::new(),
                     markers: BTreeMap::new(),
                     provider_state: None,
@@ -2125,6 +2138,7 @@ impl Pipeline {
                         {
                             return complete(send, context.request_id, malformed());
                         }
+                        scan.entry_names.insert(key.into(), entry.name);
                         scan.entry_ids.insert(key.into());
                     } else {
                         return complete(send, context.request_id, malformed());

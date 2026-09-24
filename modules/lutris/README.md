@@ -43,15 +43,18 @@ cannot select or impersonate an owner.
 `autosync_remove_uninstalled=true` removes stale Lutris-owned entries only
 after a successful complete scan. The catalog preserves manually edited or
 detached entries. When removal is false, source IDs absent from the scan are
-retained unless an explicit ID exclusion names them. Currently discovered games
-that became excluded, non-importable under the Steam setting, or shadowed by a
-direct Steam entry are selectively removed after the complete scan. The catalog
-preserves manually edited or detached entries for those removals as well.
+retained unless an exclusion names them. Name exclusions use a revision-bound
+inventory of attached Lutris-owned rows before snapshot begin, so an absent row
+can be removed by its previous catalog name without touching another provider's
+or a user's entries. Detached rows do not expose a name and remain unchanged.
+Currently discovered games that became excluded, non-importable under the Steam
+setting, or shadowed by a direct Steam entry are selectively removed after the
+complete scan. Catalog revision changes during inventory restart the inventory
+before cleanup is submitted.
 
 Other remaining gaps are trusted per-session discovery for machine services,
 cross-user import, launch handling for games whose Lutris client cannot be
-resolved, immediate removal of already imported entries when the provider is
-disabled, and matching name-only exclusions against old catalog rows absent
-from discovery.
+resolved, and immediate removal of already imported entries when the provider is
+disabled.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.

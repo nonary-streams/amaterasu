@@ -232,8 +232,8 @@ or migrates storage, including when reading a legacy document.
 
 Startup `import_principals` maps each trusted provider caller to one fixed catalog
 owner. It defaults to `{}` and has the same 16-entry principal validation as
-`export_principals`. Release policy maps `amaterasu.steam` and
-`amaterasu.playnite` to `amaterasu.management`. The importer identity comes from the
+`export_principals`. Release policy maps `amaterasu.steam`,
+`amaterasu.playnite`, and `amaterasu.lutris` to `amaterasu.management`. The importer identity comes from the
 authenticated immediate caller of `Poll`; requests do not accept an owner or
 domain selector. The catalog stores provider ownership and sync state in separate
 reserved collection rows, not in user-editable `Entry` metadata.
@@ -250,12 +250,13 @@ Begin a source snapshot and retain the returned generation and catalog revision:
 
 Providers may first enumerate their existing ownership markers with
 `provider_snapshot_inventory`. The importer is fixed by the authenticated Poll
-caller, and the operation rejects any other principal. Request the first page
-with both `after` and `expected_collection_revision` null, then pass the returned
-revision and last `source_id` on each later page:
+caller and startup import policy. Request the first page with both `after` and
+`expected_collection_revision` null, then pass the returned revision and last
+`source_id` on each later page. Providers that need names for attached rows may
+opt in with `include_entry_names`:
 
 ```json
-{"action":"provider_snapshot_inventory","after":null,"expected_collection_revision":null,"limit":32}
+{"action":"provider_snapshot_inventory","after":null,"expected_collection_revision":null,"limit":32,"include_entry_names":true}
 ```
 
 The response includes `collection_revision`, `total_count`, sorted marker rows,
@@ -264,8 +265,11 @@ Providers should require the final row count to match `total_count` before
 beginning cleanup and pass the same revision to `provider_snapshot_begin`;
 revision drift returns `revision_conflict`. Marker rows include the stable
 `source_id`, nullable trusted `added_at_unix`, provider `source_flags`, and
-`attached`, which is false after the entry was manually edited. Unknown import
-timestamps remain null so consumers can fail closed on age-based policies.
+`attached`, which is false after the entry was manually edited. With
+`include_entry_names`, `entry_name` is returned only for an attached entry
+owned by that caller; detached or changed entries have a null name. Manual rows
+and other providers' rows are never included. Unknown import timestamps remain
+null so consumers can fail closed on age-based policies.
 
 Send batches with stable source IDs and validated catalog entries. Each batch
 contains 1–8 combined entries and removal intents, at most 12,000 encoded bytes.

@@ -251,6 +251,14 @@ fn playnite_importer() -> Pipeline {
     )
 }
 
+fn lutris_importer() -> Pipeline {
+    Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([("amaterasu.lutris".into(), "amaterasu.management".into())]),
+    )
+}
+
 fn playnite_entry(name: &str) -> Value {
     json!({
         "name":name,
@@ -1698,6 +1706,7 @@ fn provider_inventory_is_fixed_owner_paginated_and_collection_revision_bound() {
     assert_eq!(first["total_count"], 2);
     assert_eq!(first["entries"][0]["source_id"], "playnite:10");
     assert_eq!(first["entries"][0]["attached"], true);
+    assert!(first["entries"][0].get("entry_name").is_none());
     assert!(first["entries"][0]["added_at_unix"].as_i64().unwrap() > 0);
     assert!(first["next_after"].is_string());
     let collection_revision = first["collection_revision"].as_u64().unwrap();
@@ -1749,6 +1758,107 @@ fn provider_inventory_is_fixed_owner_paginated_and_collection_revision_bound() {
         "amaterasu.management",
     );
     assert_eq!(stale_begin["error"]["code"], "revision_conflict");
+}
+
+#[test]
+fn provider_inventory_names_are_fixed_owner_and_attached_row_only() {
+    let mut backend = Backend::default();
+    let mut lutris = lutris_importer();
+    let lutris_begin = backend.run_for(
+        &mut lutris,
+        snapshot_begin("lutris-inventory-seed", 1),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let lutris_batch = backend.run_for(
+        &mut lutris,
+        snapshot_batch(
+            "lutris-inventory-seed",
+            lutris_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            lutris_begin["revision"].as_u64().unwrap(),
+            vec![("10", entry("Lutris-owned title"))],
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let lutris_finish = backend.run_for(
+        &mut lutris,
+        snapshot_finish(
+            "lutris-inventory-seed",
+            lutris_begin["generation"].as_u64().unwrap(),
+            1,
+            lutris_batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(lutris_finish["ok"], true, "{lutris_finish}");
+
+    let mut playnite = playnite_importer();
+    let playnite_expected_revision = backend.metadata["revision"].as_u64().unwrap();
+    let playnite_import = import_playnite_entries(
+        &mut backend,
+        &mut playnite,
+        "lutris-inventory-other-provider",
+        1,
+        playnite_expected_revision,
+        vec![("playnite:1", "Playnite-owned title")],
+    );
+    assert_eq!(playnite_import["ok"], true);
+    let manual_expected_revision = backend.metadata["revision"].as_u64().unwrap();
+    let manual = backend.run_for(
+        &mut Pipeline::default(),
+        json!({
+            "action":"create",
+            "expected_revision":manual_expected_revision,
+            "entry":entry("Manual title"),
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+
+    let mut inventory_request = snapshot_inventory(None, None, 32);
+    inventory_request["include_entry_names"] = json!(true);
+    let inventory = backend.run_for(
+        &mut lutris,
+        inventory_request,
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(inventory["ok"], true, "{inventory}");
+    assert_eq!(inventory["total_count"], 1);
+    assert_eq!(inventory["entries"][0]["source_id"], "10");
+    assert_eq!(inventory["entries"][0]["attached"], true);
+    assert_eq!(inventory["entries"][0]["entry_name"], "Lutris-owned title");
+
+    let marker_key = "~provider.entry:amaterasu.lutris:10";
+    let entry_id = backend.entries[marker_key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    backend.entries.get_mut(&entry_id).unwrap()["name"] = json!("User-edited title");
+    let mut detached_request = snapshot_inventory(None, None, 32);
+    detached_request["include_entry_names"] = json!(true);
+    let detached = backend.run_for(
+        &mut lutris,
+        detached_request,
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(detached["entries"][0]["attached"], false);
+    assert!(detached["entries"][0]["entry_name"].is_null());
 }
 
 #[test]
