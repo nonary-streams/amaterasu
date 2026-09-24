@@ -808,7 +808,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     assert!(
         state.session_stored.as_ref().unwrap()["sessions"]
             .as_array()
-            .map_or(true, |sessions| sessions.is_empty())
+            .is_none_or(|sessions| sessions.is_empty())
     );
     let mut after_logout = Pipeline::new(settings_with_ttls(120, 400));
     assert_eq!(
@@ -1455,7 +1455,7 @@ fn administrator_session_metadata_is_not_a_bearer_and_revocation_works() {
     assert!(
         state.session_stored.as_ref().unwrap()["sessions"]
             .as_array()
-            .map_or(true, |sessions| sessions.is_empty())
+            .is_none_or(|sessions| sessions.is_empty())
     );
     let mut restarted = Pipeline::new(settings());
     assert_eq!(
