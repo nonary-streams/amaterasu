@@ -151,6 +151,11 @@ impl Router {
         self.config.https_port = https_port;
     }
 
+    pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
+        self.launches
+            .set_output_name_settings(ready, configured_output_name);
+    }
+
     pub fn dispatch(
         &mut self,
         connection: u64,

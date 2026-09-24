@@ -36,6 +36,8 @@ enum Operation {
         address_family: FieldUpdate<settings::AddressFamily>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         bind_address: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        output_name: FieldUpdate<String>,
         expected_revision: u64,
     },
 }
@@ -147,6 +149,14 @@ impl ManagedModule for NvhttpModule {
             {
                 self.next_listener_rebind = Instant::now();
             }
+        }
+        if let Some(router) = &mut self.router {
+            // Apply settings before completing management writes and before dispatching
+            // HTTP requests later in this tick, so a returned update is launch-visible.
+            router.set_output_name_settings(
+                self.product_settings.loaded(),
+                self.product_settings.configured_output_name(),
+            );
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -393,6 +403,7 @@ impl NvhttpModule {
                                 port,
                                 address_family,
                                 bind_address,
+                                output_name,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -414,6 +425,7 @@ impl NvhttpModule {
                                     port,
                                     address_family,
                                     bind_address,
+                                    output_name,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -549,6 +561,7 @@ mod tests {
         let Operation::SettingsUpdate {
             address_family: omitted_family,
             bind_address: omitted_bind,
+            output_name: omitted_output,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -559,14 +572,16 @@ mod tests {
         };
         assert_eq!(omitted_family, FieldUpdate::Omitted);
         assert_eq!(omitted_bind, FieldUpdate::Omitted);
+        assert_eq!(omitted_output, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
             bind_address: blank_bind,
+            output_name: reset_output,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":null,"bind_address":""
+            "address_family":null,"bind_address":"","output_name":null
         }))
         .unwrap()
         else {
@@ -574,14 +589,16 @@ mod tests {
         };
         assert_eq!(reset_family, FieldUpdate::Null);
         assert_eq!(blank_bind, FieldUpdate::Value(String::new()));
+        assert_eq!(reset_output, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
             bind_address: address,
+            output_name,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":"both","bind_address":"::1"
+            "address_family":"both","bind_address":"::1","output_name":"stable-display-id"
         }))
         .unwrap()
         else {
@@ -589,5 +606,6 @@ mod tests {
         };
         assert_eq!(family, FieldUpdate::Value(settings::AddressFamily::Both));
         assert_eq!(address, FieldUpdate::Value("::1".into()));
+        assert_eq!(output_name, FieldUpdate::Value("stable-display-id".into()));
     }
 }

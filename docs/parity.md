@@ -63,7 +63,7 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Reliable control transport | Implemented Rust ENet, authenticated control, paired launch/revocation and leased keyboard/mouse dispatch | Controller/feedback routing, congestion integration and real client sessions |
 | RTSP negotiation | Implemented encrypted TCP tickets, UDP discovery, armed startup and paired launch/revocation integration | Complete profile negotiation, reconnect/resume and real client qualification |
 | Browser streaming | Pending | WebRTC signaling, media, input, reconnect and mixed-protocol ownership |
-| WGC/DXGI capture | Implemented Windows DXGI and WGC CPU readback; hardware unqualified | Desktop transitions, selected outputs, fallback, hybrid GPUs and pacing |
+| WGC/DXGI capture | Implemented Windows DXGI and WGC CPU readback plus persistent global output selection for new streams; hardware unqualified | Desktop transitions, hotplug recovery, fallback, hybrid GPUs and pacing |
 | Linux capture | Pending | Supported KDE Wayland paths, PipeWire/DRM and pre-login constraints |
 | Video encoders | Implemented Windows hardware Media Foundation H.264; hardware unqualified | NVIDIA/AMD/Intel, codec negotiation/probing and adapter-specific capabilities |
 | Video processing and HDR | Implemented BGRA-to-NV12 conversion, provider selection, force-IDR and graceful video drain; HDR pending | Color conversion, HDR metadata, processing, TrueHDR and SDR fallback |

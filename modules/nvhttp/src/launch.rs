@@ -210,6 +210,8 @@ impl StreamProfile {
 
 pub struct Controller {
     config: Option<StreamingConfig>,
+    configured_output_name: Option<String>,
+    output_settings_ready: bool,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -226,6 +228,8 @@ impl Controller {
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
             config,
+            configured_output_name: None,
+            output_settings_ready: true,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -236,6 +240,11 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
+        self.output_settings_ready = ready;
+        self.configured_output_name = configured_output_name.map(str::to_owned);
     }
 
     pub fn busy(&self) -> bool {
@@ -252,6 +261,9 @@ impl Controller {
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
+        if !self.output_settings_ready {
+            return Some(private_error(503, "stream settings are loading"));
+        }
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
@@ -262,6 +274,12 @@ impl Controller {
             return Some(private_error(400, "unsupported streaming request"));
         }
         let global_fec_percentage = config.profile.fec_percentage;
+        let capture_output = self
+            .configured_output_name
+            .as_deref()
+            .filter(|output_name| !output_name.is_empty())
+            .unwrap_or(&config.capture.output)
+            .to_owned();
 
         if let Some(record) = self
             .records
@@ -305,6 +323,7 @@ impl Controller {
             operation_id(&self.nonce, id, "rtsp"),
             connect_data,
             global_fec_percentage,
+            capture_output,
             connection,
             now + INITIAL_DEADLINE,
         );

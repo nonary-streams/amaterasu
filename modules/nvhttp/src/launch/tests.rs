@@ -106,6 +106,78 @@ fn secret_key_reuse_is_global_but_key_id_reuse_is_allowed_for_fresh_sessions() {
     );
 }
 
+#[test]
+fn stream_start_waits_for_persisted_output_settings() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_output_name_settings(false, None);
+
+    let reply = controller
+        .launch(1, request(1), peer(1), now)
+        .expect("unloaded persisted settings reject streaming");
+    assert_eq!(reply.status, 503);
+    assert!(!controller.busy());
+}
+
+#[test]
+fn selected_or_default_output_is_snapshotted_into_rtsp_open() {
+    for (configured, expected) in [
+        (Some("selected-display-id"), "selected-display-id"),
+        (None, "display-one"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_output_name_settings(true, configured);
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        // A later settings write affects later sessions, not this launch transaction.
+        controller.set_output_name_settings(true, Some("changed-after-launch"));
+
+        let mut broker = Broker::default();
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["capture"]["output"], expected);
+    }
+}
+
+#[test]
+fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
+    let now = Instant::now();
+    let selected = "unavailable-display-id";
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_output_name_settings(true, Some(selected));
+    let mut broker = Broker {
+        unavailable_output: Some(selected.into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    let opened_outputs: Vec<_> = broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                payload["capture"]["output"].as_str()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened_outputs, [selected]);
+}
+
 struct Broker {
     next: u64,
     results: BTreeMap<u64, Value>,
@@ -119,6 +191,7 @@ struct Broker {
     application_id: String,
     fail_rtsp_settlement: bool,
     fail_application_settlement: bool,
+    unavailable_output: Option<String>,
     unsettled_rtsp: BTreeSet<u64>,
     unsettled_application: BTreeSet<u64>,
     rtsp_closed: bool,
@@ -142,6 +215,7 @@ impl Default for Broker {
             application_id: "app-0000000000000001".into(),
             fail_rtsp_settlement: false,
             fail_application_settlement: false,
+            unavailable_output: None,
             unsettled_rtsp: BTreeSet::new(),
             unsettled_application: BTreeSet::new(),
             rtsp_closed: false,
@@ -205,6 +279,18 @@ impl Broker {
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.rtsp/1"
+            && self
+                .unavailable_output
+                .as_deref()
+                .is_some_and(|output| action == "open" && payload["capture"]["output"] == output)
+        {
+            return json!({"ok":false,"code":"not_found"});
+        }
+        if service == "amaterasu.rtsp/1" && self.unavailable_output.is_some() && action == "lookup"
+        {
+            return json!({"ok":false,"code":"ticket_not_found"});
+        }
         if service == "amaterasu.launch/1" {
             if action == "launch_export" {
                 self.application_operation = payload["operation_id"]

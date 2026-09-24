@@ -155,6 +155,8 @@ impl Controller {
             Phase::OpenRtsp => {
                 record.rtsp_requested = true;
                 let config = self.config.as_ref().expect("enabled streaming config");
+                let mut capture = config.capture.clone();
+                capture.output = record.capture_output.clone();
                 (
                     RTSP_SERVICE,
                     json!({
@@ -165,7 +167,7 @@ impl Controller {
                         "key_hex": key_hex(&record.request.remote_input_key),
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
-                        "capture": config.capture,
+                        "capture": capture,
                         "profile": {
                             "width": record.request.width,
                             "height": record.request.height,

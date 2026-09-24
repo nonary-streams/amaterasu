@@ -90,9 +90,9 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. A legacy version 1 hostname-only product
-document remains readable and uses the component's configured HTTP port; the next
-update writes a version 2 document containing both hostname and port.
+active_http_port/active_https_port values. Product document versions 1 through 4
+remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
+address policy, and v4 adds the global capture output selection.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -146,6 +146,28 @@ within 16–3840 by 16–2160; maximum FPS is 1–120. Bitrate, audio, packet du
 and reference-frame bounds are validated before listeners start. Video FEC and
 packetization settings are additionally checked by the same packetizer used for
 the stream.
+
+## Global capture output
+
+The NVHTTP settings API reads and updates the global `output_name` setting. Reads
+return `configured_output_name`, `effective_output_name`, and `capture_provider`.
+The effective name is the selected output ID, or the bootstrap
+`streaming.capture.output` when no selection is stored. Updates may omit
+`output_name` to keep its current value; `null` or `""` resets it to the bootstrap
+output. A nonempty value is stored exactly and limited to 512 UTF-8 bytes; values
+with controls or leading/trailing whitespace are rejected. A v4 product document
+stores the setting as a nullable string. Versions 1 through 3 load with no global
+selection.
+
+NVHTTP snapshots the effective output ID when a new Moonlight stream starts and
+passes it through RTSP to the existing capture provider. Direct RTSP opens retain
+their explicit per-session capture output. The selected ID applies to future
+sessions; changing it does not retarget an active capture. If that ID is no longer
+available, stream startup fails and does not fall back to another output. The
+selector depends on provider-specific output enumeration; Windows DXGI and WGC
+are the implemented capture providers. Linux capture/output enumeration and
+macOS capture/output enumeration are not implemented, so persisted output choices
+do not imply Linux or macOS streaming support.
 
 ## Wire routes
 

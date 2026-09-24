@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 const LEGACY_SETTINGS_VERSION: u64 = 1;
 const PORT_SETTINGS_VERSION: u64 = 2;
-const SETTINGS_VERSION: u64 = 3;
+const NETWORK_SETTINGS_VERSION: u64 = 3;
+const SETTINGS_VERSION: u64 = 4;
+const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -21,6 +23,7 @@ pub enum AdminAction {
         port: u16,
         address_family: FieldUpdate<AddressFamily>,
         bind_address: FieldUpdate<String>,
+        output_name: FieldUpdate<String>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -87,6 +90,7 @@ enum Purpose {
         request: u64,
         hostname: String,
         target: NetworkTarget,
+        output_name: Option<String>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -115,6 +119,7 @@ struct ProductDocument {
     port: Option<u16>,
     address_family: Option<AddressFamily>,
     bind_address: Option<String>,
+    output_name: Option<String>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -130,6 +135,7 @@ pub struct ProductSettings {
     port: u16,
     configured_address_family: Option<AddressFamily>,
     configured_bind_address: Option<String>,
+    configured_output_name: Option<String>,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
     active_rtsp_base_port: Option<u16>,
@@ -217,6 +223,7 @@ impl ProductSettings {
             port: bootstrap_port,
             configured_address_family: None,
             configured_bind_address: None,
+            configured_output_name: None,
             active_http_port: None,
             active_https_port: None,
             active_rtsp_base_port: None,
@@ -245,6 +252,28 @@ impl ProductSettings {
 
     pub fn configured_hostname(&self) -> &str {
         &self.configured_hostname
+    }
+
+    pub fn configured_output_name(&self) -> Option<&str> {
+        self.configured_output_name.as_deref()
+    }
+
+    pub fn effective_output_name(&self) -> Option<&str> {
+        self.configured_output_name.as_deref().or_else(|| {
+            self.bootstrap_settings
+                .streaming
+                .as_ref()
+                .map(|streaming| streaming.capture.output.as_str())
+        })
+    }
+
+    pub fn capture_provider(&self) -> Option<&'static str> {
+        self.bootstrap_settings.streaming.as_ref().map(|streaming| {
+            match streaming.capture.capture_provider {
+                crate::launch::CaptureProvider::Dxgi => "dxgi",
+                crate::launch::CaptureProvider::Wgc => "wgc",
+            }
+        })
     }
 
     pub fn port(&self) -> u16 {
@@ -699,6 +728,7 @@ impl ProductSettings {
                 port,
                 address_family,
                 bind_address,
+                output_name,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -716,6 +746,19 @@ impl ProductSettings {
                     );
                     return;
                 }
+                let output_name = match apply_output_name_update(
+                    output_name,
+                    self.configured_output_name.clone(),
+                ) {
+                    Ok(output_name) => output_name,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure("invalid_output_name", "output name is invalid"),
+                        );
+                        return;
+                    }
+                };
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -769,13 +812,19 @@ impl ProductSettings {
                     return;
                 }
                 self.start_call(
-                    product_update_payload(expected_revision, &hostname, &target),
+                    product_update_payload(
+                        expected_revision,
+                        &hostname,
+                        &target,
+                        output_name.as_deref(),
+                    ),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
                     Purpose::Update {
                         request: request.request,
                         hostname,
                         target,
+                        output_name,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -886,11 +935,18 @@ impl ProductSettings {
                 request,
                 hostname,
                 target,
+                output_name,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
                 CallOutcome::Payload(payload) => {
-                    match update_result(&payload, expected_revision, &hostname, &target) {
+                    match update_result(
+                        &payload,
+                        expected_revision,
+                        &hostname,
+                        &target,
+                        output_name.as_deref(),
+                    ) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
                             let previous_http_target = self.http_target();
                             let previous_rtsp_target = self.rtsp_target();
@@ -931,8 +987,7 @@ impl ProductSettings {
                         Ok(_) => {
                             self.start_load(Some(Followup::Unknown {
                                 request,
-                                reason: "product_update committed an invalid listener policy"
-                                    .into(),
+                                reason: "product_update committed invalid settings".into(),
                             }));
                         }
                         Err(error) if error.code == "revision_conflict" => {
@@ -1100,6 +1155,13 @@ impl ProductSettings {
     }
 
     fn validate_document(&self, document: &ProductDocument) -> Result<(), SettingFailure> {
+        if document
+            .output_name
+            .as_deref()
+            .is_some_and(|name| normalize_output_name(name).is_err())
+        {
+            return Err(invalid_state("persisted output name is invalid"));
+        }
         let mut validation_settings = self.bootstrap_settings.clone();
         let port = document.port.unwrap_or(self.bootstrap_port);
         validation_settings.http_bind.set_port(port);
@@ -1131,6 +1193,7 @@ impl ProductSettings {
         self.port = document.port.unwrap_or(self.bootstrap_port);
         self.configured_address_family = document.address_family;
         self.configured_bind_address = document.bind_address;
+        self.configured_output_name = document.output_name;
         self.loaded = true;
     }
 
@@ -1145,6 +1208,9 @@ impl ProductSettings {
             "bind_address":self.effective_bind_address(),
             "configured_address_family":self.configured_address_family,
             "configured_bind_address":self.configured_bind_address,
+            "configured_output_name":self.configured_output_name,
+            "effective_output_name":self.effective_output_name(),
+            "capture_provider":self.capture_provider(),
             "active_http_port":self.active_http_port,
             "active_https_port":self.active_https_port,
             "http_addresses":self.active_http_addresses,
@@ -1193,7 +1259,12 @@ fn request_command(pending: &PendingCall) -> Command {
     }
 }
 
-fn product_update_payload(expected_revision: u64, hostname: &str, target: &NetworkTarget) -> Value {
+fn product_update_payload(
+    expected_revision: u64,
+    hostname: &str,
+    target: &NetworkTarget,
+    output_name: Option<&str>,
+) -> Value {
     json!({
         "action":"product_update",
         "expected_revision":expected_revision,
@@ -1203,6 +1274,7 @@ fn product_update_payload(expected_revision: u64, hostname: &str, target: &Netwo
             "port":target.port,
             "address_family":target.address_family,
             "bind_address":target.bind_address,
+            "output_name":output_name,
         },
     })
 }
@@ -1246,6 +1318,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             port: None,
             address_family: None,
             bind_address: None,
+            output_name: None,
         });
     }
 
@@ -1255,7 +1328,10 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         .ok_or_else(|| invalid_state("product settings version is missing"))?;
     if !matches!(
         version,
-        LEGACY_SETTINGS_VERSION | PORT_SETTINGS_VERSION | SETTINGS_VERSION
+        LEGACY_SETTINGS_VERSION
+            | PORT_SETTINGS_VERSION
+            | NETWORK_SETTINGS_VERSION
+            | SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -1265,14 +1341,16 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     let expected_value_count = match version {
         LEGACY_SETTINGS_VERSION => 1,
         PORT_SETTINGS_VERSION => 2,
-        SETTINGS_VERSION => 4,
+        NETWORK_SETTINGS_VERSION => 4,
+        SETTINGS_VERSION => 5,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
-        || (version == SETTINGS_VERSION
+        || (version >= NETWORK_SETTINGS_VERSION
             && (!values.contains_key("address_family") || !values.contains_key("bind_address")))
+        || (version == SETTINGS_VERSION && !values.contains_key("output_name"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1296,7 +1374,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             .map_err(|_| invalid_state("persisted product port is outside the supported range"))?;
         Some(port)
     };
-    let (address_family, bind_address) = if version == SETTINGS_VERSION {
+    let (address_family, bind_address) = if version >= NETWORK_SETTINGS_VERSION {
         let address_family = serde_json::from_value::<Option<AddressFamily>>(
             values.get("address_family").cloned().unwrap_or(Value::Null),
         )
@@ -1309,12 +1387,23 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         (None, None)
     };
+    let output_name = if version == SETTINGS_VERSION {
+        match values.get("output_name") {
+            Some(Value::Null) => None,
+            Some(Value::String(value)) => normalize_output_name(value)
+                .map_err(|_| invalid_state("persisted output name is invalid"))?,
+            _ => return Err(invalid_state("persisted output name is invalid")),
+        }
+    } else {
+        None
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
         port,
         address_family,
         bind_address,
+        output_name,
     })
 }
 
@@ -1323,13 +1412,14 @@ fn update_result(
     expected_revision: u64,
     hostname: &str,
     target: &NetworkTarget,
+    output_name: Option<&str>,
 ) -> Result<ProductDocument, SettingFailure> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v3 network settings",
+            "product_update did not confirm the v4 output settings",
         ));
     }
     let document = parse_document(payload)?;
@@ -1337,6 +1427,7 @@ fn update_result(
         || document.port != Some(target.port)
         || document.address_family != target.address_family
         || document.bind_address != target.bind_address
+        || document.output_name.as_deref() != output_name
         || expected_revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -1344,6 +1435,31 @@ fn update_result(
         ));
     }
     Ok(document)
+}
+
+fn normalize_output_name(value: &str) -> Result<Option<String>, ()> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > MAX_OUTPUT_NAME_BYTES
+        || value.trim() != value
+        || value.trim().is_empty()
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn apply_output_name_update(
+    update: FieldUpdate<String>,
+    current: Option<String>,
+) -> Result<Option<String>, ()> {
+    match update {
+        FieldUpdate::Omitted => Ok(current),
+        FieldUpdate::Null => Ok(None),
+        FieldUpdate::Value(value) => normalize_output_name(&value),
+    }
 }
 
 fn apply_field_update<T>(update: FieldUpdate<T>, current: Option<T>) -> Option<T> {
@@ -1409,6 +1525,36 @@ fn failure_with_revision(code: &str, message: &str, revision: Option<u64>) -> Va
 mod tests {
     use super::*;
 
+    fn bootstrap_with_capture_output(output: &str) -> Settings {
+        Settings {
+            streaming: Some(crate::launch::StreamingConfig {
+                capture: crate::launch::CaptureConfig {
+                    capture_provider: crate::launch::CaptureProvider::Dxgi,
+                    output: output.into(),
+                    encoder: 0,
+                    audio_endpoint: "default".into(),
+                },
+                profile: crate::launch::StreamProfile {
+                    max_width: 1920,
+                    max_height: 1080,
+                    max_fps: 60,
+                    bitrate_kbps: 10_000,
+                    max_reference_frames: 1,
+                    packet_size: 1024,
+                    fec_percentage: 20,
+                    min_parity_shards: 2,
+                    max_fec_blocks: 1,
+                    packet_ms: 10,
+                    audio_bitrate: 128_000,
+                    encrypt_video: true,
+                    encrypt_audio: true,
+                    permit_legacy_audio_iv_wrap: false,
+                },
+            }),
+            ..Settings::default()
+        }
+    }
+
     #[test]
     fn parses_missing_and_persisted_hostname_documents() {
         let missing = parse_document(&json!({
@@ -1426,6 +1572,7 @@ mod tests {
         assert_eq!(persisted.revision, 7);
         assert_eq!(persisted.hostname.as_deref(), Some("Studio PC"));
         assert_eq!(persisted.port, None);
+        assert_eq!(persisted.output_name, None);
 
         let defaulted = parse_document(&json!({
             "ok":true,"found":true,"version":1,"revision":8,"values":{"hostname":""}
@@ -1439,6 +1586,118 @@ mod tests {
         .unwrap();
         assert_eq!(migrated.hostname.as_deref(), Some("Studio PC"));
         assert_eq!(migrated.port, Some(48_000));
+        let network_document = parse_document(&json!({
+            "ok":true,"found":true,"version":3,"revision":10,
+            "values":{"hostname":"Studio PC","port":48000,"address_family":null,"bind_address":null}
+        }))
+        .unwrap();
+        assert_eq!(network_document.output_name, None);
+    }
+
+    #[test]
+    fn output_name_update_uses_null_empty_and_omitted_as_intended() {
+        assert_eq!(
+            apply_output_name_update(FieldUpdate::Omitted, Some("existing-id".into())),
+            Ok(Some("existing-id".into()))
+        );
+        assert_eq!(
+            apply_output_name_update(FieldUpdate::Null, Some("existing-id".into())),
+            Ok(None)
+        );
+        assert_eq!(
+            apply_output_name_update(
+                FieldUpdate::Value(String::new()),
+                Some("existing-id".into())
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            apply_output_name_update(FieldUpdate::Value("selected-display-id".into()), None),
+            Ok(Some("selected-display-id".into()))
+        );
+
+        for invalid in [" ", " display-id", "display-id ", "display\nid"] {
+            assert_eq!(normalize_output_name(invalid), Err(()));
+        }
+        assert_eq!(
+            normalize_output_name(&"é".repeat(256)),
+            Ok(Some("é".repeat(256)))
+        );
+        assert_eq!(normalize_output_name(&"é".repeat(257)), Err(()));
+    }
+
+    #[test]
+    fn v4_requires_nullable_output_name_and_normalizes_empty_to_automatic() {
+        let automatic = parse_document(&json!({
+            "ok":true,"found":true,"version":4,"revision":1,
+            "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":""}
+        }))
+        .unwrap();
+        assert_eq!(automatic.output_name, None);
+
+        for payload in [
+            json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}}),
+            json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":" "}}),
+            json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":" display-id"}}),
+            json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":"display\nid"}}),
+        ] {
+            assert_eq!(
+                parse_document(&payload).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_output_selection_survives_restart_and_null_uses_bootstrap_output() {
+        let bootstrap = bootstrap_with_capture_output("bootstrap-display-id");
+        let selected_document = json!({
+            "ok":true,"found":true,"version":4,"revision":11,
+            "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":"selected-display-id"}
+        });
+        let mut first_start =
+            ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        first_start.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(
+            first_start.configured_output_name(),
+            Some("selected-display-id")
+        );
+        assert_eq!(
+            first_start.effective_output_name(),
+            Some("selected-display-id")
+        );
+        assert_eq!(first_start.settings_payload()["capture_provider"], "dxgi");
+        assert_eq!(
+            first_start.settings_payload()["configured_output_name"],
+            "selected-display-id"
+        );
+        assert_eq!(
+            first_start.settings_payload()["effective_output_name"],
+            "selected-display-id"
+        );
+
+        let mut restarted =
+            ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        restarted.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(
+            restarted.effective_output_name(),
+            Some("selected-display-id")
+        );
+
+        let automatic_document = json!({
+            "ok":true,"found":true,"version":4,"revision":12,
+            "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}
+        });
+        restarted.apply_document(parse_document(&automatic_document).unwrap());
+        assert_eq!(restarted.configured_output_name(), None);
+        assert_eq!(
+            restarted.effective_output_name(),
+            Some("bootstrap-display-id")
+        );
+        assert_eq!(
+            restarted.settings_payload()["effective_output_name"],
+            "bootstrap-display-id"
+        );
     }
 
     #[test]
@@ -1460,8 +1719,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":3,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null}
+            "ok":true,"found":true,"version":4,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -1469,19 +1728,19 @@ mod tests {
             bind_address: None,
         };
         assert_eq!(
-            update_result(&success, 3, "New Host", &target)
+            update_result(&success, 3, "New Host", &target, None)
                 .unwrap()
                 .revision,
             4
         );
         assert_eq!(
-            update_result(&success, 2, "New Host", &target)
+            update_result(&success, 2, "New Host", &target, None)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
         );
         assert_eq!(
-            update_result(&success, 3, "Other Host", &target)
+            update_result(&success, 3, "Other Host", &target, None)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
@@ -1494,7 +1753,8 @@ mod tests {
                 &NetworkTarget {
                     port: 48_001,
                     ..target.clone()
-                }
+                },
+                None,
             )
             .unwrap_err()
             .code,
@@ -1502,15 +1762,39 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":3,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null}
+            "ok":true,"found":true,"version":4,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null}
         });
         assert_eq!(
-            update_result(&reset_to_machine_name, 4, "", &target)
+            update_result(&reset_to_machine_name, 4, "", &target, None)
                 .unwrap()
                 .hostname
                 .as_deref(),
             Some("")
+        );
+
+        let selected = json!({
+            "ok":true,"found":true,"version":4,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id"}
+        });
+        assert_eq!(
+            update_result(
+                &selected,
+                8,
+                "New Host",
+                &target,
+                Some("selected-display-id")
+            )
+            .unwrap()
+            .output_name
+            .as_deref(),
+            Some("selected-display-id")
+        );
+        assert_eq!(
+            update_result(&selected, 8, "New Host", &target, None)
+                .unwrap_err()
+                .code,
+            "invalid_state_response"
         );
     }
 
@@ -1547,6 +1831,9 @@ mod tests {
                 "bind_address":"127.0.0.1",
                 "configured_address_family":null,
                 "configured_bind_address":null,
+                "configured_output_name":null,
+                "effective_output_name":null,
+                "capture_provider":null,
                 "active_http_port":null,
                 "active_https_port":null,
                 "http_addresses":null,
@@ -1623,15 +1910,16 @@ mod tests {
                     address_family: None,
                     bind_address: None,
                 },
+                output_name: None,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":3,
+                "version":4,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null}
             })),
         );
 
@@ -1675,12 +1963,13 @@ mod tests {
                     address_family: None,
                     bind_address: None,
                 },
+                output_name: None,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":3,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null}
+                "ok":true,"found":true,"version":4,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}
             })),
         );
 
@@ -1840,12 +2129,13 @@ mod tests {
                     address_family: None,
                     bind_address: None,
                 },
+                output_name: None,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":3,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}
+                "ok":true,"found":true,"version":4,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}
             })),
         );
 
@@ -1886,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
+    fn v4_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -1895,8 +2185,9 @@ mod tests {
                 address_family: None,
                 bind_address: None,
             },
+            None,
         );
-        assert_eq!(reset["version"], 3);
+        assert_eq!(reset["version"], 4);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["address_family"], Value::Null);
         assert_eq!(reset["values"]["bind_address"], Value::Null);
@@ -1909,8 +2200,10 @@ mod tests {
                 address_family: Some(AddressFamily::Both),
                 bind_address: Some(String::new()),
             },
+            Some("stable-display-id"),
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
         assert_eq!(explicit_blank["values"]["bind_address"], "");
+        assert_eq!(explicit_blank["values"]["output_name"], "stable-display-id");
     }
 }

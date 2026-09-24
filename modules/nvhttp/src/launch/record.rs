@@ -41,6 +41,7 @@ pub struct Record {
     pub rtsp_operation: String,
     pub connect_data: u32,
     pub global_fec_percentage: u8,
+    pub capture_output: String,
     pub application_fec_percentage: Option<u8>,
     pub effective_fec_percentage: u8,
     pub application_requested: bool,
@@ -77,6 +78,7 @@ impl Record {
         rtsp_operation: String,
         connect_data: u32,
         global_fec_percentage: u8,
+        capture_output: String,
         connection: u64,
         deadline: Instant,
     ) -> Self {
@@ -88,6 +90,7 @@ impl Record {
             rtsp_operation,
             connect_data,
             global_fec_percentage,
+            capture_output,
             application_fec_percentage: None,
             effective_fec_percentage: global_fec_percentage,
             application_requested: false,
