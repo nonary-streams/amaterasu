@@ -69,8 +69,12 @@ $leadJobs = for ($laneNumber = 1; $laneNumber -le 6; $laneNumber++) {
         $errorsPath = Join-Path $runDirectory "$laneId.stderr.log"
         $resultPath = Join-Path $runDirectory "$laneId.result.md"
         Get-Content -LiteralPath $promptPath -Raw |
-            & codex exec --model gpt-6-luna `
+            & codex --ask-for-approval never exec --model gpt-6-luna `
                 -c 'model_reasoning_effort="max"' `
+                -c 'agents.enabled=true' `
+                -c 'agents.max_concurrent_threads_per_session=3' `
+                -c 'agents.default_subagent_model="gpt-6-luna"' `
+                -c 'agents.default_subagent_reasoning_effort="xhigh"' `
                 --cd $laneWorktree --json --output-last-message $resultPath - `
                 1> $eventsPath 2> $errorsPath
         if ($LASTEXITCODE -ne 0) {
