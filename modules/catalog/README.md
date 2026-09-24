@@ -56,9 +56,10 @@ Executable entries can include ordered preparation and paired undo commands:
 {"action":"create","expected_revision":0,"entry":{"name":"Prepared Game","launch":{"kind":"executable","program":"/opt/games/example","preparation":[{"run":{"executable":"/opt/games/configure","args":["enable"],"environment":{"PROFILE":"game"},"cwd":"/opt/games","timeout_ms":10000},"undo":{"executable":"/opt/games/configure","args":["disable"],"environment":{"PROFILE":"game"},"cwd":"/opt/games","timeout_ms":10000}}]}}}
 ```
 
-The catalog entry is the canonical source of this lifecycle metadata. Preparation
-cannot be supplied separately by a launch request. The catalog stores and returns
-the commands but never executes them. The application lifecycle consumer runs
+The catalog entry is the canonical source of application-specific lifecycle
+metadata. The application-specific commands cannot be supplied separately by a
+launch request. The catalog stores and returns them but never executes them.
+The application lifecycle consumer runs
 `run` commands in order and owes each successfully spawned command's optional
 `undo`, including a run that may have had side effects before failing. Owed undo
 commands run in reverse order after the application process tree settles.
@@ -70,6 +71,23 @@ canonicalize to `[]`, `{}`, `null`, and `10000`; an absent `undo` canonicalizes 
 canonicalized or shell-parsed. Create and update responses contain the same
 normalized metadata committed to state, and ordinary reads, launch resolution,
 restart reloads, and legacy migration preserve it.
+
+An entry may also carry the raw Vibeshine preparation list at the entry's
+top level. Amaterasu stores this list as canonical `prep_cmd`, while accepting
+the legacy spelling `prep-cmd` on input:
+
+```json
+{"action":"create","expected_revision":0,"entry":{"name":"Legacy prepared game","prep-cmd":[{"do":"  configure --profile=\"two words\"  ","undo":" restore --profile=\"two words\" ","elevated":true}],"launch":{"kind":"executable","program":"/opt/games/example"}}}
+```
+
+Each raw item accepts `do` and `undo` strings (both default to empty) and an
+`elevated` boolean (default false). Command text is retained byte-for-byte,
+including surrounding whitespace. Each string is limited to 2048 UTF-8 bytes
+and may not contain NUL; a catalog entry may contain at most eight combined
+structured and raw application steps. Raw commands are not shell-parsed or
+expanded by catalog. On launch, they are forwarded as raw items alongside
+structured preparation steps. Raw steps follow structured steps within each
+global or application group, and global steps precede application steps.
 
 Success includes `ok`, catalog `revision`, generated `id` (initially
 `app-0000000000000001`) and `entry`. IDs are opaque, caller-local, monotonically
@@ -181,11 +199,13 @@ transport message or rewrites the whole catalog for an individual edit.
 Vibeshine's catalog-policy interface and macOS application defaults were used
 only as behavioral references for durable identity and manual launch metadata.
 No source was copied or translated. The catalog stores sparse per-application
-configuration overrides, including the video fields `max_bitrate`,
-`minimum_fps_target`, and `video_max_batch_size_kb`; the launch provider retains
-them in launch and status results. NVHTTP consumer resolution and management UI
-support for these video fields remain cross-module parity requirements. Other
-catalog gaps include legacy IDs/aliases, portable UUIDs, artwork loading and
+configuration overrides, including stream fields, the video fields
+`max_bitrate`, `minimum_fps_target`, and `video_max_batch_size_kb`, frame limiter
+settings, and `ds4_back_as_touchpad_click`. Missing values and null inputs
+inherit; explicit false and zero remain present. The launch provider retains
+these values in launch and status results. NVHTTP consumer resolution and
+management UI support remain cross-module parity requirements. Other catalog
+gaps include legacy IDs/aliases, portable UUIDs, artwork loading and
 fingerprinting, desktop entries, shell-command launch forms, environment
 overlays, and migration from Vibeshine data. There is no cross-caller aggregation
 API.
@@ -388,13 +408,20 @@ page was read successfully.
 ## Playnite Fullscreen launch entries
 
 Manual entries may use the typed launch value below. It contains no executable
-path, URI, or Playnite game ID; the fixed Playnite provider resolves its
+target, URI, or Playnite game ID; the fixed Playnite provider resolves its
 installation and owns the correlated launch ticket. `exit_timeout_seconds`
 defaults to 10 and is bounded to 0..=300.
 
 ```json
 {"action":"create","expected_revision":0,"entry":{"name":"Fullscreen","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":10}}}
 ```
+
+Both `playnite` and `playnite_fullscreen` launch targets may include an optional
+`working_directory` (legacy alias `working-dir`). It must be an absolute path
+of at most 1024 bytes without dot segments, matching the downstream launch
+protocol's bound. Launch expands configured `$()` references and trims matching
+outer quotes, then sends it as the explicit preparation working directory. It
+does not select or launch the Playnite executable.
 
 The Playnite provider also reconciles one reserved `Playnite (Fullscreen)` row
 through the internal `provider_playnite_fullscreen_entry` action. The authenticated

@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const MAX_PREPARATION_STEPS: usize = 8;
+const MAX_RAW_PREPARATION_COMMAND_BYTES: usize = 2_048;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_AUTO_DETACH: bool = true;
@@ -22,12 +23,16 @@ pub enum Operation {
         app_id: String,
         #[serde(default)]
         global_preparation: Vec<PreparationStep>,
+        #[serde(default)]
+        legacy_global_preparation: Vec<LegacyPreparationCommand>,
     },
     LaunchExport {
         operation_id: String,
         app_id: String,
         #[serde(default)]
         global_preparation: Vec<PreparationStep>,
+        #[serde(default)]
+        legacy_global_preparation: Vec<LegacyPreparationCommand>,
     },
     Lookup {
         operation_id: String,
@@ -55,16 +60,19 @@ impl Operation {
                 operation_id,
                 app_id,
                 global_preparation,
+                legacy_global_preparation,
             }
             | Self::LaunchExport {
                 operation_id,
                 app_id,
                 global_preparation,
+                legacy_global_preparation,
             } => {
                 if !valid_operation_id(operation_id) || !valid_app_id(app_id) {
                     return Err("invalid_request");
                 }
                 validate_preparation(global_preparation)?;
+                validate_legacy_preparation(legacy_global_preparation)?;
             }
             Self::Lookup { operation_id } if !valid_operation_id(operation_id) => {
                 return Err("invalid_request");
@@ -103,10 +111,18 @@ pub enum CatalogLaunch {
         game_id: String,
         #[serde(default = "default_playnite_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
+        #[serde(default, alias = "working-dir")]
+        working_directory: Option<String>,
+        #[serde(default)]
+        preparation: Vec<PreparationStep>,
     },
     PlayniteFullscreen {
         #[serde(default = "default_playnite_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
+        #[serde(default, alias = "working-dir")]
+        working_directory: Option<String>,
+        #[serde(default)]
+        preparation: Vec<PreparationStep>,
     },
 }
 
@@ -116,6 +132,26 @@ pub struct PreparationStep {
     pub run: ConfiguredCommand,
     #[serde(default)]
     pub undo: Option<ConfiguredCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyPreparationCommand {
+    #[serde(default, rename = "do")]
+    pub do_command: String,
+    #[serde(default)]
+    pub undo: String,
+    #[serde(default)]
+    pub elevated: bool,
+}
+
+/// Application-facing preparation preserves structured plans and the raw
+/// Vibeshine command strings as distinct, untagged wire variants.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum PlannedPreparationStep {
+    Structured(PreparationStep),
+    Legacy(LegacyPreparationCommand),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,6 +181,9 @@ pub struct Executable {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
+    /// The app-configured directory inherited by raw prep commands. This is
+    /// separate because `working_directory` can also be inferred for launch.
+    pub preparation_working_directory: Option<String>,
     pub steam_id: Option<String>,
     pub steam_install_dir: Option<String>,
     pub auto_detach: bool,
@@ -152,7 +191,7 @@ pub struct Executable {
     pub exit_timeout_seconds: u64,
     pub elevated: bool,
     pub detached: Vec<String>,
-    pub preparation: Vec<PreparationStep>,
+    pub preparation: Vec<PlannedPreparationStep>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,11 +200,13 @@ pub enum LaunchTarget {
     Playnite {
         game_id: String,
         exit_timeout_seconds: u64,
-        preparation: Vec<PreparationStep>,
+        working_directory: Option<String>,
+        preparation: Vec<PlannedPreparationStep>,
     },
     PlayniteFullscreen {
         exit_timeout_seconds: u64,
-        preparation: Vec<PreparationStep>,
+        working_directory: Option<String>,
+        preparation: Vec<PlannedPreparationStep>,
     },
 }
 
@@ -187,9 +228,21 @@ impl LaunchTarget {
         global_preparation: &[PreparationStep],
         environment: &BTreeMap<String, String>,
     ) -> Result<Self, &'static str> {
+        Self::from_catalog_entry_with_preparations(entry, global_preparation, &[], environment)
+    }
+
+    pub fn from_catalog_entry_with_preparations(
+        entry: &Value,
+        global_preparation: &[PreparationStep],
+        legacy_global_preparation: &[LegacyPreparationCommand],
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Self, &'static str> {
         let launch = entry.get("launch").ok_or("invalid_catalog_response")?;
         let elevated = catalog_elevated(entry)?;
         let exclude_global_preparation = catalog_excludes_global_preparation(entry)?;
+        let legacy_application_preparation = catalog_legacy_preparation(entry)?;
+        validate_preparation(global_preparation)?;
+        validate_legacy_preparation(legacy_global_preparation)?;
         let steam_id = optional_catalog_string(entry, "steam_id")?;
         let steam_install_dir = optional_catalog_string(entry, "steam_install_dir")?;
         if steam_id
@@ -204,20 +257,15 @@ impl LaunchTarget {
         let application_working_directory = catalog_working_directory(launch, environment)?;
         match Self::from_catalog_with_environment(launch, environment)? {
             Self::Executable(mut executable) => {
-                if !exclude_global_preparation {
-                    if global_preparation.len() + executable.preparation.len()
-                        > MAX_PREPARATION_STEPS
-                    {
-                        return Err("preparation_limit_exceeded");
-                    }
-                    let mut preparation = global_preparation.to_vec();
-                    apply_preparation_working_directories(
-                        &mut preparation,
-                        application_working_directory.as_deref(),
-                    );
-                    preparation.extend(executable.preparation);
-                    executable.preparation = preparation;
-                }
+                executable.preparation_working_directory = application_working_directory.clone();
+                executable.preparation = merge_preparation_plan(
+                    global_preparation,
+                    legacy_global_preparation,
+                    executable.preparation,
+                    legacy_application_preparation,
+                    !exclude_global_preparation,
+                    application_working_directory.as_deref(),
+                )?;
                 executable.steam_id = steam_id;
                 executable.steam_install_dir = steam_install_dir;
                 executable.elevated = elevated;
@@ -236,27 +284,43 @@ impl LaunchTarget {
             Self::Playnite {
                 game_id,
                 exit_timeout_seconds,
-                ..
-            } => Ok(Self::Playnite {
-                game_id,
-                exit_timeout_seconds,
-                preparation: if exclude_global_preparation {
-                    Vec::new()
-                } else {
-                    global_preparation.to_vec()
-                },
-            }),
+                working_directory,
+                preparation,
+            } => {
+                let preparation = merge_preparation_plan(
+                    global_preparation,
+                    legacy_global_preparation,
+                    preparation,
+                    legacy_application_preparation,
+                    !exclude_global_preparation,
+                    working_directory.as_deref(),
+                )?;
+                Ok(Self::Playnite {
+                    game_id,
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation,
+                })
+            }
             Self::PlayniteFullscreen {
                 exit_timeout_seconds,
-                ..
-            } => Ok(Self::PlayniteFullscreen {
-                exit_timeout_seconds,
-                preparation: if exclude_global_preparation {
-                    Vec::new()
-                } else {
-                    global_preparation.to_vec()
-                },
-            }),
+                working_directory,
+                preparation,
+            } => {
+                let preparation = merge_preparation_plan(
+                    global_preparation,
+                    legacy_global_preparation,
+                    preparation,
+                    legacy_application_preparation,
+                    !exclude_global_preparation,
+                    working_directory.as_deref(),
+                )?;
+                Ok(Self::PlayniteFullscreen {
+                    exit_timeout_seconds,
+                    working_directory,
+                    preparation,
+                })
+            }
         }
     }
 
@@ -278,27 +342,52 @@ impl LaunchTarget {
             CatalogLaunch::Playnite {
                 game_id,
                 exit_timeout_seconds,
+                working_directory,
+                preparation,
             } => {
+                let working_directory = working_directory
+                    .as_deref()
+                    .map(|directory| resolve_working_directory(directory, environment))
+                    .transpose()?
+                    .flatten();
                 if !valid_guid(&game_id)
                     || !(1..=MAX_EXIT_TIMEOUT_SECONDS).contains(&exit_timeout_seconds)
+                    || !valid_preparation(&preparation)
                 {
                     return Err("invalid_catalog_response");
                 }
                 Ok(Self::Playnite {
                     game_id: game_id.to_ascii_lowercase(),
                     exit_timeout_seconds,
-                    preparation: Vec::new(),
+                    working_directory,
+                    preparation: preparation
+                        .into_iter()
+                        .map(PlannedPreparationStep::Structured)
+                        .collect(),
                 })
             }
             CatalogLaunch::PlayniteFullscreen {
                 exit_timeout_seconds,
+                working_directory,
+                preparation,
             } => {
-                if exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+                let working_directory = working_directory
+                    .as_deref()
+                    .map(|directory| resolve_working_directory(directory, environment))
+                    .transpose()?
+                    .flatten();
+                if exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                    || !valid_preparation(&preparation)
+                {
                     return Err("invalid_catalog_response");
                 }
                 Ok(Self::PlayniteFullscreen {
                     exit_timeout_seconds,
-                    preparation: Vec::new(),
+                    working_directory,
+                    preparation: preparation
+                        .into_iter()
+                        .map(PlannedPreparationStep::Structured)
+                        .collect(),
                 })
             }
             CatalogLaunch::Application { .. } => Err("unsupported_launch_kind"),
@@ -317,6 +406,94 @@ fn catalog_excludes_global_preparation(entry: &Value) -> Result<bool, &'static s
         return Ok(false);
     };
     value.as_bool().ok_or("invalid_catalog_response")
+}
+
+fn catalog_legacy_preparation(
+    entry: &Value,
+) -> Result<Vec<LegacyPreparationCommand>, &'static str> {
+    let canonical = entry.get("prep_cmd");
+    let compatibility = entry.get("prep-cmd");
+    let Some(value) = (match (canonical, compatibility) {
+        (Some(_), Some(_)) => return Err("invalid_catalog_response"),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }) else {
+        return Ok(Vec::new());
+    };
+    let preparation: Vec<LegacyPreparationCommand> =
+        serde_json::from_value(value.clone()).map_err(|_| "invalid_catalog_response")?;
+    validate_legacy_preparation(&preparation).map_err(|_| "invalid_catalog_response")?;
+    Ok(preparation)
+}
+
+fn merge_preparation_plan(
+    global_preparation: &[PreparationStep],
+    legacy_global_preparation: &[LegacyPreparationCommand],
+    application_preparation: Vec<PlannedPreparationStep>,
+    legacy_application_preparation: Vec<LegacyPreparationCommand>,
+    include_global_preparation: bool,
+    application_working_directory: Option<&str>,
+) -> Result<Vec<PlannedPreparationStep>, &'static str> {
+    let application_step_count =
+        application_preparation.len() + legacy_application_preparation.len();
+    let global_step_count = if include_global_preparation {
+        global_preparation.len() + legacy_global_preparation.len()
+    } else {
+        0
+    };
+    if application_step_count + global_step_count > MAX_PREPARATION_STEPS {
+        return Err("preparation_limit_exceeded");
+    }
+
+    let mut plan = Vec::with_capacity(application_step_count + global_step_count);
+    if include_global_preparation {
+        let mut structured_global = global_preparation.to_vec();
+        apply_preparation_working_directories(
+            &mut structured_global,
+            application_working_directory,
+        );
+        plan.extend(
+            structured_global
+                .into_iter()
+                .map(PlannedPreparationStep::Structured),
+        );
+        plan.extend(
+            legacy_global_preparation
+                .iter()
+                .cloned()
+                .map(PlannedPreparationStep::Legacy),
+        );
+    }
+    plan.extend(application_preparation.into_iter().map(|mut step| {
+        if let PlannedPreparationStep::Structured(structured_step) = &mut step {
+            apply_preparation_working_directories(
+                std::slice::from_mut(structured_step),
+                application_working_directory,
+            );
+        }
+        step
+    }));
+    plan.extend(
+        legacy_application_preparation
+            .into_iter()
+            .map(PlannedPreparationStep::Legacy),
+    );
+    Ok(plan)
+}
+
+fn validate_legacy_preparation(steps: &[LegacyPreparationCommand]) -> Result<(), &'static str> {
+    if steps.len() > MAX_PREPARATION_STEPS
+        || steps.iter().any(|step| {
+            [step.do_command.as_str(), step.undo.as_str()]
+                .iter()
+                .any(|command| {
+                    command.len() > MAX_RAW_PREPARATION_COMMAND_BYTES || command.contains('\0')
+                })
+        })
+    {
+        return Err("invalid_legacy_preparation");
+    }
+    Ok(())
 }
 
 fn catalog_elevated(entry: &Value) -> Result<bool, &'static str> {
@@ -676,6 +853,7 @@ impl Executable {
                     program,
                     arguments,
                     working_directory: resolved_working_directory,
+                    preparation_working_directory: None,
                     steam_id: None,
                     steam_install_dir: None,
                     auto_detach,
@@ -683,7 +861,10 @@ impl Executable {
                     exit_timeout_seconds,
                     elevated: false,
                     detached,
-                    preparation,
+                    preparation: preparation
+                        .into_iter()
+                        .map(PlannedPreparationStep::Structured)
+                        .collect(),
                 })
             }
             CatalogLaunch::Application { path } => {
@@ -719,6 +900,57 @@ pub struct ApplicationConfigOverrides {
     pub amd_av1_latency_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamepad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_enable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_fps_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_disable_vsync: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_auto_virtual_framegen"
+    )]
+    pub frame_limiter_auto_virtual_framegen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtss_frame_limit_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds4_back_as_touchpad_click: Option<bool>,
+}
+
+fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(Value::Bool(enabled)) => Ok(Some(if enabled {
+            "enabled".into()
+        } else {
+            "disabled".into()
+        })),
+        Some(Value::String(value)) if value == "true" => Ok(Some("enabled".into())),
+        Some(Value::String(value)) if value == "false" => Ok(Some("disabled".into())),
+        Some(Value::String(value))
+            if matches!(value.as_str(), "enabled" | "vrr" | "legacy" | "disabled") =>
+        {
+            Ok(Some(value))
+        }
+        _ => Err(serde::de::Error::custom(
+            "frame_limiter_auto_virtual_framegen has an invalid mode",
+        )),
+    }
 }
 
 impl ApplicationConfigOverrides {
@@ -730,6 +962,30 @@ impl ApplicationConfigOverrides {
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
             || self.video_max_batch_size_kb.is_some_and(|size| size > 64)
+        {
+            return Err("invalid_catalog_response");
+        }
+        if self
+            .frame_limiter_fps_limit
+            .is_some_and(|limit| !valid_millihertz_value(limit))
+            || self
+                .frame_limiter_provider
+                .as_deref()
+                .is_some_and(|provider| !valid_frame_limiter_provider(provider))
+            || self
+                .frame_limiter_auto_virtual_framegen
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
+            || self
+                .rtss_frame_limit_type
+                .as_deref()
+                .is_some_and(|limit_type| {
+                    !cfg!(windows)
+                        || !matches!(
+                            limit_type,
+                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                        )
+                })
         {
             return Err("invalid_catalog_response");
         }
@@ -762,6 +1018,74 @@ impl ApplicationConfigOverrides {
             && self.back_button_timeout.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.controller.is_none()
+            && self.gamepad.is_none()
+            && self.keyboard.is_none()
+            && self.mouse.is_none()
+            && self.frame_limiter_enable.is_none()
+            && self.frame_limiter_fps_limit.is_none()
+            && self.frame_limiter_provider.is_none()
+            && self.frame_limiter_disable_vsync.is_none()
+            && self.frame_limiter_auto_virtual_framegen.is_none()
+            && self.rtss_frame_limit_type.is_none()
+            && self.ds4_back_as_touchpad_click.is_none()
+    }
+}
+
+fn valid_millihertz_value(value: f64) -> bool {
+    if !value.is_finite() || !(0.0..=1000.0).contains(&value) {
+        return false;
+    }
+    let millihertz = value * 1000.0;
+    let rounding_tolerance = f64::EPSILON * millihertz.abs().max(1.0) * 4.0;
+    (millihertz - millihertz.round()).abs() <= rounding_tolerance
+}
+
+fn valid_frame_limiter_provider(provider: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            provider,
+            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        provider == "auto"
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        provider == "auto"
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 
@@ -992,6 +1316,13 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn structured_step(step: &PlannedPreparationStep) -> &PreparationStep {
+        match step {
+            PlannedPreparationStep::Structured(step) => step,
+            PlannedPreparationStep::Legacy(_) => panic!("expected a structured preparation step"),
+        }
+    }
+
     fn unique_test_directory(label: &str) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1023,6 +1354,14 @@ mod tests {
         }))
         .unwrap();
         omitted.validate().unwrap();
+        let Operation::Launch {
+            legacy_global_preparation,
+            ..
+        } = omitted
+        else {
+            panic!("expected launch operation");
+        };
+        assert!(legacy_global_preparation.is_empty());
 
         let executable = std::env::current_exe().unwrap();
         let valid: Operation = serde_json::from_value(json!({
@@ -1057,6 +1396,37 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(invalid.validate(), Err("invalid_preparation"));
+
+        let legacy: Operation = serde_json::from_value(json!({
+            "action":"launch",
+            "operation_id":"raw-configured",
+            "app_id":"app-0000000000000001",
+            "legacy_global_preparation":[{"do":"  raw command  ","undo":"undo", "elevated":true}],
+        }))
+        .unwrap();
+        legacy.validate().unwrap();
+        let Operation::Launch {
+            legacy_global_preparation,
+            ..
+        } = legacy
+        else {
+            panic!("expected launch operation");
+        };
+        assert_eq!(legacy_global_preparation[0].do_command, "  raw command  ");
+        assert_eq!(legacy_global_preparation[0].undo, "undo");
+        assert!(legacy_global_preparation[0].elevated);
+
+        let oversized_legacy: Operation = serde_json::from_value(json!({
+            "action":"launch",
+            "operation_id":"raw-oversized",
+            "app_id":"app-0000000000000001",
+            "legacy_global_preparation":[{"do":"x".repeat(MAX_RAW_PREPARATION_COMMAND_BYTES + 1)}],
+        }))
+        .unwrap();
+        assert_eq!(
+            oversized_legacy.validate(),
+            Err("invalid_legacy_preparation")
+        );
     }
 
     #[test]
@@ -1261,6 +1631,121 @@ mod tests {
     }
 
     #[test]
+    fn frame_limiter_overrides_preserve_sparse_values_and_validate_contract_domains() {
+        let inherited = ApplicationConfigOverrides::default();
+        assert!(inherited.is_empty());
+        let null_values: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "frame_limiter_enable":null,
+            "frame_limiter_fps_limit":null,
+            "frame_limiter_provider":null,
+            "frame_limiter_disable_vsync":null,
+            "frame_limiter_auto_virtual_framegen":null,
+            "rtss_frame_limit_type":null,
+            "ds4_back_as_touchpad_click":null,
+        }))
+        .unwrap();
+        assert!(null_values.is_empty());
+        assert_eq!(serde_json::to_value(null_values).unwrap(), json!({}));
+
+        let configured: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "frame_limiter_enable":false,
+            "frame_limiter_fps_limit":0,
+            "frame_limiter_provider":"auto",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":true,
+            "ds4_back_as_touchpad_click":false,
+        }))
+        .unwrap();
+        configured.validate().unwrap();
+        assert_eq!(configured.frame_limiter_enable, Some(false));
+        assert_eq!(configured.frame_limiter_fps_limit, Some(0.0));
+        assert_eq!(configured.frame_limiter_provider.as_deref(), Some("auto"));
+        assert_eq!(configured.frame_limiter_disable_vsync, Some(false));
+        assert_eq!(
+            configured.frame_limiter_auto_virtual_framegen.as_deref(),
+            Some("enabled")
+        );
+        assert_eq!(configured.ds4_back_as_touchpad_click, Some(false));
+        assert_eq!(
+            serde_json::to_value(configured).unwrap(),
+            json!({
+                "frame_limiter_enable":false,
+                "frame_limiter_fps_limit":0,
+                "frame_limiter_provider":"auto",
+                "frame_limiter_disable_vsync":false,
+                "frame_limiter_auto_virtual_framegen":"enabled",
+                "ds4_back_as_touchpad_click":false,
+            })
+        );
+
+        for fps_limit in [0.0, 1.234, 1000.0] {
+            ApplicationConfigOverrides {
+                frame_limiter_fps_limit: Some(fps_limit),
+                ..ApplicationConfigOverrides::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        for fps_limit in [-0.001, 1.2345, 1000.001, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                ApplicationConfigOverrides {
+                    frame_limiter_fps_limit: Some(fps_limit),
+                    ..ApplicationConfigOverrides::default()
+                }
+                .validate(),
+                Err("invalid_catalog_response")
+            );
+        }
+        for mode in ["true", "false", "enabled", "vrr", "legacy", "disabled"] {
+            let parsed: ApplicationConfigOverrides = serde_json::from_value(json!({
+                "frame_limiter_auto_virtual_framegen":mode
+            }))
+            .unwrap();
+            parsed.validate().unwrap();
+        }
+        assert!(
+            serde_json::from_value::<ApplicationConfigOverrides>(json!({
+                "frame_limiter_auto_virtual_framegen":"invalid"
+            }))
+            .is_err()
+        );
+
+        let valid_provider = if cfg!(windows) {
+            "rtss"
+        } else if cfg!(target_os = "linux") {
+            "mangohud-proton"
+        } else {
+            "auto"
+        };
+        ApplicationConfigOverrides {
+            frame_limiter_provider: Some(valid_provider.into()),
+            ..ApplicationConfigOverrides::default()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            ApplicationConfigOverrides {
+                frame_limiter_provider: Some("unsupported".into()),
+                ..ApplicationConfigOverrides::default()
+            }
+            .validate(),
+            Err("invalid_catalog_response")
+        );
+        assert_eq!(
+            ApplicationConfigOverrides {
+                rtss_frame_limit_type: Some("nvidia reflex".into()),
+                ..ApplicationConfigOverrides::default()
+            }
+            .validate(),
+            if cfg!(windows) {
+                Ok(())
+            } else {
+                Err("invalid_catalog_response")
+            }
+        );
+    }
+
+    #[test]
     fn catalog_preparation_is_strict_and_applies_defaults() {
         let inferred_directory = std::env::current_exe()
             .unwrap()
@@ -1274,7 +1759,7 @@ mod tests {
         catalog_value["working_directory"] = json!("");
         let executable = Executable::from_catalog(&catalog_value).unwrap();
         assert_eq!(executable.exit_timeout_seconds, 10);
-        let command = &executable.preparation[0].run;
+        let command = &structured_step(&executable.preparation[0]).run;
         assert_eq!(
             executable.working_directory.as_deref(),
             Some(inferred_directory.as_str())
@@ -1283,7 +1768,7 @@ mod tests {
         assert!(command.args.is_empty());
         assert!(command.environment.is_empty());
         assert_eq!(command.cwd.as_deref(), Some(inferred_directory.as_str()));
-        assert!(executable.preparation[0].undo.is_none());
+        assert!(structured_step(&executable.preparation[0]).undo.is_none());
 
         let mut unknown = catalog_launch(json!([{
             "run":{"executable":std::env::current_exe().unwrap(),"shell":true},
@@ -1484,15 +1969,32 @@ mod tests {
         }
     }
 
+    fn legacy_preparation_step(
+        do_command: &str,
+        undo: &str,
+        elevated: bool,
+    ) -> LegacyPreparationCommand {
+        LegacyPreparationCommand {
+            do_command: do_command.into(),
+            undo: undo.into(),
+            elevated,
+        }
+    }
+
     #[test]
     fn global_preparation_precedes_app_steps_and_obeys_exclusion_alias() {
         let executable = std::env::current_exe()
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let application_directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let global = preparation_step(&executable, "global");
         let app = preparation_step(&executable, "app");
         let entry = json!({
+            "working_directory":application_directory,
             "launch": {
                 "kind":"executable",
                 "program":executable,
@@ -1504,8 +2006,12 @@ mod tests {
         else {
             panic!("expected executable target");
         };
-        assert_eq!(merged.preparation[0].run.args, ["global"]);
-        assert_eq!(merged.preparation[1].run.args, ["app"]);
+        assert_eq!(
+            merged.preparation_working_directory.as_deref(),
+            Some(application_directory.as_str())
+        );
+        assert_eq!(structured_step(&merged.preparation[0]).run.args, ["global"]);
+        assert_eq!(structured_step(&merged.preparation[1]).run.args, ["app"]);
 
         let excluded = json!({
             "exclude-global-prep-cmd":true,
@@ -1521,7 +2027,105 @@ mod tests {
             panic!("expected executable target");
         };
         assert_eq!(excluded.preparation.len(), 1);
-        assert_eq!(excluded.preparation[0].run.args, ["app"]);
+        assert_eq!(structured_step(&excluded.preparation[0]).run.args, ["app"]);
+    }
+
+    #[test]
+    fn structured_and_legacy_preparation_merge_in_order_and_exclusion_skips_both_globals() {
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let global_structured = preparation_step(&executable, "global-structured");
+        let app_structured = preparation_step(&executable, "app-structured");
+        let global_legacy = legacy_preparation_step("global raw", "global undo", true);
+        let entry = json!({
+            "prep_cmd":[{"do":"app raw", "undo":"app undo", "elevated":false}],
+            "launch": {
+                "kind":"executable",
+                "program":executable,
+                "preparation":[app_structured],
+            },
+        });
+        let LaunchTarget::Executable(merged) = LaunchTarget::from_catalog_entry_with_preparations(
+            &entry,
+            std::slice::from_ref(&global_structured),
+            std::slice::from_ref(&global_legacy),
+            &BTreeMap::new(),
+        )
+        .unwrap() else {
+            panic!("expected executable target");
+        };
+        assert_eq!(merged.preparation.len(), 4);
+        assert_eq!(
+            structured_step(&merged.preparation[0]).run.args,
+            ["global-structured"]
+        );
+        assert_eq!(
+            merged.preparation[1],
+            PlannedPreparationStep::Legacy(global_legacy.clone())
+        );
+        assert_eq!(
+            structured_step(&merged.preparation[2]).run.args,
+            ["app-structured"]
+        );
+        assert_eq!(
+            merged.preparation[3],
+            PlannedPreparationStep::Legacy(legacy_preparation_step("app raw", "app undo", false))
+        );
+
+        let excluded_entry = json!({
+            "exclude_global_prep_cmd":true,
+            "prep_cmd":[{"do":"app raw", "undo":"app undo", "elevated":false}],
+            "launch": {
+                "kind":"executable",
+                "program":std::env::current_exe().unwrap(),
+                "preparation":[app_structured],
+            },
+        });
+        let LaunchTarget::Executable(excluded) =
+            LaunchTarget::from_catalog_entry_with_preparations(
+                &excluded_entry,
+                std::slice::from_ref(&global_structured),
+                std::slice::from_ref(&global_legacy),
+                &BTreeMap::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected executable target");
+        };
+        assert_eq!(excluded.preparation.len(), 2);
+        assert_eq!(
+            structured_step(&excluded.preparation[0]).run.args,
+            ["app-structured"]
+        );
+        assert!(matches!(
+            &excluded.preparation[1],
+            PlannedPreparationStep::Legacy(step) if step.do_command == "app raw"
+        ));
+
+        let alias_entry = json!({
+            "prep-cmd":[{"do":"alias raw"}],
+            "launch":{"kind":"executable","program":std::env::current_exe().unwrap()},
+        });
+        let LaunchTarget::Executable(alias) =
+            LaunchTarget::from_catalog_entry(&alias_entry, &[]).unwrap()
+        else {
+            panic!("expected executable target");
+        };
+        assert!(matches!(
+            &alias.preparation[0],
+            PlannedPreparationStep::Legacy(step) if step.do_command == "alias raw"
+        ));
+        let ambiguous_aliases = json!({
+            "prep_cmd":[],
+            "prep-cmd":[],
+            "launch":{"kind":"executable","program":std::env::current_exe().unwrap()},
+        });
+        assert_eq!(
+            LaunchTarget::from_catalog_entry(&ambiguous_aliases, &[]).unwrap_err(),
+            "invalid_catalog_response"
+        );
     }
 
     #[test]
@@ -1569,7 +2173,8 @@ mod tests {
             LaunchTarget::from_catalog_entry(&playnite, std::slice::from_ref(&global)).unwrap();
         assert!(matches!(
             prepared,
-            LaunchTarget::Playnite { preparation, .. } if preparation == [global.clone()]
+            LaunchTarget::Playnite { preparation, .. }
+                if preparation == [PlannedPreparationStep::Structured(global.clone())]
         ));
         let fullscreen = json!({
             "launch":{"kind":"playnite_fullscreen"}
@@ -1578,7 +2183,8 @@ mod tests {
             LaunchTarget::from_catalog_entry(&fullscreen, std::slice::from_ref(&global)).unwrap();
         assert!(matches!(
             prepared_fullscreen,
-            LaunchTarget::PlayniteFullscreen { preparation, .. } if preparation == [global.clone()]
+            LaunchTarget::PlayniteFullscreen { preparation, .. }
+                if preparation == [PlannedPreparationStep::Structured(global.clone())]
         ));
         let excluded = json!({
             "exclude_global_prep_cmd":true,
@@ -1588,6 +2194,108 @@ mod tests {
             LaunchTarget::from_catalog_entry(&excluded, std::slice::from_ref(&global)),
             Ok(LaunchTarget::Playnite { preparation, .. }) if preparation.is_empty()
         ));
+    }
+
+    #[test]
+    fn playnite_working_directory_is_resolved_and_inherited_by_preparation() {
+        let application_directory = std::env::current_dir()
+            .unwrap()
+            .join("playnite working directory")
+            .to_string_lossy()
+            .into_owned();
+        let configured_directory = "\"$(AMATERASU_PLAYNITE_DIRECTORY)\"";
+        let environment = BTreeMap::from([(
+            "AMATERASU_PLAYNITE_DIRECTORY".into(),
+            application_directory.clone(),
+        )]);
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let global = preparation_step(&executable, "global");
+        let legacy_global = legacy_preparation_step("global raw", "", false);
+
+        for launch in [
+            json!({
+                "kind":"playnite",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "working_directory":configured_directory,
+                "preparation":[{"run":{"executable":executable.clone(),"args":["app"]}}],
+            }),
+            json!({
+                "kind":"playnite_fullscreen",
+                "working_directory":configured_directory,
+                "preparation":[{"run":{"executable":executable.clone(),"args":["app"]}}],
+            }),
+        ] {
+            let entry = json!({"launch":launch});
+            let target = LaunchTarget::from_catalog_entry_with_preparations(
+                &entry,
+                std::slice::from_ref(&global),
+                std::slice::from_ref(&legacy_global),
+                &environment,
+            )
+            .unwrap();
+            let (working_directory, preparation) = match target {
+                LaunchTarget::Playnite {
+                    working_directory,
+                    preparation,
+                    ..
+                }
+                | LaunchTarget::PlayniteFullscreen {
+                    working_directory,
+                    preparation,
+                    ..
+                } => (working_directory, preparation),
+                _ => panic!("expected typed Playnite target"),
+            };
+
+            assert_eq!(
+                working_directory.as_deref(),
+                Some(application_directory.as_str())
+            );
+            assert_eq!(preparation.len(), 3);
+            assert_eq!(
+                structured_step(&preparation[0]).run.cwd.as_deref(),
+                Some(application_directory.as_str())
+            );
+            assert!(matches!(
+                &preparation[1],
+                PlannedPreparationStep::Legacy(step) if step.do_command == "global raw"
+            ));
+            assert_eq!(
+                structured_step(&preparation[2]).run.cwd.as_deref(),
+                Some(application_directory.as_str())
+            );
+            assert_eq!(structured_step(&preparation[2]).run.args, ["app"]);
+        }
+
+        let alias = json!({
+            "launch":{
+                "kind":"playnite_fullscreen",
+                "working-dir":application_directory,
+            }
+        });
+        assert!(matches!(
+            LaunchTarget::from_catalog_entry(&alias, &[]).unwrap(),
+            LaunchTarget::PlayniteFullscreen {
+                working_directory: Some(_),
+                ..
+            }
+        ));
+
+        let ambiguous = json!({
+            "launch":{
+                "kind":"playnite",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "working_directory":application_directory,
+                "working-dir":application_directory,
+            }
+        });
+        assert_eq!(
+            LaunchTarget::from_catalog_entry(&ambiguous, &[]).unwrap_err(),
+            "invalid_catalog_response"
+        );
     }
 
     #[test]
@@ -1603,11 +2311,14 @@ mod tests {
 
         let executable = Executable::from_catalog(&value).unwrap();
         assert_eq!(
-            executable.preparation[0].run.cwd.as_deref(),
+            structured_step(&executable.preparation[0])
+                .run
+                .cwd
+                .as_deref(),
             Some(command_directory.to_str().unwrap())
         );
         assert_eq!(
-            executable.preparation[0]
+            structured_step(&executable.preparation[0])
                 .undo
                 .as_ref()
                 .unwrap()
@@ -1659,7 +2370,10 @@ mod tests {
         .unwrap() else {
             panic!("expected executable target");
         };
-        assert_eq!(merged.preparation[0].run.cwd.as_deref(), directory.to_str());
+        assert_eq!(
+            structured_step(&merged.preparation[0]).run.cwd.as_deref(),
+            directory.to_str()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1766,11 +2480,14 @@ mod tests {
 
         let executable = Executable::from_catalog(&value).unwrap();
         assert_eq!(
-            executable.preparation[0].run.cwd.as_deref(),
+            structured_step(&executable.preparation[0])
+                .run
+                .cwd
+                .as_deref(),
             Some(application_directory.as_str())
         );
         assert_eq!(
-            executable.preparation[0]
+            structured_step(&executable.preparation[0])
                 .undo
                 .as_ref()
                 .unwrap()
@@ -1779,11 +2496,14 @@ mod tests {
             Some(application_directory.as_str())
         );
         assert_eq!(
-            executable.preparation[1].run.cwd.as_deref(),
+            structured_step(&executable.preparation[1])
+                .run
+                .cwd
+                .as_deref(),
             Some(run_directory.as_str())
         );
         assert_eq!(
-            executable.preparation[1]
+            structured_step(&executable.preparation[1])
                 .undo
                 .as_ref()
                 .unwrap()

@@ -91,7 +91,11 @@ impl ProcessRecord {
         spec: LaunchSpec,
         detached_command_texts: Vec<String>,
     ) -> Self {
-        let lifecycle = ApplicationLifecycle::new(spec.preparation.clone());
+        let lifecycle = ApplicationLifecycle::new_with_context(
+            spec.preparation.clone(),
+            spec.environment.clone(),
+            spec.preparation_cwd.clone(),
+        );
         let mut record = Self {
             process_id,
             operation_id,
@@ -593,8 +597,12 @@ enum PreparationAction {
 
 impl PreparationLease {
     fn new(caller: &str, operation_id: String, spec: PreparationSpec) -> Self {
-        let lifecycle = ApplicationLifecycle::new(spec.preparation.clone())
-            .expect("validated preparation lease is nonempty");
+        let lifecycle = ApplicationLifecycle::new_with_context(
+            spec.preparation.clone(),
+            spec.environment.clone(),
+            spec.cwd.clone(),
+        )
+        .expect("validated preparation lease is nonempty");
         Self {
             operation_id,
             owner: caller.into(),
@@ -716,6 +724,7 @@ impl ProcessManager {
                 args,
                 environment,
                 cwd,
+                preparation_cwd,
                 elevated,
                 auto_detach,
                 wait_all,
@@ -750,6 +759,7 @@ impl ProcessManager {
                     args,
                     environment,
                     cwd,
+                    preparation_cwd,
                     elevated,
                     auto_detach,
                     wait_all,
@@ -773,10 +783,14 @@ impl ProcessManager {
             }
             Action::Prepare {
                 operation_id,
+                environment,
+                cwd,
                 preparation,
             } => {
                 let spec = PreparationSpec {
                     preparation: preparation.into_vec(),
+                    environment,
+                    cwd,
                 };
                 spec.validate(&operation_id)
                     .map_err(|_| "invalid_preparation")?;

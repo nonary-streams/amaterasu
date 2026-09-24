@@ -53,15 +53,42 @@ Launch may also contain up to eight ordered preparation steps:
 }
 ```
 
-Preparation commands use literal argv, a cleared explicit environment, optional
-absolute `cwd`, and null standard handles, just like the application. There is no
-shell interpretation. `timeout_ms` defaults to 10,000 and must be 1–30,000.
+Preparation supports both the structured `run`/`undo` command form above and the
+raw compatibility form used by catalog launchers:
+
+```json
+{"action":"launch","operation_id":"legacy-prepared-1","executable":"/opt/game/bin/game","environment":{"PROFILE":"streaming"},"preparation_cwd":"/opt/game","preparation":[{"do":"configure --profile=$(PROFILE)","undo":"configure --profile=desktop","elevated":true}]}
+```
+
+Structured commands use literal argv, a cleared explicit environment, optional
+absolute `cwd`, and null standard handles, just like the application. Raw steps
+accept exact `do` and `undo` command strings (both default empty) and an
+`elevated` flag (default false). Raw strings are split with the host platform's
+argument parser without invoking a shell. `$(NAME)` expands from the launch's
+explicit environment map, then the module process environment; `$$` yields a
+literal dollar sign. Raw commands overlay the explicit launch environment onto
+the inherited environment. The launch coordinator supplies `preparation_cwd`
+only when the catalog explicitly configures an application `working_directory`;
+otherwise each raw target's directory is inferred from its resolved path or
+`PATH`. This is separate from `cwd`, which may be inferred from the main
+executable when the catalog omits `working_directory`.
+Raw preparation retains the existing 10-second default and 30-second maximum
+command timeout and null standard handles. Windows URL and associated-file
+launches are not resolved through shell associations. These bounded execution
+rules differ from the reference helper, which waits for raw `do` commands
+without a timeout, sends their output to its configured pipe, and continues
+through undo failures. Preparation output is discarded here, and one failed undo
+blocks older undos until retry. The reference also tolerates a permission-denied
+preparation spawn error for an application without a primary command; this
+module reports the spawn failure.
+
 Steps run one at a time. A successfully spawned `run` owes its paired `undo` even
 if it later exits unsuccessfully, times out, or is cancelled, because it may have
 changed external state. Owed undo commands run in reverse order after the
 application's contained process tree has settled. Successful undo is removed
 from the owed stack; failed undo stays pending for an explicit retry. A step
-without `undo` is simply removed from the owed stack during cleanup.
+without `undo` is simply removed from the owed stack during cleanup. Raw commands
+also use the step's `elevated` flag for both `do` and `undo`.
 
 Use an absolute native executable path appropriate to the host. `args` and
 `environment` default to empty; `cwd` defaults to the host working directory.

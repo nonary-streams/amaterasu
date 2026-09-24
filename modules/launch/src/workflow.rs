@@ -126,7 +126,7 @@ impl Workflow {
                 };
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"preparation_cwd":executable.preparation_working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::StartPlaynite => match record.target.as_ref() {
@@ -141,14 +141,22 @@ impl Workflow {
                 _ => return Err("invalid_workflow"),
             },
             Step::PreparePlaynite => {
-                let preparation = match record.target.as_ref() {
-                    Some(LaunchTarget::Playnite { preparation, .. })
-                    | Some(LaunchTarget::PlayniteFullscreen { preparation, .. }) => preparation,
+                let (preparation, working_directory) = match record.target.as_ref() {
+                    Some(LaunchTarget::Playnite {
+                        preparation,
+                        working_directory,
+                        ..
+                    })
+                    | Some(LaunchTarget::PlayniteFullscreen {
+                        preparation,
+                        working_directory,
+                        ..
+                    }) => (preparation, working_directory),
                     _ => return Err("invalid_workflow"),
                 };
                 (
                     APPLICATION,
-                    json!({"action":"prepare","operation_id":record.preparation_operation,"preparation":preparation}),
+                    json!({"action":"prepare","operation_id":record.preparation_operation,"environment":environment,"cwd":working_directory,"preparation":preparation}),
                 )
             }
             Step::AwaitPreparation => (
@@ -301,6 +309,7 @@ mod tests {
         record.target = Some(LaunchTarget::Playnite {
             game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
             exit_timeout_seconds: 300,
+            working_directory: None,
             preparation: Vec::new(),
         });
         record.provider_launch_requested = true;
@@ -310,6 +319,70 @@ mod tests {
         let deadline = workflow.deadline.saturating_duration_since(Instant::now());
         assert!(deadline <= Duration::from_secs(321));
         assert!(deadline >= Duration::from_secs(320));
+    }
+
+    #[test]
+    fn playnite_preparation_forwards_the_explicit_catalog_directory() {
+        let mut records = Records::new().unwrap();
+        let (launch_id, _) = records
+            .start(
+                "alice",
+                "alice",
+                "operation".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+                Vec::new(),
+            )
+            .unwrap();
+        let directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let environment = BTreeMap::from([("GAME_PROFILE".into(), "profile-a".into())]);
+
+        for target in [
+            LaunchTarget::Playnite {
+                game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
+                exit_timeout_seconds: 10,
+                working_directory: Some(directory.clone()),
+                preparation: vec![crate::protocol::PlannedPreparationStep::Legacy(
+                    crate::protocol::LegacyPreparationCommand {
+                        do_command: "configure $(GAME_PROFILE)".into(),
+                        undo: String::new(),
+                        elevated: false,
+                    },
+                )],
+            },
+            LaunchTarget::PlayniteFullscreen {
+                exit_timeout_seconds: 10,
+                working_directory: Some(directory.clone()),
+                preparation: vec![crate::protocol::PlannedPreparationStep::Legacy(
+                    crate::protocol::LegacyPreparationCommand {
+                        do_command: "configure $(GAME_PROFILE)".into(),
+                        undo: String::new(),
+                        elevated: false,
+                    },
+                )],
+            },
+        ] {
+            let record = records.values.get_mut(&launch_id).unwrap();
+            record.target = Some(target);
+            let workflow = Workflow {
+                launch_id,
+                request: Some(1),
+                deadline: Instant::now() + Duration::from_secs(5),
+                step: Step::PreparePlaynite,
+                pending: None,
+                cleanup: false,
+            };
+            let (service, payload) = workflow.command(record, &environment).unwrap();
+
+            assert_eq!(service, APPLICATION);
+            assert_eq!(payload["action"], "prepare");
+            assert_eq!(payload["cwd"], directory);
+            assert_eq!(payload["environment"]["GAME_PROFILE"], "profile-a");
+            assert_eq!(payload["preparation"][0]["do"], "configure $(GAME_PROFILE)");
+        }
     }
 
     #[test]

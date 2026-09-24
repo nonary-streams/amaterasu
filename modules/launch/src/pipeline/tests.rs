@@ -55,7 +55,9 @@ struct Harness {
     fail_release: bool,
     released: usize,
     catalog_preparation: Option<Value>,
+    catalog_raw_preparation: Option<Value>,
     catalog_exclude_global_prep_cmd: Option<bool>,
+    catalog_config_overrides: Option<Value>,
     catalog_working_directory: Option<String>,
     catalog_auto_detach: Option<bool>,
     catalog_wait_all: Option<bool>,
@@ -114,7 +116,9 @@ impl Harness {
             fail_release: false,
             released: 0,
             catalog_preparation: None,
+            catalog_raw_preparation: None,
             catalog_exclude_global_prep_cmd: None,
+            catalog_config_overrides: None,
             catalog_working_directory: None,
             catalog_auto_detach: None,
             catalog_wait_all: None,
@@ -602,8 +606,22 @@ impl Harness {
                         if !overrides.is_empty() {
                             reply["entry"]["config_overrides"] = json!(overrides);
                         }
+                        if let Some(config_overrides) = &self.catalog_config_overrides {
+                            let entry = reply["entry"].as_object_mut().unwrap();
+                            let overrides = entry
+                                .entry("config_overrides")
+                                .or_insert_with(|| json!({}))
+                                .as_object_mut()
+                                .unwrap();
+                            for (key, value) in config_overrides.as_object().unwrap() {
+                                overrides.insert(key.clone(), value.clone());
+                            }
+                        }
                         if let Some(preparation) = &self.catalog_preparation {
                             reply["entry"]["launch"]["preparation"] = preparation.clone();
+                        }
+                        if let Some(preparation) = &self.catalog_raw_preparation {
+                            reply["entry"]["prep_cmd"] = preparation.clone();
                         }
                         if let Some(exclude) = self.catalog_exclude_global_prep_cmd {
                             reply["entry"]["exclude_global_prep_cmd"] = json!(exclude);
@@ -833,6 +851,10 @@ fn global_preparation_is_snapshotted_and_prepended_before_catalog_steps() {
     }]);
     let mut request = launch("global-preparation");
     request["global_preparation"] = global.clone();
+    request["legacy_global_preparation"] =
+        json!([{"do":"global raw", "undo":"global undo", "elevated":true}]);
+    harness.catalog_raw_preparation =
+        Some(json!([{"do":"app raw", "undo":"app undo", "elevated":false}]));
     let mut pipeline = pipeline();
 
     let started = harness.request(&mut pipeline, "alice", request.clone());
@@ -847,15 +869,23 @@ fn global_preparation_is_snapshotted_and_prepended_before_catalog_steps() {
         .expect("launch workflow sends the merged preparation sequence");
     assert_eq!(
         application_launch["preparation"].as_array().unwrap().len(),
-        2
+        4
     );
     assert_eq!(
         application_launch["preparation"][0]["run"]["args"],
         json!(["global"])
     );
     assert_eq!(
-        application_launch["preparation"][1]["run"]["args"],
+        application_launch["preparation"][1],
+        json!({"do":"global raw", "undo":"global undo", "elevated":true})
+    );
+    assert_eq!(
+        application_launch["preparation"][2]["run"]["args"],
         json!(["app"])
+    );
+    assert_eq!(
+        application_launch["preparation"][3],
+        json!({"do":"app raw", "undo":"app undo", "elevated":false})
     );
     assert_eq!(
         pipeline.records.values[&1].global_preparation[0].run.args,
@@ -863,7 +893,13 @@ fn global_preparation_is_snapshotted_and_prepended_before_catalog_steps() {
     );
 
     // A retry with a changed global setting cannot reuse the old launch ID.
-    request["global_preparation"][0]["run"]["args"] = json!(["changed"]);
+    let mut changed_structured = request.clone();
+    changed_structured["global_preparation"][0]["run"]["args"] = json!(["changed"]);
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", changed_structured)["code"],
+        "operation_conflict"
+    );
+    request["legacy_global_preparation"][0]["do"] = json!("changed raw");
     assert_eq!(
         harness.request(&mut pipeline, "alice", request)["code"],
         "operation_conflict"
@@ -877,10 +913,12 @@ fn per_application_exclusion_keeps_app_preparation_and_skips_global_steps() {
     harness.catalog_preparation = Some(json!([{
         "run":{"executable":std::env::current_exe().unwrap(),"args":["app"]},
     }]));
+    harness.catalog_raw_preparation = Some(json!([{"do":"app raw", "undo":"app undo"}]));
     let mut request = launch("global-preparation-excluded");
     request["global_preparation"] = json!([{
         "run":{"executable":std::env::current_exe().unwrap(),"args":["global"]},
     }]);
+    request["legacy_global_preparation"] = json!([{"do":"global raw", "undo":"global undo"}]);
     let mut pipeline = pipeline();
 
     let started = harness.request(&mut pipeline, "alice", request);
@@ -895,12 +933,58 @@ fn per_application_exclusion_keeps_app_preparation_and_skips_global_steps() {
         .expect("excluded app still launches");
     assert_eq!(
         application_launch["preparation"].as_array().unwrap().len(),
-        1
+        2
     );
     assert_eq!(
         application_launch["preparation"][0]["run"]["args"],
         json!(["app"])
     );
+    assert_eq!(
+        application_launch["preparation"][1],
+        json!({"do":"app raw", "undo":"app undo", "elevated":false})
+    );
+}
+
+#[test]
+fn playnite_application_preparation_accepts_raw_steps_and_keeps_global_before_app() {
+    let mut harness = Harness::new();
+    harness.catalog_playnite_game_id = Some("a1b2c3d4-1234-5678-9abc-0123456789ab".into());
+    harness.catalog_preparation = Some(json!([{
+        "run":{"executable":std::env::current_exe().unwrap(),"args":["app"]},
+    }]));
+    harness.catalog_raw_preparation = Some(json!([{"do":"app raw", "undo":"app undo"}]));
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-raw-preparation");
+    request["global_preparation"] = json!([{
+        "run":{"executable":command,"args":["global"]},
+    }]);
+    request["legacy_global_preparation"] = json!([{"do":"global raw", "undo":"global undo"}]);
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", request);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("Playnite preparation is sent before provider start");
+    assert_eq!(
+        application_launch["preparation"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(
+        application_launch["preparation"][0]["run"]["args"],
+        json!(["global"])
+    );
+    assert_eq!(application_launch["preparation"][1]["do"], "global raw");
+    assert_eq!(
+        application_launch["preparation"][2]["run"]["args"],
+        json!(["app"])
+    );
+    assert_eq!(application_launch["preparation"][3]["do"], "app raw");
 }
 
 #[test]
@@ -962,6 +1046,18 @@ fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
 #[test]
 fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app() {
     let mut harness = Harness::new();
+    let mut frame_limiter_overrides = json!({
+        "frame_limiter_enable":false,
+        "frame_limiter_fps_limit":0,
+        "frame_limiter_provider":"auto",
+        "frame_limiter_disable_vsync":false,
+        "frame_limiter_auto_virtual_framegen":"vrr",
+        "ds4_back_as_touchpad_click":false,
+    });
+    if cfg!(windows) {
+        frame_limiter_overrides["rtss_frame_limit_type"] = json!("nvidia reflex");
+    }
+    harness.catalog_config_overrides = Some(frame_limiter_overrides.clone());
     harness.catalog_fec_percentage = Some(37);
     harness.catalog_max_bitrate = Some(0);
     harness.catalog_minimum_fps_target = Some(59.94);
@@ -994,6 +1090,13 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         started["launch"]["config_overrides"]["back_button_timeout"],
         -1
     );
+    assert_eq!(started["launch"]["config_overrides"]["controller"], false);
+    assert_eq!(started["launch"]["config_overrides"]["gamepad"], "auto");
+    assert_eq!(started["launch"]["config_overrides"]["keyboard"], false);
+    assert_eq!(started["launch"]["config_overrides"]["mouse"], true);
+    for (key, value) in frame_limiter_overrides.as_object().unwrap() {
+        assert_eq!(&started["launch"]["config_overrides"][key.as_str()], value);
+    }
 
     // Later catalog edits do not replace the policy captured by this launch.
     harness.catalog_fec_percentage = Some(81);
@@ -1004,6 +1107,18 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     harness.catalog_audio_sink = Some("later-endpoint".into());
     harness.catalog_audio_sink_capture_only = Some(true);
     harness.catalog_back_button_timeout = Some(300);
+    harness.catalog_controller = Some(true);
+    harness.catalog_gamepad = Some("auto".into());
+    harness.catalog_keyboard = Some(true);
+    harness.catalog_mouse = Some(false);
+    harness.catalog_config_overrides = Some(json!({
+        "frame_limiter_enable":true,
+        "frame_limiter_fps_limit":120.5,
+        "frame_limiter_provider":"auto",
+        "frame_limiter_disable_vsync":true,
+        "frame_limiter_auto_virtual_framegen":"disabled",
+        "ds4_back_as_touchpad_click":true,
+    }));
     let status = harness.request(
         &mut pipeline,
         "nvhttp",
@@ -1029,6 +1144,13 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         status["launch"]["config_overrides"]["back_button_timeout"],
         -1
     );
+    assert_eq!(status["launch"]["config_overrides"]["controller"], false);
+    assert_eq!(status["launch"]["config_overrides"]["gamepad"], "auto");
+    assert_eq!(status["launch"]["config_overrides"]["keyboard"], false);
+    assert_eq!(status["launch"]["config_overrides"]["mouse"], true);
+    for (key, value) in frame_limiter_overrides.as_object().unwrap() {
+        assert_eq!(&status["launch"]["config_overrides"][key.as_str()], value);
+    }
     assert_eq!(
         harness
             .commands

@@ -1,5 +1,6 @@
 //! Incremental execution for trusted, configured application lifecycle commands.
 
+use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -61,24 +62,404 @@ impl ConfiguredCommand {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum PreparationStep {
+    Structured(StructuredPreparationStep),
+    Raw(RawPreparationStep),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PreparationStep {
+pub(crate) struct StructuredPreparationStep {
     pub run: ConfiguredCommand,
+    #[serde(default)]
     pub undo: Option<ConfiguredCommand>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPreparationStep {
+    #[serde(default, rename = "do")]
+    pub do_command: String,
+    #[serde(default)]
+    pub undo: String,
+    #[serde(default)]
+    pub elevated: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationCommand<'a> {
+    Structured(&'a ConfiguredCommand),
+    Raw { text: &'a str, elevated: bool },
+}
+
 impl PreparationStep {
+    fn run_command(&self) -> Option<PreparationCommand<'_>> {
+        match self {
+            Self::Structured(step) => Some(PreparationCommand::Structured(&step.run)),
+            Self::Raw(step) if !step.do_command.is_empty() => Some(PreparationCommand::Raw {
+                text: &step.do_command,
+                elevated: step.elevated,
+            }),
+            Self::Raw(_) => None,
+        }
+    }
+
+    fn undo_command(&self) -> Option<PreparationCommand<'_>> {
+        match self {
+            Self::Structured(step) => step.undo.as_ref().map(PreparationCommand::Structured),
+            Self::Raw(step) if !step.undo.is_empty() => Some(PreparationCommand::Raw {
+                text: &step.undo,
+                elevated: step.elevated,
+            }),
+            Self::Raw(_) => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Structured(step) => {
+                step.run.validate()?;
+                if let Some(undo) = &step.undo {
+                    undo.validate()?;
+                }
+            }
+            Self::Raw(step) => {
+                for command in [&step.do_command, &step.undo] {
+                    if !command.is_empty() {
+                        parse_detached_commands(vec![command.clone()])?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_all(steps: &[Self]) -> Result<(), &'static str> {
         if steps.len() > MAX_PREPARATION_STEPS {
             return Err("too many preparation steps");
         }
         for step in steps {
-            step.run.validate()?;
-            if let Some(undo) = &step.undo {
-                undo.validate()?;
-            }
+            step.validate()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn raw_preparation_step_defaults_and_preserves_exact_command_text() {
+        let defaults: PreparationStep = serde_json::from_value(json!({})).unwrap();
+        let PreparationStep::Raw(defaults) = defaults else {
+            panic!("empty preparation object must use the raw compatibility form");
+        };
+        assert_eq!(defaults.do_command, "");
+        assert_eq!(defaults.undo, "");
+        assert!(!defaults.elevated);
+
+        let raw_text = "tool  --literal=$HOME \"quoted value\"  ";
+        let selected: PreparationStep = serde_json::from_value(json!({
+            "do":raw_text,
+            "undo":"cleanup --flag",
+            "elevated":true
+        }))
+        .unwrap();
+        selected.validate().unwrap();
+        let PreparationStep::Raw(selected_raw) = &selected else {
+            panic!("raw fields must select the raw preparation form");
+        };
+        assert_eq!(selected_raw.do_command, raw_text);
+        assert_eq!(selected_raw.undo, "cleanup --flag");
+        assert!(selected_raw.elevated);
+        assert!(matches!(
+            selected.run_command(),
+            Some(PreparationCommand::Raw {
+                text,
+                elevated: true
+            }) if text == raw_text
+        ));
+        assert!(matches!(
+            selected.undo_command(),
+            Some(PreparationCommand::Raw {
+                text: "cleanup --flag",
+                elevated: true
+            })
+        ));
+
+        let equivalent_tokens: PreparationStep = serde_json::from_value(json!({
+            "do":"tool --literal=$HOME \"quoted value\"",
+            "undo":"cleanup --flag",
+            "elevated":true
+        }))
+        .unwrap();
+        assert_ne!(
+            selected, equivalent_tokens,
+            "step identity must retain the exact command strings"
+        );
+    }
+
+    #[test]
+    fn raw_preparation_expands_environment_values_and_literal_dollar_escapes() {
+        let environment = BTreeMap::from([
+            ("ROOT".to_owned(), "/games/My Title".to_owned()),
+            ("EMPTY".to_owned(), String::new()),
+        ]);
+
+        assert_eq!(
+            expand_environment_references("$(ROOT)/$$config/$(EMPTY)", &environment).unwrap(),
+            "/games/My Title/$config/"
+        );
+        assert_eq!(
+            expand_environment_references("literal $HOME", &environment).unwrap(),
+            "literal $HOME"
+        );
+        assert!(expand_environment_references("$(ROOT", &environment).is_err());
+    }
+
+    #[test]
+    fn empty_raw_commands_are_skipped_and_nonempty_commands_are_bounded() {
+        let empty: PreparationStep = serde_json::from_value(json!({
+            "do":"",
+            "undo":""
+        }))
+        .unwrap();
+        empty.validate().unwrap();
+        assert!(empty.run_command().is_none());
+        assert!(empty.undo_command().is_none());
+        let mut lifecycle = ApplicationLifecycle::new(vec![empty]).unwrap();
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.is_ready());
+        assert_eq!(lifecycle.preparation.completed, 0);
+        lifecycle.begin_cleanup();
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.is_cleanup_complete());
+
+        let oversized_command = "tool ".repeat(500);
+        for invalid_command in [
+            "tool \"unclosed",
+            oversized_command.as_str(),
+            "tool\nargument",
+        ] {
+            let invalid: PreparationStep =
+                serde_json::from_value(json!({"do":invalid_command})).unwrap();
+            assert!(invalid.validate().is_err());
+        }
+    }
+}
+
+fn expand_environment_references(
+    command: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, std::io::Error> {
+    let mut expanded = String::with_capacity(command.len());
+    let mut cursor = 0;
+
+    while let Some(relative_dollar) = command[cursor..].find('$') {
+        let dollar = cursor + relative_dollar;
+        append_bounded(&mut expanded, &command[cursor..dollar])?;
+        let after_dollar = dollar + 1;
+
+        match command.as_bytes().get(after_dollar) {
+            Some(b'$') => {
+                append_bounded(&mut expanded, "$")?;
+                cursor = after_dollar + 1;
+            }
+            Some(b'(') => {
+                let mut depth = 0usize;
+                let mut closing_parenthesis = None;
+                for (offset, character) in command[after_dollar..].char_indices() {
+                    match character {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                closing_parenthesis = Some(after_dollar + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let closing_parenthesis = closing_parenthesis.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "raw preparation environment reference is not closed",
+                    )
+                })?;
+                let name = &command[after_dollar + 1..closing_parenthesis];
+                let value = preparation_environment_value(name, environment);
+                append_bounded(&mut expanded, value.as_deref().unwrap_or_default())?;
+                cursor = closing_parenthesis + 1;
+            }
+            _ => {
+                append_bounded(&mut expanded, "$")?;
+                cursor = after_dollar;
+            }
+        }
+    }
+
+    append_bounded(&mut expanded, &command[cursor..])?;
+    Ok(expanded)
+}
+
+fn append_bounded(output: &mut String, value: &str) -> Result<(), std::io::Error> {
+    if output.len().saturating_add(value.len()) > 2_048 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expanded raw preparation command exceeds bounds",
+        ));
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn preparation_environment_value(
+    name: &str,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    #[cfg(windows)]
+    let configured = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone());
+    #[cfg(not(windows))]
+    let configured = environment.get(name).cloned();
+
+    configured.or_else(|| std::env::var(name).ok())
+}
+
+fn resolve_preparation_executable(
+    executable: &str,
+    environment: &BTreeMap<String, String>,
+    application_working_directory: Option<&str>,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let executable_path = Path::new(executable);
+    if executable.contains("://") || executable_path.is_absolute() {
+        return Ok(executable_path.to_path_buf());
+    }
+
+    if executable_path.components().count() > 1 {
+        let base_directory = match application_working_directory {
+            Some(directory) => Path::new(directory).to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        return Ok(base_directory.join(executable_path));
+    }
+
+    let configured_path = environment
+        .iter()
+        .find(|(key, _)| {
+            #[cfg(windows)]
+            {
+                key.eq_ignore_ascii_case("PATH")
+            }
+            #[cfg(not(windows))]
+            {
+                key.as_str() == "PATH"
+            }
+        })
+        .map(|(_, value)| std::ffi::OsString::from(value));
+    let search_path = configured_path.clone().or_else(|| std::env::var_os("PATH"));
+    if let Some(search_path) = search_path {
+        if let Some(resolved) = find_preparation_executable(
+            executable_path,
+            &search_path,
+            application_working_directory,
+        ) {
+            return Ok(resolved);
+        }
+    }
+
+    if configured_path.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "raw preparation executable was not found on its configured PATH",
+        ));
+    }
+    Ok(executable_path.to_path_buf())
+}
+
+fn find_preparation_executable(
+    executable: &Path,
+    search_path: &std::ffi::OsStr,
+    application_working_directory: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let base_directory = application_working_directory
+        .map(Path::new)
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())?;
+    for directory in std::env::split_paths(search_path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            base_directory.join(directory)
+        };
+        #[cfg(windows)]
+        let candidates = {
+            if executable.extension().is_some() {
+                vec![executable.to_path_buf()]
+            } else {
+                vec![
+                    executable.to_path_buf(),
+                    executable.with_extension("exe"),
+                    executable.with_extension("com"),
+                ]
+            }
+        };
+        #[cfg(not(windows))]
+        let candidates = vec![executable.to_path_buf()];
+
+        for candidate in candidates {
+            let path = directory.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn preparation_working_directory(
+    resolved_executable: &Path,
+    application_working_directory: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if let Some(directory) = application_working_directory {
+        return Some(directory.into());
+    }
+    if resolved_executable.to_string_lossy().contains("://") {
+        return None;
+    }
+    resolved_executable
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod raw_preparation_path_tests {
+    use super::*;
+
+    #[test]
+    fn raw_preparation_uses_configured_path_target_for_execution_and_directory() {
+        let current_executable = std::env::current_exe().unwrap();
+        let executable_directory = current_executable.parent().unwrap();
+        let executable_name = current_executable.file_name().unwrap().to_string_lossy();
+        let environment = BTreeMap::from([(
+            "PATH".to_owned(),
+            executable_directory.to_string_lossy().into_owned(),
+        )]);
+
+        let resolved =
+            resolve_preparation_executable(&executable_name, &environment, None).unwrap();
+        assert_eq!(resolved, current_executable);
+        assert_eq!(
+            preparation_working_directory(&resolved, None).as_deref(),
+            Some(executable_directory)
+        );
     }
 }
 
@@ -89,7 +470,9 @@ fn valid_path(value: &str) -> bool {
         && Path::new(value).is_absolute()
 }
 
-fn validate_environment(environment: &BTreeMap<String, String>) -> Result<(), &'static str> {
+pub(crate) fn validate_environment(
+    environment: &BTreeMap<String, String>,
+) -> Result<(), &'static str> {
     if environment.len() > 32
         || environment.iter().any(|(key, value)| {
             key.is_empty()
@@ -195,21 +578,57 @@ struct CommandTask {
 }
 
 impl CommandTask {
-    fn spawn(spec: &ConfiguredCommand, now: Instant) -> Result<Self, std::io::Error> {
-        let mut command = Command::new(&spec.executable);
+    fn spawn(
+        spec: PreparationCommand<'_>,
+        environment: &BTreeMap<String, String>,
+        application_working_directory: Option<&str>,
+        now: Instant,
+    ) -> Result<Self, std::io::Error> {
+        let (mut command, timeout_ms, elevated) = match spec {
+            PreparationCommand::Structured(spec) => {
+                let mut command = Command::new(&spec.executable);
+                command.args(&spec.args).env_clear().envs(&spec.environment);
+                if let Some(cwd) = &spec.cwd {
+                    command.current_dir(cwd);
+                }
+                (command, spec.timeout_ms, false)
+            }
+            PreparationCommand::Raw { text, elevated } => {
+                let expanded = expand_environment_references(text, environment)?;
+                let parsed = parse_detached_commands(vec![expanded]).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid raw preparation command",
+                    )
+                })?;
+                let parsed = parsed.into_iter().next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "raw preparation command is empty",
+                    )
+                })?;
+                let executable = resolve_preparation_executable(
+                    &parsed.executable,
+                    environment,
+                    application_working_directory,
+                )?;
+                let mut command = Command::new(&executable);
+                command.args(parsed.args).envs(environment);
+                if let Some(working_directory) =
+                    preparation_working_directory(&executable, application_working_directory)
+                {
+                    command.current_dir(working_directory);
+                }
+                (command, default_command_timeout_ms(), elevated)
+            }
+        };
         command
-            .args(&spec.args)
-            .env_clear()
-            .envs(&spec.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(cwd) = &spec.cwd {
-            command.current_dir(cwd);
-        }
         Ok(Self {
-            child: ContainedChild::spawn(&mut command, false)?,
-            execution_deadline: now + Duration::from_millis(spec.timeout_ms),
+            child: ContainedChild::spawn(&mut command, elevated)?,
+            execution_deadline: now + Duration::from_millis(timeout_ms),
             stop_requested_at: None,
             force_requested: false,
             observed_exit: false,
@@ -337,6 +756,10 @@ pub(crate) struct ApplicationLifecycle {
     #[serde(skip)]
     steps: Vec<PreparationStep>,
     #[serde(skip)]
+    environment: BTreeMap<String, String>,
+    #[serde(skip)]
+    preparation_working_directory: Option<String>,
+    #[serde(skip)]
     next_preparation: usize,
     #[serde(skip)]
     pending_undo: Vec<usize>,
@@ -348,6 +771,14 @@ pub(crate) struct ApplicationLifecycle {
 
 impl ApplicationLifecycle {
     pub(crate) fn new(steps: Vec<PreparationStep>) -> Option<Self> {
+        Self::new_with_context(steps, BTreeMap::new(), None)
+    }
+
+    pub(crate) fn new_with_context(
+        steps: Vec<PreparationStep>,
+        environment: BTreeMap<String, String>,
+        preparation_working_directory: Option<String>,
+    ) -> Option<Self> {
         (!steps.is_empty()).then_some(Self {
             preparation: PreparationReport {
                 completed: 0,
@@ -359,6 +790,8 @@ impl ApplicationLifecycle {
                 failures: Vec::new(),
             },
             steps,
+            environment,
+            preparation_working_directory,
             next_preparation: 0,
             pending_undo: Vec::new(),
             active: None,
@@ -407,27 +840,39 @@ impl ApplicationLifecycle {
     }
 
     fn start_next_preparation(&mut self, now: Instant) {
-        if self.next_preparation == self.steps.len() {
-            self.phase = Phase::Ready;
+        loop {
+            if self.next_preparation == self.steps.len() {
+                self.phase = Phase::Ready;
+                return;
+            }
+            let index = self.next_preparation;
+            let Some(command) = self.steps[index].run_command() else {
+                self.next_preparation += 1;
+                continue;
+            };
+            match CommandTask::spawn(
+                command,
+                &self.environment,
+                self.preparation_working_directory.as_deref(),
+                now,
+            ) {
+                Ok(task) => {
+                    // A started command may have changed external state even when it
+                    // later times out or exits unsuccessfully, so its undo is owed.
+                    self.pending_undo.push(index);
+                    self.cleanup.remaining = self.pending_undo.len();
+                    self.active = Some(ActiveCommand {
+                        purpose: CommandPurpose::Preparation(index),
+                        task,
+                    });
+                }
+                Err(error) => {
+                    self.preparation.failure =
+                        Some(CommandFailure::spawn(&error).at("preparation", index));
+                    self.begin_cleanup();
+                }
+            }
             return;
-        }
-        let index = self.next_preparation;
-        match CommandTask::spawn(&self.steps[index].run, now) {
-            Ok(task) => {
-                // A started command may have changed external state even when it
-                // later times out or exits unsuccessfully, so its undo is owed.
-                self.pending_undo.push(index);
-                self.cleanup.remaining = self.pending_undo.len();
-                self.active = Some(ActiveCommand {
-                    purpose: CommandPurpose::Preparation(index),
-                    task,
-                });
-            }
-            Err(error) => {
-                self.preparation.failure =
-                    Some(CommandFailure::spawn(&error).at("preparation", index));
-                self.begin_cleanup();
-            }
         }
     }
 
@@ -438,11 +883,16 @@ impl ApplicationLifecycle {
             self.cleanup.remaining = 0;
             return;
         };
-        let Some(command) = &self.steps[index].undo else {
+        let Some(command) = self.steps[index].undo_command() else {
             self.complete_undo(index);
             return;
         };
-        match CommandTask::spawn(command, now) {
+        match CommandTask::spawn(
+            command,
+            &self.environment,
+            self.preparation_working_directory.as_deref(),
+            now,
+        ) {
             Ok(task) => {
                 self.active = Some(ActiveCommand {
                     purpose: CommandPurpose::Undo(index),

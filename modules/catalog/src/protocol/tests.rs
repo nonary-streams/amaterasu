@@ -422,6 +422,228 @@ fn preparation_defaults_serialize_as_canonical_metadata() {
 }
 
 #[test]
+fn frame_limiter_overrides_are_sparse_normalized_and_platform_validated() {
+    let missing: Entry = serde_json::from_value(json!({
+        "name":"Inherited limiter settings",
+        "launch":{"kind":"executable","program":"/games/inherited"}
+    }))
+    .unwrap();
+    assert!(missing.config_overrides.is_empty());
+
+    let null_values: Entry = serde_json::from_value(json!({
+        "name":"Null limiter settings",
+        "launch":{"kind":"executable","program":"/games/null"},
+        "config_overrides":{
+            "frame_limiter_enable":null,
+            "frame_limiter_fps_limit":null,
+            "frame_limiter_provider":null,
+            "frame_limiter_disable_vsync":null,
+            "frame_limiter_auto_virtual_framegen":null,
+            "rtss_frame_limit_type":null,
+            "ds4_back_as_touchpad_click":null
+        }
+    }))
+    .unwrap();
+    assert!(null_values.config_overrides.is_empty());
+    assert_eq!(
+        serde_json::to_value(null_values).unwrap()["config_overrides"],
+        json!(null)
+    );
+
+    let mut configured: Entry = serde_json::from_value(json!({
+        "name":"Configured limiter settings",
+        "launch":{"kind":"executable","program":"/games/configured"},
+        "config_overrides":{
+            "frame_limiter_enable":false,
+            "frame_limiter_fps_limit":0,
+            "frame_limiter_provider":"auto",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":true,
+            "ds4_back_as_touchpad_click":false
+        }
+    }))
+    .unwrap();
+    configured.validate().unwrap();
+    assert_eq!(
+        configured
+            .config_overrides
+            .frame_limiter_auto_virtual_framegen
+            .as_deref(),
+        Some("enabled")
+    );
+    let persisted = serde_json::to_value(&configured).unwrap();
+    assert_eq!(
+        persisted["config_overrides"],
+        json!({
+            "frame_limiter_enable":false,
+            "frame_limiter_fps_limit":0,
+            "frame_limiter_provider":"auto",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":"enabled",
+            "ds4_back_as_touchpad_click":false
+        })
+    );
+
+    for fps_limit in [0.0, 1.234, 1000.0] {
+        configured.config_overrides.frame_limiter_fps_limit = Some(fps_limit);
+        configured.validate().unwrap();
+    }
+    for fps_limit in [-0.001, 1.2345, 1000.001, f64::NAN, f64::INFINITY] {
+        configured.config_overrides.frame_limiter_fps_limit = Some(fps_limit);
+        assert!(configured.validate().is_err());
+    }
+
+    let platform_provider = if cfg!(windows) {
+        "nvidia-control-panel"
+    } else if cfg!(target_os = "linux") {
+        "proton"
+    } else {
+        "auto"
+    };
+    configured.config_overrides.frame_limiter_fps_limit = Some(60.0);
+    configured.config_overrides.frame_limiter_provider = Some(platform_provider.into());
+    configured.validate().unwrap();
+    configured.config_overrides.frame_limiter_provider = Some("unsupported".into());
+    assert!(configured.validate().is_err());
+
+    for (legacy, canonical) in [
+        (json!(true), "enabled"),
+        (json!(false), "disabled"),
+        (json!("true"), "enabled"),
+        (json!("false"), "disabled"),
+    ] {
+        let parsed: Entry = serde_json::from_value(json!({
+            "name":"Normalized virtual frame generation",
+            "launch":{"kind":"executable","program":"/games/configured"},
+            "config_overrides":{"frame_limiter_auto_virtual_framegen":legacy}
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed
+                .config_overrides
+                .frame_limiter_auto_virtual_framegen
+                .as_deref(),
+            Some(canonical)
+        );
+    }
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name":"Invalid virtual frame generation",
+            "launch":{"kind":"executable","program":"/games/configured"},
+            "config_overrides":{"frame_limiter_auto_virtual_framegen":"true-ish"}
+        }))
+        .is_err()
+    );
+
+    configured.config_overrides.rtss_frame_limit_type = Some("nvidia reflex".into());
+    configured.config_overrides.frame_limiter_provider = Some(platform_provider.into());
+    assert_eq!(configured.validate().is_ok(), cfg!(windows));
+}
+
+#[test]
+fn raw_preparation_alias_preserves_command_text_and_uses_bounded_defaults() {
+    let mut entry: Entry = serde_json::from_value(json!({
+        "name":"Legacy prepared game",
+        "prep-cmd":[{
+            "do":"  configure --profile=\"two words\"  ",
+            "undo":" restore --profile=\"two words\" ",
+            "elevated":true
+        }],
+        "launch":{"kind":"executable","program":"/games/prepared"}
+    }))
+    .unwrap();
+    entry.validate().unwrap();
+    assert_eq!(
+        entry.prep_cmd[0].do_command,
+        "  configure --profile=\"two words\"  "
+    );
+    assert_eq!(entry.prep_cmd[0].undo, " restore --profile=\"two words\" ");
+    assert!(entry.prep_cmd[0].elevated);
+    assert_eq!(
+        serde_json::to_value(&entry).unwrap()["prep_cmd"],
+        json!([{
+            "do":"  configure --profile=\"two words\"  ",
+            "undo":" restore --profile=\"two words\" ",
+            "elevated":true
+        }])
+    );
+
+    let defaulted: Entry = serde_json::from_value(json!({
+        "name":"Defaulted prep",
+        "prep_cmd":[{}],
+        "launch":{"kind":"executable","program":"/games/prepared"}
+    }))
+    .unwrap();
+    assert_eq!(defaulted.prep_cmd[0].do_command, "");
+    assert_eq!(defaulted.prep_cmd[0].undo, "");
+    assert!(!defaulted.prep_cmd[0].elevated);
+    defaulted.validate().unwrap();
+
+    let oversized: Entry = serde_json::from_value(json!({
+        "name":"Oversized prep",
+        "prep_cmd":[{"do":"x".repeat(2049)}],
+        "launch":{"kind":"executable","program":"/games/prepared"}
+    }))
+    .unwrap();
+    assert!(oversized.validate().is_err());
+
+    let nul_command: Entry = serde_json::from_value(json!({
+        "name":"NUL prep",
+        "prep_cmd":[{"do":"tool\0argument"}],
+        "launch":{"kind":"executable","program":"/games/prepared"}
+    }))
+    .unwrap();
+    assert!(nul_command.validate().is_err());
+
+    let combined: Entry = serde_json::from_value(json!({
+        "name":"Too many prep steps",
+        "prep_cmd":[{"do":"raw"}],
+        "launch":{
+            "kind":"executable",
+            "program":command_path(),
+            "preparation":[
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}},
+                {"run":{"executable":command_path()}}
+            ]
+        }
+    }))
+    .unwrap();
+    assert!(combined.validate().is_err());
+
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name":"Ambiguous prep aliases",
+            "prep_cmd":[],
+            "prep-cmd":[],
+            "launch":{"kind":"executable","program":"/games/prepared"}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn playnite_targets_can_store_structured_application_preparation() {
+    let mut entry = playnite_entry();
+    entry.launch = serde_json::from_value(json!({
+        "kind":"playnite",
+        "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+        "preparation":[{"run":{"executable":command_path()}}]
+    }))
+    .unwrap();
+    entry.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(entry).unwrap()["launch"]["preparation"][0]["run"]["timeout_ms"],
+        10_000
+    );
+}
+
+#[test]
 fn auto_detach_can_be_disabled_and_persists_across_reload() {
     let game: Entry = serde_json::from_value(json!({
         "name":"Explicit foreground app",

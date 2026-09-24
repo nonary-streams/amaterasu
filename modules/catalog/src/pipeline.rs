@@ -1215,7 +1215,8 @@ impl Pipeline {
                 && matches!(
                     entry.launch,
                     Launch::PlayniteFullscreen {
-                        exit_timeout_seconds: 10
+                        exit_timeout_seconds: 10,
+                        ..
                     }
                 )
                 && entry.config_overrides == update.marker.config_overrides
@@ -2593,9 +2594,12 @@ fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
         steam_install_dir: None,
         config_overrides,
         exclude_global_prep_cmd: false,
+        prep_cmd: Vec::new(),
         elevated: false,
         launch: Launch::PlayniteFullscreen {
             exit_timeout_seconds: 10,
+            working_directory: None,
+            preparation: Vec::new(),
         },
     }
 }

@@ -55,6 +55,24 @@ fn controlled_child() {
         return;
     }
 
+    if arguments
+        .iter()
+        .any(|argument| argument == "--raw-preparation-marker")
+    {
+        use std::io::Write;
+
+        let marker = std::env::current_dir()
+            .unwrap()
+            .join("raw-preparation-marker");
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marker)
+            .unwrap();
+        writeln!(output, "raw").unwrap();
+        return;
+    }
+
     let mode = if arguments
         .iter()
         .any(|argument| argument == "--detached-child")
@@ -363,6 +381,24 @@ fn trace_events(path: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .map(|contents| contents.lines().map(str::to_owned).collect())
         .unwrap_or_default()
+}
+
+fn quote_raw_command_argument(argument: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{argument}\"")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
+}
+
+fn raw_test_command(argument: &str) -> String {
+    format!(
+        "{} {argument}",
+        quote_raw_command_argument("$(AMATERASU_RAW_PREPARATION_TEST_EXE)")
+    )
 }
 
 fn test_directory(name: &str) -> std::path::PathBuf {
@@ -1047,6 +1083,41 @@ fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
     );
     std::fs::remove_dir_all(directory).unwrap();
     std::fs::remove_dir_all(undo_directory).unwrap();
+}
+
+#[test]
+fn raw_preparation_commands_execute_and_undo_through_the_existing_lifecycle() {
+    let directory = test_directory("raw-preparation-cwd");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("raw-preparation", "sleep");
+    request["cwd"] = json!(directory);
+    request["preparation_cwd"] = json!(directory);
+    request["environment"]["AMATERASU_RAW_PREPARATION_TEST_EXE"] =
+        json!(std::env::current_exe().unwrap().to_string_lossy());
+    request["preparation"] = json!([{
+        "do":raw_test_command("--exact tests::controlled_child --ignored -- --raw-preparation-marker"),
+        "undo":raw_test_command("--exact tests::controlled_child --ignored -- --raw-preparation-marker"),
+        "elevated":false,
+    }]);
+
+    let started = manager.handle("alice", request);
+    assert_eq!(started["process"]["state"], "preparing", "{started}");
+    let process_id = started["process"]["process_id"].as_u64().unwrap();
+    let running = wait_for_state(&mut manager, "alice", process_id, "running");
+    let marker = directory.join("raw-preparation-marker");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "raw\n");
+    assert_eq!(running["process"]["preparation"]["completed"], 1);
+    assert_eq!(running["process"]["cleanup"]["remaining"], 1);
+
+    manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    let cancelled = wait_for_state(&mut manager, "alice", process_id, "cancelled");
+    assert_eq!(cancelled["process"]["cleanup"]["state"], "complete");
+    assert_eq!(cancelled["process"]["cleanup"]["remaining"], 0);
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "raw\nraw\n");
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

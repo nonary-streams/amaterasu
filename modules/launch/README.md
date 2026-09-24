@@ -44,20 +44,26 @@ cross-platform metadata may still be unsupported on this host. The application
 provider enforces its remaining native launch constraints, including rejection of
 implicit batch executables.
 
-A preparation plan contains at most eight ordered `run` commands with optional
-paired `undo` commands. Global steps are prepended to catalog steps unless the
+A preparation plan contains at most eight ordered steps. Structured steps use
+`run` commands with optional paired `undo` commands. Raw compatibility steps
+use `do`, `undo`, and `elevated` fields, retaining the strings as supplied.
+Launch accepts the structured host snapshot as `global_preparation` and the
+raw host snapshot as `legacy_global_preparation`; both default to empty. The
+resolved plan orders structured global steps, raw global steps, structured
+application steps, then raw application steps. The raw and structured global
+snapshots are both retained for retries, and changing either under the same
+operation ID returns `operation_conflict`. Global steps are omitted when the
 resolved catalog entry has `exclude_global_prep_cmd:true` (missing means false);
-that flag skips only global steps. The legacy spelling
+that flag skips both global forms. The legacy spelling
 `exclude-global-prep-cmd` is accepted as an alias, but supplying both spellings
 is invalid. The combined plan also has an eight-step maximum and exceeds that
 limit with `preparation_limit_exceeded` before acquiring a session lease. Each
-command uses literal argv, a cleared explicit
+structured command uses literal argv, a cleared explicit
 environment, an optional native working directory, and a 1–30000 ms timeout
 (10000 ms by default). Command paths, arguments, and environments use the same
-native application bounds. Launch snapshots the supplied global list in the
+native application bounds. Launch snapshots the supplied global lists in the
 idempotency record, parses and validates the resolved catalog plan, and forwards
-the merged plan to the application provider. Reusing an operation ID with a
-different global list returns `operation_conflict`. It applies process defaults
+the merged plan to the application provider. It applies process defaults
 only where the catalog has no per-application value (`auto_detach:true`,
 `wait_all:true`, `exit_timeout_seconds:10`). Typed Playnite targets also default
 to a 10-second exit timeout. For Playnite and Playnite Fullscreen, global
@@ -65,12 +71,16 @@ preparation must finish before the provider starts. Cleanup confirms the provide
 has stopped before running reverse-order undo, and retains the session lease if
 undo fails so the caller can retry. Executable launches merge global steps before
 catalog steps, and owe reverse-order undo for every run command they started.
-
-This payload does not implement Vibeshine's raw `do`/`undo` command strings or
-per-command `elevated`. A settings bridge must map configured commands to this
-explicit executable/argv model; these semantics remain a parity gap. Application
-launch arguments, detached commands, and preparation command fields also do not
-receive Vibeshine's general `$()` expansion.
+Raw commands are forwarded as opaque command text with their elevation flag;
+catalog and launch do not expand or shell-parse their strings. The application
+provider expands `$(NAME)` and `$$` only when it executes a raw preparation step.
+Application launch arguments, detached commands, and structured preparation
+commands do not receive Vibeshine's general `$()` expansion. For executable,
+Playnite, and Playnite Fullscreen entries, launch forwards an explicitly
+configured catalog `working_directory` as the preparation cwd. A cwd inferred
+from the main executable is not treated as an explicit app directory, so raw
+commands without one infer their own target directory from the resolved
+executable or `PATH`.
 
 Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
 (default 10 seconds, maximum 300); they contain no request-controlled path or
@@ -147,12 +157,21 @@ When a catalog entry has application overrides, launch and status responses also
 include a sparse `config_overrides` object: `fec_percentage`, `max_bitrate`,
 `minimum_fps_target`, `video_max_batch_size_kb`, `stream_audio`, `audio_sink`,
 `virtual_sink`, `audio_sink_capture_only`, `back_button_timeout`, `controller`,
-`gamepad`, `keyboard`, and `mouse`. Missing values remain absent; explicit zero,
+`gamepad`, `keyboard`, `mouse`, `frame_limiter_enable`,
+`frame_limiter_fps_limit`, `frame_limiter_provider`,
+`frame_limiter_disable_vsync`, `frame_limiter_auto_virtual_framegen`,
+`rtss_frame_limit_type`, and `ds4_back_as_touchpad_click`. Missing values remain absent; explicit zero,
 `false` values, and empty audio selectors are preserved from the catalog revision
 used to start the application. `minimum_fps_target` must be finite and from 0
 through 1000, and `video_max_batch_size_kb` must be from 0 through 64. The
-application lifecycle module retains these values in its result; NVHTTP remains
-responsible for applying application and paired-client stream settings.
+frame limiter FPS limit accepts 0 through 1000 with millihertz precision. Its
+provider is platform-specific (`auto|rtss|nvidia-control-panel|none` on Windows,
+`auto|mangohud|proton|mangohud-proton|none` on Linux, and `auto` on macOS).
+Auto virtual frame generation is normalized to `enabled|vrr|legacy|disabled`;
+legacy booleans are accepted on input. RTSS frame limit type is Windows-only.
+The launch record snapshots these settings from the catalog revision used to
+start the application. Consumer behavior for frame limiter and DS4 settings is
+provided by their runtime modules.
 
 `ok:true` acknowledges a retained lifecycle record, not necessarily a successful
 launch. Inspect `state`: `starting`, `active`, `stopping`, `stopped`, `cancelled`,

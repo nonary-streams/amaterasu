@@ -1,5 +1,5 @@
 use crate::commands::DetachedCommand;
-use crate::lifecycle::PreparationStep;
+use crate::lifecycle::{PreparationStep, validate_environment};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,6 +15,8 @@ pub(crate) enum Action {
         #[serde(default)]
         environment: BTreeMap<String, String>,
         cwd: Option<String>,
+        #[serde(default)]
+        preparation_cwd: Option<String>,
         #[serde(default)]
         elevated: bool,
         #[serde(default = "default_auto_detach")]
@@ -37,6 +39,10 @@ pub(crate) enum Action {
     },
     Prepare {
         operation_id: String,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
+        #[serde(default)]
+        cwd: Option<String>,
         #[serde(default)]
         preparation: Box<[PreparationStep]>,
     },
@@ -67,6 +73,10 @@ pub(crate) enum Action {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparationSpec {
     pub preparation: Vec<PreparationStep>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl PreparationSpec {
@@ -79,6 +89,10 @@ impl PreparationSpec {
         }
         if self.preparation.is_empty() {
             return Err("preparation must contain at least one step");
+        }
+        validate_environment(&self.environment)?;
+        if self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd)) {
+            return Err("cwd must be an absolute path");
         }
         PreparationStep::validate_all(&self.preparation)
     }
@@ -108,6 +122,7 @@ pub(crate) struct LaunchSpec {
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub preparation_cwd: Option<String>,
     pub elevated: bool,
     pub auto_detach: bool,
     pub wait_all: bool,
@@ -140,7 +155,12 @@ impl LaunchSpec {
         {
             return Err("invalid Steam app identity or installation directory");
         }
-        if !valid_path(&self.executable) || self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd))
+        if !valid_path(&self.executable)
+            || self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd))
+            || self
+                .preparation_cwd
+                .as_deref()
+                .is_some_and(|cwd| !valid_path(cwd))
         {
             return Err("executable and cwd must be absolute paths of 1 to 1024 bytes without NUL");
         }
@@ -280,6 +300,7 @@ mod tests {
             args: Vec::new(),
             environment: BTreeMap::new(),
             cwd: None,
+            preparation_cwd: None,
             elevated: false,
             auto_detach: true,
             wait_all: false,
@@ -330,5 +351,64 @@ mod tests {
             panic!("expected launch action")
         };
         assert!(!elevated);
+    }
+
+    #[test]
+    fn launch_preparation_accepts_raw_defaults_and_existing_structured_steps() {
+        let raw_text = "tool  --literal=$HOME \"quoted value\"  ";
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "action":"launch",
+            "operation_id":"raw-preparation",
+            "executable":"/bin/example",
+            "preparation":[
+                {"do":raw_text},
+                {
+                    "run":{"executable":"/bin/setup","args":["--safe"]},
+                    "undo":{"executable":"/bin/cleanup"}
+                }
+            ]
+        }))
+        .unwrap();
+        let Action::Launch { preparation, .. } = action else {
+            panic!("expected launch action")
+        };
+        assert_eq!(preparation.len(), 2);
+        let PreparationStep::Raw(raw) = &preparation[0] else {
+            panic!("raw fields must select the raw preparation form")
+        };
+        assert_eq!(raw.do_command, raw_text);
+        assert_eq!(raw.undo, "");
+        assert!(!raw.elevated);
+        let PreparationStep::Structured(structured) = &preparation[1] else {
+            panic!("existing structured fields must keep their wire shape")
+        };
+        assert_eq!(structured.run.executable, "/bin/setup");
+        assert_eq!(structured.run.args, ["--safe"]);
+        assert_eq!(
+            structured
+                .undo
+                .as_ref()
+                .map(|command| command.executable.as_str()),
+            Some("/bin/cleanup")
+        );
+        PreparationStep::validate_all(&preparation).unwrap();
+
+        let prepare_action: Action = serde_json::from_value(serde_json::json!({
+            "action":"prepare",
+            "operation_id":"raw-global-preparation",
+            "preparation":[{"undo":""}]
+        }))
+        .unwrap();
+        let Action::Prepare { preparation, .. } = prepare_action else {
+            panic!("expected prepare action")
+        };
+        assert!(matches!(&preparation[0], PreparationStep::Raw(_)));
+        PreparationSpec {
+            preparation: preparation.into_vec(),
+            environment: BTreeMap::new(),
+            cwd: None,
+        }
+        .validate("raw-global-preparation")
+        .unwrap();
     }
 }

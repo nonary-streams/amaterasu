@@ -889,6 +889,13 @@ fn preparation_and_undo_are_canonically_persisted_across_reload() {
             "expected_revision": 0,
             "entry": {
                 "name": "Prepared game",
+                "prep-cmd": [
+                    {
+                        "do": "  configure --profile=\"two words\"  ",
+                        "undo": " restore --profile=\"two words\" ",
+                        "elevated": true
+                    }
+                ],
                 "launch": {
                     "kind": "executable",
                     "program": "/games/prepared",
@@ -935,6 +942,14 @@ fn preparation_and_undo_are_canonically_persisted_across_reload() {
     ]);
     let stored = backend.entries["app-0000000000000001"].clone();
     assert_eq!(stored["launch"]["preparation"], canonical);
+    assert_eq!(
+        stored["prep_cmd"],
+        json!([{
+            "do":"  configure --profile=\"two words\"  ",
+            "undo":" restore --profile=\"two words\" ",
+            "elevated":true
+        }])
+    );
     assert_eq!(created["entry"], stored);
 
     let reloaded = backend.run(

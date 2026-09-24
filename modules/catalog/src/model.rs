@@ -4,8 +4,10 @@ use std::path::Path;
 
 pub const MAX_ENTRIES: usize = 100_000;
 const MAX_PREPARATION_STEPS: usize = 8;
+const MAX_RAW_PREPARATION_COMMAND_BYTES: usize = 2_048;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const MAX_LAUNCH_WORKING_DIRECTORY_BYTES: usize = 1_024;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +31,8 @@ pub struct Entry {
         alias = "exclude-global-prep-cmd"
     )]
     pub exclude_global_prep_cmd: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "prep-cmd")]
+    pub prep_cmd: Vec<RawPreparationCommand>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub elevated: bool,
     pub launch: Launch,
@@ -36,6 +40,17 @@ pub struct Entry {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPreparationCommand {
+    #[serde(default, rename = "do")]
+    pub do_command: String,
+    #[serde(default)]
+    pub undo: String,
+    #[serde(default)]
+    pub elevated: bool,
 }
 
 /// An opaque provider-owned image reference. The source path is never stored in
@@ -98,6 +113,49 @@ pub struct ConfigOverrides {
     pub amd_av1_latency_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_enable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_fps_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_disable_vsync: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_auto_virtual_framegen"
+    )]
+    pub frame_limiter_auto_virtual_framegen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtss_frame_limit_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds4_back_as_touchpad_click: Option<bool>,
+}
+
+fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Bool(enabled)) => Ok(Some(if enabled {
+            "enabled".into()
+        } else {
+            "disabled".into()
+        })),
+        Some(serde_json::Value::String(value)) if value == "true" => Ok(Some("enabled".into())),
+        Some(serde_json::Value::String(value)) if value == "false" => Ok(Some("disabled".into())),
+        Some(serde_json::Value::String(value))
+            if matches!(value.as_str(), "enabled" | "vrr" | "legacy" | "disabled") =>
+        {
+            Ok(Some(value))
+        }
+        _ => Err(serde::de::Error::custom(
+            "frame_limiter_auto_virtual_framegen must be enabled, vrr, legacy, or disabled",
+        )),
+    }
 }
 
 impl ConfigOverrides {
@@ -113,6 +171,39 @@ impl ConfigOverrides {
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
         {
             return Err("minimum_fps_target must be finite and between 0 and 1000");
+        }
+        if self
+            .frame_limiter_fps_limit
+            .is_some_and(|limit| !valid_millihertz_value(limit))
+        {
+            return Err("frame_limiter_fps_limit must be 0..=1000 with at most 3 decimals");
+        }
+        if self
+            .frame_limiter_provider
+            .as_deref()
+            .is_some_and(|provider| !valid_frame_limiter_provider(provider))
+        {
+            return Err("frame_limiter_provider is not available on this platform");
+        }
+        if self
+            .frame_limiter_auto_virtual_framegen
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
+        {
+            return Err("frame_limiter_auto_virtual_framegen has an invalid mode");
+        }
+        if self
+            .rtss_frame_limit_type
+            .as_deref()
+            .is_some_and(|limit_type| {
+                !cfg!(windows)
+                    || !matches!(
+                        limit_type,
+                        "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                    )
+            })
+        {
+            return Err("rtss_frame_limit_type is a Windows RTSS setting");
         }
         if self.video_max_batch_size_kb.is_some_and(|size| size > 64) {
             return Err("video_max_batch_size_kb must be between 0 and 64");
@@ -165,6 +256,44 @@ impl ConfigOverrides {
             && self.mouse.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.frame_limiter_enable.is_none()
+            && self.frame_limiter_fps_limit.is_none()
+            && self.frame_limiter_provider.is_none()
+            && self.frame_limiter_disable_vsync.is_none()
+            && self.frame_limiter_auto_virtual_framegen.is_none()
+            && self.rtss_frame_limit_type.is_none()
+            && self.ds4_back_as_touchpad_click.is_none()
+    }
+}
+
+fn valid_millihertz_value(value: f64) -> bool {
+    if !value.is_finite() || !(0.0..=1000.0).contains(&value) {
+        return false;
+    }
+    let millihertz = value * 1000.0;
+    let rounding_tolerance = f64::EPSILON * millihertz.abs().max(1.0) * 4.0;
+    (millihertz - millihertz.round()).abs() <= rounding_tolerance
+}
+
+fn valid_frame_limiter_provider(provider: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            provider,
+            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        provider == "auto"
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        provider == "auto"
     }
 }
 
@@ -236,6 +365,15 @@ pub enum Launch {
         game_id: String,
         #[serde(default = "default_playnite_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "working-dir",
+            deserialize_with = "empty_working_directory_as_none"
+        )]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preparation: Vec<PreparationStep>,
     },
     /// A manual Playnite Fullscreen launch. The authenticated Playnite provider
     /// resolves the installation and process; catalog callers cannot supply a
@@ -243,6 +381,15 @@ pub enum Launch {
     PlayniteFullscreen {
         #[serde(default = "default_playnite_fullscreen_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "working-dir",
+            deserialize_with = "empty_working_directory_as_none"
+        )]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preparation: Vec<PreparationStep>,
     },
 }
 
@@ -316,6 +463,7 @@ impl Entry {
             validate_steam_install_directory(install_directory)?;
         }
         self.config_overrides.validate()?;
+        validate_raw_preparation(&self.prep_cmd)?;
         if matches!(&self.launch, Launch::PlayniteFullscreen { .. })
             && (self.artwork.is_some()
                 || self.steam_id.is_some()
@@ -353,7 +501,7 @@ impl Entry {
                     return Err("at most 32 printable arguments of 1024 bytes are allowed");
                 }
                 if let Some(directory) = working_directory {
-                    validate_path(directory)?;
+                    validate_working_directory(directory)?;
                 }
                 if exit_timeout_seconds.is_some_and(|seconds| seconds > MAX_EXIT_TIMEOUT_SECONDS)
                     || detached.len() > MAX_DETACHED_COMMANDS
@@ -366,11 +514,14 @@ impl Entry {
                     return Err("invalid per-application process policy");
                 }
                 validate_preparation(preparation)?;
+                validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
             }
             Launch::Application { path } => validate_path(path)?,
             Launch::Playnite {
                 game_id,
                 exit_timeout_seconds,
+                working_directory,
+                preparation,
             } => {
                 if !valid_guid(game_id) {
                     return Err("Playnite launch target must contain a GUID");
@@ -378,13 +529,26 @@ impl Entry {
                 if *exit_timeout_seconds == 0 || *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
                     return Err("invalid Playnite exit timeout");
                 }
+                if let Some(directory) = working_directory {
+                    validate_working_directory(directory)?;
+                }
+                validate_preparation(preparation)?;
+                validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
             }
             Launch::PlayniteFullscreen {
                 exit_timeout_seconds,
-            } if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS => {
-                return Err("invalid Playnite Fullscreen exit timeout");
+                working_directory,
+                preparation,
+            } => {
+                if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+                    return Err("invalid Playnite Fullscreen exit timeout");
+                }
+                if let Some(directory) = working_directory {
+                    validate_working_directory(directory)?;
+                }
+                validate_preparation(preparation)?;
+                validate_combined_preparation_count(preparation.len(), self.prep_cmd.len())?;
             }
-            Launch::PlayniteFullscreen { .. } => {}
         }
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > 11_950) {
             return Err("encoded entry exceeds 11950 bytes");
@@ -441,6 +605,31 @@ fn validate_preparation(steps: &[PreparationStep]) -> Result<(), &'static str> {
         if let Some(undo) = &step.undo {
             validate_command(undo)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_raw_preparation(steps: &[RawPreparationCommand]) -> Result<(), &'static str> {
+    if steps.len() > MAX_PREPARATION_STEPS
+        || steps.iter().any(|step| {
+            [step.do_command.as_str(), step.undo.as_str()]
+                .iter()
+                .any(|command| {
+                    command.len() > MAX_RAW_PREPARATION_COMMAND_BYTES || command.contains('\0')
+                })
+        })
+    {
+        return Err("raw preparation commands exceed bounds");
+    }
+    Ok(())
+}
+
+fn validate_combined_preparation_count(
+    structured_count: usize,
+    raw_count: usize,
+) -> Result<(), &'static str> {
+    if structured_count + raw_count > MAX_PREPARATION_STEPS {
+        return Err("at most 8 preparation steps are allowed");
     }
     Ok(())
 }
@@ -538,6 +727,14 @@ fn validate_path(path: &str) -> Result<(), &'static str> {
         return Err(
             "launch paths must be absolute, printable, at most 2048 bytes, without dot segments",
         );
+    }
+    Ok(())
+}
+
+fn validate_working_directory(path: &str) -> Result<(), &'static str> {
+    validate_path(path)?;
+    if path.len() > MAX_LAUNCH_WORKING_DIRECTORY_BYTES {
+        return Err("working directory exceeds the 1024-byte launch protocol limit");
     }
     Ok(())
 }
@@ -999,6 +1196,36 @@ mod tests {
         valid.validate().unwrap();
         let persisted = serde_json::to_value(valid).unwrap();
         assert_eq!(persisted["launch"]["exit_timeout_seconds"], 10);
+        assert!(persisted["launch"].get("working_directory").is_none());
+
+        let working_directory: Entry = serde_json::from_value(json!({
+            "name":"Playnite game with directory",
+            "launch":{
+                "kind":"playnite",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "working_directory":"/games/space title"
+            }
+        }))
+        .unwrap();
+        working_directory.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(working_directory).unwrap()["launch"]["working_directory"],
+            "/games/space title"
+        );
+        let legacy_working_directory: Entry = serde_json::from_value(json!({
+            "name":"Playnite game with legacy directory",
+            "launch":{
+                "kind":"playnite",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "working-dir":"/games/legacy"
+            }
+        }))
+        .unwrap();
+        legacy_working_directory.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy_working_directory).unwrap()["launch"]["working_directory"],
+            "/games/legacy"
+        );
 
         for game_id in [
             "../other",
@@ -1018,6 +1245,30 @@ mod tests {
         }))
         .unwrap();
         assert!(entry.validate().is_err());
+
+        for directory in ["relative/path", "/games/../other", "/games/./current"] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Invalid Playnite working directory",
+                "launch":{
+                    "kind":"playnite",
+                    "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                    "working_directory":directory
+                }
+            }))
+            .unwrap();
+            assert!(entry.validate().is_err(), "accepted {directory}");
+        }
+        let oversized_directory = format!("/{}", "x".repeat(MAX_LAUNCH_WORKING_DIRECTORY_BYTES));
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"Oversized Playnite working directory",
+            "launch":{
+                "kind":"playnite",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "working_directory":oversized_directory
+            }
+        }))
+        .unwrap();
+        assert!(entry.validate().is_err());
     }
 
     #[test]
@@ -1031,12 +1282,27 @@ mod tests {
         assert!(matches!(
             entry.launch,
             Launch::PlayniteFullscreen {
-                exit_timeout_seconds: 10
+                exit_timeout_seconds: 10,
+                ..
             }
         ));
         assert_eq!(
             serde_json::to_value(entry).unwrap()["launch"],
             json!({"kind":"playnite_fullscreen","exit_timeout_seconds":10})
+        );
+
+        let with_working_directory: Entry = serde_json::from_value(json!({
+            "name":"Fullscreen with directory",
+            "launch":{
+                "kind":"playnite_fullscreen",
+                "working_directory":"/games/fullscreen"
+            }
+        }))
+        .unwrap();
+        with_working_directory.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(with_working_directory).unwrap()["launch"]["working_directory"],
+            "/games/fullscreen"
         );
 
         for timeout in [0, 300] {

@@ -122,6 +122,7 @@ impl Pipeline {
                 operation_id,
                 app_id,
                 global_preparation,
+                legacy_global_preparation,
             } => match self.records.start(
                 caller,
                 initiator,
@@ -129,6 +130,7 @@ impl Pipeline {
                 app_id,
                 CatalogSelection::Initiator,
                 global_preparation,
+                legacy_global_preparation,
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
@@ -141,6 +143,7 @@ impl Pipeline {
                 operation_id,
                 app_id,
                 global_preparation,
+                legacy_global_preparation,
             } => match self.records.start(
                 caller,
                 initiator,
@@ -148,6 +151,7 @@ impl Pipeline {
                 app_id,
                 CatalogSelection::Exported,
                 global_preparation,
+                legacy_global_preparation,
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
@@ -384,9 +388,10 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
-                match LaunchTarget::from_catalog_entry_with_environment(
+                match LaunchTarget::from_catalog_entry_with_preparations(
                     &payload["entry"],
                     &record.global_preparation,
+                    &record.legacy_global_preparation,
                     &self.environment,
                 ) {
                     Ok(target) => record.target = Some(target),
