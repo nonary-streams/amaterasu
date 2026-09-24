@@ -1,4 +1,4 @@
-use crate::model::{Document, Entry, Launch, MAX_ENTRIES, bounded_text, parse_id};
+use crate::model::{ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text, parse_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -22,6 +22,11 @@ pub enum Operation {
         id: String,
         entry: Entry,
         expected_revision: u64,
+    },
+    UpdateProviderOverrides {
+        id: String,
+        expected_revision: u64,
+        config_overrides: ConfigOverrides,
     },
     Delete {
         id: String,
@@ -118,10 +123,11 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         }
         Operation::ProviderSnapshotBegin { .. }
         | Operation::ProviderSnapshotBatch { .. }
-        | Operation::ProviderSnapshotFinish { .. } => {
+        | Operation::ProviderSnapshotFinish { .. }
+        | Operation::UpdateProviderOverrides { .. } => {
             return Err(error(
                 "invalid_request",
-                "provider snapshots are handled by the catalog pipeline",
+                "provider-owned operations are handled by the catalog pipeline",
             ));
         }
         Operation::Create {

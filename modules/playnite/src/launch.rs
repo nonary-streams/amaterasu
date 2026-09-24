@@ -45,13 +45,20 @@ struct Launch {
     operation_id: String,
     game_id: String,
     processes: Vec<ProcessImage>,
+    trusted_install_roots: BTreeSet<String>,
     ticket: String,
     state: State,
     stop_requested: bool,
     changed_at: Instant,
-    stop_sender: Option<SyncSender<u64>>,
+    stop_sender: Option<SyncSender<StopRequest>>,
     events: Option<Receiver<State>>,
     _worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StopRequest {
+    pub(crate) timeout_seconds: u64,
+    pub(crate) processes: Vec<ProcessImage>,
 }
 
 #[derive(Default)]
@@ -129,6 +136,7 @@ impl Launches {
         let mut launch = Launch {
             operation_id: operation_id.into(),
             game_id,
+            trusted_install_roots: installation_roots(&processes),
             processes,
             ticket: ticket.clone(),
             state: State::Starting,
@@ -171,13 +179,32 @@ impl Launches {
                 return existing.response();
             }
             if existing.state == State::CleanupFailed {
+                let Ok(processes) =
+                    refresh_processes_for_install(&existing.trusted_install_roots, processes)
+                else {
+                    return existing.response();
+                };
                 existing.processes = processes;
                 existing.start_worker(true, Some(timeout_seconds));
             } else if !existing.stop_requested {
-                let _ = existing
-                    .stop_sender
-                    .as_ref()
-                    .map(|sender| sender.try_send(timeout_seconds));
+                let Ok(processes) =
+                    refresh_processes_for_install(&existing.trusted_install_roots, processes)
+                else {
+                    existing.apply_state(State::CleanupFailed);
+                    return existing.response();
+                };
+                existing.processes = processes.clone();
+                if existing.stop_sender.as_ref().is_none_or(|sender| {
+                    sender
+                        .try_send(StopRequest {
+                            timeout_seconds,
+                            processes,
+                        })
+                        .is_err()
+                }) {
+                    existing.apply_state(State::CleanupFailed);
+                    return existing.response();
+                }
                 existing.stop_requested = true;
                 existing.apply_state(State::Stopping);
             }
@@ -200,6 +227,7 @@ impl Launches {
         let mut launch = Launch {
             operation_id: operation_id.into(),
             game_id,
+            trusted_install_roots: installation_roots(&processes),
             processes,
             ticket: ticket.clone(),
             state: State::Stopping,
@@ -255,16 +283,31 @@ impl Launches {
             if launch.state == State::LaunchFailed {
                 return launch.response();
             }
+            let Ok(processes) =
+                refresh_processes_for_install(&launch.trusted_install_roots, processes)
+            else {
+                return launch.response();
+            };
             launch.processes = processes;
             launch.start_worker(true, Some(timeout_seconds));
             return launch.response();
         }
         if !launch.stop_requested {
-            if launch
-                .stop_sender
-                .as_ref()
-                .is_none_or(|sender| sender.try_send(timeout_seconds).is_err())
-            {
+            let Ok(processes) =
+                refresh_processes_for_install(&launch.trusted_install_roots, processes)
+            else {
+                launch.apply_state(State::CleanupFailed);
+                return launch.response();
+            };
+            launch.processes = processes.clone();
+            if launch.stop_sender.as_ref().is_none_or(|sender| {
+                sender
+                    .try_send(StopRequest {
+                        timeout_seconds,
+                        processes,
+                    })
+                    .is_err()
+            }) {
                 launch.apply_state(State::CleanupFailed);
                 return launch.response();
             }
@@ -287,7 +330,10 @@ impl Launch {
         let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
         let (event_sender, events) = mpsc::channel();
         if let Some(timeout_seconds) = timeout_seconds {
-            let _ = stop_sender.try_send(timeout_seconds);
+            let _ = stop_sender.try_send(StopRequest {
+                timeout_seconds,
+                processes: self.processes.clone(),
+            });
         }
         let processes = self.processes.clone();
         let game_id = self.game_id.clone();
@@ -337,6 +383,60 @@ fn new_ticket() -> Result<String, &'static str> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+pub(crate) fn installation_roots(processes: &[ProcessImage]) -> BTreeSet<String> {
+    processes
+        .iter()
+        .filter_map(|process| process_installation_root(&process.path))
+        .collect()
+}
+
+pub(crate) fn refresh_processes_for_install(
+    trusted_roots: &BTreeSet<String>,
+    processes: Vec<ProcessImage>,
+) -> Result<Vec<ProcessImage>, &'static str> {
+    if trusted_roots.is_empty() {
+        return Err("process_identity_unavailable");
+    }
+    let mut seen_process_ids = BTreeSet::new();
+    let refreshed: Vec<_> = processes
+        .into_iter()
+        .filter(|process| {
+            process.process_id != 0
+                && seen_process_ids.insert(process.process_id)
+                && process_installation_root(&process.path)
+                    .is_some_and(|root| trusted_roots.contains(&root))
+        })
+        .collect();
+    if refreshed.is_empty() {
+        return Err("process_identity_changed");
+    }
+    Ok(refreshed)
+}
+
+fn process_installation_root(path: &str) -> Option<String> {
+    let normalized = path.replace('/', "\\");
+    let (root, executable) = normalized.rsplit_once('\\')?;
+    let filename = executable.to_ascii_lowercase();
+    if !matches!(
+        filename.as_str(),
+        "playnite.desktopapp.exe" | "playnite.fullscreenapp.exe"
+    ) || normalized.chars().any(char::is_control)
+        || normalized
+            .split('\\')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return None;
+    }
+    let bytes = normalized.as_bytes();
+    let drive_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let unc_absolute = normalized.starts_with("\\\\");
+    if !drive_absolute && !unc_absolute {
+        return None;
+    }
+    Some(root.to_ascii_lowercase())
+}
+
 fn valid_operation_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
@@ -365,6 +465,7 @@ mod tests {
             operation_id: "launch-operation".into(),
             game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
             processes: Vec::new(),
+            trusted_install_roots: BTreeSet::new(),
             ticket: "ab".repeat(24),
             state,
             stop_requested: false,
@@ -373,6 +474,45 @@ mod tests {
             events: Some(events),
             _worker: Some(thread::spawn(|| {})),
         }
+    }
+
+    fn process(process_id: u32, path: &str) -> ProcessImage {
+        ProcessImage {
+            process_id,
+            path: path.into(),
+        }
+    }
+
+    fn launch_observing_stop_request(
+        state: State,
+        processes: Vec<ProcessImage>,
+    ) -> (Launch, Receiver<StopRequest>) {
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let (event_sender, events) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            if let Ok(request) = stop_receiver.recv() {
+                let _ = observed_sender.send(request);
+            }
+            drop(event_sender);
+        });
+        let trusted_install_roots = installation_roots(&processes);
+        (
+            Launch {
+                operation_id: "launch-operation".into(),
+                game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
+                processes,
+                trusted_install_roots,
+                ticket: "ab".repeat(24),
+                state,
+                stop_requested: false,
+                changed_at: Instant::now(),
+                stop_sender: Some(stop_sender),
+                events: Some(events),
+                _worker: Some(worker),
+            },
+            observed_receiver,
+        )
     }
 
     #[test]
@@ -415,6 +555,76 @@ mod tests {
     }
 
     #[test]
+    fn stop_refreshes_process_id_for_the_same_playnite_install() {
+        let ticket = "ab".repeat(24);
+        let original = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+        let refreshed = process(73, r"C:\Program Files\Playnite\Playnite.FullscreenApp.exe");
+        for state in [State::Starting, State::Running] {
+            let (launch, observed) = launch_observing_stop_request(state, vec![original.clone()]);
+            let mut launches = Launches::default();
+            launches.by_ticket.insert(ticket.clone(), launch);
+
+            let response = launches.stop(&ticket, 30, vec![refreshed.clone()]);
+            assert_eq!(response["state"], "stopping");
+            let request = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(request.timeout_seconds, 30);
+            assert_eq!(request.processes, vec![refreshed.clone()]);
+        }
+    }
+
+    #[test]
+    fn stop_never_retargets_a_different_playnite_install() {
+        let ticket = "ab".repeat(24);
+        let original = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+        let unrelated = process(73, r"D:\Untrusted\Playnite\Playnite.DesktopApp.exe");
+        let (launch, observed) = launch_observing_stop_request(State::Running, vec![original]);
+        let mut launches = Launches::default();
+        launches.by_ticket.insert(ticket.clone(), launch);
+
+        let response = launches.stop(&ticket, 30, vec![unrelated]);
+        assert_eq!(response["state"], "cleanup_failed");
+        assert!(observed.recv_timeout(Duration::from_millis(20)).is_err());
+    }
+
+    #[test]
+    fn recover_stop_does_not_claim_stopping_when_the_bounded_channel_is_full() {
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let original = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+        let refreshed = process(73, r"C:\Program Files\Playnite\Playnite.FullscreenApp.exe");
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        let queued = StopRequest {
+            timeout_seconds: 15,
+            processes: vec![original.clone()],
+        };
+        stop_sender.try_send(queued.clone()).unwrap();
+        let (_event_sender, events) = mpsc::channel();
+        let mut launches = Launches::default();
+        launches.by_ticket.insert(
+            "ab".repeat(24),
+            Launch {
+                operation_id: "launch-operation".into(),
+                game_id: game_id.into(),
+                processes: vec![original.clone()],
+                trusted_install_roots: installation_roots(&[original]),
+                ticket: "ab".repeat(24),
+                state: State::Running,
+                stop_requested: false,
+                changed_at: Instant::now(),
+                stop_sender: Some(stop_sender),
+                events: Some(events),
+                _worker: Some(thread::spawn(|| {})),
+            },
+        );
+
+        let response = launches.recover_stop("launch-operation", game_id, 30, vec![refreshed]);
+        assert_eq!(response["state"], "cleanup_failed");
+        let launch = launches.by_ticket.values().next().unwrap();
+        assert!(!launch.stop_requested);
+        assert_eq!(launch.state, State::CleanupFailed);
+        assert_eq!(stop_receiver.try_recv().unwrap(), queued);
+    }
+
+    #[test]
     fn start_requires_membership_in_the_latest_complete_selected_snapshot() {
         let mut launches = Launches::default();
         let result = launches.start(
@@ -448,6 +658,7 @@ mod tests {
                 operation_id: "operation.3".into(),
                 game_id: game_id.into(),
                 processes: Vec::new(),
+                trusted_install_roots: BTreeSet::new(),
                 ticket: "ab".repeat(24),
                 state: State::Running,
                 stop_requested: false,

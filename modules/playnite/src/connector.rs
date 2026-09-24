@@ -6,6 +6,7 @@
 //! protect against a compromised Playnite process on the same host.
 
 use crate::discovery::ProcessImage;
+use crate::launch::{StopRequest, installation_roots, refresh_processes_for_install};
 use crate::snapshot::{Snapshot, SnapshotAssembler, valid_playnite_id};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread;
@@ -258,7 +259,7 @@ pub fn request_snapshot(_expected_processes: &[ProcessImage]) -> Result<Snapshot
 pub fn watch_game(
     expected_processes: &[ProcessImage],
     game_id: &str,
-    stop_requests: Receiver<u64>,
+    stop_requests: Receiver<StopRequest>,
     events: Sender<super::launch::State>,
     recovery: bool,
 ) {
@@ -274,8 +275,9 @@ pub fn watch_game(
     let mut stopping = recovery;
     let mut stop_deadline = None;
     let launch_deadline = Instant::now() + LAUNCH_START_TIMEOUT;
+    let mut expected_processes = expected_processes.to_vec();
 
-    let pipe = match connect_role(expected_processes, "launcher", Some(game_id)) {
+    let mut pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
         Ok(pipe) => pipe,
         Err(_) => {
             fail(if recovery {
@@ -287,21 +289,40 @@ pub fn watch_game(
         }
     };
     if recovery {
-        let timeout_seconds = match stop_requests.try_recv() {
-            Ok(timeout_seconds) => timeout_seconds,
+        let request = match stop_requests.try_recv() {
+            Ok(request) => request,
             Err(_) => {
                 fail(super::launch::State::CleanupFailed);
                 return;
             }
         };
-        if send_command(expected_processes, &json!({"command":"stop","id":game_id})).is_err() {
+        expected_processes = match refresh_processes_for_install(
+            &installation_roots(&expected_processes),
+            request.processes,
+        ) {
+            Ok(processes) => processes,
+            Err(_) => {
+                fail(super::launch::State::CleanupFailed);
+                return;
+            }
+        };
+        if validated_server_process(&pipe, &expected_processes).is_err() {
+            pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
+                Ok(pipe) => pipe,
+                Err(_) => {
+                    fail(super::launch::State::CleanupFailed);
+                    return;
+                }
+            };
+        }
+        if send_command(&expected_processes, &json!({"command":"stop","id":game_id})).is_err() {
             fail(super::launch::State::CleanupFailed);
             return;
         }
-        stop_deadline = Some(Instant::now() + Duration::from_secs(timeout_seconds));
+        stop_deadline = Some(Instant::now() + Duration::from_secs(request.timeout_seconds));
         let _ = events.send(super::launch::State::Stopping);
     } else if send_command(
-        expected_processes,
+        &expected_processes,
         &json!({"command":"launch","id":game_id}),
     )
     .is_err()
@@ -312,15 +333,34 @@ pub fn watch_game(
 
     loop {
         match stop_requests.try_recv() {
-            Ok(timeout_seconds) if !stopping => {
-                if send_command(expected_processes, &json!({"command":"stop","id":game_id}))
+            Ok(request) if !stopping => {
+                expected_processes = match refresh_processes_for_install(
+                    &installation_roots(&expected_processes),
+                    request.processes,
+                ) {
+                    Ok(processes) => processes,
+                    Err(_) => {
+                        fail(super::launch::State::CleanupFailed);
+                        return;
+                    }
+                };
+                if validated_server_process(&pipe, &expected_processes).is_err() {
+                    pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
+                        Ok(pipe) => pipe,
+                        Err(_) => {
+                            fail(super::launch::State::CleanupFailed);
+                            return;
+                        }
+                    };
+                }
+                if send_command(&expected_processes, &json!({"command":"stop","id":game_id}))
                     .is_err()
                 {
                     fail(super::launch::State::CleanupFailed);
                     return;
                 }
                 stopping = true;
-                stop_deadline = Some(Instant::now() + Duration::from_secs(timeout_seconds));
+                stop_deadline = Some(Instant::now() + Duration::from_secs(request.timeout_seconds));
                 let _ = events.send(super::launch::State::Stopping);
             }
             Ok(_) | Err(TryRecvError::Empty) => {}
@@ -389,7 +429,7 @@ pub fn watch_game(
 pub fn watch_game(
     _expected_processes: &[ProcessImage],
     _game_id: &str,
-    _stop_requests: Receiver<u64>,
+    _stop_requests: Receiver<StopRequest>,
     events: Sender<super::launch::State>,
     recovery: bool,
 ) {

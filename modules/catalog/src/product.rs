@@ -1,5 +1,5 @@
 //! Durable provider ownership records kept beside, but separate from, user entries.
-use crate::model::{Entry, bounded_text, parse_id};
+use crate::model::{ConfigOverrides, Entry, bounded_text, parse_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,6 +18,8 @@ pub(crate) struct Marker {
     pub(crate) entry_id: String,
     pub(crate) generation: u64,
     pub(crate) fingerprint: String,
+    #[serde(default)]
+    pub(crate) config_overrides: ConfigOverrides,
     pub(crate) detached: bool,
 }
 
@@ -112,6 +114,7 @@ pub(crate) fn validate_marker(marker: &Marker, caller: &str, source_id: &str) ->
             .fingerprint
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+        && marker.config_overrides.validate().is_ok()
 }
 
 pub(crate) fn marker_value(marker: &Marker) -> Value {
@@ -121,6 +124,16 @@ pub(crate) fn marker_value(marker: &Marker) -> Value {
 pub(crate) fn entry_fingerprint(entry: &Entry) -> String {
     let bytes = serde_json::to_vec(entry).expect("validated entry serializes");
     fingerprint_bytes(&bytes)
+}
+
+pub(crate) fn provider_entry_fingerprint(caller: &str, entry: &Entry) -> String {
+    if caller == "amaterasu.playnite" {
+        let mut provider_fields = entry.clone();
+        provider_fields.config_overrides = ConfigOverrides::default();
+        entry_fingerprint(&provider_fields)
+    } else {
+        entry_fingerprint(entry)
+    }
 }
 
 pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> String {

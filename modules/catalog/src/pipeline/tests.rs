@@ -241,6 +241,64 @@ fn snapshot_finish_policy(
     })
 }
 
+fn import_playnite_entry(
+    backend: &mut Backend,
+    pipeline: &mut Pipeline,
+    sync_id: &str,
+    source_revision: u64,
+    expected_revision: u64,
+    source_id: &str,
+    name: &str,
+) -> Value {
+    let begin = backend.run_for(
+        pipeline,
+        snapshot_begin(sync_id, source_revision),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(begin["ok"], true);
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        pipeline,
+        snapshot_batch(
+            sync_id,
+            generation,
+            source_revision,
+            0,
+            expected_revision,
+            vec![(source_id, playnite_entry(name))],
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true);
+    backend.run_for(
+        pipeline,
+        snapshot_finish(
+            sync_id,
+            generation,
+            source_revision,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    )
+}
+
+fn update_provider_overrides(id: &str, expected_revision: u64, fec_percentage: Value) -> Value {
+    json!({
+        "action":"update_provider_overrides",
+        "id":id,
+        "expected_revision":expected_revision,
+        "config_overrides":{"fec_percentage":fec_percentage},
+    })
+}
+
 #[test]
 fn old_provider_snapshot_state_defaults_to_removal_enabled() {
     let mut value = serde_json::to_value(SnapshotState::initial()).unwrap();
@@ -1062,6 +1120,305 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
             .entries
             .contains_key("~provider.entry:steam:steam:10")
     );
+}
+
+#[test]
+fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let finished = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(finished["ok"], true);
+    assert_eq!(backend.metadata["revision"], 1);
+    let id = "app-0000000000000001";
+
+    let updated = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides(id, 1, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(updated["ok"], true);
+    assert_eq!(updated["revision"], 2);
+    assert_eq!(updated["changed"], true);
+    assert_eq!(updated["replayed"], false);
+    assert_eq!(updated["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(backend.entries[id]["launch"]["kind"], "playnite");
+    assert_eq!(
+        backend.entries[id]["launch"]["game_id"],
+        "a1b2c3d4-1234-5678-9abc-0123456789ab"
+    );
+    let marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
+    assert_eq!(
+        backend.entries[marker_key]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(backend.entries[marker_key]["detached"], false);
+
+    let repeated = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides(id, 2, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(repeated["ok"], true);
+    assert_eq!(repeated["revision"], 2);
+    assert_eq!(repeated["changed"], false);
+    assert_eq!(repeated["replayed"], false);
+
+    let refreshed = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-2",
+        2,
+        2,
+        "playnite:10",
+        "Provider renamed title",
+    );
+    assert_eq!(refreshed["ok"], true);
+    assert_eq!(backend.entries[id]["name"], "Provider renamed title");
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(
+        backend.entries[id]["launch"]["game_id"],
+        "a1b2c3d4-1234-5678-9abc-0123456789ab"
+    );
+    assert_eq!(backend.entries[marker_key]["detached"], false);
+
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("playnite-scan-3", 3),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    let removed = backend.run_for(
+        &mut pipeline,
+        snapshot_finish(
+            "playnite-scan-3",
+            begin["generation"].as_u64().unwrap(),
+            3,
+            backend.metadata["revision"].as_u64().unwrap(),
+            0,
+            true,
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(removed["ok"], true);
+    assert!(!backend.entries.contains_key(id));
+    assert!(!backend.entries.contains_key(marker_key));
+    let current_revision = backend.metadata["revision"].as_u64().unwrap();
+    let after_delete = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides(id, current_revision, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(after_delete["error"]["code"], "provider_entry_not_found");
+}
+
+#[test]
+fn provider_override_enforces_management_and_fixed_playnite_identity() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let finished = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(finished["ok"], true);
+
+    let denied = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides("app-0000000000000001", 1, json!(37)),
+        "attacker",
+        "attacker",
+        "attacker",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let arbitrary_owner = backend.run_for(
+        &mut pipeline,
+        json!({
+            "action":"update_provider_overrides",
+            "id":"app-0000000000000001",
+            "owner":"principal/someone-else",
+            "expected_revision":1,
+            "config_overrides":{"fec_percentage":37}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(arbitrary_owner["error"]["code"], "invalid_request");
+
+    let stale = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides("app-0000000000000001", 0, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+    assert_eq!(stale["error"]["current_revision"], 1);
+
+    for invalid_fec in [json!(0), json!(256)] {
+        let invalid = backend.run_for(
+            &mut pipeline,
+            update_provider_overrides("app-0000000000000001", 1, invalid_fec),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(invalid["error"]["code"], "invalid_request");
+    }
+
+    let mut manual_pipeline = Pipeline::default();
+    let manual = backend.run_for(
+        &mut manual_pipeline,
+        json!({
+            "action":"create",
+            "expected_revision":1,
+            "entry":{"name":"Manual title","launch":{"kind":"application","path":"/Applications/Manual.app"}}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true);
+    let manual_id = manual["id"].as_str().unwrap();
+    let forged_manual = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides(manual_id, 2, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(forged_manual["error"]["code"], "provider_entry_not_found");
+    assert!(backend.entries[manual_id]["config_overrides"].is_null());
+}
+
+#[test]
+fn provider_override_rejects_entries_marked_for_another_provider() {
+    let id = "app-0000000000000001";
+    let source_id = "steam:10";
+    let imported_entry: crate::model::Entry = serde_json::from_value(entry("Steam title")).unwrap();
+    let marker = Marker {
+        version: 1,
+        caller: "amaterasu.steam".into(),
+        source_id: source_id.into(),
+        entry_id: id.into(),
+        generation: 1,
+        fingerprint: provider_entry_fingerprint("amaterasu.steam", &imported_entry),
+        config_overrides: ConfigOverrides::default(),
+        detached: false,
+    };
+    let playnite_state = SnapshotState {
+        version: 1,
+        generation: 1,
+        sync_id: "playnite-scan".into(),
+        source_revision: 1,
+        next_sequence: 0,
+        last_batch: None,
+        finished: true,
+        cleanup_pending: false,
+        finish_expected_revision: Some(1),
+        finish_remove_stale: true,
+    };
+    let mut backend = Backend {
+        revision: 1,
+        metadata: json!({"revision":1,"next_id":2,"provider_count":2}),
+        ..Backend::default()
+    };
+    backend
+        .entries
+        .insert(id.into(), serde_json::to_value(imported_entry).unwrap());
+    backend.entries.insert(
+        entry_key("amaterasu.steam", source_id),
+        marker_value(&marker),
+    );
+    backend.entries.insert(
+        state_key("amaterasu.playnite"),
+        serde_json::to_value(playnite_state).unwrap(),
+    );
+    let mut pipeline = playnite_importer();
+
+    let denied = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides(id, 1, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(denied["error"]["code"], "provider_entry_not_found");
+    assert!(backend.entries[id]["config_overrides"].is_null());
+    assert_eq!(backend.revision, 1);
+}
+
+#[test]
+fn provider_override_recovers_lost_commit_ack_as_an_idempotent_replay() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let finished = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(finished["ok"], true);
+
+    backend.lose_commit_ack_once = true;
+    let uncertain = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides("app-0000000000000001", 1, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(uncertain["error"]["code"], "deadline_exceeded");
+    assert_eq!(backend.metadata["revision"], 2);
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["config_overrides"]["fec_percentage"],
+        37
+    );
+
+    let replay = backend.run_for(
+        &mut pipeline,
+        update_provider_overrides("app-0000000000000001", 1, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["revision"], 2);
+    assert_eq!(replay["changed"], false);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(backend.metadata["revision"], 2);
 }
 
 #[test]

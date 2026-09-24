@@ -1,9 +1,9 @@
 use crate::STATE_SERVICE;
-use crate::model::{Document, Entry, Launch, MAX_ENTRIES, bounded_text};
+use crate::model::{ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text};
 use crate::product::{
     CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, STATE_PREFIX,
-    SnapshotState, entry_fingerprint, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
-    state_key, valid_source_id, valid_sync_id, validate_marker,
+    SnapshotState, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
+    provider_entry_fingerprint, state_key, valid_source_id, valid_sync_id, validate_marker,
 };
 use crate::protocol::{
     Change, Cursor, Operation, ProviderEntry, apply, error, matches_query, project_entry,
@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 const MAX_QUEUED: usize = 32;
 const PAGE_BYTES: usize = 12_000;
 const MAX_SCAN: usize = 256;
+const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
+const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
 type TransportResult = ModuleResult<Response>;
 
 struct Incoming {
@@ -48,6 +50,16 @@ enum Stage {
     ProviderLoading(Operation),
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
+    ProviderOverrideEntry(ProviderOverrideEntry),
+}
+
+struct ProviderOverrideEntry {
+    session: ProviderSession,
+    id: String,
+    expected_revision: u64,
+    config_overrides: ConfigOverrides,
+    marker_key: String,
+    marker: Marker,
 }
 
 struct ProviderScan {
@@ -154,6 +166,15 @@ impl Pipeline {
                 })?;
                 Ok((format!("principal/{owner}"), None, operation))
             }
+            operation @ Operation::UpdateProviderOverrides { .. } => {
+                if caller != MANAGEMENT_PRINCIPAL {
+                    return Err(error(
+                        "permission_denied",
+                        "provider overrides can only be changed by management",
+                    ));
+                }
+                Ok((format!("principal/{caller}"), None, operation))
+            }
             operation @ Operation::ExportList { .. } => {
                 let owner = self.export_principals.get(caller).ok_or_else(|| {
                     error(
@@ -215,18 +236,21 @@ impl Pipeline {
                     Operation::ProviderSnapshotBegin { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. } => Some(incoming.caller.clone()),
+                    Operation::UpdateProviderOverrides { .. } => Some(PLAYNITE_IMPORTER.into()),
                     _ => None,
                 },
                 provider_count: 0,
                 deadline: incoming.deadline,
             };
-            // The importer is the Poll caller, retained separately from the fixed
-            // owner collection key. It cannot be supplied by request payload.
+            // Snapshot authority comes from the Poll caller. Provider override
+            // requests use a fixed importer only after management authorization;
+            // neither path accepts an owner selector in request data.
             if matches!(
                 incoming.operation,
                 Operation::ProviderSnapshotBegin { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. }
+                    | Operation::UpdateProviderOverrides { .. }
             ) {
                 self.start_provider(context, incoming.operation, &mut send)?;
             } else {
@@ -469,6 +493,18 @@ impl Pipeline {
                 },
                 send,
             ),
+            Operation::UpdateProviderOverrides {
+                id,
+                expected_revision,
+                config_overrides,
+            } => self.start_provider_override_update(
+                context,
+                session,
+                id,
+                expected_revision,
+                config_overrides,
+                send,
+            ),
             _ => complete(
                 send,
                 context.request_id,
@@ -478,6 +514,241 @@ impl Pipeline {
                 ),
             ),
         }
+    }
+
+    fn start_provider_override_update(
+        &mut self,
+        context: Context,
+        session: ProviderSession,
+        id: String,
+        expected_revision: u64,
+        config_overrides: ConfigOverrides,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if session.caller != PLAYNITE_IMPORTER {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "permission_denied",
+                    "only Playnite entries accept provider overrides",
+                ),
+            );
+        }
+        if crate::model::parse_id(&id).is_none() || config_overrides.validate().is_err() {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "invalid_request",
+                    "provider overrides contain an invalid ID or FEC value",
+                ),
+            );
+        }
+        if !session.state.finished || session.state.cleanup_pending {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_snapshot_incomplete",
+                    "provider overrides require a finished Playnite snapshot",
+                ),
+            );
+        }
+        let Some((marker_key, marker)) = session
+            .markers
+            .iter()
+            .find(|(_, marker)| marker.caller == PLAYNITE_IMPORTER && marker.entry_id == id)
+        else {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_entry_not_found",
+                    "Playnite provider entry was not found",
+                ),
+            );
+        };
+        if marker.detached || session.fingerprints.get(&id) != Some(&marker.fingerprint) {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_entry_changed",
+                    "Playnite provider entry no longer matches its imported identity",
+                ),
+            );
+        }
+        let marker_key = marker_key.clone();
+        let marker = marker.clone();
+        let payload = json!({
+            "action":"collection_get",
+            "collection":session.key,
+            "key":id,
+        });
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderOverrideEntry(ProviderOverrideEntry {
+                session,
+                id,
+                expected_revision,
+                config_overrides,
+                marker_key,
+                marker,
+            }),
+            send,
+        )
+    }
+
+    fn finish_provider_override(
+        &mut self,
+        context: Context,
+        state_revision: u64,
+        payload: Value,
+        mut update: ProviderOverrideEntry,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let Some(current_document_revision) = payload["metadata"]["revision"].as_u64() else {
+            return complete(send, context.request_id, malformed());
+        };
+        if state_revision != update.session.collection_revision {
+            self.provider_sessions.remove(PLAYNITE_IMPORTER);
+            return complete(
+                send,
+                context.request_id,
+                revision_conflict(current_document_revision),
+            );
+        }
+        if payload["found"] != true {
+            if payload["found"] == false {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "provider_entry_not_found",
+                        "Playnite catalog entry was not found",
+                    ),
+                );
+            }
+            return complete(send, context.request_id, malformed());
+        }
+        if current_document_revision != update.session.document_revision
+            || payload["metadata"]["next_id"].as_u64() != Some(update.session.next_id)
+            || payload["metadata"]["provider_count"].as_u64() != Some(update.session.provider_count)
+        {
+            self.provider_sessions.remove(PLAYNITE_IMPORTER);
+            return complete(
+                send,
+                context.request_id,
+                revision_conflict(current_document_revision),
+            );
+        }
+        let Some(entry_value) = payload.get("value").filter(|value| !value.is_null()) else {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_entry_not_found",
+                    "Playnite catalog entry was not found",
+                ),
+            );
+        };
+        let mut entry: Entry = match serde_json::from_value::<Entry>(entry_value.clone()) {
+            Ok(entry) if entry.validate().is_ok() => entry,
+            _ => return complete(send, context.request_id, malformed()),
+        };
+        if !matches!(entry.launch, Launch::Playnite { .. })
+            || provider_entry_fingerprint(PLAYNITE_IMPORTER, &entry) != update.marker.fingerprint
+            || entry.config_overrides != update.marker.config_overrides
+        {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_entry_changed",
+                    "Playnite catalog entry differs from its provider marker",
+                ),
+            );
+        }
+
+        let requested_is_current = entry.config_overrides == update.config_overrides
+            && update.marker.config_overrides == update.config_overrides;
+        if update.expected_revision != current_document_revision {
+            if requested_is_current {
+                return complete(
+                    send,
+                    context.request_id,
+                    json!({
+                        "ok":true,
+                        "id":update.id,
+                        "revision":current_document_revision,
+                        "config_overrides":update.config_overrides,
+                        "changed":false,
+                        "replayed":true,
+                    }),
+                );
+            }
+            return complete(
+                send,
+                context.request_id,
+                revision_conflict(current_document_revision),
+            );
+        }
+        if requested_is_current {
+            return complete(
+                send,
+                context.request_id,
+                json!({
+                    "ok":true,
+                    "id":update.id,
+                    "revision":current_document_revision,
+                    "config_overrides":update.config_overrides,
+                    "changed":false,
+                    "replayed":false,
+                }),
+            );
+        }
+        let Some(new_document_revision) = current_document_revision.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "catalog revision exhausted"),
+            );
+        };
+        entry.config_overrides = update.config_overrides.clone();
+        update.marker.config_overrides = update.config_overrides.clone();
+        update
+            .session
+            .markers
+            .insert(update.marker_key.clone(), update.marker.clone());
+        update.session.document_revision = new_document_revision;
+        let reply = json!({
+            "ok":true,
+            "id":update.id,
+            "revision":new_document_revision,
+            "config_overrides":update.config_overrides,
+            "changed":true,
+            "replayed":false,
+        });
+        let request = collection_commit(
+            &update.session,
+            vec![
+                json!({"key":update.id,"value":entry}),
+                json!({"key":update.marker_key,"value":marker_value(&update.marker)}),
+            ],
+        );
+        self.submit(
+            context,
+            request,
+            Stage::ProviderSaving(ProviderSave {
+                session: update.session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
     }
 
     fn begin_snapshot(
@@ -577,9 +848,9 @@ impl Pipeline {
         let mut entries_changed = false;
         for provider_entry in entries {
             let source_id = provider_entry.source_id;
-            let entry = provider_entry.entry;
+            let mut entry = provider_entry.entry;
             let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
-                && session.caller != "amaterasu.playnite";
+                && session.caller != PLAYNITE_IMPORTER;
             if !valid_source_id(&source_id)
                 || !source_ids.insert(source_id.clone())
                 || entry.validate().is_err()
@@ -595,9 +866,8 @@ impl Pipeline {
                 );
             }
             let key = entry_key(&session.caller, &source_id);
-            let desired_fingerprint = entry_fingerprint(&entry);
             let existing = session.markers.get(&key).cloned();
-            let (entry_id, detached) = if let Some(marker) = existing {
+            let (entry_id, detached, config_overrides) = if let Some(marker) = existing {
                 if !validate_marker(&marker, &session.caller, &source_id) {
                     return complete(send, context.request_id, malformed());
                 }
@@ -610,9 +880,9 @@ impl Pipeline {
                 if marker.detached
                     || session.fingerprints.get(&marker.entry_id) != Some(&marker.fingerprint)
                 {
-                    (marker.entry_id, true)
+                    (marker.entry_id, true, marker.config_overrides)
                 } else {
-                    (marker.entry_id, false)
+                    (marker.entry_id, false, marker.config_overrides)
                 }
             } else {
                 if session.entry_ids.len() >= MAX_ENTRIES {
@@ -644,8 +914,12 @@ impl Pipeline {
                 };
                 session.next_id = next_id;
                 session.entry_ids.insert(entry_id.clone());
-                (entry_id, false)
+                (entry_id, false, ConfigOverrides::default())
             };
+            if session.caller == PLAYNITE_IMPORTER {
+                entry.config_overrides = config_overrides.clone();
+            }
+            let desired_fingerprint = provider_entry_fingerprint(&session.caller, &entry);
             let mut marker = Marker {
                 version: 1,
                 caller: session.caller.clone(),
@@ -653,6 +927,7 @@ impl Pipeline {
                 entry_id: entry_id.clone(),
                 generation: session.state.generation,
                 fingerprint: desired_fingerprint.clone(),
+                config_overrides,
                 detached,
             };
             if detached {
@@ -975,6 +1250,9 @@ impl Pipeline {
                 }
                 complete(send, context.request_id, save.reply)
             }
+            Stage::ProviderOverrideEntry(update) => {
+                self.finish_provider_override(context, state_revision, payload, update, send)
+            }
             Stage::ProviderLoading(operation) => {
                 let found = payload["found"] == true;
                 if payload["found"] != true && payload["found"] != false {
@@ -1075,7 +1353,13 @@ impl Pipeline {
                             };
                         if scan
                             .fingerprints
-                            .insert(key.into(), entry_fingerprint(&entry))
+                            .insert(
+                                key.into(),
+                                provider_entry_fingerprint(
+                                    context.importer.as_deref().unwrap_or_default(),
+                                    &entry,
+                                ),
+                            )
                             .is_some()
                         {
                             return complete(send, context.request_id, malformed());
