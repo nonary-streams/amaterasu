@@ -3,6 +3,7 @@ use crate::backend::{Backend, CaptureSession};
 use crate::model::{CaptureResult, Frame, Output};
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::*;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,11 +84,68 @@ fn open(controller: &mut Controller<FakeBackend>, owner: &str) -> u64 {
         Operation::Open {
             operation_id: None,
             output: "fake-output".into(),
+            constant_rate: false,
         },
         &mut || Ok(()),
     );
     assert_eq!(reply["ok"], true);
     reply["stream"].as_u64().unwrap()
+}
+
+fn open_constant_rate(controller: &mut Controller<FakeBackend>, owner: &str) -> u64 {
+    let reply = controller.handle(
+        owner,
+        Operation::Open {
+            operation_id: None,
+            output: "fake-output".into(),
+            constant_rate: true,
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["constant_rate"], true);
+    reply["stream"].as_u64().unwrap()
+}
+
+#[test]
+fn constant_rate_open_is_opt_in_and_deserializes_explicitly() {
+    let default = serde_json::from_value::<Operation>(json!({
+        "action": "open",
+        "output": "fake-output"
+    }))
+    .unwrap();
+    assert!(matches!(
+        default,
+        Operation::Open {
+            constant_rate: false,
+            ..
+        }
+    ));
+
+    let enabled = serde_json::from_value::<Operation>(json!({
+        "action": "open",
+        "output": "fake-output",
+        "constant_rate": true
+    }))
+    .unwrap();
+    assert!(matches!(
+        enabled,
+        Operation::Open {
+            constant_rate: true,
+            ..
+        }
+    ));
+}
+
+fn frame(timestamp_us: u64, sequence: u64, bytes: &[u8]) -> Frame {
+    Frame {
+        width: 2,
+        height: 1,
+        stride: 8,
+        timestamp_us,
+        sequence,
+        bytes: Arc::new(bytes.to_vec()),
+    }
 }
 
 struct TestBinding(*const CaptureApi);
@@ -131,6 +189,21 @@ impl TestBinding {
         }
     }
 
+    fn read_rejected(&self, id: u64) -> Status {
+        // SAFETY: binding owns the table and reject_frame is synchronous.
+        unsafe {
+            let api = &*self.0;
+            (api.read_frame)(
+                api.base.context,
+                id,
+                FrameSink {
+                    context: std::ptr::null_mut(),
+                    write: reject_frame,
+                },
+            )
+        }
+    }
+
     fn geometry(&self, id: u64) -> (Status, Option<CaptureGeometry>) {
         let mut geometry = std::mem::MaybeUninit::uninit();
         // SAFETY: binding owns the table and geometry is writable for this call.
@@ -169,6 +242,10 @@ unsafe extern "C" fn copy_frame(context: *mut c_void, frame: *const CpuFrame) ->
     STATUS_OK
 }
 
+unsafe extern "C" fn reject_frame(_: *mut c_void, _: *const CpuFrame) -> Status {
+    STATUS_INVALID_ARGUMENT
+}
+
 #[test]
 fn native_binding_enforces_owner_and_releases_its_state_reference_once() {
     let (controller, drops) = setup(true);
@@ -197,6 +274,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
         Operation::Open {
             operation_id: None,
             output: "fake".into(),
+            constant_rate: false,
         },
         &mut || Ok(()),
     );
@@ -209,6 +287,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
         Operation::Open {
             operation_id: None,
             output: "fake".into(),
+            constant_rate: false,
         },
         &mut || {
             calls += 1;
@@ -236,7 +315,8 @@ fn stream_capacity_owner_close_and_shutdown_are_enforced() {
             "owner",
             Operation::Open {
                 operation_id: None,
-                output: "fake".into()
+                output: "fake".into(),
+                constant_rate: false,
             },
             &mut || Ok(())
         )["error"]["code"],
@@ -270,7 +350,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
             stride: 8,
             timestamp_us: 1,
             sequence: 1,
-            bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            bytes: Arc::new(vec![1, 2, 3, 4, 5, 6, 7, 8]),
         })),
         Ok(None),
         Err(CaptureError::new("access_lost", "test desktop switch")),
@@ -334,6 +414,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
     let request = || Operation::Open {
         output: "fake".into(),
         operation_id: Some("start-1".into()),
+        constant_rate: false,
     };
     let opened = controller.handle("owner", request(), &mut || Ok(()));
     let id = opened["stream"].as_u64().unwrap();
@@ -354,8 +435,9 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
         "not_found"
     );
     let conflict = Operation::Open {
-        output: "different".into(),
+        output: "fake".into(),
         operation_id: Some("start-1".into()),
+        constant_rate: true,
     };
     assert_eq!(
         controller.handle("owner", conflict, &mut || Ok(()))["error"]["code"],
@@ -407,6 +489,7 @@ fn identical_operation_ids_are_scoped_to_each_owner() {
     let request = || Operation::Open {
         output: "fake-output".into(),
         operation_id: Some("shared-operation-name".into()),
+        constant_rate: false,
     };
     let first = controller.handle("first", request(), &mut || Ok(()));
     let second = controller.handle("second", request(), &mut || Ok(()));
@@ -469,7 +552,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
         stride: 4,
         timestamp_us: 1,
         sequence: 1,
-        bytes: vec![1, 2, 3, 4],
+        bytes: Arc::new(vec![1, 2, 3, 4]),
     }))])));
     let drops = Arc::new(AtomicUsize::new(0));
     let controller = Arc::new(Mutex::new(Controller::new(
@@ -504,6 +587,87 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
     assert_eq!(sink.observed, [1, 2, 3, 4]);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(binding.read(stream, &mut Vec::new()), MEDIA_CLOSED);
+}
+
+#[test]
+fn rejected_native_delivery_clears_the_constant_rate_cache() {
+    let events = Arc::new(Mutex::new(VecDeque::from([
+        Ok(Some(frame(1, 1, &[1, 2, 3, 4, 5, 6, 7, 8]))),
+        Ok(None),
+    ])));
+    let controller = Arc::new(Mutex::new(Controller::new(
+        FakeBackend {
+            events,
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        true,
+    )));
+    let stream = open_constant_rate(&mut controller.lock().unwrap(), "owner");
+    let factory = native::Factory::new(controller);
+    let binding = TestBinding::new(&factory, "owner");
+
+    assert_eq!(binding.read_rejected(stream), STATUS_INVALID_ARGUMENT);
+    assert_eq!(binding.read(stream, &mut Vec::new()), MEDIA_PENDING);
+}
+
+#[test]
+fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_error() {
+    let events = VecDeque::from([
+        Ok(None),
+        Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))),
+        Ok(None),
+        Ok(None),
+        Err(CaptureError::new("backend_error", "temporary read failure")),
+        Ok(None),
+    ]);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let backend = FakeBackend {
+        events: Arc::new(Mutex::new(events)),
+        geometries: Arc::new(Mutex::new(VecDeque::new())),
+        drops,
+    };
+    let mut controller = Controller::new(backend, true);
+    let stream = open_constant_rate(&mut controller, "owner");
+
+    assert!(controller.read("owner", stream, 0).unwrap().is_none());
+    let first = controller.read("owner", stream, 0).unwrap().unwrap();
+    assert_eq!(first.sequence, 1);
+    let second = controller.read("owner", stream, 0).unwrap().unwrap();
+    let third = controller.read("owner", stream, 0).unwrap().unwrap();
+    assert!(first.timestamp_us < second.timestamp_us);
+    assert!(second.timestamp_us < third.timestamp_us);
+    assert_eq!((first.sequence, second.sequence, third.sequence), (1, 2, 3));
+    assert_eq!(first.bytes.as_ref(), second.bytes.as_ref());
+    assert_eq!(second.bytes.as_ref(), third.bytes.as_ref());
+    assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "backend_error"
+    );
+    assert!(controller.read("owner", stream, 0).unwrap().is_none());
+    controller.close("owner", stream).unwrap();
+    assert_eq!(
+        controller.read("owner", stream, 0).unwrap_err().code,
+        "not_found"
+    );
+}
+
+#[test]
+fn default_wgc_mode_does_not_repeat_the_last_frame() {
+    let events = VecDeque::from([Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))), Ok(None)]);
+    let backend = FakeBackend {
+        events: Arc::new(Mutex::new(events)),
+        geometries: Arc::new(Mutex::new(VecDeque::new())),
+        drops: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut controller = Controller::new(backend, true);
+    let stream = open(&mut controller, "owner");
+
+    let first = controller.read("owner", stream, 0).unwrap().unwrap();
+    assert_eq!((first.timestamp_us, first.sequence), (7, 4));
+    assert!(controller.read("owner", stream, 0).unwrap().is_none());
 }
 
 #[cfg(windows)]

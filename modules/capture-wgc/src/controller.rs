@@ -3,6 +3,7 @@ use crate::model::{CaptureError, CaptureResult, Frame, MAX_STREAMS, MAX_WAIT_MS,
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 struct Stream {
     owner: String,
@@ -10,6 +11,29 @@ struct Stream {
     session: Box<dyn CaptureSession>,
     geometry: Option<CaptureGeometry>,
     operation_id: Option<String>,
+    constant_rate: bool,
+    opened_at: Instant,
+    last_frame: Option<Frame>,
+    next_sequence: u64,
+    last_timestamp_us: u64,
+}
+
+impl Stream {
+    fn stamp(&mut self, frame: &mut Frame) -> CaptureResult<()> {
+        let sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+            CaptureError::new("sequence_exhausted", "capture frame sequence exhausted")
+        })?;
+        let next_timestamp_us = self.last_timestamp_us.checked_add(1).ok_or_else(|| {
+            CaptureError::new("timestamp_exhausted", "capture frame timestamp exhausted")
+        })?;
+        let elapsed_us = self.opened_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let timestamp_us = elapsed_us.max(next_timestamp_us);
+        self.next_sequence = sequence;
+        self.last_timestamp_us = timestamp_us;
+        frame.sequence = sequence;
+        frame.timestamp_us = timestamp_us;
+        Ok(())
+    }
 }
 
 pub struct Controller<B: Backend> {
@@ -51,7 +75,8 @@ impl<B: Backend> Controller<B> {
             Operation::Open {
                 output,
                 operation_id,
-            } => self.open(caller, &output, operation_id, guard),
+                constant_rate,
+            } => self.open(caller, &output, operation_id, constant_rate, guard),
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id),
             Operation::Close { stream } => self.close(caller, stream).map(|()| json!({"ok":true})),
         };
@@ -63,6 +88,7 @@ impl<B: Backend> Controller<B> {
         caller: &str,
         output: &str,
         operation_id: Option<String>,
+        constant_rate: bool,
         guard: &mut impl FnMut() -> CaptureResult<()>,
     ) -> CaptureResult<Value> {
         if !self.enabled {
@@ -74,13 +100,18 @@ impl<B: Backend> Controller<B> {
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
-                if existing.output != output {
+                if existing.output != output || existing.constant_rate != constant_rate {
                     return Err(CaptureError::new(
                         "operation_conflict",
-                        "operation ID already selected a different output",
+                        "operation ID already selected a different output or delivery mode",
                     ));
                 }
-                return Ok(open_reply(stream_id, &existing.output, existing.geometry));
+                return Ok(open_reply(
+                    stream_id,
+                    &existing.output,
+                    existing.geometry,
+                    existing.constant_rate,
+                ));
             }
         }
         if self.streams.len() >= MAX_STREAMS {
@@ -103,10 +134,15 @@ impl<B: Backend> Controller<B> {
                 session,
                 geometry,
                 operation_id,
+                constant_rate,
+                opened_at: Instant::now(),
+                last_frame: None,
+                next_sequence: 0,
+                last_timestamp_us: 0,
             },
         );
         self.opened_stream = Some(id);
-        Ok(open_reply(id, output, geometry))
+        Ok(open_reply(id, output, geometry, constant_rate))
     }
 
     fn status(&self, caller: &str) -> Value {
@@ -115,7 +151,8 @@ impl<B: Backend> Controller<B> {
             .iter()
             .filter(|(_, stream)| stream.owner == caller)
             .map(|(id, stream)| {
-                let mut reply = stream_reply(*id, &stream.output, stream.geometry);
+                let mut reply =
+                    stream_reply(*id, &stream.output, stream.geometry, stream.constant_rate);
                 reply["device_adapter"] = stream.session.device_adapter();
                 reply
             })
@@ -154,7 +191,9 @@ impl<B: Backend> Controller<B> {
     fn lookup(&self, caller: &str, operation_id: &str) -> CaptureResult<Value> {
         validate_operation_id(operation_id)?;
         self.find_operation(caller, operation_id)
-            .map(|(id, stream)| open_reply(id, &stream.output, stream.geometry))
+            .map(|(id, stream)| {
+                open_reply(id, &stream.output, stream.geometry, stream.constant_rate)
+            })
             .ok_or_else(|| {
                 CaptureError::new("not_found", "no capture stream owned by this operation")
             })
@@ -179,17 +218,50 @@ impl<B: Backend> Controller<B> {
     pub fn read(&mut self, caller: &str, id: u64, wait_ms: u32) -> CaptureResult<Option<Frame>> {
         self.authorize(caller, id)?;
         if wait_ms > MAX_WAIT_MS {
+            self.streams
+                .get_mut(&id)
+                .expect("authorized stream")
+                .last_frame = None;
             return Err(CaptureError::new(
                 "invalid_request",
                 "frame wait must be at most 16 ms",
             ));
         }
-        let result = self
-            .streams
-            .get_mut(&id)
-            .expect("authorized stream")
-            .session
-            .read(wait_ms);
+        let result = {
+            let stream = self.streams.get_mut(&id).expect("authorized stream");
+            match stream.session.read(wait_ms) {
+                Ok(Some(mut frame)) if stream.constant_rate => match stream.stamp(&mut frame) {
+                    Ok(()) => {
+                        stream.last_frame = Some(frame.clone());
+                        Ok(Some(frame))
+                    }
+                    Err(error) => {
+                        stream.last_frame = None;
+                        Err(error)
+                    }
+                },
+                Ok(None) if stream.constant_rate => {
+                    let Some(mut frame) = stream.last_frame.clone() else {
+                        return Ok(None);
+                    };
+                    match stream.stamp(&mut frame) {
+                        Ok(()) => {
+                            stream.last_frame = Some(frame.clone());
+                            Ok(Some(frame))
+                        }
+                        Err(error) => {
+                            stream.last_frame = None;
+                            Err(error)
+                        }
+                    }
+                }
+                Ok(frame) => Ok(frame),
+                Err(error) => {
+                    stream.last_frame = None;
+                    Err(error)
+                }
+            }
+        };
         if result
             .as_ref()
             .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
@@ -199,10 +271,22 @@ impl<B: Backend> Controller<B> {
         result
     }
 
+    pub fn discard_cached_frame(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
+        self.authorize(caller, id)?;
+        self.streams
+            .get_mut(&id)
+            .expect("authorized stream")
+            .last_frame = None;
+        Ok(())
+    }
+
     pub fn geometry(&mut self, caller: &str, id: u64) -> CaptureResult<Option<CaptureGeometry>> {
         self.authorize(caller, id)?;
         let stream = self.streams.get_mut(&id).expect("authorized stream");
         let current = stream.session.geometry();
+        if current.is_err() {
+            stream.last_frame = None;
+        }
         let changed = current
             .as_ref()
             .is_ok_and(|current| *current != stream.geometry);
@@ -211,6 +295,7 @@ impl<B: Backend> Controller<B> {
                 .as_ref()
                 .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
         {
+            stream.last_frame = None;
             self.streams.remove(&id);
             return Err(CaptureError::new(
                 "access_lost",
@@ -255,14 +340,28 @@ fn enumeration_reply(outputs: Vec<crate::model::Output>) -> CaptureResult<Value>
     Ok(reply)
 }
 
-fn open_reply(stream_id: u64, output: &str, geometry: Option<CaptureGeometry>) -> Value {
-    let mut reply = stream_reply(stream_id, output, geometry);
+fn open_reply(
+    stream_id: u64,
+    output: &str,
+    geometry: Option<CaptureGeometry>,
+    constant_rate: bool,
+) -> Value {
+    let mut reply = stream_reply(stream_id, output, geometry, constant_rate);
     reply["ok"] = json!(true);
     reply
 }
 
-fn stream_reply(stream_id: u64, output: &str, geometry: Option<CaptureGeometry>) -> Value {
-    let mut reply = json!({ "stream": stream_id, "output": output });
+fn stream_reply(
+    stream_id: u64,
+    output: &str,
+    geometry: Option<CaptureGeometry>,
+    constant_rate: bool,
+) -> Value {
+    let mut reply = json!({
+        "stream": stream_id,
+        "output": output,
+        "constant_rate": constant_rate,
+    });
     if let Some(geometry) = geometry {
         reply["desktop_geometry"] = json!(geometry);
     }

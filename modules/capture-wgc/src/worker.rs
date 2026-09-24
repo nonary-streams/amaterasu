@@ -142,7 +142,7 @@ mod tests {
                 stride: 4,
                 timestamp_us: 0,
                 sequence: 1,
-                bytes: vec![1, 2, 3, 4],
+                bytes: Arc::new(vec![1, 2, 3, 4]),
             }))
         }
     }
@@ -187,7 +187,7 @@ mod tests {
             }
             thread::yield_now();
         }
-        assert_eq!(frame.unwrap().bytes, [1, 2, 3, 4]);
+        assert_eq!(frame.unwrap().bytes.as_slice(), [1, 2, 3, 4]);
         drop(worker);
         let trace = trace.lock().unwrap();
         assert_eq!(

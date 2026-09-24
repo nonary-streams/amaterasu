@@ -27,9 +27,20 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
   Windows can prove the selected monitor's physical rectangle and the complete
   virtual desktop. The opaque unsigned 64-bit stream ID must retain integer
   precision in clients.
+- Open also accepts optional `constant_rate`; when `true`, it enables cached
+  image repeats as described below. Omission and `false` retain event-driven
+  delivery.
 - Open accepts optional `operation_id` containing 1..128 UTF-8 bytes. Repeating
-  the same caller/output/operation ID returns the existing live stream.
-  A different output with the same operation ID returns `operation_conflict`.
+  the same caller/output/delivery mode/operation ID returns the existing live
+  stream. A different output or delivery mode with the same operation ID
+  returns `operation_conflict`.
+- Open accepts optional `constant_rate`, defaulting to `false`. When enabled,
+  reads repeat the last completed WGC image if no newer frame is ready. The
+  caller controls the read cadence; WGC does not start a timer. Repeated frames
+  share the retained owned pixel allocation and receive new sequence numbers
+  and monotonic timestamps. A read or geometry error, or a rejected sink
+  delivery other than temporary `MEDIA_BUSY`, clears the cached image; closed
+  or failed streams never replay it.
 - `{"action":"lookup","operation_id":"start-1"}` recovers that caller's
   same stream/output reply after a lost open result. The mapping ends when the
   stream closes or loses its capture source.
@@ -103,14 +114,22 @@ The native callback receives at most one tight BGRA8 frame, `stride = width * 4`
 and `len = stride * height`. Pixel rows are copied individually; uninitialized
 GPU padding is never borrowed or exported. Dimensions are at most 8192 per axis,
 and tight pixels are bounded to 128 MiB. Timestamps are monotonic microseconds
-from this stream's creation epoch, sampled at copy submission; they are not
-presentation timestamps. Sequence increases per completed CPU readback.
+from this stream's creation epoch; they are not presentation timestamps.
+Sequence increases for each delivered frame. In constant-rate mode, the
+controller assigns a fresh timestamp and sequence whenever it repeats cached
+pixels.
 
-The frame and its bytes live only through the synchronous sink callback. The
-consumer must copy or finish processing before return. No controller mutex is
-held during the callback, so it may close the stream without invalidating that
-frame. A rejected callback consumes the frame; its status is returned unchanged.
-No frame bytes travel in JSON.
+The frame and its bytes live through the synchronous sink callback. The
+consumer must copy or finish processing before return. Constant-rate mode keeps
+the last completed frame in owned shared storage; no callback pointer is
+retained. No controller mutex is held during the callback, so it may close the
+stream without invalidating that frame. A rejected callback consumes the
+delivery; its status is returned unchanged. A non-`MEDIA_BUSY` rejection also
+clears the cached frame. No frame bytes travel in JSON.
+
+The global Vibeshine `capture = wgcc` configuration route is not implemented
+yet. The opt-in open field is the backend behavior needed for that route; its
+configuration handoff through NVHTTP, RTSP, and stream-session remains pending.
 
 Native statuses are `MEDIA_PENDING` (no ready CPU frame), `MEDIA_BUSY` (controller
 already in use), `MEDIA_CLOSED` (unknown/foreign/ended stream),
@@ -129,7 +148,7 @@ capture cadence and is not atomic with the frame.
 
 ## Verification and remaining gates
 
-Twelve fake-backend and byte-array tests cover caller-owned operations and native
+Sixteen unit tests cover caller-owned operations and native
 bindings, replay/lookup, callback pixel lifetime, row pitch, cancellation, capacity,
 shutdown, incompatible ABI queries, non-`Send` worker ownership, bounded outstanding
 polling, joined destruction, and failed initialization cleanup. Windows x86_64 MSVC

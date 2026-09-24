@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 pub const MAX_STREAMS: usize = 4;
 pub const MAX_WAIT_MS: u32 = 16;
@@ -52,6 +53,8 @@ pub enum Operation {
     Open {
         output: String,
         operation_id: Option<String>,
+        #[serde(default)]
+        constant_rate: bool,
     },
     Lookup {
         operation_id: String,
@@ -61,13 +64,14 @@ pub enum Operation {
     },
 }
 
+#[derive(Clone, Debug)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub timestamp_us: u64,
     pub sequence: u64,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<Vec<u8>>,
 }
 
 #[cfg(any(windows, test))]

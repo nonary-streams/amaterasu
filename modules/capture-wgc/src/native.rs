@@ -74,6 +74,12 @@ impl<B: Backend> Binding<B> {
             Err(error) => Err(capture_error_status(&error)),
         }
     }
+
+    fn discard_cached_frame(&self, stream: u64) {
+        if let Ok(mut controller) = self.controller.lock() {
+            let _ = controller.discard_cached_frame(&self.caller, stream);
+        }
+    }
 }
 
 fn capture_error_status(error: &crate::model::CaptureError) -> Status {
@@ -163,7 +169,12 @@ unsafe extern "C" fn read_frame<B: Backend>(
         // SAFETY: sink is supplied by the native consumer for this call only.
         // The owned frame stays alive through callback; no controller lock is
         // held while invoking foreign code. The consumer must not retain bytes.
-        unsafe { sink.send(&borrowed) }
+        // SAFETY: the callback borrows this frame only for the synchronous call.
+        let status = unsafe { sink.send(&borrowed) };
+        if status != STATUS_OK && status != MEDIA_BUSY {
+            binding.discard_cached_frame(stream);
+        }
+        status
     }))
     .unwrap_or(STATUS_INTERNAL_ERROR)
 }

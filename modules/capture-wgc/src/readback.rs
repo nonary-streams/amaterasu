@@ -1,5 +1,6 @@
 use crate::model::{CaptureError, CaptureResult, Frame, copy_bgra_rows, frame_layout};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -186,7 +187,7 @@ impl Readback {
             width: pending.width,
             height: pending.height,
             stride,
-            bytes,
+            bytes: Arc::new(bytes),
             timestamp_us: pending.timestamp_us,
             sequence: self.sequence,
         };
