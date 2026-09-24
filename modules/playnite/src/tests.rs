@@ -56,10 +56,25 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         "enabled":true,
         "sync_all_installed":true,
         "autosync_remove_uninstalled":false,
+        "focus_attempts":9,
+        "focus_timeout_secs":45,
+        "focus_exit_on_first":true,
         "expected_revision":3
     }))
     .unwrap();
     assert!(action.is_settings());
+    let Action::SettingsUpdate {
+        focus_attempts,
+        focus_timeout_secs,
+        focus_exit_on_first,
+        ..
+    } = action
+    else {
+        panic!("expected settings update")
+    };
+    assert_eq!(focus_attempts, Some(9));
+    assert_eq!(focus_timeout_secs, Some(45));
+    assert_eq!(focus_exit_on_first, Some(true));
 
     let legacy_update: Action = serde_json::from_value(json!({
         "action":"settings_update",
@@ -69,12 +84,18 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     .unwrap();
     let Action::SettingsUpdate {
         autosync_remove_uninstalled,
+        focus_attempts,
+        focus_timeout_secs,
+        focus_exit_on_first,
         ..
     } = legacy_update
     else {
         panic!("expected settings update")
     };
     assert_eq!(autosync_remove_uninstalled, None);
+    assert_eq!(focus_attempts, None);
+    assert_eq!(focus_timeout_secs, None);
+    assert_eq!(focus_exit_on_first, None);
 
     assert!(
         serde_json::from_value::<Action>(json!({

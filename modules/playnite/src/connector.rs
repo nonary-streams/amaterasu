@@ -6,6 +6,7 @@
 //! protect against a compromised Playnite process on the same host.
 
 use crate::discovery::ProcessImage;
+use crate::focus::{FocusPolicy, FocusRetry, FocusTarget};
 use crate::launch::{StopRequest, installation_roots, refresh_processes_for_install};
 use crate::snapshot::{Snapshot, SnapshotAssembler, valid_playnite_id};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -262,6 +263,7 @@ pub fn watch_game(
     stop_requests: Receiver<StopRequest>,
     events: Sender<super::launch::State>,
     recovery: bool,
+    focus_policy: FocusPolicy,
 ) {
     use serde_json::json;
 
@@ -272,6 +274,7 @@ pub fn watch_game(
     let mut buffer = [0u8; 4096];
     let mut received = 0usize;
     let mut started = false;
+    let mut focus_retry = FocusRetry::default();
     let mut stopping = recovery;
     let mut stop_deadline = None;
     let launch_deadline = Instant::now() + LAUNCH_START_TIMEOUT;
@@ -360,6 +363,7 @@ pub fn watch_game(
                     return;
                 }
                 stopping = true;
+                focus_retry.cancel();
                 stop_deadline = Some(Instant::now() + Duration::from_secs(request.timeout_seconds));
                 let _ = events.send(super::launch::State::Stopping);
             }
@@ -374,6 +378,7 @@ pub fn watch_game(
             fail(super::launch::State::CleanupFailed);
             return;
         }
+        focus_retry.tick_with(Instant::now(), FocusRetry::attempt_windows_focus);
 
         let available = match pipe.available() {
             Ok(available) => available as usize,
@@ -404,13 +409,28 @@ pub fn watch_game(
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                if let Some((name, status_game_id)) = parse_game_status(&line)
-                    && status_game_id.eq_ignore_ascii_case(game_id)
-                    && let Some(state) = apply_game_status(&name, &mut started, stopping)
+                if let Some(status) = parse_game_status(&line)
+                    && status.game_id.eq_ignore_ascii_case(game_id)
                 {
-                    let _ = events.send(state);
-                    if state == super::launch::State::Stopped {
-                        return;
+                    let was_started = started;
+                    let state = apply_game_status(&status.name, &mut started, stopping);
+                    if status.name == "gameStarted" && !stopping {
+                        if was_started {
+                            focus_retry.observe_target(status.focus_target);
+                        } else {
+                            focus_retry.start(focus_policy, status.focus_target, Instant::now());
+                        }
+                    } else if started && !stopping {
+                        focus_retry.observe_target(status.focus_target);
+                    }
+                    if let Some(state) = state {
+                        if state == super::launch::State::Stopped {
+                            focus_retry.cancel();
+                        }
+                        let _ = events.send(state);
+                        if state == super::launch::State::Stopped {
+                            return;
+                        }
                     }
                 }
                 line.clear();
@@ -432,6 +452,7 @@ pub fn watch_game(
     _stop_requests: Receiver<StopRequest>,
     events: Sender<super::launch::State>,
     recovery: bool,
+    _focus_policy: FocusPolicy,
 ) {
     let _ = events.send(if recovery {
         super::launch::State::CleanupFailed
@@ -452,7 +473,14 @@ fn send_command(
     pipe.write_all(&line)
 }
 
-fn parse_game_status(line: &[u8]) -> Option<(String, String)> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GameStatus {
+    name: String,
+    game_id: String,
+    focus_target: FocusTarget,
+}
+
+fn parse_game_status(line: &[u8]) -> Option<GameStatus> {
     let message: serde_json::Value = serde_json::from_slice(line).ok()?;
     if message["type"] != "status" {
         return None;
@@ -460,12 +488,21 @@ fn parse_game_status(line: &[u8]) -> Option<(String, String)> {
     if message.get("ticket").is_some() || message.pointer("/status/ticket").is_some() {
         return None;
     }
-    let name = message.pointer("/status/name")?.as_str()?;
-    let game_id = message.pointer("/status/id")?.as_str()?;
+    let status = message.get("status")?;
+    let name = status.get("name")?.as_str()?;
+    let game_id = status.get("id")?.as_str()?;
     if !valid_playnite_id(game_id) {
         return None;
     }
-    Some((name.into(), game_id.into()))
+    let focus_target = FocusTarget::from_status_paths(
+        status.get("installDir").and_then(serde_json::Value::as_str),
+        status.get("exe").and_then(serde_json::Value::as_str),
+    );
+    Some(GameStatus {
+        name: name.into(),
+        game_id: game_id.into(),
+        focus_target,
+    })
 }
 
 fn apply_game_status(
@@ -527,6 +564,7 @@ mod tests {
     #[cfg(windows)]
     use super::decode_pipe_name;
     use super::{apply_game_status, parse_game_status, state_after_start_failure};
+    use crate::focus::FocusTarget;
     use crate::launch::State;
 
     #[cfg(windows)]
@@ -550,13 +588,16 @@ mod tests {
 
     #[test]
     fn status_parser_requires_typed_status_and_valid_guid() {
-        let valid = br#"{"type":"status","status":{"name":"gameStarted","id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}}"#;
+        let valid = br#"{"type":"status","status":{"name":"gameStarted","id":"a1b2c3d4-1234-5678-9abc-0123456789ab","installDir":"C:\\Games\\Sample","exe":"C:\\Games\\Sample\\game.exe"}}"#;
+        let parsed = parse_game_status(valid).unwrap();
+        assert_eq!(parsed.name, "gameStarted");
+        assert_eq!(parsed.game_id, "a1b2c3d4-1234-5678-9abc-0123456789ab");
         assert_eq!(
-            parse_game_status(valid),
-            Some((
-                "gameStarted".into(),
-                "a1b2c3d4-1234-5678-9abc-0123456789ab".into()
-            ))
+            parsed.focus_target,
+            FocusTarget::from_status_paths(
+                Some(r"C:\Games\Sample"),
+                Some(r"C:\Games\Sample\game.exe")
+            )
         );
         for invalid in [
             br#"{"type":"hello","status":{"name":"gameStarted","id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}}"#.as_slice(),
@@ -568,6 +609,23 @@ mod tests {
                 assert!(parse_game_status(invalid).is_none());
             }
         }
+    }
+
+    #[test]
+    fn focus_targets_from_status_ignore_unbounded_or_relative_paths() {
+        let parsed = parse_game_status(
+            br#"{"type":"status","status":{"name":"gameStarted","id":"a1b2c3d4-1234-5678-9abc-0123456789ab","installDir":"C:\\","exe":"..\\game.exe"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.name, "gameStarted");
+        assert_eq!(parsed.focus_target, FocusTarget::default());
+
+        let oversized = format!(
+            r#"{{"type":"status","status":{{"name":"gameStarted","id":"a1b2c3d4-1234-5678-9abc-0123456789ab","exe":"C:\\{}\\game.exe"}}}}"#,
+            "x".repeat(4_100)
+        );
+        let parsed = parse_game_status(oversized.as_bytes()).unwrap();
+        assert!(parsed.focus_target.executable.is_none());
     }
 
     #[test]

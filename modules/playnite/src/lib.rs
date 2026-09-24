@@ -3,6 +3,7 @@ mod catalog_sync;
 mod configuration;
 mod connector;
 mod discovery;
+mod focus;
 mod launch;
 mod settings;
 mod snapshot;
@@ -40,6 +41,12 @@ enum Action {
         autosync_delete_after_days: Option<u32>,
         #[serde(default)]
         autosync_require_replacement: Option<bool>,
+        #[serde(default)]
+        focus_attempts: Option<u32>,
+        #[serde(default)]
+        focus_timeout_secs: Option<u32>,
+        #[serde(default)]
+        focus_exit_on_first: Option<bool>,
         #[serde(default)]
         recent_games: Option<u32>,
         #[serde(default)]
@@ -329,6 +336,11 @@ impl PlayniteModule {
                     &game_id,
                     &self.eligible_launch_ids,
                     self.last_discovery.processes.clone(),
+                    focus::FocusPolicy {
+                        attempts: self.configuration.settings().focus_attempts,
+                        timeout_secs: self.configuration.settings().focus_timeout_secs,
+                        exit_on_first: self.configuration.settings().focus_exit_on_first,
+                    },
                 );
                 self.complete(id, response)
             }
@@ -380,6 +392,9 @@ impl PlayniteModule {
                 autosync_remove_uninstalled,
                 autosync_delete_after_days,
                 autosync_require_replacement,
+                focus_attempts,
+                focus_timeout_secs,
+                focus_exit_on_first,
                 recent_games,
                 recent_max_age_days,
                 sync_categories,
@@ -400,6 +415,9 @@ impl PlayniteModule {
                         .unwrap_or(current.autosync_delete_after_days),
                     autosync_require_replacement: autosync_require_replacement
                         .unwrap_or(current.autosync_require_replacement),
+                    focus_attempts: focus_attempts.unwrap_or(current.focus_attempts),
+                    focus_timeout_secs: focus_timeout_secs.unwrap_or(current.focus_timeout_secs),
+                    focus_exit_on_first: focus_exit_on_first.unwrap_or(current.focus_exit_on_first),
                     recent_games: recent_games.unwrap_or(current.recent_games),
                     recent_max_age_days: recent_max_age_days.unwrap_or(current.recent_max_age_days),
                     sync_categories: sync_categories

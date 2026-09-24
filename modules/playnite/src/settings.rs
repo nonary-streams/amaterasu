@@ -22,6 +22,12 @@ pub struct ProductSettings {
     pub autosync_delete_after_days: u32,
     #[serde(default = "default_autosync_require_replacement")]
     pub autosync_require_replacement: bool,
+    #[serde(default = "default_focus_attempts")]
+    pub focus_attempts: u32,
+    #[serde(default = "default_focus_timeout_secs")]
+    pub focus_timeout_secs: u32,
+    #[serde(default)]
+    pub focus_exit_on_first: bool,
     #[serde(default = "default_recent_games")]
     pub recent_games: u32,
     #[serde(default = "default_recent_max_age_days")]
@@ -58,6 +64,14 @@ fn default_autosync_require_replacement() -> bool {
     true
 }
 
+fn default_focus_attempts() -> u32 {
+    3
+}
+
+fn default_focus_timeout_secs() -> u32 {
+    15
+}
+
 fn default_recent_games() -> u32 {
     10
 }
@@ -75,6 +89,9 @@ impl Default for ProductSettings {
             autosync_remove_uninstalled: default_autosync_remove_uninstalled(),
             autosync_delete_after_days: default_autosync_delete_after_days(),
             autosync_require_replacement: default_autosync_require_replacement(),
+            focus_attempts: default_focus_attempts(),
+            focus_timeout_secs: default_focus_timeout_secs(),
+            focus_exit_on_first: false,
             recent_games: default_recent_games(),
             recent_max_age_days: default_recent_max_age_days(),
             sync_categories: Vec::new(),
@@ -91,8 +108,10 @@ impl ProductSettings {
         if self.recent_games > 10_000
             || self.recent_max_age_days > 36_500
             || self.autosync_delete_after_days > i32::MAX as u32
+            || self.focus_attempts > i32::MAX as u32
+            || self.focus_timeout_secs > i32::MAX as u32
         {
-            return Err("Playnite recent or cleanup settings exceed their supported bounds");
+            return Err("Playnite numeric settings exceed their supported bounds");
         }
         validate_filter_values(&self.sync_categories, "category")?;
         validate_filter_values(&self.exclude_categories, "category")?;
@@ -207,6 +226,9 @@ mod tests {
         assert_eq!(settings.recent_max_age_days, 30);
         assert_eq!(settings.autosync_delete_after_days, 14);
         assert!(settings.autosync_require_replacement);
+        assert_eq!(settings.focus_attempts, 3);
+        assert_eq!(settings.focus_timeout_secs, 15);
+        assert!(!settings.focus_exit_on_first);
     }
 
     #[test]
@@ -237,6 +259,18 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("autosync_require_replacement");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("focus_attempts");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("focus_timeout_secs");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("focus_exit_on_first");
         assert!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":true,"version":1,"revision":6,
@@ -254,6 +288,9 @@ mod tests {
         .0;
         assert_eq!(old_settings.autosync_delete_after_days, 14);
         assert!(old_settings.autosync_require_replacement);
+        assert_eq!(old_settings.focus_attempts, 3);
+        assert_eq!(old_settings.focus_timeout_secs, 15);
+        assert!(!old_settings.focus_exit_on_first);
         assert_eq!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":false,"version":null,"revision":0,"values":{}
@@ -302,6 +339,44 @@ mod tests {
         assert!(
             ProductSettings {
                 autosync_delete_after_days: i32::MAX as u32 + 1,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn focus_settings_match_the_nonnegative_host_integer_range() {
+        assert!(
+            ProductSettings {
+                focus_attempts: 0,
+                focus_timeout_secs: 0,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                focus_attempts: i32::MAX as u32,
+                focus_timeout_secs: i32::MAX as u32,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                focus_attempts: i32::MAX as u32 + 1,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ProductSettings {
+                focus_timeout_secs: i32::MAX as u32 + 1,
                 ..ProductSettings::default()
             }
             .validate()

@@ -1,5 +1,5 @@
 //! Correlates internal launch requests with authenticated extension sessions.
-use crate::{connector, discovery::ProcessImage, snapshot::valid_playnite_id};
+use crate::{connector, discovery::ProcessImage, focus::FocusPolicy, snapshot::valid_playnite_id};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -46,6 +46,7 @@ struct Launch {
     game_id: String,
     processes: Vec<ProcessImage>,
     trusted_install_roots: BTreeSet<String>,
+    focus_policy: FocusPolicy,
     ticket: String,
     state: State,
     stop_requested: bool,
@@ -99,6 +100,7 @@ impl Launches {
         game_id: &str,
         eligible_game_ids: &BTreeSet<String>,
         processes: Vec<ProcessImage>,
+        focus_policy: FocusPolicy,
     ) -> Value {
         self.prune();
         if !valid_operation_id(operation_id) || !valid_playnite_id(game_id) {
@@ -137,6 +139,7 @@ impl Launches {
             operation_id: operation_id.into(),
             game_id,
             trusted_install_roots: installation_roots(&processes),
+            focus_policy,
             processes,
             ticket: ticket.clone(),
             state: State::Starting,
@@ -228,6 +231,7 @@ impl Launches {
             operation_id: operation_id.into(),
             game_id,
             trusted_install_roots: installation_roots(&processes),
+            focus_policy: FocusPolicy::disabled(),
             processes,
             ticket: ticket.clone(),
             state: State::Stopping,
@@ -337,8 +341,16 @@ impl Launch {
         }
         let processes = self.processes.clone();
         let game_id = self.game_id.clone();
+        let focus_policy = self.focus_policy;
         let worker = thread::spawn(move || {
-            connector::watch_game(&processes, &game_id, stop_receiver, event_sender, recovery);
+            connector::watch_game(
+                &processes,
+                &game_id,
+                stop_receiver,
+                event_sender,
+                recovery,
+                focus_policy,
+            );
         });
         self.stop_sender = Some(stop_sender);
         self.events = Some(events);
@@ -466,6 +478,7 @@ mod tests {
             game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
             processes: Vec::new(),
             trusted_install_roots: BTreeSet::new(),
+            focus_policy: FocusPolicy::default(),
             ticket: "ab".repeat(24),
             state,
             stop_requested: false,
@@ -503,6 +516,7 @@ mod tests {
                 game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
                 processes,
                 trusted_install_roots,
+                focus_policy: FocusPolicy::default(),
                 ticket: "ab".repeat(24),
                 state,
                 stop_requested: false,
@@ -606,6 +620,7 @@ mod tests {
                 game_id: game_id.into(),
                 processes: vec![original.clone()],
                 trusted_install_roots: installation_roots(&[original]),
+                focus_policy: FocusPolicy::default(),
                 ticket: "ab".repeat(24),
                 state: State::Running,
                 stop_requested: false,
@@ -632,6 +647,7 @@ mod tests {
             "a1b2c3d4-1234-5678-9abc-0123456789ab",
             &BTreeSet::new(),
             Vec::new(),
+            FocusPolicy::default(),
         );
         assert_eq!(result["code"], "game_not_in_complete_snapshot");
         let malformed = launches.start(
@@ -639,6 +655,7 @@ mod tests {
             "not-a-guid",
             &BTreeSet::from(["not-a-guid".into()]),
             Vec::new(),
+            FocusPolicy::default(),
         );
         assert_eq!(malformed["code"], "invalid_request");
         assert!(launches.by_ticket.is_empty());
@@ -659,6 +676,7 @@ mod tests {
                 game_id: game_id.into(),
                 processes: Vec::new(),
                 trusted_install_roots: BTreeSet::new(),
+                focus_policy: FocusPolicy::default(),
                 ticket: "ab".repeat(24),
                 state: State::Running,
                 stop_requested: false,
@@ -673,6 +691,7 @@ mod tests {
             game_id,
             &BTreeSet::from([game_id.into()]),
             Vec::new(),
+            FocusPolicy::default(),
         );
         assert_eq!(same["ticket"], "ab".repeat(24));
         let changed = launches.start(
@@ -680,6 +699,7 @@ mod tests {
             other_id,
             &BTreeSet::from([other_id.into()]),
             Vec::new(),
+            FocusPolicy::default(),
         );
         assert_eq!(changed["code"], "operation_conflict");
     }

@@ -35,3 +35,16 @@ protocol, but full reference focus and fullscreen launch behavior and the
 remaining extension synchronization features are still pending. Playnite
 selection and age settings have Amaterasu-specific bounds, so this does not
 claim every reference input edge is identical.
+
+Focus settings default to 3 confirmed focus attempts, a 15-second timeout, and
+`focus_exit_on_first=false`. Zero attempts or zero timeout disables focus;
+positive numeric settings accept the nonnegative signed 32-bit range. On
+Windows, focus uses bounded status paths from the authenticated extension and
+tries at most once per second. A supplied executable path must match exactly;
+the install directory is used only when no executable path is available. The
+timeout remains fixed for the active game even when status metadata changes,
+and retries end on timeout, successful-attempt budget, stop, or disconnect.
+Other platforms preserve settings but do not perform window focus. The
+reference `playnite_fullscreen_entry_enabled` and per-app
+`playnite-fullscreen` launch behavior remain pending because the current
+catalog launch contract cannot represent that host launcher action safely.
