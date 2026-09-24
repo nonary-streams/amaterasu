@@ -25,12 +25,14 @@ namespace Amaterasu {
     mouse: boolean,
     highResolutionScrolling: boolean,
     alwaysSendScancodes: boolean,
+    keyRightAltToKeyWin: boolean,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
       typeof mouse !== "boolean" ||
       typeof highResolutionScrolling !== "boolean" ||
-      typeof alwaysSendScancodes !== "boolean"
+      typeof alwaysSendScancodes !== "boolean" ||
+      typeof keyRightAltToKeyWin !== "boolean"
     )
       throw new Error("Input policy values must be enabled or disabled.");
     return {
@@ -38,6 +40,7 @@ namespace Amaterasu {
       mouse,
       high_resolution_scrolling: highResolutionScrolling,
       always_send_scancodes: alwaysSendScancodes,
+      key_rightalt_to_key_win: keyRightAltToKeyWin,
     };
   }
 
@@ -1113,6 +1116,12 @@ namespace Amaterasu {
           "checkbox",
         );
         alwaysSendScancodes.checked = settings.values.always_send_scancodes;
+        const keyRightAltToKeyWin = input(
+          "input_key_rightalt_to_key_win",
+          "",
+          "checkbox",
+        );
+        keyRightAltToKeyWin.checked = settings.values.key_rightalt_to_key_win;
         const status = el(
           "p",
           settings.applied ? "muted" : "error",
@@ -1142,6 +1151,11 @@ namespace Amaterasu {
             alwaysSendScancodes,
             "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping.",
           ),
+          field(
+            "Map Right Alt to Left Windows",
+            keyRightAltToKeyWin,
+            "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes.",
+          ),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -1157,6 +1171,7 @@ namespace Amaterasu {
                     mouse.checked,
                     highResolutionScrolling.checked,
                     alwaysSendScancodes.checked,
+                    keyRightAltToKeyWin.checked,
                   ),
                   expected_revision: settings.revision,
                 },

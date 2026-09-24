@@ -386,12 +386,14 @@ def test_auth_and_crud(console, api):
             "always_send_scancodes",
         )
     ), input_defaults
+    assert input_defaults["values"]["key_rightalt_to_key_win"] is False, input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
     input_policy_update = {
         "keyboard": False,
         "mouse": True,
         "high_resolution_scrolling": False,
         "always_send_scancodes": False,
+        "key_rightalt_to_key_win": True,
     }
     input_values = {**input_defaults["values"], **input_policy_update}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
@@ -404,6 +406,7 @@ def test_auth_and_crud(console, api):
         "mouse": True,
         "high_resolution_scrolling": True,
         "always_send_scancodes": True,
+        "key_rightalt_to_key_win": False,
         "expected_revision": input_defaults["revision"],
     }, administrator)
     assert status == 200 and input_conflict.get("error", {}).get("code") == "revision_conflict", input_conflict
@@ -412,10 +415,14 @@ def test_auth_and_crud(console, api):
     }, administrator)[0] == 400
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
-    # Legacy clients omit both newer fields; the update must preserve their
-    # stored values while changing keyboard and mouse policy.
+    # A v3 client knows the first four fields but omits the v4 Right Alt option.
+    # The update must preserve that value while changing the earlier controls.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
-        "keyboard": True, "mouse": True, "expected_revision": input_saved["revision"],
+        "keyboard": True,
+        "mouse": True,
+        "high_resolution_scrolling": input_saved["values"]["high_resolution_scrolling"],
+        "always_send_scancodes": input_saved["values"]["always_send_scancodes"],
+        "expected_revision": input_saved["revision"],
     }, administrator)
     input_values = {**input_values, "keyboard": True, "mouse": True}
     assert status == 200 and input_legacy_updated["ok"] and input_legacy_updated["applied"], input_legacy_updated
@@ -787,7 +794,7 @@ def main():
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy and restart persistence,")
     print("session restart invalidation,")
-    print("input keyboard/mouse/scrolling/scancode CAS, legacy updates, restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input policy CAS, Right Alt mapping, v3 field omission and restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

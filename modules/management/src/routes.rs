@@ -812,11 +812,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan_codes["always_send_scancodes"], false);
+        let right_alt_mapping = payload(
+            update,
+            br#"{"keyboard":true,"mouse":false,"key_rightalt_to_key_win":true,"expected_revision":10}"#,
+        )
+        .unwrap();
+        assert_eq!(right_alt_mapping["key_rightalt_to_key_win"], true);
         for rejected in [
             br#"{"keyboard":false,"mouse":true}"#.as_slice(),
             br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":"true","expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"high_resolution_scrolling":"true","expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":true,"key_rightalt_to_key_win":"true","expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":-1}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":0,"owner":"other"}"#,
         ] {
