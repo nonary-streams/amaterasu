@@ -118,7 +118,7 @@ impl Workflow {
                 };
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::StartPlaynite => {
@@ -217,6 +217,7 @@ pub fn first_cleanup_step(record: &Record) -> Step {
 mod tests {
     use super::*;
     use crate::records::Records;
+    use std::collections::BTreeMap;
 
     #[test]
     fn ambiguous_playnite_start_looks_up_its_operation_and_stop_deadline_is_bounded() {
@@ -242,5 +243,46 @@ mod tests {
         let deadline = workflow.deadline.saturating_duration_since(Instant::now());
         assert!(deadline <= Duration::from_secs(321));
         assert!(deadline >= Duration::from_secs(320));
+    }
+
+    #[test]
+    fn steam_catalog_metadata_reaches_the_application_launch_request() {
+        let mut records = Records::new().unwrap();
+        let (launch_id, _) = records
+            .start(
+                "alice",
+                "alice",
+                "operation".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+            )
+            .unwrap();
+        let record = records.values.get_mut(&launch_id).unwrap();
+        let program = std::env::current_exe().unwrap();
+        record.target = Some(LaunchTarget::Executable(
+            crate::protocol::Executable::from_catalog(&json!({
+                "kind":"executable",
+                "program":program,
+                "arguments":["-applaunch","42"]
+            }))
+            .unwrap(),
+        ));
+        if let Some(LaunchTarget::Executable(executable)) = record.target.as_mut() {
+            executable.steam_id = Some("42".into());
+            executable.steam_install_dir = Some("/games/title".into());
+        }
+        record.process_operation = "steam-launch".into();
+        let workflow = Workflow {
+            launch_id,
+            request: None,
+            deadline: Instant::now() + Duration::from_secs(5),
+            step: Step::Spawn,
+            pending: None,
+            cleanup: false,
+        };
+
+        let (_, payload) = workflow.command(record, &BTreeMap::new()).unwrap();
+        assert_eq!(payload["steam_id"], "42");
+        assert_eq!(payload["steam_install_dir"], "/games/title");
     }
 }

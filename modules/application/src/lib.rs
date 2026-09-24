@@ -4,6 +4,7 @@ mod containment;
 mod lifecycle;
 mod processes;
 mod protocol;
+mod steam_tracking;
 pub use processes::ProcessManager;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};

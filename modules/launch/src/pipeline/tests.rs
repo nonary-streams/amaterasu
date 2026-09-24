@@ -53,6 +53,8 @@ struct Harness {
     catalog_wait_all: Option<bool>,
     catalog_exit_timeout_seconds: Option<u64>,
     catalog_detached: Option<Vec<String>>,
+    catalog_steam_id: Option<String>,
+    catalog_steam_install_dir: Option<String>,
     catalog_fec_percentage: Option<u8>,
     catalog_playnite_game_id: Option<String>,
     catalog_playnite_exit_timeout_seconds: u64,
@@ -96,6 +98,8 @@ impl Harness {
             catalog_wait_all: None,
             catalog_exit_timeout_seconds: None,
             catalog_detached: None,
+            catalog_steam_id: None,
+            catalog_steam_install_dir: None,
             catalog_fec_percentage: None,
             catalog_playnite_game_id: None,
             catalog_playnite_exit_timeout_seconds: 10,
@@ -471,6 +475,12 @@ impl Harness {
                         if let Some(detached) = &self.catalog_detached {
                             reply["entry"]["launch"]["detached"] = json!(detached);
                         }
+                        if let Some(steam_id) = &self.catalog_steam_id {
+                            reply["entry"]["steam_id"] = json!(steam_id);
+                        }
+                        if let Some(install_dir) = &self.catalog_steam_install_dir {
+                            reply["entry"]["steam_install_dir"] = json!(install_dir);
+                        }
                         if action == "resolve_exported_launch" {
                             reply["catalog_owner"] = json!("management");
                         }
@@ -740,6 +750,27 @@ fn persisted_process_lifecycle_policy_reaches_application_launch() {
         application_launch["detached"],
         json!(["/opt/tools/overlay --launch"])
     );
+}
+
+#[test]
+fn persisted_steam_identity_and_install_directory_reach_application_launch() {
+    let mut harness = Harness::new();
+    harness.catalog_steam_id = Some("42".into());
+    harness.catalog_steam_install_dir = Some("/games/space game".into());
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", launch("steam-metadata"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("launch workflow sends an application launch request");
+    assert_eq!(application_launch["steam_id"], "42");
+    assert_eq!(application_launch["steam_install_dir"], "/games/space game");
 }
 
 #[test]

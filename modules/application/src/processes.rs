@@ -4,6 +4,7 @@ use crate::lifecycle::ApplicationLifecycle;
 use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, ProcessState, TerminalOutcome,
 };
+use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -71,6 +72,12 @@ struct ProcessRecord {
     auto_detached: bool,
     #[serde(skip)]
     detached_children: Vec<std::process::Child>,
+    #[serde(skip)]
+    steam_launcher: Option<std::process::Child>,
+    #[serde(skip)]
+    steam_tracker: Option<SteamProcessTracker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steam_game_liveness: Option<SteamGameLiveness>,
 }
 
 impl ProcessRecord {
@@ -90,6 +97,9 @@ impl ProcessRecord {
             application_started_at: None,
             auto_detached: false,
             detached_children: Vec::new(),
+            steam_launcher: None,
+            steam_tracker: None,
+            steam_game_liveness: None,
         };
         if record.lifecycle.is_none() {
             record.spawn_application();
@@ -110,6 +120,30 @@ impl ProcessRecord {
             .stderr(Stdio::null());
         if let Some(cwd) = &self.spec.cwd {
             command.current_dir(cwd);
+        }
+        if self.is_steam_metadata_launch() {
+            self.steam_tracker = self
+                .spec
+                .steam_install_dir
+                .as_deref()
+                .and_then(SteamProcessTracker::begin);
+            self.steam_game_liveness = Some(if self.steam_tracker.is_some() {
+                SteamGameLiveness::Searching
+            } else {
+                SteamGameLiveness::Unknown
+            });
+            match command.spawn() {
+                Ok(child) => {
+                    self.pid = Some(child.id());
+                    self.steam_launcher = Some(child);
+                    self.application_started_at = Some(Instant::now());
+                    self.state = ProcessState::Running;
+                }
+                Err(error) => self.complete_or_clean(Completion::LaunchFailed {
+                    os_error: error.raw_os_error(),
+                }),
+            }
+            return;
         }
         match ContainedChild::spawn(&mut command) {
             Ok(child) => {
@@ -154,6 +188,13 @@ impl ProcessRecord {
     fn reap_detached_commands(&mut self) {
         self.detached_children
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        if self
+            .steam_launcher
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+        {
+            self.steam_launcher = None;
+        }
     }
 
     fn complete_or_clean(&mut self, completion: Completion) {
@@ -192,6 +233,10 @@ impl ProcessRecord {
     }
 
     fn observe_running(&mut self, now: Instant) {
+        if self.is_steam_metadata_launch() {
+            self.observe_steam_running(now);
+            return;
+        }
         let observation = self
             .child
             .as_mut()
@@ -237,6 +282,22 @@ impl ProcessRecord {
                 self.completion = Some(Completion::ExitedPending);
                 self.mark_cleanup_failed();
             }
+        }
+    }
+
+    fn observe_steam_running(&mut self, now: Instant) {
+        let Some(tracker) = &mut self.steam_tracker else {
+            self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
+            return;
+        };
+        let liveness = tracker.observe(now);
+        let finished = tracker.was_associated() && liveness == SteamGameLiveness::Unknown;
+        self.steam_game_liveness = Some(liveness);
+        if finished {
+            self.complete_or_clean(Completion::Exited {
+                exit_code: None,
+                success: true,
+            });
         }
     }
 
@@ -338,6 +399,26 @@ impl ProcessRecord {
             ProcessState::Running if !self.auto_detached => self.observe_running(now),
             ProcessState::Running => {}
             ProcessState::Stopping if self.child.is_some() => self.advance_main_stop(now),
+            ProcessState::Stopping
+                if self
+                    .steam_tracker
+                    .as_ref()
+                    .is_some_and(SteamProcessTracker::is_stopping) =>
+            {
+                if !self
+                    .steam_tracker
+                    .as_mut()
+                    .expect("stopping Steam tracker exists")
+                    .advance_stop(now)
+                {
+                    self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
+                    let completion = self
+                        .completion
+                        .take()
+                        .expect("stopping Steam process has an outcome");
+                    self.complete_or_clean(completion);
+                }
+            }
             ProcessState::Stopping => self.advance_lifecycle_cleanup(now),
             ProcessState::CleanupFailed { .. }
             | ProcessState::Exited { .. }
@@ -348,6 +429,9 @@ impl ProcessRecord {
     }
 
     fn request_termination(&mut self) -> Result<(), &'static str> {
+        if self.is_steam_metadata_launch() {
+            return self.request_steam_termination();
+        }
         match self.state {
             ProcessState::Preparing => {
                 self.completion = Some(Completion::Cancelled);
@@ -385,6 +469,64 @@ impl ProcessRecord {
             | ProcessState::Cancelled => {}
         }
         Ok(())
+    }
+
+    fn request_steam_termination(&mut self) -> Result<(), &'static str> {
+        match self.state {
+            ProcessState::Preparing => {
+                self.completion = Some(Completion::Cancelled);
+                self.lifecycle
+                    .as_mut()
+                    .expect("preparing has lifecycle")
+                    .begin_cleanup();
+                self.state = ProcessState::Stopping;
+            }
+            ProcessState::Running => {
+                let now = Instant::now();
+                let tracking = self
+                    .steam_tracker
+                    .as_mut()
+                    .is_some_and(|tracker| tracker.request_stop(now));
+                if tracking {
+                    self.completion = Some(Completion::Cancelled);
+                    self.steam_game_liveness = Some(SteamGameLiveness::Stopping);
+                    self.state = ProcessState::Stopping;
+                } else {
+                    // The Steam launcher is intentionally outside the managed
+                    // job/group. Without attributed game PIDs, release the lease
+                    // without signaling the Steam client or an unrelated process.
+                    self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
+                    self.complete_or_clean(Completion::Cancelled);
+                }
+            }
+            ProcessState::CleanupFailed { .. } if self.child.is_some() => {
+                if self.stop_deadline.is_some() {
+                    self.state = ProcessState::Stopping;
+                } else {
+                    let completion = self
+                        .completion
+                        .as_ref()
+                        .expect("failed main cleanup has an outcome")
+                        .clone();
+                    self.begin_main_stop(completion, Instant::now())?;
+                }
+            }
+            ProcessState::CleanupFailed { .. } => {
+                if let Some(lifecycle) = &mut self.lifecycle {
+                    lifecycle.retry_cleanup();
+                    self.state = ProcessState::Stopping;
+                }
+            }
+            ProcessState::Stopping
+            | ProcessState::Exited { .. }
+            | ProcessState::LaunchFailed { .. }
+            | ProcessState::Cancelled => {}
+        }
+        Ok(())
+    }
+
+    fn is_steam_metadata_launch(&self) -> bool {
+        self.spec.steam_id.is_some() || self.spec.steam_install_dir.is_some()
     }
 
     fn abort_active_lifecycle_command(&mut self) {
@@ -460,6 +602,8 @@ impl ProcessManager {
                 auto_detach,
                 wait_all,
                 exit_timeout_seconds,
+                steam_id,
+                steam_install_dir,
                 detached,
                 preparation,
             } => {
@@ -472,8 +616,10 @@ impl ProcessManager {
                     auto_detach,
                     wait_all,
                     exit_timeout_seconds,
+                    steam_id,
+                    steam_install_dir,
                     detached,
-                    preparation,
+                    preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
                 self.launch(caller, operation_id, spec)

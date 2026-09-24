@@ -131,6 +131,8 @@ pub struct Executable {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
+    pub steam_id: Option<String>,
+    pub steam_install_dir: Option<String>,
     pub auto_detach: bool,
     pub wait_all: bool,
     pub exit_timeout_seconds: u64,
@@ -152,6 +154,32 @@ fn default_playnite_exit_timeout_seconds() -> u64 {
 }
 
 impl LaunchTarget {
+    pub fn from_catalog_entry(entry: &Value) -> Result<Self, &'static str> {
+        let launch = entry.get("launch").ok_or("invalid_catalog_response")?;
+        let steam_id = optional_catalog_string(entry, "steam_id")?;
+        let steam_install_dir = optional_catalog_string(entry, "steam_install_dir")?;
+        if steam_id
+            .as_deref()
+            .is_some_and(|value| !valid_steam_id(value))
+            || steam_install_dir
+                .as_deref()
+                .is_some_and(|value| !valid_steam_install_directory(value))
+        {
+            return Err("invalid_catalog_response");
+        }
+        match Self::from_catalog(launch)? {
+            Self::Executable(mut executable) => {
+                executable.steam_id = steam_id;
+                executable.steam_install_dir = steam_install_dir;
+                Ok(Self::Executable(executable))
+            }
+            Self::Playnite { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
+                Err("invalid_catalog_response")
+            }
+            playnite => Ok(playnite),
+        }
+    }
+
     pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
         let launch: CatalogLaunch =
             serde_json::from_value(value.clone()).map_err(|_| "invalid_catalog_response")?;
@@ -176,6 +204,46 @@ impl LaunchTarget {
             CatalogLaunch::Application { .. } => Err("unsupported_launch_kind"),
         }
     }
+}
+
+fn optional_catalog_string(entry: &Value, key: &str) -> Result<Option<String>, &'static str> {
+    match entry.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err("invalid_catalog_response"),
+    }
+}
+
+fn valid_steam_id(value: &str) -> bool {
+    value
+        .parse::<u32>()
+        .is_ok_and(|id| id != 0 && id.to_string() == value)
+}
+
+fn valid_steam_install_directory(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 1_024
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value
+            .split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    {
+        return false;
+    }
+    let components = value
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let drive_rooted = value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'/' | b'\\');
+    let unc_rooted = value.starts_with("\\\\") || value.starts_with("//");
+    let posix_rooted = value.starts_with('/') && !unc_rooted;
+    (drive_rooted && components.len() > 1)
+        || (unc_rooted && components.len() >= 3)
+        || (posix_rooted && !components.is_empty())
 }
 
 fn valid_guid(value: &str) -> bool {
@@ -236,6 +304,8 @@ impl Executable {
                     program,
                     arguments,
                     working_directory: resolved_working_directory,
+                    steam_id: None,
+                    steam_install_dir: None,
                     auto_detach,
                     wait_all,
                     exit_timeout_seconds,
@@ -569,6 +639,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn steam_runtime_metadata_is_read_from_catalog_entry_and_strictly_validated() {
+        let entry = json!({
+            "steam_id":"42",
+            "steam_install_dir":"/games/space game",
+            "launch":catalog_launch(json!([])),
+        });
+        let LaunchTarget::Executable(executable) =
+            LaunchTarget::from_catalog_entry(&entry).unwrap()
+        else {
+            panic!("expected executable target");
+        };
+        assert_eq!(executable.steam_id.as_deref(), Some("42"));
+        assert_eq!(
+            executable.steam_install_dir.as_deref(),
+            Some("/games/space game")
+        );
+
+        for steam_id in ["0", "01", "4294967296"] {
+            let invalid = json!({
+                "steam_id":steam_id,
+                "launch":catalog_launch(json!([])),
+            });
+            assert_eq!(
+                LaunchTarget::from_catalog_entry(&invalid).unwrap_err(),
+                "invalid_catalog_response"
+            );
+        }
+        for install_dir in ["\\\\server\\share", "\\foo", "/", "/games/../other"] {
+            let invalid = json!({
+                "steam_install_dir":install_dir,
+                "launch":catalog_launch(json!([])),
+            });
+            assert_eq!(
+                LaunchTarget::from_catalog_entry(&invalid).unwrap_err(),
+                "invalid_catalog_response"
+            );
+        }
+
+        let playnite = json!({
+            "steam_id":"42",
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+        });
+        assert_eq!(
+            LaunchTarget::from_catalog_entry(&playnite).unwrap_err(),
+            "invalid_catalog_response"
+        );
     }
 
     #[test]

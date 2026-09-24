@@ -33,7 +33,7 @@ fn controlled_child() {
             }
         }
         "exit-failure" => std::process::exit(7),
-        "detached-marker" => {
+        "detached-marker" | "steam-marker" => {
             std::thread::sleep(Duration::from_millis(100));
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
             std::fs::write(marker, b"detached").unwrap();
@@ -53,6 +53,94 @@ fn controlled_child() {
         }
         _ => {}
     }
+}
+
+#[test]
+fn steam_launch_without_an_install_directory_is_unknown_and_never_kills_the_launcher() {
+    let marker = std::env::temp_dir().join(format!(
+        "amaterasu-steam-detached-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut request = launch("steam-untracked", "steam-marker");
+    request["steam_id"] = json!("42");
+    request["steam_install_dir"] = json!(
+        std::env::temp_dir()
+            .join("missing-amaterasu-steam-game")
+            .to_string_lossy()
+    );
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", request);
+    assert_eq!(launched["ok"], true, "{launched}");
+    let process_id = launched["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(launched["process"]["steam_game_liveness"], "unknown");
+
+    let stopped = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["process"]["state"], "cancelled");
+
+    for _ in 0..30 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(marker.exists(), "Steam launcher child was signaled on stop");
+    let _ = std::fs::remove_file(marker);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn steam_install_tree_association_tracks_and_stops_only_the_new_game_process() {
+    let install_directory = std::env::temp_dir().join(format!(
+        "amaterasu-steam-game-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&install_directory).unwrap();
+    let mut request = launch("steam-tracked", "sleep");
+    request["steam_id"] = json!("42");
+    request["steam_install_dir"] = json!(install_directory);
+    request["cwd"] = json!(install_directory);
+
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", request);
+    assert_eq!(launched["ok"], true, "{launched}");
+    let process_id = launched["process"]["process_id"].as_u64().unwrap();
+
+    let associated = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+    assert_eq!(
+        associated["process"]["steam_game_liveness"], "associated",
+        "{associated}"
+    );
+
+    let stopping = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(stopping["process"]["state"], "stopping", "{stopping}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stopped = stopping;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        stopped = manager.handle("alice", json!({"action":"status","process_id":process_id}));
+        if stopped["process"]["state"] == "cancelled" {
+            break;
+        }
+    }
+    assert_eq!(stopped["process"]["state"], "cancelled", "{stopped}");
+    let _ = std::fs::remove_dir(install_directory);
 }
 
 fn trace_child() {

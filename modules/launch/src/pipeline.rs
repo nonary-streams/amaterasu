@@ -374,7 +374,7 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
-                match LaunchTarget::from_catalog(&payload["entry"]["launch"]) {
+                match LaunchTarget::from_catalog_entry(&payload["entry"]) {
                     Ok(target) => record.target = Some(target),
                     Err(code) => return self.dependency_failed(job, code, send),
                 }

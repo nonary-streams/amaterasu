@@ -92,7 +92,7 @@ impl ContainedChild {
     pub fn group_running(&self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
-            return linux_group_has_live_members(self.id());
+            linux_group_has_live_members(self.id())
         }
         #[cfg(target_os = "macos")]
         {

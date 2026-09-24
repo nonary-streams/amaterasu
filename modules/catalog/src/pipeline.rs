@@ -1085,6 +1085,11 @@ impl Pipeline {
                 }
                 None => false,
             };
+            let has_steam_metadata = entry.steam_id.is_some() || entry.steam_install_dir.is_some();
+            let valid_steam_metadata_identity = entry.steam_id.as_ref().is_some_and(|app_id| {
+                session.caller == STEAM_IMPORTER && source_id == format!("steam:{app_id}")
+            });
+            let invalid_steam_metadata = has_steam_metadata && !valid_steam_metadata_identity;
             if invalid_artwork_owner {
                 return complete(
                     send,
@@ -1092,6 +1097,16 @@ impl Pipeline {
                     error(
                         "provider_artwork_required",
                         "Steam artwork requires the authenticated Steam importer and matching app ID",
+                    ),
+                );
+            }
+            if invalid_steam_metadata {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "provider_identity_required",
+                        "Steam metadata requires the authenticated Steam importer and matching source ID",
                     ),
                 );
             }

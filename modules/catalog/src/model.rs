@@ -17,6 +17,10 @@ pub struct Entry {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<ArtworkReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steam_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steam_install_dir: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
     pub launch: Launch,
@@ -171,6 +175,16 @@ impl Entry {
         if let Some(artwork) = &self.artwork {
             artwork.validate()?;
         }
+        if self
+            .steam_id
+            .as_deref()
+            .is_some_and(|id| !valid_steam_id(id))
+        {
+            return Err("steam_id must be canonical nonzero u32 decimal");
+        }
+        if let Some(install_directory) = &self.steam_install_dir {
+            validate_steam_install_directory(install_directory)?;
+        }
         self.config_overrides.validate()?;
         if !bounded_text(&self.name, 160) || self.name.trim().is_empty() {
             return Err("name must contain 1..160 bytes of printable text");
@@ -234,6 +248,45 @@ impl Entry {
         }
         Ok(())
     }
+}
+
+pub fn valid_steam_id(value: &str) -> bool {
+    let Ok(app_id) = value.parse::<u32>() else {
+        return false;
+    };
+    app_id != 0 && app_id.to_string() == value
+}
+
+fn validate_steam_install_directory(value: &str) -> Result<(), &'static str> {
+    if value.trim() != value || value.is_empty() || value.len() > 1_024 {
+        return Err("steam_install_dir must be 1..1024 bytes without surrounding whitespace");
+    }
+    if value.chars().any(char::is_control)
+        || value
+            .split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    {
+        return Err("steam_install_dir must be absolute and contain no dot segments or controls");
+    }
+
+    let components = value
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let drive_rooted = value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'/' | b'\\');
+    let unc_rooted = value.starts_with("\\\\") || value.starts_with("//");
+    let posix_rooted = value.starts_with('/') && !unc_rooted;
+    if (drive_rooted && components.len() <= 1)
+        || (unc_rooted && components.len() < 3)
+        || (posix_rooted && components.is_empty())
+        || !(drive_rooted || unc_rooted || posix_rooted)
+    {
+        return Err("steam_install_dir must name a directory below its filesystem root");
+    }
+    Ok(())
 }
 
 fn validate_preparation(steps: &[PreparationStep]) -> Result<(), &'static str> {
@@ -503,5 +556,51 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn steam_launch_metadata_is_sparse_canonical_and_path_bounded() {
+        let legacy: Entry = serde_json::from_value(json!({
+            "name":"Legacy entry",
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        legacy.validate().unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert!(legacy.get("steam_id").is_none());
+        assert!(legacy.get("steam_install_dir").is_none());
+
+        assert!(valid_steam_id("4294967295"));
+        for invalid in ["0", "01", "+42", "steam:42", "4294967296"] {
+            assert!(!valid_steam_id(invalid), "accepted Steam ID {invalid}");
+        }
+
+        for directory in [
+            "/games/space game",
+            "C:\\SteamLibrary\\steamapps\\common\\Game",
+            "//server/share/games/Game",
+            "\\\\server\\share\\games\\Game",
+        ] {
+            validate_steam_install_directory(directory).unwrap();
+        }
+        for directory in [
+            "",
+            "relative/game",
+            "/",
+            "C:\\",
+            "\\\\server\\share",
+            "//server/share",
+            "\\foo",
+            "/games/./example",
+            "/games/../example",
+            " /games/example",
+            "/games/example ",
+            &format!("/{}", "x".repeat(1_024)),
+        ] {
+            assert!(
+                validate_steam_install_directory(directory).is_err(),
+                "accepted Steam install directory {directory:?}"
+            );
+        }
     }
 }

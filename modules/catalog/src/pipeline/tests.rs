@@ -183,6 +183,15 @@ fn steam_artwork_entry(name: &str, revision: Option<&str>) -> Value {
     result
 }
 
+fn steam_launch_entry(name: &str, app_id: &str, install_dir: Option<&str>) -> Value {
+    let mut result = entry(name);
+    result["steam_id"] = json!(app_id);
+    if let Some(install_dir) = install_dir {
+        result["steam_install_dir"] = json!(install_dir);
+    }
+    result
+}
+
 fn run_steam_artwork_snapshot(
     backend: &mut Backend,
     pipeline: &mut Pipeline,
@@ -2871,6 +2880,117 @@ fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id
     );
     assert_eq!(wrong_source["error"]["code"], "provider_artwork_required");
     assert!(!backend.entries.contains_key("app-0000000000000001"));
+}
+
+#[test]
+fn steam_runtime_metadata_requires_matching_importer_identity_but_manual_crud_can_set_it() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([
+            ("amaterasu.steam".into(), "amaterasu.management".into()),
+            ("other.provider".into(), "amaterasu.management".into()),
+        ]),
+    );
+
+    let other_begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("other-steam-metadata", 1),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let forged = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "other-steam-metadata",
+            other_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![(
+                "other:42",
+                steam_launch_entry("Forged", "42", Some("/games/x")),
+            )],
+        ),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(forged["error"]["code"], "provider_identity_required");
+
+    let steam_begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("mismatched-steam-metadata", 2),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let mismatched = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "mismatched-steam-metadata",
+            steam_begin["generation"].as_u64().unwrap(),
+            2,
+            0,
+            0,
+            vec![("steam:43", steam_launch_entry("Mismatched", "42", None))],
+        ),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(mismatched["error"]["code"], "provider_identity_required");
+
+    let manual = backend.run_for(
+        &mut Pipeline::default(),
+        json!({
+            "action":"create",
+            "expected_revision":0,
+            "entry":{
+                "name":"Manual Steam entry",
+                "steam_id":"42",
+                "steam_install_dir":"/games/space game",
+                "launch":{"kind":"application","path":"/Applications/Game.app"}
+            }
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+    assert_eq!(
+        backend.entries[manual["id"].as_str().unwrap()]["steam_id"],
+        "42"
+    );
+    assert_eq!(
+        backend.entries[manual["id"].as_str().unwrap()]["steam_install_dir"],
+        "/games/space game"
+    );
+
+    let updated = backend.run_for(
+        &mut Pipeline::default(),
+        json!({
+            "action":"update",
+            "id":manual["id"],
+            "expected_revision":manual["revision"],
+            "entry":{
+                "name":"Updated Steam entry",
+                "steam_id":"42",
+                "steam_install_dir":"/games/renamed",
+                "launch":{"kind":"application","path":"/Applications/Game.app"}
+            }
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(updated["ok"], true, "{updated}");
+    assert_eq!(
+        backend.entries[manual["id"].as_str().unwrap()]["steam_install_dir"],
+        "/games/renamed"
+    );
 }
 
 #[test]

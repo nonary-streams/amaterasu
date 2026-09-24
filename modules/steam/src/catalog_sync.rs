@@ -538,6 +538,9 @@ fn catalog_records(
     }
     let mut records = Vec::new();
     for game in selected {
+        if game.app_id == 0 {
+            return Err("Steam discovery returned a zero app ID".into());
+        }
         let stable_id = format!("steam:{}", game.app_id);
         if game.stable_id != stable_id {
             return Err("Steam discovery returned a noncanonical source ID".into());
@@ -557,6 +560,7 @@ fn catalog_records(
                 "name":game.name,
                 "description":"",
                 "tags":["steam"],
+                "steam_id":game.app_id.to_string(),
                 "launch":{
                     "kind":"executable",
                     "program":program,
@@ -570,6 +574,15 @@ fn catalog_records(
                 }
             }
         });
+        if !game.install_directory.is_empty() {
+            if !valid_install_directory(&game.install_directory) {
+                return Err(format!(
+                    "Steam game {} has an invalid installation directory",
+                    game.app_id
+                ));
+            }
+            record["entry"]["steam_install_dir"] = json!(game.install_directory);
+        }
         if let Some(revision) = game.artwork_revision.as_deref() {
             let parsed_revision = revision.parse::<u64>().ok();
             if parsed_revision.is_none_or(|number| number.to_string() != revision) {
@@ -599,6 +612,31 @@ fn catalog_records(
         records.push(record);
     }
     Ok(records)
+}
+
+fn valid_install_directory(value: &str) -> bool {
+    if value.len() > 1_024
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value
+            .split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+    {
+        return false;
+    }
+    let components = value
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let drive_rooted = value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'/' | b'\\');
+    let unc_rooted = value.starts_with("\\\\") || value.starts_with("//");
+    let posix_rooted = value.starts_with('/') && !unc_rooted;
+    (drive_rooted && components.len() > 1)
+        || (unc_rooted && components.len() >= 3)
+        || (posix_rooted && !components.is_empty())
 }
 
 fn is_importable(game: &Game, include_tools: bool) -> bool {
@@ -774,6 +812,11 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["source_id"], "steam:42");
+        assert_eq!(records[0]["entry"]["steam_id"], "42");
+        assert_eq!(
+            records[0]["entry"]["steam_install_dir"],
+            "/Steam/steamapps/common/Game"
+        );
         assert_eq!(
             records[0]["entry"]["artwork"],
             json!({"provider":"steam","app_id":42,"revision":"123456"})
@@ -789,6 +832,28 @@ mod tests {
         invalid.artwork_revision = Some("revision".into());
         let invalid_games = [(42, invalid)].into_iter().collect();
         assert!(catalog_records(&invalid_games, &settings, &executable, 2_000_000_000).is_err());
+
+        let mut missing_install_dir = game(43, "No install directory", true);
+        missing_install_dir.install_directory.clear();
+        let records = catalog_records(
+            &[(43, missing_install_dir)].into_iter().collect(),
+            &settings,
+            &executable,
+            2_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(records[0]["entry"]["steam_id"], "43");
+        assert!(records[0]["entry"].get("steam_install_dir").is_none());
+
+        for invalid_path in ["/", "\\foo", "/games/../outside"] {
+            let mut invalid_game = game(44, "Invalid install directory", true);
+            invalid_game.install_directory = invalid_path.into();
+            let invalid_games = [(44, invalid_game)].into_iter().collect();
+            assert!(
+                catalog_records(&invalid_games, &settings, &executable, 2_000_000_000).is_err(),
+                "accepted install directory {invalid_path:?}"
+            );
+        }
     }
 
     #[test]
