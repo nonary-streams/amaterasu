@@ -83,6 +83,18 @@ test("audio sink overrides distinguish inheritance from explicit automatic", () 
   assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
 });
 
+test("Back button timeout overrides preserve inheritance and signed i32 values", () => {
+  const parse = model.parseBackButtonTimeoutOverride;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  "), null);
+  assert.equal(parse("-1"), -1);
+  assert.equal(parse("0"), 0);
+  assert.equal(parse("-2147483648"), -2147483648);
+  assert.equal(parse("2147483647"), 2147483647);
+  for (const value of ["-2147483649", "2147483648", "1.5", "1e2", "+1", "abc"])
+    assert.throws(() => parse(value));
+});
+
 test("application editor saves sparse FEC and executable lifecycle fields", () => {
   const form = new FormData();
   form.set("name", "Policy app");
@@ -94,13 +106,14 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
   form.set("exit_timeout_seconds", "0");
   form.set("fec_percentage", "37");
   form.set("stream_audio", "false");
+  form.set("back_button_timeout", "-1");
   form.set("detached", "first --ordered\n\nsecond");
   form.set(
     "preparation",
     JSON.stringify([{ run: { executable: "C:\\Tools\\prepare.exe" } }]),
   );
   const entry = ordinary(model.entryFromForm(form));
-  assert.deepEqual(entry.config_overrides, { fec_percentage: 37, stream_audio: false });
+  assert.deepEqual(entry.config_overrides, { fec_percentage: 37, stream_audio: false, back_button_timeout: -1 });
   assert.deepEqual(entry.launch, {
     kind: "executable",
     program: "C:\\Games\\policy.exe",
@@ -121,18 +134,28 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     stream_audio: null,
     audio_sink: null,
     audio_sink_capture_only: null,
+    back_button_timeout: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("37", "false")), {
     fec_percentage: 37,
     stream_audio: false,
     audio_sink: null,
     audio_sink_capture_only: null,
+    back_button_timeout: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("", "", "inherit", "", "false")), {
     fec_percentage: null,
     stream_audio: null,
     audio_sink: null,
     audio_sink_capture_only: false,
+    back_button_timeout: null,
+  });
+  assert.deepEqual(ordinary(model.providerConfigOverrides("", "", "inherit", "", "", "-1")), {
+    fec_percentage: null,
+    stream_audio: null,
+    audio_sink: null,
+    audio_sink_capture_only: null,
+    back_button_timeout: -1,
   });
   assert.equal(model.parseAudioSinkCaptureOnlyOverride(""), null);
   assert.equal(model.parseAudioSinkCaptureOnlyOverride("true"), true);

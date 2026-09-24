@@ -23,17 +23,30 @@ namespace Amaterasu {
     return percentage;
   }
 
-  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = ""): {
+  export function parseBackButtonTimeoutOverride(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^-?[0-9]+$/.test(trimmed))
+      throw new Error("Back button timeout must be a whole signed 32-bit number, or blank to inherit.");
+    const timeout = Number(trimmed);
+    if (!Number.isSafeInteger(timeout) || timeout < -0x8000_0000 || timeout > 0x7fff_ffff)
+      throw new Error("Back button timeout must be a whole signed 32-bit number, or blank to inherit.");
+    return timeout;
+  }
+
+  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = ""): {
     fec_percentage: number | null;
     stream_audio: boolean | null;
     audio_sink: string | null;
     audio_sink_capture_only: boolean | null;
+    back_button_timeout: number | null;
   } {
     return {
       fec_percentage: parseFecOverride(value),
       stream_audio: parseStreamAudioOverride(streamAudioValue),
       audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
       audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
+      back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
     };
   }
 
@@ -156,16 +169,18 @@ namespace Amaterasu {
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
     const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
     const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
+    const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null
+      fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
             ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
             ...(audioSink === null ? {} : { audio_sink: audioSink }),
             ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
+            ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

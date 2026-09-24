@@ -54,6 +54,7 @@ namespace Amaterasu {
       stream_audio?: boolean;
       audio_sink?: string;
       audio_sink_capture_only?: boolean;
+      back_button_timeout?: number;
     };
   }
   export interface CatalogRow {
@@ -218,6 +219,7 @@ namespace Amaterasu {
       stream_audio?: boolean;
       audio_sink?: string;
       audio_sink_capture_only?: boolean;
+      back_button_timeout?: number;
     };
   }
   export interface PairingClients {

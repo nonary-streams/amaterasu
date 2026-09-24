@@ -316,6 +316,16 @@ namespace Amaterasu {
         "audio_sink_capture_only",
         row.entry.config_overrides?.audio_sink_capture_only,
       );
+      const backButtonTimeout = input(
+        "back_button_timeout",
+        row.entry.config_overrides?.back_button_timeout?.toString() ?? "",
+        "number",
+      );
+      backButtonTimeout.min = String(-0x8000_0000);
+      backButtonTimeout.max = String(0x7fff_ffff);
+      backButtonTimeout.step = "1";
+      backButtonTimeout.placeholder = "Inherit";
+      backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
       const form = el(
         "form",
         "editor-form",
@@ -327,6 +337,7 @@ namespace Amaterasu {
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
         field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
+        field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -337,12 +348,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; audio_sink_capture_only?: boolean };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -513,6 +524,15 @@ namespace Amaterasu {
       "audio_sink_capture_only",
       entry?.config_overrides?.audio_sink_capture_only,
     );
+    const backButtonTimeout = input(
+      "back_button_timeout",
+      entry?.config_overrides?.back_button_timeout?.toString() ?? "",
+      "number",
+    );
+    backButtonTimeout.min = String(-0x8000_0000);
+    backButtonTimeout.max = String(0x7fff_ffff);
+    backButtonTimeout.step = "1";
+    backButtonTimeout.placeholder = "Inherit";
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -573,6 +593,7 @@ namespace Amaterasu {
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       audioSink.controls,
       field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
+      field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
       steamIdField,
       steamInstallDirField,
       fullscreen,

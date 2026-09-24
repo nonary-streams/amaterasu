@@ -22,12 +22,25 @@ var Amaterasu;
         return percentage;
     }
     Amaterasu.parseFecOverride = parseFecOverride;
-    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "") {
+    function parseBackButtonTimeoutOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^-?[0-9]+$/.test(trimmed))
+            throw new Error("Back button timeout must be a whole signed 32-bit number, or blank to inherit.");
+        const timeout = Number(trimmed);
+        if (!Number.isSafeInteger(timeout) || timeout < -0x8000_0000 || timeout > 0x7fff_ffff)
+            throw new Error("Back button timeout must be a whole signed 32-bit number, or blank to inherit.");
+        return timeout;
+    }
+    Amaterasu.parseBackButtonTimeoutOverride = parseBackButtonTimeoutOverride;
+    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "") {
         return {
             fec_percentage: parseFecOverride(value),
             stream_audio: parseStreamAudioOverride(streamAudioValue),
             audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
             audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
+            back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
         };
     }
     Amaterasu.providerConfigOverrides = providerConfigOverrides;
@@ -152,15 +165,17 @@ var Amaterasu;
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
         const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
         const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
+        const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
         const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
-        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null
+        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
             ? undefined
             : {
                 ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
                 ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
                 ...(audioSink === null ? {} : { audio_sink: audioSink }),
                 ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
+                ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
@@ -817,7 +832,13 @@ var Amaterasu;
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
             const captureOnly = audioOverrideSelect("audio_sink_capture_only", row.entry.config_overrides?.audio_sink_capture_only);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."));
+            const backButtonTimeout = Amaterasu.input("back_button_timeout", row.entry.config_overrides?.back_button_timeout?.toString() ?? "", "number");
+            backButtonTimeout.min = String(-0x8000_0000);
+            backButtonTimeout.max = String(0x7fff_ffff);
+            backButtonTimeout.step = "1";
+            backButtonTimeout.placeholder = "Inherit";
+            backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -828,7 +849,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value);
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -948,6 +969,11 @@ var Amaterasu;
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
         const captureOnly = audioOverrideSelect("audio_sink_capture_only", entry?.config_overrides?.audio_sink_capture_only);
+        const backButtonTimeout = Amaterasu.input("back_button_timeout", entry?.config_overrides?.back_button_timeout?.toString() ?? "", "number");
+        backButtonTimeout.min = String(-0x8000_0000);
+        backButtonTimeout.max = String(0x7fff_ffff);
+        backButtonTimeout.step = "1";
+        backButtonTimeout.placeholder = "Inherit";
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -977,7 +1003,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -1870,6 +1896,12 @@ var Amaterasu;
                     fec.step = "1";
                     fec.placeholder = "Inherit";
                     fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+                    const backButtonTimeout = Amaterasu.input(`back_button_timeout_${client.certificate_id}`, client.config_overrides?.back_button_timeout?.toString() ?? "", "number");
+                    backButtonTimeout.min = String(-0x8000_0000);
+                    backButtonTimeout.max = String(0x7fff_ffff);
+                    backButtonTimeout.step = "1";
+                    backButtonTimeout.placeholder = "Inherit";
+                    backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${client.name}`);
                     const streamAudio = Amaterasu.el("select");
                     streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
                     const audioChoices = [
@@ -1927,6 +1959,7 @@ var Amaterasu;
                                 expected_revision: settings.revision,
                                 config_overrides: {
                                     ...parseClientFecOverride(fec.value),
+                                    back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
                                     stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
                                     audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                                     audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
@@ -1946,10 +1979,10 @@ var Amaterasu;
                     }), "primary");
                     save.disabled = !context.api.allows("pairing.admin");
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), captureOnly, Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), captureOnly, Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
                 if (context.content.isConnected)

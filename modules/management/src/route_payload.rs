@@ -707,6 +707,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "stream_audio",
             "audio_sink",
             "audio_sink_capture_only",
+            "back_button_timeout",
         ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
@@ -725,6 +726,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     }
     optional_audio_sink(overrides)?;
     optional_audio_sink_capture_only(overrides)?;
+    optional_back_button_timeout(overrides)?;
     Ok(())
 }
 
@@ -749,6 +751,18 @@ fn optional_audio_sink_capture_only(overrides: &Object) -> Result<(), &'static s
         .get("audio_sink_capture_only")
         .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
     {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_back_button_timeout(overrides: &Object) -> Result<(), &'static str> {
+    if overrides.get("back_button_timeout").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_i64()
+                .is_some_and(|timeout| i32::try_from(timeout).is_ok())
+    }) {
         return Err(INVALID);
     }
     Ok(())
@@ -1459,6 +1473,67 @@ mod pairing_override_tests {
             assert!(catalog_config_overrides(&overrides).is_err());
         }
     }
+
+    #[test]
+    fn back_button_timeout_override_accepts_sparse_signed_i32_values() {
+        let provider = Route {
+            service: "amaterasu.catalog/1",
+            action: "update_provider_overrides",
+            scope: Some("catalog.write"),
+            requires_empty_body: false,
+        };
+        let pairing = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        for value in [
+            Value::Null,
+            serde_json::json!(i32::MIN),
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(i32::MAX),
+        ] {
+            let overrides = serde_json::json!({"back_button_timeout": value});
+            let provider_payload = serde_json::json!({
+                "id":"app-0000000000000001", "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            let pairing_payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            assert!(catalog_config_overrides(&overrides).is_ok());
+            assert!(validate(provider, provider_payload.as_object().unwrap()).is_ok());
+            assert!(validate(pairing, pairing_payload.as_object().unwrap()).is_ok());
+        }
+
+        let invalid_values = [
+            serde_json::json!(i64::from(i32::MIN) - 1),
+            serde_json::json!(i64::from(i32::MAX) + 1),
+            serde_json::json!(1.5),
+            serde_json::json!("-1"),
+            serde_json::json!(true),
+        ];
+        for value in invalid_values {
+            let overrides = serde_json::json!({"back_button_timeout": value});
+            let provider_payload = serde_json::json!({
+                "id":"app-0000000000000001", "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            let pairing_payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            assert!(catalog_config_overrides(&overrides).is_err());
+            assert!(validate(provider, provider_payload.as_object().unwrap()).is_err());
+            assert!(validate(pairing, pairing_payload.as_object().unwrap()).is_err());
+        }
+        let float_integer: Value = serde_json::from_str(r#"{"back_button_timeout":1.0}"#).unwrap();
+        assert!(catalog_config_overrides(&float_integer).is_err());
+        assert!(catalog_config_overrides(&serde_json::json!({})).is_ok());
+    }
 }
 
 fn safe_bind_address(value: &str) -> Option<IpAddr> {
@@ -1541,6 +1616,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "stream_audio",
                     "audio_sink",
                     "audio_sink_capture_only",
+                    "back_button_timeout",
                 ],
             )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
@@ -1559,6 +1635,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             optional_audio_sink(config_overrides)?;
             optional_audio_sink_capture_only(config_overrides)?;
+            optional_back_button_timeout(config_overrides)?;
             Ok(())
         }
         _ => Err(INVALID),

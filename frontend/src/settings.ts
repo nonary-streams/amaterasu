@@ -1269,6 +1269,16 @@ namespace Amaterasu {
           fec.step = "1";
           fec.placeholder = "Inherit";
           fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+          const backButtonTimeout = input(
+            `back_button_timeout_${client.certificate_id}`,
+            client.config_overrides?.back_button_timeout?.toString() ?? "",
+            "number",
+          );
+          backButtonTimeout.min = String(-0x8000_0000);
+          backButtonTimeout.max = String(0x7fff_ffff);
+          backButtonTimeout.step = "1";
+          backButtonTimeout.placeholder = "Inherit";
+          backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${client.name}`);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -1328,6 +1338,7 @@ namespace Amaterasu {
                   expected_revision: settings.revision,
                   config_overrides: {
                     ...parseClientFecOverride(fec.value),
+                    back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
                     stream_audio: parseStreamAudioOverride(streamAudio.value),
                     audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                     audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
@@ -1353,13 +1364,13 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, streamAudio, el("div", "", audioSinkMode, audioSinkId), captureOnly, el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), captureOnly, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
-            el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."),
+            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Each save uses the current pairing revision."),
             tableView,
             el("div", "actions", badge(`Revision ${settings.revision}`)),
           ),
