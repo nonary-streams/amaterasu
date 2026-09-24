@@ -139,9 +139,9 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
             program: program.into(),
             arguments: vec!["--literal=$HOME".into()],
             working_directory: None,
-            auto_detach: true,
-            wait_all: true,
-            exit_timeout_seconds: 10,
+            auto_detach: Some(true),
+            wait_all: Some(true),
+            exit_timeout_seconds: Some(10),
             detached: Vec::new(),
             preparation: Vec::new(),
         };
@@ -175,7 +175,7 @@ fn preparation_defaults_serialize_as_canonical_metadata() {
     game.validate().unwrap();
 
     let encoded = serde_json::to_value(&game).unwrap();
-    assert_eq!(encoded["launch"]["auto_detach"], true);
+    assert!(encoded["launch"].get("auto_detach").is_none());
     assert_eq!(
         encoded["launch"]["preparation"],
         json!([{
@@ -242,8 +242,13 @@ fn application_lifecycle_policy_defaults_aliases_and_persists() {
     .unwrap();
     defaults.validate().unwrap();
     let encoded_defaults = serde_json::to_value(defaults).unwrap();
-    assert_eq!(encoded_defaults["launch"]["wait_all"], true);
-    assert_eq!(encoded_defaults["launch"]["exit_timeout_seconds"], 10);
+    assert!(encoded_defaults["launch"].get("auto_detach").is_none());
+    assert!(encoded_defaults["launch"].get("wait_all").is_none());
+    assert!(
+        encoded_defaults["launch"]
+            .get("exit_timeout_seconds")
+            .is_none()
+    );
     assert!(encoded_defaults["launch"].get("detached").is_none());
 
     let entry: Entry = serde_json::from_value(json!({
@@ -251,6 +256,8 @@ fn application_lifecycle_policy_defaults_aliases_and_persists() {
         "launch": {
             "kind": "executable",
             "program": "/games/example/game",
+            "working-dir": "/games/example",
+            "auto-detach": true,
             "wait-all": false,
             "exit-timeout": 0,
             "detached": ["/games/example/overlay --quiet", "/games/example/metrics"]
@@ -272,6 +279,8 @@ fn application_lifecycle_policy_defaults_aliases_and_persists() {
     let persisted = serde_json::to_value(document).unwrap();
     let reloaded: Document = serde_json::from_value(persisted).unwrap();
     let reloaded = serde_json::to_value(reloaded.entries.values().next().unwrap()).unwrap();
+    assert_eq!(reloaded["launch"]["working_directory"], "/games/example");
+    assert_eq!(reloaded["launch"]["auto_detach"], true);
     assert_eq!(reloaded["launch"]["wait_all"], false);
     assert_eq!(reloaded["launch"]["exit_timeout_seconds"], 0);
     assert_eq!(
@@ -280,6 +289,8 @@ fn application_lifecycle_policy_defaults_aliases_and_persists() {
     );
     assert!(reloaded["launch"].get("wait-all").is_none());
     assert!(reloaded["launch"].get("exit-timeout").is_none());
+    assert!(reloaded["launch"].get("working-dir").is_none());
+    assert!(reloaded["launch"].get("auto-detach").is_none());
 }
 
 #[test]

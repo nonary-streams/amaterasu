@@ -32,12 +32,20 @@ pub enum Launch {
             deserialize_with = "empty_working_directory_as_none"
         )]
         working_directory: Option<String>,
-        #[serde(default = "default_auto_detach", alias = "auto-detach")]
-        auto_detach: bool,
-        #[serde(default = "default_wait_all", alias = "wait-all")]
-        wait_all: bool,
-        #[serde(default = "default_exit_timeout_seconds", alias = "exit-timeout")]
-        exit_timeout_seconds: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "auto-detach"
+        )]
+        auto_detach: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "wait-all")]
+        wait_all: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "exit-timeout"
+        )]
+        exit_timeout_seconds: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         detached: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -53,18 +61,6 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<String>::deserialize(deserializer)?.filter(|directory| !directory.is_empty()))
-}
-
-fn default_auto_detach() -> bool {
-    true
-}
-
-fn default_wait_all() -> bool {
-    true
-}
-
-fn default_exit_timeout_seconds() -> u64 {
-    10
 }
 
 const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
@@ -129,7 +125,7 @@ impl Entry {
                 if let Some(directory) = working_directory {
                     validate_path(directory)?;
                 }
-                if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                if exit_timeout_seconds.is_some_and(|seconds| seconds > MAX_EXIT_TIMEOUT_SECONDS)
                     || detached.len() > MAX_DETACHED_COMMANDS
                     || detached.iter().any(|command| {
                         command.is_empty()

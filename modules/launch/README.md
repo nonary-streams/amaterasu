@@ -35,9 +35,12 @@ paired `undo` commands. Each command uses literal argv, a cleared explicit
 environment, an optional native working directory, and a 1–30000 ms timeout
 (10000 ms by default). Command paths, arguments, and environments use the same
 native application bounds. Launch parses and validates the resolved catalog plan,
-fills protocol defaults, and forwards it without accepting request-level additions
-or overrides. The application runs preparation before the main executable and owes
-reverse-order undo for every run command it started.
+applies private process defaults only where the catalog has no per-application
+value (`auto_detach:true`, `wait_all:true`, `exit_timeout_seconds:10`), and forwards
+the resolved plan without accepting request-level additions or overrides. Explicit
+catalog values reach the application provider. The application runs preparation
+before the main executable and owes reverse-order undo for every run command it
+started.
 
 Catalog lookup uses `resolve_launch` with the original runtime parent. Catalog
 accepts this action only from configured launch principals and selects the

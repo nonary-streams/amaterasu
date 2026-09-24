@@ -6,6 +6,9 @@ use std::path::Path;
 const MAX_PREPARATION_STEPS: usize = 8;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_AUTO_DETACH: bool = true;
+const DEFAULT_WAIT_ALL: bool = true;
+const DEFAULT_EXIT_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -71,12 +74,12 @@ pub enum CatalogLaunch {
         arguments: Vec<String>,
         #[serde(default)]
         working_directory: Option<String>,
-        #[serde(default = "default_auto_detach", alias = "auto-detach")]
-        auto_detach: bool,
-        #[serde(default = "default_wait_all", alias = "wait-all")]
-        wait_all: bool,
-        #[serde(default = "default_exit_timeout_seconds", alias = "exit-timeout")]
-        exit_timeout_seconds: u64,
+        #[serde(default, alias = "auto-detach")]
+        auto_detach: Option<bool>,
+        #[serde(default, alias = "wait-all")]
+        wait_all: Option<bool>,
+        #[serde(default, alias = "exit-timeout")]
+        exit_timeout_seconds: Option<u64>,
         #[serde(default)]
         detached: Vec<String>,
         #[serde(default)]
@@ -113,18 +116,6 @@ fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
 }
 
-fn default_auto_detach() -> bool {
-    true
-}
-
-fn default_wait_all() -> bool {
-    true
-}
-
-fn default_exit_timeout_seconds() -> u64 {
-    10
-}
-
 const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_DETACHED_COMMANDS: usize = 16;
 const MAX_DETACHED_COMMAND_BYTES: usize = 2048;
@@ -155,6 +146,10 @@ impl Executable {
                 detached,
                 mut preparation,
             } => {
+                let auto_detach = auto_detach.unwrap_or(DEFAULT_AUTO_DETACH);
+                let wait_all = wait_all.unwrap_or(DEFAULT_WAIT_ALL);
+                let exit_timeout_seconds =
+                    exit_timeout_seconds.unwrap_or(DEFAULT_EXIT_TIMEOUT_SECONDS);
                 let working_directory = working_directory.filter(|directory| !directory.is_empty());
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)

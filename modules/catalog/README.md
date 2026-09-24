@@ -73,11 +73,13 @@ mutations require `expected_revision`, referring to the **whole caller catalog**
 Each successful mutation advances it once. Missing IDs return `not_found`.
 Delete returns `ok`, `revision`, `id`, `deleted:true`.
 
-Executable launch metadata defaults `auto_detach` and `wait_all` to `true`,
-`exit_timeout_seconds` to 10, and `detached` to an empty ordered list. The
-accepted aliases `auto-detach`, `wait-all`, and `exit-timeout` are serialized
-back using their canonical underscore names. `exit_timeout_seconds` is limited
-to 300; `detached` accepts up to 16 nonempty command strings of 2048 bytes each.
+Executable lifecycle options are sparse per-application values. When omitted,
+launch resolves `auto_detach` and `wait_all` to `true` and
+`exit_timeout_seconds` to 10 seconds; these defaults are not written into the
+catalog document. `detached` defaults to an empty ordered list. The accepted
+aliases `auto-detach`, `wait-all`, and `exit-timeout` are serialized using their
+canonical underscore names. `exit_timeout_seconds` is limited to 300;
+`detached` accepts up to 16 nonempty command strings of 2048 bytes each.
 Detached strings are parsed by the application module at launch time, so catalog
 validation checks their bounds and control characters while launch validation
 checks command syntax. These fields configure the application process manager;
