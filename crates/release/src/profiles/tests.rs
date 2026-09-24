@@ -95,6 +95,7 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
 fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
     let host_configuration_service = "amaterasu.host-configuration/1";
     assert_eq!(DIAGNOSTICS.calls, &[host_configuration_service]);
+    assert!(DIAGNOSTICS.dependencies.contains(&HOST_CONFIGURATION.id));
     assert!(MANAGEMENT.calls.contains(&host_configuration_service));
     assert!(MANAGEMENT.dependencies.contains(&HOST_CONFIGURATION.id));
 

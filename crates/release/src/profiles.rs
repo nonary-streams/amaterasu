@@ -134,7 +134,7 @@ const DIAGNOSTICS: ComponentDefinition = ComponentDefinition {
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    dependencies: &[RUNTIME_ID, "amaterasu.host-configuration"],
 };
 
 const STEAM: ComponentDefinition = ComponentDefinition {
