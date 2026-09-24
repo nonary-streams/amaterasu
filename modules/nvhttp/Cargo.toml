@@ -18,6 +18,7 @@ httparse.workspace = true
 pem-rfc7468 = { version = "0.7", features = ["alloc"] }
 x509-cert = "0.2.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+socket2 = "0.6.5"
 
 [lints]
 workspace = true

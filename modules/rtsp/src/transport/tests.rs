@@ -94,6 +94,53 @@ fn real_tcp_transactions_share_response_sequence_and_replay_state() {
 }
 
 #[test]
+fn dual_family_transport_accepts_v4_and_v6_on_the_same_port() {
+    let mut server = Transport::bind_all(
+        vec!["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()],
+        false,
+    )
+    .unwrap();
+    let addresses = server.local_addrs().unwrap();
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(addresses[0].port(), addresses[1].port());
+
+    for (ticket, address, peer, key) in [
+        (11, addresses[0], "127.0.0.1".parse().unwrap(), [11; 16]),
+        (12, addresses[1], "::1".parse().unwrap(), [12; 16]),
+    ] {
+        server.add_ticket(ticket, peer, &key).unwrap();
+        let envelope = RtspSealer::new(&key, Direction::ClientToHost)
+            .unwrap()
+            .seal(&request(ticket as u32))
+            .unwrap();
+        let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(&envelope).unwrap();
+        let (connection, accepted_ticket, decoded) = authenticated(&mut server);
+        assert_eq!(accepted_ticket, ticket);
+        assert_eq!(decoded.cseq, ticket as u32);
+        let response = serialize_response(200, ticket as u32, &[], b"family ok").unwrap();
+        server.reply(connection, &response).unwrap();
+        assert_eq!(
+            disconnected(&mut server),
+            ("response_complete", Some(ticket))
+        );
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        assert_eq!(
+            RtspOpener::new(&key, Direction::HostToClient)
+                .unwrap()
+                .open(&received)
+                .unwrap()
+                .plaintext,
+            response
+        );
+    }
+}
+
+#[test]
 fn same_ip_candidates_require_decryption_and_failed_trial_preserves_valid_sequence() {
     let mut server = server();
     for id in 1..=2 {

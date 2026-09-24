@@ -47,11 +47,15 @@ remains in effect. An explicit empty address keeps the legacy loopback address w
 enabled. For wildcard listeners, RTSP selects a concrete local route for each peer
 and uses it in the returned URL and that stream's UDP binds.
 
-The library currently binds one TCP family at a time. With an explicit address,
-`both` permits either address family. An empty remote-enabled `both` bind selects
-IPv6; it does not install a second IPv4 listener or guarantee platform dual-stack
-acceptance. IPv4 and IPv6 listeners therefore cannot both accept tickets at once;
-full `both` parity remains pending.
+With an explicit IP, RTSP and derived UDP binds use that one family. With an
+explicit empty address and `both`, RTSP binds separate IPv4 and IPv6 TCP sockets
+on the same port, and UDP preflight checks both family-specific video, control,
+and audio ports together. IPv6 sockets are v6-only, so IPv4 reachability does not
+depend on host dual-stack defaults. When remote access is disabled, both sockets
+are loopback-only; otherwise each family uses its wildcard. Wildcard RTSP selects
+a concrete same-family local route for each peer and uses it for that ticket's URL
+and UDP binds. Status retains the compatibility `local` field for the primary
+listener and adds `locals` containing every bound address.
 
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,
 downstream `stream_state`, and fixed failure/cleanup codes. `playing` means PLAY

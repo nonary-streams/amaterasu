@@ -100,9 +100,13 @@ listeners while preserving their configured ports. If either key is omitted, the
 legacy `http_bind` and `https_bind` addresses remain in effect. With explicit
 `bind_address:""`, remote access disabled keeps the legacy loopback addresses;
 remote access enabled binds the family wildcard. `allow_remote` remains the gate
-for non-loopback listeners. Each service currently owns one listener per protocol,
-so `both` chooses one family from the explicit address, or IPv6 for an empty
-remote-enabled bind; it does not yet create simultaneous IPv4 and IPv6 listeners.
+for non-loopback listeners. With an explicit IP, that family is used. With an
+explicit empty address and `both`, each HTTP and HTTPS protocol binds separate
+IPv4 and IPv6 sockets on the same respective port. IPv6 sockets are v6-only, so
+IPv4 reachability does not depend on the host's dual-stack default. When remote
+access is disabled, the pair is loopback-only; otherwise it uses both family
+wildcards. Status retains the legacy primary `http_address` and `https_address`
+fields and also exposes `http_addresses` and `https_addresses` for the full pair.
 
 Public streaming is a separate startup opt-in. Omitting `streaming` disables it.
 The complete settings object has no executable, arguments, environment, or catalog

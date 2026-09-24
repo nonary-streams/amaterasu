@@ -311,6 +311,8 @@ impl NvhttpModule {
                             "enabled":self.server.is_some(),
                             "http_address":self.server.as_ref().map(|server|server.http_address().to_string()),
                             "https_address":self.server.as_ref().map(|server|server.https_address().to_string()),
+                            "http_addresses":self.server.as_ref().map(|server|server.http_addresses().iter().map(ToString::to_string).collect::<Vec<_>>()),
+                            "https_addresses":self.server.as_ref().map(|server|server.https_addresses().iter().map(ToString::to_string).collect::<Vec<_>>()),
                             "tls_ready":self.server.as_ref().is_some_and(|server|server.tls_ready()),
                             "connections":self.server.as_ref().map_or(0,|server|server.connections()),
                             "tls_error":self.tls_error,

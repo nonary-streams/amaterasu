@@ -3,6 +3,7 @@ use amaterasu_gamestream::{
     sdp::{Announce, ColorMode, ControlProtocol},
 };
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 const DEFAULT_BASE_PORT: u16 = 47_989;
@@ -55,35 +56,58 @@ impl Settings {
     }
 
     pub fn resolved_bind(&self) -> Result<SocketAddr, &'static str> {
-        Ok(SocketAddr::new(self.resolved_bind_ip()?, self.bind.port()))
+        self.resolved_binds()?
+            .into_iter()
+            .next()
+            .ok_or("invalid_bind")
     }
 
-    fn resolved_bind_ip(&self) -> Result<IpAddr, &'static str> {
+    pub fn resolved_binds(&self) -> Result<Vec<SocketAddr>, &'static str> {
+        Ok(self
+            .resolved_bind_ips()?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, self.bind.port()))
+            .collect())
+    }
+
+    fn resolved_bind_ips(&self) -> Result<Vec<IpAddr>, &'static str> {
         let family = self.resolved_address_family();
-        let ip = match self.bind_address.as_deref() {
-            None => self.bind.ip(),
-            Some(configured) if configured.trim().is_empty() => {
-                if self.allow_remote {
-                    family.wildcard()
-                } else {
-                    self.bind.ip()
-                }
-            }
-            Some(configured) => configured
-                .trim()
-                .parse::<IpAddr>()
-                .map_err(|_| "invalid_bind")?,
+        let addresses = match self.bind_address.as_deref() {
+            None => vec![self.bind.ip()],
+            Some(configured) if configured.trim().is_empty() => match (family, self.allow_remote) {
+                (AddressFamily::Ipv4, true) => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
+                (AddressFamily::Ipv4, false) => vec![self.bind.ip()],
+                (AddressFamily::Both, true) => vec![
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                ],
+                (AddressFamily::Both, false) => vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+            },
+            Some(configured) => vec![
+                configured
+                    .trim()
+                    .parse::<IpAddr>()
+                    .map_err(|_| "invalid_bind")?,
+            ],
         };
-        if !family.supports(ip) {
-            return Err("address_family_mismatch");
-        }
-        if invalid_configured_bind(ip)
-            || (self.bind_address.is_none() && invalid_bind_address(ip))
-            || (!self.allow_remote && !ip.is_loopback())
-        {
-            return Err("invalid_bind");
-        }
-        Ok(ip)
+        addresses
+            .into_iter()
+            .map(|ip| {
+                if !family.supports(ip) {
+                    return Err("address_family_mismatch");
+                }
+                if invalid_configured_bind(ip)
+                    || (self.bind_address.is_none() && invalid_bind_address(ip))
+                    || (!self.allow_remote && !ip.is_loopback())
+                {
+                    return Err("invalid_bind");
+                }
+                Ok(ip)
+            })
+            .collect()
     }
 
     fn resolved_address_family(&self) -> AddressFamily {
@@ -111,16 +135,31 @@ impl Settings {
         }
     }
 
+    #[cfg(test)]
     pub fn rtsp_bind_for_base(&self, base_port: u16) -> Result<SocketAddr, &'static str> {
-        validate_base_port(base_port)?;
-        Ok(SocketAddr::new(
-            self.resolved_bind_ip()?,
-            base_port + RTSP_SETUP_OFFSET,
-        ))
+        self.rtsp_binds_for_base(base_port)?
+            .into_iter()
+            .next()
+            .ok_or("invalid_bind")
     }
 
+    pub fn rtsp_binds_for_base(&self, base_port: u16) -> Result<Vec<SocketAddr>, &'static str> {
+        validate_base_port(base_port)?;
+        Ok(self
+            .resolved_bind_ips()?
+            .into_iter()
+            .map(|address| SocketAddr::new(address, base_port + RTSP_SETUP_OFFSET))
+            .collect())
+    }
+
+    #[cfg(test)]
     pub fn media_binds(&self, base_port: u16) -> Result<MediaBinds, &'static str> {
-        self.media_binds_on(base_port, self.resolved_bind_ip()?)
+        let address = self
+            .resolved_bind_ips()?
+            .into_iter()
+            .next()
+            .ok_or("invalid_bind")?;
+        self.media_binds_on(base_port, address)
     }
 
     pub fn media_binds_on(
@@ -129,7 +168,11 @@ impl Settings {
         local_address: IpAddr,
     ) -> Result<MediaBinds, &'static str> {
         validate_base_port(base_port)?;
-        let configured_address = self.resolved_bind_ip()?;
+        let configured_addresses = self.resolved_bind_ips()?;
+        let configured_address = configured_addresses
+            .into_iter()
+            .find(|address| address.is_ipv4() == local_address.is_ipv4())
+            .ok_or("address_family_mismatch")?;
         let address = if configured_address.is_unspecified() {
             local_address
         } else {
@@ -146,28 +189,39 @@ impl Settings {
     }
 
     pub fn probe_media_binds(&self, base_port: u16) -> Result<(), &'static str> {
-        let binds = self.media_binds(base_port)?;
+        let binds = self.media_binds_by_family(base_port)?;
         // Hold every UDP socket until the complete set has been checked. The
         // stream-session service later binds its per-session sockets from the
         // same addresses; this preflight cannot reserve sockets across services.
-        let mut sockets = Vec::with_capacity(3);
-        for bind in [binds.video, binds.control, binds.audio] {
-            sockets.push(UdpSocket::bind(bind).map_err(|_| "udp_bind_failed")?);
+        let mut sockets = Vec::with_capacity(binds.len() * 3);
+        for bind in binds
+            .iter()
+            .flat_map(|family| [family.video, family.control, family.audio])
+        {
+            let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))
+                .map_err(|_| "udp_bind_failed")?;
+            if bind.is_ipv6() {
+                socket.set_only_v6(true).map_err(|_| "udp_bind_failed")?;
+            }
+            socket
+                .bind(&SockAddr::from(bind))
+                .map_err(|_| "udp_bind_failed")?;
+            sockets.push(UdpSocket::from(socket));
         }
         Ok(())
+    }
+
+    pub fn media_binds_by_family(&self, base_port: u16) -> Result<Vec<MediaBinds>, &'static str> {
+        self.resolved_bind_ips()?
+            .into_iter()
+            .map(|address| self.media_binds_on(base_port, address))
+            .collect()
     }
 }
 
 impl AddressFamily {
     fn supports(self, address: IpAddr) -> bool {
         matches!(self, Self::Both) || address.is_ipv4()
-    }
-
-    fn wildcard(self) -> IpAddr {
-        match self {
-            Self::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            Self::Both => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        }
     }
 }
 
@@ -648,12 +702,53 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            settings.resolved_bind().unwrap(),
-            "[::]:48010".parse().unwrap()
+            settings.resolved_binds().unwrap(),
+            vec![
+                "0.0.0.0:48010".parse().unwrap(),
+                "[::]:48010".parse().unwrap()
+            ]
         );
         assert_eq!(
-            settings.media_binds(DEFAULT_BASE_PORT).unwrap().video,
-            "[::]:47998".parse().unwrap()
+            settings.media_binds_by_family(DEFAULT_BASE_PORT).unwrap(),
+            vec![
+                MediaBinds {
+                    video: "0.0.0.0:47998".parse().unwrap(),
+                    control: "0.0.0.0:47999".parse().unwrap(),
+                    audio: "0.0.0.0:48000".parse().unwrap(),
+                },
+                MediaBinds {
+                    video: "[::]:47998".parse().unwrap(),
+                    control: "[::]:47999".parse().unwrap(),
+                    audio: "[::]:48000".parse().unwrap(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_family_udp_preflight_checks_the_ipv6_addresses_too() {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "allow_remote": true,
+            "address_family": "both",
+            "bind_address": "",
+            "bind": "127.0.0.1:48010"
+        }))
+        .unwrap();
+        settings
+            .probe_media_binds(DEFAULT_BASE_PORT)
+            .expect("all six family-specific UDP sockets bind together");
+
+        let occupied_address: SocketAddr = "[::]:47998".parse().unwrap();
+        let blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        blocker.set_only_v6(true).unwrap();
+        blocker.bind(&SockAddr::from(occupied_address)).unwrap();
+        let _blocker = UdpSocket::from(blocker);
+
+        assert_eq!(
+            settings.probe_media_binds(DEFAULT_BASE_PORT),
+            Err("udp_bind_failed"),
+            "a conflict on only the IPv6 video bind must defer network activation"
         );
     }
 

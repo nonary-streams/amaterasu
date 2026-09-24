@@ -85,13 +85,13 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
-        if self
-            .local
-            .is_some_and(|address| config.peer_ip.is_ipv4() != address.is_ipv4())
-        {
-            rpc::complete(runtime, request, error("peer_family_mismatch"));
-            return;
-        }
+        let local = match self.advertised_local_for_peer(config.peer_ip) {
+            Ok(local) => local,
+            Err(code) => {
+                rpc::complete(runtime, request, error(code));
+                return;
+            }
+        };
         if let Some(existing) = self.records.values().find(|record| {
             record.owner == caller && record.config.operation_id == config.operation_id
         }) {
@@ -117,13 +117,6 @@ impl Controller {
         let (ticket, session_token, udp_discovery) = match self.new_identity(config.discover_peers)
         {
             Ok(identity) => identity,
-            Err(code) => {
-                rpc::complete(runtime, request, error(code));
-                return;
-            }
-        };
-        let local = match self.advertised_local_for_peer(config.peer_ip) {
-            Ok(local) => local,
             Err(code) => {
                 rpc::complete(runtime, request, error(code));
                 return;
@@ -230,6 +223,7 @@ impl Controller {
                 .map(|record| record.response())
                 .collect();
             json!({"ok":true,"enabled":self.settings.enabled,"local":self.local,
+                "locals":self.locals,
                 "connections":self.transport.as_ref().map_or(0, Transport::connection_count),
                 "tickets":tickets,"total":owned.len(),"truncated":owned.len()>16})
         };

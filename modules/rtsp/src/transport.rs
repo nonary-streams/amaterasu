@@ -5,6 +5,7 @@ mod tickets;
 
 use amaterasu_gamestream::{crypto::MAX_RTSP_PLAINTEXT_BYTES, rtsp::Request};
 use connection::{Connection, Step};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::BTreeMap,
     io,
@@ -31,7 +32,7 @@ pub enum Event {
 }
 
 pub struct Transport {
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     tickets: Tickets,
     connections: BTreeMap<u64, Connection>,
     next_connection: u64,
@@ -40,19 +41,56 @@ pub struct Transport {
 }
 
 impl Transport {
+    #[cfg(test)]
     pub fn bind(address: SocketAddr, allow_remote: bool) -> TransportResult<Self> {
-        if mapped(address.ip())
-            || address.ip().is_multicast()
-            || (!allow_remote && !address.ip().is_loopback())
-        {
+        Self::bind_all(vec![address], allow_remote)
+    }
+
+    pub fn bind_all(addresses: Vec<SocketAddr>, allow_remote: bool) -> TransportResult<Self> {
+        if addresses.is_empty() {
             return Err("invalid_listen_address");
         }
-        let listener = TcpListener::bind(address).map_err(|_| "tcp_bind_failed")?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "tcp_configuration_failed")?;
+        let mut listeners = Vec::with_capacity(addresses.len());
+        let mut selected_port = None;
+        for mut address in addresses {
+            if mapped(address.ip())
+                || address.ip().is_multicast()
+                || (!allow_remote && !address.ip().is_loopback())
+            {
+                return Err("invalid_listen_address");
+            }
+            if address.port() == 0
+                && let Some(port) = selected_port
+            {
+                address.set_port(port);
+            }
+            let socket = Socket::new(
+                Domain::for_address(address),
+                Type::STREAM,
+                Some(Protocol::TCP),
+            )
+            .map_err(|_| "tcp_bind_failed")?;
+            if address.is_ipv6() {
+                socket
+                    .set_only_v6(true)
+                    .map_err(|_| "tcp_configuration_failed")?;
+            }
+            socket
+                .bind(&SockAddr::from(address))
+                .map_err(|_| "tcp_bind_failed")?;
+            socket
+                .listen(4096)
+                .map_err(|_| "tcp_configuration_failed")?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|_| "tcp_configuration_failed")?;
+            let listener: TcpListener = socket.into();
+            selected_port
+                .get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
+            listeners.push(listener);
+        }
         Ok(Self {
-            listener,
+            listeners,
             tickets: Tickets::default(),
             connections: BTreeMap::new(),
             next_connection: 0,
@@ -61,8 +99,19 @@ impl Transport {
         })
     }
 
+    #[cfg(test)]
     pub fn local_addr(&self) -> TransportResult<SocketAddr> {
-        self.listener.local_addr().map_err(|_| "tcp_address_failed")
+        self.local_addrs()?
+            .into_iter()
+            .next()
+            .ok_or("tcp_address_failed")
+    }
+
+    pub fn local_addrs(&self) -> TransportResult<Vec<SocketAddr>> {
+        self.listeners
+            .iter()
+            .map(|listener| listener.local_addr().map_err(|_| "tcp_address_failed"))
+            .collect()
     }
 
     pub fn add_ticket(&mut self, id: u64, peer: IpAddr, key: &[u8; 16]) -> TransportResult<()> {
@@ -138,32 +187,34 @@ impl Transport {
     }
 
     fn accept(&mut self) {
-        for _ in 0..ACCEPT_BUDGET {
-            let (socket, peer) = match self.listener.accept() {
-                Ok(accepted) => accepted,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            if self.connections.len() >= MAX_CONNECTIONS
-                || self
-                    .connections
-                    .values()
-                    .filter(|connection| connection.peer() == peer.ip())
-                    .count()
-                    >= MAX_CONNECTIONS_PER_IP
-                || (!self.allow_remote && !peer.ip().is_loopback())
-                || !self.tickets.has_peer(peer.ip())
-            {
-                continue;
+        for listener in &self.listeners {
+            for _ in 0..ACCEPT_BUDGET {
+                let (socket, peer) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if self.connections.len() >= MAX_CONNECTIONS
+                    || self
+                        .connections
+                        .values()
+                        .filter(|connection| connection.peer() == peer.ip())
+                        .count()
+                        >= MAX_CONNECTIONS_PER_IP
+                    || (!self.allow_remote && !peer.ip().is_loopback())
+                    || !self.tickets.has_peer(peer.ip())
+                {
+                    continue;
+                }
+                let Some(id) = self.next_connection.checked_add(1) else {
+                    continue;
+                };
+                let Ok(connection) = Connection::new(socket, peer.ip(), self.now) else {
+                    continue;
+                };
+                self.next_connection = id;
+                self.connections.insert(id, connection);
             }
-            let Some(id) = self.next_connection.checked_add(1) else {
-                continue;
-            };
-            let Ok(connection) = Connection::new(socket, peer.ip(), self.now) else {
-                continue;
-            };
-            self.next_connection = id;
-            self.connections.insert(id, connection);
         }
     }
 

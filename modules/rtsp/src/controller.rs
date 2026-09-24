@@ -50,6 +50,7 @@ pub struct Controller {
     network_retry_at: u64,
     transport: Option<Transport>,
     local: Option<SocketAddr>,
+    locals: Vec<SocketAddr>,
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
     job: Option<Job>,
@@ -61,12 +62,13 @@ impl Controller {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
         let network_base_port = settings.default_base_port();
-        let (transport, local) = if settings.enabled {
-            let transport = Transport::bind(settings.resolved_bind()?, settings.allow_remote)?;
-            let local = transport.local_addr()?;
-            (Some(transport), Some(local))
+        let (transport, locals, local) = if settings.enabled {
+            let transport = Transport::bind_all(settings.resolved_binds()?, settings.allow_remote)?;
+            let locals = transport.local_addrs()?;
+            let local = locals.first().copied().ok_or("tcp_address_failed")?;
+            (Some(transport), locals, Some(local))
         } else {
-            (None, None)
+            (None, Vec::new(), None)
         };
         Ok(Self {
             settings,
@@ -77,6 +79,7 @@ impl Controller {
             network_retry_at: 0,
             transport,
             local,
+            locals,
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
             job: None,
@@ -166,10 +169,12 @@ impl Controller {
         &self,
         peer: IpAddr,
     ) -> Result<SocketAddr, &'static str> {
-        let listener = self.local.ok_or("listener_unavailable")?;
-        if listener.ip().is_ipv4() != peer.is_ipv4() {
-            return Err("peer_family_mismatch");
-        }
+        let listener = self
+            .locals
+            .iter()
+            .copied()
+            .find(|address| address.ip().is_ipv4() == peer.is_ipv4())
+            .ok_or("peer_family_mismatch")?;
         if !listener.ip().is_unspecified() {
             return Ok(listener);
         }
@@ -211,8 +216,8 @@ impl Controller {
         let Some(base_port) = self.network_base_port else {
             return Ok(false);
         };
-        let bind = self.settings.rtsp_bind_for_base(base_port)?;
-        if self.active_network_base_port == Some(base_port) && self.local == Some(bind) {
+        let binds = self.settings.rtsp_binds_for_base(base_port)?;
+        if self.active_network_base_port == Some(base_port) && self.locals == binds {
             return Ok(true);
         }
         if !self.settings.enabled
@@ -226,16 +231,18 @@ impl Controller {
         }
 
         self.settings.probe_media_binds(base_port)?;
-        if self.local == Some(bind) {
+        if self.locals == binds {
             self.listener_base_port = Some(base_port);
             self.active_network_base_port = Some(base_port);
             self.network_error = None;
             return Ok(true);
         }
-        let replacement = Transport::bind(bind, self.settings.allow_remote)?;
-        let local = replacement.local_addr()?;
+        let replacement = Transport::bind_all(binds, self.settings.allow_remote)?;
+        let locals = replacement.local_addrs()?;
+        let local = locals.first().copied().ok_or("tcp_address_failed")?;
         self.transport = Some(replacement);
         self.local = Some(local);
+        self.locals = locals;
         self.settings.bind = local;
         self.listener_base_port = Some(base_port);
         self.active_network_base_port = Some(base_port);

@@ -259,6 +259,75 @@ fn wildcard_listener_advertises_the_peer_route_and_uses_it_for_udp_binds() {
     );
 }
 
+#[test]
+fn both_family_listeners_accept_v4_and_v6_and_keep_each_stream_family_aligned() {
+    for allow_remote in [false, true] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "allow_remote": allow_remote,
+            "address_family": "both",
+            "bind_address": "",
+            "bind": "127.0.0.1:0"
+        }))
+        .unwrap();
+        let controller = Controller::new(settings).expect("dual-family RTSP listeners");
+        assert_eq!(controller.locals.len(), 2);
+        assert_eq!(controller.locals[0].port(), controller.locals[1].port());
+
+        for listener in &controller.locals {
+            let peer_ip = if listener.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            };
+            assert_eq!(listener.ip().is_loopback(), !allow_remote);
+            let destination = SocketAddr::new(
+                if listener.ip().is_unspecified() {
+                    peer_ip
+                } else {
+                    listener.ip()
+                },
+                listener.port(),
+            );
+            assert!(TcpStream::connect(destination).is_ok());
+
+            let advertised = controller
+                .advertised_local_for_peer(peer_ip)
+                .expect("family-matched local route");
+            assert_eq!(advertised.ip(), peer_ip);
+            assert_eq!(advertised.port(), listener.port());
+            let media = controller
+                .settings
+                .media_binds_on(TEST_BASE_PORT, advertised.ip())
+                .expect("peer-family UDP binds");
+            assert_eq!(media.video.ip(), peer_ip);
+            assert_eq!(media.control.ip(), peer_ip);
+            assert_eq!(media.audio.ip(), peer_ip);
+        }
+    }
+}
+
+#[test]
+fn status_reports_all_bound_families_and_keeps_legacy_local_field() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true,
+        "address_family": "both",
+        "bind_address": "",
+        "bind": "127.0.0.1:0"
+    }))
+    .unwrap();
+    let controller = Controller::new(settings).expect("dual-family RTSP listeners");
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+
+    controller.status(99, "caller", None, &runtime);
+
+    let (_, response) = endpoint.completions.pop().expect("status completion");
+    assert_eq!(response["local"], json!(controller.local));
+    assert_eq!(response["locals"], json!(controller.locals));
+    assert_eq!(response["locals"].as_array().unwrap().len(), 2);
+}
+
 fn free_base_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
     let port = listener.local_addr().unwrap().port();
@@ -325,6 +394,45 @@ fn network_port_updates_rebind_rtsp_and_defer_until_the_stream_is_idle() {
     assert_eq!(binds.video, SocketAddr::new(active.ip(), port + 9));
     assert_eq!(binds.control, SocketAddr::new(active.ip(), port + 10));
     assert_eq!(binds.audio, SocketAddr::new(active.ip(), port + 11));
+}
+
+#[test]
+fn network_port_update_rebinds_both_family_listeners_and_udp_policy() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true,
+        "address_family": "both",
+        "bind_address": "",
+        "bind": "127.0.0.1:0"
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).expect("dual-family bootstrap listener");
+    let base_port = free_base_port();
+
+    let response = controller
+        .configure_network_port(base_port, 1)
+        .expect("dual-family network port applies");
+
+    assert_eq!(response["active"], true);
+    assert_eq!(controller.locals.len(), 2);
+    assert_eq!(controller.locals[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(controller.locals[1].ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+    assert_eq!(controller.locals[0].port(), base_port + 21);
+    assert_eq!(controller.locals[1].port(), base_port + 21);
+    for peer in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let binds = controller
+            .media_binds_for_open(peer)
+            .expect("family-matched UDP policy");
+        assert_eq!(binds.video.ip(), peer);
+        assert_eq!(binds.video.port(), base_port + 9);
+        assert_eq!(binds.control.ip(), peer);
+        assert_eq!(binds.control.port(), base_port + 10);
+        assert_eq!(binds.audio.ip(), peer);
+        assert_eq!(binds.audio.port(), base_port + 11);
+    }
 }
 
 #[test]

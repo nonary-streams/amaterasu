@@ -47,11 +47,14 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        let http_bind = self.resolved_http_bind()?;
-        let https_bind = self.resolved_https_bind()?;
+        let http_binds = self.resolved_http_binds()?;
+        let https_binds = self.resolved_https_binds()?;
         validate_configured_hostname(&self.hostname)?;
         validate_hostname(&effective_hostname(&self.hostname))?;
-        if http_bind == https_bind && http_bind.port() != 0 {
+        if http_binds
+            .iter()
+            .any(|http| http.port() != 0 && https_binds.iter().any(|https| https == http))
+        {
             return Err("listener_addresses_conflict");
         }
         if let Some(streaming) = &self.streaming {
@@ -60,41 +63,69 @@ impl Settings {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn resolved_http_bind(&self) -> Result<SocketAddr, &'static str> {
-        self.resolve_bind(self.http_bind)
+        self.resolved_http_binds()?
+            .into_iter()
+            .next()
+            .ok_or("invalid_bind_address")
     }
 
+    #[cfg(test)]
     pub fn resolved_https_bind(&self) -> Result<SocketAddr, &'static str> {
-        self.resolve_bind(self.https_bind)
+        self.resolved_https_binds()?
+            .into_iter()
+            .next()
+            .ok_or("invalid_bind_address")
     }
 
-    fn resolve_bind(&self, legacy: SocketAddr) -> Result<SocketAddr, &'static str> {
+    pub fn resolved_http_binds(&self) -> Result<Vec<SocketAddr>, &'static str> {
+        self.resolve_binds(self.http_bind)
+    }
+
+    pub fn resolved_https_binds(&self) -> Result<Vec<SocketAddr>, &'static str> {
+        self.resolve_binds(self.https_bind)
+    }
+
+    fn resolve_binds(&self, legacy: SocketAddr) -> Result<Vec<SocketAddr>, &'static str> {
         let family = self.resolved_address_family(legacy.ip());
-        let ip = match self.bind_address.as_deref() {
-            None => legacy.ip(),
-            Some(address) if address.trim().is_empty() => {
-                if self.allow_remote {
-                    family.wildcard()
-                } else {
-                    legacy.ip()
-                }
-            }
-            Some(address) => address
-                .trim()
-                .parse::<IpAddr>()
-                .map_err(|_| "invalid_bind_address")?,
+        let addresses = match self.bind_address.as_deref() {
+            None => vec![legacy.ip()],
+            Some(address) if address.trim().is_empty() => match (family, self.allow_remote) {
+                (AddressFamily::Ipv4, true) => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
+                (AddressFamily::Ipv4, false) => vec![legacy.ip()],
+                (AddressFamily::Both, true) => vec![
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                ],
+                (AddressFamily::Both, false) => vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+            },
+            Some(address) => vec![
+                address
+                    .trim()
+                    .parse::<IpAddr>()
+                    .map_err(|_| "invalid_bind_address")?,
+            ],
         };
-        if !family.supports(ip) {
-            return Err("address_family_mismatch");
-        }
-        if invalid_configured_bind(ip) || (!self.allow_remote && !ip.is_loopback()) {
-            return Err(if !self.allow_remote && !ip.is_loopback() {
-                "remote_binding_requires_allow_remote"
-            } else {
-                "invalid_bind_address"
-            });
-        }
-        Ok(SocketAddr::new(ip, legacy.port()))
+        addresses
+            .into_iter()
+            .map(|ip| {
+                if !family.supports(ip) {
+                    return Err("address_family_mismatch");
+                }
+                if invalid_configured_bind(ip) || (!self.allow_remote && !ip.is_loopback()) {
+                    return Err(if !self.allow_remote && !ip.is_loopback() {
+                        "remote_binding_requires_allow_remote"
+                    } else {
+                        "invalid_bind_address"
+                    });
+                }
+                Ok(SocketAddr::new(ip, legacy.port()))
+            })
+            .collect()
     }
 
     fn resolved_address_family(&self, legacy_ip: IpAddr) -> AddressFamily {
@@ -116,13 +147,6 @@ impl Settings {
 impl AddressFamily {
     fn supports(self, address: IpAddr) -> bool {
         matches!(self, Self::Both) || address.is_ipv4()
-    }
-
-    fn wildcard(self) -> IpAddr {
-        match self {
-            Self::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            Self::Both => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        }
     }
 }
 
@@ -317,8 +341,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            settings.resolved_http_bind().unwrap().ip(),
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            settings.resolved_http_binds().unwrap(),
+            vec![
+                "0.0.0.0:47989".parse().unwrap(),
+                "[::]:47989".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn both_family_without_remote_access_resolves_to_both_loopback_addresses() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "address_family": "both",
+            "bind_address": "",
+            "http_bind": "127.0.0.1:47989"
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.resolved_http_binds().unwrap(),
+            vec![
+                "127.0.0.1:47989".parse().unwrap(),
+                "[::1]:47989".parse().unwrap()
+            ]
         );
     }
 

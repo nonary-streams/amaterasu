@@ -4,6 +4,9 @@ use crate::{
     wire::{Reply, Request},
 };
 use rustls::{ServerConfig, ServerConnection};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+#[cfg(test)]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
@@ -40,8 +43,8 @@ pub struct Closed {
 }
 
 pub struct Server {
-    http: TcpListener,
-    https: TcpListener,
+    http: Vec<TcpListener>,
+    https: Vec<TcpListener>,
     connections: BTreeMap<u64, Connection>,
     next_id: u64,
     configuration: Option<Arc<ServerConfig>>,
@@ -50,10 +53,14 @@ pub struct Server {
 
 impl Server {
     pub fn bind(settings: &Settings) -> Result<Self, String> {
-        let http_address = settings.resolved_http_bind().map_err(str::to_owned)?;
-        let https_address = settings.resolved_https_bind().map_err(str::to_owned)?;
-        let http = bind_listener(http_address, "HTTP")?;
-        let https = bind_listener(https_address, "HTTPS")?;
+        let http = bind_listeners(
+            settings.resolved_http_binds().map_err(str::to_owned)?,
+            "HTTP",
+        )?;
+        let https = bind_listeners(
+            settings.resolved_https_binds().map_err(str::to_owned)?,
+            "HTTPS",
+        )?;
         Ok(Self {
             http,
             https,
@@ -65,10 +72,24 @@ impl Server {
     }
 
     pub fn http_address(&self) -> SocketAddr {
-        self.http.local_addr().expect("bound HTTP listener")
+        self.http_addresses()[0]
     }
     pub fn https_address(&self) -> SocketAddr {
-        self.https.local_addr().expect("bound HTTPS listener")
+        self.https_addresses()[0]
+    }
+
+    pub fn http_addresses(&self) -> Vec<SocketAddr> {
+        self.http
+            .iter()
+            .map(|listener| listener.local_addr().expect("bound HTTP listener"))
+            .collect()
+    }
+
+    pub fn https_addresses(&self) -> Vec<SocketAddr> {
+        self.https
+            .iter()
+            .map(|listener| listener.local_addr().expect("bound HTTPS listener"))
+            .collect()
     }
 
     /// Rebinds the HTTP pair while retaining existing accepted connections.
@@ -76,30 +97,28 @@ impl Server {
     pub fn rebind_port(&mut self, http_port: u16) -> Result<(), String> {
         crate::settings::validate_port(http_port).map_err(str::to_owned)?;
         let https_port = crate::settings::https_port(http_port);
-        if self.http_address().port() == http_port && self.https_address().port() == https_port {
+        let old_http_addresses = self.http_addresses();
+        let old_https_addresses = self.https_addresses();
+        if old_http_addresses
+            .iter()
+            .all(|address| address.port() == http_port)
+            && old_https_addresses
+                .iter()
+                .all(|address| address.port() == https_port)
+        {
             return Ok(());
         }
 
-        let http_address = SocketAddr::new(self.http_address().ip(), http_port);
-        let https_address = SocketAddr::new(self.https_address().ip(), https_port);
-        let old_http_address = self.http_address();
-        let old_https_address = self.https_address();
-        let http = replacement_listener(
-            http_address,
-            old_http_address,
-            old_https_address,
-            &self.http,
-            &self.https,
-            "HTTP",
-        )?;
-        let https = replacement_listener(
-            https_address,
-            old_http_address,
-            old_https_address,
-            &self.http,
-            &self.https,
-            "HTTPS",
-        )?;
+        let http_addresses = old_http_addresses
+            .iter()
+            .map(|address| SocketAddr::new(address.ip(), http_port))
+            .collect::<Vec<_>>();
+        let https_addresses = old_https_addresses
+            .iter()
+            .map(|address| SocketAddr::new(address.ip(), https_port))
+            .collect::<Vec<_>>();
+        let http = replacement_listeners(&http_addresses, &self.http, &self.https, "HTTP")?;
+        let https = replacement_listeners(&https_addresses, &self.http, &self.https, "HTTPS")?;
 
         self.http = http;
         self.https = https;
@@ -174,59 +193,62 @@ impl Server {
     }
 
     fn accept(&mut self, secure: bool) {
-        let listener = if secure { &self.https } else { &self.http };
-        for _ in 0..4 {
-            let (socket, remote) = match listener.accept() {
-                Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            };
-            let peer_count = self
-                .connections
-                .values()
-                .filter(|connection| connection.remote == remote.ip())
-                .count();
-            if self.connections.len() >= MAX_CONNECTIONS
-                || peer_count >= MAX_PER_PEER
-                || (secure && !self.tls_ready)
-            {
-                continue;
-            }
-            if socket.set_nonblocking(true).is_err() {
-                continue;
-            }
-            let _ = socket.set_nodelay(true);
-            let tls = if secure {
-                let Some(configuration) = &self.configuration else {
-                    continue;
+        let listeners = if secure { &self.https } else { &self.http };
+        for listener in listeners {
+            for _ in 0..4 {
+                let (socket, remote) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
                 };
-                let Ok(mut connection) = ServerConnection::new(configuration.clone()) else {
+                let remote = normalize_ip(remote.ip());
+                let peer_count = self
+                    .connections
+                    .values()
+                    .filter(|connection| connection.remote == remote)
+                    .count();
+                if self.connections.len() >= MAX_CONNECTIONS
+                    || peer_count >= MAX_PER_PEER
+                    || (secure && !self.tls_ready)
+                {
                     continue;
+                }
+                if socket.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                let _ = socket.set_nodelay(true);
+                let tls = if secure {
+                    let Some(configuration) = &self.configuration else {
+                        continue;
+                    };
+                    let Ok(mut connection) = ServerConnection::new(configuration.clone()) else {
+                        continue;
+                    };
+                    connection.set_buffer_limit(Some(MAX_REQUEST));
+                    Some(connection)
+                } else {
+                    None
                 };
-                connection.set_buffer_limit(Some(MAX_REQUEST));
-                Some(connection)
-            } else {
-                None
-            };
-            let Some(id) = self.next_id.checked_add(1) else {
-                break;
-            };
-            self.next_id = id;
-            self.connections.insert(
-                id,
-                Connection {
-                    socket,
-                    remote: remote.ip(),
-                    tls,
-                    input: Vec::new(),
-                    output: None,
-                    waiting: false,
-                    finished: false,
-                    closing: false,
-                    response_delivered: false,
-                    deadline: Instant::now() + IO_TIMEOUT,
-                },
-            );
+                let Some(id) = self.next_id.checked_add(1) else {
+                    break;
+                };
+                self.next_id = id;
+                self.connections.insert(
+                    id,
+                    Connection {
+                        socket,
+                        remote,
+                        tls,
+                        input: Vec::new(),
+                        output: None,
+                        waiting: false,
+                        finished: false,
+                        closing: false,
+                        response_delivered: false,
+                        deadline: Instant::now() + IO_TIMEOUT,
+                    },
+                );
+            }
         }
     }
 
@@ -272,37 +294,75 @@ impl Server {
 }
 
 fn bind_listener(address: SocketAddr, name: &str) -> Result<TcpListener, String> {
-    let listener =
-        TcpListener::bind(address).map_err(|_| format!("{name} listener unavailable"))?;
-    listener
+    let domain = Domain::for_address(address);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|_| format!("{name} socket unavailable"))?;
+    if address.is_ipv6() {
+        socket
+            .set_only_v6(true)
+            .map_err(|_| format!("{name} IPv6 configuration failed"))?;
+    }
+    socket
+        .bind(&SockAddr::from(address))
+        .map_err(|_| format!("{name} listener unavailable"))?;
+    socket
+        .listen(128)
+        .map_err(|_| format!("{name} listen failed"))?;
+    socket
         .set_nonblocking(true)
         .map_err(|_| format!("{name} nonblocking setup failed"))?;
-    Ok(listener)
+    Ok(socket.into())
 }
 
-fn replacement_listener(
-    address: SocketAddr,
-    old_http_address: SocketAddr,
-    old_https_address: SocketAddr,
-    old_http: &TcpListener,
-    old_https: &TcpListener,
+fn bind_listeners(addresses: Vec<SocketAddr>, name: &str) -> Result<Vec<TcpListener>, String> {
+    let mut listeners = Vec::with_capacity(addresses.len());
+    let mut selected_port = None;
+    for mut address in addresses {
+        if address.port() == 0
+            && let Some(port) = selected_port
+        {
+            address.set_port(port);
+        }
+        let listener = bind_listener(address, name)?;
+        selected_port.get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
+        listeners.push(listener);
+    }
+    Ok(listeners)
+}
+
+fn replacement_listeners(
+    addresses: &[SocketAddr],
+    old_http: &[TcpListener],
+    old_https: &[TcpListener],
     name: &str,
-) -> Result<TcpListener, String> {
-    // A TCP listener is protocol-neutral; TLS/plain handling is chosen by the
-    // accept call. Reusing a same-address listener for the other role is safe,
-    // while already accepted streams retain their own TLS/plain connection state.
-    let existing = if address == old_http_address {
-        Some(old_http)
-    } else if address == old_https_address {
-        Some(old_https)
-    } else {
-        None
-    };
-    match existing {
-        Some(listener) => listener
-            .try_clone()
-            .map_err(|_| format!("{name} listener clone failed")),
-        None => bind_listener(address, name),
+) -> Result<Vec<TcpListener>, String> {
+    let mut replacements = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        // A TCP listener is protocol-neutral; TLS/plain handling is chosen by
+        // the accept call. Reusing a same-address listener for the other role is
+        // safe while existing accepted streams retain their own connection state.
+        let existing = old_http
+            .iter()
+            .chain(old_https)
+            .find(|listener| listener.local_addr().ok() == Some(*address));
+        let listener = match existing {
+            Some(listener) => listener
+                .try_clone()
+                .map_err(|_| format!("{name} listener clone failed"))?,
+            None => bind_listener(*address, name)?,
+        };
+        replacements.push(listener);
+    }
+    Ok(replacements)
+}
+
+fn normalize_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        IpAddr::V4(address) => IpAddr::V4(address),
     }
 }
 
@@ -660,6 +720,160 @@ mod tests {
     }
 
     #[test]
+    fn both_family_accepts_ipv4_and_ipv6_with_or_without_remote_access() {
+        for allow_remote in [false, true] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "allow_remote": allow_remote,
+                "address_family": "both",
+                "bind_address": "",
+                "http_bind": "127.0.0.1:0",
+                "https_bind": "127.0.0.1:0"
+            }))
+            .unwrap();
+            let mut server = Server::bind(&settings).expect("bind both address families");
+            let http_addresses = server.http_addresses();
+            let https_addresses = server.https_addresses();
+            assert_eq!(http_addresses.len(), 2);
+            assert_eq!(https_addresses.len(), 2);
+            let (expected_v4, expected_v6) = if allow_remote {
+                (
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                )
+            } else {
+                (
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                )
+            };
+            assert_eq!(http_addresses[0].ip(), expected_v4);
+            assert_eq!(http_addresses[1].ip(), expected_v6);
+            assert_eq!(http_addresses[0].port(), http_addresses[1].port());
+            assert_eq!(https_addresses[0].port(), https_addresses[1].port());
+            assert!(https_addresses.iter().all(|address| {
+                if allow_remote {
+                    address.ip().is_unspecified()
+                } else {
+                    address.ip().is_loopback()
+                }
+            }));
+
+            let tls_configuration = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+            server.replace_tls(Arc::new(tls_configuration));
+
+            let mut clients = Vec::new();
+            for address in &http_addresses {
+                let destination = SocketAddr::new(
+                    if address.is_ipv4() {
+                        IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V6(Ipv6Addr::LOCALHOST)
+                    },
+                    address.port(),
+                );
+                let mut client = TcpStream::connect(destination).unwrap();
+                client
+                    .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+                    .unwrap();
+                clients.push(client);
+            }
+            let mut tls_clients = Vec::new();
+            for address in https_addresses {
+                let destination = SocketAddr::new(
+                    if address.is_ipv4() {
+                        IpAddr::V4(Ipv4Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V6(Ipv6Addr::LOCALHOST)
+                    },
+                    address.port(),
+                );
+                tls_clients.push(TcpStream::connect(destination).unwrap());
+            }
+
+            let requests = server.tick().requests;
+            assert_eq!(requests.len(), 2);
+            assert_eq!(server.connections(), 4, "both HTTPS families were accepted");
+            let peers = requests
+                .into_iter()
+                .map(|request| request.remote)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                peers,
+                [
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                ]
+                .into_iter()
+                .collect()
+            );
+            drop(clients);
+            drop(tls_clients);
+        }
+    }
+
+    #[test]
+    fn port_rebind_retains_both_listener_families() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "address_family": "both",
+            "bind_address": "",
+            "http_bind": "127.0.0.1:0",
+            "https_bind": "127.0.0.1:0"
+        }))
+        .unwrap();
+        let mut server = Server::bind(&settings).unwrap();
+        let base_port = available_port_pair();
+
+        server.rebind_port(base_port).unwrap();
+
+        let http = server.http_addresses();
+        let https = server.https_addresses();
+        assert_eq!(http.len(), 2);
+        assert_eq!(https.len(), 2);
+        assert_eq!(http[0].port(), base_port);
+        assert_eq!(http[1].port(), base_port);
+        assert_eq!(https[0].port(), crate::settings::https_port(base_port));
+        assert_eq!(https[1].port(), crate::settings::https_port(base_port));
+
+        let mut clients = Vec::new();
+        for address in &http {
+            let peer = if address.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            };
+            let mut client = TcpStream::connect(SocketAddr::new(peer, address.port())).unwrap();
+            client
+                .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+                .unwrap();
+            clients.push(client);
+        }
+        let requests = server.tick().requests;
+        assert_eq!(requests.len(), 2);
+        let peers = requests
+            .into_iter()
+            .map(|request| request.remote)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            peers,
+            [
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            ]
+            .into_iter()
+            .collect()
+        );
+        drop(clients);
+    }
+
+    #[test]
     fn port_rebind_changes_both_live_listeners_and_preserves_accepted_connections() {
         let settings = Settings {
             enabled: true,
@@ -783,7 +997,12 @@ mod tests {
             let Ok(http) = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], base))) else {
                 continue;
             };
-            drop((http, https));
+            let Ok(raised_http) =
+                TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], raised_base)))
+            else {
+                continue;
+            };
+            drop((http, raised_http, https));
             return base;
         }
         panic!("could not reserve an unused local listener port pair");
