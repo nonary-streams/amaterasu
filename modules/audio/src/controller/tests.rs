@@ -13,9 +13,11 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+type OpenCall = (String, Option<String>, Option<u32>, bool);
+
 #[derive(Default)]
 struct Observed {
-    opens: Mutex<Vec<(String, bool)>>,
+    opens: Mutex<Vec<OpenCall>>,
     drops: AtomicUsize,
 }
 
@@ -28,22 +30,33 @@ impl Backend for FakeBackend {
         Ok(vec![Endpoint {
             id: "render.explicit".into(),
             name: "Selected endpoint".into(),
+            description: None,
+            adapter_name: None,
             default_multimedia: false,
         }])
     }
 
-    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened> {
-        self.observed
-            .opens
-            .lock()
-            .unwrap()
-            .push((endpoint.into(), capture_sink_without_routing));
-        if endpoint != "render.explicit" {
-            return Err("endpoint_not_found");
-        }
+    fn open(
+        &self,
+        endpoint: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Opened> {
+        self.observed.opens.lock().unwrap().push((
+            endpoint.into(),
+            virtual_sink.map(str::to_owned),
+            channels,
+            capture_sink_without_routing,
+        ));
+        let selected = match virtual_sink {
+            Some("Studio Virtual") if matches!(channels, Some(2 | 6 | 8)) => "render.virtual",
+            None if endpoint == "render.explicit" => "render.explicit",
+            _ => return Err("endpoint_not_found"),
+        };
         Ok(Opened {
-            endpoint: endpoint.into(),
-            format: Format::new(48_000, 2, PCM_F32).unwrap(),
+            endpoint: selected.into(),
+            format: Format::new(48_000, channels.unwrap_or(2), PCM_F32).unwrap(),
             source: Box::new(FakeSource {
                 packets: VecDeque::from([Packet {
                     frames: 1,
@@ -91,6 +104,8 @@ fn controller(enabled: bool) -> (Controller, Arc<Observed>) {
 fn open() -> Operation {
     Operation::Open {
         endpoint: "render.explicit".into(),
+        virtual_sink: None,
+        channels: None,
         operation_id: Some("one".into()),
         capture_sink_without_routing: false,
     }
@@ -108,7 +123,7 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
     assert_eq!(opened.payload, repeated.payload);
     assert_eq!(
         *observed.opens.lock().unwrap(),
-        [("render.explicit".into(), false)]
+        [("render.explicit".into(), None, None, false)]
     );
     assert_eq!(
         controller
@@ -140,6 +155,8 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
                 "alice",
                 Operation::Open {
                     endpoint: "default".into(),
+                    virtual_sink: None,
+                    channels: None,
                     operation_id: Some("one".into()),
                     capture_sink_without_routing: false
                 }
@@ -154,7 +171,7 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
     );
     assert_eq!(
         *observed.opens.lock().unwrap(),
-        [("render.explicit".into(), false)]
+        [("render.explicit".into(), None, None, false)]
     );
 }
 
@@ -163,6 +180,8 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
     let (mut controller, observed) = controller(true);
     let operation = Operation::Open {
         endpoint: "render.explicit".into(),
+        virtual_sink: None,
+        channels: None,
         operation_id: Some("capture-only".into()),
         capture_sink_without_routing: true,
     };
@@ -178,7 +197,7 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
     );
     assert_eq!(
         *observed.opens.lock().unwrap(),
-        [("render.explicit".into(), true)]
+        [("render.explicit".into(), None, None, true)]
     );
     assert_eq!(
         controller
@@ -186,6 +205,8 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
                 "alice",
                 Operation::Open {
                     endpoint: "render.explicit".into(),
+                    virtual_sink: None,
+                    channels: None,
                     operation_id: Some("capture-only".into()),
                     capture_sink_without_routing: false,
                 }
@@ -195,7 +216,7 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
     );
     assert_eq!(
         *observed.opens.lock().unwrap(),
-        [("render.explicit".into(), true)]
+        [("render.explicit".into(), None, None, true)]
     );
 }
 
@@ -223,6 +244,8 @@ fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
         "alice",
         Operation::Open {
             endpoint: "render.missing".into(),
+            virtual_sink: None,
+            channels: None,
             operation_id: Some("missing-endpoint".into()),
             capture_sink_without_routing: false,
         },
@@ -231,8 +254,136 @@ fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
     assert_eq!(result.err(), Some("endpoint_not_found"));
     assert_eq!(
         *observed.opens.lock().unwrap(),
-        [("render.missing".into(), false)]
+        [("render.missing".into(), None, None, false)]
     );
+}
+
+#[test]
+fn virtual_sink_selection_precedes_regular_endpoint_and_binds_layout_to_retry() {
+    let (mut controller, observed) = controller(true);
+    let request = Operation::Open {
+        endpoint: String::new(),
+        virtual_sink: Some("Studio Virtual".into()),
+        channels: Some(6),
+        operation_id: Some("virtual-audio".into()),
+        capture_sink_without_routing: false,
+    };
+
+    let opened = controller.handle("alice", request).unwrap();
+    assert_eq!(opened.payload["endpoint"], "render.virtual");
+    assert_eq!(opened.payload["requested_endpoint"], "");
+    assert_eq!(opened.payload["virtual_sink"], "Studio Virtual");
+    assert_eq!(opened.payload["channels"], 6);
+    assert_eq!(opened.payload["format"]["channels"], 6);
+
+    let retry = controller
+        .handle(
+            "alice",
+            Operation::Open {
+                endpoint: String::new(),
+                virtual_sink: Some("Studio Virtual".into()),
+                channels: Some(6),
+                operation_id: Some("virtual-audio".into()),
+                capture_sink_without_routing: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(opened.payload, retry.payload);
+    assert_eq!(
+        controller
+            .handle(
+                "alice",
+                Operation::Open {
+                    endpoint: String::new(),
+                    virtual_sink: Some("Studio Virtual".into()),
+                    channels: Some(8),
+                    operation_id: Some("virtual-audio".into()),
+                    capture_sink_without_routing: false,
+                },
+            )
+            .err(),
+        Some("operation_conflict")
+    );
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [(String::new(), Some("Studio Virtual".into()), Some(6), false)]
+    );
+}
+
+#[test]
+fn unavailable_virtual_sink_does_not_fall_back_to_requested_regular_endpoint() {
+    let (mut controller, observed) = controller(true);
+    let result = controller.handle(
+        "alice",
+        Operation::Open {
+            endpoint: "render.explicit".into(),
+            virtual_sink: Some("Missing Virtual".into()),
+            channels: Some(2),
+            operation_id: Some("unavailable-virtual".into()),
+            capture_sink_without_routing: false,
+        },
+    );
+
+    assert_eq!(result.err(), Some("endpoint_not_found"));
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [(
+            "render.explicit".into(),
+            Some("Missing Virtual".into()),
+            Some(2),
+            false
+        )]
+    );
+}
+
+#[test]
+fn virtual_sink_rejects_capture_only_routing_policy() {
+    let (mut controller, observed) = controller(true);
+    let result = controller.handle(
+        "alice",
+        Operation::Open {
+            endpoint: String::new(),
+            virtual_sink: Some(String::new()),
+            channels: Some(2),
+            operation_id: None,
+            capture_sink_without_routing: true,
+        },
+    );
+
+    assert_eq!(result.err(), Some("invalid_open_policy"));
+    assert!(observed.opens.lock().unwrap().is_empty());
+}
+
+#[test]
+fn virtual_sink_requires_supported_channel_layout_and_regular_open_rejects_layout() {
+    let (mut controller, observed) = controller(true);
+    let unsupported_virtual = controller.handle(
+        "alice",
+        Operation::Open {
+            endpoint: String::new(),
+            virtual_sink: Some(String::new()),
+            channels: Some(4),
+            operation_id: None,
+            capture_sink_without_routing: false,
+        },
+    );
+    assert_eq!(
+        unsupported_virtual.err(),
+        Some("unsupported_channel_layout")
+    );
+
+    let regular_with_layout = controller.handle(
+        "alice",
+        Operation::Open {
+            endpoint: "render.explicit".into(),
+            virtual_sink: None,
+            channels: Some(6),
+            operation_id: None,
+            capture_sink_without_routing: false,
+        },
+    );
+    assert_eq!(regular_with_layout.err(), Some("invalid_channel_layout"));
+    assert!(observed.opens.lock().unwrap().is_empty());
 }
 
 #[test]

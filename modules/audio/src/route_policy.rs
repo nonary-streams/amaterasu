@@ -257,6 +257,40 @@ mod tests {
     }
 
     #[test]
+    fn virtual_sink_route_lease_restores_all_roles_after_capture_closes() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let routed = endpoints("render.virtual", "render.virtual", "render.virtual");
+        let mut policy = RoutePolicy::new();
+
+        assert!(matches!(
+            policy.acquire("render.virtual", &original),
+            Ok(AcquirePlan::Assign(_))
+        ));
+        for role in DefaultRole::ALL {
+            policy.record_assignment("render.virtual", role).unwrap();
+        }
+        assert_eq!(
+            policy.release("render.virtual", &routed),
+            Ok(ReleasePlan::Restore(vec![
+                RoleAssignment {
+                    role: DefaultRole::Console,
+                    endpoint: "render.console".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Multimedia,
+                    endpoint: "render.multimedia".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Communications,
+                    endpoint: "render.comms".into(),
+                },
+            ]))
+        );
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
     fn a_same_target_lease_shares_switch_and_restores_only_after_last_release() {
         let original = endpoints("render.console", "render.multimedia", "render.comms");
         let routed = endpoints("render.selected", "render.selected", "render.selected");

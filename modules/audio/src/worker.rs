@@ -28,7 +28,13 @@ pub struct Opened {
 
 pub trait Backend: Send {
     fn enumerate(&self) -> AudioResult<Vec<Endpoint>>;
-    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened>;
+    fn open(
+        &self,
+        endpoint: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Opened>;
 }
 
 pub struct NativeBackend;
@@ -37,9 +43,19 @@ impl Backend for NativeBackend {
         enumerate()
     }
 
-    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened> {
-        let (source, endpoint, format) =
-            Worker::open(endpoint.to_owned(), capture_sink_without_routing)?;
+    fn open(
+        &self,
+        endpoint: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Opened> {
+        let (source, endpoint, format) = Worker::open(
+            endpoint.to_owned(),
+            virtual_sink.map(str::to_owned),
+            channels,
+            capture_sink_without_routing,
+        )?;
         Ok(Opened {
             source: Box::new(source),
             endpoint,
@@ -58,6 +74,8 @@ pub struct Worker {
 impl Worker {
     pub fn open(
         endpoint: String,
+        virtual_sink: Option<String>,
+        channels: Option<u32>,
         capture_sink_without_routing: bool,
     ) -> AudioResult<(Self, String, Format)> {
         let (sender, packets) = mpsc::sync_channel(QUEUE_PACKETS);
@@ -69,14 +87,18 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-loopback".into())
             .spawn(move || {
-                let mut capture =
-                    match platform::Capture::open(&endpoint, capture_sink_without_routing) {
-                        Ok(capture) => capture,
-                        Err(error) => {
-                            let _ = ready.send(Err(error));
-                            return;
-                        }
-                    };
+                let mut capture = match platform::Capture::open(
+                    &endpoint,
+                    virtual_sink.as_deref(),
+                    channels,
+                    capture_sink_without_routing,
+                ) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
                 if ready
                     .send(Ok((capture.endpoint().to_owned(), capture.format())))
                     .is_err()

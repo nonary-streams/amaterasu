@@ -7,6 +7,10 @@ pub type AudioResult<T> = Result<T, &'static str>;
 pub struct Endpoint {
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_name: Option<String>,
     pub default_multimedia: bool,
 }
 
@@ -36,6 +40,8 @@ impl Format {
             channel_mask: match channels {
                 1 => 4,
                 2 => 3,
+                6 => 0x003f,
+                8 => 0x063f,
                 _ => 0,
             },
             name,
@@ -88,6 +94,10 @@ pub enum Operation {
     Open {
         endpoint: String,
         #[serde(default)]
+        virtual_sink: Option<String>,
+        #[serde(default)]
+        channels: Option<u32>,
+        #[serde(default)]
         operation_id: Option<String>,
         #[serde(default)]
         capture_sink_without_routing: bool,
@@ -107,6 +117,13 @@ pub enum Operation {
 pub fn validate_endpoint(endpoint: &str) -> AudioResult<()> {
     if endpoint.is_empty() || endpoint.len() > 4096 || endpoint.chars().any(char::is_control) {
         return Err("invalid_endpoint");
+    }
+    Ok(())
+}
+
+pub fn validate_virtual_sink(virtual_sink: &str) -> AudioResult<()> {
+    if virtual_sink.len() > 4096 || virtual_sink.chars().any(char::is_control) {
+        return Err("invalid_virtual_sink");
     }
     Ok(())
 }

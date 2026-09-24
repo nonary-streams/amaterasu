@@ -7,6 +7,7 @@ mod packet;
 mod platform;
 #[cfg(any(windows, test))]
 mod route_policy;
+mod virtual_sink;
 mod worker;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};

@@ -11,13 +11,14 @@ Strict JSON controls:
 ```json
 {"action":"enumerate"}
 {"action":"open","endpoint":"default","operation_id":"living-room-audio"}
+{"action":"open","endpoint":"","virtual_sink":"","channels":6,"operation_id":"surround-audio"}
 {"action":"lookup","operation_id":"living-room-audio"}
 {"action":"status"}
 {"action":"status","stream":1}
 {"action":"close","stream":1}
 ```
 
-Enumeration returns `{ok:true,enabled,endpoints:[{id,name,default_multimedia}]}`
+Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
 for active render endpoints. Explicit endpoint IDs come from that list; `default`
 resolves the current multimedia render endpoint once when opened. The selected
 endpoint remains fixed for the session. Enumeration is limited to 64 endpoints
@@ -31,8 +32,22 @@ endpoint, preserving role changes made elsewhere. If assignment fails, open
 fails and attempts to restore roles changed earlier in the same open. A failed
 restore blocks later routed opens, which retry cleanup first; there is no
 background retry. Opening `default`
-does not change default roles. The provider does not change volume, mute state,
-visibility, or device configuration.
+does not change default roles. The provider does not change volume or mute state.
+
+An open with `virtual_sink` selects a managed virtual render endpoint before the
+regular `endpoint`. `virtual_sink:null` or omission keeps regular endpoint
+selection. An empty string matches the active endpoint whose adapter name is
+exactly `Steam Streaming Speakers`; nonempty text matches an active endpoint's
+ID, friendly name, device description, or adapter name, in that priority order.
+Matching is exact and case-sensitive. The virtual selector never falls back to
+the regular endpoint or the default endpoint when it is unavailable. `channels`
+selects stereo (2), 5.1 (6), or 7.1 (8); when omitted in virtual mode it defaults
+to stereo. For 5.1, the backend tries back-speaker and side-speaker masks. It
+sets the selected endpoint's engine format to 48 kHz float32 or signed PCM16 and
+fails with `virtual_sink_format_unavailable` if Windows rejects every candidate.
+The engine format change belongs to the selected endpoint and is not restored
+when capture closes. Capture-only routing is invalid for virtual selection;
+virtual opens use the normal shared default-role lease and cleanup.
 
 Set `capture_sink_without_routing:true` on an open to capture the selected
 endpoint without changing any render default role. The product resolver should
@@ -41,8 +56,11 @@ sink present, no configured virtual sink, and the selected sink equal to that
 configured sink. The audio module receives this per-open policy snapshot; it does
 not derive eligibility from product settings.
 
-Open/lookup return `{ok:true,stream,endpoint,capture_sink_without_routing,format}`.
-An omitted policy field is accepted as false for older callers. Format contains
+Open/lookup return `{ok:true,stream,endpoint,requested_endpoint,virtual_sink,channels,capture_sink_without_routing,format}`.
+`endpoint` is the selected endpoint ID, `requested_endpoint` is the caller's
+regular selector, `virtual_sink` is the requested virtual selector, and `channels`
+is the resolved requested virtual layout. An omitted policy field is accepted
+as false for older callers. Format contains
 `sample_rate`, `channels`, `channel_mask`, and `format:"f32"|"i16"`. Status returns
 `{ok:true,enabled,audio_route_restore_pending,streams:[...]}` with only the
 caller's streams, optionally filtered by ID. The route flag reports a failed
@@ -54,8 +72,8 @@ Close returns `{ok:true}`. Missing/foreign lookup or close returns
 Driver error strings and PCM samples are never placed in control replies.
 
 The optional operation ID is 1–128 ASCII graphic bytes. Same-caller retry with
-that ID, requested endpoint, and routing policy reuses the original stream;
-changing either endpoint or policy conflicts. After close, retry returns
+that ID, requested endpoint, virtual selector, layout, and routing policy reuses
+the original stream; changing any of those values conflicts. After close, retry returns
 `stream_closed` and lookup returns `stream_not_found`. Up to 128 operation
 records remain in memory per module instance. There are at most four live
 streams, two per caller. Open
@@ -75,7 +93,8 @@ respective endpoint. These are trusted native modules, not a native-code sandbox
 
 The Windows backend uses official `windows` crate COM bindings. Explicit routed
 opens use the undocumented Windows `IPolicyConfig::SetDefaultEndpoint` COM
-interface at a documented ABI boundary; inability to snapshot or switch roles
+interface at a documented ABI boundary; virtual opens also use its
+`SetDeviceFormat` method at that boundary. Inability to snapshot or switch roles
 fails the capture open. Each stream has
 a dedicated apartment thread that activates `IAudioClient`, validates its mix
 format, initializes shared-mode `AUDCLNT_STREAMFLAGS_LOOPBACK`, and starts

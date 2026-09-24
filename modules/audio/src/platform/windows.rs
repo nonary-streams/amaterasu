@@ -5,6 +5,7 @@ use crate::{
     route_policy::{
         AcquirePlan, DefaultEndpoints, DefaultRole, ReleasePlan, RoleAssignment, RoutePolicy,
     },
+    virtual_sink::{ChannelLayout, channel_layout, select_endpoint},
 };
 use amaterasu_media::{
     AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32, PCM_I16,
@@ -15,7 +16,9 @@ use std::{
 };
 use windows::{
     Win32::{
-        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
+        Devices::FunctionDiscovery::{
+            PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName,
+        },
         Media::{
             Audio::*, KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
             Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
@@ -38,7 +41,14 @@ static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
 #[repr(C)]
 struct PolicyConfigVtable {
     base__: IUnknown_Vtbl,
-    preceding_methods: [unsafe extern "system" fn() -> HRESULT; 10],
+    preceding_set_device_format: [unsafe extern "system" fn() -> HRESULT; 3],
+    set_device_format: unsafe extern "system" fn(
+        *mut c_void,
+        PCWSTR,
+        *mut WAVEFORMATEX,
+        *mut WAVEFORMATEX,
+    ) -> HRESULT,
+    intervening_methods: [unsafe extern "system" fn() -> HRESULT; 6],
     set_default_endpoint: unsafe extern "system" fn(*mut c_void, PCWSTR, ERole) -> HRESULT,
 }
 
@@ -87,6 +97,38 @@ impl PolicyConfig {
             (vtable.set_default_endpoint)(self.0, PCWSTR(wide.as_ptr()), role)
                 .ok()
                 .map_err(|_| "audio_route_change_failed")
+        }
+    }
+
+    fn set_device_format(
+        &self,
+        endpoint: &str,
+        format: &mut WAVEFORMATEXTENSIBLE,
+    ) -> AudioResult<()> {
+        let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
+        let mut default_format = WAVEFORMATEX {
+            wFormatTag: 0,
+            nChannels: 0,
+            nSamplesPerSec: 0,
+            nAvgBytesPerSec: 0,
+            nBlockAlign: 0,
+            wBitsPerSample: 0,
+            cbSize: 0,
+        };
+        // SAFETY: the vtable slot is SetDeviceFormat, the fourth IPolicyConfig
+        // method after IUnknown. The UTF-16 ID and both format structures stay
+        // live for the synchronous COM call. This undocumented ABI is isolated
+        // here and invoked only for an explicitly selected virtual sink.
+        unsafe {
+            let vtable = &**(self.0 as *mut *const PolicyConfigVtable);
+            (vtable.set_device_format)(
+                self.0,
+                PCWSTR(wide.as_ptr()),
+                (&mut format.Format) as *mut WAVEFORMATEX,
+                &mut default_format,
+            )
+            .ok()
+            .map_err(|_| "virtual_sink_format_unavailable")
         }
     }
 }
@@ -355,6 +397,10 @@ fn identifier(device: &IMMDevice) -> AudioResult<String> {
 pub fn enumerate() -> AudioResult<Vec<Endpoint>> {
     let _apartment = Apartment::start()?;
     let enumerator = enumerator()?;
+    active_render_endpoints(&enumerator)
+}
+
+fn active_render_endpoints(enumerator: &IMMDeviceEnumerator) -> AudioResult<Vec<Endpoint>> {
     // SAFETY: active render endpoint enumeration opens no capture stream.
     unsafe {
         let default = enumerator
@@ -379,21 +425,33 @@ pub fn enumerate() -> AudioResult<Vec<Endpoint>> {
             let properties = device
                 .OpenPropertyStore(STGM_READ)
                 .map_err(|_| "endpoint_metadata_failed")?;
-            let value = properties
-                .GetValue(&PKEY_Device_FriendlyName)
-                .map_err(|_| "endpoint_metadata_failed")?;
-            let name = TaskString(
-                PropVariantToStringAlloc(&value).map_err(|_| "endpoint_metadata_failed")?,
-            )
-            .text()?;
+            let name = property_text(&properties, &PKEY_Device_FriendlyName)
+                .ok_or("endpoint_metadata_failed")?;
+            let description = property_text(&properties, &PKEY_Device_DeviceDesc);
+            let adapter_name = property_text(&properties, &PKEY_DeviceInterface_FriendlyName);
             endpoints.push(Endpoint {
                 default_multimedia: default.as_ref() == Some(&id),
                 id,
                 name,
+                description,
+                adapter_name,
             });
         }
         Ok(endpoints)
     }
+}
+
+fn property_text(
+    properties: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
+    key: &windows::Win32::Foundation::PROPERTYKEY,
+) -> Option<String> {
+    // SAFETY: property store is live in its caller's apartment, and the
+    // returned PROPVARIANT is converted synchronously before it is dropped.
+    let value = unsafe { properties.GetValue(key).ok()? };
+    // SAFETY: PropVariantToStringAlloc accepts the live PROPVARIANT and returns
+    // one task allocation, owned by TaskString below.
+    let text = unsafe { PropVariantToStringAlloc(&value).ok()? };
+    TaskString(text).text().ok()
 }
 
 struct MixFormat(*mut WAVEFORMATEX);
@@ -462,6 +520,51 @@ impl MixFormat {
     }
 }
 
+fn virtual_waveformat(channels: u32, channel_mask: u32, code: u32) -> WAVEFORMATEXTENSIBLE {
+    let bits_per_sample = if code == PCM_F32 { 32 } else { 16 };
+    let block_align = (channels * u32::from(bits_per_sample) / 8) as u16;
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: 0xfffe,
+            nChannels: channels as u16,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * u32::from(block_align),
+            nBlockAlign: block_align,
+            wBitsPerSample: bits_per_sample,
+            cbSize: 22,
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: bits_per_sample,
+        },
+        dwChannelMask: channel_mask,
+        SubFormat: if code == PCM_F32 {
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        } else {
+            KSDATAFORMAT_SUBTYPE_PCM
+        },
+    }
+}
+
+fn set_virtual_device_layout(endpoint: &str, layout: ChannelLayout) -> AudioResult<()> {
+    let policy = PolicyConfig::new()?;
+    for code in [PCM_F32, PCM_I16] {
+        for mask in layout.masks {
+            let mut format = virtual_waveformat(layout.channels, *mask, code);
+            if policy.set_device_format(endpoint, &mut format).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    Err("virtual_sink_format_unavailable")
+}
+
+fn validate_virtual_mix(format: Format, layout: ChannelLayout) -> AudioResult<()> {
+    if format.channels != layout.channels || !layout.masks.contains(&format.channel_mask) {
+        return Err("unsupported_channel_layout");
+    }
+    Ok(())
+}
+
 pub struct Capture {
     capture: IAudioCaptureClient,
     client: IAudioClient,
@@ -473,13 +576,29 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn open(requested: &str, capture_sink_without_routing: bool) -> AudioResult<Self> {
+    pub fn open(
+        requested: &str,
+        virtual_sink: Option<&str>,
+        channels: Option<u32>,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Self> {
         let apartment = Apartment::start()?;
         let enumerator = enumerator()?;
+        let desired_layout = virtual_sink
+            .map(|_| channel_layout(channels.unwrap_or(2)))
+            .transpose()?;
+        if virtual_sink.is_some() && capture_sink_without_routing {
+            return Err("invalid_open_policy");
+        }
         // SAFETY: activation and capture interface references never leave this
         // apartment. The mix-format allocation stays live through Initialize.
         unsafe {
-            let device = if requested == "default" {
+            let device = if let Some(selector) = virtual_sink {
+                let endpoints = active_render_endpoints(&enumerator)?;
+                let selected = select_endpoint(&endpoints, selector).ok_or("endpoint_not_found")?;
+                let wide: Vec<u16> = selected.id.encode_utf16().chain(Some(0)).collect();
+                enumerator.GetDevice(PCWSTR(wide.as_ptr()))
+            } else if requested == "default" {
                 enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)
             } else {
                 let wide: Vec<u16> = requested.encode_utf16().chain(Some(0)).collect();
@@ -497,11 +616,17 @@ impl Capture {
             let endpoint = identifier(&device)?;
             let route_lease =
                 RouteLease::acquire(&enumerator, &endpoint, capture_sink_without_routing)?;
+            if let Some(layout) = desired_layout {
+                set_virtual_device_layout(&endpoint, layout)?;
+            }
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|_| "audio_activation_failed")?;
             let mix = MixFormat(client.GetMixFormat().map_err(|_| "unsupported_format")?);
             let format = mix.describe()?;
+            if let Some(layout) = desired_layout {
+                validate_virtual_mix(format, layout)?;
+            }
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -687,7 +812,7 @@ mod tests {
             .or(devices.first())
             .expect("test needs an active render endpoint");
         let before = defaults();
-        let mut capture = Capture::open(&endpoint.id, true).unwrap();
+        let mut capture = Capture::open(&endpoint.id, None, None, true).unwrap();
         assert_eq!(capture.endpoint(), endpoint.id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut packets = 0;
