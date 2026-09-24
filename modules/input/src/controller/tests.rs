@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{Button, DevicePolicy, Key};
+use crate::model::{Axis, Button, DevicePolicy, Key};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -588,6 +588,270 @@ fn disabled_categories_are_accepted_without_native_injection() {
 }
 
 #[test]
+fn high_resolution_scroll_units_pass_through_by_default() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let token = acquire(&mut controller, Instant::now());
+    let events = vec![
+        Event::ScrollUnits {
+            axis: Axis::Vertical,
+            amount: 17,
+        },
+        Event::ScrollUnits {
+            axis: Axis::Horizontal,
+            amount: -31,
+        },
+    ];
+
+    assert_eq!(batch(&mut controller, &token, events)["ok"], true);
+    assert_eq!(
+        *controller.backend.trace.borrow(),
+        [
+            Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 17,
+            },
+            Event::ScrollUnits {
+                axis: Axis::Horizontal,
+                amount: -31,
+            },
+        ]
+    );
+}
+
+#[test]
+fn event_json_keeps_legacy_steps_and_adds_bounded_raw_units() {
+    let legacy: Event = serde_json::from_value(serde_json::json!({
+        "kind":"scroll",
+        "axis":"vertical",
+        "steps":-2,
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy,
+        Event::Scroll {
+            axis: Axis::Vertical,
+            steps: -2,
+        }
+    );
+
+    let raw: Event = serde_json::from_value(serde_json::json!({
+        "kind":"scroll_units",
+        "axis":"horizontal",
+        "amount":-45,
+    }))
+    .unwrap();
+    assert_eq!(
+        raw,
+        Event::ScrollUnits {
+            axis: Axis::Horizontal,
+            amount: -45,
+        }
+    );
+    assert!(raw.validate().is_ok());
+
+    let zero: Event = serde_json::from_value(serde_json::json!({
+        "kind":"scroll_units",
+        "axis":"vertical",
+        "amount":0,
+    }))
+    .unwrap();
+    assert_eq!(zero.validate().unwrap_err().code, "invalid_event");
+}
+
+#[test]
+fn disabled_high_resolution_scroll_accumulates_per_axis_and_resets_per_lease() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_high_resolution_scrolling(false);
+    let token = acquire(&mut controller, Instant::now());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![
+                Event::ScrollUnits {
+                    axis: Axis::Vertical,
+                    amount: 60,
+                },
+                Event::ScrollUnits {
+                    axis: Axis::Horizontal,
+                    amount: -60,
+                },
+                Event::ScrollUnits {
+                    axis: Axis::Vertical,
+                    amount: 60,
+                },
+                Event::ScrollUnits {
+                    axis: Axis::Horizontal,
+                    amount: -60,
+                },
+            ]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        *controller.backend.trace.borrow(),
+        [
+            Event::Scroll {
+                axis: Axis::Vertical,
+                steps: 1,
+            },
+            Event::Scroll {
+                axis: Axis::Horizontal,
+                steps: -1,
+            },
+        ]
+    );
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 60,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.vertical_scroll_remainder, 60);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            Instant::now(),
+            &mut || Ok(()),
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.vertical_scroll_remainder, 0);
+
+    let next_lease = acquire(&mut controller, Instant::now());
+    assert_eq!(
+        batch(
+            &mut controller,
+            &next_lease,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 60,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.backend.trace.borrow().len(), 2);
+    assert_eq!(controller.vertical_scroll_remainder, 60);
+}
+
+#[test]
+fn changing_scroll_mode_discards_fractional_wheel_units() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_high_resolution_scrolling(false);
+    let token = acquire(&mut controller, Instant::now());
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 60,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.vertical_scroll_remainder, 60);
+
+    controller.set_high_resolution_scrolling(true);
+    assert_eq!(controller.vertical_scroll_remainder, 0);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 60,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        controller.backend.trace.borrow().last(),
+        Some(&Event::ScrollUnits {
+            axis: Axis::Vertical,
+            amount: 60,
+        })
+    );
+}
+
+#[test]
+fn a_large_raw_scroll_is_split_into_bounded_legacy_step_events() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_high_resolution_scrolling(false);
+    let token = acquire(&mut controller, Instant::now());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: i16::MAX,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        *controller.backend.trace.borrow(),
+        [
+            Event::Scroll {
+                axis: Axis::Vertical,
+                steps: 100,
+            },
+            Event::Scroll {
+                axis: Axis::Vertical,
+                steps: 100,
+            },
+            Event::Scroll {
+                axis: Axis::Vertical,
+                steps: 73,
+            },
+        ]
+    );
+    assert_eq!(controller.vertical_scroll_remainder, 7);
+}
+
+#[test]
+fn failed_legacy_scroll_injection_does_not_commit_fractional_remainder() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_high_resolution_scrolling(false);
+    let token = acquire(&mut controller, Instant::now());
+    assert_eq!(
+        batch(&mut controller, &token, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+    controller.backend.fail_release = true;
+    controller.backend.fail_next = true;
+
+    let failed = batch(
+        &mut controller,
+        &token,
+        vec![Event::ScrollUnits {
+            axis: Axis::Vertical,
+            amount: 121,
+        }],
+    );
+    assert_eq!(failed["ok"], false);
+    assert_eq!(failed["accepted"], 0);
+    assert_eq!(failed["partial_event_possible"], true);
+    assert!(controller.cleanup_required());
+    assert_eq!(controller.vertical_scroll_remainder, 0);
+
+    controller.backend.fail_release = false;
+    controller.expire(Instant::now() + Duration::from_millis(101));
+    assert!(controller.lease.is_none());
+    assert_eq!(controller.vertical_scroll_remainder, 0);
+}
+
+#[test]
 fn disabling_a_category_releases_held_inputs_and_gates_before_cleanup_retry() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
@@ -614,7 +878,7 @@ fn disabling_a_category_releases_held_inputs_and_gates_before_cleanup_retry() {
         )
         .unwrap();
     assert_eq!(controller.pressed, [Pressed::Button(Button::Left)]);
-    assert_eq!(controller.device_policy().keyboard, false);
+    assert!(!controller.device_policy().keyboard);
     assert_eq!(
         batch(&mut controller, &token, vec![key(30, KeyState::Down)])["suppressed"],
         1
@@ -629,7 +893,7 @@ fn disabling_a_category_releases_held_inputs_and_gates_before_cleanup_retry() {
         now,
     );
     assert_eq!(failure.unwrap_err().code, "release_failed");
-    assert_eq!(controller.device_policy().mouse, false);
+    assert!(!controller.device_policy().mouse);
     assert!(controller.cleanup_required());
     assert_eq!(controller.pressed, [Pressed::Button(Button::Left)]);
 

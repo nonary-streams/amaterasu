@@ -56,10 +56,12 @@ controller state, and haptics return an explicit translation error.
 
 Wire mouse buttons map as 1 left, 2 middle, 3 right, 4 back, and 5 forward.
 Relative `-32768` is rejected because the input service's symmetric range ends at
-32767. Scroll amounts accumulate independently by axis in the protocol's 120-unit
-wheel detents; full steps are split into events of at most 100 steps. Thus one
-authenticated input record yields a batch of at most seven service events, and it
-may deliberately yield none for a duplicate release or partial wheel detent.
+32767. Nonzero scroll amounts pass through as raw signed 16-bit wheel units; the
+input service applies the global option and performs per-lease 120-unit detent
+accumulation when high-resolution scrolling is disabled. A zero scroll amount
+yields no event. One authenticated input record yields a batch of at most seven
+service events, and it may deliberately yield none for a duplicate release or
+zero-delta scroll record.
 
 Absolute coordinates are not inferred from the selected stream resolution.
 Translation requires an authoritative `AbsoluteViewport` expressed as an

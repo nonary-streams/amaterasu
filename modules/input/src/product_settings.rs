@@ -6,7 +6,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 1;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 2;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
@@ -17,6 +17,8 @@ pub struct InputPolicy {
     pub keyboard: bool,
     #[serde(default = "default_enabled")]
     pub mouse: bool,
+    #[serde(default = "default_enabled")]
+    pub high_resolution_scrolling: bool,
 }
 
 const fn default_enabled() -> bool {
@@ -32,7 +34,11 @@ impl InputPolicy {
     }
 
     fn values(self) -> Value {
-        json!({"keyboard":self.keyboard,"mouse":self.mouse})
+        json!({
+            "keyboard":self.keyboard,
+            "mouse":self.mouse,
+            "high_resolution_scrolling":self.high_resolution_scrolling,
+        })
     }
 
     fn update_payload(self, expected_revision: u64) -> Value {
@@ -50,6 +56,7 @@ impl Default for InputPolicy {
         Self {
             keyboard: true,
             mouse: true,
+            high_resolution_scrolling: true,
         }
     }
 }
@@ -125,6 +132,20 @@ impl ProductSettings {
 
     pub fn busy(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub fn merge_update(
+        &self,
+        keyboard: bool,
+        mouse: bool,
+        high_resolution_scrolling: Option<bool>,
+    ) -> InputPolicy {
+        InputPolicy {
+            keyboard,
+            mouse,
+            high_resolution_scrolling: high_resolution_scrolling
+                .unwrap_or(self.policy.high_resolution_scrolling),
+        }
     }
 
     pub fn get_response<B: Backend>(&self, controller: &Controller<B>) -> Value {
@@ -370,6 +391,7 @@ impl ProductSettings {
                         self.policy = policy;
                         self.revision = revision;
                         self.ready = true;
+                        controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
                         let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
@@ -433,6 +455,7 @@ impl ProductSettings {
                         self.policy = actual;
                         self.revision = revision;
                         self.ready = true;
+                        controller.set_high_resolution_scrolling(actual.high_resolution_scrolling);
                         let cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
@@ -468,6 +491,7 @@ impl ProductSettings {
         self.policy = policy;
         self.revision = revision;
         self.ready = true;
+        controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
         let cleanup = controller
             .set_device_policy(policy.device_policy(), std::time::Instant::now())
             .is_err();
@@ -489,8 +513,9 @@ impl ProductSettings {
 
     fn response<B: Backend>(&self, controller: &Controller<B>, persisted: bool) -> Value {
         let cleanup_required = controller.cleanup_required();
-        let applied =
-            controller.device_policy() == self.policy.device_policy() && !cleanup_required;
+        let applied = controller.device_policy() == self.policy.device_policy()
+            && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
+            && !cleanup_required;
         settings_response_with_state(
             self.policy,
             self.revision,
@@ -562,12 +587,18 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if payload["version"].as_u64() == Some(u64::from(PRODUCT_SETTINGS_VERSION)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1 | 2)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
-            if values
-                .keys()
-                .any(|key| !matches!(key.as_str(), "keyboard" | "mouse"))
-            {
+            let version = payload["version"].as_u64().unwrap_or_default();
+            let has_unknown_key = values.keys().any(|key| match version {
+                1 => !matches!(key.as_str(), "keyboard" | "mouse"),
+                2 => !matches!(
+                    key.as_str(),
+                    "keyboard" | "mouse" | "high_resolution_scrolling"
+                ),
+                _ => true,
+            });
+            if has_unknown_key {
                 return Err("unknown input policy value");
             }
             let policy: InputPolicy = serde_json::from_value(payload["values"].clone())

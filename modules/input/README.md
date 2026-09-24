@@ -20,20 +20,24 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 1 stores `{ "keyboard": true, "mouse": true }`; an absent
-document uses those defaults. The module needs calls to configuration and state
+after startup. Version 2 stores `keyboard`, `mouse`, and
+`high_resolution_scrolling`; an absent document enables all three. Version 1
+documents migrate in memory with high-resolution scrolling enabled, preserving
+the saved keyboard and mouse values. The next update writes the complete v2
+document. The module needs calls to configuration and state
 and dependencies on both services; the configuration service uses the caller's
 delegated authority for its durable state read. Management cannot select another
 product namespace.
 
 Administrators use the fixed management routes `/v1/input/settings_get` and
 `/v1/input/settings_update`, protected by `configuration.read` and
-`configuration.write`. An update body contains both boolean fields and
-`expected_revision`. Product settings actions accept only the exact runtime
-caller `amaterasu.management`.
+`configuration.write`. An update body contains both keyboard and mouse fields,
+`expected_revision`, and may contain `high_resolution_scrolling`. Older updates
+that omit the new field preserve its current durable value. Product settings
+actions accept only the exact runtime caller `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -52,9 +56,12 @@ be polled. Settings reads do not block on the startup fetch; they return
 `settings_unavailable` until the stored document has loaded rather than presenting
 bootstrap defaults as persisted settings.
 
-This slice implements only `global:keyboard` and `global:mouse`. Scancode mode,
-high-resolution scrolling, controller, and gamepad parity remain pending because
-their Amaterasu event encodings/backends need matching runtime effects first.
+The live global policy includes `keyboard`, `mouse`, and
+`high_resolution_scrolling`. When high-resolution scrolling is disabled, the
+input controller accumulates signed wheel units separately per axis and emits
+legacy 120-unit detents. Fractional remainders are discarded on mode changes,
+mouse disable, and lease end. The default preserves raw high-resolution units.
+Scancode mode, controller, and gamepad parity remain pending.
 
 ## JSON API
 
@@ -118,13 +125,21 @@ At most 128 keys/buttons may be held. Supported events:
   monitor or viewport. Linux absolute mapping is explicitly unsupported.
 - `scroll`: `axis` is `vertical` or `horizontal`; `steps` is a nonzero integer
   from -100 to 100. One step is 120 Windows wheel units or one evdev wheel detent.
-  High-resolution fractional scrolling is not implemented.
+- `scroll_units`: `axis` is `vertical` or `horizontal`; `amount` is a nonzero
+  signed 16-bit wheel-unit delta. This preserves Moonlight's raw fractional
+  scrolling. When the global high-resolution option is disabled, the controller
+  accumulates each axis and emits `scroll` detents instead.
 
 Linux key example:
 
 ```json
 {"kind":"key","key":{"platform":"linux_evdev","code":30},"state":"down"}
 ```
+
+On Linux, high-resolution wheel injection sends both `REL_WHEEL_HI_RES` /
+`REL_HWHEEL_HI_RES` units and compatible legacy detents as each axis reaches 120
+units. Linux event encoding is unit-tested but runtime delivery still needs
+verification on Linux hardware.
 
 Success responses contain `ok:true` and the lease/accepted event count or release
 result. Errors contain `ok:false`, `error.code`, `error.message`, and

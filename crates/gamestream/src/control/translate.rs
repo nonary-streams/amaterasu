@@ -1,8 +1,5 @@
 use super::Input;
 
-const WHEEL_DELTA: i32 = 120;
-const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyState {
     Down,
@@ -32,6 +29,7 @@ pub enum InputEvent {
     Relative { dx: i32, dy: i32 },
     Absolute { x: u16, y: u16 },
     Scroll { axis: ScrollAxis, steps: i32 },
+    ScrollUnits { axis: ScrollAxis, amount: i16 },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -85,8 +83,6 @@ impl AbsoluteViewport {
 pub struct InputTranslator {
     held_keys: [bool; 256],
     held_buttons: [bool; 5],
-    vertical_scroll_remainder: i32,
-    horizontal_scroll_remainder: i32,
     absolute_viewport: Option<AbsoluteViewport>,
 }
 
@@ -95,15 +91,13 @@ impl InputTranslator {
         Self {
             held_keys: [false; 256],
             held_buttons: [false; 5],
-            vertical_scroll_remainder: 0,
-            horizontal_scroll_remainder: 0,
             absolute_viewport,
         }
     }
 
     /// Translate one authenticated control input record into one bounded input
     /// service batch. Empty batches are deliberate for duplicate releases and
-    /// sub-detent scroll fragments.
+    /// zero-delta scroll records.
     pub fn translate(&mut self, input: Input<'_>) -> Result<InputBatch, TranslationError> {
         let events = match input {
             Input::Keyboard {
@@ -252,20 +246,10 @@ impl InputTranslator {
     }
 
     fn scroll(&mut self, axis: ScrollAxis, amount: i16) -> Vec<InputEvent> {
-        let remainder = match axis {
-            ScrollAxis::Horizontal => &mut self.horizontal_scroll_remainder,
-            ScrollAxis::Vertical => &mut self.vertical_scroll_remainder,
-        };
-        let total = *remainder + i32::from(amount);
-        let mut steps = total / WHEEL_DELTA;
-        *remainder = total % WHEEL_DELTA;
-        let mut events = Vec::new();
-        while steps != 0 {
-            let chunk = steps.clamp(-MAX_SCROLL_STEPS_PER_EVENT, MAX_SCROLL_STEPS_PER_EVENT);
-            events.push(InputEvent::Scroll { axis, steps: chunk });
-            steps -= chunk;
+        if amount == 0 {
+            return Vec::new();
         }
-        events
+        vec![InputEvent::ScrollUnits { axis, amount }]
     }
 }
 
@@ -503,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_button_order_scroll_accumulation_and_delta_bounds_are_explicit() {
+    fn mouse_button_order_and_raw_scroll_passthrough_are_explicit() {
         let mut translator = InputTranslator::default();
         assert_eq!(
             translator
@@ -518,22 +502,32 @@ mod tests {
                 pressed: true
             }]
         );
-        assert!(
-            translator
-                .translate(Input::VerticalScroll { amount: 60 })
-                .unwrap()
-                .events()
-                .is_empty()
-        );
         assert_eq!(
             translator
                 .translate(Input::VerticalScroll { amount: 60 })
                 .unwrap()
                 .events(),
-            &[InputEvent::Scroll {
+            &[InputEvent::ScrollUnits {
                 axis: ScrollAxis::Vertical,
-                steps: 1
+                amount: 60
             }]
+        );
+        assert_eq!(
+            translator
+                .translate(Input::HorizontalScroll { amount: -120 })
+                .unwrap()
+                .events(),
+            &[InputEvent::ScrollUnits {
+                axis: ScrollAxis::Horizontal,
+                amount: -120
+            }]
+        );
+        assert!(
+            translator
+                .translate(Input::VerticalScroll { amount: 0 })
+                .unwrap()
+                .events()
+                .is_empty()
         );
         assert_eq!(
             translator.translate(Input::RelativeMouse { x: i16::MIN, y: 0 }),

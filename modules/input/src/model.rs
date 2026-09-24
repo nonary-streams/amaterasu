@@ -114,6 +114,7 @@ pub enum Event {
     Relative { dx: i32, dy: i32 },
     Absolute { x: u16, y: u16 },
     Scroll { axis: Axis, steps: i32 },
+    ScrollUnits { axis: Axis, amount: i16 },
 }
 impl Event {
     pub fn enabled_by(&self, policy: DevicePolicy) -> bool {
@@ -122,7 +123,8 @@ impl Event {
             Self::Button { .. }
             | Self::Relative { .. }
             | Self::Absolute { .. }
-            | Self::Scroll { .. } => policy.mouse,
+            | Self::Scroll { .. }
+            | Self::ScrollUnits { .. } => policy.mouse,
         }
     }
 
@@ -163,6 +165,10 @@ impl Event {
                     "scroll steps must be nonzero and between -100 and 100",
                 ))
             }
+            Self::ScrollUnits { amount, .. } if *amount == 0 => Err(InputError::new(
+                "invalid_event",
+                "high-resolution scroll units must be nonzero",
+            )),
             _ => Ok(()),
         }
     }

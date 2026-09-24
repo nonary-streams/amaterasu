@@ -22,6 +22,28 @@ fn relative(sequence: u64) -> crate::plane::ControlRecord {
     }
 }
 
+fn vertical_scroll(sequence: u64, amount: i16) -> crate::plane::ControlRecord {
+    let mut payload = vec![0, 0, 0, 10, 10, 0, 0, 0];
+    payload.extend_from_slice(&amount.to_be_bytes());
+    payload.extend_from_slice(&amount.to_be_bytes());
+    payload.extend_from_slice(&[0, 0]);
+    crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload,
+        sequence,
+    }
+}
+
+fn horizontal_scroll(sequence: u64, amount: i16) -> crate::plane::ControlRecord {
+    let mut payload = vec![0, 0, 0, 6, 1, 0, 0, 0x55];
+    payload.extend_from_slice(&amount.to_be_bytes());
+    crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload,
+        sequence,
+    }
+}
+
 fn absolute(sequence: u64, x: u16, y: u16, width: u16, height: u16) -> crate::plane::ControlRecord {
     let mut payload = vec![0, 0, 0, 14, 5, 0, 0, 0];
     payload.extend_from_slice(&x.to_be_bytes());
@@ -82,6 +104,30 @@ fn active_input_is_batched_and_released_before_media_drain() {
         .unwrap();
     assert!(release < drain);
     assert!(host.broker.input_lease.is_none());
+}
+
+#[test]
+fn raw_vertical_and_horizontal_scroll_units_keep_order_and_fractional_amounts() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    host.plane.borrow_mut().controls.extend([
+        vertical_scroll(1, 60),
+        horizontal_scroll(2, -30),
+        vertical_scroll(3, 0),
+    ]);
+    host.idle();
+
+    assert_eq!(
+        host.broker.input_events,
+        [
+            json!({"kind":"scroll_units","axis":"vertical","amount":60}),
+            json!({"kind":"scroll_units","axis":"horizontal","amount":-30}),
+        ]
+    );
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 2);
 }
 
 #[test]

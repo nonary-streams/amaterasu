@@ -315,5 +315,13 @@ fn event_payload(event: InputEvent) -> Value {
             },
             "steps": steps,
         }),
+        InputEvent::ScrollUnits { axis, amount } => json!({
+            "kind": "scroll_units",
+            "axis": match axis {
+                ScrollAxis::Horizontal => "horizontal",
+                ScrollAxis::Vertical => "vertical",
+            },
+            "amount": amount,
+        }),
     }
 }

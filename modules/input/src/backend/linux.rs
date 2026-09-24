@@ -9,6 +9,13 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
+const REL_X: u16 = 0;
+const REL_Y: u16 = 1;
+const REL_HWHEEL: u16 = 6;
+const REL_WHEEL: u16 = 8;
+const REL_HWHEEL_HI_RES: u16 = 12;
+const REL_WHEEL_HI_RES: u16 = 11;
+const WHEEL_DELTA: i32 = 120;
 const UI_SET_EVBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 100);
 const UI_SET_KEYBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 101);
 const UI_SET_RELBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 102);
@@ -50,7 +57,14 @@ impl Device {
                 set_bit(fd, UI_SET_KEYBIT, code)?;
             }
             set_bit(fd, UI_SET_EVBIT, u32::from(EV_REL))?;
-            for code in [0, 1, 6, 8] {
+            for code in [
+                REL_X,
+                REL_Y,
+                REL_HWHEEL,
+                REL_WHEEL,
+                REL_HWHEEL_HI_RES,
+                REL_WHEEL_HI_RES,
+            ] {
                 set_bit(fd, UI_SET_RELBIT, code)?;
             }
         }
@@ -105,6 +119,8 @@ pub struct LinuxBackend {
     path: String,
     keyboard: Option<Device>,
     pointer: Option<Device>,
+    vertical_scroll_remainder: i32,
+    horizontal_scroll_remainder: i32,
 }
 impl LinuxBackend {
     pub fn new(path: String) -> Self {
@@ -112,6 +128,8 @@ impl LinuxBackend {
             path,
             keyboard: None,
             pointer: None,
+            vertical_scroll_remainder: 0,
+            horizontal_scroll_remainder: 0,
         }
     }
 }
@@ -154,6 +172,8 @@ impl Backend for LinuxBackend {
         }
         let keyboard = Device::create(&self.path, true)?;
         let pointer = Device::create(&self.path, false)?;
+        self.vertical_scroll_remainder = 0;
+        self.horizontal_scroll_remainder = 0;
         self.keyboard = Some(keyboard);
         self.pointer = Some(pointer);
         Ok(())
@@ -201,15 +221,18 @@ impl Backend for LinuxBackend {
                 },
                 i32::from(*pressed),
             )]),
-            Event::Relative { dx, dy } => pointer.emit(&[(EV_REL, 0, *dx), (EV_REL, 1, *dy)]),
+            Event::Relative { dx, dy } => {
+                pointer.emit(&[(EV_REL, REL_X, *dx), (EV_REL, REL_Y, *dy)])
+            }
             Event::Scroll { axis, steps } => pointer.emit(&[(
                 EV_REL,
                 match axis {
-                    Axis::Horizontal => 6,
-                    Axis::Vertical => 8,
+                    Axis::Horizontal => REL_HWHEEL,
+                    Axis::Vertical => REL_WHEEL,
                 },
                 *steps,
             )]),
+            Event::ScrollUnits { axis, amount } => self.scroll_units(*axis, *amount),
             _ => Err(InputError::new(
                 "unsupported_event",
                 "unsupported uinput event",
@@ -219,8 +242,133 @@ impl Backend for LinuxBackend {
     fn stop(&mut self) {
         self.pointer = None;
         self.keyboard = None;
+        self.vertical_scroll_remainder = 0;
+        self.horizontal_scroll_remainder = 0;
     }
 }
+
+impl LinuxBackend {
+    fn scroll_units(&mut self, axis: Axis, amount: i16) -> InputResult<()> {
+        let Self {
+            pointer,
+            vertical_scroll_remainder,
+            horizontal_scroll_remainder,
+            ..
+        } = self;
+        let pointer = pointer.as_ref().ok_or_else(not_started)?;
+        let remainder = match axis {
+            Axis::Horizontal => horizontal_scroll_remainder,
+            Axis::Vertical => vertical_scroll_remainder,
+        };
+        emit_scroll_units(axis, amount, remainder, |events| pointer.emit(events))
+    }
+}
+
+fn emit_scroll_units(
+    axis: Axis,
+    amount: i16,
+    remainder: &mut i32,
+    mut emit: impl FnMut(&[(u16, u16, i32)]) -> InputResult<()>,
+) -> InputResult<()> {
+    let ((high_resolution_code, high_resolution_amount), legacy, next_remainder) =
+        scroll_unit_frame(axis, amount, *remainder);
+    let mut events = [
+        (EV_REL, high_resolution_code, high_resolution_amount),
+        (EV_REL, 0, 0),
+    ];
+    let event_count = if let Some((legacy_code, legacy_steps)) = legacy {
+        events[1] = (EV_REL, legacy_code, legacy_steps);
+        2
+    } else {
+        1
+    };
+    emit(&events[..event_count])?;
+    *remainder = next_remainder;
+    Ok(())
+}
+
+fn scroll_unit_frame(
+    axis: Axis,
+    amount: i16,
+    remainder: i32,
+) -> ((u16, i32), Option<(u16, i32)>, i32) {
+    let (high_resolution_code, legacy_code) = match axis {
+        Axis::Horizontal => (REL_HWHEEL_HI_RES, REL_HWHEEL),
+        Axis::Vertical => (REL_WHEEL_HI_RES, REL_WHEEL),
+    };
+    let total = remainder + i32::from(amount);
+    let steps = total / WHEEL_DELTA;
+    let remainder = total % WHEEL_DELTA;
+    (
+        (high_resolution_code, i32::from(amount)),
+        (steps != 0).then_some((legacy_code, steps)),
+        remainder,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_resolution_scroll_maps_raw_units_and_compatible_detents_per_axis() {
+        let mut vertical = 0;
+        let (hi_res, legacy, vertical) = scroll_unit_frame(Axis::Vertical, 60, vertical);
+        assert_eq!(hi_res, (REL_WHEEL_HI_RES, 60));
+        assert_eq!(legacy, None);
+        assert_eq!(vertical, 60);
+        let (hi_res, legacy, vertical) = scroll_unit_frame(Axis::Vertical, 60, vertical);
+        assert_eq!(hi_res, (REL_WHEEL_HI_RES, 60));
+        assert_eq!(legacy, Some((REL_WHEEL, 1)));
+        assert_eq!(vertical, 0);
+
+        let (hi_res, legacy, vertical) = scroll_unit_frame(Axis::Vertical, -60, 0);
+        assert_eq!(hi_res, (REL_WHEEL_HI_RES, -60));
+        assert_eq!(legacy, None);
+        assert_eq!(vertical, -60);
+        let (_, legacy, vertical) = scroll_unit_frame(Axis::Vertical, -60, vertical);
+        assert_eq!(legacy, Some((REL_WHEEL, -1)));
+        assert_eq!(vertical, 0);
+
+        let (hi_res, legacy, horizontal) = scroll_unit_frame(Axis::Horizontal, -120, 0);
+        assert_eq!(hi_res, (REL_HWHEEL_HI_RES, -120));
+        assert_eq!(legacy, Some((REL_HWHEEL, -1)));
+        assert_eq!(horizontal, 0);
+
+        let (hi_res, legacy, horizontal) = scroll_unit_frame(Axis::Horizontal, 60, 0);
+        assert_eq!(hi_res, (REL_HWHEEL_HI_RES, 60));
+        assert_eq!(legacy, None);
+        assert_eq!(horizontal, 60);
+        let (_, legacy, horizontal) = scroll_unit_frame(Axis::Horizontal, 60, horizontal);
+        assert_eq!(legacy, Some((REL_HWHEEL, 1)));
+        assert_eq!(horizontal, 0);
+    }
+
+    #[test]
+    fn failed_uinput_scroll_write_preserves_fractional_remainder() {
+        let mut remainder = 60;
+        let result = emit_scroll_units(Axis::Vertical, 60, &mut remainder, |events| {
+            assert_eq!(
+                events,
+                &[(EV_REL, REL_WHEEL_HI_RES, 60), (EV_REL, REL_WHEEL, 1)]
+            );
+            Err(InputError::new("injection_failed", "test write failure"))
+        });
+        assert_eq!(result.unwrap_err().code, "injection_failed");
+        assert_eq!(remainder, 60);
+
+        emit_scroll_units(Axis::Vertical, 60, &mut remainder, |events| {
+            assert_eq!(
+                events,
+                &[(EV_REL, REL_WHEEL_HI_RES, 60), (EV_REL, REL_WHEEL, 1)]
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(remainder, 0);
+    }
+}
+
 fn write_frame(fd: RawFd, frame: &[libc::input_event]) -> InputResult<()> {
     let bytes = std::mem::size_of_val(frame);
     let mut written = 0;

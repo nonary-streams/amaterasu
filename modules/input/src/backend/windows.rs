@@ -132,6 +132,13 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
             };
             mouse.mouseData = (*steps * 120) as u32;
         }
+        Event::ScrollUnits { axis, amount } => {
+            mouse.dwFlags = match axis {
+                Axis::Horizontal => MOUSEEVENTF_HWHEEL,
+                Axis::Vertical => MOUSEEVENTF_WHEEL,
+            };
+            mouse.mouseData = i32::from(*amount) as u32;
+        }
         Event::Key { .. } => unreachable!("keyboard handled above"),
     }
     Ok(INPUT {
@@ -178,5 +185,15 @@ mod tests {
         // SAFETY: scroll events encode INPUT_MOUSE and initialize mi.
         let scroll = unsafe { scroll.Anonymous.mi };
         assert_eq!(scroll.mouseData as i32, -240);
+
+        let high_resolution = native_input(&Event::ScrollUnits {
+            axis: Axis::Horizontal,
+            amount: -30,
+        })
+        .unwrap();
+        // SAFETY: high-resolution scroll events encode INPUT_MOUSE and initialize mi.
+        let high_resolution = unsafe { high_resolution.Anonymous.mi };
+        assert_eq!(high_resolution.mouseData as i32, -30);
+        assert_eq!(high_resolution.dwFlags, MOUSEEVENTF_HWHEEL);
     }
 }

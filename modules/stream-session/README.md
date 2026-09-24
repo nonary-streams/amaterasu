@@ -61,7 +61,7 @@ never accepts a caller-supplied lease or operation identity. Input received befo
 the session becomes active is discarded without changing keyboard/button state.
 
 The active path supports the fixed Moonlight virtual-key mapping, relative mouse,
-five mouse buttons, and horizontal or vertical wheel detents. Absolute input is
+five mouse buttons, and raw horizontal or vertical wheel units. Absolute input is
 enabled only when the video provider returns a valid `desktop_geometry` snapshot
 for the captured output and its containing virtual desktop and the acquired input
 backend reports absolute-pointer support. The stream dimensions never substitute

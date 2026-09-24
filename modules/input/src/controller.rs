@@ -11,6 +11,8 @@ use std::{
 
 const MAX_ACQUIRE_OPERATIONS: usize = 64;
 const OPERATION_RETENTION: Duration = Duration::from_secs(300);
+const WHEEL_DELTA: i32 = 120;
+const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
 
 struct Lease {
     owner: String,
@@ -34,6 +36,9 @@ pub struct Controller<B: Backend> {
     backend: B,
     enabled: bool,
     device_policy: DevicePolicy,
+    high_resolution_scrolling: bool,
+    vertical_scroll_remainder: i32,
+    horizontal_scroll_remainder: i32,
     lease: Option<Lease>,
     // Preserve press order so cleanup releases chords in reverse order.
     pressed: Vec<Pressed>,
@@ -46,6 +51,9 @@ impl<B: Backend> Controller<B> {
             backend,
             enabled,
             device_policy: DevicePolicy::default(),
+            high_resolution_scrolling: true,
+            vertical_scroll_remainder: 0,
+            horizontal_scroll_remainder: 0,
             lease: None,
             pressed: Vec::new(),
             retry_at: Instant::now(),
@@ -97,11 +105,30 @@ impl<B: Backend> Controller<B> {
         self.device_policy
     }
 
+    pub fn high_resolution_scrolling(&self) -> bool {
+        self.high_resolution_scrolling
+    }
+
+    pub fn set_high_resolution_scrolling(&mut self, enabled: bool) {
+        if self.high_resolution_scrolling != enabled {
+            self.high_resolution_scrolling = enabled;
+            self.reset_scroll_remainders();
+        }
+    }
+
+    fn reset_scroll_remainders(&mut self) {
+        self.vertical_scroll_remainder = 0;
+        self.horizontal_scroll_remainder = 0;
+    }
+
     /// Switches policy gates before attempting native cleanup. Requests later
     /// in the module queue therefore cannot inject disabled categories even if
     /// releasing an already-held input needs a retry.
     pub fn set_device_policy(&mut self, policy: DevicePolicy, now: Instant) -> InputResult<()> {
         self.device_policy = policy;
+        if !policy.mouse {
+            self.reset_scroll_remainders();
+        }
         let mut failure = None;
         for index in (0..self.pressed.len()).rev() {
             let pressed = &self.pressed[index];
@@ -216,6 +243,7 @@ impl<B: Backend> Controller<B> {
         let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         guard()?;
         self.backend.start()?;
+        self.reset_scroll_remainders();
         self.lease = Some(Lease {
             owner: caller.into(),
             token: token.clone(),
@@ -323,7 +351,7 @@ impl<B: Backend> Controller<B> {
                     ));
                 }
                 if event.enabled_by(policy) {
-                    self.inject(event)
+                    self.inject_batch_event(event)
                 } else {
                     suppressed += 1;
                     Ok(())
@@ -415,6 +443,36 @@ impl<B: Backend> Controller<B> {
         }
         Ok(())
     }
+
+    fn inject_batch_event(&mut self, event: &Event) -> InputResult<()> {
+        let Event::ScrollUnits { axis, amount } = event else {
+            return self.inject(event);
+        };
+        if self.high_resolution_scrolling {
+            return self.inject(event);
+        }
+
+        let previous_remainder = match axis {
+            crate::model::Axis::Horizontal => self.horizontal_scroll_remainder,
+            crate::model::Axis::Vertical => self.vertical_scroll_remainder,
+        };
+        let total = previous_remainder + i32::from(*amount);
+        let mut steps = total / WHEEL_DELTA;
+        let next_remainder = total % WHEEL_DELTA;
+        while steps != 0 {
+            let chunk = steps.clamp(-MAX_SCROLL_STEPS_PER_EVENT, MAX_SCROLL_STEPS_PER_EVENT);
+            self.inject(&Event::Scroll {
+                axis: *axis,
+                steps: chunk,
+            })?;
+            steps -= chunk;
+        }
+        match axis {
+            crate::model::Axis::Horizontal => self.horizontal_scroll_remainder = next_remainder,
+            crate::model::Axis::Vertical => self.vertical_scroll_remainder = next_remainder,
+        }
+        Ok(())
+    }
     fn finish_lease(&mut self, now: Instant, reason: &'static str) -> InputResult<()> {
         if let Some(lease) = &mut self.lease {
             lease.termination_reason.get_or_insert(reason);
@@ -438,9 +496,11 @@ impl<B: Backend> Controller<B> {
             return Err(InputError::new("release_failed", error.message));
         }
         let Some(lease) = self.lease.take() else {
+            self.reset_scroll_remainders();
             self.retry_at = now;
             return Ok(());
         };
+        self.reset_scroll_remainders();
         self.backend.stop();
         if let Some(operation_id) = lease.operation_id {
             self.terminal_acquires.push_back(TerminalAcquire {
@@ -465,7 +525,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

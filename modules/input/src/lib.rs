@@ -8,7 +8,7 @@ use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, Runti
 use backend::NativeBackend;
 use controller::Controller;
 use model::{InputError, MAX_QUEUED_REQUESTS, Operation};
-use product_settings::{InputPolicy, ProductSettings};
+use product_settings::ProductSettings;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -51,6 +51,8 @@ enum SettingsOperation {
     SettingsUpdate {
         keyboard: bool,
         mouse: bool,
+        #[serde(default)]
+        high_resolution_scrolling: Option<bool>,
         expected_revision: u64,
     },
 }
@@ -194,6 +196,7 @@ impl InputModule {
                 Ok(SettingsOperation::SettingsUpdate {
                     keyboard,
                     mouse,
+                    high_resolution_scrolling,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -203,10 +206,15 @@ impl InputModule {
                         .deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis() as u64;
+                    let desired = self.product_settings.merge_update(
+                        keyboard,
+                        mouse,
+                        high_resolution_scrolling,
+                    );
                     match self.product_settings.begin_update(
                         request.id,
                         expected_revision,
-                        InputPolicy { keyboard, mouse },
+                        desired,
                         remaining_ms,
                     ) {
                         Ok(()) => Ok(()),
@@ -347,6 +355,40 @@ mod tests {
             &settings,
             SERVICE,
             &json!({"action":"status"}),
+        ));
+    }
+
+    #[test]
+    fn legacy_settings_update_shape_omits_only_the_new_scroll_field() {
+        let legacy: SettingsOperation = serde_json::from_value(json!({
+            "action":"settings_update",
+            "keyboard":false,
+            "mouse":true,
+            "expected_revision":4,
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            SettingsOperation::SettingsUpdate {
+                high_resolution_scrolling: None,
+                ..
+            }
+        ));
+
+        let current: SettingsOperation = serde_json::from_value(json!({
+            "action":"settings_update",
+            "keyboard":false,
+            "mouse":true,
+            "high_resolution_scrolling":false,
+            "expected_revision":4,
+        }))
+        .unwrap();
+        assert!(matches!(
+            current,
+            SettingsOperation::SettingsUpdate {
+                high_resolution_scrolling: Some(false),
+                ..
+            }
         ));
     }
 }

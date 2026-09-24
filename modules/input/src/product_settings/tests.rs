@@ -76,7 +76,10 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     }))
     .unwrap();
     assert_eq!(policy, InputPolicy::default());
-    assert_eq!(policy.values(), json!({"keyboard":true,"mouse":true}));
+    assert_eq!(
+        policy.values(),
+        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true})
+    );
     assert_eq!(revision, 0);
 }
 
@@ -105,19 +108,49 @@ fn product_v1_load_preserves_values_and_defaults_a_missing_legacy_field() {
         policy,
         InputPolicy {
             keyboard: false,
-            mouse: true
+            mouse: true,
+            high_resolution_scrolling: true,
         }
     );
     assert_eq!(revision, 9);
 }
 
 #[test]
+fn product_v2_reads_high_resolution_value_and_defaults_a_missing_field() {
+    let (disabled, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":2,
+        "revision":10,
+        "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false},
+    }))
+    .unwrap();
+    assert!(!disabled.high_resolution_scrolling);
+    assert!(!disabled.keyboard);
+    assert!(!disabled.mouse);
+
+    let (defaulted, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":2,
+        "revision":11,
+        "values":{"keyboard":false,"mouse":true},
+    }))
+    .unwrap();
+    assert!(defaulted.high_resolution_scrolling);
+    assert!(!defaulted.keyboard);
+    assert!(defaulted.mouse);
+}
+
+#[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
+        json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
+        json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true,"high_resolution_scrolling":"true"}}),
         json!({"ok":true,"found":false,"version":null,"revision":1,"values":{}}),
     ] {
         assert!(read_document(&document).is_err(), "accepted {document}");
@@ -125,7 +158,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v1_document() {
+fn update_requires_current_revision_and_sends_whole_v2_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -138,6 +171,7 @@ fn update_requires_current_revision_and_sends_whole_v1_document() {
             InputPolicy {
                 keyboard: false,
                 mouse: true,
+                high_resolution_scrolling: true,
             },
             10_000,
         )
@@ -153,6 +187,7 @@ fn update_requires_current_revision_and_sends_whole_v1_document() {
             InputPolicy {
                 keyboard: false,
                 mouse: false,
+                high_resolution_scrolling: false,
             },
             10_000,
         )
@@ -178,9 +213,65 @@ fn update_requires_current_revision_and_sends_whole_v1_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":1,
-            "values":{"keyboard":false,"mouse":false},
+            "version":2,
+            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false},
         })
+    );
+}
+
+#[test]
+fn old_updates_preserve_high_resolution_scrolling_and_new_updates_can_change_it() {
+    let mut settings = ProductSettings::new();
+    settings.ready = true;
+    settings.revision = 9;
+    settings.pending = None;
+    settings.policy.high_resolution_scrolling = false;
+    let legacy_desired = settings.merge_update(false, true, None);
+    assert!(!legacy_desired.high_resolution_scrolling);
+    settings
+        .begin_update(90, 9, legacy_desired, 10_000)
+        .unwrap();
+    let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
+        panic!("legacy settings update was not submitted");
+    };
+    assert_eq!(payload["version"], 2);
+    assert_eq!(
+        payload["values"],
+        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false})
+    );
+    assert!(
+        settings
+            .merge_update(false, true, Some(true))
+            .high_resolution_scrolling
+    );
+}
+
+#[test]
+fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() {
+    let mut settings = ProductSettings::new();
+    let mut controller = Controller::new(TestBackend::default(), true);
+    let mut script = Script::new([Response::Ok]);
+    let policy = InputPolicy {
+        keyboard: true,
+        mouse: true,
+        high_resolution_scrolling: false,
+    };
+
+    settings
+        .apply_update(
+            &mut |command| script.send(command),
+            &mut controller,
+            93,
+            policy,
+            1,
+        )
+        .unwrap();
+
+    assert!(!controller.high_resolution_scrolling());
+    assert_eq!(settings.get_response(&controller)["applied"], true);
+    assert_eq!(
+        settings.get_response(&controller)["values"]["high_resolution_scrolling"],
+        false
     );
 }
 
@@ -190,6 +281,7 @@ fn management_readback_distinguishes_persisted_and_applied_policy() {
         InputPolicy {
             keyboard: false,
             mouse: true,
+            high_resolution_scrolling: true,
         },
         12,
         true,
@@ -233,9 +325,9 @@ fn terminal_configuration_result_is_retained_until_release_then_applied_once() {
     let updated = json!({
         "ok":true,
         "found":true,
-        "version":1,
+        "version":2,
         "revision":1,
-        "values":{"keyboard":false,"mouse":true},
+        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true},
     });
     let mut script = Script::new([
         Response::Accepted { id: 11 },
@@ -271,6 +363,7 @@ fn terminal_configuration_result_is_retained_until_release_then_applied_once() {
             InputPolicy {
                 keyboard: false,
                 mouse: true,
+                high_resolution_scrolling: true,
             },
             10_000,
         )
@@ -366,8 +459,8 @@ fn native_release_failure_reports_saved_policy_as_pending() {
     );
 
     let product_result = json!({
-        "ok":true,"found":true,"version":1,"revision":1,
-        "values":{"keyboard":false,"mouse":true}
+        "ok":true,"found":true,"version":2,"revision":1,
+        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true}
     });
     let mut script = Script::new([Response::Ok, Response::Ok]);
     let mut settings = ProductSettings::new();
@@ -379,6 +472,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
             desired: InputPolicy {
                 keyboard: false,
                 mouse: true,
+                high_resolution_scrolling: true,
             },
         },
         call: Call::Releasing {
