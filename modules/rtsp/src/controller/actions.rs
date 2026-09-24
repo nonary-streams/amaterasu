@@ -43,6 +43,14 @@ impl Controller {
     ) {
         match operation {
             Operation::Open(config) => self.open(request, caller, config, now, remaining, runtime),
+            Operation::NetworkConfigure { port } => {
+                if caller != "amaterasu.nvhttp" {
+                    rpc::complete(runtime, request, error("permission_denied"));
+                } else {
+                    let payload = self.configure_network_port(port, now).unwrap_or_else(error);
+                    rpc::complete(runtime, request, payload);
+                }
+            }
             Operation::Close { ticket } => self.close(request, &caller, ticket, now, runtime),
             Operation::Status { ticket } => self.status(request, &caller, ticket, runtime),
             Operation::Lookup { operation_id } => {
@@ -136,9 +144,12 @@ impl Controller {
             revoke_after: None,
             cleanup_confirmed: false,
         };
-        let payload = record
-            .config
-            .prepare(&record.operation(), record.udp_discovery.as_ref());
+        let media_binds = self.media_binds_for_open();
+        let payload = record.config.prepare_with_media_binds(
+            &record.operation(),
+            record.udp_discovery.as_ref(),
+            media_binds,
+        );
         let operation = self.operation_id(&record, "prepare");
         self.records.insert(ticket, record);
         self.job = Some(Job {

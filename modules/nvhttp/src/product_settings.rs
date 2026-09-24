@@ -90,10 +90,12 @@ pub struct ProductSettings {
     port_configured: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
+    active_rtsp_base_port: Option<u16>,
     revision: u64,
     loaded: bool,
     last_error: Option<String>,
     listener_error: Option<String>,
+    rtsp_listener_error: Option<String>,
     queued: VecDeque<AdminRequest>,
     completions: VecDeque<Completion>,
     pending: Option<PendingCall>,
@@ -106,6 +108,7 @@ struct Completion {
     request: u64,
     payload: Value,
     required_http_port: Option<u16>,
+    required_rtsp_port: Option<u16>,
 }
 
 impl ProductSettings {
@@ -124,10 +127,12 @@ impl ProductSettings {
             port_configured: false,
             active_http_port: None,
             active_https_port: None,
+            active_rtsp_base_port: None,
             revision: 0,
             loaded: false,
             last_error: None,
             listener_error: None,
+            rtsp_listener_error: None,
             queued: VecDeque::new(),
             completions: VecDeque::new(),
             pending: None,
@@ -147,6 +152,39 @@ impl ProductSettings {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_rtsp_base_port(&self) -> Option<u16> {
+        self.active_rtsp_base_port
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rtsp_listener_error(&self) -> Option<&str> {
+        self.rtsp_listener_error.as_deref()
+    }
+
+    pub fn set_active_rtsp_base_port(&mut self, port: Option<u16>) {
+        self.active_rtsp_base_port = port;
+    }
+
+    pub fn rtsp_completion_request(&self, port: u16) -> Option<u64> {
+        self.completions
+            .iter()
+            .find(|completion| completion.required_rtsp_port == Some(port))
+            .map(|completion| completion.request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rtsp_completion_payload(&self, request: u64) -> Option<&Value> {
+        self.completions
+            .iter()
+            .find(|completion| completion.request == request)
+            .map(|completion| &completion.payload)
     }
 
     pub fn port_needs_application(&self) -> bool {
@@ -189,6 +227,29 @@ impl ProductSettings {
         self.listener_error = None;
     }
 
+    pub fn record_rtsp_apply_failure(&mut self, port: u16, message: String) {
+        self.rtsp_listener_error = Some(message.clone());
+        if let Some(completion) = self
+            .completions
+            .iter_mut()
+            .find(|completion| completion.required_rtsp_port == Some(port))
+        {
+            completion.payload = json!({
+                "ok":false,
+                "code":"listener_apply_pending",
+                "message":format!("settings were persisted but RTSP/UDP listeners are not active: {message}"),
+                "persisted":true,
+                "hostname":self.hostname,
+                "revision":self.revision,
+            });
+            completion.required_rtsp_port = None;
+        }
+    }
+
+    pub fn record_rtsp_apply_success(&mut self) {
+        self.rtsp_listener_error = None;
+    }
+
     pub fn record_listener_disabled(&mut self) {
         if self.port_needs_application() {
             self.listener_error =
@@ -203,6 +264,7 @@ impl ProductSettings {
     pub fn last_error(&self) -> Option<&str> {
         self.listener_error
             .as_deref()
+            .or(self.rtsp_listener_error.as_deref())
             .or(self.last_error.as_deref())
     }
 
@@ -375,6 +437,11 @@ impl ProductSettings {
     }
 
     fn start_next(&mut self) {
+        if self.completions.iter().any(|completion| {
+            completion.required_http_port.is_some() || completion.required_rtsp_port.is_some()
+        }) {
+            return;
+        }
         if !self.loaded {
             if Instant::now() >= self.next_retry {
                 self.start_load(None);
@@ -566,6 +633,7 @@ impl ProductSettings {
                                     request,
                                     self.settings_payload(),
                                     require_listener_apply.then_some(port),
+                                    require_listener_apply.then_some(port),
                                 );
                             }
                         }
@@ -639,19 +707,22 @@ impl ProductSettings {
             request,
             payload,
             required_http_port: None,
+            required_rtsp_port: None,
         });
     }
 
-    fn queue_update_completion(
+    pub(crate) fn queue_update_completion(
         &mut self,
         request: u64,
         payload: Value,
         required_http_port: Option<u16>,
+        required_rtsp_port: Option<u16>,
     ) {
         self.completions.push_back(Completion {
             request,
             payload,
             required_http_port,
+            required_rtsp_port,
         });
     }
 
@@ -665,11 +736,19 @@ impl ProductSettings {
         }) {
             return;
         }
+        if completion
+            .required_rtsp_port
+            .is_some_and(|port| self.active_rtsp_base_port != Some(port))
+        {
+            return;
+        }
         let mut payload = completion.payload.clone();
         if payload.get("ok").and_then(Value::as_bool) == Some(true) {
             payload["active_http_port"] = json!(self.active_http_port);
             payload["active_https_port"] = json!(self.active_https_port);
+            payload["active_rtsp_port"] = json!(self.active_rtsp_base_port);
             payload["listener_error"] = json!(self.listener_error);
+            payload["rtsp_listener_error"] = json!(self.rtsp_listener_error);
         }
         match runtime.send(Command::Complete {
             request: completion.request,
@@ -712,6 +791,8 @@ impl ProductSettings {
             "active_http_port":self.active_http_port,
             "active_https_port":self.active_https_port,
             "listener_error":self.listener_error,
+            "active_rtsp_port":self.active_rtsp_base_port,
+            "rtsp_listener_error":self.rtsp_listener_error,
             "revision":self.revision,
         })
     }
@@ -1036,7 +1117,9 @@ mod tests {
                 "https_port":47984,
                 "active_http_port":null,
                 "active_https_port":null,
+                "active_rtsp_port":null,
                 "listener_error":null,
+                "rtsp_listener_error":null,
                 "revision":3,
             })
         );
@@ -1126,7 +1209,12 @@ mod tests {
     fn failed_live_port_apply_never_reports_a_committed_update_as_applied() {
         let mut settings = ProductSettings::new("Computer Name".into(), settings::DEFAULT_PORT);
         settings.set_active_ports(Some(47_989), Some(47_984));
-        settings.queue_update_completion(12, settings.settings_payload(), Some(48_000));
+        settings.queue_update_completion(
+            12,
+            settings.settings_payload(),
+            Some(48_000),
+            Some(48_000),
+        );
 
         settings.record_port_apply_failure(48_000, "HTTPS listener unavailable".into());
 
@@ -1136,5 +1224,39 @@ mod tests {
         assert_eq!(completion.payload["code"], "listener_apply_failed");
         assert_eq!(completion.payload["persisted"], true);
         assert_eq!(completion.required_http_port, None);
+    }
+
+    #[test]
+    fn settings_update_waits_for_rtsp_base_port_and_reports_persisted_pending_on_failure() {
+        let mut settings = ProductSettings::new("Computer Name".into(), settings::DEFAULT_PORT);
+        settings.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":2,"revision":2,
+                "values":{"hostname":"Old Host","port":47989}
+            }))
+            .unwrap(),
+        );
+        settings.set_active_ports(Some(47_989), Some(47_984));
+        settings.queue_update_completion(
+            77,
+            settings.settings_payload(),
+            Some(47_989),
+            Some(47_989),
+        );
+
+        assert_eq!(settings.rtsp_completion_request(47_989), Some(77));
+        assert_eq!(settings.completions.front().unwrap().payload["ok"], true);
+
+        settings.record_rtsp_apply_failure(47_989, "listener_apply_pending: active stream".into());
+        assert_eq!(settings.rtsp_completion_request(47_989), None);
+        let completion = settings.completions.front().unwrap();
+        let payload = &completion.payload;
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["code"], "listener_apply_pending");
+        assert_eq!(payload["persisted"], true);
+        assert_eq!(
+            settings.settings_payload()["rtsp_listener_error"],
+            "listener_apply_pending: active stream"
+        );
     }
 }

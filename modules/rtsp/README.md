@@ -26,6 +26,17 @@ authorized settings.
 The ticket peer and explicit listener must use the same address family; an
 unreachable ticket is rejected before media allocation.
 
+NVHTTP is the only caller allowed to use the private `network_configure {port}`
+action. For a valid base port in 1029..=65514, it configures this listener at
+base+21 and passes per-stream local UDP binds at base+9 (video), base+10 (control),
+and base+11 (audio) to `stream-session`. The existing listener IP is preserved.
+The action defers while a ticket is live or an accepted TCP connection remains,
+and reports active only after the replacement RTSP listener binds and all three
+UDP addresses pass a simultaneous bind check. UDP sockets themselves belong to
+per-session stream owners, so the check does not reserve ports between streams.
+Pending updates keep new opens on the previous active base until retry succeeds.
+This does not alter NVHTTP's HTTP/HTTPS listener or weaken its loopback policy.
+
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,
 downstream `stream_state`, and fixed failure/cleanup codes. `playing` means PLAY
 was accepted; `stream_state: active` separately indicates media startup completed.

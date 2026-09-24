@@ -65,20 +65,35 @@ revision 1.
 The NVHTTP product settings editor also stores a Moonlight HTTP base port. It
 accepts 1029 through 65514; the HTTP listener binds to that port and HTTPS to the
 base port minus five. This matches Vibeshine's NVHTTP port offsets and keeps both
-ports in range. Updating the base port prepares both replacement listeners before
-releasing either current listener, retains accepted connections, and updates
-/serverinfo to advertise the new bound ports. A successful update is acknowledged
-only after both listeners are active. If binding fails after persistence, NVHTTP
-returns listener_apply_failed with persisted:true, retains the previous active
-listeners, and retries applying the stored port with backoff.
+ports in range. The same setting configures RTSP TCP at base+21 and the per-stream
+UDP source ports at base+9 (video), base+10 (control), and base+11 (audio). The
+RTSP listener retains its configured bind IP; the NVHTTP control listener remains
+loopback unless startup policy explicitly allows remote binding.
+
+Updating the base port prepares both NVHTTP replacement listeners before releasing
+either current listener, retains accepted connections, and updates `/serverinfo`
+to advertise the new bound ports. RTSP changes wait until all live RTSP tickets
+are terminal and accepted RTSP TCP connections have closed. While that change is
+pending, new RTSP opens keep using the active base port. The RTSP module checks that
+all three UDP addresses can bind together before acknowledging application, then
+passes those addresses to `stream-session` for each later stream. Per-session UDP
+sockets are created by the stream owner and are not reserved while idle, so an
+external process can still claim a port after preflight.
+
+A successful update is acknowledged only after both NVHTTP listeners and the RTSP
+listener/UDP bind preflight are active at the requested base. If an RTSP stream is
+active, a TCP or UDP target is occupied, or a listener cannot bind after
+persistence, NVHTTP returns `listener_apply_pending` with `persisted:true`, retains
+the previous active ports, and retries applying the stored port. Restart loads the
+stored base and repeats reconciliation. The settings response includes
+`active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
 active_http_port/active_https_port values. A legacy version 1 hostname-only product
 document remains readable and uses the component's configured HTTP port; the next
 update writes a version 2 document containing both hostname and port. This NVHTTP
 slice keeps its configured bind IPs unchanged and loopback restrictions intact. It
-does not yet apply the global address_family or bind_address settings, or remap the
-separate RTSP and UDP streaming ports, which remain startup-configured.
+does not yet apply the global `address_family` or `bind_address` settings.
 
 Public streaming is a separate startup opt-in. Omitting `streaming` disables it.
 The complete settings object has no executable, arguments, environment, or catalog

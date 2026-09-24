@@ -43,6 +43,10 @@ struct PendingNetwork {
 
 pub struct Controller {
     settings: Settings,
+    network_base_port: Option<u16>,
+    active_network_base_port: Option<u16>,
+    network_error: Option<&'static str>,
+    network_retry_at: u64,
     transport: Option<Transport>,
     local: Option<SocketAddr>,
     records: BTreeMap<u64, Record>,
@@ -55,6 +59,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
+        let network_base_port = settings.default_base_port();
         let (transport, local) = if settings.enabled {
             let transport = Transport::bind(settings.bind, settings.allow_remote)?;
             let local = transport.local_addr()?;
@@ -64,6 +69,10 @@ impl Controller {
         };
         Ok(Self {
             settings,
+            network_base_port,
+            active_network_base_port: None,
+            network_error: None,
+            network_retry_at: 0,
             transport,
             local,
             records: BTreeMap::new(),
@@ -86,6 +95,7 @@ impl Controller {
         if self.job.is_none() {
             self.poll_caller(runtime, now)?;
         }
+        self.reconcile_network_port(now);
         Ok(())
     }
 
@@ -120,6 +130,96 @@ impl Controller {
         }
         self.pending_network
             .retain(|pending| pending.ticket != ticket);
+    }
+
+    pub(super) fn configure_network_port(
+        &mut self,
+        port: u16,
+        now: u64,
+    ) -> Result<Value, &'static str> {
+        crate::model::validate_base_port(port)?;
+        self.network_base_port = Some(port);
+        self.network_error = None;
+        let applied = self.try_apply_network_port();
+        if let Err(error) = applied {
+            self.network_error = Some(error);
+            self.network_retry_at = now.saturating_add(1_000);
+        } else if applied == Ok(true) {
+            self.active_network_base_port = Some(port);
+            self.network_retry_at = 0;
+        }
+        Ok(self.network_status(applied.is_ok_and(|applied| applied)))
+    }
+
+    pub(super) fn media_binds_for_open(&self) -> Option<crate::model::MediaBinds> {
+        self.active_network_base_port
+            .or(self.network_base_port)
+            .and_then(|port| self.settings.media_binds(port).ok())
+    }
+
+    fn reconcile_network_port(&mut self, now: u64) {
+        if self.network_base_port.is_none() || now < self.network_retry_at {
+            return;
+        }
+        match self.try_apply_network_port() {
+            Ok(true) => {
+                self.active_network_base_port = self.network_base_port;
+                self.network_error = None;
+                self.network_retry_at = 0;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.network_error = Some(error);
+                self.network_retry_at = now.saturating_add(1_000);
+            }
+        }
+    }
+
+    fn try_apply_network_port(&mut self) -> Result<bool, &'static str> {
+        let Some(base_port) = self.network_base_port else {
+            return Ok(false);
+        };
+        let bind = self.settings.rtsp_bind_for_base(base_port)?;
+        if self.active_network_base_port == Some(base_port) && self.local == Some(bind) {
+            return Ok(true);
+        }
+        if !self.settings.enabled
+            || self.records.values().any(|record| !record.state.terminal())
+            || self
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.connection_count() != 0)
+        {
+            return Ok(false);
+        }
+
+        self.settings.probe_media_binds(base_port)?;
+        if self.local == Some(bind) {
+            self.active_network_base_port = Some(base_port);
+            self.network_error = None;
+            return Ok(true);
+        }
+        let replacement = Transport::bind(bind, self.settings.allow_remote)?;
+        let local = replacement.local_addr()?;
+        self.transport = Some(replacement);
+        self.local = Some(local);
+        self.settings.bind = local;
+        self.active_network_base_port = Some(base_port);
+        self.network_error = None;
+        Ok(true)
+    }
+
+    fn network_status(&self, applied: bool) -> Value {
+        serde_json::json!({
+            "ok": true,
+            "desired_port": self.network_base_port,
+            "rtsp_port": self.local.map(|address| address.port()),
+            "active_base_port": self.active_network_base_port,
+            "active": applied,
+            "pending": !applied,
+            "udp_binds_preflighted": applied,
+            "error": self.network_error,
+        })
     }
 }
 

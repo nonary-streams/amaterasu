@@ -1,5 +1,6 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 mod launch;
+mod network_settings;
 mod product_settings;
 mod server;
 mod settings;
@@ -7,6 +8,7 @@ mod tls;
 mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use network_settings::NetworkSettings;
 use product_settings::{AdminAction, ProductSettings};
 use serde::Deserialize;
 use serde_json::json;
@@ -44,6 +46,7 @@ struct NvhttpModule {
     next_refresh: Instant,
     warm: WarmIdentity,
     product_settings: ProductSettings,
+    network_settings: NetworkSettings,
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
 }
@@ -87,6 +90,7 @@ impl ManagedModule for NvhttpModule {
             next_refresh: Instant::now(),
             warm: WarmIdentity::new(),
             product_settings,
+            network_settings: NetworkSettings::default(),
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
         })
@@ -105,6 +109,15 @@ impl ManagedModule for NvhttpModule {
             {
                 self.next_listener_rebind = Instant::now();
             }
+        }
+        if self.product_settings.loaded() {
+            self.network_settings.tick(
+                &self.runtime,
+                self.product_settings.port(),
+                &mut self.product_settings,
+            )?;
+            self.product_settings
+                .set_active_rtsp_base_port(self.network_settings.active_base_port());
         }
         if self.server.is_none() {
             self.product_settings.record_listener_disabled();

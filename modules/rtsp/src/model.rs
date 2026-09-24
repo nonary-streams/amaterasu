@@ -3,7 +3,15 @@ use amaterasu_gamestream::{
     sdp::{Announce, ColorMode, ControlProtocol},
 };
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+
+const DEFAULT_BASE_PORT: u16 = 47_989;
+const MIN_BASE_PORT: u16 = 1_029;
+const MAX_BASE_PORT: u16 = 65_514;
+const RTSP_SETUP_OFFSET: u16 = 21;
+const VIDEO_OFFSET: u16 = 9;
+const CONTROL_OFFSET: u16 = 10;
+const AUDIO_OFFSET: u16 = 11;
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -18,7 +26,7 @@ impl Default for Settings {
         Self {
             enabled: false,
             allow_remote: false,
-            bind: "127.0.0.1:48010".parse().expect("literal"),
+            bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_BASE_PORT + RTSP_SETUP_OFFSET)),
             allowed_principals: Vec::new(),
         }
     }
@@ -36,6 +44,61 @@ impl Settings {
             return Err("invalid_bind");
         }
         Ok(())
+    }
+
+    pub fn default_base_port(&self) -> Option<u16> {
+        let port = self.bind.port();
+        if port == 0 {
+            None
+        } else {
+            port.checked_sub(RTSP_SETUP_OFFSET)
+                .filter(|base| (MIN_BASE_PORT..=MAX_BASE_PORT).contains(base))
+        }
+    }
+
+    pub fn rtsp_bind_for_base(&self, base_port: u16) -> Result<SocketAddr, &'static str> {
+        validate_base_port(base_port)?;
+        Ok(SocketAddr::new(
+            self.bind.ip(),
+            base_port + RTSP_SETUP_OFFSET,
+        ))
+    }
+
+    pub fn media_binds(&self, base_port: u16) -> Result<MediaBinds, &'static str> {
+        validate_base_port(base_port)?;
+        let address = self.bind.ip();
+        Ok(MediaBinds {
+            video: SocketAddr::new(address, base_port + VIDEO_OFFSET),
+            control: SocketAddr::new(address, base_port + CONTROL_OFFSET),
+            audio: SocketAddr::new(address, base_port + AUDIO_OFFSET),
+        })
+    }
+
+    pub fn probe_media_binds(&self, base_port: u16) -> Result<(), &'static str> {
+        let binds = self.media_binds(base_port)?;
+        // Hold every UDP socket until the complete set has been checked. The
+        // stream-session service later binds its per-session sockets from the
+        // same addresses; this preflight cannot reserve sockets across services.
+        let mut sockets = Vec::with_capacity(3);
+        for bind in [binds.video, binds.control, binds.audio] {
+            sockets.push(UdpSocket::bind(bind).map_err(|_| "udp_bind_failed")?);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaBinds {
+    pub video: SocketAddr,
+    pub control: SocketAddr,
+    pub audio: SocketAddr,
+}
+
+pub fn validate_base_port(port: u16) -> Result<(), &'static str> {
+    if (MIN_BASE_PORT..=MAX_BASE_PORT).contains(&port) {
+        Ok(())
+    } else {
+        Err("invalid_port")
     }
 }
 
@@ -214,7 +277,17 @@ impl Open {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn prepare(&self, operation: &str, discovery: Option<&UdpDiscovery>) -> serde_json::Value {
+        self.prepare_with_media_binds(operation, discovery, None)
+    }
+
+    pub fn prepare_with_media_binds(
+        &self,
+        operation: &str,
+        discovery: Option<&UdpDiscovery>,
+        binds: Option<MediaBinds>,
+    ) -> serde_json::Value {
         let mut payload = serde_json::json!({
             "action": "prepare",
             "operation_id": operation,
@@ -245,6 +318,11 @@ impl Open {
             payload["video_port"] = self.video_port.into();
             payload["audio_port"] = self.audio_port.into();
         }
+        if let Some(binds) = binds {
+            payload["video_bind"] = serde_json::json!(binds.video);
+            payload["control_bind"] = serde_json::json!(binds.control);
+            payload["audio_bind"] = serde_json::json!(binds.audio);
+        }
         payload
     }
 
@@ -273,6 +351,7 @@ impl Open {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Open(Open),
+    NetworkConfigure { port: u16 },
     Close { ticket: u64 },
     Status { ticket: Option<u64> },
     Lookup { operation_id: String },
@@ -396,6 +475,53 @@ mod tests {
                 Err("invalid_settings")
             );
         }
+    }
+
+    #[test]
+    fn global_port_uses_vibeshine_rtsp_and_media_offsets_on_the_configured_ip() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        let binds = settings.media_binds(DEFAULT_BASE_PORT).unwrap();
+        assert_eq!(binds.video, "127.0.0.1:47998".parse().unwrap());
+        assert_eq!(binds.control, "127.0.0.1:47999".parse().unwrap());
+        assert_eq!(binds.audio, "127.0.0.1:48000".parse().unwrap());
+        assert_eq!(
+            settings.rtsp_bind_for_base(DEFAULT_BASE_PORT).unwrap(),
+            "127.0.0.1:48010".parse().unwrap()
+        );
+
+        let ipv6: Settings = serde_json::from_value(serde_json::json!({
+            "bind": "[::1]:48010"
+        }))
+        .unwrap();
+        let ipv6_binds = ipv6.media_binds(48_000).unwrap();
+        assert_eq!(ipv6_binds.video, "[::1]:48009".parse().unwrap());
+        assert_eq!(ipv6_binds.control, "[::1]:48010".parse().unwrap());
+        assert_eq!(ipv6_binds.audio, "[::1]:48011".parse().unwrap());
+
+        for invalid in [0, 1_028, 65_515, u16::MAX] {
+            assert_eq!(settings.media_binds(invalid), Err("invalid_port"));
+            assert_eq!(settings.rtsp_bind_for_base(invalid), Err("invalid_port"));
+        }
+    }
+
+    #[test]
+    fn rtsp_prepare_includes_configured_server_udp_source_ports() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        let binds = settings.media_binds(DEFAULT_BASE_PORT).unwrap();
+        let payload = open().prepare_with_media_binds("operation", None, Some(binds));
+        assert_eq!(payload["video_bind"], "127.0.0.1:47998");
+        assert_eq!(payload["control_bind"], "127.0.0.1:47999");
+        assert_eq!(payload["audio_bind"], "127.0.0.1:48000");
+
+        let discovery = UdpDiscovery {
+            video_ping_payload: "video-token-0001".into(),
+            audio_ping_payload: "audio-token-0001".into(),
+        };
+        let payload = open().prepare_with_media_binds("discovery", Some(&discovery), Some(binds));
+        assert!(payload.get("video_port").is_none());
+        assert!(payload.get("audio_port").is_none());
+        assert_eq!(payload["video_bind"], "127.0.0.1:47998");
+        assert_eq!(payload["audio_bind"], "127.0.0.1:48000");
     }
 
     #[test]

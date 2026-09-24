@@ -1,18 +1,29 @@
 use super::*;
 use amaterasu_gamestream::rtsp::Method;
 use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
-use std::ffi::c_void;
+use std::{
+    ffi::c_void,
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::Mutex,
+};
+
+static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct Endpoint {
     commands: Vec<Command>,
+    completions: Vec<(u64, Value)>,
 }
 
 impl Endpoint {
-    fn dispatch(&self, command: &Command) -> Response {
+    fn dispatch(&mut self, command: &Command) -> Response {
         match command {
             Command::CheckRequest { .. } => Response::error("request_ended", "cancelled"),
             Command::Request { .. } => Response::Accepted { id: 71 },
+            Command::Complete { request, payload } => {
+                self.completions.push((*request, payload.clone()));
+                Response::Ok
+            }
             Command::Cancel { .. } => Response::error("unavailable", "deliberate failure"),
             _ => Response::Ok,
         }
@@ -189,6 +200,186 @@ fn cleanup_status_polling_preserves_one_deadline() {
     assert!(record.state == State::CleanupFailed);
     assert_eq!(record.cleanup_error, Some("cleanup_deadline"));
     assert!(record.uncertain.is_some());
+}
+
+fn free_base_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port.saturating_sub(21).clamp(1_029, 65_514)
+}
+
+#[test]
+fn network_port_updates_rebind_rtsp_and_defer_until_the_stream_is_idle() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("enabled RTSP listener");
+    let old_port = free_base_port();
+    let mut port = free_base_port();
+    while port == old_port {
+        port = free_base_port();
+    }
+    let old_status = controller
+        .configure_network_port(old_port, 1)
+        .expect("initial base port applied");
+    assert_eq!(old_status["active"], true);
+    let old_local = controller.local.expect("bound listener");
+
+    controller.records.insert(5, record(State::Playing));
+    let pending = controller
+        .configure_network_port(port, 10)
+        .expect("configuration accepted");
+    assert_eq!(pending["ok"], true);
+    assert_eq!(pending["active"], false);
+    assert_eq!(pending["pending"], true);
+    assert_eq!(pending["udp_binds_preflighted"], false);
+    assert_eq!(pending["active_base_port"], old_port);
+    assert_eq!(controller.local, Some(old_local));
+    let deferred_binds = controller.media_binds_for_open().unwrap();
+    assert_eq!(deferred_binds.video.port(), old_port + 9);
+    assert_eq!(deferred_binds.control.port(), old_port + 10);
+    assert_eq!(deferred_binds.audio.port(), old_port + 11);
+
+    controller.records.get_mut(&5).unwrap().state = State::Closed;
+    controller.reconcile_network_port(11);
+    let active = controller.local.expect("rebound listener");
+    assert_eq!(active.ip(), old_local.ip(), "preserve configured bind IP");
+    assert_eq!(
+        active.port(),
+        port + 21,
+        "port={port}, network_error={:?}",
+        controller.network_error
+    );
+    assert_eq!(controller.active_network_base_port, Some(port));
+    let applied_binds = controller.media_binds_for_open().unwrap();
+    assert_eq!(applied_binds.video.port(), port + 9);
+    assert_eq!(applied_binds.control.port(), port + 10);
+    assert_eq!(applied_binds.audio.port(), port + 11);
+
+    let binds = controller.settings.media_binds(port).unwrap();
+    assert_eq!(binds.video, SocketAddr::new(active.ip(), port + 9));
+    assert_eq!(binds.control, SocketAddr::new(active.ip(), port + 10));
+    assert_eq!(binds.audio, SocketAddr::new(active.ip(), port + 11));
+}
+
+#[test]
+fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_state() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("listener");
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    let port = free_base_port();
+
+    controller.receive(
+        10,
+        "amaterasu.management".into(),
+        Operation::NetworkConfigure { port },
+        0,
+        5_000,
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[0].1["code"], "permission_denied");
+    assert_eq!(controller.network_base_port, None);
+
+    controller.receive(
+        11,
+        "amaterasu.nvhttp".into(),
+        Operation::NetworkConfigure { port },
+        0,
+        5_000,
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[1].1["ok"], true);
+    assert_eq!(endpoint.completions[1].1["active"], true);
+    assert_eq!(endpoint.completions[1].1["active_base_port"], port);
+}
+
+#[test]
+fn network_port_update_rejects_occupied_tcp_and_udp_targets_then_retries() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    for occupied_udp_offset in [None, Some(9), Some(10), Some(11)] {
+        let settings = Settings {
+            enabled: true,
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut controller = Controller::new(settings).expect("enabled RTSP listener");
+        let old_local = controller.local.expect("bound listener");
+        let port = free_base_port();
+        let tcp_reservation = if occupied_udp_offset.is_none() {
+            Some(
+                TcpListener::bind(SocketAddr::new(old_local.ip(), port + 21))
+                    .expect("reserve target TCP port"),
+            )
+        } else {
+            None
+        };
+        let udp_reservation = occupied_udp_offset
+            .map(|offset| UdpSocket::bind(SocketAddr::new(old_local.ip(), port + offset)).unwrap());
+
+        let pending = controller
+            .configure_network_port(port, 0)
+            .expect("desired port is accepted");
+        assert_eq!(pending["active"], false);
+        assert_eq!(
+            pending["error"],
+            if occupied_udp_offset.is_none() {
+                "tcp_bind_failed"
+            } else {
+                "udp_bind_failed"
+            }
+        );
+        assert_eq!(controller.local, Some(old_local));
+
+        drop(tcp_reservation);
+        drop(udp_reservation);
+        controller.reconcile_network_port(1_000);
+        assert_eq!(controller.local.unwrap().port(), port + 21);
+        assert_eq!(controller.active_network_base_port, Some(port));
+    }
+}
+
+#[test]
+fn accepted_rtsp_connections_are_kept_on_the_old_listener_until_it_is_idle() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("enabled RTSP listener");
+    let old_local = controller.local.expect("bound listener");
+    controller
+        .transport
+        .as_mut()
+        .unwrap()
+        .add_ticket(23, old_local.ip(), &[7; 16])
+        .unwrap();
+    let connection = TcpStream::connect(old_local).unwrap();
+    controller.transport.as_mut().unwrap().poll(1);
+    assert_eq!(controller.transport.as_ref().unwrap().connection_count(), 1);
+
+    let port = free_base_port();
+    let pending = controller
+        .configure_network_port(port, 2)
+        .expect("configuration accepted");
+    assert_eq!(pending["active"], false);
+    assert_eq!(controller.local, Some(old_local));
+
+    drop(connection);
+    controller.transport.as_mut().unwrap().poll(3);
+    assert_eq!(controller.transport.as_ref().unwrap().connection_count(), 0);
+    controller.reconcile_network_port(4);
+    assert_eq!(controller.local.unwrap().port(), port + 21);
 }
 
 fn request(method: Method, target: &str, cseq: u32, session: bool) -> Request {
