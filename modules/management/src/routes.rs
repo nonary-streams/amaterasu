@@ -550,6 +550,7 @@ mod tests {
             "sync_all_installed":false,
             "recent_games":10,
             "recent_max_age_days":30,
+            "autosync_remove_uninstalled":true,
             "expected_revision":0
         });
         assert_eq!(
@@ -565,6 +566,7 @@ mod tests {
         let legacy_payload = payload(update, &serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(legacy_payload["action"], "settings_update");
         assert!(legacy_payload.get("include_tools").is_none());
+        assert!(legacy_payload.get("autosync_remove_uninstalled").is_none());
 
         let mut invalid_payloads = vec![
             serde_json::json!({"enabled":true,"expected_revision":0}),
@@ -587,6 +589,7 @@ mod tests {
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_games":10001,"expected_revision":0}),
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_max_age_days":36501,"expected_revision":0}),
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_games":1.5,"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"autosync_remove_uninstalled":"true","expected_revision":0}),
         ];
         invalid_payloads.push(serde_json::json!({
             "enabled":true,

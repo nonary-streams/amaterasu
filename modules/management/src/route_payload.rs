@@ -108,6 +108,7 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
                     "sync_all_installed",
                     "recent_games",
                     "recent_max_age_days",
+                    "autosync_remove_uninstalled",
                 ],
             )?;
             if object.get("enabled").and_then(Value::as_bool).is_none()
@@ -119,7 +120,11 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
-            for field in ["include_tools", "sync_all_installed"] {
+            for field in [
+                "include_tools",
+                "sync_all_installed",
+                "autosync_remove_uninstalled",
+            ] {
                 if object
                     .get(field)
                     .is_some_and(|value| value.as_bool().is_none())

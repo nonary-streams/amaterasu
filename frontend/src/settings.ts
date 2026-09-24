@@ -78,18 +78,21 @@ namespace Amaterasu {
   export function parseSteamImportSettings(
     includeTools: boolean,
     syncAllInstalled: boolean,
+    autosyncRemoveUninstalled: boolean,
     recentGames: number,
     recentMaxAgeDays: number,
   ): Pick<
     SteamSettings["values"],
     | "include_tools"
     | "sync_all_installed"
+    | "autosync_remove_uninstalled"
     | "recent_games"
     | "recent_max_age_days"
   > {
     if (
       typeof includeTools !== "boolean" ||
       typeof syncAllInstalled !== "boolean" ||
+      typeof autosyncRemoveUninstalled !== "boolean" ||
       !Number.isSafeInteger(recentGames) ||
       recentGames < 0 ||
       recentGames > 10_000 ||
@@ -101,6 +104,7 @@ namespace Amaterasu {
     return {
       include_tools: includeTools,
       sync_all_installed: syncAllInstalled,
+      autosync_remove_uninstalled: autosyncRemoveUninstalled,
       recent_games: recentGames,
       recent_max_age_days: recentMaxAgeDays,
     };
@@ -222,6 +226,13 @@ namespace Amaterasu {
           "checkbox",
         );
         syncAllInstalled.checked = settings.values.sync_all_installed;
+        const autosyncRemoveUninstalled = input(
+          "steam_autosync_remove_uninstalled",
+          "",
+          "checkbox",
+        );
+        autosyncRemoveUninstalled.checked =
+          settings.values.autosync_remove_uninstalled;
         const recentGames = input(
           "steam_recent_games",
           String(settings.values.recent_games),
@@ -276,6 +287,11 @@ namespace Amaterasu {
             "When off, import recently played games instead of every installed game.",
           ),
           field(
+            "Remove uninstalled games during synchronization",
+            autosyncRemoveUninstalled,
+            "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries.",
+          ),
+          field(
             "Recent games to import",
             recentGames,
             "Maximum number of recently played games (0–10000); zero imports none in recent-only mode.",
@@ -304,6 +320,7 @@ namespace Amaterasu {
               ...parseSteamImportSettings(
                 includeTools.checked,
                 syncAllInstalled.checked,
+                autosyncRemoveUninstalled.checked,
                 recentGames.valueAsNumber,
                 recentMaxAgeDays.valueAsNumber,
               ),

@@ -47,35 +47,39 @@ test("Steam exclusions preserve valid ID and name objects without normalization"
 
 test("Steam import controls preserve booleans and bounded recent-game values", () => {
   const parseImport = context.Amaterasu.parseSteamImportSettings;
-  assert.deepEqual(ordinary(parseImport(false, true, 10, 30)), {
+  assert.deepEqual(ordinary(parseImport(false, true, true, 10, 30)), {
     include_tools: false,
     sync_all_installed: true,
+    autosync_remove_uninstalled: true,
     recent_games: 10,
     recent_max_age_days: 30,
   });
-  assert.deepEqual(ordinary(parseImport(true, false, 0, 0)), {
+  assert.deepEqual(ordinary(parseImport(true, false, false, 0, 0)), {
     include_tools: true,
     sync_all_installed: false,
+    autosync_remove_uninstalled: false,
     recent_games: 0,
     recent_max_age_days: 0,
   });
-  assert.deepEqual(ordinary(parseImport(false, false, 10_000, 36_500)), {
+  assert.deepEqual(ordinary(parseImport(false, false, true, 10_000, 36_500)), {
     include_tools: false,
     sync_all_installed: false,
+    autosync_remove_uninstalled: true,
     recent_games: 10_000,
     recent_max_age_days: 36_500,
   });
-  for (const [include, all, recent, age] of [
-    [0, false, 10, 30],
-    [false, "true", 10, 30],
-    [false, false, -1, 30],
-    [false, false, 10_001, 30],
-    [false, false, 1.5, 30],
-    [false, false, 10, -1],
-    [false, false, 10, 36_501],
-    [false, false, 10, 30.5],
+  for (const [include, all, remove, recent, age] of [
+    [0, false, true, 10, 30],
+    [false, "true", true, 10, 30],
+    [false, false, "true", 10, 30],
+    [false, false, true, -1, 30],
+    [false, false, true, 10_001, 30],
+    [false, false, true, 1.5, 30],
+    [false, false, true, 10, -1],
+    [false, false, true, 10, 36_501],
+    [false, false, true, 10, 30.5],
   ]) {
-    assert.throws(() => parseImport(include, all, recent, age));
+    assert.throws(() => parseImport(include, all, remove, recent, age));
   }
 });
 

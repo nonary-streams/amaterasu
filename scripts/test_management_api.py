@@ -249,6 +249,7 @@ def test_auth_and_crud(console, api):
         "sync_all_installed": False,
         "recent_games": 10,
         "recent_max_age_days": 30,
+        "autosync_remove_uninstalled": True,
     }, steam_settings
     if not steam_settings["values"]["enabled"]:
         status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
@@ -261,9 +262,10 @@ def test_auth_and_crud(console, api):
             {"name": "Uninstalled Title"},
         ],
         "include_tools": False,
-        "sync_all_installed": False,
+        "sync_all_installed": True,
         "recent_games": 25,
         "recent_max_age_days": 45,
+        "autosync_remove_uninstalled": False,
     }
     status, steam_enabled, _ = api.post("/v1/steam/settings_update", {
         **steam_values, "expected_revision": steam_settings["revision"],
