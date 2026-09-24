@@ -323,9 +323,20 @@ All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled
 
 | Lead | Session ID | Runner PID | Startup report |
 | --- | --- | ---: | --- |
-| luna-01 | `01a0d516-858e-7c40-b459-5de0bbf3d0dd` | 24488 | launch-configured |
-| luna-02 | `01a0d516-8616-7270-a509-547be018f212` | 42520 | XHigh workers confirmed |
-| luna-03 | `01a0d516-85d0-7261-b883-4dddf4473f99` | 21396 | startup verified |
-| luna-04 | `01a0d516-8713-7b83-87f1-d35c0828ae10` | 23168 | session verified; worker check pending |
-| luna-05 | `01a0d516-8830-7960-af1e-079a13415f97` | 23228 | XHigh workers starting |
-| luna-06 | `01a0d516-8960-7e02-ac81-3eee350f679a` | 43508 | launch-configured |
+| luna-01 | `01a0d516-858e-7c40-b459-5de0bbf3d0dd` | 24488 | session started; XHigh worker not yet reported |
+| luna-02 | `01a0d516-8616-7270-a509-547be018f212` | 42520 | one XHigh worker confirmed; second check pending |
+| luna-03 | `01a0d516-85d0-7261-b883-4dddf4473f99` | 21396 | session verified; XHigh worker not yet reported |
+| luna-04 | `01a0d516-8713-7b83-87f1-d35c0828ae10` | 23168 | session verified; XHigh worker not yet reported |
+| luna-05 | `01a0d516-8830-7960-af1e-079a13415f97` | 23228 | Steam and launch workers scoped; settings report pending |
+| luna-06 | `01a0d516-8960-7e02-ac81-3eee350f679a` | 43508 | two XHigh workers confirmed (diagnostics, session history) |
+
+## XHigh workers
+
+| Lead | Worker | Worker session | Settings | Scope | Status |
+| --- | --- | --- | --- | --- | --- |
+| luna-02 | `network_policy_scan` | not yet reported | `gpt-6-luna` / `xhigh` confirmed | Network-owned paths | active |
+| luna-02 | `stream_policy_scan` | not yet reported | `gpt-6-luna` / `xhigh` pending confirmation | Stream-owned paths | startup confirmation pending |
+| luna-05 | `steam_slice` | not yet reported | `gpt-6-luna` / `xhigh` requested | `modules/steam/` | startup confirmation pending |
+| luna-05 | `launchers_slice` | not yet reported | `gpt-6-luna` / `xhigh` requested | `modules/playnite/`, `modules/lutris/` | startup confirmation pending |
+| luna-06 | `diagnostics` | `01a0d51a-45be-7bd0-b4d8-08923ae89823` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/diagnostics/` | active |
+| luna-06 | `session_history` | `01a0d51a-69e9-7532-873f-55552f306fae` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/session-history/` | active |
