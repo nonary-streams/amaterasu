@@ -35,11 +35,24 @@ fn peer(marker: u8) -> PeerIdentity {
 }
 
 fn peer_with_fec(marker: u8, fec_percentage: Option<u8>) -> PeerIdentity {
+    peer_with_overrides(marker, fec_percentage, None)
+}
+
+fn peer_with_overrides(
+    marker: u8,
+    fec_percentage: Option<u8>,
+    stream_audio: Option<bool>,
+) -> PeerIdentity {
     let certificate = vec![marker; 32];
     let certificate_id = fingerprint(&certificate);
     PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate)
         .unwrap()
-        .with_paired_identity(format!("client-{marker}"), certificate_id, fec_percentage)
+        .with_paired_identity(
+            format!("client-{marker}"),
+            certificate_id,
+            fec_percentage,
+            stream_audio,
+        )
         .unwrap()
 }
 
@@ -66,14 +79,19 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
     let certificate = vec![7; 32];
     let peer = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone()).unwrap();
     assert_eq!(
-        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None)
+        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None, None)
             .err()
             .unwrap(),
         "invalid_paired_identity"
     );
     let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
         .unwrap()
-        .with_paired_identity("moonlight-id".into(), fingerprint(&certificate), Some(37))
+        .with_paired_identity(
+            "moonlight-id".into(),
+            fingerprint(&certificate),
+            Some(37),
+            Some(false),
+        )
         .unwrap();
     assert_eq!(paired.paired_client_id(), Some("moonlight-id"));
 }
@@ -198,6 +216,7 @@ struct Broker {
     application_stopped: bool,
     application_unhealthy: bool,
     application_fec_percentage: Option<u8>,
+    application_stream_audio: Option<bool>,
 }
 
 impl Default for Broker {
@@ -222,6 +241,7 @@ impl Default for Broker {
             application_stopped: false,
             application_unhealthy: false,
             application_fec_percentage: None,
+            application_stream_audio: None,
         }
     }
 }
@@ -321,8 +341,16 @@ impl Broker {
                     Value::Null
                 },
             });
-            if let Some(fec_percentage) = self.application_fec_percentage {
-                launch["config_overrides"] = json!({"fec_percentage":fec_percentage});
+            if self.application_fec_percentage.is_some() || self.application_stream_audio.is_some()
+            {
+                let mut config_overrides = json!({});
+                if let Some(fec_percentage) = self.application_fec_percentage {
+                    config_overrides["fec_percentage"] = json!(fec_percentage);
+                }
+                if let Some(stream_audio) = self.application_stream_audio {
+                    config_overrides["stream_audio"] = json!(stream_audio);
+                }
+                launch["config_overrides"] = config_overrides;
             }
             return json!({"ok":true,"launch":launch});
         }
@@ -428,6 +456,45 @@ fn global_app_and_verified_client_fec_values_apply_in_precedence_order() {
             })
             .expect("RTSP open request");
         assert_eq!(rtsp_open["profile"]["fec_percentage"], expected);
+    }
+}
+
+#[test]
+fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
+    for (global, app, client, expected) in [
+        (true, None, None, true),
+        (false, None, None, false),
+        (false, Some(true), None, true),
+        (true, Some(false), None, false),
+        (true, Some(false), Some(true), true),
+        (false, Some(true), Some(false), false),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_stream_audio(global);
+        let mut broker = Broker {
+            application_stream_audio: app,
+            ..Default::default()
+        };
+        assert!(
+            controller
+                .launch(10, request(1), peer_with_overrides(1, None, client), now)
+                .is_none()
+        );
+        // Settings changes after admission apply to later launches only.
+        controller.set_global_stream_audio(!global);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["stream_audio"], expected);
     }
 }
 

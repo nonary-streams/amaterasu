@@ -167,6 +167,7 @@ impl Controller {
                         "key_hex": key_hex(&record.request.remote_input_key),
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
+                        "stream_audio": record.effective_stream_audio,
                         "capture": capture,
                         "profile": {
                             "width": record.request.width,
@@ -231,14 +232,23 @@ impl Controller {
                 match application_response(record, &payload) {
                     Ok((launch_id, "active", true)) if record.state == State::Starting => {
                         record.application_launch = Some(launch_id);
-                        match application_fec_percentage(&payload) {
-                            Ok(application_fec_percentage) => {
+                        match application_config_overrides(&payload) {
+                            Ok(application_overrides) => {
+                                let application_fec_percentage =
+                                    application_overrides.fec_percentage;
                                 record.application_fec_percentage = application_fec_percentage;
                                 record.effective_fec_percentage = record
                                     .peer
                                     .client_fec_percentage
                                     .or(application_fec_percentage)
                                     .unwrap_or(record.global_fec_percentage);
+                                record.application_stream_audio =
+                                    application_overrides.stream_audio;
+                                record.effective_stream_audio = record
+                                    .peer
+                                    .client_stream_audio
+                                    .or(application_overrides.stream_audio)
+                                    .unwrap_or(record.global_stream_audio);
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -571,9 +581,12 @@ fn application_response<'a>(
 #[serde(default, deny_unknown_fields)]
 struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
+    stream_audio: Option<bool>,
 }
 
-fn application_fec_percentage(payload: &Value) -> Result<Option<u8>, &'static str> {
+fn application_config_overrides(
+    payload: &Value,
+) -> Result<ApplicationConfigOverrides, &'static str> {
     let launch = payload
         .get("launch")
         .filter(|value| value.is_object())
@@ -587,7 +600,7 @@ fn application_fec_percentage(payload: &Value) -> Result<Option<u8>, &'static st
     if config_overrides.fec_percentage == Some(0) {
         return Err("invalid_application_response");
     }
-    Ok(config_overrides.fec_percentage)
+    Ok(config_overrides)
 }
 
 fn rtsp_response<'a>(

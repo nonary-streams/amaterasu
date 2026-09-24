@@ -47,6 +47,7 @@ pub struct PeerIdentity {
     client_id: Option<String>,
     certificate_id: Option<String>,
     client_fec_percentage: Option<u8>,
+    client_stream_audio: Option<bool>,
 }
 
 impl PeerIdentity {
@@ -63,6 +64,7 @@ impl PeerIdentity {
             client_id: None,
             certificate_id: None,
             client_fec_percentage: None,
+            client_stream_audio: None,
         })
     }
 
@@ -71,6 +73,7 @@ impl PeerIdentity {
         client_id: String,
         certificate_id: String,
         fec_percentage: Option<u8>,
+        stream_audio: Option<bool>,
     ) -> Result<Self, &'static str> {
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
@@ -82,6 +85,7 @@ impl PeerIdentity {
         self.client_id = Some(client_id);
         self.certificate_id = Some(certificate_id.to_ascii_lowercase());
         self.client_fec_percentage = fec_percentage;
+        self.client_stream_audio = stream_audio;
         Ok(self)
     }
 
@@ -212,6 +216,7 @@ pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
     output_settings_ready: bool,
+    global_stream_audio: bool,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -230,6 +235,7 @@ impl Controller {
             config,
             configured_output_name: None,
             output_settings_ready: true,
+            global_stream_audio: true,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -245,6 +251,10 @@ impl Controller {
     pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
         self.output_settings_ready = ready;
         self.configured_output_name = configured_output_name.map(str::to_owned);
+    }
+
+    pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
+        self.global_stream_audio = stream_audio;
     }
 
     pub fn busy(&self) -> bool {
@@ -274,6 +284,7 @@ impl Controller {
             return Some(private_error(400, "unsupported streaming request"));
         }
         let global_fec_percentage = config.profile.fec_percentage;
+        let global_stream_audio = self.global_stream_audio;
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -323,6 +334,7 @@ impl Controller {
             operation_id(&self.nonce, id, "rtsp"),
             connect_data,
             global_fec_percentage,
+            global_stream_audio,
             capture_output,
             connection,
             now + INITIAL_DEADLINE,

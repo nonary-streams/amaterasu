@@ -156,6 +156,10 @@ impl Router {
             .set_output_name_settings(ready, configured_output_name);
     }
 
+    pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
+        self.launches.set_global_stream_audio(stream_audio);
+    }
+
     pub fn dispatch(
         &mut self,
         connection: u64,
@@ -502,6 +506,7 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
 #[serde(default, deny_unknown_fields)]
 struct ClientConfigOverrides {
     fec_percentage: Option<u8>,
+    stream_audio: Option<bool>,
 }
 
 #[cfg(test)]

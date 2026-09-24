@@ -38,6 +38,8 @@ enum Operation {
         bind_address: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         output_name: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        stream_audio: FieldUpdate<bool>,
         expected_revision: u64,
     },
 }
@@ -157,6 +159,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.loaded(),
                 self.product_settings.configured_output_name(),
             );
+            router.set_global_stream_audio(self.product_settings.stream_audio());
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -404,6 +407,7 @@ impl NvhttpModule {
                                 address_family,
                                 bind_address,
                                 output_name,
+                                stream_audio,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -426,6 +430,7 @@ impl NvhttpModule {
                                     address_family,
                                     bind_address,
                                     output_name,
+                                    stream_audio,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -562,6 +567,7 @@ mod tests {
             address_family: omitted_family,
             bind_address: omitted_bind,
             output_name: omitted_output,
+            stream_audio: omitted_audio,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -573,15 +579,17 @@ mod tests {
         assert_eq!(omitted_family, FieldUpdate::Omitted);
         assert_eq!(omitted_bind, FieldUpdate::Omitted);
         assert_eq!(omitted_output, FieldUpdate::Omitted);
+        assert_eq!(omitted_audio, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
             bind_address: blank_bind,
             output_name: reset_output,
+            stream_audio: null_audio,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":null,"bind_address":"","output_name":null
+            "address_family":null,"bind_address":"","output_name":null,"stream_audio":null
         }))
         .unwrap()
         else {
@@ -590,15 +598,17 @@ mod tests {
         assert_eq!(reset_family, FieldUpdate::Null);
         assert_eq!(blank_bind, FieldUpdate::Value(String::new()));
         assert_eq!(reset_output, FieldUpdate::Null);
+        assert_eq!(null_audio, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
             bind_address: address,
             output_name,
+            stream_audio,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":"both","bind_address":"::1","output_name":"stable-display-id"
+            "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false
         }))
         .unwrap()
         else {
@@ -607,5 +617,6 @@ mod tests {
         assert_eq!(family, FieldUpdate::Value(settings::AddressFamily::Both));
         assert_eq!(address, FieldUpdate::Value("::1".into()));
         assert_eq!(output_name, FieldUpdate::Value("stable-display-id".into()));
+        assert_eq!(stream_audio, FieldUpdate::Value(false));
     }
 }

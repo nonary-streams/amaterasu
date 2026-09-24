@@ -383,6 +383,8 @@ pub struct Open {
     pub key_hex: String,
     pub key_id: u32,
     pub connect_data: u32,
+    #[serde(default = "default_stream_audio")]
+    pub stream_audio: bool,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -445,6 +447,7 @@ impl Open {
             "key_hex": self.key_hex,
             "key_id": self.key_id,
             "connect_data": self.connect_data,
+            "stream_audio": self.stream_audio,
             "video": {
                 "packet_size": self.profile.packet_size,
                 "fec_percentage": self.profile.fec_percentage,
@@ -495,6 +498,10 @@ impl Open {
             },
         })
     }
+}
+
+fn default_stream_audio() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -792,6 +799,25 @@ mod tests {
         assert!(payload.get("audio_port").is_none());
         assert_eq!(payload["video_bind"], "127.0.0.1:47998");
         assert_eq!(payload["audio_bind"], "127.0.0.1:48000");
+    }
+
+    #[test]
+    fn stream_audio_flag_reaches_prepare_without_removing_the_required_audio_lane() {
+        let legacy_open = open();
+        assert!(
+            legacy_open.stream_audio,
+            "older callers retain audio by default"
+        );
+
+        let mut disabled = legacy_open;
+        disabled.stream_audio = false;
+        let payload = disabled.prepare("operation", None);
+        assert_eq!(payload["stream_audio"], false);
+        assert_eq!(payload["video_port"], 47_998);
+        assert_eq!(payload["audio_port"], 48_000);
+        assert_eq!(payload["audio"]["packet_ms"], 10);
+        assert_eq!(payload["audio"]["bitrate"], 128_000);
+        assert_eq!(payload["encrypt_audio"], true);
     }
 
     #[test]

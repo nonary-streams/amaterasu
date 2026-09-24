@@ -9,7 +9,8 @@ const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 const LEGACY_SETTINGS_VERSION: u64 = 1;
 const PORT_SETTINGS_VERSION: u64 = 2;
 const NETWORK_SETTINGS_VERSION: u64 = 3;
-const SETTINGS_VERSION: u64 = 4;
+const OUTPUT_SETTINGS_VERSION: u64 = 4;
+const SETTINGS_VERSION: u64 = 5;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,6 +25,7 @@ pub enum AdminAction {
         address_family: FieldUpdate<AddressFamily>,
         bind_address: FieldUpdate<String>,
         output_name: FieldUpdate<String>,
+        stream_audio: FieldUpdate<bool>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -91,6 +93,7 @@ enum Purpose {
         hostname: String,
         target: NetworkTarget,
         output_name: Option<String>,
+        stream_audio: bool,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -120,6 +123,7 @@ struct ProductDocument {
     address_family: Option<AddressFamily>,
     bind_address: Option<String>,
     output_name: Option<String>,
+    stream_audio: bool,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -136,6 +140,7 @@ pub struct ProductSettings {
     configured_address_family: Option<AddressFamily>,
     configured_bind_address: Option<String>,
     configured_output_name: Option<String>,
+    stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
     active_rtsp_base_port: Option<u16>,
@@ -224,6 +229,7 @@ impl ProductSettings {
             configured_address_family: None,
             configured_bind_address: None,
             configured_output_name: None,
+            stream_audio: true,
             active_http_port: None,
             active_https_port: None,
             active_rtsp_base_port: None,
@@ -256,6 +262,10 @@ impl ProductSettings {
 
     pub fn configured_output_name(&self) -> Option<&str> {
         self.configured_output_name.as_deref()
+    }
+
+    pub fn stream_audio(&self) -> bool {
+        self.stream_audio
     }
 
     pub fn effective_output_name(&self) -> Option<&str> {
@@ -729,6 +739,7 @@ impl ProductSettings {
                 address_family,
                 bind_address,
                 output_name,
+                stream_audio,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -755,6 +766,16 @@ impl ProductSettings {
                         self.queue_completion(
                             request.request,
                             failure("invalid_output_name", "output name is invalid"),
+                        );
+                        return;
+                    }
+                };
+                let stream_audio = match apply_boolean_update(stream_audio, self.stream_audio) {
+                    Ok(stream_audio) => stream_audio,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure("invalid_stream_audio", "stream_audio must be a boolean"),
                         );
                         return;
                     }
@@ -817,6 +838,7 @@ impl ProductSettings {
                         &hostname,
                         &target,
                         output_name.as_deref(),
+                        stream_audio,
                     ),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
@@ -825,6 +847,7 @@ impl ProductSettings {
                         hostname,
                         target,
                         output_name,
+                        stream_audio,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -936,6 +959,7 @@ impl ProductSettings {
                 hostname,
                 target,
                 output_name,
+                stream_audio,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
@@ -946,6 +970,7 @@ impl ProductSettings {
                         &hostname,
                         &target,
                         output_name.as_deref(),
+                        stream_audio,
                     ) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
                             let previous_http_target = self.http_target();
@@ -1194,6 +1219,7 @@ impl ProductSettings {
         self.configured_address_family = document.address_family;
         self.configured_bind_address = document.bind_address;
         self.configured_output_name = document.output_name;
+        self.stream_audio = document.stream_audio;
         self.loaded = true;
     }
 
@@ -1209,6 +1235,7 @@ impl ProductSettings {
             "configured_address_family":self.configured_address_family,
             "configured_bind_address":self.configured_bind_address,
             "configured_output_name":self.configured_output_name,
+            "stream_audio":self.stream_audio,
             "effective_output_name":self.effective_output_name(),
             "capture_provider":self.capture_provider(),
             "active_http_port":self.active_http_port,
@@ -1264,6 +1291,7 @@ fn product_update_payload(
     hostname: &str,
     target: &NetworkTarget,
     output_name: Option<&str>,
+    stream_audio: bool,
 ) -> Value {
     json!({
         "action":"product_update",
@@ -1275,6 +1303,7 @@ fn product_update_payload(
             "address_family":target.address_family,
             "bind_address":target.bind_address,
             "output_name":output_name,
+            "stream_audio":stream_audio,
         },
     })
 }
@@ -1319,6 +1348,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             address_family: None,
             bind_address: None,
             output_name: None,
+            stream_audio: true,
         });
     }
 
@@ -1331,6 +1361,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         LEGACY_SETTINGS_VERSION
             | PORT_SETTINGS_VERSION
             | NETWORK_SETTINGS_VERSION
+            | OUTPUT_SETTINGS_VERSION
             | SETTINGS_VERSION
     ) || revision == 0
     {
@@ -1342,7 +1373,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         LEGACY_SETTINGS_VERSION => 1,
         PORT_SETTINGS_VERSION => 2,
         NETWORK_SETTINGS_VERSION => 4,
-        SETTINGS_VERSION => 5,
+        OUTPUT_SETTINGS_VERSION => 5,
+        SETTINGS_VERSION => 6,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1350,7 +1382,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
         || (version >= NETWORK_SETTINGS_VERSION
             && (!values.contains_key("address_family") || !values.contains_key("bind_address")))
-        || (version == SETTINGS_VERSION && !values.contains_key("output_name"))
+        || (version >= OUTPUT_SETTINGS_VERSION && !values.contains_key("output_name"))
+        || (version == SETTINGS_VERSION && !values.contains_key("stream_audio"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1387,7 +1420,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         (None, None)
     };
-    let output_name = if version == SETTINGS_VERSION {
+    let output_name = if version >= OUTPUT_SETTINGS_VERSION {
         match values.get("output_name") {
             Some(Value::Null) => None,
             Some(Value::String(value)) => normalize_output_name(value)
@@ -1397,6 +1430,14 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         None
     };
+    let stream_audio = if version == SETTINGS_VERSION {
+        values
+            .get("stream_audio")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid_state("persisted stream_audio is not a boolean"))?
+    } else {
+        true
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -1404,6 +1445,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         address_family,
         bind_address,
         output_name,
+        stream_audio,
     })
 }
 
@@ -1413,13 +1455,14 @@ fn update_result(
     hostname: &str,
     target: &NetworkTarget,
     output_name: Option<&str>,
+    stream_audio: bool,
 ) -> Result<ProductDocument, SettingFailure> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v4 output settings",
+            "product_update did not confirm the v5 stream audio settings",
         ));
     }
     let document = parse_document(payload)?;
@@ -1428,6 +1471,7 @@ fn update_result(
         || document.address_family != target.address_family
         || document.bind_address != target.bind_address
         || document.output_name.as_deref() != output_name
+        || document.stream_audio != stream_audio
         || expected_revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -1459,6 +1503,14 @@ fn apply_output_name_update(
         FieldUpdate::Omitted => Ok(current),
         FieldUpdate::Null => Ok(None),
         FieldUpdate::Value(value) => normalize_output_name(&value),
+    }
+}
+
+fn apply_boolean_update(update: FieldUpdate<bool>, current: bool) -> Result<bool, ()> {
+    match update {
+        FieldUpdate::Omitted => Ok(current),
+        FieldUpdate::Null => Err(()),
+        FieldUpdate::Value(value) => Ok(value),
     }
 }
 
@@ -1564,6 +1616,7 @@ mod tests {
         assert_eq!(missing.revision, 0);
         assert_eq!(missing.hostname, None);
         assert_eq!(missing.port, None);
+        assert!(missing.stream_audio);
 
         let persisted = parse_document(&json!({
             "ok":true,"found":true,"version":1,"revision":7,"values":{"hostname":"Studio PC"}
@@ -1573,6 +1626,7 @@ mod tests {
         assert_eq!(persisted.hostname.as_deref(), Some("Studio PC"));
         assert_eq!(persisted.port, None);
         assert_eq!(persisted.output_name, None);
+        assert!(persisted.stream_audio);
 
         let defaulted = parse_document(&json!({
             "ok":true,"found":true,"version":1,"revision":8,"values":{"hostname":""}
@@ -1592,6 +1646,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(network_document.output_name, None);
+        assert!(network_document.stream_audio);
     }
 
     #[test]
@@ -1634,6 +1689,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(automatic.output_name, None);
+        assert!(automatic.stream_audio);
 
         for payload in [
             json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}}),
@@ -1643,6 +1699,50 @@ mod tests {
         ] {
             assert_eq!(
                 parse_document(&payload).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+    }
+
+    #[test]
+    fn v5_requires_a_boolean_and_old_documents_migrate_with_audio_enabled() {
+        let current = parse_document(&json!({
+            "ok":true,"found":true,"version":5,"revision":2,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":false}
+        }))
+        .unwrap();
+        assert!(!current.stream_audio);
+
+        for version in 1..=4 {
+            let values = match version {
+                1 => json!({"hostname":"Host"}),
+                2 => json!({"hostname":"Host","port":47989}),
+                3 => {
+                    json!({"hostname":"Host","port":47989,"address_family":null,"bind_address":null})
+                }
+                4 => {
+                    json!({"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null})
+                }
+                _ => unreachable!(),
+            };
+            let migrated = parse_document(&json!({
+                "ok":true,"found":true,"version":version,"revision":1,"values":values
+            }))
+            .unwrap();
+            assert!(migrated.stream_audio, "version {version}");
+        }
+
+        for malformed in [
+            json!({"ok":true,"found":true,"version":5,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}}),
+            json!({"ok":true,"found":true,"version":5,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":null}}),
+            json!({"ok":true,"found":true,"version":5,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":"false"}}),
+        ] {
+            assert_eq!(
+                parse_document(&malformed).unwrap_err().code,
                 "invalid_state_response"
             );
         }
@@ -1719,8 +1819,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":4,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null}
+            "ok":true,"found":true,"version":5,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -1728,19 +1828,19 @@ mod tests {
             bind_address: None,
         };
         assert_eq!(
-            update_result(&success, 3, "New Host", &target, None)
+            update_result(&success, 3, "New Host", &target, None, true)
                 .unwrap()
                 .revision,
             4
         );
         assert_eq!(
-            update_result(&success, 2, "New Host", &target, None)
+            update_result(&success, 2, "New Host", &target, None, true)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
         );
         assert_eq!(
-            update_result(&success, 3, "Other Host", &target, None)
+            update_result(&success, 3, "Other Host", &target, None, true)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
@@ -1755,6 +1855,7 @@ mod tests {
                     ..target.clone()
                 },
                 None,
+                true,
             )
             .unwrap_err()
             .code,
@@ -1762,11 +1863,11 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":4,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null}
+            "ok":true,"found":true,"version":5,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
         });
         assert_eq!(
-            update_result(&reset_to_machine_name, 4, "", &target, None)
+            update_result(&reset_to_machine_name, 4, "", &target, None, true)
                 .unwrap()
                 .hostname
                 .as_deref(),
@@ -1774,8 +1875,8 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":4,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id"}
+            "ok":true,"found":true,"version":5,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true}
         });
         assert_eq!(
             update_result(
@@ -1783,7 +1884,8 @@ mod tests {
                 8,
                 "New Host",
                 &target,
-                Some("selected-display-id")
+                Some("selected-display-id"),
+                true,
             )
             .unwrap()
             .output_name
@@ -1791,7 +1893,7 @@ mod tests {
             Some("selected-display-id")
         );
         assert_eq!(
-            update_result(&selected, 8, "New Host", &target, None)
+            update_result(&selected, 8, "New Host", &target, None, true)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
@@ -1830,9 +1932,10 @@ mod tests {
                 "address_family":"ipv4",
                 "bind_address":"127.0.0.1",
                 "configured_address_family":null,
-                "configured_bind_address":null,
-                "configured_output_name":null,
-                "effective_output_name":null,
+            "configured_bind_address":null,
+            "configured_output_name":null,
+            "stream_audio":true,
+            "effective_output_name":null,
                 "capture_provider":null,
                 "active_http_port":null,
                 "active_https_port":null,
@@ -1911,15 +2014,16 @@ mod tests {
                     bind_address: None,
                 },
                 output_name: None,
+                stream_audio: true,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":4,
+                "version":5,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
             })),
         );
 
@@ -1964,12 +2068,13 @@ mod tests {
                     bind_address: None,
                 },
                 output_name: None,
+                stream_audio: true,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":4,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}
+                "ok":true,"found":true,"version":5,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
             })),
         );
 
@@ -2130,12 +2235,13 @@ mod tests {
                     bind_address: None,
                 },
                 output_name: None,
+                stream_audio: true,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":4,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null}
+                "ok":true,"found":true,"version":5,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
             })),
         );
 
@@ -2176,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
+    fn v5_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -2186,9 +2292,11 @@ mod tests {
                 bind_address: None,
             },
             None,
+            false,
         );
-        assert_eq!(reset["version"], 4);
+        assert_eq!(reset["version"], 5);
         assert_eq!(reset["expected_revision"], 7);
+        assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
         assert_eq!(reset["values"]["bind_address"], Value::Null);
 
@@ -2201,9 +2309,92 @@ mod tests {
                 bind_address: Some(String::new()),
             },
             Some("stable-display-id"),
+            true,
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
         assert_eq!(explicit_blank["values"]["bind_address"], "");
         assert_eq!(explicit_blank["values"]["output_name"], "stable-display-id");
+        assert_eq!(explicit_blank["values"]["stream_audio"], true);
+    }
+
+    #[test]
+    fn stream_audio_update_preserves_omission_and_rejects_null() {
+        assert_eq!(apply_boolean_update(FieldUpdate::Omitted, false), Ok(false));
+        assert_eq!(apply_boolean_update(FieldUpdate::Omitted, true), Ok(true));
+        assert_eq!(
+            apply_boolean_update(FieldUpdate::Value(false), true),
+            Ok(false)
+        );
+        assert_eq!(
+            apply_boolean_update(FieldUpdate::Value(true), false),
+            Ok(true)
+        );
+        assert_eq!(apply_boolean_update(FieldUpdate::Null, true), Err(()));
+    }
+
+    #[test]
+    fn stream_audio_admin_update_writes_v5_and_rejects_null() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":5,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":false}
+            }))
+            .unwrap(),
+        );
+        product
+            .enqueue(
+                7,
+                5_000,
+                AdminAction::Update {
+                    hostname: "Host".into(),
+                    port: 47_989,
+                    address_family: FieldUpdate::Omitted,
+                    bind_address: FieldUpdate::Omitted,
+                    output_name: FieldUpdate::Omitted,
+                    stream_audio: FieldUpdate::Omitted,
+                    expected_revision: 4,
+                    require_listener_apply: true,
+                },
+            )
+            .unwrap();
+        product.start_next();
+        let payload = &product.pending.as_ref().unwrap().payload;
+        assert_eq!(payload["version"], 5);
+        assert_eq!(payload["expected_revision"], 4);
+        assert_eq!(payload["values"]["stream_audio"], false);
+
+        let mut invalid = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        invalid.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":4,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null}
+            }))
+            .unwrap(),
+        );
+        invalid
+            .enqueue(
+                8,
+                5_000,
+                AdminAction::Update {
+                    hostname: "Host".into(),
+                    port: 47_989,
+                    address_family: FieldUpdate::Omitted,
+                    bind_address: FieldUpdate::Omitted,
+                    output_name: FieldUpdate::Omitted,
+                    stream_audio: FieldUpdate::Null,
+                    expected_revision: 4,
+                    require_listener_apply: true,
+                },
+            )
+            .unwrap();
+        invalid.start_next();
+        assert!(invalid.pending.is_none());
+        assert_eq!(
+            invalid.completions.front().unwrap().payload["code"],
+            "invalid_stream_audio"
+        );
     }
 }

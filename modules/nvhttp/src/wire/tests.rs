@@ -55,7 +55,7 @@ impl Broker {
                             "paired": 1,
                             "certificate_id": hex(&Sha256::digest(certificate_der)),
                             "client_id": "certificate-bound-client",
-                            "config_overrides": {"fec_percentage": 49}
+                            "config_overrides": {"fec_percentage": 49, "stream_audio": false}
                         })
                     }
                     (PAIRING_SERVICE, "begin") => {
@@ -86,7 +86,7 @@ impl Broker {
                             "state": "active",
                             "failure": null,
                             "cleanup_error": null,
-                            "config_overrides": {"fec_percentage": 37}
+                            "config_overrides": {"fec_percentage": 37, "stream_audio": true}
                         }
                     }),
                     ("amaterasu.rtsp/1", "open") => json!({
@@ -344,6 +344,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     // The pairing record's certificate-keyed value outranks the app value (37)
     // and global value (20). The query's forged uniqueid has no effect.
     assert_eq!(rtsp_open["profile"]["fec_percentage"], 49);
+    assert_eq!(rtsp_open["stream_audio"], false);
 }
 
 #[test]
