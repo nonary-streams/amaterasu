@@ -1,5 +1,6 @@
 mod actions;
 mod cleanup;
+mod history;
 mod input;
 mod lifecycle;
 mod record;
@@ -49,6 +50,7 @@ pub struct Pipeline {
     started: Instant,
     background_turn: bool,
     control_after: u64,
+    history_after: u64,
 }
 
 impl Pipeline {
@@ -62,6 +64,7 @@ impl Pipeline {
             started: Instant::now(),
             background_turn: false,
             control_after: 0,
+            history_after: 0,
         })
     }
 
@@ -75,6 +78,7 @@ impl Pipeline {
         let mut settled = true;
         for record in self.records.values_mut() {
             record.plane = None;
+            settled &= record.history.shutdown(send);
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
@@ -103,6 +107,7 @@ impl Pipeline {
         factory: &mut Factory<'_>,
     ) -> ModuleResult<()> {
         self.pump(now);
+        self.progress_history(now, send);
         if let Some(mut job) = self.job.take() {
             let mut record = self
                 .records
@@ -159,6 +164,36 @@ impl Pipeline {
             }
             _ => Err("stream session poll failed".into()),
         }
+    }
+
+    fn progress_history(&mut self, now: u64, send: &mut Send<'_>) {
+        let eligible = |record: &&Record| record.history.has_work();
+        let selected = self
+            .records
+            .values()
+            .filter(eligible)
+            .find(|record| record.id > self.history_after)
+            .or_else(|| self.records.values().find(eligible))
+            .map(|record| record.id);
+        let Some(id) = selected else {
+            return;
+        };
+        self.history_after = id;
+        let queued = {
+            let record = self.records.get(&id).expect("selected history record");
+            let start = record
+                .start
+                .as_ref()
+                .expect("history begins after activation");
+            record
+                .history
+                .queued_request(record.id, &record.owner, start)
+        };
+        self.records
+            .get_mut(&id)
+            .expect("selected history record")
+            .history
+            .progress(queued, now, send);
     }
 
     fn schedule_control(&mut self, now: u64) -> bool {

@@ -83,6 +83,7 @@ impl Pipeline {
                 }) {
                     return self.cleanup_rejected(record, job, send);
                 }
+                record.history.teardown_confirmed();
                 record.resources.remove(&Resource::Session);
                 record.attempted.remove(&Resource::Session);
             }

@@ -242,12 +242,14 @@ impl Pipeline {
                     Ok(true)
                 } else {
                     record.state = State::Active;
+                    record.history.activated();
                     Ok(self.deliver_success(record, job, now, send))
                 }
             }
             Step::AcquireInput => {
                 accept_input_lease(record, &payload, now)?;
                 record.state = State::Active;
+                record.history.activated();
                 Ok(self.deliver_success(record, job, now, send))
             }
             Step::RenewInput => {

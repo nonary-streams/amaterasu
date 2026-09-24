@@ -66,6 +66,14 @@ pub struct Broker {
     pub input_expires_in_ms: Option<u64>,
     pub input_absolute_pointer: Option<Value>,
     pub input_controller_supported: Option<Value>,
+    pub history_available: bool,
+    pub history_storage_degraded: bool,
+    pub history_recording_disabled: bool,
+    pub history_pending_polls: usize,
+    pub history_requests: BTreeSet<u64>,
+    pub history_released: usize,
+    pub history_begins: Vec<Value>,
+    pub history_ends: Vec<Value>,
 }
 
 impl Broker {
@@ -135,6 +143,12 @@ impl Broker {
                 operation_id,
                 ..
             } => {
+                if service == "amaterasu.session-history/1" && !self.history_available {
+                    return Ok(Response::Error {
+                        code: "service_unavailable".into(),
+                        message: String::new(),
+                    });
+                }
                 if let Some(id) = self.operations.get(&operation_id) {
                     return Ok(Response::Accepted { id: *id });
                 }
@@ -154,6 +168,9 @@ impl Broker {
                         cancelled: false,
                     },
                 );
+                if service == "amaterasu.session-history/1" {
+                    self.history_requests.insert(id);
+                }
                 self.operations.insert(operation_id, id);
                 if self.fault.as_ref().is_some_and(|(target, mode)| {
                     target == &service && matches!(mode, Fault::Admission)
@@ -170,6 +187,13 @@ impl Broker {
                         code: "cancelled".into(),
                         message: String::new(),
                     });
+                }
+                if pending.call.service == "amaterasu.session-history/1"
+                    && self.history_pending_polls > 0
+                {
+                    self.history_pending_polls -= 1;
+                    self.requests.insert(request, pending);
+                    return Ok(Response::Pending);
                 }
                 let fault = self
                     .fault
@@ -206,6 +230,9 @@ impl Broker {
             Command::ReleaseResult { request } => {
                 self.requests.remove(&request);
                 self.operations.retain(|_, id| *id != request);
+                if self.history_requests.remove(&request) {
+                    self.history_released += 1;
+                }
                 Ok(Response::Ok)
             }
             _ => panic!("unexpected broker operation"),
@@ -215,6 +242,29 @@ impl Broker {
     fn execute(&mut self, call: &Call) -> Value {
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if service == "amaterasu.session-history/1" {
+            return match action {
+                "session_begin" => {
+                    self.history_begins.push(call.payload.clone());
+                    if self.history_storage_degraded {
+                        json!({"ok":false,"error":{"code":"storage_unavailable","message":"storage unavailable"}})
+                    } else if self.history_recording_disabled {
+                        json!({"ok":true,"recorded":false})
+                    } else {
+                        json!({"ok":true,"recorded":true})
+                    }
+                }
+                "session_end" => {
+                    self.history_ends.push(call.payload.clone());
+                    if self.history_storage_degraded {
+                        json!({"ok":false,"code":"storage_unavailable"})
+                    } else {
+                        json!({"ok":true,"recorded":true})
+                    }
+                }
+                _ => panic!("unexpected session history action"),
+            };
+        }
         if service == "amaterasu.input/1" {
             return self.input(action, &call.payload);
         }

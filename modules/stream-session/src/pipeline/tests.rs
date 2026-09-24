@@ -1,5 +1,6 @@
 mod armed;
 mod harness;
+mod history;
 mod input;
 use super::*;
 use harness::*;

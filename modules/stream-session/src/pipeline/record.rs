@@ -67,6 +67,7 @@ impl Resource {
 
 pub(super) struct Record {
     pub id: u64,
+    pub history: super::history::SessionHistory,
     pub owner: String,
     pub config: PrepareConfig,
     pub start: Option<StartConfig>,
@@ -118,6 +119,7 @@ impl Record {
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         Self {
             id,
+            history: super::history::SessionHistory::new(),
             owner,
             config,
             start: None,

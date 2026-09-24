@@ -66,6 +66,25 @@ impl Pending {
         self.attempts = 0;
     }
 
+    /// Releases a result already retrieved by `poll`. Result ownership belongs
+    /// to the caller once `Progress::Result` is returned.
+    pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
+        let Some(request) = self.request else {
+            return true;
+        };
+        match send(Command::ReleaseResult { request }) {
+            Ok(Response::Ok) => {
+                self.request = None;
+                true
+            }
+            Ok(Response::Error { code, .. }) if code == "not_found" => {
+                self.request = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn poll(&mut self, send: &mut Send<'_>, now: u64) -> Progress {
         if self.attempts >= 3 {
             return Progress::Unresolved;
