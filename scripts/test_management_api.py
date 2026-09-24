@@ -403,6 +403,7 @@ def test_auth_and_crud(console, api):
         "name": "HTTP Game",
         "steam_id": "730",
         "steam_install_dir": steam_install_dir,
+        "exclude_global_prep_cmd": True,
         "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250},
         "launch": {
             "kind": "executable",
@@ -421,6 +422,7 @@ def test_auth_and_crud(console, api):
     assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, found
     assert found["entry"]["steam_id"] == "730", found
     assert found["entry"]["steam_install_dir"] == steam_install_dir, found
+    assert found["entry"]["exclude_global_prep_cmd"] is True, found
     assert found["entry"]["launch"]["auto_detach"] is False, found
     assert found["entry"]["launch"]["wait_all"] is True, found
     assert found["entry"]["launch"]["exit_timeout_seconds"] == 0, found
@@ -446,6 +448,16 @@ def test_auth_and_crud(console, api):
             administrator,
         )
         assert status == 400 and not rejected_sink["ok"], rejected_sink
+    for invalid_exclusion in (None, 1, "true"):
+        status, rejected_exclusion, _ = api.post(
+            "/v1/catalog/create",
+            {
+                "entry": {**entry, "exclude_global_prep_cmd": invalid_exclusion},
+                "expected_revision": created["revision"],
+            },
+            administrator,
+        )
+        assert status == 400 and not rejected_exclusion["ok"], rejected_exclusion
     for invalid_metadata in ({"steam_id": "000730"}, {"steam_install_dir": "C:\\" if os.name == "nt" else "/"}):
         status, rejected, _ = api.post("/v1/catalog/create", {
             "entry": {**entry, **invalid_metadata}, "expected_revision": created["revision"],
@@ -470,6 +482,7 @@ def test_auth_and_crud(console, api):
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_id"] == "730", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_install_dir"] == steam_install_dir, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["exclude_global_prep_cmd"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
@@ -551,6 +564,7 @@ def test_auth_and_crud(console, api):
     assert host_settings["effective_minimum_fps_target"] == 20, host_settings
     assert host_settings["configured_audio_sink"] is None, host_settings
     assert host_settings["configured_virtual_sink"] is None, host_settings
+    assert host_settings["configured_global_preparation"] == [], host_settings
     assert host_settings["configured_external_ip"] is None, host_settings
     assert isinstance(host_settings["effective_audio_sink"], str), host_settings
     assert host_settings["configured_wgc_pacing_smoothing"] is None, host_settings
@@ -586,6 +600,7 @@ def test_auth_and_crud(console, api):
     assert explicit_blank_host["configured_address_family"] == "ipv4", explicit_blank_host
     assert explicit_blank_host["configured_bind_address"] == "", explicit_blank_host
     assert explicit_blank_host["bind_address"] == "127.0.0.1", explicit_blank_host
+    global_preparation = [{"run": {"executable": prepare_path}}]
     status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
         "hostname": "Living Room & Games",
         "port": explicit_blank_host["port"],
@@ -596,6 +611,7 @@ def test_auth_and_crud(console, api):
         "minimum_fps_target": 37.5,
         "audio_sink": "test-audio-endpoint",
         "virtual_sink": "test-virtual-endpoint",
+        "global_preparation": global_preparation,
         "audio_sink_capture_only": True,
         "external_ip": "203.0.113.42",
         "wgc_pacing_smoothing": False,
@@ -616,6 +632,8 @@ def test_auth_and_crud(console, api):
     assert renamed_host["effective_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["configured_audio_sink"] == "test-audio-endpoint", renamed_host
     assert renamed_host["configured_virtual_sink"] == "test-virtual-endpoint", renamed_host
+    assert len(renamed_host["configured_global_preparation"]) == 1, renamed_host
+    assert renamed_host["configured_global_preparation"][0]["run"]["executable"] == prepare_path, renamed_host
     assert renamed_host["audio_sink_capture_only"] is True, renamed_host
     assert renamed_host["configured_external_ip"] == "203.0.113.42", renamed_host
     assert renamed_host["effective_audio_sink"] == "test-audio-endpoint", renamed_host
@@ -674,6 +692,12 @@ def test_auth_and_crud(console, api):
             "expected_revision": renamed_host["revision"],
             "virtual_sink": invalid_sink,
         }, administrator)[0] == 400
+    for invalid_preparation in (False, {}, [{"run": {"executable": "relative-tool"}}]):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "global_preparation": invalid_preparation,
+        }, administrator)[0] == 400
     for invalid_capture_only in (None, 1, "true"):
         assert api.post("/v1/nvhttp/settings_update", {
             "hostname": "Living Room & Games", "port": renamed_host["port"],
@@ -718,6 +742,7 @@ def test_auth_and_crud(console, api):
     assert moved_host["configured_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["effective_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["configured_audio_sink"] == "test-audio-endpoint", moved_host
+    assert moved_host["configured_global_preparation"] == renamed_host["configured_global_preparation"], moved_host
     assert moved_host["audio_sink_capture_only"] is True, moved_host
     assert moved_host["configured_external_ip"] == "203.0.113.42", moved_host
     assert moved_host["effective_audio_sink"] == "test-audio-endpoint", moved_host
@@ -750,11 +775,13 @@ def test_auth_and_crud(console, api):
     assert input_defaults["values"]["key_repeat_frequency"] == 24.9, input_defaults
     assert input_defaults["values"]["back_button_timeout"] == -1, input_defaults
     assert input_defaults["values"]["gamepad"] == "auto", input_defaults
+    assert input_defaults["values"]["controller"] is True, input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
     selected_gamepad = "x360" if sys.platform == "win32" else "xone" if sys.platform == "linux" else "auto"
     assert api.post("/v1/input/status")[0] == 401
     status, input_status, _ = api.post("/v1/input/status", token=administrator)
     assert status == 200 and input_status["gamepad"] == "auto", input_status
+    assert input_status["controller_enabled"] is True, input_status
     assert "auto" in input_status["supported_profiles"], input_status
     assert selected_gamepad in input_status["supported_profiles"], input_status
     input_policy_update = {
@@ -767,6 +794,7 @@ def test_auth_and_crud(console, api):
         "key_repeat_frequency": 31.25,
         "back_button_timeout": 300,
         "gamepad": selected_gamepad,
+        "controller": False,
     }
     input_values = {**input_defaults["values"], **input_policy_update}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
@@ -776,6 +804,7 @@ def test_auth_and_crud(console, api):
     assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
     status, input_status, _ = api.post("/v1/input/status", token=administrator)
     assert status == 200 and input_status["gamepad"] == selected_gamepad, input_status
+    assert input_status["controller_enabled"] is False, input_status
     status, input_conflict, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
         "mouse": True,
@@ -799,6 +828,8 @@ def test_auth_and_crud(console, api):
         {"back_button_timeout": None},
         {"gamepad": "not_a_gamepad"},
         {"gamepad": 1},
+        {"controller": None},
+        {"controller": "false"},
     ]:
         invalid_status, _, _ = api.post("/v1/input/settings_update", {
             "keyboard": input_values["keyboard"],
@@ -819,7 +850,7 @@ def test_auth_and_crud(console, api):
     assert input_zero_repeat["values"] == input_values and input_zero_repeat["revision"] == 2, input_zero_repeat
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 2, input_saved
-    # A v3 client omits Right Alt, repeat, controller timeout, and gamepad fields; preserve them while it
+    # A v3 client omits Right Alt, repeat, controller, Back timeout, and gamepad fields; preserve them while it
     # updates the older keyboard, mouse, scrolling and scancode settings.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
@@ -1286,6 +1317,8 @@ def main():
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
             assert host_settings["audio_sink_capture_only"] is True, host_settings
             assert host_settings["configured_virtual_sink"] == "test-virtual-endpoint", host_settings
+            assert len(host_settings["configured_global_preparation"]) == 1, host_settings
+            assert host_settings["configured_global_preparation"][0]["run"]["executable"] == (r"C:\Tools\prepare.exe" if os.name == "nt" else "/opt/tools/prepare"), host_settings
             assert host_settings["address_family"] == "ipv4", host_settings
             assert host_settings["configured_address_family"] == "ipv4", host_settings
             assert host_settings["configured_bind_address"] == "", host_settings
@@ -1362,6 +1395,7 @@ def main():
                 "minimum_fps_target": None,
                 "audio_sink": None,
                 "virtual_sink": None,
+                "global_preparation": None,
                 "audio_sink_capture_only": False,
                 "external_ip": None,
                 "wgc_pacing_smoothing": None,
@@ -1384,6 +1418,7 @@ def main():
             assert reset_host["effective_minimum_fps_target"] == 20, reset_host
             assert reset_host["configured_audio_sink"] is None, reset_host
             assert reset_host["configured_virtual_sink"] is None, reset_host
+            assert reset_host["configured_global_preparation"] == [], reset_host
             assert reset_host["configured_external_ip"] is None, reset_host
             assert isinstance(reset_host["effective_audio_sink"], str), reset_host
             assert reset_host["configured_wgc_pacing_smoothing"] is None, reset_host
@@ -1396,9 +1431,9 @@ def main():
             console.eof()
         finally:
             console.close()
-    print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, manual Playnite Fullscreen validation, token persistence/revocation,")
+    print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle and global-preparation exclusion CAS and restart persistence, manual Playnite Fullscreen validation, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
-    print("Moonlight hostname/port live rebind, capture backend/output and audio/virtual-sink policy persistence,")
+    print("Moonlight hostname/port live rebind, capture backend/output, audio/virtual-sink and structured global-preparation policy persistence,")
     print("certificate-bound FEC/audio/virtual-sink/Back timeout override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery, authorized artwork retrieval and restart persistence,")
@@ -1406,7 +1441,7 @@ def main():
     print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
     print("session history authorization, settings CAS, status, and restart persistence,")
     print("session restart invalidation,")
-    print("input policy CAS, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input policy CAS, controller switch, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

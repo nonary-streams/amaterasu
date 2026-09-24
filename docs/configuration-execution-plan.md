@@ -204,6 +204,17 @@ cross-platform qualification. `global:virtual_sink` and its scoped overrides
 remain pending.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
+Global preparation now persists as a bounded structured list in NVHTTP product
+document v16 and is copied into each admitted launch. The launch module puts
+those steps before application preparation unless the catalog entry sets
+`exclude_global_prep_cmd`. Playnite and Playnite Fullscreen launches use a
+prepare-only application lease: provider start waits for preparation, and
+provider stop is confirmed before reverse undo. A failed undo retains the
+session for retry. Vibeshine's `global_prep_cmd` accepts raw `do`/`undo` command
+strings, an `elevated` flag, and `$()` environment expansion; Amaterasu's
+structured executable/arguments form does not yet implement those semantics.
+`global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
+remain pending despite the working structured lifecycle.
 
 The Windows global capture output can now be selected by exact provider ID
 and persists through host restart. A launch snapshots that output into RTSP
@@ -234,8 +245,21 @@ The media transport now caps each software video send batch to a selected
 host setting, migrates older documents to the 64 KiB default, and snapshots
 the effective value through RTSP and stream session on launch. The signed
 editor preserves raw 0..64 selections while reporting the effective fallback.
-Platform UDP segmentation offload and its compatibility behavior remain
-pending.
+The transport also attempts Windows UDP segmentation or Linux UDP GSO for
+eligible batches and falls back to ordinary datagrams when the socket or
+platform does not support it. Driver, NIC, and live Linux behavior still need
+qualification before this setting can be marked complete.
+
+`global:sw_preset` and `global:sw_tune` remain pending. Vibeshine defaults
+them to `superfast` and `zerolatency` and passes their strings to x264/x265
+through FFmpeg; its parser accepts strings beyond the web editor's listed
+choices. Amaterasu's encoder module currently enumerates Windows hardware
+H.264 MFTs and has no software encoder consumer on any platform. Carrying
+these values through settings alone would not affect output. A software
+encoder must preserve the current NV12 input, Annex B output, timestamps,
+forced IDR, and drain contracts. Exact preset/tune behavior requires an x264
+backend and a deliberate dependency and distribution choice before the
+settings can be presented as functional.
 
 The `ping_timeout` setting now has a signed editor and nullable product
 document v13 value. Its 10,000 ms default and 0..2,147,483,647 ms range are
@@ -310,6 +334,13 @@ are recognized but cannot inject controller packets. The signed management
 route and editor preserve profile choices and show lease-time availability.
 Native runtime qualification and missing profiles still block
 full gamepad parity.
+Input product document v8 also persists the default-enabled `controller`
+switch. Disabling it suppresses controller snapshots while leaving keyboard
+and mouse input active; existing virtual slots are removed immediately, with
+failed removal retained for retry. The signed editor and status expose the
+policy and pending cleanup. Vibeshine also permits this key as an application
+and paired-client override, which Amaterasu has not yet resolved into a lease.
+Native device qualification remains pending.
 
 The live path follows this order; steps 1, 2, and 4 plus initial Linux and
 Windows backends in step 3 are implemented:

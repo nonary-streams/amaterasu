@@ -158,4 +158,6 @@ property. Hardware and emitted-bitstream qualification remain outstanding.
 The nested video configuration also carries `max_batch_size_kb` (default 64,
 range 0..=64) to the media transport. Values 0 and unsupported in-range values
 normalize to an effective 64; 16, 32, and 64 select the software per-frame send
-allowance. This does not enable Windows USO or Linux GSO segmentation offload.
+allowance. Eligible batches attempt Windows UDP segmentation or Linux UDP GSO;
+unsupported sockets fall back to individual datagrams. Live NIC and Linux
+qualification remain outstanding.
