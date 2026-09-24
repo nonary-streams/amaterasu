@@ -51,6 +51,9 @@ test("manual Playnite Fullscreen entries use a typed bounded launch", () => {
   form.set("path", "C:\\Ignored\\Playnite.exe");
   form.set("steam_id", "123");
   form.set("steam_install_dir", "C:\\Ignored");
+  form.set("exit_timeout_seconds", "invalid inactive value");
+  form.set("detached", "bad\tcommand");
+  form.set("preparation", "invalid inactive value");
   form.set("fullscreen_exit_timeout_seconds", "0");
   const entry = ordinary(model.entryFromForm(form));
   assert.deepEqual(entry.launch, { kind: "playnite_fullscreen", exit_timeout_seconds: 0 });

@@ -141,9 +141,9 @@ namespace Amaterasu {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
             ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
           };
-    const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
-    const detached = parseDetachedCommands(text("detached"));
-    const preparation = parsePreparation(text("preparation"));
+    const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
+    const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
+    const preparation = kind === "executable" ? parsePreparation(text("preparation")) : [];
     const launch: Launch = kind === "playnite_fullscreen"
       ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
       : kind === "application"
