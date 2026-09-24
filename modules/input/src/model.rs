@@ -38,6 +38,16 @@ pub enum Operation {
         keyboard: Option<bool>,
         #[serde(default)]
         mouse: Option<bool>,
+        #[serde(default)]
+        high_resolution_scrolling: Option<bool>,
+        #[serde(default)]
+        always_send_scancodes: Option<bool>,
+        #[serde(default)]
+        key_rightalt_to_key_win: Option<bool>,
+        #[serde(default)]
+        key_repeat_delay: Option<u32>,
+        #[serde(default)]
+        key_repeat_frequency: Option<f64>,
     },
     Lookup {
         operation_id: String,
@@ -554,7 +564,12 @@ mod tests {
             "controller":false,
             "gamepad":"auto",
             "keyboard":true,
-            "mouse":false
+            "mouse":false,
+            "high_resolution_scrolling":false,
+            "always_send_scancodes":false,
+            "key_rightalt_to_key_win":true,
+            "key_repeat_delay":0,
+            "key_repeat_frequency":0.0
         }))
         .unwrap();
         assert!(matches!(
@@ -564,6 +579,11 @@ mod tests {
                 gamepad: Some(GamepadProfile::Auto),
                 keyboard: Some(true),
                 mouse: Some(false),
+                high_resolution_scrolling: Some(false),
+                always_send_scancodes: Some(false),
+                key_rightalt_to_key_win: Some(true),
+                key_repeat_delay: Some(0),
+                key_repeat_frequency: Some(0.0),
                 ..
             }
         ));

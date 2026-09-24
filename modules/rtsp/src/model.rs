@@ -415,6 +415,16 @@ pub struct Open {
     pub channels: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_resolution_scrolling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_send_scancodes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rightalt_to_key_win: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_delay: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_frequency: Option<f64>,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -460,6 +470,15 @@ impl Open {
             .is_some_and(|name| !valid_name(name))
         {
             return Err("invalid_device_name");
+        }
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+            || self
+                .key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err("invalid_input_policy_override");
         }
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
@@ -559,6 +578,11 @@ impl Open {
                 "virtual_sink": self.virtual_sink,
                 "channels": self.channels,
                 "back_button_timeout": self.back_button_timeout,
+                "high_resolution_scrolling": self.high_resolution_scrolling,
+                "always_send_scancodes": self.always_send_scancodes,
+                "key_rightalt_to_key_win": self.key_rightalt_to_key_win,
+                "key_repeat_delay": self.key_repeat_delay,
+                "key_repeat_frequency": self.key_repeat_frequency,
                 "device_name": self.device_name,
                 "configuration": {
                     "width": self.profile.width,
@@ -1261,6 +1285,47 @@ mod tests {
             selected_timeout.arm(42)["configuration"]["back_button_timeout"],
             -1
         );
+    }
+
+    #[test]
+    fn scoped_keyboard_policy_overrides_reach_stream_session_and_stay_sparse() {
+        let inherited = open();
+        assert_eq!(inherited.high_resolution_scrolling, None);
+        assert_eq!(inherited.always_send_scancodes, None);
+        assert_eq!(inherited.key_rightalt_to_key_win, None);
+        assert_eq!(inherited.key_repeat_delay, None);
+        assert_eq!(inherited.key_repeat_frequency, None);
+
+        let mut selected = open();
+        selected.high_resolution_scrolling = Some(false);
+        selected.always_send_scancodes = Some(false);
+        selected.key_rightalt_to_key_win = Some(true);
+        selected.key_repeat_delay = Some(0);
+        selected.key_repeat_frequency = Some(0.0);
+        assert!(selected.validate(false).is_ok());
+
+        let configuration = selected.arm(43)["configuration"].clone();
+        assert_eq!(configuration["high_resolution_scrolling"], false);
+        assert_eq!(configuration["always_send_scancodes"], false);
+        assert_eq!(configuration["key_rightalt_to_key_win"], true);
+        assert_eq!(configuration["key_repeat_delay"], 0);
+        assert_eq!(configuration["key_repeat_frequency"], 0.0);
+    }
+
+    #[test]
+    fn scoped_repeat_overrides_reject_values_outside_input_policy_bounds() {
+        for (field, value) in [
+            ("key_repeat_delay", json!(i32::MAX as u64 + 1)),
+            ("key_repeat_frequency", json!(-0.1)),
+        ] {
+            let mut request = open_json();
+            request[field] = value;
+            let request: Open = serde_json::from_value(request).unwrap();
+            assert_eq!(
+                request.validate(false),
+                Err("invalid_input_policy_override")
+            );
+        }
     }
 
     #[test]

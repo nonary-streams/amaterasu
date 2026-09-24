@@ -3,6 +3,8 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
+#[path = "windows_user_process.rs"]
+mod windows_user_process;
 use windows_sys::Win32::Foundation::{
     ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
 };
@@ -12,11 +14,108 @@ use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, SendNotifyMessageW, WM_CLOSE,
 };
+use windows_user_process::{
+    CreatedUserProcess, NativeProcess, active_user_token_for_system_host,
+    create_suspended_user_process, create_uncontained_user_process, resume_user_process,
+};
 
 pub(crate) struct ContainedChild {
-    child: Child,
+    child: SuspendedProcess,
     job: OwnedHandle,
     group_finished: bool,
+}
+
+enum ProcessHandle {
+    Standard(Child),
+    User(NativeProcess),
+}
+
+impl ProcessHandle {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.id(),
+            Self::User(child) => child.id(),
+        }
+    }
+
+    fn raw_handle(&self) -> HANDLE {
+        match self {
+            Self::Standard(child) => child.as_raw_handle(),
+            Self::User(child) => child.raw_handle(),
+        }
+    }
+
+    fn terminate(&mut self) -> io::Result<()> {
+        match self {
+            Self::Standard(child) => child.kill(),
+            Self::User(child) => child.terminate(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Standard(child) => child.try_wait(),
+            Self::User(child) => child.try_wait(),
+        }
+    }
+}
+
+pub(crate) struct DetachedChild {
+    process: ProcessHandle,
+}
+
+impl DetachedChild {
+    pub fn spawn(command: &mut Command, elevated: bool) -> io::Result<Self> {
+        let user_token = active_user_token_for_system_host(elevated)?;
+        let process = if let Some(token) = user_token.as_ref() {
+            ProcessHandle::User(create_uncontained_user_process(
+                command,
+                token.as_raw_handle(),
+            )?)
+        } else {
+            ProcessHandle::Standard(command.spawn()?)
+        };
+        Ok(Self { process })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.process.id()
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.process.try_wait()
+    }
+}
+
+struct SuspendedProcess {
+    process: ProcessHandle,
+    user_primary_thread: Option<OwnedHandle>,
+}
+
+impl SuspendedProcess {
+    fn id(&self) -> u32 {
+        self.process.id()
+    }
+
+    fn raw_handle(&self) -> HANDLE {
+        self.process.raw_handle()
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.process.terminate();
+    }
+
+    fn resume(&self) -> io::Result<()> {
+        if let Some(thread) = &self.user_primary_thread {
+            resume_user_process(thread)
+        } else if let ProcessHandle::Standard(child) = &self.process {
+            resume_primary_thread(child)
+        } else {
+            Err(io::Error::other(
+                "user process is missing its primary thread",
+            ))
+        }
+    }
 }
 
 fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
@@ -28,7 +127,7 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 }
 
 impl ContainedChild {
-    pub fn spawn(command: &mut Command) -> io::Result<Self> {
+    pub fn spawn(command: &mut Command, elevated: bool) -> io::Result<Self> {
         // SAFETY: null security attributes/name create an unnamed, non-inheritable
         // job. OwnedHandle closes the sole handle even on error or host termination.
         let job = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
@@ -46,22 +145,41 @@ impl ContainedChild {
         {
             return Err(io::Error::last_os_error());
         }
-        // No application code can run before job assignment. Preserve std's native
-        // argument quoting, environment, cwd, and null stdio setup.
-        let mut child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
+        // The active user's process token is used when this module host is SYSTEM.
+        // A standard non-admin account retains the token unchanged even when the
+        // catalog requested elevation, matching the source's documented warning.
+        let user_token = active_user_token_for_system_host(elevated)?;
+        // Neither creation path can run app code before private-job assignment.
+        let mut child = if let Some(token) = user_token.as_ref() {
+            let CreatedUserProcess {
+                process,
+                primary_thread,
+            } = create_suspended_user_process(command, token.as_raw_handle())?;
+            SuspendedProcess {
+                process: ProcessHandle::User(process),
+                user_primary_thread: Some(primary_thread),
+            }
+        } else {
+            let child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
+            SuspendedProcess {
+                process: ProcessHandle::Standard(child),
+                user_primary_thread: None,
+            }
+        };
         // SAFETY: both handles remain owned throughout assignment.
-        let assigned =
-            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+        let assigned = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.raw_handle()) };
         let setup = if assigned == 0 {
             Err(io::Error::last_os_error())
         } else {
-            resume_primary_thread(&child)
+            child.resume()
         };
         if let Err(error) = setup {
             // Assignment/resume errors fail closed: never run an uncontained child.
-            let _ = child.kill();
-            // Do not block forever on an OS termination failure.
-            let _ = child.try_wait();
+            if assigned != 0 {
+                // SAFETY: the job owns this child and kill-on-close is enabled.
+                let _ = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+            }
+            child.terminate();
             return Err(error);
         }
         Ok(Self {
@@ -78,7 +196,11 @@ impl ContainedChild {
         Ok(self.successful_exit()?.is_some())
     }
     pub fn successful_exit(&mut self) -> io::Result<Option<bool>> {
-        Ok(self.child.try_wait()?.map(|status| status.success()))
+        Ok(self
+            .child
+            .process
+            .try_wait()?
+            .map(|status| status.success()))
     }
     pub fn group_running(&self) -> io::Result<bool> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
@@ -156,7 +278,7 @@ impl ContainedChild {
         if accounting.ActiveProcesses != 0 {
             return Ok(None);
         }
-        self.child.try_wait()
+        self.child.process.try_wait()
     }
 }
 

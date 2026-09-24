@@ -562,6 +562,11 @@ pub(super) struct ClientConfigOverrides {
     pub(super) gamepad: Option<String>,
     pub(super) keyboard: Option<bool>,
     pub(super) mouse: Option<bool>,
+    pub(super) high_resolution_scrolling: Option<bool>,
+    pub(super) always_send_scancodes: Option<bool>,
+    pub(super) key_rightalt_to_key_win: Option<bool>,
+    pub(super) key_repeat_delay: Option<u32>,
+    pub(super) key_repeat_frequency: Option<f64>,
 }
 
 #[cfg(test)]

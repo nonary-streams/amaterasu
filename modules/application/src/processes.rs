@@ -1,5 +1,5 @@
 use crate::commands::parse_detached_commands;
-use crate::containment::ContainedChild;
+use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
 use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
@@ -72,9 +72,9 @@ struct ProcessRecord {
     #[serde(skip)]
     auto_detached: bool,
     #[serde(skip)]
-    detached_children: Vec<std::process::Child>,
+    detached_children: Vec<DetachedChild>,
     #[serde(skip)]
-    steam_launcher: Option<std::process::Child>,
+    steam_launcher: Option<DetachedChild>,
     #[serde(skip)]
     steam_tracker: Option<SteamProcessTracker>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,7 +133,7 @@ impl ProcessRecord {
             } else {
                 SteamGameLiveness::Unknown
             });
-            match command.spawn() {
+            match DetachedChild::spawn(&mut command, self.spec.elevated) {
                 Ok(child) => {
                     self.pid = Some(child.id());
                     self.steam_launcher = Some(child);
@@ -146,7 +146,7 @@ impl ProcessRecord {
             }
             return;
         }
-        match ContainedChild::spawn(&mut command) {
+        match ContainedChild::spawn(&mut command, self.spec.elevated) {
             Ok(child) => {
                 self.pid = Some(child.id());
                 self.child = Some(child);
@@ -180,7 +180,7 @@ impl ProcessRecord {
 
             // The source treats these as best-effort launchers. Their spawn
             // failure must not prevent the primary application from starting.
-            if let Ok(child) = command.spawn() {
+            if let Ok(child) = DetachedChild::spawn(&mut command, self.spec.elevated) {
                 self.detached_children.push(child);
             }
         }
@@ -683,6 +683,7 @@ impl ProcessManager {
                 args,
                 environment,
                 cwd,
+                elevated,
                 auto_detach,
                 wait_all,
                 exit_timeout_seconds,
@@ -697,6 +698,7 @@ impl ProcessManager {
                     args,
                     environment,
                     cwd,
+                    elevated,
                     auto_detach,
                     wait_all,
                     exit_timeout_seconds,

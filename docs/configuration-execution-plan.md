@@ -1,10 +1,244 @@
 # Vibeshine configuration parity execution plan
 
-Sol owns integration, cross-module contracts, security review, and
-final verification. Luna XHigh workers take bounded domains with disjoint file
-ownership. Each worker uses the pinned Vibeshine commit in
+One GPT-6 Luna Max coordinator launches six separate `codex exec` sessions,
+each running a GPT-6 Luna Max domain orchestrator. Each of those six leads
+spawns Luna XHigh workers for bounded implementation tasks. There are seven
+Luna Max roles in total: the coordinator plus Luna 01 through Luna 06. The
+coordinator owns scheduling, cross-lane coordination, the integration queue,
+and final verification. The six leads own their domain contracts, worker
+assignments, reviews, and qualification. This replaces the single GPT-6 Sol
+High orchestrator. Each worker uses the pinned Vibeshine commit in
 [configuration-parity.md](configuration-parity.md) as a behavioral reference,
 without copying or translating its implementation.
+
+The six leads must be independent CLI sessions launched as concurrent OS
+processes. Do not launch them through the coordinator's `spawn_agent` tool:
+that would put them under the coordinator's four-slot agent-tree limit. Each
+CLI session provides the root for its own worker tree, subject to that session's
+available tools and limits. This topology moves the six leads outside the
+coordinator's local agent tree; it does not remove account-wide usage limits
+or machine resource constraints. Verify each session's effective model,
+reasoning effort, and worker capability at startup; never silently substitute
+a model or fall back to three leads in waves. Updating this guide alone does
+not launch any processes or create worktrees.
+
+## Launching and supervising the separate sessions
+
+The coordinator runs as `gpt-6-luna` with reasoning effort `max`. It prepares
+the integration worktree and six lane worktrees described below, then launches
+all six `codex exec` processes before waiting for any one to finish. Each lead
+uses `gpt-6-luna` with `model_reasoning_effort="max"`; its implementation workers
+use `gpt-6-luna` with `xhigh`. Lead prompts must explicitly authorize worker
+delegation and specify those settings. When the worker tool requires a fresh or partial
+context fork to override model/effort, use that mode and supply the full task
+contract rather than inheriting the lead's Max effort accidentally.
+
+Use one external run directory, for example
+`D:\sources\worktrees\amaterasu-config-runs\<run-id>`, outside every Git
+worktree. The coordinator creates a prompt and mailbox for each lane there.
+Every prompt includes the absolute lane worktree, branch and baseline SHA,
+this plan and AGENTS.md paths, stable IDs/scopes, allowed write paths, worker
+model/effort, required tests, mailbox locations, and completion contract.
+Separate CLI sessions do not inherit the coordinator's conversation or its
+collaboration-tool mailbox.
+
+The following PowerShell template starts six background jobs, each invoking
+a separate CLI process in its prepared worktree. Set `$runRoot` to the run
+directory and `$laneWorktrees` to the six actual absolute paths in lane order
+before running it; prompt files and worktrees must already exist. Retain the
+parent PowerShell process and job handles while supervising the sessions.
+
+```powershell
+$leadJobs = for ($laneNumber = 1; $laneNumber -le 6; $laneNumber++) {
+    $laneId = 'luna-{0:00}' -f $laneNumber
+    Start-Job -Name $laneId -ArgumentList @(
+        $laneWorktrees[$laneNumber - 1], $runRoot, $laneId
+    ) -ScriptBlock {
+        param($laneWorktree, $runDirectory, $laneId)
+        $ErrorActionPreference = 'Stop'
+        Set-Location -LiteralPath $laneWorktree
+        $promptPath = Join-Path $runDirectory "$laneId.prompt.md"
+        $eventsPath = Join-Path $runDirectory "$laneId.events.jsonl"
+        $errorsPath = Join-Path $runDirectory "$laneId.stderr.log"
+        $resultPath = Join-Path $runDirectory "$laneId.result.md"
+        Get-Content -LiteralPath $promptPath -Raw |
+            & codex exec --model gpt-6-luna `
+                -c 'model_reasoning_effort="max"' `
+                --cd $laneWorktree --json --output-last-message $resultPath - `
+                1> $eventsPath 2> $errorsPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "$laneId failed with exit code $LASTEXITCODE; inspect $errorsPath"
+        }
+    }
+}
+```
+
+Use the authorized local execution profile and confirm it permits the required
+worktree, Git, build, and mailbox writes before dispatch. CLI help for the
+installed version is the authority for supported flags. The launch template's
+stdin prompt, JSON event stream, final-message output, and session resume flow
+follow [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+and were checked against `codex-cli 0.156.1` help. Model access and nested-worker
+availability still require the startup check in each launched session.
+
+The coordinator supervises job/process status, stderr, event logs, and lane
+mailboxes, recording each CLI session ID from its startup events. Poll without
+blocking on one lane while others need coordination. Every lane has a
+coordinator-written inbox and a lead-written outbox; use uniquely named,
+sequenced messages published by temporary-file rename, with request IDs and
+acknowledgments. Leads check their inbox at task boundaries and report
+progress, blockers, dependency requests, worker ownership, and candidate SHAs
+to their outbox. The coordinator relays cross-lane requests and commits durable
+decisions to the integration ledger. A file written in one worktree is not
+automatically visible in another worktree's copy of that file.
+
+A lead completing a bounded batch returns its handoff and may exit. After
+confirming that process and its workers have stopped writing, the coordinator
+can run `codex exec resume <session-id>` from that lane's worktree, explicitly
+passing the same model and effort plus its next prompt. Use the recorded
+session ID, never `--last`, and unique logs/results for every invocation.
+Do not start a second writer for an active lane or mistake a stale result file
+for a new completion. On a crash or timeout, reconcile worker processes, Git
+status, and submitted SHAs before resume or reassignment. The coordinator keeps
+supervising until all six lanes are accounted for and their accepted work is
+integrated; it reports remaining blockers without marking them complete.
+
+## Six orchestrator lanes
+
+Every orchestrator uses `gpt-6-luna` with reasoning effort `max`. Existing
+bounded implementation workers retain Luna XHigh (`gpt-6-luna`, `xhigh`).
+The following directory ownership is exclusive and recursive, including local
+tests, manifests, and READMEs. A lead may read any file, but may write only its
+owned paths and explicitly assigned new paths. Ownership applies across all
+worktrees: independent checkouts alone do not prevent overlapping changes.
+
+| Lead / branch suffix | Configuration responsibility | Initial exclusive write ownership |
+| --- | --- | --- |
+| Luna 01 / `foundation` | Typed settings, migrations, authentication, authorization, and host bootstrap | `modules/configuration/`, `modules/authentication/`, `modules/state/`, `crates/runtime/`, `crates/host/`, `crates/package/`, `crates/storage/`, `crates/identity/`, `crates/module-sdk/`, `crates/contracts/`, `crates/abi/`, `sdk/`; shared root manifests, root lockfiles, CI, and scripts |
+| Luna 02 / `network` | Network policy, pairing, launch admission, negotiation, stream snapshots, transport, and recovery | `modules/nvhttp/`, `modules/pairing/`, `modules/rtsp/`, `modules/stream-session/`, `modules/media-transport/`, `modules/control-transport/`, `modules/session/`, `crates/gamestream/` |
+| Luna 03 / `video-display` | Capture selection and pacing, display lifecycle, video, encoders, frame generation and frame limiter parity | `modules/video/`, `modules/encode/`, `modules/capture-dxgi/`, `modules/capture-wgc/`, `modules/display/`, `modules/virtual-display/`, `crates/media/`, `crates/windows-capture-geometry/` |
+| Luna 04 / `audio-input` | Audio routing and formats, keyboard/mouse/controller policy, native input backends, and scoped input/audio behavior | `modules/audio/`, `modules/audio-encode/`, `modules/input/` |
+| Luna 05 / `applications` | Catalog, preparation and process lifecycle, Steam, Playnite, Lutris, and application override storage | `modules/catalog/`, `modules/application/`, `modules/launch/`, `modules/steam/`, `modules/playnite/`, `modules/lutris/` |
+| Luna 06 / `management` | Management routes and editor, diagnostics, session history, statistics, and visible settings behavior | `modules/management/`, `frontend/`, `modules/diagnostics/`, `modules/session-history/` |
+
+Each lead also owns its future handoff file at
+`docs/configuration-workstreams/luna-01.md` through `luna-06.md`, respectively.
+The coordinator exclusively owns the shared parity documents, coverage ledger,
+and coordination ledger; the six handoff files are lead-owned exceptions. Paths
+not listed above are unassigned: the coordinator must assign them before anyone
+writes them. In particular, allocate new tray, updater, frame limiter, platform,
+or fixture paths explicitly; the table does not imply those consumers already exist.
+
+A setting's accountable lead follows its runtime domain, including its aliases
+and application/client overrides. That lead coordinates the complete behavior;
+it does not gain write access to every consumer. Mixed inventory domains such
+as `Audio/Video`, `General`, and `Advanced runtime and recovery options` must be
+split by stable ID, not assigned wholesale by their display label. Before
+dispatch, the coordinator records exactly one accountable lead for every coverage ID,
+and the responsible collaborators for every supported override scope. Each
+entry starts `pending`; ownership is not evidence of implementation.
+
+## Worktree isolation and coordination
+
+1. Establish a clean, committed baseline before dispatch. Inspect the current
+   checkout, active writers, branch, and worktrees. Existing uncommitted
+   application, catalog, input, launch, and management work must be reconciled
+   with its owners; do not stage, stash, reset, or include it implicitly. Record
+   the chosen baseline SHA and any deferred changes in the coordination ledger.
+2. Create a dedicated integration branch `config-parity/integration` and
+   worktree `D:\sources\worktrees\amaterasu-config-integration`. Create six
+   branches `config-parity/<suffix>` and corresponding
+   `D:\sources\worktrees\amaterasu-config-<suffix>` worktrees from the recorded
+   baseline, using the suffixes in the table. Check existing branches and paths
+   before creation; verify repository, HEAD, branch, and clean status in each.
+   Copy applicable local setup and AGENTS.md using the worktree workflow. If
+   provisioning build-enabled worktrees under that workflow, use its required
+   `_large` suffix on both branch and directory names and record actual names.
+3. The coordinator is the sole writer of the integration worktree and its coordination
+   ledger, `docs/configuration-coordination.md`. Record the baseline, actual
+   worktree/branch map, coverage-ID assignments, path owners, active writers,
+   dependency requests, schema reservations, review assignments, candidate
+   SHAs, and last validated integration SHA there. Other leads send structured
+   requests; they never edit this central file from their own branches.
+4. Every lead and worker receives an explicit absolute working directory and
+   checks `git rev-parse --show-toplevel` and `git branch --show-current` before
+   edits or commits. Never switch another lane's checkout or run a Git mutation
+   there. A nested worker gets a separate branch/worktree and a narrower,
+   disjoint path assignment; its lead merges it locally before submission.
+5. Keep build outputs, frontend dependencies, test state roots, logs, sockets,
+   and service ports isolated by lane. Give each build-enabled lane a distinct
+   `CARGO_TARGET_DIR`. Do not share mutable target directories or native device
+   fixtures. Serialize tests that use host-global audio routes, virtual displays,
+   input devices, fixed ports, or installed services through the coordinator's resource
+   queue. Record prerequisites and cleanup evidence for those tests.
+6. Use small dependency requests containing the stable IDs and scopes, owning
+   and requesting leads, exact paths, proposed data contract, migration/version
+   needs, acceptance tests, dependency SHAs, and blocking status. The receiving
+   lead acknowledges ownership and reports delivery or a concrete blocker in
+   its handoff. Review requests and the merge queue at every slice boundary;
+   an unavailable owner blocks that change instead of inviting another writer.
+
+The default for a cross-domain edit is an owner-authored prerequisite commit.
+For example, an audio setting can require Luna 02 to change NVHTTP persistence
+and stream snapshots, Luna 05 to change catalog overrides, and Luna 06 to change
+the signed route and editor. Luna 04 supplies the contract and runtime tests.
+Land the contract prerequisites first, then let consumers merge the validated
+integration commit into their own branches. Do not independently cherry-pick
+the same dependency into multiple lanes.
+
+If an ownership transfer is necessary, the coordinator records the exact paths, previous
+and new owners, starting SHA, and return condition. The previous owner must
+acknowledge that it has stopped editing and deliver or explicitly defer its
+outstanding changes before the new owner starts. The transfer lasts through
+integration and review; no simultaneous file leases are allowed. Reserve each
+persisted document version and ABI/protocol change with its file owner before
+implementation. Concurrent settings work must not independently allocate the
+same next document version or overwrite a neighbor's migration.
+
+## Merge queue and review
+
+1. Each lead submits a small committed slice with its base integration SHA,
+   exact candidate SHA, stable IDs/scopes, changed paths, dependencies, test
+   commands/results, platform evidence, and remaining gaps in its handoff file.
+   Run rustfmt, meaningful tests, and strict Clippy before submission. An editor
+   or durable field without its runtime effect stays incomplete.
+2. The coordinator checks ownership against
+   `git diff --name-only <base-sha>...<candidate-sha>` and assigns review to
+   another Luna Max lead. The author cannot approve its own slice. The coordinator's
+   changes and conflict resolutions also require an independent lead's review.
+   Consumers review shared contracts and security-sensitive changes before merge.
+3. Freeze the submitted candidate while it is in the queue. With a clean
+   integration worktree, merge that SHA using `git merge --no-ff --no-commit`.
+   Process one candidate at a time in dependency order. On conflicts, abort
+   the trial merge and return the current integration SHA and conflicting
+   paths to the owning leads. They coordinate a correction in their own lane,
+   rerun affected checks, and resubmit for review. Never choose one side blindly
+   for settings schemas, migrations, authorization, or override precedence.
+4. Validate the combined tree before creating the integration commit. Run
+   `cargo fmt --all --check`, `cargo test --workspace --locked`, and
+   `cargo clippy --workspace --all-targets --locked -- -D warnings`, plus
+   `python scripts/inventory_configuration.py --check`. Run relevant signed
+   host/script regressions and `npm test` in `frontend` for editor changes.
+   Meet the platform gates in CI and the native qualification requirements of
+   the changed settings. On failure, abort the trial merge, retain the logs,
+   and return the failure to its owner. Keep the last validated integration
+   SHA as the common base until a candidate passes.
+5. Commit a passing merge with the attribution below and publish its SHA to all
+   leads through the coordination ledger. Idle/ready leads merge that SHA into
+   their clean lane branches before starting dependent work; busy leads finish
+   their bounded slice first. Resubmit and revalidate any candidate changed by
+   synchronization. Do not rebase or force-update another lead's branch.
+6. Only the coordinator updates the shared coverage ledger and consolidated progress
+   narrative after independent review confirms all evidence. Keep local and
+   platform validation distinct; a test that was not run cannot close a gate.
+   Integrate partial improvements with explicit `pending` IDs and missing
+   behavior, while reserving `verified` for complete parity.
+7. After a validated batch, coordinate with the destination branch's owner
+   before merging the integration branch back with `--no-ff`. The destination
+   checkout must be clean and free of another active writer. If it advanced,
+   merge its new head into integration and rerun the affected and required
+   gates before promotion. Preserve source branches/worktrees for follow-up;
+   cleanup occurs only after successful promotion and an explicit cleanup task.
 
 ## Definition of complete
 
@@ -19,7 +253,13 @@ application/client override independently. Keep genuinely unsupported behavior
 
 ## Work sequence
 
-| Phase | Luna XHigh assignment | Sol integration gate |
+These phases describe dependencies within a settings slice. After its required
+foundation contracts land, each lane advances independently; integrations and
+application overrides need not wait for every core streaming setting. Include
+scoped overrides in the same slice when feasible. Final audit is the shared
+completion gate for all six lanes.
+
+| Phase | Parallel assignments coordinated by the six Luna Max leads | Integration gate maintained by the Luna Max coordinator |
 | --- | --- | --- |
 | 1. Reference contract | Inventory parser, guide, web, integration, application and override settings; pin sources and defaults | Audit stable IDs, conflicts and omissions; run the inventory drift check in CI |
 | 2. Settings foundation | Extend typed schema, caller-owned product documents, versioned updates and editor controls | Review authority, migration, CAS ambiguity, result release and concurrent request progress |
@@ -30,7 +270,7 @@ application/client override independently. Keep genuinely unsupported behavior
 | 7. Final audit | Independent Luna review of each remaining `pending` ID and every documented source mismatch | Zero pending IDs, complete platform gates, full locked suite, strict Clippy, rustfmt and signed host tests |
 
 Workers should report concrete changed files, test commands and results, and
-unimplemented behavior. Sol integrates only when the ownership boundary is clear
+unimplemented behavior. The coordinator integrates only when the ownership boundary is clear
 and the option's observable effect is tested. The current increment establishes
 the inventory and settings foundation, host and application lifecycle controls,
 session renewal, network policy, Steam and Playnite provider slices, a live
@@ -97,7 +337,7 @@ and Clippy. Use the repository's Nonary Git identity and include these exact
 lines in every plan commit, including integration commits:
 
 ```text
-Orchestrated By: GPT-6 Sol High
+Orchestrated By: GPT-6 Luna Max
 Planned By: GPT-6 Astra High
 ```
 

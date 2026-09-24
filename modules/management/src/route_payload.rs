@@ -662,8 +662,22 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             "steam_install_dir",
             "exclude_global_prep_cmd",
             "exclude-global-prep-cmd",
+            "elevated",
         ],
     )?;
+    if entry
+        .get("elevated")
+        .is_some_and(|value| value.as_bool().is_none())
+        || (entry.get("elevated").and_then(Value::as_bool) == Some(true)
+            && entry
+                .get("launch")
+                .and_then(Value::as_object)
+                .and_then(|launch| launch.get("kind"))
+                .and_then(Value::as_str)
+                != Some("executable"))
+    {
+        return Err(INVALID);
+    }
     if entry.contains_key("exclude_global_prep_cmd")
         && entry.contains_key("exclude-global-prep-cmd")
     {
@@ -2424,6 +2438,7 @@ mod catalog_tests {
                 "name": "Configured app",
                 "steam_id": "4294967295",
                 "steam_install_dir": "C:\\Games\\Configured",
+                "elevated": true,
                 "exclude_global_prep_cmd": true,
                 "config_overrides": {"fec_percentage": 255, "stream_audio": false},
                 "launch": {
@@ -2443,6 +2458,16 @@ mod catalog_tests {
             }
         });
         assert!(validate(route("create"), create.as_object().unwrap()).is_ok());
+        let update = serde_json::json!({
+            "id":"app-0000000000000001",
+            "expected_revision":4,
+            "entry": {
+                "name":"Updated elevated app",
+                "elevated":true,
+                "launch":{"kind":"executable","program":"C:\\Games\\game.exe"}
+            }
+        });
+        assert!(validate(route("update"), update.as_object().unwrap()).is_ok());
         let legacy = serde_json::json!({
             "entry": {"name":"Legacy", "launch":{"kind":"application","path":"/opt/example"}},
             "expected_revision": 0
@@ -2511,6 +2536,9 @@ mod catalog_tests {
         assert!(validate(route("create"), fullscreen.as_object().unwrap()).is_ok());
         let invalid = [
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","owner":"other","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","elevated":"true","launch":{"kind":"executable","program":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","elevated":true,"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","elevated":true,"launch":{"kind":"playnite_fullscreen"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":0},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":256},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":"37"},"launch":{"kind":"application","path":"/x"}}}),

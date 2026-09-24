@@ -126,7 +126,7 @@ impl Workflow {
                 };
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"elevated":executable.elevated,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::StartPlaynite => match record.target.as_ref() {
@@ -352,5 +352,40 @@ mod tests {
         let (_, payload) = workflow.command(record, &BTreeMap::new()).unwrap();
         assert_eq!(payload["steam_id"], "42");
         assert_eq!(payload["steam_install_dir"], "/games/title");
+    }
+
+    #[test]
+    fn executable_elevation_policy_reaches_application_launch_payload() {
+        let mut records = Records::new().unwrap();
+        let (launch_id, _) = records
+            .start(
+                "alice",
+                "alice",
+                "operation".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+                Vec::new(),
+            )
+            .unwrap();
+        let record = records.values.get_mut(&launch_id).unwrap();
+        let mut executable = crate::protocol::Executable::from_catalog(&json!({
+            "kind":"executable",
+            "program":std::env::current_exe().unwrap(),
+        }))
+        .unwrap();
+        executable.elevated = true;
+        record.target = Some(LaunchTarget::Executable(executable));
+        record.process_operation = "elevated-launch".into();
+        let workflow = Workflow {
+            launch_id,
+            request: None,
+            deadline: Instant::now() + Duration::from_secs(5),
+            step: Step::Spawn,
+            pending: None,
+            cleanup: false,
+        };
+
+        let (_, payload) = workflow.command(record, &BTreeMap::new()).unwrap();
+        assert_eq!(payload["elevated"], true);
     }
 }

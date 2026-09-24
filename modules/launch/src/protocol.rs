@@ -150,6 +150,7 @@ pub struct Executable {
     pub auto_detach: bool,
     pub wait_all: bool,
     pub exit_timeout_seconds: u64,
+    pub elevated: bool,
     pub detached: Vec<String>,
     pub preparation: Vec<PreparationStep>,
 }
@@ -187,6 +188,7 @@ impl LaunchTarget {
         environment: &BTreeMap<String, String>,
     ) -> Result<Self, &'static str> {
         let launch = entry.get("launch").ok_or("invalid_catalog_response")?;
+        let elevated = catalog_elevated(entry)?;
         let exclude_global_preparation = catalog_excludes_global_preparation(entry)?;
         let steam_id = optional_catalog_string(entry, "steam_id")?;
         let steam_install_dir = optional_catalog_string(entry, "steam_install_dir")?;
@@ -218,8 +220,11 @@ impl LaunchTarget {
                 }
                 executable.steam_id = steam_id;
                 executable.steam_install_dir = steam_install_dir;
+                executable.elevated = elevated;
                 Ok(Self::Executable(executable))
             }
+            Self::Playnite { .. } if elevated => Err("invalid_catalog_response"),
+            Self::PlayniteFullscreen { .. } if elevated => Err("invalid_catalog_response"),
             Self::Playnite { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
                 Err("invalid_catalog_response")
             }
@@ -312,6 +317,14 @@ fn catalog_excludes_global_preparation(entry: &Value) -> Result<bool, &'static s
         return Ok(false);
     };
     value.as_bool().ok_or("invalid_catalog_response")
+}
+
+fn catalog_elevated(entry: &Value) -> Result<bool, &'static str> {
+    match entry.get("elevated") {
+        None => Ok(false),
+        Some(Value::Bool(elevated)) => Ok(*elevated),
+        Some(_) => Err("invalid_catalog_response"),
+    }
 }
 
 fn catalog_working_directory(
@@ -668,6 +681,7 @@ impl Executable {
                     auto_detach,
                     wait_all,
                     exit_timeout_seconds,
+                    elevated: false,
                     detached,
                     preparation,
                 })
@@ -1237,6 +1251,43 @@ mod tests {
             LaunchTarget::from_catalog_entry(&playnite, &[]).unwrap_err(),
             "invalid_catalog_response"
         );
+    }
+
+    #[test]
+    fn elevated_is_an_optional_top_level_executable_policy() {
+        let program = std::env::current_exe().unwrap();
+        let entry = json!({
+            "name":"Elevated app",
+            "launch":{"kind":"executable","program":program}
+        });
+        let LaunchTarget::Executable(defaulted) =
+            LaunchTarget::from_catalog_entry(&entry, &[]).unwrap()
+        else {
+            panic!("expected executable target")
+        };
+        assert!(!defaulted.elevated);
+
+        let entry = json!({
+            "name":"Elevated app",
+            "elevated":true,
+            "launch":{"kind":"executable","program":program}
+        });
+        let LaunchTarget::Executable(configured) =
+            LaunchTarget::from_catalog_entry(&entry, &[]).unwrap()
+        else {
+            panic!("expected executable target")
+        };
+        assert!(configured.elevated);
+
+        for invalid in [
+            json!({"name":"bad","elevated":"true","launch":{"kind":"executable","program":program}}),
+            json!({"name":"bad","elevated":true,"launch":{"kind":"playnite_fullscreen"}}),
+        ] {
+            assert_eq!(
+                LaunchTarget::from_catalog_entry(&invalid, &[]).unwrap_err(),
+                "invalid_catalog_response"
+            );
+        }
     }
 
     fn preparation_step(executable: &str, argument: &str) -> PreparationStep {

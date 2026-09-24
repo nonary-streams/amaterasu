@@ -3,10 +3,14 @@
 mod unix;
 #[cfg(unix)]
 pub(crate) use unix::ContainedChild;
+#[cfg(unix)]
+pub(crate) use unix::DetachedChild;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::ContainedChild;
+#[cfg(windows)]
+pub(crate) use windows::DetachedChild;
 
 #[cfg(any(target_os = "macos", test))]
 fn macos_members_are_dead<I, F>(members: I, mut is_zombie: F) -> bool

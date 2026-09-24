@@ -2523,6 +2523,7 @@ fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
         steam_install_dir: None,
         config_overrides,
         exclude_global_prep_cmd: false,
+        elevated: false,
         launch: Launch::PlayniteFullscreen {
             exit_timeout_seconds: 10,
         },

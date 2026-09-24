@@ -164,6 +164,27 @@ impl Controller {
                     "audio_endpoint":record.audio_endpoint,
                     "host_audio_enabled":record.request.host_audio_enabled,
                 });
+                let profile = json!({
+                    "width": record.request.width,
+                    "height": record.request.height,
+                    "fps": record.request.fps,
+                    "bitrate_kbps": record
+                        .global_max_bitrate_kbps
+                        .map_or(config.profile.bitrate_kbps, |limit| {
+                            config.profile.bitrate_kbps.min(limit)
+                        }),
+                    "max_reference_frames": config.profile.max_reference_frames,
+                    "packet_size": config.profile.packet_size,
+                    "fec_percentage": record.effective_fec_percentage,
+                    "video_max_batch_size_kb": record.global_video_max_batch_size_kb,
+                    "min_parity_shards": config.profile.min_parity_shards,
+                    "max_fec_blocks": config.profile.max_fec_blocks,
+                    "packet_ms": config.profile.packet_ms,
+                    "audio_bitrate": config.profile.audio_bitrate,
+                    "encrypt_video": config.profile.encrypt_video,
+                    "encrypt_audio": config.profile.encrypt_audio,
+                    "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
+                });
                 (
                     RTSP_SERVICE,
                     json!({
@@ -184,31 +205,16 @@ impl Controller {
                         "gamepad": record.scoped_gamepad,
                         "keyboard": record.scoped_keyboard,
                         "mouse": record.scoped_mouse,
+                        "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
+                        "always_send_scancodes": record.scoped_always_send_scancodes,
+                        "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
+                        "key_repeat_delay": record.scoped_key_repeat_delay,
+                        "key_repeat_frequency": record.scoped_key_repeat_frequency,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "capture": capture,
-                        "profile": {
-                            "width": record.request.width,
-                            "height": record.request.height,
-                            "fps": record.request.fps,
-                            "bitrate_kbps": record
-                                .global_max_bitrate_kbps
-                                .map_or(config.profile.bitrate_kbps, |limit| {
-                                    config.profile.bitrate_kbps.min(limit)
-                                }),
-                            "max_reference_frames": config.profile.max_reference_frames,
-                            "packet_size": config.profile.packet_size,
-                            "fec_percentage": record.effective_fec_percentage,
-                            "video_max_batch_size_kb": record.global_video_max_batch_size_kb,
-                            "min_parity_shards": config.profile.min_parity_shards,
-                            "max_fec_blocks": config.profile.max_fec_blocks,
-                            "packet_ms": config.profile.packet_ms,
-                            "audio_bitrate": config.profile.audio_bitrate,
-                            "encrypt_video": config.profile.encrypt_video,
-                            "encrypt_audio": config.profile.encrypt_audio,
-                            "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
-                        },
+                        "profile": profile,
                     }),
                     15_000,
                 )
@@ -339,6 +345,26 @@ impl Controller {
                                     .or(application_overrides.keyboard);
                                 record.scoped_mouse =
                                     record.peer.client_mouse.or(application_overrides.mouse);
+                                record.scoped_high_resolution_scrolling = record
+                                    .peer
+                                    .client_high_resolution_scrolling
+                                    .or(application_overrides.high_resolution_scrolling);
+                                record.scoped_always_send_scancodes = record
+                                    .peer
+                                    .client_always_send_scancodes
+                                    .or(application_overrides.always_send_scancodes);
+                                record.scoped_key_rightalt_to_key_win = record
+                                    .peer
+                                    .client_key_rightalt_to_key_win
+                                    .or(application_overrides.key_rightalt_to_key_win);
+                                record.scoped_key_repeat_delay = record
+                                    .peer
+                                    .client_key_repeat_delay
+                                    .or(application_overrides.key_repeat_delay);
+                                record.scoped_key_repeat_frequency = record
+                                    .peer
+                                    .client_key_repeat_frequency
+                                    .or(application_overrides.key_repeat_frequency);
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -680,6 +706,11 @@ struct ApplicationConfigOverrides {
     gamepad: Option<String>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
+    high_resolution_scrolling: Option<bool>,
+    always_send_scancodes: Option<bool>,
+    key_rightalt_to_key_win: Option<bool>,
+    key_repeat_delay: Option<u32>,
+    key_repeat_frequency: Option<f64>,
 }
 
 fn application_config_overrides(
@@ -714,6 +745,15 @@ fn application_config_overrides(
         .gamepad
         .as_deref()
         .is_some_and(|profile| !valid_gamepad_profile(profile))
+    {
+        return Err("invalid_application_response");
+    }
+    if config_overrides
+        .key_repeat_delay
+        .is_some_and(|delay| delay > i32::MAX as u32)
+        || config_overrides
+            .key_repeat_frequency
+            .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
     {
         return Err("invalid_application_response");
     }

@@ -27,6 +27,11 @@ struct AcquireRequest {
     gamepad: Option<GamepadProfile>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
+    high_resolution_scrolling: Option<bool>,
+    always_send_scancodes: Option<bool>,
+    key_rightalt_to_key_win: Option<bool>,
+    key_repeat_delay: Option<u32>,
+    key_repeat_frequency: Option<f64>,
 }
 
 struct Lease {
@@ -41,6 +46,11 @@ struct Lease {
     requested_gamepad: Option<GamepadProfile>,
     requested_keyboard: Option<bool>,
     requested_mouse: Option<bool>,
+    requested_high_resolution_scrolling: Option<bool>,
+    requested_always_send_scancodes: Option<bool>,
+    requested_key_rightalt_to_key_win: Option<bool>,
+    requested_key_repeat_delay: Option<u32>,
+    requested_key_repeat_frequency: Option<f64>,
     back_button_timeout_ms: i32,
     termination_reason: Option<&'static str>,
     key_encoding: Option<KeyEncoding>,
@@ -58,6 +68,11 @@ struct TerminalAcquire {
     requested_gamepad: Option<GamepadProfile>,
     requested_keyboard: Option<bool>,
     requested_mouse: Option<bool>,
+    requested_high_resolution_scrolling: Option<bool>,
+    requested_always_send_scancodes: Option<bool>,
+    requested_key_rightalt_to_key_win: Option<bool>,
+    requested_key_repeat_delay: Option<u32>,
+    requested_key_repeat_frequency: Option<f64>,
     reason: &'static str,
     retained_until: Instant,
 }
@@ -133,6 +148,11 @@ impl<B: Backend> Controller<B> {
                 gamepad,
                 keyboard,
                 mouse,
+                high_resolution_scrolling,
+                always_send_scancodes,
+                key_rightalt_to_key_win,
+                key_repeat_delay,
+                key_repeat_frequency,
             } => self.acquire(
                 caller,
                 AcquireRequest {
@@ -143,6 +163,11 @@ impl<B: Backend> Controller<B> {
                     gamepad,
                     keyboard,
                     mouse,
+                    high_resolution_scrolling,
+                    always_send_scancodes,
+                    key_rightalt_to_key_win,
+                    key_repeat_delay,
+                    key_repeat_frequency,
                 },
                 now,
                 guard,
@@ -223,13 +248,47 @@ impl<B: Backend> Controller<B> {
             .unwrap_or(self.gamepad_profile)
     }
 
+    fn effective_high_resolution_scrolling(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_high_resolution_scrolling)
+            .unwrap_or(self.high_resolution_scrolling)
+    }
+
+    fn effective_always_send_scancodes(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_always_send_scancodes)
+            .unwrap_or(self.always_send_scancodes)
+    }
+
+    fn effective_key_rightalt_to_key_win(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_key_rightalt_to_key_win)
+            .unwrap_or(self.key_rightalt_to_key_win)
+    }
+
+    fn effective_key_repeat_policy(&self) -> (u32, f64) {
+        let lease = self.lease.as_ref();
+        (
+            lease
+                .and_then(|lease| lease.requested_key_repeat_delay)
+                .unwrap_or(self.key_repeat_delay_ms),
+            lease
+                .and_then(|lease| lease.requested_key_repeat_frequency)
+                .unwrap_or(self.key_repeat_frequency_hz),
+        )
+    }
+
     pub fn high_resolution_scrolling(&self) -> bool {
         self.high_resolution_scrolling
     }
 
     pub fn set_high_resolution_scrolling(&mut self, enabled: bool) {
-        if self.high_resolution_scrolling != enabled {
-            self.high_resolution_scrolling = enabled;
+        let previous = self.effective_high_resolution_scrolling();
+        self.high_resolution_scrolling = enabled;
+        if previous != self.effective_high_resolution_scrolling() {
             self.reset_scroll_remainders();
         }
     }
@@ -239,8 +298,12 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_always_send_scancodes(&mut self, enabled: bool) {
+        let previous = self.effective_always_send_scancodes();
         self.always_send_scancodes = enabled;
-        self.backend.set_always_send_scancodes(enabled);
+        let effective = self.effective_always_send_scancodes();
+        if previous != effective {
+            self.backend.set_always_send_scancodes(effective);
+        }
     }
 
     pub fn key_rightalt_to_key_win(&self) -> bool {
@@ -248,8 +311,12 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
+        let previous = self.effective_key_rightalt_to_key_win();
         self.key_rightalt_to_key_win = enabled;
-        self.backend.set_key_rightalt_to_key_win(enabled);
+        let effective = self.effective_key_rightalt_to_key_win();
+        if previous != effective {
+            self.backend.set_key_rightalt_to_key_win(effective);
+        }
     }
 
     pub fn key_repeat_policy(&self) -> (u32, f64) {
@@ -257,9 +324,10 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_key_repeat_policy(&mut self, delay_ms: u32, frequency_hz: f64) {
-        if self.key_repeat_delay_ms != delay_ms || self.key_repeat_frequency_hz != frequency_hz {
-            self.key_repeat_delay_ms = delay_ms;
-            self.key_repeat_frequency_hz = frequency_hz;
+        let previous = self.effective_key_repeat_policy();
+        self.key_repeat_delay_ms = delay_ms;
+        self.key_repeat_frequency_hz = frequency_hz;
+        if previous != self.effective_key_repeat_policy() {
             self.repeating_key = None;
         }
     }
@@ -401,7 +469,21 @@ impl<B: Backend> Controller<B> {
             gamepad: requested_gamepad,
             keyboard: requested_keyboard,
             mouse: requested_mouse,
+            high_resolution_scrolling: requested_high_resolution_scrolling,
+            always_send_scancodes: requested_always_send_scancodes,
+            key_rightalt_to_key_win: requested_key_rightalt_to_key_win,
+            key_repeat_delay: requested_key_repeat_delay,
+            key_repeat_frequency: requested_key_repeat_frequency,
         } = request;
+        if requested_key_repeat_delay.is_some_and(|delay| delay > i32::MAX as u32)
+            || requested_key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err(InputError::new(
+                "invalid_request",
+                "scoped key repeat values are outside their supported range",
+            ));
+        }
         if let Some(operation_id) = operation_id.as_deref() {
             validate_operation_id(operation_id)?;
             if let Some(lease) = self.lease.as_ref().filter(|lease| {
@@ -413,6 +495,12 @@ impl<B: Backend> Controller<B> {
                     || lease.requested_gamepad != requested_gamepad
                     || lease.requested_keyboard != requested_keyboard
                     || lease.requested_mouse != requested_mouse
+                    || lease.requested_high_resolution_scrolling
+                        != requested_high_resolution_scrolling
+                    || lease.requested_always_send_scancodes != requested_always_send_scancodes
+                    || lease.requested_key_rightalt_to_key_win != requested_key_rightalt_to_key_win
+                    || lease.requested_key_repeat_delay != requested_key_repeat_delay
+                    || lease.requested_key_repeat_frequency != requested_key_repeat_frequency
                 {
                     return Err(operation_conflict());
                 }
@@ -435,6 +523,13 @@ impl<B: Backend> Controller<B> {
                     || terminal.requested_gamepad != requested_gamepad
                     || terminal.requested_keyboard != requested_keyboard
                     || terminal.requested_mouse != requested_mouse
+                    || terminal.requested_high_resolution_scrolling
+                        != requested_high_resolution_scrolling
+                    || terminal.requested_always_send_scancodes != requested_always_send_scancodes
+                    || terminal.requested_key_rightalt_to_key_win
+                        != requested_key_rightalt_to_key_win
+                    || terminal.requested_key_repeat_delay != requested_key_repeat_delay
+                    || terminal.requested_key_repeat_frequency != requested_key_repeat_frequency
                 {
                     return Err(operation_conflict());
                 }
@@ -480,12 +575,29 @@ impl<B: Backend> Controller<B> {
         let back_button_timeout_ms =
             requested_back_button_timeout.unwrap_or(self.back_button_timeout_ms);
         let gamepad_profile = requested_gamepad.unwrap_or(self.gamepad_profile);
+        let high_resolution_scrolling =
+            requested_high_resolution_scrolling.unwrap_or(self.high_resolution_scrolling);
+        let always_send_scancodes =
+            requested_always_send_scancodes.unwrap_or(self.always_send_scancodes);
+        let key_rightalt_to_key_win =
+            requested_key_rightalt_to_key_win.unwrap_or(self.key_rightalt_to_key_win);
+        if high_resolution_scrolling != self.high_resolution_scrolling {
+            self.reset_scroll_remainders();
+        }
         self.backend.set_back_button_timeout(back_button_timeout_ms);
         self.backend.set_gamepad_profile(gamepad_profile);
+        self.backend
+            .set_always_send_scancodes(always_send_scancodes);
+        self.backend
+            .set_key_rightalt_to_key_win(key_rightalt_to_key_win);
         if let Err(error) = self.backend.start() {
             self.backend
                 .set_back_button_timeout(self.back_button_timeout_ms);
             self.backend.set_gamepad_profile(self.gamepad_profile);
+            self.backend
+                .set_always_send_scancodes(self.always_send_scancodes);
+            self.backend
+                .set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
             return Err(error);
         }
         self.reset_scroll_remainders();
@@ -501,6 +613,11 @@ impl<B: Backend> Controller<B> {
             requested_gamepad,
             requested_keyboard,
             requested_mouse,
+            requested_high_resolution_scrolling,
+            requested_always_send_scancodes,
+            requested_key_rightalt_to_key_win,
+            requested_key_repeat_delay,
+            requested_key_repeat_frequency,
             back_button_timeout_ms,
             termination_reason: None,
             key_encoding: None,
@@ -752,7 +869,7 @@ impl<B: Backend> Controller<B> {
         let Event::ScrollUnits { axis, amount } = event else {
             return self.inject(event);
         };
-        if self.high_resolution_scrolling {
+        if self.effective_high_resolution_scrolling() {
             return self.inject(event);
         }
 
@@ -793,13 +910,13 @@ impl<B: Backend> Controller<B> {
         }
         match state {
             KeyState::Down => {
-                if self.key_repeat_delay_ms == 0 {
+                let (delay_ms, frequency_hz) = self.effective_key_repeat_policy();
+                if delay_ms == 0 {
                     self.repeating_key = None;
                     return Ok(());
                 }
-                let period = repeat_period(self.key_repeat_frequency_hz);
-                let Some(next_due) =
-                    now.checked_add(Duration::from_millis(u64::from(self.key_repeat_delay_ms)))
+                let period = repeat_period(frequency_hz);
+                let Some(next_due) = now.checked_add(Duration::from_millis(u64::from(delay_ms)))
                 else {
                     self.repeating_key = None;
                     return Ok(());
@@ -925,6 +1042,10 @@ impl<B: Backend> Controller<B> {
         self.backend
             .set_back_button_timeout(self.back_button_timeout_ms);
         self.backend.set_gamepad_profile(self.gamepad_profile);
+        self.backend
+            .set_always_send_scancodes(self.always_send_scancodes);
+        self.backend
+            .set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
         let Some(lease) = self.lease.take() else {
             self.reset_scroll_remainders();
             self.retry_at = now;
@@ -941,6 +1062,11 @@ impl<B: Backend> Controller<B> {
                 requested_gamepad: lease.requested_gamepad,
                 requested_keyboard: lease.requested_keyboard,
                 requested_mouse: lease.requested_mouse,
+                requested_high_resolution_scrolling: lease.requested_high_resolution_scrolling,
+                requested_always_send_scancodes: lease.requested_always_send_scancodes,
+                requested_key_rightalt_to_key_win: lease.requested_key_rightalt_to_key_win,
+                requested_key_repeat_delay: lease.requested_key_repeat_delay,
+                requested_key_repeat_frequency: lease.requested_key_repeat_frequency,
                 reason: lease.termination_reason.unwrap_or(reason),
                 retained_until: now + OPERATION_RETENTION,
             });
@@ -969,6 +1095,11 @@ impl<B: Backend> Controller<B> {
                 "controller_enabled":lease.requested_controller.unwrap_or(self.controller_enabled),
                 "keyboard":lease.requested_keyboard.unwrap_or(self.device_policy.keyboard),
                 "mouse":lease.requested_mouse.unwrap_or(self.device_policy.mouse),
+                "high_resolution_scrolling":lease.requested_high_resolution_scrolling.unwrap_or(self.high_resolution_scrolling),
+                "always_send_scancodes":lease.requested_always_send_scancodes.unwrap_or(self.always_send_scancodes),
+                "key_rightalt_to_key_win":lease.requested_key_rightalt_to_key_win.unwrap_or(self.key_rightalt_to_key_win),
+                "key_repeat_delay":lease.requested_key_repeat_delay.unwrap_or(self.key_repeat_delay_ms),
+                "key_repeat_frequency":lease.requested_key_repeat_frequency.unwrap_or(self.key_repeat_frequency_hz),
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "effective_gamepad_profile":lease.effective_gamepad_profile,
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
@@ -1011,6 +1142,11 @@ fn active_lease(
         "lease": lease.token,
         "ttl_ms": lease.requested_ttl_ms.unwrap_or(5000),
         "back_button_timeout": lease.back_button_timeout_ms,
+        "high_resolution_scrolling": lease.requested_high_resolution_scrolling,
+        "always_send_scancodes": lease.requested_always_send_scancodes,
+        "key_rightalt_to_key_win": lease.requested_key_rightalt_to_key_win,
+        "key_repeat_delay": lease.requested_key_repeat_delay,
+        "key_repeat_frequency": lease.requested_key_repeat_frequency,
         "expires_in_ms": lease.expires.saturating_duration_since(now).as_millis() as u64,
         "backend": backend,
         "absolute_pointer": absolute_pointer,

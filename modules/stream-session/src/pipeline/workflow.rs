@@ -146,7 +146,12 @@ impl Job {
                     "controller":record.start.as_ref().expect("validated start configuration").controller,
                     "gamepad":record.start.as_ref().expect("validated start configuration").gamepad,
                     "keyboard":record.start.as_ref().expect("validated start configuration").keyboard,
-                    "mouse":record.start.as_ref().expect("validated start configuration").mouse}),
+                    "mouse":record.start.as_ref().expect("validated start configuration").mouse,
+                    "high_resolution_scrolling":record.start.as_ref().expect("validated start configuration").high_resolution_scrolling,
+                    "always_send_scancodes":record.start.as_ref().expect("validated start configuration").always_send_scancodes,
+                    "key_rightalt_to_key_win":record.start.as_ref().expect("validated start configuration").key_rightalt_to_key_win,
+                    "key_repeat_delay":record.start.as_ref().expect("validated start configuration").key_repeat_delay,
+                    "key_repeat_frequency":record.start.as_ref().expect("validated start configuration").key_repeat_frequency}),
             ),
             Step::FindInput => (
                 "amaterasu.input/1".into(),

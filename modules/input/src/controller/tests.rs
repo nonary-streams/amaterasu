@@ -18,6 +18,9 @@ struct FakeBackend {
     effective_gamepad_profile: Option<&'static str>,
     gamepad_profile: GamepadProfile,
     back_button_timeout_ms: i32,
+    always_send_scancodes: bool,
+    key_rightalt_to_key_win: bool,
+    right_alt_mapping_trace: Vec<(KeyState, bool)>,
     fail_controller_disable: bool,
     controller_disable_calls: usize,
     active_controller_slots: BTreeSet<u16>,
@@ -54,6 +57,14 @@ impl Backend for FakeBackend {
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.trace.borrow_mut().push(event.clone());
+        if let Event::Key {
+            key: Key::MoonlightVk { code: 0xa5, .. },
+            state,
+        } = event
+        {
+            self.right_alt_mapping_trace
+                .push((*state, self.key_rightalt_to_key_win));
+        }
         if let Event::Controller { active_mask, .. } = event {
             self.active_controller_slots
                 .retain(|slot| active_mask & (1 << slot) != 0);
@@ -83,6 +94,12 @@ impl Backend for FakeBackend {
     }
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.back_button_timeout_ms = timeout_ms;
+    }
+    fn set_always_send_scancodes(&mut self, enabled: bool) {
+        self.always_send_scancodes = enabled;
+    }
+    fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
+        self.key_rightalt_to_key_win = enabled;
     }
     fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
         self.gamepad_profile = profile;
@@ -141,6 +158,11 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -170,6 +192,11 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -199,6 +226,11 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -221,6 +253,11 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -236,6 +273,11 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -264,6 +306,11 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -309,6 +356,11 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -356,6 +408,11 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             gamepad: Some(GamepadProfile::Auto),
             keyboard: Some(true),
             mouse: Some(false),
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -435,6 +492,11 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             gamepad: Some(global_gamepad),
             keyboard: Some(true),
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -462,6 +524,174 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
         &mut || Ok(()),
     );
     assert_eq!(controller.backend.gamepad_profile, global_gamepad);
+}
+
+#[test]
+fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_defaults() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_high_resolution_scrolling(true);
+    controller.set_always_send_scancodes(true);
+    controller.set_key_rightalt_to_key_win(false);
+    controller.set_key_repeat_policy(500, 24.9);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("keyboard-policy-owner".into()),
+            ttl_ms: Some(1_000),
+            back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: Some(false),
+            always_send_scancodes: Some(false),
+            key_rightalt_to_key_win: Some(true),
+            key_repeat_delay: Some(0),
+            key_repeat_frequency: Some(0.0),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["high_resolution_scrolling"], false);
+    assert_eq!(acquired["always_send_scancodes"], false);
+    assert_eq!(acquired["key_rightalt_to_key_win"], true);
+    assert_eq!(acquired["key_repeat_delay"], 0);
+    assert_eq!(acquired["key_repeat_frequency"], 0.0);
+    assert!(!controller.backend.always_send_scancodes);
+    assert!(controller.backend.key_rightalt_to_key_win);
+
+    let token = acquired["lease"].as_str().unwrap();
+    let right_alt_down = Event::Key {
+        key: Key::MoonlightVk {
+            code: 0xa5,
+            normalized: false,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        },
+        state: KeyState::Down,
+    };
+    assert_eq!(
+        batch(
+            &mut controller,
+            token,
+            vec![
+                right_alt_down,
+                Event::ScrollUnits {
+                    axis: Axis::Vertical,
+                    amount: 60,
+                },
+            ]
+        )["ok"],
+        true
+    );
+    assert!(controller.repeating_key.is_none());
+    assert_eq!(controller.vertical_scroll_remainder, 60);
+
+    // Host updates remain visible as defaults without changing an explicit
+    // stream selection or the keyboard mapping used for its eventual key-up.
+    controller.set_high_resolution_scrolling(true);
+    controller.set_always_send_scancodes(true);
+    controller.set_key_rightalt_to_key_win(false);
+    controller.set_key_repeat_policy(10, 100.0);
+    assert!(!controller.effective_high_resolution_scrolling());
+    assert!(!controller.effective_always_send_scancodes());
+    assert!(controller.effective_key_rightalt_to_key_win());
+    assert_eq!(controller.effective_key_repeat_policy(), (0, 0.0));
+    assert!(!controller.backend.always_send_scancodes);
+    assert!(controller.backend.key_rightalt_to_key_win);
+    assert_eq!(
+        batch(
+            &mut controller,
+            token,
+            vec![Event::ScrollUnits {
+                axis: Axis::Vertical,
+                amount: 60,
+            }]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.vertical_scroll_remainder, 0);
+    assert_eq!(
+        controller.backend.trace.borrow().last(),
+        Some(&Event::Scroll {
+            axis: Axis::Vertical,
+            steps: 1,
+        })
+    );
+
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release {
+                lease: token.into()
+            },
+            now,
+            &mut || Ok(()),
+        )["released"],
+        true
+    );
+    assert_eq!(
+        controller.backend.right_alt_mapping_trace,
+        [(KeyState::Down, true), (KeyState::Up, true)]
+    );
+    assert!(controller.backend.always_send_scancodes);
+    assert!(!controller.backend.key_rightalt_to_key_win);
+    assert_eq!(controller.key_repeat_policy(), (10, 100.0));
+    assert!(controller.high_resolution_scrolling());
+
+    let next = controller.handle(
+        "second-owner",
+        Operation::Acquire {
+            operation_id: None,
+            ttl_ms: Some(1_000),
+            back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
+        },
+        now + Duration::from_millis(1),
+        &mut || Ok(()),
+    );
+    assert_eq!(next["ok"], true, "{next}");
+    let next_token = next["lease"].as_str().unwrap();
+    let second_input = controller.handle(
+        "second-owner",
+        Operation::Batch {
+            lease: next_token.into(),
+            events: vec![key(30, KeyState::Down)],
+        },
+        now + Duration::from_millis(2),
+        &mut || Ok(()),
+    );
+    assert_eq!(second_input["ok"], true, "{second_input}");
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().period,
+        repeat_period(100.0)
+    );
+}
+
+#[test]
+fn scoped_repeat_overrides_reject_values_outside_product_policy_bounds() {
+    for (key, value) in [
+        ("key_repeat_delay", json!(i32::MAX as u64 + 1)),
+        ("key_repeat_frequency", json!(-0.1)),
+    ] {
+        let mut controller = Controller::new(FakeBackend::default(), true);
+        let mut payload = json!({"action":"acquire"});
+        payload[key] = value;
+        let operation = serde_json::from_value(payload).unwrap();
+        let response = controller.handle("owner", operation, Instant::now(), &mut || Ok(()));
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert_eq!(controller.backend.starts, 0);
+    }
 }
 
 fn selected_supported_profile() -> GamepadProfile {
@@ -922,6 +1152,11 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),
@@ -997,6 +1232,11 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -1014,6 +1254,11 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         Instant::now(),
         &mut || Err(InputError::new("cancelled", "ended")),
@@ -1050,6 +1295,11 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         Operation::Renew {
             lease: token.clone(),
@@ -1092,6 +1342,11 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -1139,6 +1394,11 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         gamepad: None,
         keyboard: None,
         mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: None,
+        key_repeat_frequency: None,
     };
     let first = controller.handle("owner", acquire(), now, &mut || Ok(()));
     let token = first["lease"].as_str().unwrap().to_owned();
@@ -1184,6 +1444,11 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             gamepad: None,
             keyboard: None,
             mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
         },
         now,
         &mut || Ok(()),

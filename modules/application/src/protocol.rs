@@ -15,6 +15,8 @@ pub(crate) enum Action {
         #[serde(default)]
         environment: BTreeMap<String, String>,
         cwd: Option<String>,
+        #[serde(default)]
+        elevated: bool,
         #[serde(default = "default_auto_detach")]
         auto_detach: bool,
         #[serde(default = "default_wait_all")]
@@ -106,6 +108,7 @@ pub(crate) struct LaunchSpec {
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub elevated: bool,
     pub auto_detach: bool,
     pub wait_all: bool,
     pub exit_timeout_seconds: u64,
@@ -277,6 +280,7 @@ mod tests {
             args: Vec::new(),
             environment: BTreeMap::new(),
             cwd: None,
+            elevated: false,
             auto_detach: true,
             wait_all: false,
             exit_timeout_seconds: 10,
@@ -304,5 +308,27 @@ mod tests {
         for directory in ["relative/game", "/", "C:\\", "\\foo", "//server/share"] {
             assert!(spec(None, Some(directory)).validate("invalid").is_err());
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn elevated_policy_remains_admissible_when_unix_ignores_it() {
+        let mut launch = spec(None, None);
+        launch.elevated = true;
+        assert_eq!(launch.validate("unix-ignores-elevation"), Ok(()));
+    }
+
+    #[test]
+    fn application_action_defaults_elevated_to_false() {
+        let action: Action = serde_json::from_value(serde_json::json!({
+            "action":"launch",
+            "operation_id":"legacy",
+            "executable":"/bin/example"
+        }))
+        .unwrap();
+        let Action::Launch { elevated, .. } = action else {
+            panic!("expected launch action")
+        };
+        assert!(!elevated);
     }
 }

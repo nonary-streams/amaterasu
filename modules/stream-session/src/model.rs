@@ -295,6 +295,16 @@ pub struct StartConfig {
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_resolution_scrolling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_send_scancodes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rightalt_to_key_win: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_delay: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_frequency: Option<f64>,
     /// Moonlight's device name for the session; independent from capture output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
@@ -325,6 +335,15 @@ impl StartConfig {
             .gamepad
             .as_deref()
             .is_some_and(|profile| !valid_gamepad_profile(profile))
+        {
+            return Err("invalid_start_configuration");
+        }
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+            || self
+                .key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
         {
             return Err("invalid_start_configuration");
         }
@@ -603,6 +622,41 @@ mod tests {
             request["minimum_fps_target"] = json!(invalid);
             let parsed: StartConfig = serde_json::from_value(request).unwrap();
             assert_eq!(parsed.validate(true), Err("invalid_minimum_fps_target"));
+        }
+    }
+
+    #[test]
+    fn scoped_keyboard_behavior_overrides_are_sparse_and_bounded() {
+        let inherited: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert!(inherited.high_resolution_scrolling.is_none());
+        assert!(inherited.always_send_scancodes.is_none());
+        assert!(inherited.key_rightalt_to_key_win.is_none());
+        assert!(inherited.key_repeat_delay.is_none());
+        assert!(inherited.key_repeat_frequency.is_none());
+        assert!(inherited.validate(true).is_ok());
+
+        let mut selected = start_json();
+        selected["high_resolution_scrolling"] = json!(false);
+        selected["always_send_scancodes"] = json!(false);
+        selected["key_rightalt_to_key_win"] = json!(true);
+        selected["key_repeat_delay"] = json!(0);
+        selected["key_repeat_frequency"] = json!(0.0);
+        let selected: StartConfig = serde_json::from_value(selected).unwrap();
+        assert_eq!(selected.high_resolution_scrolling, Some(false));
+        assert_eq!(selected.always_send_scancodes, Some(false));
+        assert_eq!(selected.key_rightalt_to_key_win, Some(true));
+        assert_eq!(selected.key_repeat_delay, Some(0));
+        assert_eq!(selected.key_repeat_frequency, Some(0.0));
+        assert!(selected.validate(true).is_ok());
+
+        for (field, value) in [
+            ("key_repeat_delay", json!(i32::MAX as u64 + 1)),
+            ("key_repeat_frequency", json!(-0.1)),
+        ] {
+            let mut invalid = start_json();
+            invalid[field] = value;
+            let invalid: StartConfig = serde_json::from_value(invalid).unwrap();
+            assert_eq!(invalid.validate(true), Err("invalid_start_configuration"));
         }
     }
 

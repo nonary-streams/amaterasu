@@ -415,6 +415,7 @@ def test_auth_and_crud(console, api):
     prepare_path = r"C:\Tools\prepare.exe" if os.name == "nt" else "/opt/tools/prepare"
     entry = {
         "name": "HTTP Game",
+        "elevated": True,
         "steam_id": "730",
         "steam_install_dir": steam_install_dir,
         "exclude_global_prep_cmd": True,
@@ -434,6 +435,7 @@ def test_auth_and_crud(console, api):
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
     assert status == 200 and found["entry"]["config_overrides"] == entry["config_overrides"], found
+    assert found["entry"]["elevated"] is True, found
     assert found["entry"]["steam_id"] == "730", found
     assert found["entry"]["steam_install_dir"] == steam_install_dir, found
     assert found["entry"]["exclude_global_prep_cmd"] is True, found
@@ -504,6 +506,7 @@ def test_auth_and_crud(console, api):
     assert conflict["error"]["code"] == "revision_conflict", conflict
     status, saved_catalog_entry, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
+    assert saved_catalog_entry["entry"]["elevated"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_id"] == "730", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_install_dir"] == steam_install_dir, saved_catalog_entry
     assert saved_catalog_entry["entry"]["exclude_global_prep_cmd"] is True, saved_catalog_entry
@@ -556,6 +559,16 @@ def test_auth_and_crud(console, api):
         status, rejected, _ = api.post(
             "/v1/catalog/create",
             {"entry": {"name": "Invalid Fullscreen", "launch": invalid_launch}, "expected_revision": catalog_revision},
+            administrator,
+        )
+        assert status == 400 and not rejected["ok"], rejected
+    for invalid_elevation in (
+        {**entry, "elevated": "true"},
+        {**fullscreen_entry, "elevated": True},
+    ):
+        status, rejected, _ = api.post(
+            "/v1/catalog/create",
+            {"entry": invalid_elevation, "expected_revision": catalog_revision},
             administrator,
         )
         assert status == 400 and not rejected["ok"], rejected

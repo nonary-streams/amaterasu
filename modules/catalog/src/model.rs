@@ -29,6 +29,8 @@ pub struct Entry {
         alias = "exclude-global-prep-cmd"
     )]
     pub exclude_global_prep_cmd: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub elevated: bool,
     pub launch: Launch,
 }
 
@@ -265,6 +267,9 @@ fn default_command_timeout_ms() -> u64 {
 
 impl Entry {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.elevated && !matches!(&self.launch, Launch::Executable { .. }) {
+            return Err("elevated is supported only for executable launch targets");
+        }
         if let Some(artwork) = &self.artwork {
             artwork.validate()?;
         }
@@ -558,6 +563,7 @@ mod tests {
         }))
         .unwrap();
         legacy.validate().unwrap();
+        assert!(!legacy.elevated);
         assert_eq!(legacy.config_overrides.fec_percentage, Some(37));
         assert_eq!(legacy.config_overrides.stream_audio, None);
         let legacy_json = serde_json::to_value(legacy).unwrap();
@@ -591,6 +597,45 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":37,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn elevated_defaults_false_round_trips_for_executables_and_rejects_other_targets() {
+        let omitted: Entry = serde_json::from_value(json!({
+            "name":"Legacy executable",
+            "launch":{"kind":"executable","program":"/games/example"}
+        }))
+        .unwrap();
+        assert!(!omitted.elevated);
+        assert!(
+            serde_json::to_value(&omitted)
+                .unwrap()
+                .get("elevated")
+                .is_none()
+        );
+
+        let elevated: Entry = serde_json::from_value(json!({
+            "name":"Elevated executable",
+            "elevated":true,
+            "launch":{"kind":"executable","program":"/games/example"}
+        }))
+        .unwrap();
+        elevated.validate().unwrap();
+        assert_eq!(serde_json::to_value(elevated).unwrap()["elevated"], true);
+
+        for launch in [
+            json!({"kind":"application","path":"/games/example"}),
+            json!({"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}),
+            json!({"kind":"playnite_fullscreen"}),
+        ] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Not executable",
+                "elevated":true,
+                "launch":launch
+            }))
+            .unwrap();
+            assert!(entry.validate().is_err());
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub(crate) struct ContainedChild {
 }
 
 impl ContainedChild {
-    pub fn spawn(command: &mut Command) -> io::Result<Self> {
+    pub fn spawn(command: &mut Command, _elevated: bool) -> io::Result<Self> {
         // std sets the group before exec; no allocating pre_exec callback is needed.
         let child = command.process_group(0).spawn()?;
         Ok(Self {
@@ -122,6 +122,22 @@ impl ContainedChild {
         if !self.group_finished {
             return Ok(None);
         }
+        self.child.try_wait()
+    }
+}
+
+pub(crate) struct DetachedChild {
+    child: Child,
+}
+
+impl DetachedChild {
+    pub fn spawn(command: &mut Command, _elevated: bool) -> io::Result<Self> {
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 }

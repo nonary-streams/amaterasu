@@ -207,7 +207,7 @@ pub struct Client {
     pub config_overrides: ClientConfigOverrides,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +230,16 @@ pub struct ClientConfigOverrides {
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_resolution_scrolling: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_send_scancodes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rightalt_to_key_win: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_delay: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_repeat_frequency: Option<f64>,
 }
 
 impl ClientConfigOverrides {
@@ -261,6 +271,15 @@ impl ClientConfigOverrides {
         {
             return Err("invalid_config_overrides");
         }
+        if self
+            .key_repeat_delay
+            .is_some_and(|delay| delay > i32::MAX as u32)
+            || self
+                .key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        {
+            return Err("invalid_config_overrides");
+        }
         Ok(())
     }
 
@@ -275,6 +294,11 @@ impl ClientConfigOverrides {
             && self.gamepad.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
+            && self.high_resolution_scrolling.is_none()
+            && self.always_send_scancodes.is_none()
+            && self.key_rightalt_to_key_win.is_none()
+            && self.key_repeat_delay.is_none()
+            && self.key_repeat_frequency.is_none()
     }
 }
 
@@ -534,6 +558,55 @@ mod tests {
             if let Ok(invalid) = serde_json::from_value::<ClientConfigOverrides>(value) {
                 assert!(invalid.validate().is_err());
             }
+        }
+    }
+
+    #[test]
+    fn client_keyboard_policy_overrides_are_sparse_and_strictly_bounded() {
+        let inherited = ClientConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(inherited.key_repeat_delay, None);
+        assert_eq!(inherited.key_repeat_frequency, None);
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        let selected: ClientConfigOverrides = serde_json::from_value(json!({
+            "high_resolution_scrolling":false,
+            "always_send_scancodes":false,
+            "key_rightalt_to_key_win":true,
+            "key_repeat_delay":0,
+            "key_repeat_frequency":24.9
+        }))
+        .unwrap();
+        selected.validate().unwrap();
+        assert_eq!(selected.high_resolution_scrolling, Some(false));
+        assert_eq!(selected.always_send_scancodes, Some(false));
+        assert_eq!(selected.key_rightalt_to_key_win, Some(true));
+        assert_eq!(selected.key_repeat_delay, Some(0));
+        assert_eq!(selected.key_repeat_frequency, Some(24.9));
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            json!({
+                "high_resolution_scrolling":false,
+                "always_send_scancodes":false,
+                "key_rightalt_to_key_win":true,
+                "key_repeat_delay":0,
+                "key_repeat_frequency":24.9
+            })
+        );
+
+        for invalid in [
+            json!({"key_repeat_delay": i32::MAX as u64 + 1}),
+            json!({"key_repeat_frequency": -0.1}),
+        ] {
+            let overrides: ClientConfigOverrides = serde_json::from_value(invalid).unwrap();
+            assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
+        }
+        for invalid in [
+            json!({"high_resolution_scrolling": 1}),
+            json!({"key_repeat_delay": 1.5}),
+            json!({"key_repeat_frequency": "24.9"}),
+        ] {
+            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }
     }
 }

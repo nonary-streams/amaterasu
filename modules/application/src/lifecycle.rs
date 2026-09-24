@@ -208,7 +208,7 @@ impl CommandTask {
             command.current_dir(cwd);
         }
         Ok(Self {
-            child: ContainedChild::spawn(&mut command)?,
+            child: ContainedChild::spawn(&mut command, false)?,
             execution_deadline: now + Duration::from_millis(spec.timeout_ms),
             stop_requested_at: None,
             force_requested: false,

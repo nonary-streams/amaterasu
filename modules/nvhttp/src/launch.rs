@@ -45,7 +45,7 @@ pub struct LaunchRequest {
     pub key_id: u32,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct PeerIdentity {
     remote: IpAddr,
     certificate: Vec<u8>,
@@ -61,6 +61,11 @@ pub struct PeerIdentity {
     client_gamepad: Option<String>,
     client_keyboard: Option<bool>,
     client_mouse: Option<bool>,
+    client_high_resolution_scrolling: Option<bool>,
+    client_always_send_scancodes: Option<bool>,
+    client_key_rightalt_to_key_win: Option<bool>,
+    client_key_repeat_delay: Option<u32>,
+    client_key_repeat_frequency: Option<f64>,
 }
 
 impl PeerIdentity {
@@ -86,6 +91,11 @@ impl PeerIdentity {
             client_gamepad: None,
             client_keyboard: None,
             client_mouse: None,
+            client_high_resolution_scrolling: None,
+            client_always_send_scancodes: None,
+            client_key_rightalt_to_key_win: None,
+            client_key_repeat_delay: None,
+            client_key_repeat_frequency: None,
         })
     }
 
@@ -106,6 +116,11 @@ impl PeerIdentity {
             gamepad,
             keyboard,
             mouse,
+            high_resolution_scrolling,
+            always_send_scancodes,
+            key_rightalt_to_key_win,
+            key_repeat_delay,
+            key_repeat_frequency,
         } = config_overrides;
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
@@ -120,6 +135,9 @@ impl PeerIdentity {
             || gamepad
                 .as_deref()
                 .is_some_and(|profile| !valid_gamepad_profile(profile))
+            || key_repeat_delay.is_some_and(|delay| delay > i32::MAX as u32)
+            || key_repeat_frequency
+                .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
         {
             return Err("invalid_paired_identity");
         }
@@ -135,6 +153,11 @@ impl PeerIdentity {
         self.client_gamepad = gamepad;
         self.client_keyboard = keyboard;
         self.client_mouse = mouse;
+        self.client_high_resolution_scrolling = high_resolution_scrolling;
+        self.client_always_send_scancodes = always_send_scancodes;
+        self.client_key_rightalt_to_key_win = key_rightalt_to_key_win;
+        self.client_key_repeat_delay = key_repeat_delay;
+        self.client_key_repeat_frequency = key_repeat_frequency;
         Ok(self)
     }
 

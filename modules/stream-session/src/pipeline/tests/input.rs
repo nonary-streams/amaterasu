@@ -79,6 +79,11 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     start_request["configuration"]["gamepad"] = json!("auto");
     start_request["configuration"]["keyboard"] = json!(false);
     start_request["configuration"]["mouse"] = json!(true);
+    start_request["configuration"]["high_resolution_scrolling"] = json!(false);
+    start_request["configuration"]["always_send_scancodes"] = json!(false);
+    start_request["configuration"]["key_rightalt_to_key_win"] = json!(true);
+    start_request["configuration"]["key_repeat_delay"] = json!(0);
+    start_request["configuration"]["key_repeat_frequency"] = json!(0.0);
 
     assert_eq!(host.response(2, start_request)["state"], "active");
     let acquire = host
@@ -92,6 +97,11 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     assert_eq!(acquire.payload["gamepad"], "auto");
     assert_eq!(acquire.payload["keyboard"], false);
     assert_eq!(acquire.payload["mouse"], true);
+    assert_eq!(acquire.payload["high_resolution_scrolling"], false);
+    assert_eq!(acquire.payload["always_send_scancodes"], false);
+    assert_eq!(acquire.payload["key_rightalt_to_key_win"], true);
+    assert_eq!(acquire.payload["key_repeat_delay"], 0);
+    assert_eq!(acquire.payload["key_repeat_frequency"], 0.0);
 }
 
 fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {
