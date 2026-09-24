@@ -103,7 +103,12 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(
                 object,
                 &["enabled", "auto_sync", "exclude_games", "expected_revision"],
-                &[],
+                &[
+                    "include_tools",
+                    "sync_all_installed",
+                    "recent_games",
+                    "recent_max_age_days",
+                ],
             )?;
             if object.get("enabled").and_then(Value::as_bool).is_none()
                 || object.get("auto_sync").and_then(Value::as_bool).is_none()
@@ -113,6 +118,25 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
                     .is_none()
             {
                 return Err(INVALID);
+            }
+            for field in ["include_tools", "sync_all_installed"] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| value.as_bool().is_none())
+                {
+                    return Err(INVALID);
+                }
+            }
+            for (field, maximum) in [
+                ("recent_games", 10_000_u64),
+                ("recent_max_age_days", 36_500_u64),
+            ] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| !value.as_u64().is_some_and(|value| value <= maximum))
+                {
+                    return Err(INVALID);
+                }
             }
             steam_exclusions(object.get("exclude_games").ok_or(INVALID)?)
         }

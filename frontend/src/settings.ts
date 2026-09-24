@@ -75,6 +75,37 @@ namespace Amaterasu {
     return parsed as SteamExclusion[];
   }
 
+  export function parseSteamImportSettings(
+    includeTools: boolean,
+    syncAllInstalled: boolean,
+    recentGames: number,
+    recentMaxAgeDays: number,
+  ): Pick<
+    SteamSettings["values"],
+    | "include_tools"
+    | "sync_all_installed"
+    | "recent_games"
+    | "recent_max_age_days"
+  > {
+    if (
+      typeof includeTools !== "boolean" ||
+      typeof syncAllInstalled !== "boolean" ||
+      !Number.isSafeInteger(recentGames) ||
+      recentGames < 0 ||
+      recentGames > 10_000 ||
+      !Number.isSafeInteger(recentMaxAgeDays) ||
+      recentMaxAgeDays < 0 ||
+      recentMaxAgeDays > 36_500
+    )
+      throw new Error("Steam import values are outside their supported ranges.");
+    return {
+      include_tools: includeTools,
+      sync_all_installed: syncAllInstalled,
+      recent_games: recentGames,
+      recent_max_age_days: recentMaxAgeDays,
+    };
+  }
+
   export function steamStatusDescription(status: SteamStatus): string {
     if (status.settings_ready === false)
       return "Provider settings are still loading; runtime state is not confirmed yet.";
@@ -183,6 +214,32 @@ namespace Amaterasu {
         enabled.checked = settings.values.enabled;
         const autoSync = input("steam_auto_sync", "", "checkbox");
         autoSync.checked = settings.values.auto_sync;
+        const includeTools = input("steam_include_tools", "", "checkbox");
+        includeTools.checked = settings.values.include_tools;
+        const syncAllInstalled = input(
+          "steam_sync_all_installed",
+          "",
+          "checkbox",
+        );
+        syncAllInstalled.checked = settings.values.sync_all_installed;
+        const recentGames = input(
+          "steam_recent_games",
+          String(settings.values.recent_games),
+          "number",
+        );
+        recentGames.required = true;
+        recentGames.min = "0";
+        recentGames.max = "10000";
+        recentGames.step = "1";
+        const recentMaxAgeDays = input(
+          "steam_recent_max_age_days",
+          String(settings.values.recent_max_age_days),
+          "number",
+        );
+        recentMaxAgeDays.required = true;
+        recentMaxAgeDays.min = "0";
+        recentMaxAgeDays.max = "36500";
+        recentMaxAgeDays.step = "1";
         const exclusions = el("textarea");
         exclusions.name = "steam_exclude_games";
         exclusions.rows = 10;
@@ -209,6 +266,26 @@ namespace Amaterasu {
             "Controls automatic scans of the configured Steam library roots.",
           ),
           field(
+            "Include tools",
+            includeTools,
+            "Includes tools alongside games when importing the library.",
+          ),
+          field(
+            "Synchronize all installed games",
+            syncAllInstalled,
+            "When off, import recently played games instead of every installed game.",
+          ),
+          field(
+            "Recent games to import",
+            recentGames,
+            "Maximum number of recently played games (0–10000); zero imports none in recent-only mode.",
+          ),
+          field(
+            "Recent game age limit (days)",
+            recentMaxAgeDays,
+            "Ignore games older than this age (0–36500); zero disables the age cutoff.",
+          ),
+          field(
             "Excluded games (JSON)",
             exclusions,
             'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.',
@@ -224,6 +301,12 @@ namespace Amaterasu {
               enabled: enabled.checked,
               auto_sync: autoSync.checked,
               exclude_games: parseSteamExclusions(exclusions.value),
+              ...parseSteamImportSettings(
+                includeTools.checked,
+                syncAllInstalled.checked,
+                recentGames.valueAsNumber,
+                recentMaxAgeDays.valueAsNumber,
+              ),
               expected_revision: settings.revision,
             });
             context.notify("Steam discovery setting saved.");

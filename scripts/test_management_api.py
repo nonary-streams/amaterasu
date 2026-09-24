@@ -245,6 +245,10 @@ def test_auth_and_crud(console, api):
         "enabled": steam_settings["values"]["enabled"],
         "auto_sync": False,
         "exclude_games": [],
+        "include_tools": False,
+        "sync_all_installed": False,
+        "recent_games": 10,
+        "recent_max_age_days": 30,
     }, steam_settings
     if not steam_settings["values"]["enabled"]:
         status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
@@ -256,11 +260,28 @@ def test_auth_and_crud(console, api):
             {"id": "731", "name": "Future Game"},
             {"name": "Uninstalled Title"},
         ],
+        "include_tools": False,
+        "sync_all_installed": False,
+        "recent_games": 25,
+        "recent_max_age_days": 45,
     }
     status, steam_enabled, _ = api.post("/v1/steam/settings_update", {
         **steam_values, "expected_revision": steam_settings["revision"],
     }, administrator)
     assert status == 200 and steam_enabled["values"] == steam_values, steam_enabled
+
+    # Older clients still send the original three editable values; newer values
+    # must be preserved by the provider's patch-compatible update contract.
+    legacy_values = {
+        "enabled": steam_values["enabled"],
+        "auto_sync": False,
+        "exclude_games": steam_values["exclude_games"],
+    }
+    status, steam_legacy_update, _ = api.post("/v1/steam/settings_update", {
+        **legacy_values, "expected_revision": steam_enabled["revision"],
+    }, administrator)
+    steam_values = {**steam_values, **legacy_values}
+    assert status == 200 and steam_legacy_update["values"] == steam_values, steam_legacy_update
     status, stale, _ = api.post("/v1/steam/settings_update", {
         "enabled": False, "auto_sync": False, "exclude_games": [],
         "expected_revision": steam_settings["revision"],

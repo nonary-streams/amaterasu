@@ -45,6 +45,40 @@ test("Steam exclusions preserve valid ID and name objects without normalization"
   assert.deepEqual(ordinary(parse(JSON.stringify(exclusions))), exclusions);
 });
 
+test("Steam import controls preserve booleans and bounded recent-game values", () => {
+  const parseImport = context.Amaterasu.parseSteamImportSettings;
+  assert.deepEqual(ordinary(parseImport(false, true, 10, 30)), {
+    include_tools: false,
+    sync_all_installed: true,
+    recent_games: 10,
+    recent_max_age_days: 30,
+  });
+  assert.deepEqual(ordinary(parseImport(true, false, 0, 0)), {
+    include_tools: true,
+    sync_all_installed: false,
+    recent_games: 0,
+    recent_max_age_days: 0,
+  });
+  assert.deepEqual(ordinary(parseImport(false, false, 10_000, 36_500)), {
+    include_tools: false,
+    sync_all_installed: false,
+    recent_games: 10_000,
+    recent_max_age_days: 36_500,
+  });
+  for (const [include, all, recent, age] of [
+    [0, false, 10, 30],
+    [false, "true", 10, 30],
+    [false, false, -1, 30],
+    [false, false, 10_001, 30],
+    [false, false, 1.5, 30],
+    [false, false, 10, -1],
+    [false, false, 10, 36_501],
+    [false, false, 10, 30.5],
+  ]) {
+    assert.throws(() => parseImport(include, all, recent, age));
+  }
+});
+
 test("Steam exclusion editor rejects malformed or ambiguous entries", () => {
   const invalid = [
     "not JSON",

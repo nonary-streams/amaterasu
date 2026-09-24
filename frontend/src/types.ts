@@ -65,6 +65,10 @@ namespace Amaterasu {
       enabled: boolean;
       auto_sync: boolean;
       exclude_games: SteamExclusion[];
+      include_tools: boolean;
+      sync_all_installed: boolean;
+      recent_games: number;
+      recent_max_age_days: number;
     };
   }
   export interface SteamExclusion {

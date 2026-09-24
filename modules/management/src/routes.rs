@@ -546,12 +546,25 @@ mod tests {
                 {"id":"730","name":"Counter-Strike 2"},
                 {"name":"Portal 2"}
             ],
+            "include_tools":false,
+            "sync_all_installed":false,
+            "recent_games":10,
+            "recent_max_age_days":30,
             "expected_revision":0
         });
         assert_eq!(
             payload(update, &serde_json::to_vec(&valid).unwrap()).unwrap()["action"],
             "settings_update"
         );
+        let legacy = serde_json::json!({
+            "enabled":true,
+            "auto_sync":false,
+            "exclude_games":[],
+            "expected_revision":7
+        });
+        let legacy_payload = payload(update, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(legacy_payload["action"], "settings_update");
+        assert!(legacy_payload.get("include_tools").is_none());
 
         let mut invalid_payloads = vec![
             serde_json::json!({"enabled":true,"expected_revision":0}),
@@ -569,6 +582,11 @@ mod tests {
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"730","name":"Game","extra":true}],"expected_revision":0}),
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"730"},{"id":"730","name":"Game"}],"expected_revision":0}),
             serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"name":"Game"},{"name":"game"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"include_tools":1,"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"sync_all_installed":"true","expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_games":10001,"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_max_age_days":36501,"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[],"recent_games":1.5,"expected_revision":0}),
         ];
         invalid_payloads.push(serde_json::json!({
             "enabled":true,
