@@ -182,7 +182,7 @@ impl Record {
                 .as_bytes()
                 .to_vec()
         } else {
-            serde_json::to_vec(&(start.capture_provider, &start.output))
+            serde_json::to_vec(&(start.capture_provider, start.constant_rate, &start.output))
                 .expect("bounded configuration")
         };
         let digest = Sha256::digest(identity);
@@ -279,7 +279,8 @@ impl Record {
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");
                 json!({"action":"open","capture_provider":start.capture_provider,"output":start.output,
-                    "encoder":start.encoder,"configuration":start.configuration,"packet_boundaries":true})
+                    "constant_rate":start.constant_rate,"encoder":start.encoder,
+                    "configuration":start.configuration,"packet_boundaries":true})
             }
             Resource::AudioCapture => {
                 json!({"action":"open","endpoint":self.start.as_ref().expect("validated start workflow").audio_endpoint})

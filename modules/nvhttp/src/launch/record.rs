@@ -1,4 +1,4 @@
-use super::{LaunchRequest, PeerIdentity};
+use super::{CaptureProvider, LaunchRequest, PeerIdentity};
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
 use std::{collections::VecDeque, time::Instant};
 
@@ -45,6 +45,8 @@ pub struct Record {
     pub application_stream_audio: Option<bool>,
     pub effective_stream_audio: bool,
     pub capture_output: String,
+    pub capture_provider: CaptureProvider,
+    pub constant_rate: bool,
     pub application_fec_percentage: Option<u8>,
     pub effective_fec_percentage: u8,
     pub application_requested: bool,
@@ -83,6 +85,8 @@ impl Record {
         global_fec_percentage: u8,
         global_stream_audio: bool,
         capture_output: String,
+        capture_provider: CaptureProvider,
+        constant_rate: bool,
         connection: u64,
         deadline: Instant,
     ) -> Self {
@@ -98,6 +102,8 @@ impl Record {
             application_stream_audio: None,
             effective_stream_audio: global_stream_audio,
             capture_output,
+            capture_provider,
+            constant_rate,
             application_fec_percentage: None,
             effective_fec_percentage: global_fec_percentage,
             application_requested: false,

@@ -82,18 +82,21 @@ rejection, or any ambiguous batch result fails the session and releases held
 input; a batch is never replayed under another operation ID.
 
 Audio endpoints are leased under their resolved identity. Video capture leases
-identify provider plus output, not a canonical physical display across providers.
-Both are shared read leases. Display mutation, topology restoration and
-application launch integration remain separate work.
+identify provider, constant-rate mode, and output, not a canonical physical display
+across providers. Both are shared read leases. Display mutation, topology
+restoration and application launch integration remain separate work. The optional
+`constant_rate` start field is accepted only with WGC and defaults to false.
 
 ## Current limits
 
 The initial path requires H.264 SDR, 48 kHz stereo capture, and 5 or 10 ms Opus.
-It has no resampler, capture pacing policy, audiovisual clock correction, network
-RTSP listener or full Moonlight playback qualification. Real Windows capture,
-encoding, and OS input injection still require hardware validation; Linux
-providers remain incomplete. The signed synthetic integration tests framing and
-real Opus/network composition, not hardware capture or H.264 decoding.
+It has no resampler, audiovisual clock correction, network RTSP listener or full
+Moonlight playback qualification. WGC constant-rate delivery is opt-in and repeats
+the last owned frame at the stream cadence; it does not provide automatic capture
+selection or context-aware frame pacing. Real Windows capture, encoding, and OS
+input injection still require hardware validation; Linux providers remain
+incomplete. The signed synthetic integration tests framing and real Opus/network
+composition, not hardware capture or H.264 decoding.
 
 ## Arming after RTSP negotiation
 

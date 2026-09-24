@@ -150,7 +150,37 @@ impl CaptureConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    #[default]
+    Auto,
+    Ddx,
+    Wgc,
+    Wgcc,
+}
+
+impl CaptureMode {
+    pub fn resolve(self, bootstrap_provider: CaptureProvider) -> (CaptureProvider, bool) {
+        match self {
+            Self::Auto => (bootstrap_provider, false),
+            Self::Ddx => (CaptureProvider::Dxgi, false),
+            Self::Wgc => (CaptureProvider::Wgc, false),
+            Self::Wgcc => (CaptureProvider::Wgc, true),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ddx => "ddx",
+            Self::Wgc => "wgc",
+            Self::Wgcc => "wgcc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProvider {
     Dxgi,
@@ -215,6 +245,7 @@ impl StreamProfile {
 pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
+    configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
     records: BTreeMap<u64, Record>,
@@ -234,6 +265,7 @@ impl Controller {
         Ok(Self {
             config,
             configured_output_name: None,
+            configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
             records: BTreeMap::new(),
@@ -251,6 +283,10 @@ impl Controller {
     pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
         self.output_settings_ready = ready;
         self.configured_output_name = configured_output_name.map(str::to_owned);
+    }
+
+    pub fn set_capture_mode(&mut self, configured_capture: CaptureMode) {
+        self.configured_capture = configured_capture;
     }
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
@@ -291,6 +327,9 @@ impl Controller {
             .filter(|output_name| !output_name.is_empty())
             .unwrap_or(&config.capture.output)
             .to_owned();
+        let (capture_provider, constant_rate) = self
+            .configured_capture
+            .resolve(config.capture.capture_provider);
 
         if let Some(record) = self
             .records
@@ -336,6 +375,8 @@ impl Controller {
             global_fec_percentage,
             global_stream_audio,
             capture_output,
+            capture_provider,
+            constant_rate,
             connection,
             now + INITIAL_DEADLINE,
         );

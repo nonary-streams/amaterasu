@@ -18,8 +18,10 @@ The control actions are `open`, `close {ticket}`, `status {ticket?}` and
 and optional `discover_peers` (default false). Fixed mode requires both ports.
 Discovery mode requires them to be omitted or zero so caller-supplied ports cannot
 silently override discovery.
-Capture contains `capture_provider` (`dxgi` or `wgc`), `output`, `encoder` and
-`audio_endpoint`. The profile supplies dimensions, frame rate, bitrate in kbps,
+Capture contains `capture_provider` (`dxgi` or `wgc`), optional `constant_rate`
+(default false), `output`, `encoder` and `audio_endpoint`. Constant-rate capture is
+accepted only with WGC and is forwarded to stream-session and Video as part of the
+per-open selection. The profile supplies dimensions, frame rate, bitrate in kbps,
 reference-frame limit, video packet/FEC settings, Opus packet duration/bitrate and
 encryption policy. Unknown fields are rejected; network data cannot override these
 authorized settings.

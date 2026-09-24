@@ -1,5 +1,8 @@
 //! Caller-scoped NVHTTP product settings persisted by the configuration service.
-use crate::settings::{self, AddressFamily, Settings};
+use crate::{
+    launch::CaptureMode,
+    settings::{self, AddressFamily, Settings},
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -10,7 +13,8 @@ const LEGACY_SETTINGS_VERSION: u64 = 1;
 const PORT_SETTINGS_VERSION: u64 = 2;
 const NETWORK_SETTINGS_VERSION: u64 = 3;
 const OUTPUT_SETTINGS_VERSION: u64 = 4;
-const SETTINGS_VERSION: u64 = 5;
+const STREAM_AUDIO_SETTINGS_VERSION: u64 = 5;
+const SETTINGS_VERSION: u64 = 6;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +30,7 @@ pub enum AdminAction {
         bind_address: FieldUpdate<String>,
         output_name: FieldUpdate<String>,
         stream_audio: FieldUpdate<bool>,
+        capture: FieldUpdate<CaptureMode>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -94,6 +99,7 @@ enum Purpose {
         target: NetworkTarget,
         output_name: Option<String>,
         stream_audio: bool,
+        capture: CaptureMode,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -124,6 +130,7 @@ struct ProductDocument {
     bind_address: Option<String>,
     output_name: Option<String>,
     stream_audio: bool,
+    capture: CaptureMode,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -140,6 +147,7 @@ pub struct ProductSettings {
     configured_address_family: Option<AddressFamily>,
     configured_bind_address: Option<String>,
     configured_output_name: Option<String>,
+    configured_capture: CaptureMode,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -229,6 +237,7 @@ impl ProductSettings {
             configured_address_family: None,
             configured_bind_address: None,
             configured_output_name: None,
+            configured_capture: CaptureMode::Auto,
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -264,6 +273,10 @@ impl ProductSettings {
         self.configured_output_name.as_deref()
     }
 
+    pub fn configured_capture(&self) -> CaptureMode {
+        self.configured_capture
+    }
+
     pub fn stream_audio(&self) -> bool {
         self.stream_audio
     }
@@ -279,7 +292,10 @@ impl ProductSettings {
 
     pub fn capture_provider(&self) -> Option<&'static str> {
         self.bootstrap_settings.streaming.as_ref().map(|streaming| {
-            match streaming.capture.capture_provider {
+            let (provider, _) = self
+                .configured_capture
+                .resolve(streaming.capture.capture_provider);
+            match provider {
                 crate::launch::CaptureProvider::Dxgi => "dxgi",
                 crate::launch::CaptureProvider::Wgc => "wgc",
             }
@@ -740,6 +756,7 @@ impl ProductSettings {
                 bind_address,
                 output_name,
                 stream_audio,
+                capture,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -780,6 +797,7 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let capture = apply_capture_update(capture, self.configured_capture);
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -839,6 +857,7 @@ impl ProductSettings {
                         &target,
                         output_name.as_deref(),
                         stream_audio,
+                        capture,
                     ),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
@@ -848,6 +867,7 @@ impl ProductSettings {
                         target,
                         output_name,
                         stream_audio,
+                        capture,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -960,6 +980,7 @@ impl ProductSettings {
                 target,
                 output_name,
                 stream_audio,
+                capture,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
@@ -971,6 +992,7 @@ impl ProductSettings {
                         &target,
                         output_name.as_deref(),
                         stream_audio,
+                        capture,
                     ) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
                             let previous_http_target = self.http_target();
@@ -1220,6 +1242,7 @@ impl ProductSettings {
         self.configured_bind_address = document.bind_address;
         self.configured_output_name = document.output_name;
         self.stream_audio = document.stream_audio;
+        self.configured_capture = document.capture;
         self.loaded = true;
     }
 
@@ -1235,6 +1258,7 @@ impl ProductSettings {
             "configured_address_family":self.configured_address_family,
             "configured_bind_address":self.configured_bind_address,
             "configured_output_name":self.configured_output_name,
+            "configured_capture":self.configured_capture.as_str(),
             "stream_audio":self.stream_audio,
             "effective_output_name":self.effective_output_name(),
             "capture_provider":self.capture_provider(),
@@ -1292,6 +1316,7 @@ fn product_update_payload(
     target: &NetworkTarget,
     output_name: Option<&str>,
     stream_audio: bool,
+    capture: CaptureMode,
 ) -> Value {
     json!({
         "action":"product_update",
@@ -1304,6 +1329,7 @@ fn product_update_payload(
             "bind_address":target.bind_address,
             "output_name":output_name,
             "stream_audio":stream_audio,
+            "capture":capture,
         },
     })
 }
@@ -1349,6 +1375,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             bind_address: None,
             output_name: None,
             stream_audio: true,
+            capture: CaptureMode::Auto,
         });
     }
 
@@ -1362,6 +1389,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | PORT_SETTINGS_VERSION
             | NETWORK_SETTINGS_VERSION
             | OUTPUT_SETTINGS_VERSION
+            | STREAM_AUDIO_SETTINGS_VERSION
             | SETTINGS_VERSION
     ) || revision == 0
     {
@@ -1374,7 +1402,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         PORT_SETTINGS_VERSION => 2,
         NETWORK_SETTINGS_VERSION => 4,
         OUTPUT_SETTINGS_VERSION => 5,
-        SETTINGS_VERSION => 6,
+        STREAM_AUDIO_SETTINGS_VERSION => 6,
+        SETTINGS_VERSION => 7,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1383,7 +1412,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= NETWORK_SETTINGS_VERSION
             && (!values.contains_key("address_family") || !values.contains_key("bind_address")))
         || (version >= OUTPUT_SETTINGS_VERSION && !values.contains_key("output_name"))
-        || (version == SETTINGS_VERSION && !values.contains_key("stream_audio"))
+        || (version >= STREAM_AUDIO_SETTINGS_VERSION && !values.contains_key("stream_audio"))
+        || (version == SETTINGS_VERSION && !values.contains_key("capture"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1430,13 +1460,24 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         None
     };
-    let stream_audio = if version == SETTINGS_VERSION {
+    let stream_audio = if version >= STREAM_AUDIO_SETTINGS_VERSION {
         values
             .get("stream_audio")
             .and_then(Value::as_bool)
             .ok_or_else(|| invalid_state("persisted stream_audio is not a boolean"))?
     } else {
         true
+    };
+    let capture = if version == SETTINGS_VERSION {
+        serde_json::from_value::<CaptureMode>(
+            values
+                .get("capture")
+                .cloned()
+                .ok_or_else(|| invalid_state("persisted capture mode is missing"))?,
+        )
+        .map_err(|_| invalid_state("persisted capture mode is invalid"))?
+    } else {
+        CaptureMode::Auto
     };
     Ok(ProductDocument {
         revision,
@@ -1446,6 +1487,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         bind_address,
         output_name,
         stream_audio,
+        capture,
     })
 }
 
@@ -1456,13 +1498,14 @@ fn update_result(
     target: &NetworkTarget,
     output_name: Option<&str>,
     stream_audio: bool,
+    capture: CaptureMode,
 ) -> Result<ProductDocument, SettingFailure> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v5 stream audio settings",
+            "product_update did not confirm the v6 capture settings",
         ));
     }
     let document = parse_document(payload)?;
@@ -1472,6 +1515,7 @@ fn update_result(
         || document.bind_address != target.bind_address
         || document.output_name.as_deref() != output_name
         || document.stream_audio != stream_audio
+        || document.capture != capture
         || expected_revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -1511,6 +1555,14 @@ fn apply_boolean_update(update: FieldUpdate<bool>, current: bool) -> Result<bool
         FieldUpdate::Omitted => Ok(current),
         FieldUpdate::Null => Err(()),
         FieldUpdate::Value(value) => Ok(value),
+    }
+}
+
+fn apply_capture_update(update: FieldUpdate<CaptureMode>, current: CaptureMode) -> CaptureMode {
+    match update {
+        FieldUpdate::Omitted => current,
+        FieldUpdate::Null => CaptureMode::Auto,
+        FieldUpdate::Value(value) => value,
     }
 }
 
@@ -1617,6 +1669,7 @@ mod tests {
         assert_eq!(missing.hostname, None);
         assert_eq!(missing.port, None);
         assert!(missing.stream_audio);
+        assert_eq!(missing.capture, CaptureMode::Auto);
 
         let persisted = parse_document(&json!({
             "ok":true,"found":true,"version":1,"revision":7,"values":{"hostname":"Studio PC"}
@@ -1627,6 +1680,7 @@ mod tests {
         assert_eq!(persisted.port, None);
         assert_eq!(persisted.output_name, None);
         assert!(persisted.stream_audio);
+        assert_eq!(persisted.capture, CaptureMode::Auto);
 
         let defaulted = parse_document(&json!({
             "ok":true,"found":true,"version":1,"revision":8,"values":{"hostname":""}
@@ -1647,6 +1701,7 @@ mod tests {
         .unwrap();
         assert_eq!(network_document.output_name, None);
         assert!(network_document.stream_audio);
+        assert_eq!(network_document.capture, CaptureMode::Auto);
     }
 
     #[test]
@@ -1705,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_requires_a_boolean_and_old_documents_migrate_with_audio_enabled() {
+    fn v5_requires_a_boolean_and_old_documents_migrate_with_auto_capture() {
         let current = parse_document(&json!({
             "ok":true,"found":true,"version":5,"revision":2,
             "values":{"hostname":"Host","port":47989,"address_family":null,
@@ -1713,6 +1768,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!current.stream_audio);
+        assert_eq!(current.capture, CaptureMode::Auto);
 
         for version in 1..=4 {
             let values = match version {
@@ -1731,6 +1787,7 @@ mod tests {
             }))
             .unwrap();
             assert!(migrated.stream_audio, "version {version}");
+            assert_eq!(migrated.capture, CaptureMode::Auto, "version {version}");
         }
 
         for malformed in [
@@ -1745,6 +1802,95 @@ mod tests {
                 parse_document(&malformed).unwrap_err().code,
                 "invalid_state_response"
             );
+        }
+    }
+
+    #[test]
+    fn v6_capture_mode_is_strict_and_legacy_versions_migrate_to_auto() {
+        let current = parse_document(&json!({
+            "ok":true,"found":true,"version":6,"revision":2,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":false,"capture":"wgcc"}
+        }))
+        .unwrap();
+        assert_eq!(current.capture, CaptureMode::Wgcc);
+
+        for mode in ["auto", "ddx", "wgc", "wgcc"] {
+            let document = parse_document(&json!({
+                "ok":true,"found":true,"version":6,"revision":2,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":false,"capture":mode}
+            }))
+            .unwrap();
+            assert_eq!(document.capture.as_str(), mode);
+        }
+
+        for malformed in [
+            json!({"ok":true,"found":true,"version":6,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true}}),
+            json!({"ok":true,"found":true,"version":6,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":null}}),
+            json!({"ok":true,"found":true,"version":6,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"unknown"}}),
+        ] {
+            assert_eq!(
+                parse_document(&malformed).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_selection_survives_restart_and_reports_the_resolved_provider() {
+        let mut bootstrap = bootstrap_with_capture_output("bootstrap-display-id");
+        bootstrap
+            .streaming
+            .as_mut()
+            .expect("test streaming config")
+            .capture
+            .capture_provider = crate::launch::CaptureProvider::Wgc;
+        let selected_document = json!({
+            "ok":true,"found":true,"version":6,"revision":3,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":true,"capture":"wgcc"}
+        });
+
+        let mut first_start =
+            ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        first_start.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(first_start.configured_capture(), CaptureMode::Wgcc);
+        assert_eq!(first_start.capture_provider(), Some("wgc"));
+        assert_eq!(first_start.settings_payload()["configured_capture"], "wgcc");
+
+        let mut restarted =
+            ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        restarted.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(restarted.configured_capture(), CaptureMode::Wgcc);
+        assert_eq!(restarted.capture_provider(), Some("wgc"));
+    }
+
+    #[test]
+    fn each_capture_mode_resolves_to_its_effective_provider() {
+        let bootstrap = bootstrap_with_capture_output("bootstrap-display-id");
+        for (mode, provider) in [
+            (CaptureMode::Auto, "dxgi"),
+            (CaptureMode::Ddx, "dxgi"),
+            (CaptureMode::Wgc, "wgc"),
+            (CaptureMode::Wgcc, "wgc"),
+        ] {
+            let document = json!({
+                "ok":true,"found":true,"version":6,"revision":3,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,
+                    "capture":mode.as_str()}
+            });
+            let mut settings =
+                ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+            settings.apply_document(parse_document(&document).unwrap());
+            assert_eq!(settings.capture_provider(), Some(provider), "{mode:?}");
         }
     }
 
@@ -1819,8 +1965,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":5,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
+            "ok":true,"found":true,"version":6,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -1828,21 +1974,45 @@ mod tests {
             bind_address: None,
         };
         assert_eq!(
-            update_result(&success, 3, "New Host", &target, None, true)
-                .unwrap()
-                .revision,
+            update_result(
+                &success,
+                3,
+                "New Host",
+                &target,
+                None,
+                true,
+                CaptureMode::Auto
+            )
+            .unwrap()
+            .revision,
             4
         );
         assert_eq!(
-            update_result(&success, 2, "New Host", &target, None, true)
-                .unwrap_err()
-                .code,
+            update_result(
+                &success,
+                2,
+                "New Host",
+                &target,
+                None,
+                true,
+                CaptureMode::Auto
+            )
+            .unwrap_err()
+            .code,
             "invalid_state_response"
         );
         assert_eq!(
-            update_result(&success, 3, "Other Host", &target, None, true)
-                .unwrap_err()
-                .code,
+            update_result(
+                &success,
+                3,
+                "Other Host",
+                &target,
+                None,
+                true,
+                CaptureMode::Auto
+            )
+            .unwrap_err()
+            .code,
             "invalid_state_response"
         );
         assert_eq!(
@@ -1856,6 +2026,7 @@ mod tests {
                 },
                 None,
                 true,
+                CaptureMode::Auto,
             )
             .unwrap_err()
             .code,
@@ -1863,20 +2034,28 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":5,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
+            "ok":true,"found":true,"version":6,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
         });
         assert_eq!(
-            update_result(&reset_to_machine_name, 4, "", &target, None, true)
-                .unwrap()
-                .hostname
-                .as_deref(),
+            update_result(
+                &reset_to_machine_name,
+                4,
+                "",
+                &target,
+                None,
+                true,
+                CaptureMode::Auto
+            )
+            .unwrap()
+            .hostname
+            .as_deref(),
             Some("")
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":5,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true}
+            "ok":true,"found":true,"version":6,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true,"capture":"auto"}
         });
         assert_eq!(
             update_result(
@@ -1886,6 +2065,7 @@ mod tests {
                 &target,
                 Some("selected-display-id"),
                 true,
+                CaptureMode::Auto,
             )
             .unwrap()
             .output_name
@@ -1893,9 +2073,17 @@ mod tests {
             Some("selected-display-id")
         );
         assert_eq!(
-            update_result(&selected, 8, "New Host", &target, None, true)
-                .unwrap_err()
-                .code,
+            update_result(
+                &selected,
+                8,
+                "New Host",
+                &target,
+                None,
+                true,
+                CaptureMode::Auto
+            )
+            .unwrap_err()
+            .code,
             "invalid_state_response"
         );
     }
@@ -1934,6 +2122,7 @@ mod tests {
                 "configured_address_family":null,
             "configured_bind_address":null,
             "configured_output_name":null,
+            "configured_capture":"auto",
             "stream_audio":true,
             "effective_output_name":null,
                 "capture_provider":null,
@@ -2015,15 +2204,16 @@ mod tests {
                 },
                 output_name: None,
                 stream_audio: true,
+                capture: CaptureMode::Auto,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":5,
+                "version":6,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
             })),
         );
 
@@ -2069,12 +2259,13 @@ mod tests {
                 },
                 output_name: None,
                 stream_audio: true,
+                capture: CaptureMode::Auto,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":5,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
+                "ok":true,"found":true,"version":6,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
             })),
         );
 
@@ -2236,12 +2427,13 @@ mod tests {
                 },
                 output_name: None,
                 stream_audio: true,
+                capture: CaptureMode::Auto,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":5,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true}
+                "ok":true,"found":true,"version":6,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
             })),
         );
 
@@ -2282,7 +2474,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
+    fn v6_product_update_payload_keeps_nulls_and_capture_mode_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -2293,8 +2485,9 @@ mod tests {
             },
             None,
             false,
+            CaptureMode::Auto,
         );
-        assert_eq!(reset["version"], 5);
+        assert_eq!(reset["version"], 6);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
@@ -2310,11 +2503,13 @@ mod tests {
             },
             Some("stable-display-id"),
             true,
+            CaptureMode::Wgcc,
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
         assert_eq!(explicit_blank["values"]["bind_address"], "");
         assert_eq!(explicit_blank["values"]["output_name"], "stable-display-id");
         assert_eq!(explicit_blank["values"]["stream_audio"], true);
+        assert_eq!(explicit_blank["values"]["capture"], "wgcc");
     }
 
     #[test]
@@ -2333,13 +2528,28 @@ mod tests {
     }
 
     #[test]
-    fn stream_audio_admin_update_writes_v5_and_rejects_null() {
+    fn capture_update_omission_preserves_and_null_resets_to_auto() {
+        for mode in [CaptureMode::Ddx, CaptureMode::Wgc, CaptureMode::Wgcc] {
+            assert_eq!(apply_capture_update(FieldUpdate::Omitted, mode), mode);
+            assert_eq!(
+                apply_capture_update(FieldUpdate::Null, mode),
+                CaptureMode::Auto
+            );
+        }
+        assert_eq!(
+            apply_capture_update(FieldUpdate::Value(CaptureMode::Wgcc), CaptureMode::Ddx),
+            CaptureMode::Wgcc
+        );
+    }
+
+    #[test]
+    fn stream_audio_admin_update_writes_v6_and_rejects_null() {
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         product.apply_document(
             parse_document(&json!({
-                "ok":true,"found":true,"version":5,"revision":4,
+                "ok":true,"found":true,"version":6,"revision":4,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
-                    "bind_address":null,"output_name":null,"stream_audio":false}
+                    "bind_address":null,"output_name":null,"stream_audio":false,"capture":"auto"}
             }))
             .unwrap(),
         );
@@ -2354,6 +2564,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
+                    capture: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -2361,9 +2572,10 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 5);
+        assert_eq!(payload["version"], 6);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
+        assert_eq!(payload["values"]["capture"], "auto");
 
         let mut invalid = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         invalid.apply_document(
@@ -2385,6 +2597,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Null,
+                    capture: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -2395,6 +2608,54 @@ mod tests {
         assert_eq!(
             invalid.completions.front().unwrap().payload["code"],
             "invalid_stream_audio"
+        );
+    }
+
+    #[test]
+    fn capture_admin_update_persists_and_returns_the_selected_mode() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":5,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true}
+            }))
+            .unwrap(),
+        );
+        product
+            .enqueue(
+                11,
+                5_000,
+                AdminAction::Update {
+                    hostname: "Host".into(),
+                    port: 47_989,
+                    address_family: FieldUpdate::Omitted,
+                    bind_address: FieldUpdate::Omitted,
+                    output_name: FieldUpdate::Omitted,
+                    stream_audio: FieldUpdate::Omitted,
+                    capture: FieldUpdate::Value(CaptureMode::Wgcc),
+                    expected_revision: 4,
+                    require_listener_apply: false,
+                },
+            )
+            .unwrap();
+        product.start_next();
+        let pending = product.pending.take().expect("product update request");
+        assert_eq!(pending.payload["version"], 6);
+        assert_eq!(pending.payload["values"]["capture"], "wgcc");
+
+        product.finish_call(
+            pending.purpose,
+            CallOutcome::Payload(json!({
+                "ok":true,"found":true,"version":6,"revision":5,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"wgcc"}
+            })),
+        );
+        assert_eq!(product.configured_capture(), CaptureMode::Wgcc);
+        assert_eq!(
+            product.completions.front().unwrap().payload["configured_capture"],
+            "wgcc"
         );
     }
 }

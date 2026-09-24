@@ -256,6 +256,8 @@ pub fn validate_base_port(port: u16) -> Result<(), &'static str> {
 #[serde(deny_unknown_fields)]
 pub struct Capture {
     pub capture_provider: CaptureProvider,
+    #[serde(default)]
+    pub constant_rate: bool,
     pub output: String,
     pub encoder: u32,
     pub audio_endpoint: String,
@@ -421,6 +423,9 @@ impl Open {
     }
 
     fn validate_capture(&self) -> Result<(), &'static str> {
+        if self.capture.constant_rate && self.capture.capture_provider != CaptureProvider::Wgc {
+            return Err("constant_rate_requires_wgc");
+        }
         if !valid_label(&self.capture.output, 512)
             || !valid_label(&self.capture.audio_endpoint, 4096)
         {
@@ -485,6 +490,7 @@ impl Open {
             "session": session,
             "configuration": {
                 "capture_provider": self.capture.capture_provider,
+                "constant_rate": self.capture.constant_rate,
                 "output": self.capture.output,
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
@@ -1060,6 +1066,22 @@ mod tests {
         assert_eq!(video["fps"], 60);
         assert_eq!(video["bitrate"], 16_000_000);
         assert_eq!(video["max_reference_frames"], 0);
+    }
+
+    #[test]
+    fn constant_rate_capture_is_wgc_only_and_reaches_session_start() {
+        let mut request = open();
+        assert!(!request.capture.constant_rate);
+        request.capture.capture_provider = CaptureProvider::Wgc;
+        request.capture.constant_rate = true;
+        assert!(request.validate(false).is_ok());
+
+        let arm = request.arm(41);
+        assert_eq!(arm["configuration"]["capture_provider"], "wgc");
+        assert_eq!(arm["configuration"]["constant_rate"], true);
+
+        request.capture.capture_provider = CaptureProvider::Dxgi;
+        assert_eq!(request.validate(false), Err("constant_rate_requires_wgc"));
     }
 
     #[test]

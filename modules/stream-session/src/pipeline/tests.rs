@@ -83,6 +83,44 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
 }
 
 #[test]
+fn constant_rate_mode_reaches_video_open_and_uses_a_distinct_capture_lease() {
+    let mut constant_host = Harness::new();
+    let prepared = constant_host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["capture_provider"] = json!("wgc");
+    configuration["configuration"]["constant_rate"] = json!(true);
+    assert_eq!(constant_host.response(2, configuration)["state"], "active");
+    let constant_record = &constant_host.pipeline.records[&id];
+    let constant_lease = constant_record.lease(false);
+    let constant_open = constant_host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("constant-rate video open");
+    assert_eq!(constant_open.payload["capture_provider"], "wgc");
+    assert_eq!(constant_open.payload["constant_rate"], true);
+
+    let mut variable_host = Harness::new();
+    let prepared = variable_host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(id);
+    configuration["configuration"]["capture_provider"] = json!("wgc");
+    assert_eq!(variable_host.response(2, configuration)["state"], "active");
+    let variable_record = &variable_host.pipeline.records[&id];
+    let variable_lease = variable_record.lease(false);
+    let variable_open = variable_host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("variable-rate video open");
+    assert_eq!(variable_open.payload["constant_rate"], false);
+    assert_ne!(constant_lease, variable_lease);
+}
+
+#[test]
 fn disabled_audio_skips_encoder_capture_and_audio_lease_but_keeps_video_plane() {
     let mut host = Harness::new();
     let mut request = prepare();

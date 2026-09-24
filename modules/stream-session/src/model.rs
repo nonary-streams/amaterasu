@@ -249,6 +249,8 @@ fn is_zero(value: &u32) -> bool {
 pub struct StartConfig {
     #[serde(default)]
     pub capture_provider: CaptureProvider,
+    #[serde(default)]
+    pub constant_rate: bool,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,
@@ -256,6 +258,9 @@ pub struct StartConfig {
 }
 impl StartConfig {
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
+            return Err("constant_rate_requires_wgc");
+        }
         if !valid_label(&self.output, 512)
             || (stream_audio && !valid_label(&self.audio_endpoint, 4096))
             || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))

@@ -499,6 +499,72 @@ fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
 }
 
 #[test]
+fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
+    for (mode, bootstrap_provider, expected_provider, expected_constant_rate) in [
+        (
+            CaptureMode::Auto,
+            CaptureProvider::Dxgi,
+            CaptureProvider::Dxgi,
+            false,
+        ),
+        (
+            CaptureMode::Auto,
+            CaptureProvider::Wgc,
+            CaptureProvider::Wgc,
+            false,
+        ),
+        (
+            CaptureMode::Ddx,
+            CaptureProvider::Wgc,
+            CaptureProvider::Dxgi,
+            false,
+        ),
+        (
+            CaptureMode::Wgc,
+            CaptureProvider::Dxgi,
+            CaptureProvider::Wgc,
+            false,
+        ),
+        (
+            CaptureMode::Wgcc,
+            CaptureProvider::Dxgi,
+            CaptureProvider::Wgc,
+            true,
+        ),
+    ] {
+        let now = Instant::now();
+        let mut stream_config = config();
+        stream_config.capture.capture_provider = bootstrap_provider;
+        let mut controller = Controller::new(Some(stream_config)).unwrap();
+        controller.set_capture_mode(mode);
+        let mut broker = Broker::default();
+
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        controller.set_capture_mode(CaptureMode::Ddx);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(
+            rtsp_open["capture"]["capture_provider"],
+            json!(expected_provider)
+        );
+        assert_eq!(
+            rtsp_open["capture"]["constant_rate"],
+            expected_constant_rate
+        );
+    }
+}
+
+#[test]
 fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

@@ -155,8 +155,13 @@ impl Controller {
             Phase::OpenRtsp => {
                 record.rtsp_requested = true;
                 let config = self.config.as_ref().expect("enabled streaming config");
-                let mut capture = config.capture.clone();
-                capture.output = record.capture_output.clone();
+                let capture = json!({
+                    "capture_provider":record.capture_provider,
+                    "constant_rate":record.constant_rate,
+                    "output":record.capture_output,
+                    "encoder":config.capture.encoder,
+                    "audio_endpoint":config.capture.audio_endpoint,
+                });
                 (
                     RTSP_SERVICE,
                     json!({

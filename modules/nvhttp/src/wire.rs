@@ -160,6 +160,10 @@ impl Router {
         self.launches.set_global_stream_audio(stream_audio);
     }
 
+    pub fn set_capture_mode(&mut self, capture: crate::launch::CaptureMode) {
+        self.launches.set_capture_mode(capture);
+    }
+
     pub fn dispatch(
         &mut self,
         connection: u64,

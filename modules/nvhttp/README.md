@@ -90,9 +90,10 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. Product document versions 1 through 4
+active_http_port/active_https_port values. Product document versions 1 through 6
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
-address policy, and v4 adds the global capture output selection.
+address policy, v4 adds the global capture output, v5 adds audio enablement, and v6
+adds the global capture mode.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -168,6 +169,24 @@ selector depends on provider-specific output enumeration; Windows DXGI and WGC
 are the implemented capture providers. Linux capture/output enumeration and
 macOS capture/output enumeration are not implemented, so persisted output choices
 do not imply Linux or macOS streaming support.
+
+## Global capture mode
+
+The same NVHTTP settings API accepts `capture` values `auto`, `ddx`, `wgc`, and
+`wgcc`. Reads return `configured_capture` and keep `capture_provider` as the
+effective provider used by output enumeration. An omitted update field preserves
+the stored mode; `null` or `"auto"` selects automatic mode. Product document v6
+stores a canonical mode, and older documents load as `auto`.
+
+`ddx` selects DXGI with event-driven delivery, `wgc` selects WGC with variable-rate
+delivery, and `wgcc` selects WGC with constant-rate delivery. Explicit WGC modes
+fail at stream start when WGC is not allowed by the Video provider configuration;
+they do not silently fall back to DXGI. `auto` preserves the startup
+`streaming.capture.capture_provider` and uses variable-rate delivery. Vibeshine's
+automatic WGC choice can depend on virtual-display and game context; Amaterasu does
+not yet model that policy. Per-client and per-application capture overrides are
+also not implemented. A direct RTSP open remains explicit about its provider and
+constant-rate flag.
 
 ## Wire routes
 

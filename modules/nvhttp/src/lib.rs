@@ -8,6 +8,7 @@ mod tls;
 mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use launch::CaptureMode;
 use network_settings::NetworkSettings;
 use product_settings::{AdminAction, FieldUpdate, ProductSettings};
 use serde::{Deserialize, Deserializer};
@@ -40,6 +41,8 @@ enum Operation {
         output_name: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         stream_audio: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        capture: FieldUpdate<CaptureMode>,
         expected_revision: u64,
     },
 }
@@ -160,6 +163,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.configured_output_name(),
             );
             router.set_global_stream_audio(self.product_settings.stream_audio());
+            router.set_capture_mode(self.product_settings.configured_capture());
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -408,6 +412,7 @@ impl NvhttpModule {
                                 bind_address,
                                 output_name,
                                 stream_audio,
+                                capture,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -431,6 +436,7 @@ impl NvhttpModule {
                                     bind_address,
                                     output_name,
                                     stream_audio,
+                                    capture,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -568,6 +574,7 @@ mod tests {
             bind_address: omitted_bind,
             output_name: omitted_output,
             stream_audio: omitted_audio,
+            capture: omitted_capture,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -580,16 +587,18 @@ mod tests {
         assert_eq!(omitted_bind, FieldUpdate::Omitted);
         assert_eq!(omitted_output, FieldUpdate::Omitted);
         assert_eq!(omitted_audio, FieldUpdate::Omitted);
+        assert_eq!(omitted_capture, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
             bind_address: blank_bind,
             output_name: reset_output,
             stream_audio: null_audio,
+            capture: null_capture,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":null,"bind_address":"","output_name":null,"stream_audio":null
+            "address_family":null,"bind_address":"","output_name":null,"stream_audio":null,"capture":null
         }))
         .unwrap()
         else {
@@ -599,16 +608,18 @@ mod tests {
         assert_eq!(blank_bind, FieldUpdate::Value(String::new()));
         assert_eq!(reset_output, FieldUpdate::Null);
         assert_eq!(null_audio, FieldUpdate::Null);
+        assert_eq!(null_capture, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
             bind_address: address,
             output_name,
             stream_audio,
+            capture,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false
+            "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false,"capture":"wgcc"
         }))
         .unwrap()
         else {
@@ -618,5 +629,14 @@ mod tests {
         assert_eq!(address, FieldUpdate::Value("::1".into()));
         assert_eq!(output_name, FieldUpdate::Value("stable-display-id".into()));
         assert_eq!(stream_audio, FieldUpdate::Value(false));
+        assert_eq!(capture, FieldUpdate::Value(CaptureMode::Wgcc));
+
+        assert!(
+            serde_json::from_value::<Operation>(json!({
+                "action":"settings_update","hostname":"Host","port":48000,
+                "expected_revision":2,"capture":"fallback"
+            }))
+            .is_err()
+        );
     }
 }
