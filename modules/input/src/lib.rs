@@ -63,6 +63,8 @@ enum SettingsOperation {
         key_repeat_delay: Option<u32>,
         #[serde(default)]
         key_repeat_frequency: Option<f64>,
+        #[serde(default)]
+        back_button_timeout: Option<i32>,
         expected_revision: u64,
     },
 }
@@ -211,6 +213,7 @@ impl InputModule {
                     key_rightalt_to_key_win,
                     key_repeat_delay,
                     key_repeat_frequency,
+                    back_button_timeout,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -228,6 +231,7 @@ impl InputModule {
                         key_rightalt_to_key_win,
                         key_repeat_delay,
                         key_repeat_frequency,
+                        back_button_timeout,
                     });
                     match self.product_settings.begin_update(
                         request.id,
@@ -393,6 +397,7 @@ mod tests {
                 key_rightalt_to_key_win: None,
                 key_repeat_delay: None,
                 key_repeat_frequency: None,
+                back_button_timeout: None,
                 ..
             }
         ));
@@ -406,6 +411,7 @@ mod tests {
             "key_rightalt_to_key_win":false,
             "key_repeat_delay":250,
             "key_repeat_frequency":30.5,
+            "back_button_timeout":-1,
             "expected_revision":4,
         }))
         .unwrap();
@@ -417,6 +423,7 @@ mod tests {
                 key_rightalt_to_key_win: Some(false),
                 key_repeat_delay: Some(250),
                 key_repeat_frequency: Some(30.5),
+                back_button_timeout: Some(-1),
                 ..
             }
         ));

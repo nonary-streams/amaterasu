@@ -6,7 +6,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 5;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 6;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
@@ -29,6 +29,8 @@ pub struct InputPolicy {
     pub key_repeat_delay: u32,
     #[serde(default = "default_key_repeat_frequency")]
     pub key_repeat_frequency: f64,
+    #[serde(default = "default_back_button_timeout")]
+    pub back_button_timeout: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -40,6 +42,7 @@ pub struct InputPolicyUpdate {
     pub key_rightalt_to_key_win: Option<bool>,
     pub key_repeat_delay: Option<u32>,
     pub key_repeat_frequency: Option<f64>,
+    pub back_button_timeout: Option<i32>,
 }
 
 const fn default_enabled() -> bool {
@@ -63,6 +66,7 @@ impl InputPolicy {
             "key_rightalt_to_key_win":self.key_rightalt_to_key_win,
             "key_repeat_delay":self.key_repeat_delay,
             "key_repeat_frequency":self.key_repeat_frequency,
+            "back_button_timeout":self.back_button_timeout,
         })
     }
 
@@ -94,6 +98,10 @@ const fn default_key_repeat_frequency() -> f64 {
     DEFAULT_KEY_REPEAT_FREQUENCY_HZ
 }
 
+const fn default_back_button_timeout() -> i32 {
+    -1
+}
+
 impl Default for InputPolicy {
     fn default() -> Self {
         Self {
@@ -104,6 +112,7 @@ impl Default for InputPolicy {
             key_rightalt_to_key_win: false,
             key_repeat_delay: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
+            back_button_timeout: default_back_button_timeout(),
         }
     }
 }
@@ -200,6 +209,9 @@ impl ProductSettings {
             key_repeat_frequency: update
                 .key_repeat_frequency
                 .unwrap_or(self.policy.key_repeat_frequency),
+            back_button_timeout: update
+                .back_button_timeout
+                .unwrap_or(self.policy.back_button_timeout),
         }
     }
 
@@ -456,6 +468,7 @@ impl ProductSettings {
                             policy.key_repeat_delay,
                             policy.key_repeat_frequency,
                         );
+                        controller.set_back_button_timeout_ms(policy.back_button_timeout);
                         let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
@@ -526,6 +539,7 @@ impl ProductSettings {
                             actual.key_repeat_delay,
                             actual.key_repeat_frequency,
                         );
+                        controller.set_back_button_timeout_ms(actual.back_button_timeout);
                         let cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
@@ -565,6 +579,7 @@ impl ProductSettings {
         controller.set_always_send_scancodes(policy.always_send_scancodes);
         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
         controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
+        controller.set_back_button_timeout_ms(policy.back_button_timeout);
         let cleanup = controller
             .set_device_policy(policy.device_policy(), std::time::Instant::now())
             .is_err();
@@ -595,6 +610,7 @@ impl ProductSettings {
                     self.policy.key_repeat_delay,
                     self.policy.key_repeat_frequency,
                 )
+            && controller.back_button_timeout_ms() == self.policy.back_button_timeout
             && !cleanup_required;
         settings_response_with_state(
             self.policy,
@@ -667,7 +683,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=5)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=6)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -697,6 +713,17 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                         | "key_rightalt_to_key_win"
                         | "key_repeat_delay"
                         | "key_repeat_frequency"
+                ),
+                6 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
                 ),
                 _ => true,
             });

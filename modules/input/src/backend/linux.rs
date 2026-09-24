@@ -228,6 +228,7 @@ pub struct LinuxBackend {
     gamepads: GamepadSlots<UinputGamepad>,
     gamepad_probe: Option<Device>,
     controller_input_supported: bool,
+    back_button_timeout_ms: i32,
 }
 impl LinuxBackend {
     pub fn new(path: String) -> Self {
@@ -242,6 +243,7 @@ impl LinuxBackend {
             gamepads: GamepadSlots::new(),
             gamepad_probe: None,
             controller_input_supported: false,
+            back_button_timeout_ms: -1,
         }
     }
 }
@@ -349,9 +351,14 @@ impl Backend for LinuxBackend {
             };
             let (path, gamepads) = (&self.path, &mut self.gamepads);
             return gamepads
-                .apply(*number, *active_mask, state, |slot| {
-                    UinputGamepad::create(path, slot)
-                })
+                .apply(
+                    *number,
+                    *active_mask,
+                    state,
+                    self.back_button_timeout_ms,
+                    std::time::Instant::now(),
+                    |slot| UinputGamepad::create(path, slot),
+                )
                 .map_err(|error| InputError::new("controller_unavailable", error.message));
         }
         if let Event::Key { key, state } = event {
@@ -453,6 +460,21 @@ impl Backend for LinuxBackend {
 
     fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
         self.key_rightalt_to_key_win = enabled;
+    }
+
+    fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
+        // Timer-driven controller writes are retried by GamepadSlots while
+        // their effective state remains dirty. A transient write failure must
+        // not tear down the keyboard, pointer, or stream lease before retry.
+        let _ = self.gamepads.advance(now);
+        Ok(())
+    }
+
+    fn set_back_button_timeout(&mut self, timeout_ms: i32) {
+        self.back_button_timeout_ms = timeout_ms;
+        if timeout_ms < 0 {
+            self.gamepads.disable_pending_back_timeouts();
+        }
     }
 }
 

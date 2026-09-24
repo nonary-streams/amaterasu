@@ -80,7 +80,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9})
+        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1})
     );
     assert_eq!(revision, 0);
 }
@@ -204,6 +204,29 @@ fn product_v5_preserves_repeat_settings_and_zero_frequency_uses_default() {
 }
 
 #[test]
+fn product_v6_reads_disabled_and_explicit_back_button_timeouts() {
+    let (disabled, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":6,
+        "revision":17,
+        "values":{"keyboard":true,"mouse":true,"back_button_timeout":-1},
+    }))
+    .unwrap();
+    assert_eq!(disabled.back_button_timeout, -1);
+
+    let (enabled, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":6,
+        "revision":18,
+        "values":{"keyboard":true,"mouse":true,"back_button_timeout":0},
+    }))
+    .unwrap();
+    assert_eq!(enabled.back_button_timeout, 0);
+}
+
+#[test]
 fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
     let (disabled, _) = read_document(&json!({
         "ok":true,
@@ -231,7 +254,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":7,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -242,6 +265,10 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
         json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":"true"}}),
         json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_delay":100}}),
         json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
+        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":2147483648i64}}),
+        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":-2147483649i64}}),
+        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":1.5}}),
+        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":"100"}}),
         json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_delay":-1}}),
         json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_frequency":-0.1}}),
         json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true}}),
@@ -252,7 +279,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v5_document() {
+fn update_requires_current_revision_and_sends_whole_v6_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -313,8 +340,8 @@ fn update_requires_current_revision_and_sends_whole_v5_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":5,
-            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9},
+            "version":6,
+            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1},
         })
     );
 }
@@ -344,10 +371,10 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 5);
+    assert_eq!(payload["version"], 6);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0})
+        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1})
     );
     assert!(
         !settings
@@ -414,6 +441,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         key_rightalt_to_key_win: true,
         key_repeat_delay: 250,
         key_repeat_frequency: 30.5,
+        back_button_timeout: 1_250,
     };
 
     settings
@@ -429,6 +457,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert!(!controller.high_resolution_scrolling());
     assert!(!controller.always_send_scancodes());
     assert!(controller.key_rightalt_to_key_win());
+    assert_eq!(controller.back_button_timeout_ms(), 1_250);
     assert_eq!(settings.get_response(&controller)["applied"], true);
     assert_eq!(
         settings.get_response(&controller)["values"]["high_resolution_scrolling"],
@@ -437,6 +466,10 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert_eq!(
         settings.get_response(&controller)["values"]["key_rightalt_to_key_win"],
         true
+    );
+    assert_eq!(
+        settings.get_response(&controller)["values"]["back_button_timeout"],
+        1_250
     );
 }
 

@@ -20,21 +20,23 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 5 stores `keyboard`, `mouse`,
+after startup. Version 6 stores `keyboard`, `mouse`,
 `high_resolution_scrolling`, `always_send_scancodes`, and
 `key_rightalt_to_key_win`, `key_repeat_delay`, and
-`key_repeat_frequency`; an absent document enables keyboard, mouse,
+`key_repeat_frequency`, and `back_button_timeout`; an absent document enables keyboard, mouse,
 high-resolution scrolling, and scancode mode, leaves right-Alt mapping disabled,
-and uses a 500 ms initial key-repeat delay at 24.9 Hz. Versions 1 through 4
+uses a 500 ms initial key-repeat delay at 24.9 Hz, and disables the Back timeout
+with `-1`. Versions 1 through 5
 migrate in memory with the new repeat defaults. Version 1 documents migrate in
 memory with high-resolution
 scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
 Version 2 documents preserve all three saved values and default scancode mode to
 enabled. Version 3 preserves all four earlier values and defaults right-Alt
-mapping to disabled. The next update writes the complete v5 document. Delay is
+mapping to disabled. The next update writes the complete v6 document. Delay is
 an integer from 0 through 2,147,483,647 milliseconds; zero disables repeat.
 Frequency is a finite nonnegative decimal in Hz. Zero keeps Vibeshine's 24.9 Hz
-default. The module needs calls to configuration and state
+default. Back timeout is a signed 32-bit millisecond value; any negative value
+disables the shortcut. The module needs calls to configuration and state
 and dependencies on both services; the configuration service uses the caller's
 delegated authority for its durable state read. Management cannot select another
 product namespace.
@@ -45,11 +47,11 @@ Administrators use the fixed management routes `/v1/input/settings_get` and
 `expected_revision`, and may contain `high_resolution_scrolling`,
 `always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
 newer fields preserve their current durable values. The update may also include
-`key_repeat_delay` and `key_repeat_frequency`. Product settings
+`key_repeat_delay`, `key_repeat_frequency`, and `back_button_timeout`. Product settings
 actions accept only the exact runtime caller `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -70,8 +72,8 @@ bootstrap defaults as persisted settings.
 
 The live global policy includes `keyboard`, `mouse`,
 `high_resolution_scrolling`, `always_send_scancodes`,
-`key_rightalt_to_key_win`, `key_repeat_delay`, and
-`key_repeat_frequency`. When high-resolution
+`key_rightalt_to_key_win`, `key_repeat_delay`,
+`key_repeat_frequency`, and `back_button_timeout`. When high-resolution
 scrolling is disabled, the input controller accumulates signed wheel units
 separately per axis and emits legacy 120-unit detents. Fractional remainders are
 discarded on mode changes, mouse disable, and lease end. The default preserves
@@ -86,8 +88,19 @@ US physical-key mapping in either mode. The backend remembers the representation
 selected on key-down so repeats, releases, and lease cleanup remain paired if
 the setting changes while a key is held. Linux intentionally ignores this
 setting and maps either packet form through the existing fixed US-to-evdev table;
-unmapped raw keys are rejected during batch validation. Controller and gamepad
-parity remain pending.
+unmapped raw keys are rejected during batch validation.
+
+Linux creates per-lease uinput gamepads when its startup probe succeeds. It maps
+controller number and active mask across 16 slots, projects assigned buttons,
+triggers, and signed axes, removes inactive slots, and retries failed
+timeout-driven state writes while retaining slot ownership. The global
+`back_button_timeout` defaults to `-1`; nonnegative values schedule a Back
+deadline per slot. On expiry, the module releases Back, pulses Guide for 100
+milliseconds after successful delivery, and suppresses Back until the client
+reports it released. Slot removal and lease teardown cancel pending timers.
+Windows currently reports controller input unsupported. Per-app and per-client
+`back_button_timeout` overrides are not yet resolved, and platform-qualified
+controller parity remains pending.
 
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
 VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw

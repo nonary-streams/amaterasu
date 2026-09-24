@@ -47,9 +47,10 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     key_rightalt_to_key_win: true,
     key_repeat_delay: 0,
     key_repeat_frequency: 0,
+    back_button_timeout: -1,
   });
   assert.deepEqual(
-    ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25)),
+    ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25, 2147483647)),
     {
       keyboard: true,
       mouse: true,
@@ -58,7 +59,17 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       key_rightalt_to_key_win: false,
       key_repeat_delay: 2147483647,
       key_repeat_frequency: 31.25,
+      back_button_timeout: 2147483647,
     },
+  );
+  assert.equal(
+    ordinary(parsePolicy(true, true, true, true, false, 0, 0, -2147483648))
+      .back_button_timeout,
+    -2147483648,
+  );
+  assert.equal(
+    ordinary(parsePolicy(true, true, true, true, false, 0, 0, 0)).back_button_timeout,
+    0,
   );
   for (const values of [
     ["false", true, true, true, true, 500, 24.9],
@@ -71,6 +82,11 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     [true, true, true, true, true, 500, -0.1],
     [true, true, true, true, true, 500, Number.NaN],
     [true, true, true, true, true, 500, Number.POSITIVE_INFINITY],
+    [true, true, true, true, true, 500, 24.9, -2147483649],
+    [true, true, true, true, true, 500, 24.9, 2147483648],
+    [true, true, true, true, true, 500, 24.9, 1.5],
+    [true, true, true, true, true, 500, 24.9, "100"],
+    [true, true, true, true, true, 500, 24.9, Number.NaN],
   ]) {
     assert.throws(() => parsePolicy(...values));
   }

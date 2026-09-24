@@ -16,6 +16,7 @@ const WHEEL_DELTA: i32 = 120;
 const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
+const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
 
 struct Lease {
     owner: String,
@@ -52,6 +53,7 @@ pub struct Controller<B: Backend> {
     key_rightalt_to_key_win: bool,
     key_repeat_delay_ms: u32,
     key_repeat_frequency_hz: f64,
+    back_button_timeout_ms: i32,
     repeating_key: Option<RepeatingKey>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
@@ -72,6 +74,7 @@ impl<B: Backend> Controller<B> {
             key_rightalt_to_key_win: false,
             key_repeat_delay_ms: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
+            back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
             repeating_key: None,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
@@ -119,6 +122,10 @@ impl<B: Backend> Controller<B> {
                 .and_then(|lease| lease.termination_reason)
                 .unwrap_or("expired");
             let _ = self.finish_lease(now, reason);
+            return;
+        }
+        if self.lease.is_some() && !self.cleanup_required() && self.backend.advance(now).is_err() {
+            let _ = self.finish_lease(now, "failed");
             return;
         }
         if self.lease.is_some() && !self.cleanup_required() && self.repeat_if_due(now).is_err() {
@@ -169,6 +176,15 @@ impl<B: Backend> Controller<B> {
             self.key_repeat_frequency_hz = frequency_hz;
             self.repeating_key = None;
         }
+    }
+
+    pub fn back_button_timeout_ms(&self) -> i32 {
+        self.back_button_timeout_ms
+    }
+
+    pub fn set_back_button_timeout_ms(&mut self, timeout_ms: i32) {
+        self.back_button_timeout_ms = timeout_ms;
+        self.backend.set_back_button_timeout(timeout_ms);
     }
 
     fn reset_scroll_remainders(&mut self) {
@@ -746,7 +762,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

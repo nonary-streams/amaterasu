@@ -1,4 +1,5 @@
 use crate::model::{Event, InputResult};
+use std::time::Instant;
 
 pub trait Backend {
     fn name(&self) -> &'static str;
@@ -17,6 +18,11 @@ pub trait Backend {
     /// Maps the host's right-Alt virtual key to the left Windows key. Backends
     /// preserve the selected mapping for matching key-up events.
     fn set_key_rightalt_to_key_win(&mut self, _enabled: bool) {}
+    /// Advances native timers that need service even when the client sends no packet.
+    fn advance(&mut self, _now: Instant) -> InputResult<()> {
+        Ok(())
+    }
+    fn set_back_button_timeout(&mut self, _timeout_ms: i32) {}
     fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]

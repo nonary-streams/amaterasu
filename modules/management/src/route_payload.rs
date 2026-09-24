@@ -386,6 +386,7 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     "key_rightalt_to_key_win",
                     "key_repeat_delay",
                     "key_repeat_frequency",
+                    "back_button_timeout",
                 ],
             )?;
             if object.get("keyboard").and_then(Value::as_bool).is_none()
@@ -406,6 +407,11 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     value
                         .as_f64()
                         .is_none_or(|frequency| !frequency.is_finite() || frequency < 0.0)
+                })
+                || object.get("back_button_timeout").is_some_and(|value| {
+                    value
+                        .as_i64()
+                        .is_none_or(|timeout| i32::try_from(timeout).is_err())
                 })
                 || object
                     .get("expected_revision")
@@ -1654,6 +1660,10 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"key_repeat_delay":0,"key_repeat_frequency":0.0,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"key_repeat_delay":2147483647,"key_repeat_frequency":24.9,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":-1,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":0,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":2147483647,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":-2147483648,"expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_ok());
         }
@@ -1674,6 +1684,10 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"key_repeat_frequency":-0.1,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"key_repeat_frequency":"24.9","expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"key_repeat_frequency":null,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":2147483648i64,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":-2147483649i64,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":0.5,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":"-1","expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_err());
         }

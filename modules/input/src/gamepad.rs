@@ -1,6 +1,10 @@
 use crate::model::{InputError, InputResult};
+use std::time::{Duration, Instant};
 
 pub(crate) const GAMEPAD_SLOT_COUNT: usize = 16;
+const BACK_BUTTON_MASK: u32 = 1 << 5;
+const GUIDE_BUTTON_MASK: u32 = 1 << 10;
+const GUIDE_PULSE: Duration = Duration::from_millis(100);
 
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
@@ -181,9 +185,112 @@ pub(crate) trait GamepadDevice {
     }
 }
 
+struct GamepadSlot<Device> {
+    device: Device,
+    client_state: ControllerSnapshot,
+    back_deadline: Option<Instant>,
+    guide_pulse_pending: bool,
+    guide_until: Option<Instant>,
+    suppress_back: bool,
+    dirty: bool,
+}
+
+impl<Device: GamepadDevice> GamepadSlot<Device> {
+    fn new(device: Device) -> Self {
+        Self {
+            device,
+            client_state: ControllerSnapshot::default(),
+            back_deadline: None,
+            guide_pulse_pending: false,
+            guide_until: None,
+            suppress_back: false,
+            dirty: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        state: ControllerSnapshot,
+        timeout_ms: i32,
+        now: Instant,
+    ) -> InputResult<()> {
+        let back_was_pressed = self.client_state.buttons & BACK_BUTTON_MASK != 0;
+        let back_is_pressed = state.buttons & BACK_BUTTON_MASK != 0;
+        if !back_is_pressed {
+            self.back_deadline = None;
+            self.suppress_back = false;
+        } else if timeout_ms < 0 {
+            self.back_deadline = None;
+        } else if !back_was_pressed && timeout_ms >= 0 {
+            self.back_deadline = now.checked_add(Duration::from_millis(timeout_ms as u64));
+        }
+        self.client_state = state;
+        self.expire(now);
+        self.write_effective_state(now)
+    }
+
+    fn advance(&mut self, now: Instant) -> InputResult<()> {
+        self.expire(now);
+        if self.dirty {
+            self.write_effective_state(now)?;
+        }
+        Ok(())
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self.back_deadline.is_some_and(|deadline| now >= deadline) {
+            self.back_deadline = None;
+            if self.client_state.buttons & BACK_BUTTON_MASK != 0 {
+                self.suppress_back = true;
+                self.guide_pulse_pending = true;
+                self.dirty = true;
+            }
+        }
+        if self.guide_until.is_some_and(|deadline| now >= deadline) {
+            self.guide_until = None;
+            self.dirty = true;
+        }
+    }
+
+    fn write_effective_state(&mut self, now: Instant) -> InputResult<()> {
+        self.dirty = true;
+        self.device.update(self.effective_state(now))?;
+        self.dirty = false;
+        if self.guide_pulse_pending {
+            self.guide_pulse_pending = false;
+            self.guide_until = now.checked_add(GUIDE_PULSE);
+        }
+        Ok(())
+    }
+
+    fn effective_state(&self, now: Instant) -> ControllerSnapshot {
+        let mut state = self.client_state;
+        if self.suppress_back {
+            state.buttons &= !BACK_BUTTON_MASK;
+        }
+        if self.guide_pulse_pending || self.guide_until.is_some_and(|deadline| now < deadline) {
+            state.buttons |= GUIDE_BUTTON_MASK;
+        }
+        state
+    }
+
+    fn cancel_timeout(&mut self) {
+        self.client_state = ControllerSnapshot::default();
+        self.back_deadline = None;
+        self.guide_pulse_pending = false;
+        self.guide_until = None;
+        self.suppress_back = false;
+        self.dirty = true;
+    }
+
+    fn disable_pending_back_timeout(&mut self) {
+        self.back_deadline = None;
+    }
+}
+
 /// Owns the client-relative controller slots for one input lease.
 pub(crate) struct GamepadSlots<Device> {
-    devices: [Option<Device>; GAMEPAD_SLOT_COUNT],
+    devices: [Option<GamepadSlot<Device>>; GAMEPAD_SLOT_COUNT],
 }
 
 impl<Device: GamepadDevice> GamepadSlots<Device> {
@@ -198,6 +305,8 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         number: u16,
         active_mask: u16,
         state: ControllerSnapshot,
+        back_button_timeout_ms: i32,
+        now: Instant,
         mut create: impl FnMut(u8) -> InputResult<Device>,
     ) -> InputResult<()> {
         if usize::from(number) >= GAMEPAD_SLOT_COUNT {
@@ -211,7 +320,8 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
             if active_mask & (1 << slot) == 0
                 && let Some(device) = slot_device.as_mut()
             {
-                device.release()?;
+                device.cancel_timeout();
+                device.device.release()?;
                 *slot_device = None;
             }
         }
@@ -221,12 +331,31 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
             return Ok(());
         }
         if self.devices[slot].is_none() {
-            self.devices[slot] = Some(create(number as u8)?);
+            self.devices[slot] = Some(GamepadSlot::new(create(number as u8)?));
         }
         self.devices[slot]
             .as_mut()
             .expect("active gamepad slot was created")
-            .update(state)
+            .update(state, back_button_timeout_ms, now)
+    }
+
+    pub(crate) fn advance(&mut self, now: Instant) -> InputResult<()> {
+        let mut first_error = None;
+        for slot in &mut self.devices {
+            if let Some(slot) = slot.as_mut()
+                && let Err(error) = slot.advance(now)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn disable_pending_back_timeouts(&mut self) {
+        for slot in self.devices.iter_mut().flatten() {
+            slot.disable_pending_back_timeout();
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -237,7 +366,8 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         let mut first_error = None;
         for slot_device in &mut self.devices {
             if let Some(device) = slot_device.as_mut() {
-                match device.release() {
+                device.cancel_timeout();
+                match device.device.release() {
                     Ok(()) => *slot_device = None,
                     Err(error) => {
                         if first_error.is_none() {
@@ -291,6 +421,34 @@ mod tests {
     fn create_device(trace: Rc<RefCell<Trace>>, slot: u8) -> InputResult<FakeDevice> {
         trace.borrow_mut().created.push(slot);
         Ok(FakeDevice { slot, trace })
+    }
+
+    fn apply_state(
+        slots: &mut GamepadSlots<FakeDevice>,
+        trace: &Rc<RefCell<Trace>>,
+        number: u16,
+        active_mask: u16,
+        buttons: u32,
+        timeout_ms: i32,
+        now: Instant,
+    ) {
+        slots
+            .apply(
+                number,
+                active_mask,
+                ControllerSnapshot {
+                    buttons,
+                    ..ControllerSnapshot::default()
+                },
+                timeout_ms,
+                now,
+                |slot| create_device(trace.clone(), slot),
+            )
+            .unwrap();
+    }
+
+    fn has_button(state: ControllerSnapshot, mask: u32) -> bool {
+        state.buttons & mask != 0
     }
 
     #[test]
@@ -493,22 +651,37 @@ mod tests {
         };
 
         slots
-            .apply(0, 0b1000_0000_0000_0001, state, |slot| {
-                create_device(trace.clone(), slot)
-            })
+            .apply(
+                0,
+                0b1000_0000_0000_0001,
+                state,
+                -1,
+                Instant::now(),
+                |slot| create_device(trace.clone(), slot),
+            )
             .unwrap();
         slots
-            .apply(15, 0b1000_0000_0000_0001, state, |slot| {
-                create_device(trace.clone(), slot)
-            })
+            .apply(
+                15,
+                0b1000_0000_0000_0001,
+                state,
+                -1,
+                Instant::now(),
+                |slot| create_device(trace.clone(), slot),
+            )
             .unwrap();
         assert_eq!(trace.borrow().created, [0, 15]);
         assert_eq!(trace.borrow().updates, [(0, state), (15, state)]);
 
         slots
-            .apply(0, 1, ControllerSnapshot::default(), |slot| {
-                create_device(trace.clone(), slot)
-            })
+            .apply(
+                0,
+                1,
+                ControllerSnapshot::default(),
+                -1,
+                Instant::now(),
+                |slot| create_device(trace.clone(), slot),
+            )
             .unwrap();
         assert_eq!(trace.borrow().dropped, [15]);
         assert_eq!(
@@ -529,14 +702,24 @@ mod tests {
         let trace = Rc::new(RefCell::new(Trace::default()));
         let mut slots = GamepadSlots::new();
         slots
-            .apply(3, 1 << 3, ControllerSnapshot::default(), |slot| {
-                create_device(trace.clone(), slot)
-            })
+            .apply(
+                3,
+                1 << 3,
+                ControllerSnapshot::default(),
+                -1,
+                Instant::now(),
+                |slot| create_device(trace.clone(), slot),
+            )
             .unwrap();
         slots
-            .apply(3, 0, ControllerSnapshot::default(), |slot| {
-                create_device(trace.clone(), slot)
-            })
+            .apply(
+                3,
+                0,
+                ControllerSnapshot::default(),
+                -1,
+                Instant::now(),
+                |slot| create_device(trace.clone(), slot),
+            )
             .unwrap();
 
         assert_eq!(trace.borrow().created, [3]);
@@ -568,6 +751,8 @@ mod tests {
                     buttons: 1,
                     ..ControllerSnapshot::default()
                 },
+                -1,
+                Instant::now(),
                 |_| {
                     Ok(FailingDevice {
                         fail_release: fail_release.clone(),
@@ -581,5 +766,410 @@ mod tests {
         fail_release.set(false);
         slots.stop().unwrap();
         assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn back_timeout_releases_back_pulses_guide_and_suppresses_until_release() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 2, 1 << 2, BACK_BUTTON_MASK, 200, start);
+        slots.advance(start + Duration::from_millis(199)).unwrap();
+        assert_eq!(trace.borrow().updates.len(), 1);
+        assert!(has_button(trace.borrow().updates[0].1, BACK_BUTTON_MASK));
+
+        slots.advance(start + Duration::from_millis(200)).unwrap();
+        let pulse = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(pulse, BACK_BUTTON_MASK));
+        assert!(has_button(pulse, GUIDE_BUTTON_MASK));
+
+        apply_state(
+            &mut slots,
+            &trace,
+            2,
+            1 << 2,
+            BACK_BUTTON_MASK,
+            200,
+            start + Duration::from_millis(210),
+        );
+        assert!(!has_button(
+            trace.borrow().updates.last().unwrap().1,
+            BACK_BUTTON_MASK
+        ));
+        assert!(has_button(
+            trace.borrow().updates.last().unwrap().1,
+            GUIDE_BUTTON_MASK
+        ));
+
+        slots.advance(start + Duration::from_millis(300)).unwrap();
+        let guide_released = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(guide_released, BACK_BUTTON_MASK));
+        assert!(!has_button(guide_released, GUIDE_BUTTON_MASK));
+
+        apply_state(
+            &mut slots,
+            &trace,
+            2,
+            1 << 2,
+            0,
+            200,
+            start + Duration::from_millis(310),
+        );
+        apply_state(
+            &mut slots,
+            &trace,
+            2,
+            1 << 2,
+            BACK_BUTTON_MASK,
+            200,
+            start + Duration::from_millis(320),
+        );
+        slots.advance(start + Duration::from_millis(520)).unwrap();
+        let second_pulse = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(second_pulse, BACK_BUTTON_MASK));
+        assert!(has_button(second_pulse, GUIDE_BUTTON_MASK));
+    }
+
+    #[test]
+    fn failed_timeout_writes_retry_back_release_and_guide_pulse_release() {
+        struct IntermittentDevice {
+            trace: Rc<RefCell<Vec<ControllerSnapshot>>>,
+            failures_remaining: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl GamepadDevice for IntermittentDevice {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                self.trace.borrow_mut().push(state);
+                let failures = self.failures_remaining.get();
+                if failures > 0 {
+                    self.failures_remaining.set(failures - 1);
+                    Err(InputError::new(
+                        "injection_failed",
+                        "temporary write failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let start = Instant::now();
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let failures_remaining = Rc::new(std::cell::Cell::new(0));
+        let mut slots = GamepadSlots::new();
+        slots
+            .apply(
+                0,
+                1,
+                ControllerSnapshot {
+                    buttons: BACK_BUTTON_MASK,
+                    ..ControllerSnapshot::default()
+                },
+                100,
+                start,
+                |_| {
+                    Ok(IntermittentDevice {
+                        trace: trace.clone(),
+                        failures_remaining: failures_remaining.clone(),
+                    })
+                },
+            )
+            .unwrap();
+
+        failures_remaining.set(1);
+        let timeout = start + Duration::from_millis(100);
+        assert_eq!(slots.advance(timeout).unwrap_err().code, "injection_failed");
+        let failed_back_release = *trace.borrow().last().unwrap();
+        assert!(!has_button(failed_back_release, BACK_BUTTON_MASK));
+        assert!(has_button(failed_back_release, GUIDE_BUTTON_MASK));
+
+        slots.advance(timeout + Duration::from_millis(1)).unwrap();
+        let delivered_back_release = *trace.borrow().last().unwrap();
+        assert!(!has_button(delivered_back_release, BACK_BUTTON_MASK));
+        assert!(has_button(delivered_back_release, GUIDE_BUTTON_MASK));
+
+        let pulse_end = timeout + Duration::from_millis(101);
+        failures_remaining.set(1);
+        assert_eq!(
+            slots.advance(pulse_end).unwrap_err().code,
+            "injection_failed"
+        );
+        assert!(!has_button(
+            *trace.borrow().last().unwrap(),
+            GUIDE_BUTTON_MASK
+        ));
+
+        slots.advance(pulse_end + Duration::from_millis(1)).unwrap();
+        assert!(!has_button(
+            *trace.borrow().last().unwrap(),
+            BACK_BUTTON_MASK
+        ));
+        assert!(!has_button(
+            *trace.borrow().last().unwrap(),
+            GUIDE_BUTTON_MASK
+        ));
+    }
+
+    #[test]
+    fn back_release_before_deadline_cancels_the_guide_pulse() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 0, 1, BACK_BUTTON_MASK, 300, start);
+        apply_state(
+            &mut slots,
+            &trace,
+            0,
+            1,
+            0,
+            300,
+            start + Duration::from_millis(299),
+        );
+        slots.advance(start + Duration::from_secs(1)).unwrap();
+
+        assert!(
+            trace
+                .borrow()
+                .updates
+                .iter()
+                .all(|(_, state)| { !has_button(*state, GUIDE_BUTTON_MASK) })
+        );
+        assert!(!has_button(
+            trace.borrow().updates.last().unwrap().1,
+            BACK_BUTTON_MASK
+        ));
+    }
+
+    #[test]
+    fn disabled_back_timeout_never_schedules_guide() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 4, 1 << 4, BACK_BUTTON_MASK, -1, start);
+        slots.advance(start + Duration::from_secs(60)).unwrap();
+
+        assert_eq!(trace.borrow().updates.len(), 1);
+        assert!(has_button(trace.borrow().updates[0].1, BACK_BUTTON_MASK));
+    }
+
+    #[test]
+    fn disabling_timeout_while_back_is_held_cancels_only_the_pending_deadline() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 4, 1 << 4, BACK_BUTTON_MASK, 100, start);
+        slots.disable_pending_back_timeouts();
+        slots.advance(start + Duration::from_secs(1)).unwrap();
+
+        assert!(has_button(
+            trace.borrow().updates.last().unwrap().1,
+            BACK_BUTTON_MASK
+        ));
+        assert!(
+            trace
+                .borrow()
+                .updates
+                .iter()
+                .all(|(_, state)| { !has_button(*state, GUIDE_BUTTON_MASK) })
+        );
+    }
+
+    #[test]
+    fn disabling_timeout_after_expiry_preserves_guide_pulse_and_back_suppression() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 4, 1 << 4, BACK_BUTTON_MASK, 10, start);
+        slots.advance(start + Duration::from_millis(10)).unwrap();
+        slots.disable_pending_back_timeouts();
+        let pulse = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(pulse, BACK_BUTTON_MASK));
+        assert!(has_button(pulse, GUIDE_BUTTON_MASK));
+
+        slots.advance(start + Duration::from_millis(110)).unwrap();
+        let pulse_end = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(pulse_end, BACK_BUTTON_MASK));
+        assert!(!has_button(pulse_end, GUIDE_BUTTON_MASK));
+
+        apply_state(
+            &mut slots,
+            &trace,
+            4,
+            1 << 4,
+            0,
+            -1,
+            start + Duration::from_millis(111),
+        );
+        apply_state(
+            &mut slots,
+            &trace,
+            4,
+            1 << 4,
+            BACK_BUTTON_MASK,
+            -1,
+            start + Duration::from_millis(112),
+        );
+        assert!(has_button(
+            trace.borrow().updates.last().unwrap().1,
+            BACK_BUTTON_MASK
+        ));
+    }
+
+    #[test]
+    fn back_timeout_is_independent_for_each_client_slot() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 1, 0b11, BACK_BUTTON_MASK, 100, start);
+        apply_state(
+            &mut slots,
+            &trace,
+            0,
+            0b11,
+            BACK_BUTTON_MASK,
+            100,
+            start + Duration::from_millis(50),
+        );
+        slots.advance(start + Duration::from_millis(100)).unwrap();
+        assert!(has_button(
+            trace.borrow().updates.last().unwrap().1,
+            GUIDE_BUTTON_MASK
+        ));
+        assert_eq!(trace.borrow().updates.last().unwrap().0, 1);
+
+        slots.advance(start + Duration::from_millis(150)).unwrap();
+        assert!(has_button(
+            trace.borrow().updates.last().unwrap().1,
+            GUIDE_BUTTON_MASK
+        ));
+        assert_eq!(trace.borrow().updates.last().unwrap().0, 0);
+    }
+
+    #[test]
+    fn slot_removal_and_reuse_cancel_an_old_back_deadline() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 3, 1 << 3, BACK_BUTTON_MASK, 100, start);
+        apply_state(
+            &mut slots,
+            &trace,
+            3,
+            0,
+            0,
+            100,
+            start + Duration::from_millis(10),
+        );
+        apply_state(
+            &mut slots,
+            &trace,
+            3,
+            1 << 3,
+            1,
+            100,
+            start + Duration::from_millis(20),
+        );
+        slots.advance(start + Duration::from_millis(200)).unwrap();
+
+        assert_eq!(trace.borrow().created, [3, 3]);
+        assert_eq!(trace.borrow().dropped, [3]);
+        assert!(
+            trace
+                .borrow()
+                .updates
+                .iter()
+                .all(|(_, state)| { !has_button(*state, GUIDE_BUTTON_MASK) })
+        );
+    }
+
+    #[test]
+    fn lease_stop_cancels_back_deadlines_before_a_later_lease_reuses_the_slot() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 1, 1 << 1, BACK_BUTTON_MASK, 100, start);
+        slots.stop().unwrap();
+        slots.advance(start + Duration::from_secs(1)).unwrap();
+        apply_state(
+            &mut slots,
+            &trace,
+            1,
+            1 << 1,
+            1,
+            100,
+            start + Duration::from_secs(2),
+        );
+        slots.advance(start + Duration::from_secs(3)).unwrap();
+
+        assert_eq!(trace.borrow().created, [1, 1]);
+        assert!(
+            trace
+                .borrow()
+                .updates
+                .iter()
+                .all(|(_, state)| { !has_button(*state, GUIDE_BUTTON_MASK) })
+        );
+    }
+
+    #[test]
+    fn failed_timeout_write_retries_and_starts_guide_pulse_after_delivery() {
+        struct FlakyDevice {
+            fail_next: std::rc::Rc<std::cell::Cell<bool>>,
+            updates: std::rc::Rc<RefCell<Vec<ControllerSnapshot>>>,
+        }
+        impl GamepadDevice for FlakyDevice {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                self.updates.borrow_mut().push(state);
+                if self.fail_next.replace(false) {
+                    Err(InputError::new(
+                        "injection_failed",
+                        "injected write failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let fail_next = std::rc::Rc::new(std::cell::Cell::new(true));
+        let updates = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+        let result = slots.apply(
+            0,
+            1,
+            ControllerSnapshot {
+                buttons: BACK_BUTTON_MASK,
+                ..ControllerSnapshot::default()
+            },
+            0,
+            start,
+            |_| {
+                Ok(FlakyDevice {
+                    fail_next: fail_next.clone(),
+                    updates: updates.clone(),
+                })
+            },
+        );
+
+        assert_eq!(result.unwrap_err().code, "injection_failed");
+        assert!(has_button(updates.borrow()[0], GUIDE_BUTTON_MASK));
+        slots.advance(start + Duration::from_millis(50)).unwrap();
+        assert!(has_button(updates.borrow()[1], GUIDE_BUTTON_MASK));
+        slots.advance(start + Duration::from_millis(149)).unwrap();
+        assert_eq!(updates.borrow().len(), 2);
+        slots.advance(start + Duration::from_millis(150)).unwrap();
+        assert!(!has_button(
+            *updates.borrow().last().unwrap(),
+            GUIDE_BUTTON_MASK
+        ));
     }
 }

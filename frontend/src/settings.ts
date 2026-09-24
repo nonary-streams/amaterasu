@@ -1,6 +1,8 @@
 namespace Amaterasu {
   const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
   const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
+  const minInputBackButtonTimeoutMs = -0x8000_0000;
+  const maxInputBackButtonTimeoutMs = 0x7fff_ffff;
   const maxHistoryLimit = 0x7fff_ffff;
 
   export function parseHistorySettings(
@@ -48,6 +50,7 @@ namespace Amaterasu {
     keyRightAltToKeyWin: boolean,
     keyRepeatDelay: number,
     keyRepeatFrequency: number,
+    backButtonTimeout: number = -1,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
@@ -59,9 +62,12 @@ namespace Amaterasu {
       keyRepeatDelay < 0 ||
       keyRepeatDelay > maxInputKeyRepeatDelayMs ||
       !Number.isFinite(keyRepeatFrequency) ||
-      keyRepeatFrequency < 0
+      keyRepeatFrequency < 0 ||
+      !Number.isSafeInteger(backButtonTimeout) ||
+      backButtonTimeout < minInputBackButtonTimeoutMs ||
+      backButtonTimeout > maxInputBackButtonTimeoutMs
     )
-      throw new Error("Input policy values or key repeat settings are invalid.");
+      throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
     return {
       keyboard,
       mouse,
@@ -70,6 +76,7 @@ namespace Amaterasu {
       key_rightalt_to_key_win: keyRightAltToKeyWin,
       key_repeat_delay: keyRepeatDelay,
       key_repeat_frequency: keyRepeatFrequency,
+      back_button_timeout: backButtonTimeout,
     };
   }
 
@@ -1486,6 +1493,15 @@ namespace Amaterasu {
         keyRepeatFrequency.required = true;
         keyRepeatFrequency.min = "0";
         keyRepeatFrequency.step = "any";
+        const backButtonTimeout = input(
+          "input_back_button_timeout",
+          String(settings.values.back_button_timeout),
+          "number",
+        );
+        backButtonTimeout.required = true;
+        backButtonTimeout.min = String(minInputBackButtonTimeoutMs);
+        backButtonTimeout.max = String(maxInputBackButtonTimeoutMs);
+        backButtonTimeout.step = "1";
         const status = el(
           "p",
           settings.applied ? "muted" : "error",
@@ -1530,6 +1546,11 @@ namespace Amaterasu {
             keyRepeatFrequency,
             "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported.",
           ),
+          field(
+            "Back button timeout (milliseconds)",
+            backButtonTimeout,
+            "On Linux when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other backends do not inject gamepads.",
+          ),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -1548,6 +1569,7 @@ namespace Amaterasu {
                     keyRightAltToKeyWin.checked,
                     keyRepeatDelay.valueAsNumber,
                     keyRepeatFrequency.valueAsNumber,
+                    backButtonTimeout.valueAsNumber,
                   ),
                   expected_revision: settings.revision,
                 },

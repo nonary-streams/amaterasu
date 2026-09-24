@@ -971,6 +971,8 @@ var Amaterasu;
 (function (Amaterasu) {
     const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
     const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
+    const minInputBackButtonTimeoutMs = -0x8000_0000;
+    const maxInputBackButtonTimeoutMs = 0x7fff_ffff;
     const maxHistoryLimit = 0x7fff_ffff;
     function parseHistorySettings(enabled, ttlDays, sizeLimitMb) {
         if (typeof enabled !== "boolean" ||
@@ -998,7 +1000,7 @@ var Amaterasu;
         };
     }
     Amaterasu.parseAuthTokenLifetimes = parseAuthTokenLifetimes;
-    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency) {
+    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
             typeof highResolutionScrolling !== "boolean" ||
@@ -1008,8 +1010,11 @@ var Amaterasu;
             keyRepeatDelay < 0 ||
             keyRepeatDelay > maxInputKeyRepeatDelayMs ||
             !Number.isFinite(keyRepeatFrequency) ||
-            keyRepeatFrequency < 0)
-            throw new Error("Input policy values or key repeat settings are invalid.");
+            keyRepeatFrequency < 0 ||
+            !Number.isSafeInteger(backButtonTimeout) ||
+            backButtonTimeout < minInputBackButtonTimeoutMs ||
+            backButtonTimeout > maxInputBackButtonTimeoutMs)
+            throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
         return {
             keyboard,
             mouse,
@@ -1018,6 +1023,7 @@ var Amaterasu;
             key_rightalt_to_key_win: keyRightAltToKeyWin,
             key_repeat_delay: keyRepeatDelay,
             key_repeat_frequency: keyRepeatFrequency,
+            back_button_timeout: backButtonTimeout,
         };
     }
     Amaterasu.parseInputPolicy = parseInputPolicy;
@@ -1998,17 +2004,22 @@ var Amaterasu;
                 keyRepeatFrequency.required = true;
                 keyRepeatFrequency.min = "0";
                 keyRepeatFrequency.step = "any";
+                const backButtonTimeout = Amaterasu.input("input_back_button_timeout", String(settings.values.back_button_timeout), "number");
+                backButtonTimeout.required = true;
+                backButtonTimeout.min = String(minInputBackButtonTimeoutMs);
+                backButtonTimeout.max = String(maxInputBackButtonTimeoutMs);
+                backButtonTimeout.step = "1";
                 const status = Amaterasu.el("p", settings.applied ? "muted" : "error", inputPolicyStatusDescription(settings));
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other backends do not inject gamepads."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
                         try {
                             const updated = await context.api.post("input/settings_update", {
-                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber),
+                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber),
                                 expected_revision: settings.revision,
                             });
                             context.notify(updated.applied

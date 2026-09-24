@@ -236,6 +236,7 @@ namespace Amaterasu {
       key_rightalt_to_key_win: boolean;
       key_repeat_delay: number;
       key_repeat_frequency: number;
+      back_button_timeout: number;
     };
   }
   export interface HistorySettingsReply {
