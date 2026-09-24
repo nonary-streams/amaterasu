@@ -5,6 +5,15 @@
 control protocol with temporary owned leases. It does not install or modify a
 driver. Settings default to
 `{"enabled":false,"dd_activate_virtual_display":false,"dd_use_sunshine_virtual_display_driver":true}`.
+The permanent-monitor setting `dd_virtual_display_permanent_count` has a range
+of 0 through 4; the legacy name `dd_vdd_static_monitor_count` is also accepted,
+and the canonical name takes precedence if both are supplied. Integral values
+outside the range normalize to zero while remaining configured, matching
+Vibeshine. Non-integer and null values are rejected. Status reports numeric zero
+for an unset value and uses a separate configured flag to distinguish it from
+explicit zero.
+This setting does not change the eight-record limit for temporary leased
+monitors.
 `enabled` remains the module's service gate and is independent of the stable
 configuration setting names. When it is false, create returns `disabled` without
 touching the driver. When the module is enabled, create may manage a temporary
@@ -123,6 +132,10 @@ ambiguous creation, bounded exact cleanup, departure confirmation, and malformed
 lengths/counts/UTF-16. Persistent global configuration projection and per-client
 behavior remain pending; the defaults and module settings payload do not provide
 that configuration plumbing. The `dd_activate_virtual_display` stream-time
-topology behavior also remains pending. Run `cargo test -p
+topology behavior also remains pending. Permanent-monitor creation is unsupported:
+status reports the configured count and `permanent_monitor_runtime_supported:false`,
+but this module does not ask the driver to create permanent monitors. Product
+settings persistence and migration, and management edit authority remain pending.
+Windows driver qualification for permanent monitors has not been run. Run `cargo test -p
 amaterasu-virtual-display` and cross-check with `cargo check -p
 amaterasu-virtual-display --target x86_64-pc-windows-msvc`.

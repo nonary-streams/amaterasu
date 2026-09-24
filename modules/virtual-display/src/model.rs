@@ -1,13 +1,100 @@
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
+const MAX_PERMANENT_MONITOR_COUNT: u64 = 4;
+
 pub struct Settings {
     pub enabled: bool,
     pub dd_activate_virtual_display: bool,
     pub dd_use_sunshine_virtual_display_driver: bool,
+    /// None preserves the distinction between an omitted setting and explicit zero.
+    pub dd_virtual_display_permanent_count: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SettingsInput {
+    enabled: bool,
+    dd_activate_virtual_display: bool,
+    dd_use_sunshine_virtual_display_driver: bool,
+    dd_virtual_display_permanent_count: Present<Value>,
+    dd_vdd_static_monitor_count: Present<Value>,
+}
+
+impl Default for SettingsInput {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dd_activate_virtual_display: false,
+            dd_use_sunshine_virtual_display_driver: true,
+            dd_virtual_display_permanent_count: Present::default(),
+            dd_vdd_static_monitor_count: Present::default(),
+        }
+    }
+}
+
+struct Present<T>(Option<T>);
+
+impl<T> Default for Present<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Present<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(|value| Self(Some(value)))
+    }
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = SettingsInput::deserialize(deserializer)?;
+        let permanent_count = input
+            .dd_virtual_display_permanent_count
+            .0
+            .or(input.dd_vdd_static_monitor_count.0)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .map(|count| {
+                        if count <= MAX_PERMANENT_MONITOR_COUNT {
+                            count as u8
+                        } else {
+                            0
+                        }
+                    })
+                    .or_else(|| {
+                        value.as_i64().map(|count| {
+                            if (0..=MAX_PERMANENT_MONITOR_COUNT as i64).contains(&count) {
+                                count as u8
+                            } else {
+                                0
+                            }
+                        })
+                    })
+                    .ok_or_else(|| D::Error::custom("permanent monitor count must be an integer"))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            enabled: input.enabled,
+            dd_activate_virtual_display: input.dd_activate_virtual_display,
+            dd_use_sunshine_virtual_display_driver: input.dd_use_sunshine_virtual_display_driver,
+            dd_virtual_display_permanent_count: permanent_count,
+        })
+    }
 }
 
 impl Default for Settings {
@@ -16,6 +103,7 @@ impl Default for Settings {
             enabled: false,
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
+            dd_virtual_display_permanent_count: None,
         }
     }
 }

@@ -99,6 +99,7 @@ fn driver_selection_rejects_sunshine_driver_without_native_effects() {
         enabled: true,
         dd_activate_virtual_display: false,
         dd_use_sunshine_virtual_display_driver: false,
+        ..Settings::default()
     });
 
     assert_eq!(
@@ -160,6 +161,119 @@ fn settings_default_to_reference_values_and_accept_stable_names() {
     assert!(configured.enabled);
     assert!(configured.dd_activate_virtual_display);
     assert!(!configured.dd_use_sunshine_virtual_display_driver);
+    assert_eq!(configured.dd_virtual_display_permanent_count, None);
+}
+
+#[test]
+fn permanent_monitor_count_preserves_unset_and_explicit_zero() {
+    let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
+    assert_eq!(defaults.dd_virtual_display_permanent_count, None);
+
+    let explicit_zero = serde_json::from_value::<Settings>(json!({
+        "dd_virtual_display_permanent_count": 0
+    }))
+    .unwrap();
+    assert_eq!(explicit_zero.dd_virtual_display_permanent_count, Some(0));
+
+    let maximum = serde_json::from_value::<Settings>(json!({
+        "dd_virtual_display_permanent_count": 4
+    }))
+    .unwrap();
+    assert_eq!(maximum.dd_virtual_display_permanent_count, Some(4));
+}
+
+#[test]
+fn permanent_monitor_count_accepts_legacy_alias_and_canonical_wins() {
+    let alias = serde_json::from_value::<Settings>(json!({
+        "dd_vdd_static_monitor_count": 3
+    }))
+    .unwrap();
+    assert_eq!(alias.dd_virtual_display_permanent_count, Some(3));
+
+    let both = serde_json::from_value::<Settings>(json!({
+        "dd_virtual_display_permanent_count": 1,
+        "dd_vdd_static_monitor_count": 4
+    }))
+    .unwrap();
+    assert_eq!(both.dd_virtual_display_permanent_count, Some(1));
+
+    let canonical_wins_over_invalid_alias = serde_json::from_value::<Settings>(json!({
+        "dd_virtual_display_permanent_count": 2,
+        "dd_vdd_static_monitor_count": "ignored"
+    }))
+    .unwrap();
+    assert_eq!(
+        canonical_wins_over_invalid_alias.dd_virtual_display_permanent_count,
+        Some(2)
+    );
+
+    let canonical_out_of_range = serde_json::from_value::<Settings>(json!({
+        "dd_virtual_display_permanent_count": 5,
+        "dd_vdd_static_monitor_count": 2
+    }))
+    .unwrap();
+    assert_eq!(
+        canonical_out_of_range.dd_virtual_display_permanent_count,
+        Some(0)
+    );
+
+    let alias_out_of_range = serde_json::from_value::<Settings>(json!({
+        "dd_vdd_static_monitor_count": -1
+    }))
+    .unwrap();
+    assert_eq!(
+        alias_out_of_range.dd_virtual_display_permanent_count,
+        Some(0)
+    );
+}
+
+#[test]
+fn permanent_monitor_count_rejects_non_integer_values() {
+    for invalid in [json!(1.5), json!("2"), json!(null), json!(true)] {
+        assert!(
+            serde_json::from_value::<Settings>(json!({
+                "dd_virtual_display_permanent_count": invalid.clone()
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Settings>(json!({
+                "dd_vdd_static_monitor_count": invalid
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn status_reports_permanent_count_and_unsupported_runtime() {
+    let (mut unconfigured_manager, _) = setup_with(Settings::default());
+    let unconfigured_status =
+        unconfigured_manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(unconfigured_status["dd_virtual_display_permanent_count"], 0);
+    assert_eq!(
+        unconfigured_status["dd_virtual_display_permanent_count_configured"],
+        false
+    );
+    assert_eq!(
+        unconfigured_status["permanent_monitor_runtime_supported"],
+        false
+    );
+
+    let settings = serde_json::from_value::<Settings>(json!({
+        "dd_vdd_static_monitor_count": 2
+    }))
+    .unwrap();
+    let (mut manager, _) = setup_with(settings);
+    let status = manager.handle("alice", Operation::Status { identity: None });
+
+    assert_eq!(status["dd_virtual_display_permanent_count"], 2);
+    assert_eq!(
+        status["dd_virtual_display_permanent_count_configured"],
+        true
+    );
+    assert_eq!(status["permanent_monitor_runtime_supported"], false);
+    assert_eq!(status["permanent_monitor_runtime_state"], "unsupported");
 }
 
 #[test]
