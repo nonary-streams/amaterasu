@@ -266,6 +266,37 @@ fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_relo
 }
 
 #[test]
+fn input_policy_can_load_durable_settings_and_management_can_edit_them() {
+    assert!(INPUT.calls.contains(&"amaterasu.configuration/1"));
+    assert!(INPUT.dependencies.contains(&CONFIGURATION.id));
+    assert!(MANAGEMENT.calls.contains(&"amaterasu.input/1"));
+    assert!(MANAGEMENT.dependencies.contains(&INPUT.id));
+
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-input-settings-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+    for policy in [development, installer] {
+        assert!(
+            policy.principals[INPUT.id]
+                .call
+                .contains("amaterasu.configuration/1")
+        );
+        assert!(
+            policy.principals[MANAGEMENT.id]
+                .call
+                .contains("amaterasu.input/1")
+        );
+    }
+}
+
+#[test]
 fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
     assert!(STEAM.calls.contains(&"amaterasu.catalog/1"));
     assert!(STEAM.dependencies.contains(&CATALOG.id));

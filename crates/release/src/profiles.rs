@@ -242,11 +242,11 @@ const INPUT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.input",
     library: "amaterasu_input",
     provides: &["amaterasu.input/1"],
-    calls: &[],
+    calls: &["amaterasu.configuration/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
 };
 
 const INPUT_PROBE: ComponentDefinition = ComponentDefinition {
@@ -501,6 +501,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.configuration/1",
         "amaterasu.session/1",
         "amaterasu.application/1",
+        "amaterasu.input/1",
         "amaterasu.steam/1",
         "amaterasu.playnite/1",
         "amaterasu.diagnostics/1",
@@ -531,6 +532,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.configuration",
         "amaterasu.session",
         "amaterasu.application",
+        "amaterasu.input",
         "amaterasu.steam",
         "amaterasu.playnite",
         "amaterasu.diagnostics",
