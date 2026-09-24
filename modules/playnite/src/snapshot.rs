@@ -272,7 +272,7 @@ pub fn select_game_sources(
         .collect();
     installed.sort_by(|left, right| right.last_played.cmp(&left.last_played));
 
-    let included_categories = lower_set(&settings.sync_categories);
+    let included_categories = ascii_lower_set(&settings.sync_categories);
     let excluded_categories = ascii_lower_set(&settings.exclude_categories);
     let included_plugins = lower_set(&settings.sync_plugins);
     let excluded_plugins = lower_set(&settings.exclude_plugins);
@@ -327,7 +327,7 @@ pub fn select_game_sources(
         if game
             .categories
             .iter()
-            .any(|category| included_categories.contains(&category.to_lowercase()))
+            .any(|category| included_categories.contains(&category.to_ascii_lowercase()))
         {
             source_flags |= SOURCE_CATEGORY;
         }
@@ -659,6 +659,33 @@ mod tests {
                 .map(|game| game.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["three"]
+        );
+    }
+
+    #[test]
+    fn included_categories_use_ascii_case_insensitive_matching() {
+        let snapshot = Snapshot {
+            games: vec![
+                game("ascii-match", &["ARCADE"], "plugin", ""),
+                game("unicode-distinct", &["K"], "other", ""),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 0,
+            sync_categories: vec!["arcade".into(), "k".into()],
+            ..ProductSettings::default()
+        };
+
+        let selected = select_games(&snapshot, &settings, 0);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ascii-match"]
         );
     }
 
