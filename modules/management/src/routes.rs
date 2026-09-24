@@ -90,6 +90,7 @@ pub fn resolve(path: &str) -> Option<Route> {
             Some("application.terminate"),
         ),
         ("steam", "list") => ("amaterasu.steam/1", "list", Some("steam.read")),
+        ("steam", "artwork_read") => ("amaterasu.steam/1", "artwork_read", Some("steam.read")),
         ("steam", "status") => ("amaterasu.steam/1", "status", Some("steam.read")),
         ("steam", "refresh") => ("amaterasu.steam/1", "refresh", Some("steam.refresh")),
         ("steam", "settings") => (
@@ -650,6 +651,60 @@ mod tests {
             });
             assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
         }
+        for capture in [
+            serde_json::Value::Null,
+            serde_json::json!("auto"),
+            serde_json::json!("ddx"),
+            serde_json::json!("wgc"),
+            serde_json::json!("wgcc"),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "capture":capture,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for capture in [
+            serde_json::json!("dxgi"),
+            serde_json::json!("WGC"),
+            serde_json::json!(true),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "capture":capture,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
+        }
+        for size in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(16),
+            serde_json::json!(20),
+            serde_json::json!(32),
+            serde_json::json!(64),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room", "port":47989, "expected_revision":2,
+                "video_max_batch_size_kb":size,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for size in [
+            serde_json::json!(-1),
+            serde_json::json!(65),
+            serde_json::json!(16.5),
+            serde_json::json!("16"),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room", "port":47989, "expected_revision":2,
+                "video_max_batch_size_kb":size,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
+        }
         for output_name in [
             serde_json::json!(" "),
             serde_json::json!(" DISPLAY1"),
@@ -771,6 +826,28 @@ mod tests {
                 payload(update, &serde_json::to_vec(&invalid).unwrap()).is_err(),
                 "accepted malformed Steam settings payload: {invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn steam_artwork_route_is_read_scoped_and_accepts_only_a_bounded_cursor() {
+        let route = resolve("/v1/steam/artwork_read").unwrap();
+        assert_eq!(route.service, "amaterasu.steam/1");
+        assert_eq!(route.action, "artwork_read");
+        assert_eq!(route.scope, Some("steam.read"));
+        let valid =
+            serde_json::json!({"app_id":42,"revision":"18446744073709551615","offset":8192});
+        let forwarded = payload(route, &serde_json::to_vec(&valid).unwrap()).unwrap();
+        assert_eq!(forwarded["action"], "artwork_read");
+        for invalid in [
+            serde_json::json!({"app_id":0,"revision":"1","offset":0}),
+            serde_json::json!({"app_id":4294967296_u64,"revision":"1","offset":0}),
+            serde_json::json!({"app_id":42,"revision":"../art","offset":0}),
+            serde_json::json!({"app_id":42,"revision":"1","offset":1}),
+            serde_json::json!({"app_id":42,"revision":"1","offset":8*1024*1024+8192}),
+            serde_json::json!({"app_id":42,"revision":"1","offset":0,"path":"C:\\other.png"}),
+        ] {
+            assert!(payload(route, &serde_json::to_vec(&invalid).unwrap()).is_err());
         }
     }
 

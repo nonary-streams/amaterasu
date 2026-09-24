@@ -156,6 +156,22 @@ namespace Amaterasu {
     return value;
   }
 
+  export function parseCaptureSelection(value: string): NvhttpSettings["configured_capture"] {
+    if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc")
+      return value;
+    throw new Error("Choose Automatic, Desktop Duplication, or a Windows Graphics Capture mode.");
+  }
+
+  export function parseVideoMaxBatchSize(value: string): number | null {
+    if (value.trim() === "") return null;
+    if (!/^(0|[1-9][0-9]*)$/.test(value))
+      throw new Error("Video batch size must be a whole number from 0 to 64 KiB.");
+    const size = Number(value);
+    if (!Number.isSafeInteger(size) || size > 64)
+      throw new Error("Video batch size must be a whole number from 0 to 64 KiB.");
+    return size;
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -333,6 +349,17 @@ namespace Amaterasu {
       typeof values.auto_sync !== "boolean" ||
       typeof values.sync_all_installed !== "boolean" ||
       typeof values.autosync_remove_uninstalled !== "boolean" ||
+      typeof values.autosync_require_replacement !== "boolean" ||
+      typeof values.focus_exit_on_first !== "boolean" ||
+      !Number.isSafeInteger(values.autosync_delete_after_days) ||
+      values.autosync_delete_after_days < 0 ||
+      values.autosync_delete_after_days > 2_147_483_647 ||
+      !Number.isSafeInteger(values.focus_attempts) ||
+      values.focus_attempts < 0 ||
+      values.focus_attempts > 2_147_483_647 ||
+      !Number.isSafeInteger(values.focus_timeout_secs) ||
+      values.focus_timeout_secs < 0 ||
+      values.focus_timeout_secs > 2_147_483_647 ||
       !Number.isSafeInteger(values.recent_games) ||
       values.recent_games < 0 ||
       values.recent_games > 10_000 ||
@@ -346,6 +373,11 @@ namespace Amaterasu {
       auto_sync: values.auto_sync,
       sync_all_installed: values.sync_all_installed,
       autosync_remove_uninstalled: values.autosync_remove_uninstalled,
+      autosync_delete_after_days: values.autosync_delete_after_days,
+      autosync_require_replacement: values.autosync_require_replacement,
+      focus_attempts: values.focus_attempts,
+      focus_timeout_secs: values.focus_timeout_secs,
+      focus_exit_on_first: values.focus_exit_on_first,
       recent_games: values.recent_games,
       recent_max_age_days: values.recent_max_age_days,
       sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -841,6 +873,41 @@ namespace Amaterasu {
           "checkbox",
         );
         removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+        const deleteAfterDays = input(
+          "playnite_autosync_delete_after_days",
+          String(settings.values.autosync_delete_after_days),
+          "number",
+        );
+        deleteAfterDays.required = true;
+        deleteAfterDays.min = "0";
+        deleteAfterDays.max = "2147483647";
+        deleteAfterDays.step = "1";
+        const requireReplacement = input(
+          "playnite_autosync_require_replacement",
+          "",
+          "checkbox",
+        );
+        requireReplacement.checked = settings.values.autosync_require_replacement;
+        const focusAttempts = input(
+          "playnite_focus_attempts",
+          String(settings.values.focus_attempts),
+          "number",
+        );
+        focusAttempts.required = true;
+        focusAttempts.min = "0";
+        focusAttempts.max = "2147483647";
+        focusAttempts.step = "1";
+        const focusTimeoutSecs = input(
+          "playnite_focus_timeout_secs",
+          String(settings.values.focus_timeout_secs),
+          "number",
+        );
+        focusTimeoutSecs.required = true;
+        focusTimeoutSecs.min = "0";
+        focusTimeoutSecs.max = "2147483647";
+        focusTimeoutSecs.step = "1";
+        const focusExitOnFirst = input("playnite_focus_exit_on_first", "", "checkbox");
+        focusExitOnFirst.checked = settings.values.focus_exit_on_first;
         const recentGames = input(
           "playnite_recent_games",
           String(settings.values.recent_games),
@@ -937,6 +1004,31 @@ namespace Amaterasu {
             "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot.",
           ),
           field(
+            "Delete expired Playnite games after (days)",
+            deleteAfterDays,
+            "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup.",
+          ),
+          field(
+            "Require a replacement for recent-game cleanup",
+            requireReplacement,
+            "Limit removal of unselected recent imports to the count of newly selected games.",
+          ),
+          field(
+            "Focus attempts after game start",
+            focusAttempts,
+            "Try to focus the confirmed Playnite game process this many times. Zero disables focus.",
+          ),
+          field(
+            "Focus timeout (seconds)",
+            focusTimeoutSecs,
+            "Stop trying after this many seconds. Zero disables focus.",
+          ),
+          field(
+            "Stop focus attempts after first success",
+            focusExitOnFirst,
+            "When enabled, stop retrying once the game is confirmed in the foreground.",
+          ),
+          field(
             "Recent games to import",
             recentGames,
             "Maximum number of recent games (0–10000); zero disables recent-game selection.",
@@ -984,6 +1076,11 @@ namespace Amaterasu {
                 auto_sync: autoSync.checked,
                 sync_all_installed: syncAllInstalled.checked,
                 autosync_remove_uninstalled: removeUninstalled.checked,
+                autosync_delete_after_days: deleteAfterDays.valueAsNumber,
+                autosync_require_replacement: requireReplacement.checked,
+                focus_attempts: focusAttempts.valueAsNumber,
+                focus_timeout_secs: focusTimeoutSecs.valueAsNumber,
+                focus_exit_on_first: focusExitOnFirst.checked,
                 recent_games: recentGames.valueAsNumber,
                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                 sync_categories: parsePlayniteFilterList(
@@ -1336,6 +1433,20 @@ namespace Amaterasu {
         useStartupBindAddress.addEventListener("change", () => {
           bindAddress.disabled = useStartupBindAddress.checked;
         });
+        const capture = el("select");
+        capture.name = "capture";
+        const captureChoices: Array<[NvhttpSettings["configured_capture"], string]> = [
+          ["auto", "Automatic (startup capture backend)"],
+          ["ddx", "Desktop Duplication"],
+          ["wgc", "Windows Graphics Capture"],
+          ["wgcc", "Windows Graphics Capture, constant rate"],
+        ];
+        for (const [value, label] of captureChoices) {
+          const option = el("option", "", label);
+          option.value = value;
+          capture.append(option);
+        }
+        capture.value = settings.configured_capture;
         const outputName = el("select");
         outputName.name = "output_name";
         const automaticOutput = el("option", "", "Automatic (startup output)");
@@ -1377,6 +1488,17 @@ namespace Amaterasu {
         outputName.value = settings.configured_output_name ?? "";
         const streamAudio = input("stream_audio", "", "checkbox");
         streamAudio.checked = settings.stream_audio;
+        const videoBatchSize = input(
+          "video_max_batch_size_kb",
+          settings.configured_video_max_batch_size_kb === null
+            ? ""
+            : String(settings.configured_video_max_batch_size_kb),
+          "number",
+        );
+        videoBatchSize.min = "0";
+        videoBatchSize.max = "64";
+        videoBatchSize.step = "1";
+        videoBatchSize.placeholder = "Default (64)";
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1400,11 +1522,21 @@ namespace Amaterasu {
             "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
           ),
           field(
+            "Capture backend",
+            capture,
+            `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`,
+          ),
+          field(
             "Capture output",
             outputName,
             "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
           ),
           field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
+          field(
+            "Video batch size (KiB)",
+            videoBatchSize,
+            `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`,
+          ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           el(
             "p",
@@ -1428,8 +1560,10 @@ namespace Amaterasu {
               hostname: hostname.value,
               port: port.valueAsNumber,
               ...network,
+              capture: parseCaptureSelection(capture.value),
               output_name: parseOutputNameSelection(outputName.value),
               stream_audio: streamAudio.checked,
+              video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");

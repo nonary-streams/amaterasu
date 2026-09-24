@@ -1,4 +1,69 @@
 namespace Amaterasu {
+  interface SteamArtworkChunk {
+    ok: boolean;
+    app_id: number;
+    revision: string;
+    offset: number;
+    next_offset: number | null;
+    total_bytes: number;
+    mime_type: string;
+    data: string;
+  }
+
+  export async function readSteamArtwork(
+    api: Api,
+    reference: NonNullable<Entry["artwork"]>,
+  ): Promise<Blob> {
+    if (
+      reference.provider !== "steam" ||
+      !Number.isSafeInteger(reference.app_id) ||
+      reference.app_id < 1 ||
+      reference.app_id > 0xffff_ffff ||
+      !/^[0-9]{1,20}$/.test(reference.revision)
+    ) throw new Error("Invalid Steam artwork reference.");
+    let offset = 0;
+    let totalBytes: number | null = null;
+    let mimeType: string | null = null;
+    const chunks: ArrayBuffer[] = [];
+    while (true) {
+      const reply = await api.post<SteamArtworkChunk>("steam/artwork_read", {
+        app_id: reference.app_id,
+        revision: reference.revision,
+        offset,
+      });
+      if (
+        reply.ok !== true ||
+        reply.app_id !== reference.app_id ||
+        reply.revision !== reference.revision ||
+        reply.offset !== offset ||
+        !Number.isSafeInteger(reply.total_bytes) ||
+        reply.total_bytes < 1 ||
+        reply.total_bytes > 8 * 1024 * 1024 ||
+        !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
+        typeof reply.data !== "string" ||
+        (totalBytes !== null && totalBytes !== reply.total_bytes) ||
+        (mimeType !== null && mimeType !== reply.mime_type)
+      ) throw new Error("Steam artwork changed during transfer.");
+      totalBytes = reply.total_bytes;
+      mimeType = reply.mime_type;
+      const decoded = atob(reply.data);
+      if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
+        throw new Error("Invalid Steam artwork chunk.");
+      const bytes = new Uint8Array(decoded.length);
+      for (let index = 0; index < decoded.length; index++)
+        bytes[index] = decoded.charCodeAt(index);
+      chunks.push(bytes.buffer);
+      const end = offset + decoded.length;
+      if (reply.next_offset === null) {
+        if (end !== totalBytes) throw new Error("Incomplete Steam artwork transfer.");
+        return new Blob(chunks, { type: mimeType });
+      }
+      if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
+        throw new Error("Invalid Steam artwork cursor.");
+      offset = end;
+    }
+  }
+
   function audioOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
     const select = el("select");
     select.name = name;
@@ -151,21 +216,36 @@ namespace Amaterasu {
       );
       remove.disabled = !api.allows("catalog.write");
       actions.push(remove);
+      const art = el(
+        "div",
+        "app-art",
+        el("span", "", row.entry.name.slice(0, 2).toUpperCase()),
+        badge(
+          row.entry.launch.kind === "executable"
+            ? "Executable"
+            : providerLaunch
+              ? "Playnite"
+              : "Application",
+        ),
+      );
+      if (row.entry.artwork?.provider === "steam" && api.allows("steam.read")) {
+        void readSteamArtwork(api, row.entry.artwork).then((blob) => {
+          if (!content.isConnected || !art.isConnected) return;
+          const url = URL.createObjectURL(blob);
+          const image = el("img") as HTMLImageElement;
+          image.alt = "";
+          image.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+          image.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
+          image.src = url;
+          art.prepend(image);
+        }).catch(() => {
+          // Keep the initials when local artwork is absent or changes mid-read.
+        });
+      }
       return el(
         "article",
         "app-card",
-        el(
-          "div",
-          "app-art",
-          el("span", "", row.entry.name.slice(0, 2).toUpperCase()),
-          badge(
-            row.entry.launch.kind === "executable"
-              ? "Executable"
-              : providerLaunch
-                ? "Playnite"
-                : "Application",
-          ),
-        ),
+        art,
         el(
           "div",
           "app-details",
@@ -388,6 +468,10 @@ namespace Amaterasu {
       "stream_audio",
       entry?.config_overrides?.stream_audio,
     );
+    const steamId = input("steam_id", entry?.steam_id ?? "");
+    steamId.maxLength = 10;
+    const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
+    steamInstallDir.maxLength = 1024;
     const processPolicy = el(
       "div",
       "form-grid",
@@ -424,6 +508,8 @@ namespace Amaterasu {
       field("Absolute application path", path),
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
+      field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking."),
+      field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it."),
       executable,
     );
     return form;

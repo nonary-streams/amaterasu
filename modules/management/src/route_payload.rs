@@ -104,6 +104,30 @@ fn authentication_token(value: &str) -> Result<(), &'static str> {
 fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
+        "artwork_read" => {
+            fields(object, &["app_id", "revision", "offset"], &[])?;
+            if !object
+                .get("app_id")
+                .and_then(Value::as_u64)
+                .is_some_and(|app_id| app_id > 0 && app_id <= u64::from(u32::MAX))
+                || !object
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .is_some_and(|revision| {
+                        !revision.is_empty()
+                            && revision.len() <= 20
+                            && revision.bytes().all(|byte| byte.is_ascii_digit())
+                            && revision.parse::<u64>().is_ok()
+                    })
+                || !object
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|offset| offset <= 8 * 1024 * 1024 && offset % 8192 == 0)
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "settings_update" => {
             fields(
                 object,
@@ -319,6 +343,11 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
                 &[
                     "auto_sync",
                     "autosync_remove_uninstalled",
+                    "autosync_delete_after_days",
+                    "autosync_require_replacement",
+                    "focus_attempts",
+                    "focus_timeout_secs",
+                    "focus_exit_on_first",
                     "sync_all_installed",
                     "recent_games",
                     "recent_max_age_days",
@@ -340,6 +369,8 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
             for field in [
                 "auto_sync",
                 "autosync_remove_uninstalled",
+                "autosync_require_replacement",
+                "focus_exit_on_first",
                 "sync_all_installed",
             ] {
                 if object
@@ -350,6 +381,9 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
                 }
             }
             for (field, maximum) in [
+                ("autosync_delete_after_days", 2_147_483_647_u64),
+                ("focus_attempts", 2_147_483_647_u64),
+                ("focus_timeout_secs", 2_147_483_647_u64),
                 ("recent_games", 10_000_u64),
                 ("recent_max_age_days", 36_500_u64),
             ] {
@@ -487,7 +521,13 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
     fields(
         entry,
         &["name", "launch"],
-        &["description", "tags", "config_overrides"],
+        &[
+            "description",
+            "tags",
+            "config_overrides",
+            "steam_id",
+            "steam_install_dir",
+        ],
     )?;
     let name = text(entry, "name")?;
     if name.trim().is_empty() || name.len() > 160 || name.chars().any(char::is_control) {
@@ -514,7 +554,52 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
     if let Some(overrides) = entry.get("config_overrides") {
         catalog_config_overrides(overrides)?;
     }
+    if let Some(steam_id) = entry.get("steam_id") {
+        let steam_id = steam_id.as_str().ok_or(INVALID)?;
+        let app_id = steam_id.parse::<u32>().map_err(|_| INVALID)?;
+        if app_id == 0 || app_id.to_string() != steam_id {
+            return Err(INVALID);
+        }
+    }
+    if let Some(install_dir) = entry.get("steam_install_dir") {
+        let install_dir = install_dir.as_str().ok_or(INVALID)?;
+        if !valid_steam_install_dir(install_dir) {
+            return Err(INVALID);
+        }
+    }
     catalog_launch(entry.get("launch").ok_or(INVALID)?)
+}
+
+fn valid_steam_install_dir(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > 1024
+        || path.trim() != path
+        || path.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    let (segments, minimum) = if let Some(unc) = normalized.strip_prefix("//") {
+        (unc, 3)
+    } else if normalized.len() >= 3
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+        && normalized.as_bytes()[2] == b'/'
+    {
+        (&normalized[3..], 1)
+    } else if path.starts_with('/') {
+        (&normalized[1..], 1)
+    } else {
+        return false;
+    };
+    let segments: Vec<_> = segments
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    segments.len() >= minimum
+        && segments
+            .iter()
+            .all(|segment| *segment != "." && *segment != "..")
 }
 
 fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
@@ -795,6 +880,8 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "bind_address",
                     "output_name",
                     "stream_audio",
+                    "capture",
+                    "video_max_batch_size_kb",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -845,6 +932,19 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                 .get("stream_audio")
                 .is_some_and(|value| value.as_bool().is_none())
             {
+                return Err(INVALID);
+            }
+            if let Some(capture) = object.get("capture") {
+                match capture {
+                    Value::Null => {}
+                    Value::String(value)
+                        if matches!(value.as_str(), "auto" | "ddx" | "wgc" | "wgcc") => {}
+                    _ => return Err(INVALID),
+                }
+            }
+            if object.get("video_max_batch_size_kb").is_some_and(|value| {
+                !value.is_null() && !value.as_u64().is_some_and(|size| size <= 64)
+            }) {
                 return Err(INVALID);
             }
             Ok(())
@@ -1175,6 +1275,11 @@ mod playnite_tests {
             "expected_revision":7,
             "sync_all_installed":true,
             "autosync_remove_uninstalled":false,
+            "autosync_delete_after_days":2147483647,
+            "autosync_require_replacement":true,
+            "focus_attempts":2147483647,
+            "focus_timeout_secs":2147483647,
+            "focus_exit_on_first":false,
             "recent_games":0,
             "recent_max_age_days":36500,
             "sync_categories":["Action", "RPG"],
@@ -1193,6 +1298,12 @@ mod playnite_tests {
             serde_json::json!({"enabled":false,"expected_revision":-1}),
             serde_json::json!({"enabled":false,"expected_revision":0,"auto_sync":"true"}),
             serde_json::json!({"enabled":false,"expected_revision":0,"autosync_remove_uninstalled":"false"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"autosync_delete_after_days":2147483648_u64}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"autosync_delete_after_days":-1}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"autosync_require_replacement":"true"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"focus_attempts":2147483648_u64}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"focus_timeout_secs":-1}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"focus_exit_on_first":"false"}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_games":10001}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_max_age_days":36501}),
             serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":"Action"}),
@@ -1240,6 +1351,8 @@ mod catalog_tests {
             "expected_revision": 4,
             "entry": {
                 "name": "Configured app",
+                "steam_id": "4294967295",
+                "steam_install_dir": "C:\\Games\\Configured",
                 "config_overrides": {"fec_percentage": 255, "stream_audio": false},
                 "launch": {
                     "kind": "executable",
@@ -1310,6 +1423,14 @@ mod catalog_tests {
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":256},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":"37"},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"stream_audio":"false"},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"0","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"0001","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"4294967296","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_install_dir":"/","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_install_dir":"C:\\\\","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_install_dir":"\\game","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_install_dir":"/opt/../games","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_install_dir":"\\\\server\\share","launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":"false"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":true,"auto-detach":false}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","exit-timeout":301}}}),

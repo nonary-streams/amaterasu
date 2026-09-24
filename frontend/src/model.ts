@@ -40,6 +40,39 @@ namespace Amaterasu {
     throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
   }
 
+  export function parseSteamId(value: string): string | null {
+    if (value === "") return null;
+    if (!/^[1-9][0-9]*$/.test(value) || value.length > 10 || Number(value) > 0xffff_ffff)
+      throw new Error("Steam app ID must be a canonical nonzero 32-bit decimal number.");
+    return value;
+  }
+
+  export function parseSteamInstallDir(value: string): string | null {
+    if (value === "") return null;
+    if (
+      value.trim() !== value ||
+      new TextEncoder().encode(value).length > 1024 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(value)
+    ) throw new Error("Steam install directory must be a printable absolute path of at most 1024 UTF-8 bytes.");
+    const normalized = value.replace(/\\/g, "/");
+    let components: string[];
+    if (normalized.startsWith("//")) {
+      components = normalized.slice(2).split("/").filter(Boolean);
+      if (components.length < 3) throw new Error("Steam UNC install directory needs a game subdirectory.");
+    } else if (/^[A-Za-z]:\//.test(normalized)) {
+      components = normalized.slice(3).split("/").filter(Boolean);
+      if (components.length < 1) throw new Error("Steam install directory cannot be a drive root.");
+    } else if (value.startsWith("/") && normalized.startsWith("/")) {
+      components = normalized.slice(1).split("/").filter(Boolean);
+      if (components.length < 1) throw new Error("Steam install directory cannot be a filesystem root.");
+    } else {
+      throw new Error("Steam install directory must be an absolute path.");
+    }
+    if (components.some((part) => part === "." || part === ".."))
+      throw new Error("Steam install directory cannot contain dot segments.");
+    return value;
+  }
+
   export function parseDetachedCommands(value: string): string[] {
     const commands = value
       .split(/\r?\n/)
@@ -95,6 +128,8 @@ namespace Amaterasu {
     const kind = text("kind") === "executable" ? "executable" : "application";
     const fecPercentage = parseFecOverride(text("fec_percentage"));
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
+    const steamId = parseSteamId(String(data.get("steam_id") ?? ""));
+    const steamInstallDir = parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
       fecPercentage === null && streamAudio === null
         ? undefined
@@ -129,6 +164,8 @@ namespace Amaterasu {
         .map((tag) => tag.trim())
         .filter(Boolean),
       launch,
+      ...(steamId === null ? {} : { steam_id: steamId }),
+      ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
       ...(configOverrides ? { config_overrides: configOverrides } : {}),
     };
   }

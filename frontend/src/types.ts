@@ -45,6 +45,9 @@ namespace Amaterasu {
     description: string;
     tags: string[];
     launch: Launch;
+    artwork?: { provider: "steam"; app_id: number; revision: string };
+    steam_id?: string;
+    steam_install_dir?: string;
     config_overrides?: {
       fec_percentage?: number;
       stream_audio?: boolean;
@@ -83,7 +86,11 @@ namespace Amaterasu {
     configured_bind_address: string | null;
     configured_output_name: string | null;
     effective_output_name: string | null;
+    configured_capture: "auto" | "ddx" | "wgc" | "wgcc";
     capture_provider: "dxgi" | "wgc" | null;
+    configured_video_max_batch_size_kb: number | null;
+    effective_video_max_batch_size_kb: number;
+    video_batch_size_fallback: boolean;
     stream_audio: boolean;
     http_addresses: string[] | null;
     https_addresses: string[] | null;
@@ -149,6 +156,11 @@ namespace Amaterasu {
       auto_sync: boolean;
       sync_all_installed: boolean;
       autosync_remove_uninstalled: boolean;
+      autosync_delete_after_days: number;
+      autosync_require_replacement: boolean;
+      focus_attempts: number;
+      focus_timeout_secs: number;
+      focus_exit_on_first: boolean;
       recent_games: number;
       recent_max_age_days: number;
       sync_categories: string[];

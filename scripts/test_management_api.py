@@ -2,6 +2,7 @@
 """Real HTTP/authentication/catalog integration through the persistent native host."""
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -20,6 +21,9 @@ from test_platform_modules import PlatformHarness, configure_steam_fixture
 ORIGIN = "http://127.0.0.1:3000"
 PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
+STEAM_ARTWORK = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="
+)
 
 
 def available_moonlight_port_pair():
@@ -360,9 +364,12 @@ def test_auth_and_crud(console, api):
     status, catalog, _ = api.post("/v1/catalog/list", token=administrator)
     assert status == 200 and catalog["ok"], catalog
     game_path = r"C:\Games\HTTPGame\game.exe" if os.name == "nt" else "/opt/games/http-game"
+    steam_install_dir = r"C:\Games\HTTPGame" if os.name == "nt" else "/opt/games/http-game"
     prepare_path = r"C:\Tools\prepare.exe" if os.name == "nt" else "/opt/tools/prepare"
     entry = {
         "name": "HTTP Game",
+        "steam_id": "730",
+        "steam_install_dir": steam_install_dir,
         "config_overrides": {"fec_percentage": 37, "stream_audio": False},
         "launch": {
             "kind": "executable",
@@ -379,11 +386,18 @@ def test_auth_and_crud(console, api):
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
     assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False}, found
+    assert found["entry"]["steam_id"] == "730", found
+    assert found["entry"]["steam_install_dir"] == steam_install_dir, found
     assert found["entry"]["launch"]["auto_detach"] is False, found
     assert found["entry"]["launch"]["wait_all"] is True, found
     assert found["entry"]["launch"]["exit_timeout_seconds"] == 0, found
     assert found["entry"]["launch"]["detached"] == ["helper --ordered"], found
     assert found["entry"]["launch"]["preparation"][0]["run"]["executable"] == prepare_path, found
+    for invalid_metadata in ({"steam_id": "000730"}, {"steam_install_dir": "C:\\" if os.name == "nt" else "/"}):
+        status, rejected, _ = api.post("/v1/catalog/create", {
+            "entry": {**entry, **invalid_metadata}, "expected_revision": created["revision"],
+        }, administrator)
+        assert status == 400 and not rejected["ok"], rejected
     updated_entry = {
         **entry,
         "name": "Renamed",
@@ -401,6 +415,8 @@ def test_auth_and_crud(console, api):
     assert conflict["error"]["code"] == "revision_conflict", conflict
     status, saved_catalog_entry, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
+    assert saved_catalog_entry["entry"]["steam_id"] == "730", saved_catalog_entry
+    assert saved_catalog_entry["entry"]["steam_install_dir"] == steam_install_dir, saved_catalog_entry
     assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False}, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
@@ -428,6 +444,10 @@ def test_auth_and_crud(console, api):
     assert host_settings["configured_address_family"] is None, host_settings
     assert host_settings["configured_bind_address"] is None, host_settings
     assert host_settings["configured_output_name"] is None, host_settings
+    assert host_settings["configured_capture"] == "auto", host_settings
+    assert host_settings["configured_video_max_batch_size_kb"] is None, host_settings
+    assert host_settings["effective_video_max_batch_size_kb"] == 64, host_settings
+    assert host_settings["video_batch_size_fallback"] is False, host_settings
     assert host_settings["stream_audio"] is True, host_settings
     assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
     assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
@@ -460,12 +480,18 @@ def test_auth_and_crud(console, api):
         "hostname": "Living Room & Games",
         "port": explicit_blank_host["port"],
         "output_name": "test-output",
+        "capture": "wgcc",
+        "video_max_batch_size_kb": 20,
         "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
     }, administrator)
     assert status == 200 and renamed_host["hostname"] == "Living Room & Games", renamed_host
     assert renamed_host["configured_output_name"] == "test-output", renamed_host
     assert renamed_host["effective_output_name"] == "test-output", renamed_host
+    assert renamed_host["configured_capture"] == "wgcc", renamed_host
+    assert renamed_host["configured_video_max_batch_size_kb"] == 20, renamed_host
+    assert renamed_host["effective_video_max_batch_size_kb"] == 64, renamed_host
+    assert renamed_host["video_batch_size_fallback"] is True, renamed_host
     assert renamed_host["stream_audio"] is False, renamed_host
     assert renamed_host["configured_address_family"] == "ipv4", renamed_host
     assert renamed_host["configured_bind_address"] == "", renamed_host
@@ -484,6 +510,16 @@ def test_auth_and_crud(console, api):
         "expected_revision": renamed_host["revision"],
         "output_name": " ",
     }, administrator)[0] == 400
+    assert api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games", "port": renamed_host["port"],
+        "expected_revision": renamed_host["revision"],
+        "capture": "dxgi",
+    }, administrator)[0] == 400
+    assert api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games", "port": renamed_host["port"],
+        "expected_revision": renamed_host["revision"],
+        "video_max_batch_size_kb": 65,
+    }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
         connection.request("GET", "/serverinfo")
@@ -498,6 +534,8 @@ def test_auth_and_crud(console, api):
     }, administrator)
     assert status == 200 and moved_host["ok"], moved_host
     assert moved_host["configured_output_name"] == "test-output", moved_host
+    assert moved_host["configured_capture"] == "wgcc", moved_host
+    assert moved_host["configured_video_max_batch_size_kb"] == 20, moved_host
     assert moved_host["stream_audio"] is False, moved_host
     assert moved_host["active_http_port"] == moved_port, moved_host
     assert moved_host["active_https_port"] == moved_port - 5, moved_host
@@ -657,6 +695,18 @@ def test_auth_and_crud(console, api):
         time.sleep(0.02)
     assert len(games["games"]) == 1 and games["games"][0]["stable_id"] == "steam:730", games
     assert games["games"][0]["installed"], games
+    artwork_revision = games["games"][0].get("artwork_revision")
+    assert isinstance(artwork_revision, str) and artwork_revision.isdecimal(), games
+    status, artwork, _ = api.post("/v1/steam/artwork_read", {
+        "app_id": 730, "revision": artwork_revision, "offset": 0,
+    }, administrator)
+    assert status == 200 and artwork["ok"], artwork
+    assert artwork["next_offset"] is None and artwork["total_bytes"] == len(STEAM_ARTWORK), artwork
+    assert artwork["mime_type"] == "image/png", artwork
+    assert base64.b64decode(artwork["data"]) == STEAM_ARTWORK, artwork
+    assert api.post("/v1/steam/artwork_read", {
+        "app_id": 730, "revision": artwork_revision, "offset": 1,
+    }, administrator)[0] == 400
     deadline = time.monotonic() + 5
     while True:
         status, lutris_status, _ = api.post("/v1/lutris/status", token=administrator)
@@ -730,6 +780,11 @@ def test_auth_and_crud(console, api):
         "auto_sync": True,
         "sync_all_installed": False,
         "autosync_remove_uninstalled": True,
+        "autosync_delete_after_days": 14,
+        "autosync_require_replacement": True,
+        "focus_attempts": 3,
+        "focus_timeout_secs": 15,
+        "focus_exit_on_first": False,
         "recent_games": 10,
         "recent_max_age_days": 30,
         "sync_categories": [],
@@ -743,6 +798,11 @@ def test_auth_and_crud(console, api):
         "auto_sync": False,
         "sync_all_installed": True,
         "autosync_remove_uninstalled": False,
+        "autosync_delete_after_days": 0,
+        "autosync_require_replacement": False,
+        "focus_attempts": 5,
+        "focus_timeout_secs": 20,
+        "focus_exit_on_first": True,
         "recent_games": 25,
         "recent_max_age_days": 45,
         "sync_categories": ["Action", "RPG"],
@@ -862,6 +922,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="amaterasu-management-") as temporary:
         harness = PlatformHarness(Path(temporary))
         configure_steam_fixture(harness)
+        artwork_path = harness.directory / "steam-library" / "appcache" / "librarycache" / "730_library_600x900_2x.png"
+        artwork_path.parent.mkdir(parents=True)
+        artwork_path.write_bytes(STEAM_ARTWORK)
         initial_port = available_moonlight_port_pair()
         bootstrap_path = harness.root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
@@ -913,6 +976,10 @@ def main():
             assert host_settings["configured_address_family"] == "ipv4", host_settings
             assert host_settings["configured_bind_address"] == "", host_settings
             assert host_settings["configured_output_name"] == "test-output", host_settings
+            assert host_settings["configured_capture"] == "wgcc", host_settings
+            assert host_settings["configured_video_max_batch_size_kb"] == 20, host_settings
+            assert host_settings["effective_video_max_batch_size_kb"] == 64, host_settings
+            assert host_settings["video_batch_size_fallback"] is True, host_settings
             assert host_settings["stream_audio"] is False, host_settings
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
@@ -960,6 +1027,8 @@ def main():
                 "hostname": "Living Room & Games", "port": moved_port,
                 "address_family": None, "bind_address": None,
                 "output_name": "",
+                "capture": None,
+                "video_max_batch_size_kb": None,
                 "stream_audio": True,
                 "expected_revision": reset_revision,
             }, relogged["bearer"])
@@ -967,6 +1036,10 @@ def main():
             assert reset_host["configured_address_family"] is None, reset_host
             assert reset_host["configured_bind_address"] is None, reset_host
             assert reset_host["configured_output_name"] is None, reset_host
+            assert reset_host["configured_capture"] == "auto", reset_host
+            assert reset_host["configured_video_max_batch_size_kb"] is None, reset_host
+            assert reset_host["effective_video_max_batch_size_kb"] == 64, reset_host
+            assert reset_host["video_batch_size_fallback"] is False, reset_host
             assert reset_host["stream_audio"] is True, reset_host
             assert reset_host["address_family"] == "ipv4", reset_host
             assert reset_host["bind_address"] == "127.0.0.1", reset_host
@@ -975,10 +1048,10 @@ def main():
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
-    print("Moonlight hostname/port live rebind, capture output and audio policy persistence,")
+    print("Moonlight hostname/port live rebind, capture backend/output and audio policy persistence,")
     print("certificate-bound FEC/audio override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
-    print("Steam settings CAS, discovery and restart persistence,")
+    print("Steam settings CAS, discovery, authorized artwork retrieval and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy and restart persistence,")
     print("session restart invalidation,")

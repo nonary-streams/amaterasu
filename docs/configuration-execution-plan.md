@@ -49,9 +49,18 @@ Planned By: GPT-6 Astra High
 Steam catalog reconciliation now owns explicit exclusions, app type selection,
 recent-play selection, and the policy for retaining stale entries in all-game
 sync. It reads local app metadata and play history before changing the catalog;
-an incomplete scan leaves the prior catalog intact. Artwork, richer reference
-metadata, and platform-specific discovery and launch behavior still need
-verification. The Steam IDs remain pending until those effects are covered.
+an incomplete scan leaves the prior catalog intact. Remote artwork, richer
+reference metadata, and platform-specific discovery and launch behavior still
+need verification. The Steam IDs remain pending until those effects are covered.
+
+The Steam importer now discovers bounded local artwork and persists opaque
+provider references instead of filesystem paths. The signed `steam.read`
+endpoint serves fixed-size image chunks; the catalog editor assembles and
+displays those chunks with revision and size checks. This covers local artwork
+discovery and browser display, while remote artwork sources and platform
+qualification remain pending. Manual catalog entries can preserve explicit
+Steam ID and install-directory metadata, but live process association still
+needs its runtime and platform gates.
 
 The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
 IPv4 and IPv6 listeners can coexist where the startup policy requests both.
@@ -91,6 +100,14 @@ launch; explicit WGC modes fail when that provider is unavailable. The `auto`
 mode retains the startup provider. Vibeshine's virtual-display/game-context
 selection for `auto`, per-app/client capture overrides, and Linux/macOS capture
 support remain pending.
+
+The media transport now caps each software video send batch to a selected
+16, 32, or 64 KiB frame allowance. Product document v7 persists the nullable
+host setting, migrates older documents to the 64 KiB default, and snapshots
+the effective value through RTSP and stream session on launch. The signed
+editor preserves raw 0..64 selections while reporting the effective fallback.
+Platform UDP segmentation offload and its compatibility behavior remain
+pending.
 
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when

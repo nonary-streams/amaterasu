@@ -94,6 +94,11 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     auto_sync: false,
     sync_all_installed: true,
     autosync_remove_uninstalled: false,
+    autosync_delete_after_days: 14,
+    autosync_require_replacement: true,
+    focus_attempts: 3,
+    focus_timeout_secs: 15,
+    focus_exit_on_first: false,
     recent_games: 0,
     recent_max_age_days: 36500,
     sync_categories: ["Action"],
@@ -129,6 +134,14 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     { ...values, recent_max_age_days: 36501 },
     { ...values, enabled: "true" },
     { ...values, autosync_remove_uninstalled: "false" },
+    { ...values, autosync_delete_after_days: -1 },
+    { ...values, autosync_delete_after_days: 2_147_483_648 },
+    { ...values, autosync_delete_after_days: 1.5 },
+    { ...values, autosync_require_replacement: "true" },
+    { ...values, focus_attempts: -1 },
+    { ...values, focus_attempts: 2_147_483_648 },
+    { ...values, focus_timeout_secs: 1.5 },
+    { ...values, focus_exit_on_first: "false" },
     { ...values, exclude_games: Array.from({ length: 256 }, (_, index) => `game-${index}-${"x".repeat(500)}`) },
   ]) {
     assert.throws(() => parseSettings(invalid));
@@ -214,6 +227,24 @@ test("capture output selection preserves exact IDs and automatic reset", () => {
   assert.equal(parse("DISPLAY1"), "DISPLAY1");
   assert.equal(parse("é".repeat(256)), "é".repeat(256));
   for (const invalid of [" ", " DISPLAY1", "DISPLAY1 ", "bad\nname", "é".repeat(257)])
+    assert.throws(() => parse(invalid));
+});
+
+test("capture backend selection accepts only the four supported modes", () => {
+  const parse = context.Amaterasu.parseCaptureSelection;
+  for (const mode of ["auto", "ddx", "wgc", "wgcc"])
+    assert.equal(parse(mode), mode);
+  for (const invalid of ["", "dxgi", "WGC", "wgcc ", "other"])
+    assert.throws(() => parse(invalid));
+});
+
+test("video batch size editor preserves default and bounded reference values", () => {
+  const parse = context.Amaterasu.parseVideoMaxBatchSize;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  "), null);
+  for (const size of [0, 16, 20, 32, 64])
+    assert.equal(parse(String(size)), size);
+  for (const invalid of ["-1", "65", "16.5", "016", "16 KB", "NaN"])
     assert.throws(() => parse(invalid));
 });
 

@@ -39,6 +39,46 @@ var Amaterasu;
         throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
     }
     Amaterasu.parseStreamAudioOverride = parseStreamAudioOverride;
+    function parseSteamId(value) {
+        if (value === "")
+            return null;
+        if (!/^[1-9][0-9]*$/.test(value) || value.length > 10 || Number(value) > 0xffff_ffff)
+            throw new Error("Steam app ID must be a canonical nonzero 32-bit decimal number.");
+        return value;
+    }
+    Amaterasu.parseSteamId = parseSteamId;
+    function parseSteamInstallDir(value) {
+        if (value === "")
+            return null;
+        if (value.trim() !== value ||
+            new TextEncoder().encode(value).length > 1024 ||
+            /[\u0000-\u001f\u007f-\u009f]/.test(value))
+            throw new Error("Steam install directory must be a printable absolute path of at most 1024 UTF-8 bytes.");
+        const normalized = value.replace(/\\/g, "/");
+        let components;
+        if (normalized.startsWith("//")) {
+            components = normalized.slice(2).split("/").filter(Boolean);
+            if (components.length < 3)
+                throw new Error("Steam UNC install directory needs a game subdirectory.");
+        }
+        else if (/^[A-Za-z]:\//.test(normalized)) {
+            components = normalized.slice(3).split("/").filter(Boolean);
+            if (components.length < 1)
+                throw new Error("Steam install directory cannot be a drive root.");
+        }
+        else if (value.startsWith("/") && normalized.startsWith("/")) {
+            components = normalized.slice(1).split("/").filter(Boolean);
+            if (components.length < 1)
+                throw new Error("Steam install directory cannot be a filesystem root.");
+        }
+        else {
+            throw new Error("Steam install directory must be an absolute path.");
+        }
+        if (components.some((part) => part === "." || part === ".."))
+            throw new Error("Steam install directory cannot contain dot segments.");
+        return value;
+    }
+    Amaterasu.parseSteamInstallDir = parseSteamInstallDir;
     function parseDetachedCommands(value) {
         const commands = value
             .split(/\r?\n/)
@@ -82,6 +122,8 @@ var Amaterasu;
         const kind = text("kind") === "executable" ? "executable" : "application";
         const fecPercentage = parseFecOverride(text("fec_percentage"));
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
+        const steamId = parseSteamId(String(data.get("steam_id") ?? ""));
+        const steamInstallDir = parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
         const configOverrides = fecPercentage === null && streamAudio === null
             ? undefined
             : {
@@ -114,6 +156,8 @@ var Amaterasu;
                 .map((tag) => tag.trim())
                 .filter(Boolean),
             launch,
+            ...(steamId === null ? {} : { steam_id: steamId }),
+            ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
             ...(configOverrides ? { config_overrides: configOverrides } : {}),
         };
     }
@@ -520,6 +564,56 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    async function readSteamArtwork(api, reference) {
+        if (reference.provider !== "steam" ||
+            !Number.isSafeInteger(reference.app_id) ||
+            reference.app_id < 1 ||
+            reference.app_id > 0xffff_ffff ||
+            !/^[0-9]{1,20}$/.test(reference.revision))
+            throw new Error("Invalid Steam artwork reference.");
+        let offset = 0;
+        let totalBytes = null;
+        let mimeType = null;
+        const chunks = [];
+        while (true) {
+            const reply = await api.post("steam/artwork_read", {
+                app_id: reference.app_id,
+                revision: reference.revision,
+                offset,
+            });
+            if (reply.ok !== true ||
+                reply.app_id !== reference.app_id ||
+                reply.revision !== reference.revision ||
+                reply.offset !== offset ||
+                !Number.isSafeInteger(reply.total_bytes) ||
+                reply.total_bytes < 1 ||
+                reply.total_bytes > 8 * 1024 * 1024 ||
+                !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
+                typeof reply.data !== "string" ||
+                (totalBytes !== null && totalBytes !== reply.total_bytes) ||
+                (mimeType !== null && mimeType !== reply.mime_type))
+                throw new Error("Steam artwork changed during transfer.");
+            totalBytes = reply.total_bytes;
+            mimeType = reply.mime_type;
+            const decoded = atob(reply.data);
+            if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
+                throw new Error("Invalid Steam artwork chunk.");
+            const bytes = new Uint8Array(decoded.length);
+            for (let index = 0; index < decoded.length; index++)
+                bytes[index] = decoded.charCodeAt(index);
+            chunks.push(bytes.buffer);
+            const end = offset + decoded.length;
+            if (reply.next_offset === null) {
+                if (end !== totalBytes)
+                    throw new Error("Incomplete Steam artwork transfer.");
+                return new Blob(chunks, { type: mimeType });
+            }
+            if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
+                throw new Error("Invalid Steam artwork cursor.");
+            offset = end;
+        }
+    }
+    Amaterasu.readSteamArtwork = readSteamArtwork;
     function audioOverrideSelect(name, current) {
         const select = Amaterasu.el("select");
         select.name = name;
@@ -630,11 +724,26 @@ var Amaterasu;
             }, "quiet danger-text");
             remove.disabled = !api.allows("catalog.write");
             actions.push(remove);
-            return Amaterasu.el("article", "app-card", Amaterasu.el("div", "app-art", Amaterasu.el("span", "", row.entry.name.slice(0, 2).toUpperCase()), Amaterasu.badge(row.entry.launch.kind === "executable"
+            const art = Amaterasu.el("div", "app-art", Amaterasu.el("span", "", row.entry.name.slice(0, 2).toUpperCase()), Amaterasu.badge(row.entry.launch.kind === "executable"
                 ? "Executable"
                 : providerLaunch
                     ? "Playnite"
-                    : "Application")), Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
+                    : "Application"));
+            if (row.entry.artwork?.provider === "steam" && api.allows("steam.read")) {
+                void readSteamArtwork(api, row.entry.artwork).then((blob) => {
+                    if (!content.isConnected || !art.isConnected)
+                        return;
+                    const url = URL.createObjectURL(blob);
+                    const image = Amaterasu.el("img");
+                    image.alt = "";
+                    image.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+                    image.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
+                    image.src = url;
+                    art.prepend(image);
+                }).catch(() => {
+                });
+            }
+            return Amaterasu.el("article", "app-card", art, Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
         }
         function showProviderOverrideEditor(row) {
             let editRevision = revision;
@@ -774,6 +883,10 @@ var Amaterasu;
         fec.max = "255";
         fec.step = "1";
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
+        const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
+        steamId.maxLength = 10;
+        const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
+        steamInstallDir.maxLength = 1024;
         const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
         const showKind = () => {
@@ -785,7 +898,7 @@ var Amaterasu;
         };
         kind.addEventListener("change", showKind);
         showKind();
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking."), Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it."), executable);
         return form;
     }
 })(Amaterasu || (Amaterasu = {}));
@@ -918,6 +1031,23 @@ var Amaterasu;
         return value;
     }
     Amaterasu.parseOutputNameSelection = parseOutputNameSelection;
+    function parseCaptureSelection(value) {
+        if (value === "auto" || value === "ddx" || value === "wgc" || value === "wgcc")
+            return value;
+        throw new Error("Choose Automatic, Desktop Duplication, or a Windows Graphics Capture mode.");
+    }
+    Amaterasu.parseCaptureSelection = parseCaptureSelection;
+    function parseVideoMaxBatchSize(value) {
+        if (value.trim() === "")
+            return null;
+        if (!/^(0|[1-9][0-9]*)$/.test(value))
+            throw new Error("Video batch size must be a whole number from 0 to 64 KiB.");
+        const size = Number(value);
+        if (!Number.isSafeInteger(size) || size > 64)
+            throw new Error("Video batch size must be a whole number from 0 to 64 KiB.");
+        return size;
+    }
+    Amaterasu.parseVideoMaxBatchSize = parseVideoMaxBatchSize;
     function parseSteamExclusions(value) {
         let parsed;
         try {
@@ -1082,6 +1212,17 @@ var Amaterasu;
             typeof values.auto_sync !== "boolean" ||
             typeof values.sync_all_installed !== "boolean" ||
             typeof values.autosync_remove_uninstalled !== "boolean" ||
+            typeof values.autosync_require_replacement !== "boolean" ||
+            typeof values.focus_exit_on_first !== "boolean" ||
+            !Number.isSafeInteger(values.autosync_delete_after_days) ||
+            values.autosync_delete_after_days < 0 ||
+            values.autosync_delete_after_days > 2_147_483_647 ||
+            !Number.isSafeInteger(values.focus_attempts) ||
+            values.focus_attempts < 0 ||
+            values.focus_attempts > 2_147_483_647 ||
+            !Number.isSafeInteger(values.focus_timeout_secs) ||
+            values.focus_timeout_secs < 0 ||
+            values.focus_timeout_secs > 2_147_483_647 ||
             !Number.isSafeInteger(values.recent_games) ||
             values.recent_games < 0 ||
             values.recent_games > 10_000 ||
@@ -1094,6 +1235,11 @@ var Amaterasu;
             auto_sync: values.auto_sync,
             sync_all_installed: values.sync_all_installed,
             autosync_remove_uninstalled: values.autosync_remove_uninstalled,
+            autosync_delete_after_days: values.autosync_delete_after_days,
+            autosync_require_replacement: values.autosync_require_replacement,
+            focus_attempts: values.focus_attempts,
+            focus_timeout_secs: values.focus_timeout_secs,
+            focus_exit_on_first: values.focus_exit_on_first,
             recent_games: values.recent_games,
             recent_max_age_days: values.recent_max_age_days,
             sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -1412,6 +1558,25 @@ var Amaterasu;
                 syncAllInstalled.checked = settings.values.sync_all_installed;
                 const removeUninstalled = Amaterasu.input("playnite_autosync_remove_uninstalled", "", "checkbox");
                 removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+                const deleteAfterDays = Amaterasu.input("playnite_autosync_delete_after_days", String(settings.values.autosync_delete_after_days), "number");
+                deleteAfterDays.required = true;
+                deleteAfterDays.min = "0";
+                deleteAfterDays.max = "2147483647";
+                deleteAfterDays.step = "1";
+                const requireReplacement = Amaterasu.input("playnite_autosync_require_replacement", "", "checkbox");
+                requireReplacement.checked = settings.values.autosync_require_replacement;
+                const focusAttempts = Amaterasu.input("playnite_focus_attempts", String(settings.values.focus_attempts), "number");
+                focusAttempts.required = true;
+                focusAttempts.min = "0";
+                focusAttempts.max = "2147483647";
+                focusAttempts.step = "1";
+                const focusTimeoutSecs = Amaterasu.input("playnite_focus_timeout_secs", String(settings.values.focus_timeout_secs), "number");
+                focusTimeoutSecs.required = true;
+                focusTimeoutSecs.min = "0";
+                focusTimeoutSecs.max = "2147483647";
+                focusTimeoutSecs.step = "1";
+                const focusExitOnFirst = Amaterasu.input("playnite_focus_exit_on_first", "", "checkbox");
+                focusExitOnFirst.checked = settings.values.focus_exit_on_first;
                 const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
@@ -1456,7 +1621,7 @@ var Amaterasu;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
@@ -1466,6 +1631,11 @@ var Amaterasu;
                                 auto_sync: autoSync.checked,
                                 sync_all_installed: syncAllInstalled.checked,
                                 autosync_remove_uninstalled: removeUninstalled.checked,
+                                autosync_delete_after_days: deleteAfterDays.valueAsNumber,
+                                autosync_require_replacement: requireReplacement.checked,
+                                focus_attempts: focusAttempts.valueAsNumber,
+                                focus_timeout_secs: focusTimeoutSecs.valueAsNumber,
+                                focus_exit_on_first: focusExitOnFirst.checked,
                                 recent_games: recentGames.valueAsNumber,
                                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                                 sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),
@@ -1691,6 +1861,20 @@ var Amaterasu;
                 useStartupBindAddress.addEventListener("change", () => {
                     bindAddress.disabled = useStartupBindAddress.checked;
                 });
+                const capture = Amaterasu.el("select");
+                capture.name = "capture";
+                const captureChoices = [
+                    ["auto", "Automatic (startup capture backend)"],
+                    ["ddx", "Desktop Duplication"],
+                    ["wgc", "Windows Graphics Capture"],
+                    ["wgcc", "Windows Graphics Capture, constant rate"],
+                ];
+                for (const [value, label] of captureChoices) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value;
+                    capture.append(option);
+                }
+                capture.value = settings.configured_capture;
                 const outputName = Amaterasu.el("select");
                 outputName.name = "output_name";
                 const automaticOutput = Amaterasu.el("option", "", "Automatic (startup output)");
@@ -1732,11 +1916,18 @@ var Amaterasu;
                 outputName.value = settings.configured_output_name ?? "";
                 const streamAudio = Amaterasu.input("stream_audio", "", "checkbox");
                 streamAudio.checked = settings.stream_audio;
+                const videoBatchSize = Amaterasu.input("video_max_batch_size_kb", settings.configured_video_max_batch_size_kb === null
+                    ? ""
+                    : String(settings.configured_video_max_batch_size_kb), "number");
+                videoBatchSize.min = "0";
+                videoBatchSize.max = "64";
+                videoBatchSize.step = "1";
+                videoBatchSize.placeholder = "Default (64)";
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -1745,8 +1936,10 @@ var Amaterasu;
                             hostname: hostname.value,
                             port: port.valueAsNumber,
                             ...network,
+                            capture: parseCaptureSelection(capture.value),
                             output_name: parseOutputNameSelection(outputName.value),
                             stream_audio: streamAudio.checked,
+                            video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
                             expected_revision: settings.revision,
                         });
                         context.notify("Host settings saved.");

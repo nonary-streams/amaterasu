@@ -113,6 +113,29 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.throws(() => model.parseDetachedCommands("é".repeat(1025)));
 });
 
+test("Steam metadata is sparse and rejects ambiguous IDs or directory roots", () => {
+  const form = new FormData();
+  form.set("name", "Steam game");
+  form.set("kind", "executable");
+  form.set("path", "/games/game");
+  form.set("steam_id", "4294967295");
+  form.set("steam_install_dir", "/opt/games/steam-game");
+  const entry = ordinary(model.entryFromForm(form));
+  assert.equal(entry.steam_id, "4294967295");
+  assert.equal(entry.steam_install_dir, "/opt/games/steam-game");
+  form.set("steam_id", "");
+  form.set("steam_install_dir", "");
+  const sparse = ordinary(model.entryFromForm(form));
+  assert.equal(Object.hasOwn(sparse, "steam_id"), false);
+  assert.equal(Object.hasOwn(sparse, "steam_install_dir"), false);
+  for (const value of ["0", "01", "4294967296", "-1", "1.0", " 1 "])
+    assert.throws(() => model.parseSteamId(value));
+  for (const value of ["/", "C:\\", "\\foo", "\\\\server\\share", "relative/game", "/opt/../game", " /opt/game", "/opt/game\n"])
+    assert.throws(() => model.parseSteamInstallDir(value));
+  assert.equal(model.parseSteamInstallDir("C:\\Games\\Game"), "C:\\Games\\Game");
+  assert.equal(model.parseSteamInstallDir("\\\\server\\share\\game"), "\\\\server\\share\\game");
+});
+
 test("integer settings reject blank, fractional and unsafe integer values", () => {
   for (const value of ["", "  ", "1.5", "9007199254740992", "NaN"]) {
     assert.throws(() => model.fieldValue({ type: "integer" }, { value }));
