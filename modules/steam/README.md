@@ -103,12 +103,13 @@ is served from that file; otherwise list records carry a stable opaque reference
 to the fixed Steam CDN portrait. The authenticated
 `POST /v1/steam/artwork_read` action fetches that image on demand and returns the
 same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
-an eight-second timeout, accepts only bounded JPEG portraits, keeps up to four
-images in memory, and cools down failed app IDs for ten minutes. Failed remote
-fetches leave the UI to use its existing icon fallback. The current 8 MiB
-end-to-end limit is lower than Vibeshine's 16 MiB remote response cap; the
-management and frontend chunk contract must be widened before matching that
-limit. Remote images are not persisted or converted to PNG, unlike Vibeshine.
+an eight-second timeout, accepts only JPEG portraits up to 16 MiB, keeps up to
+four images in memory, and cools down failed app IDs for ten minutes. The
+authenticated chunk route and frontend assembly use the same 16 MiB image
+limit. Failed remote fetches leave the UI to use its existing icon fallback.
+Vibeshine retains persistent converted covers through transient remote failures
+and replaces low-resolution local art when a full portrait is available; those
+behaviors remain pending. Remote images are not persisted or converted to PNG.
 Unlike Vibeshine's legacy host config parser, the product API rejects negative
 counts and ages as malformed unsigned values instead of clamping them to zero.
 

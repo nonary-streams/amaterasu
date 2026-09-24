@@ -13,7 +13,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 const MAX_ARTWORK_ROOTS: usize = 4;
 const MAX_USER_DIRECTORIES: usize = 32;
 const MAX_HASH_DIRECTORIES: usize = 32;
-pub const MAX_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const MAX_REMOTE_FAILURES: usize = 64;
 const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
@@ -906,6 +906,45 @@ mod tests {
         assert_eq!(last.next_offset, None);
         assert_eq!(last.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
         assert_eq!(last.revision, revision);
+    }
+
+    #[test]
+    fn remote_artwork_accepts_the_reference_limit_and_rejects_bytes_above_it() {
+        let revision = remote_revision(42, 123).unwrap();
+        let mut cache = RemoteArtworkCache::default();
+        let bytes = synthetic_jpeg(600, 900, MAX_ARTWORK_BYTES as usize);
+        assert_eq!(bytes.len() as u64, MAX_ARTWORK_BYTES);
+        let first = cache
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes))
+            .unwrap();
+        assert_eq!(first.total_bytes, MAX_ARTWORK_BYTES);
+        assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
+
+        let last_offset = MAX_ARTWORK_BYTES - ARTWORK_CHUNK_BYTES as u64;
+        let last = cache
+            .read_chunk_with(42, 123, &revision, last_offset, Instant::now(), |_| {
+                panic!("cached full-size artwork must not be fetched again")
+            })
+            .unwrap();
+        assert_eq!(last.total_bytes, MAX_ARTWORK_BYTES);
+        assert_eq!(last.next_offset, None);
+        assert_eq!(last.data.len(), ARTWORK_CHUNK_BYTES.div_ceil(3) * 4);
+
+        let oversized = synthetic_jpeg(600, 900, MAX_ARTWORK_BYTES as usize + 1);
+        assert!(!validate_remote_artwork(&oversized));
+        assert_eq!(
+            RemoteArtworkCache::default()
+                .read_chunk_with(
+                    43,
+                    123,
+                    &remote_revision(43, 123).unwrap(),
+                    0,
+                    Instant::now(),
+                    |_| { Ok(oversized) }
+                )
+                .unwrap_err(),
+            "unsupported_artwork"
+        );
     }
 
     #[test]
