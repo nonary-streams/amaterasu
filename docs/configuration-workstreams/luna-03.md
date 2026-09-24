@@ -174,4 +174,44 @@ Reference evidence: pinned Vibeshine `src/config.h` defines `SUNSHINE_VIRTUAL_DI
 
 The service has no permanent-monitor creation backend. Product defaults and persistence, the reserved product-settings migration, management editing, per-application/per-client resolution and projection, and Windows qualification remain absent. Keep both IDs pending.
 
-Next slice: resolve the pending `global:encoder` snapshot contract with Luna 02. Once the stable `EncoderIdentity` projection and provider-selection owner are confirmed, implement a bounded video-side selection adapter in the owned video/encode paths; preserve the v17 reservation and do not write foreign paths.
+Next slice: apply the configured permanent display count through the virtual-display driver protocol (runtime slice in progress). Then resume the pending `global:encoder` snapshot contract with Luna 02; preserve the v17 reservation and do not write foreign paths.
+
+## Slice 5: WGC source timestamp pacing
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `c9d8379d74e0e871695a6446a3f03e86bda75929`
+- Candidate code SHA: `fd7e0ae8dd442307742655931aded1689933231b`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This slice covers `global:wgc_pacing_smoothing`, a global WGC pacing setting with a default of enabled. It corrects which monotonic timestamp anchors existing WGC phase-preserving pacing. The ID remains `pending` because the focused tests were not run and Windows capture/runtime qualification remains outstanding.
+
+### Changed paths
+
+- `modules/video/src/plane.rs`
+- `modules/video/src/pipeline.rs`
+- `modules/video/src/pipeline/pacing.rs`
+- `modules/video/src/pipeline/tests.rs`
+
+### Behavior and evidence
+
+The capture plane now carries the source `CpuFrame.timestamp_us` alongside a local callback observation before the existing video timestamp and sequence are written into the encoder frame. WGC pacing pairs the first valid source timestamp with that local monotonic observation, then maps strictly increasing source deltas onto the stream-relative clock. Zero, duplicate, regressing, or unrepresentable source timestamps fall back to the local observation and start a fresh mapping. The existing snap window, hold limit, and encoder timestamp/sequence contract are unchanged.
+
+Pinned Vibeshine `src/platform/windows/display_base.cpp` anchors from `capture_pacing_timestamp`, falling back to the frame timestamp and then the local steady clock. Amaterasu's WGC capture records its timestamp at frame acquisition before readback; the local observation is sampled later at the video callback. Mapping source deltas removes callback/readback delay variation while preserving a monotonic epoch usable by the current video scheduler.
+
+### Review and validation
+
+- Implementation worker: `/root/encode_inventory`, `gpt-6-luna` / `xhigh`; edited only the four listed video paths.
+- Independent reviewer: `/root/review_virtual_display`, `gpt-6-luna` / `xhigh`; found no code issues in the mapping/fallback paths, encoder metadata behavior, or test scope.
+- Parent reviewed the source reference and final diff.
+- Passed `rustfmt --edition 2024 --check modules/video/src/plane.rs modules/video/src/pipeline.rs modules/video/src/pipeline/pacing.rs modules/video/src/pipeline/tests.rs` and `git diff --check` before commit.
+- Added tests cover source timestamp retention, unchanged encoder metadata, callback-delay-independent phase re-anchoring, invalid timestamp recovery, and unrepresentable deltas. Cargo tests, builds, and Clippy were not run because this lightweight worktree is reserved for source-only work.
+- No Windows WGC runtime qualification was run.
+
+### Remaining mismatches and next slice
+
+The current source path exposes global product persistence, management editing, and launch projection in foreign-owned `modules/nvhttp` paths; those consumers were inspected read-only and still need integration-owner confirmation. No per-application or per-client scope is assigned to this setting. Keep `global:wgc_pacing_smoothing` pending until its tests run and the Windows WGC runtime is qualified. Next slice: implement the configured permanent display count over the pinned Windows driver protocol, independent of temporary-display leases; keep the `global:encoder` selection contract request pending with Luna 02.
