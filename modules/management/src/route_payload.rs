@@ -14,6 +14,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
     }
     match route.service {
         "amaterasu.authentication/1" => authentication(route.action, object),
+        "amaterasu.catalog/1" => catalog(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
         "amaterasu.launch/1" => launch(route.action, object),
@@ -373,6 +374,327 @@ fn playnite_filter_values(value: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn catalog(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "get" => {
+            fields(object, &["id"], &[])?;
+            catalog_id(text(object, "id")?)
+        }
+        "list" => {
+            fields(object, &[], &["cursor", "limit"])?;
+            catalog_page_options(object)
+        }
+        "search" => {
+            fields(object, &["query"], &["cursor", "limit"])?;
+            let query = text(object, "query")?;
+            if query.trim().is_empty() || query.len() > 160 || query.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+            catalog_page_options(object)
+        }
+        "create" => {
+            fields(object, &["entry", "expected_revision"], &[])?;
+            unsigned_u64(object, "expected_revision")?;
+            catalog_entry(object.get("entry").ok_or(INVALID)?)
+        }
+        "update" => {
+            fields(object, &["id", "entry", "expected_revision"], &[])?;
+            catalog_id(text(object, "id")?)?;
+            unsigned_u64(object, "expected_revision")?;
+            catalog_entry(object.get("entry").ok_or(INVALID)?)
+        }
+        "delete" => {
+            fields(object, &["id", "expected_revision"], &[])?;
+            catalog_id(text(object, "id")?)?;
+            unsigned_u64(object, "expected_revision")
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn catalog_page_options(object: &Object) -> Result<(), &'static str> {
+    if object.get("limit").is_some_and(|value| {
+        !value
+            .as_u64()
+            .is_some_and(|limit| (1..=32).contains(&limit))
+    }) {
+        return Err(INVALID);
+    }
+    if let Some(cursor) = object.get("cursor")
+        && !cursor.is_null()
+    {
+        let cursor = cursor.as_object().ok_or(INVALID)?;
+        fields(cursor, &["revision", "after", "query"], &[])?;
+        unsigned_u64(cursor, "revision")?;
+        catalog_id(text(cursor, "after")?)?;
+        let query = text(cursor, "query")?;
+        if query.len() > 160 || query.chars().any(char::is_control) {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
+}
+
+fn catalog_id(value: &str) -> Result<(), &'static str> {
+    let Some(suffix) = value.strip_prefix("app-") else {
+        return Err(INVALID);
+    };
+    if suffix.len() != 16
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || suffix.bytes().all(|byte| byte == b'0')
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn catalog_entry(value: &Value) -> Result<(), &'static str> {
+    let entry = value.as_object().ok_or(INVALID)?;
+    fields(
+        entry,
+        &["name", "launch"],
+        &["description", "tags", "config_overrides"],
+    )?;
+    let name = text(entry, "name")?;
+    if name.trim().is_empty() || name.len() > 160 || name.chars().any(char::is_control) {
+        return Err(INVALID);
+    }
+    if let Some(description) = entry.get("description") {
+        let description = description.as_str().ok_or(INVALID)?;
+        if description.len() > 1024 || description.chars().any(char::is_control) {
+            return Err(INVALID);
+        }
+    }
+    if let Some(tags) = entry.get("tags") {
+        let tags = tags.as_array().ok_or(INVALID)?;
+        if tags.len() > 16
+            || tags.iter().any(|tag| {
+                tag.as_str().is_none_or(|tag| {
+                    tag.trim().is_empty() || tag.len() > 64 || tag.chars().any(char::is_control)
+                })
+            })
+        {
+            return Err(INVALID);
+        }
+    }
+    if let Some(overrides) = entry.get("config_overrides") {
+        let overrides = overrides.as_object().ok_or(INVALID)?;
+        fields(overrides, &[], &["fec_percentage"])?;
+        if let Some(fec) = overrides.get("fec_percentage")
+            && !fec.is_null()
+            && !fec
+                .as_u64()
+                .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
+        {
+            return Err(INVALID);
+        }
+    }
+    catalog_launch(entry.get("launch").ok_or(INVALID)?)
+}
+
+fn catalog_launch(value: &Value) -> Result<(), &'static str> {
+    let launch = value.as_object().ok_or(INVALID)?;
+    match text(launch, "kind")? {
+        "application" => {
+            fields(launch, &["kind", "path"], &[])?;
+            text(launch, "path")?;
+        }
+        "executable" => {
+            fields(
+                launch,
+                &["kind", "program"],
+                &[
+                    "arguments",
+                    "working_directory",
+                    "working-dir",
+                    "auto_detach",
+                    "auto-detach",
+                    "wait_all",
+                    "wait-all",
+                    "exit_timeout_seconds",
+                    "exit-timeout",
+                    "detached",
+                    "preparation",
+                ],
+            )?;
+            text(launch, "program")?;
+            optional_string(launch, "working_directory", "working-dir")?;
+            optional_boolean(launch, "auto_detach", "auto-detach")?;
+            optional_boolean(launch, "wait_all", "wait-all")?;
+            optional_timeout(launch, "exit_timeout_seconds", "exit-timeout")?;
+            if let Some(arguments) = launch.get("arguments") {
+                string_array(arguments, 32, 1024, true)?;
+            }
+            if let Some(detached) = launch.get("detached") {
+                string_array(detached, 16, 2048, false)?;
+            }
+            if let Some(preparation) = launch.get("preparation") {
+                catalog_preparation(preparation)?;
+            }
+        }
+        // Playnite identities can only be written by the trusted provider.
+        _ => return Err(INVALID),
+    }
+    Ok(())
+}
+
+fn optional_string(object: &Object, canonical: &str, alias: &str) -> Result<(), &'static str> {
+    if object.contains_key(canonical) && object.contains_key(alias) {
+        return Err(INVALID);
+    }
+    if object
+        .get(canonical)
+        .or_else(|| object.get(alias))
+        .is_some_and(|value| !value.is_null() && value.as_str().is_none())
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_boolean(object: &Object, canonical: &str, alias: &str) -> Result<(), &'static str> {
+    if object.contains_key(canonical) && object.contains_key(alias) {
+        return Err(INVALID);
+    }
+    if object
+        .get(canonical)
+        .or_else(|| object.get(alias))
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_timeout(object: &Object, canonical: &str, alias: &str) -> Result<(), &'static str> {
+    if object.contains_key(canonical) && object.contains_key(alias) {
+        return Err(INVALID);
+    }
+    if object
+        .get(canonical)
+        .or_else(|| object.get(alias))
+        .is_some_and(|value| {
+            !value.is_null() && !value.as_u64().is_some_and(|timeout| timeout <= 300)
+        })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn string_array(
+    value: &Value,
+    maximum_items: usize,
+    maximum_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), &'static str> {
+    let values = value.as_array().ok_or(INVALID)?;
+    if values.len() > maximum_items
+        || values.iter().any(|value| {
+            value.as_str().is_none_or(|value| {
+                (!allow_empty && value.is_empty())
+                    || value.len() > maximum_bytes
+                    || value.chars().any(char::is_control)
+            })
+        })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn catalog_preparation(value: &Value) -> Result<(), &'static str> {
+    let steps = value.as_array().ok_or(INVALID)?;
+    if steps.len() > 8 {
+        return Err(INVALID);
+    }
+    for step in steps {
+        let step = step.as_object().ok_or(INVALID)?;
+        fields(step, &["run"], &["undo"])?;
+        catalog_command(step.get("run").ok_or(INVALID)?)?;
+        if let Some(undo) = step.get("undo")
+            && !undo.is_null()
+        {
+            catalog_command(undo)?;
+        }
+    }
+    Ok(())
+}
+
+fn catalog_command(value: &Value) -> Result<(), &'static str> {
+    let command = value.as_object().ok_or(INVALID)?;
+    fields(
+        command,
+        &["executable"],
+        &["args", "environment", "cwd", "timeout_ms"],
+    )?;
+    text(command, "executable")?;
+    if let Some(args) = command.get("args") {
+        command_arguments(args)?;
+    }
+    if command
+        .get("cwd")
+        .is_some_and(|value| !value.is_null() && value.as_str().is_none())
+    {
+        return Err(INVALID);
+    }
+    if let Some(environment) = command.get("environment") {
+        let environment = environment.as_object().ok_or(INVALID)?;
+        let mut folded_names = BTreeSet::new();
+        if environment.len() > 32
+            || environment.iter().any(|(key, value)| {
+                let invalid_key = key.is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                invalid_key
+                    || value
+                        .as_str()
+                        .is_none_or(|value| value.len() > 1024 || value.contains('\0'))
+                    || !folded_names.insert(key.to_ascii_uppercase())
+            })
+            || environment
+                .iter()
+                .map(|(key, value)| key.len() + value.as_str().map_or(0, str::len))
+                .sum::<usize>()
+                > 4096
+        {
+            return Err(INVALID);
+        }
+    }
+    if command.get("timeout_ms").is_some_and(|value| {
+        !value
+            .as_u64()
+            .is_some_and(|timeout| (1..=30_000).contains(&timeout))
+    }) {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn command_arguments(value: &Value) -> Result<(), &'static str> {
+    let arguments = value.as_array().ok_or(INVALID)?;
+    if arguments.len() > 64
+        || arguments.iter().any(|argument| {
+            argument
+                .as_str()
+                .is_none_or(|argument| argument.len() > 1024 || argument.contains('\0'))
+        })
+        || arguments
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .sum::<usize>()
+            > 8192
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 fn steam_exclusions(value: &Value) -> Result<(), &'static str> {
     let exclusions = value.as_array().ok_or(INVALID)?;
     if exclusions.len() > 256 {
@@ -662,6 +984,14 @@ fn unsigned(object: &Object, key: &str) -> Result<(), &'static str> {
     }
 }
 
+fn unsigned_u64(object: &Object, key: &str) -> Result<(), &'static str> {
+    if object.get(key).and_then(Value::as_u64).is_some() {
+        Ok(())
+    } else {
+        Err(INVALID)
+    }
+}
+
 fn launch(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "launch" => {
@@ -804,5 +1134,96 @@ mod playnite_tests {
                 "accepted malformed Playnite settings payload: {value}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    fn route(action: &'static str) -> Route {
+        Route {
+            service: "amaterasu.catalog/1",
+            action,
+            scope: Some("catalog.write"),
+            requires_empty_body: false,
+        }
+    }
+
+    #[test]
+    fn catalog_editor_accepts_sparse_fec_and_supported_executable_policy() {
+        let create = serde_json::json!({
+            "expected_revision": 4,
+            "entry": {
+                "name": "Configured app",
+                "config_overrides": {"fec_percentage": 255},
+                "launch": {
+                    "kind": "executable",
+                    "program": "C:\\Games\\game.exe",
+                    "arguments": ["--fullscreen"],
+                    "working-dir": "",
+                    "auto-detach": false,
+                    "wait-all": false,
+                    "exit-timeout": 0,
+                    "detached": ["first", "second"],
+                    "preparation": [{
+                        "run": {"executable": "C:\\Tools\\prepare.exe"},
+                        "undo": null
+                    }]
+                }
+            }
+        });
+        assert!(validate(route("create"), create.as_object().unwrap()).is_ok());
+        let legacy = serde_json::json!({
+            "entry": {"name":"Legacy", "launch":{"kind":"application","path":"/opt/example"}},
+            "expected_revision": 0
+        });
+        assert!(validate(route("create"), legacy.as_object().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn catalog_routes_reject_unowned_fields_and_out_of_range_overrides() {
+        let invalid = [
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","owner":"other","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":0},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":256},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":"37"},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":"false"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":true,"auto-detach":false}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","exit-timeout":301}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","detached":["bad\ncommand"]}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab","exit_timeout_seconds":10}}}),
+            serde_json::json!({"id":"app-0000000000000001","expected_revision":0,"action":"delete"}),
+        ];
+        for value in invalid {
+            assert!(
+                validate(route("create"), value.as_object().unwrap()).is_err(),
+                "accepted malformed catalog editor payload: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_page_and_revision_payloads_are_bounded() {
+        let list = serde_json::json!({
+            "limit": 32,
+            "cursor": {"revision": 5, "after": "app-0000000000000001", "query": "game"}
+        });
+        assert!(validate(route("list"), list.as_object().unwrap()).is_ok());
+        for value in [
+            serde_json::json!({"limit":33}),
+            serde_json::json!({"limit":0}),
+            serde_json::json!({"extra":true}),
+            serde_json::json!({"cursor":{"revision":0,"after":"app-0000000000000000","query":""}}),
+        ] {
+            assert!(validate(route("list"), value.as_object().unwrap()).is_err());
+        }
+        let update = serde_json::json!({
+            "id":"app-0000000000000001",
+            "expected_revision":u64::MAX,
+            "entry":{"name":"Updated","launch":{"kind":"application","path":"/opt/app"}}
+        });
+        assert!(validate(route("update"), update.as_object().unwrap()).is_ok());
+        assert!(validate(route("delete"), update.as_object().unwrap()).is_err());
     }
 }

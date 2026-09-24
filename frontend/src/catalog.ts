@@ -100,8 +100,10 @@ namespace Amaterasu {
     });
 
     function card(row: CatalogRow): HTMLElement {
+      const providerLaunch = row.entry.launch.kind === "playnite";
       const edit = button("Edit", () => showEditor(row));
-      edit.disabled = !api.allows("catalog.write");
+      edit.disabled = !api.allows("catalog.write") || providerLaunch;
+      if (providerLaunch) edit.title = "Playnite launch targets are managed by the provider.";
       const remove = button(
         "Delete",
         async () => {
@@ -135,7 +137,9 @@ namespace Amaterasu {
           badge(
             row.entry.launch.kind === "executable"
               ? "Executable"
-              : "Application",
+              : providerLaunch
+                ? "Playnite"
+                : "Application",
           ),
         ),
         el(
@@ -208,7 +212,7 @@ namespace Amaterasu {
     description.value = entry?.description ?? "";
     description.maxLength = 1024;
     description.rows = 2;
-    const tags = input("tags", entry?.tags.join(", ") ?? "");
+    const tags = input("tags", entry?.tags?.join(", ") ?? "");
     const kind = el("select");
     kind.name = "kind";
     for (const [value, text] of [
@@ -223,13 +227,58 @@ namespace Amaterasu {
     const path = input("path", entry ? launchPath(entry) : "");
     path.required = true;
     path.placeholder = "/Applications/Example.app";
+    const executableLaunch =
+      entry?.launch.kind === "executable" ? entry.launch : undefined;
     const argumentsField = el("textarea");
     argumentsField.name = "arguments";
     argumentsField.rows = 2;
-    argumentsField.value = JSON.stringify(entry?.launch.arguments ?? []);
+    argumentsField.value = JSON.stringify(executableLaunch?.arguments ?? []);
     const directory = input(
       "working_directory",
-      entry?.launch.working_directory ?? "",
+      entry?.launch.kind === "executable"
+        ? (entry.launch.working_directory ?? "")
+        : "",
+    );
+    const autoDetach = el("input");
+    autoDetach.type = "checkbox";
+    autoDetach.name = "auto_detach";
+    autoDetach.checked = executableLaunch?.auto_detach ?? true;
+    const waitAll = el("input");
+    waitAll.type = "checkbox";
+    waitAll.name = "wait_all";
+    waitAll.checked = executableLaunch?.wait_all ?? true;
+    const exitTimeout = input(
+      "exit_timeout_seconds",
+      String(executableLaunch?.exit_timeout_seconds ?? 5),
+      "number",
+    );
+    exitTimeout.min = "0";
+    exitTimeout.max = "300";
+    exitTimeout.step = "1";
+    const detached = el("textarea");
+    detached.name = "detached";
+    detached.rows = 3;
+    detached.value = executableLaunch?.detached?.join("\n") ?? "";
+    const preparation = input(
+      "preparation",
+      JSON.stringify(executableLaunch?.preparation ?? []),
+      "hidden",
+    );
+    const fec = input(
+      "fec_percentage",
+      entry?.config_overrides?.fec_percentage?.toString() ?? "",
+      "number",
+    );
+    fec.min = "1";
+    fec.max = "255";
+    fec.step = "1";
+    const processPolicy = el(
+      "div",
+      "form-grid",
+      field("Auto detach", autoDetach, "Retain a quick successful launcher."),
+      field("Wait for all processes", waitAll, "Keep the app active while its process group is running."),
+      field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."),
+      field("Detached commands", detached, "One ordered command per line; up to 16."),
     );
     const executable = el(
       "div",
@@ -240,6 +289,8 @@ namespace Amaterasu {
         'A JSON array of literal arguments. Example: ["--fullscreen"]',
       ),
       field("Working directory", directory, "Optional absolute path."),
+      processPolicy,
+      preparation,
     );
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
@@ -255,6 +306,7 @@ namespace Amaterasu {
       field("Description", description),
       field("Tags", tags, "Separate tags with commas."),
       field("Absolute application path", path),
+      field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       executable,
     );
     return form;

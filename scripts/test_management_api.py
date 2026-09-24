@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 from pathlib import Path
 import socket
 import sys
@@ -243,15 +244,56 @@ def test_auth_and_crud(console, api):
     assert status == 403 and administrator not in json.dumps(failure), failure
     status, catalog, _ = api.post("/v1/catalog/list", token=administrator)
     assert status == 200 and catalog["ok"], catalog
-    entry = {"name": "HTTP Game", "launch": {"kind": "application", "path": "/Applications/Game.app"}}
+    game_path = r"C:\Games\HTTPGame\game.exe" if os.name == "nt" else "/opt/games/http-game"
+    prepare_path = r"C:\Tools\prepare.exe" if os.name == "nt" else "/opt/tools/prepare"
+    entry = {
+        "name": "HTTP Game",
+        "config_overrides": {"fec_percentage": 37},
+        "launch": {
+            "kind": "executable",
+            "program": game_path,
+            "arguments": ["--fullscreen"],
+            "auto_detach": False,
+            "wait_all": True,
+            "exit_timeout_seconds": 0,
+            "detached": ["helper --ordered"],
+            "preparation": [{"run": {"executable": prepare_path}}],
+        },
+    }
     status, created, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog["revision"]}, administrator)
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
-    assert status == 200 and found["entry"]["name"] == "HTTP Game", found
-    status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": dict(entry, name="Renamed"), "expected_revision": created["revision"]}, administrator)
+    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37}, found
+    assert found["entry"]["launch"]["auto_detach"] is False, found
+    assert found["entry"]["launch"]["wait_all"] is True, found
+    assert found["entry"]["launch"]["exit_timeout_seconds"] == 0, found
+    assert found["entry"]["launch"]["detached"] == ["helper --ordered"], found
+    assert found["entry"]["launch"]["preparation"][0]["run"]["executable"] == prepare_path, found
+    updated_entry = {
+        **entry,
+        "name": "Renamed",
+        "config_overrides": {"fec_percentage": 43},
+        "launch": {**entry["launch"], "auto_detach": True, "wait_all": False},
+    }
+    status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": updated_entry, "expected_revision": created["revision"]}, administrator)
     assert status == 200 and renamed["ok"], renamed
-    status, deleted, _ = api.post("/v1/catalog/delete", {"id": created["id"], "expected_revision": renamed["revision"]}, administrator)
-    assert status == 200 and deleted["ok"], deleted
+    status, conflict, _ = api.post(
+        "/v1/catalog/update",
+        {"id": created["id"], "entry": entry, "expected_revision": created["revision"]},
+        administrator,
+    )
+    assert status == 200 and not conflict["ok"], conflict
+    assert conflict["error"]["code"] == "revision_conflict", conflict
+    status, saved_catalog_entry, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
+    assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
+    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43}, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["launch"]["exit_timeout_seconds"] == 0, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["launch"]["detached"] == ["helper --ordered"], saved_catalog_entry
+    catalog_id = created["id"]
+    catalog_revision = renamed["revision"]
+    catalog_entry = saved_catalog_entry["entry"]
     status, configured, _ = api.post("/v1/configuration/register", {"fields": {"fps": {"type": "integer", "default": 60}}}, administrator)
     assert status == 200 and configured["ok"], configured
     status, migrated, _ = api.post("/v1/configuration/migrate", {
@@ -588,7 +630,7 @@ def test_auth_and_crud(console, api):
         token["bearer"],
     )
     assert status == 403 and not result["ok"], result
-    status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": deleted["revision"]}, token["bearer"])
+    status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog_revision}, token["bearer"])
     assert status == 403 and not result["ok"], result
     assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/steam/settings", token=token["bearer"])[0] == 403
@@ -617,6 +659,9 @@ def test_auth_and_crud(console, api):
         lutris_revision,
         playnite_values,
         playnite_revision,
+        catalog_id,
+        catalog_revision,
+        catalog_entry,
     )
 
 
@@ -661,7 +706,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision, catalog_id, catalog_revision, catalog_entry = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -707,6 +752,11 @@ def main():
             assert playnite_settings["revision"] == playnite_revision, playnite_settings
             status, playnite_status, _ = api.post("/v1/playnite/status", token=relogged["bearer"])
             assert status == 200 and playnite_status["settings_ready"] and not playnite_status["enabled"], playnite_status
+            status, persisted_catalog_entry, _ = api.post(
+                "/v1/catalog/get", {"id": catalog_id}, relogged["bearer"]
+            )
+            assert status == 200 and persisted_catalog_entry["entry"] == catalog_entry, persisted_catalog_entry
+            assert persisted_catalog_entry["revision"] == catalog_revision, persisted_catalog_entry
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -730,7 +780,7 @@ def main():
             console.eof()
         finally:
             console.close()
-    print("Passed: real HTTP login/authentication, route scopes, catalog CRUD, token persistence/revocation,")
+    print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, token persistence/revocation,")
     print("Moonlight hostname/port live rebind, certificate-bound FEC override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery and restart persistence,")

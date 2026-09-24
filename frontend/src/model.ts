@@ -12,9 +12,76 @@ namespace Amaterasu {
     return parsed as string[];
   }
 
+  export function parseFecOverride(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^[0-9]+$/.test(trimmed))
+      throw new Error("FEC percentage must be a whole number from 1 to 255.");
+    const percentage = Number(trimmed);
+    if (!Number.isSafeInteger(percentage) || percentage < 1 || percentage > 255)
+      throw new Error("FEC percentage must be a whole number from 1 to 255.");
+    return percentage;
+  }
+
+  export function parseDetachedCommands(value: string): string[] {
+    const commands = value
+      .split(/\r?\n/)
+      .map((command) => command.trim())
+      .filter(Boolean);
+    if (
+      commands.length > 16 ||
+      commands.some(
+        (command) =>
+          new TextEncoder().encode(command).length > 2048 ||
+          /[\u0000-\u001f\u007f]/.test(command),
+      )
+    ) {
+      throw new Error(
+        "Enter up to 16 detached commands, each at most 2048 bytes without control characters.",
+      );
+    }
+    return commands;
+  }
+
+  export function parseExitTimeout(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (!/^[0-9]+$/.test(trimmed))
+      throw new Error("Exit timeout must be a whole number from 0 to 300 seconds.");
+    const seconds = Number(trimmed);
+    if (!Number.isSafeInteger(seconds) || seconds > 300)
+      throw new Error("Exit timeout must be a whole number from 0 to 300 seconds.");
+    return seconds;
+  }
+
+  function parsePreparation(value: string): PreparationStep[] {
+    const parsed: unknown = JSON.parse(value || "[]");
+    if (
+      !Array.isArray(parsed) ||
+      parsed.some(
+        (step) =>
+          step === null ||
+          Array.isArray(step) ||
+          typeof step !== "object" ||
+          !step.run ||
+          Array.isArray(step.run) ||
+          typeof step.run !== "object",
+      )
+    ) {
+      throw new Error("Existing preparation commands are malformed; reload before saving.");
+    }
+    return parsed as PreparationStep[];
+  }
+
   export function entryFromForm(data: FormData): Entry {
     const text = (name: string) => String(data.get(name) ?? "").trim();
     const kind = text("kind") === "executable" ? "executable" : "application";
+    const fecPercentage = parseFecOverride(text("fec_percentage"));
+    const configOverrides =
+      fecPercentage === null ? undefined : { fec_percentage: fecPercentage };
+    const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
+    const detached = parseDetachedCommands(text("detached"));
+    const preparation = parsePreparation(text("preparation"));
     const launch: Launch =
       kind === "application"
         ? { kind, path: text("path") }
@@ -23,6 +90,13 @@ namespace Amaterasu {
             program: text("path"),
             arguments: parseArguments(String(data.get("arguments") ?? "[]")),
             working_directory: text("working_directory") || null,
+            auto_detach: data.has("auto_detach"),
+            wait_all: data.has("wait_all"),
+            ...(exitTimeoutSeconds === null
+              ? {}
+              : { exit_timeout_seconds: exitTimeoutSeconds }),
+            ...(detached.length ? { detached } : {}),
+            ...(preparation.length ? { preparation } : {}),
           };
     return {
       name: text("name"),
@@ -32,6 +106,7 @@ namespace Amaterasu {
         .map((tag) => tag.trim())
         .filter(Boolean),
       launch,
+      ...(configOverrides ? { config_overrides: configOverrides } : {}),
     };
   }
 
@@ -84,9 +159,14 @@ namespace Amaterasu {
   }
 
   export function launchPath(entry: Entry): string {
-    return entry.launch.kind === "application"
-      ? (entry.launch.path ?? "")
-      : (entry.launch.program ?? "");
+    switch (entry.launch.kind) {
+      case "application":
+        return entry.launch.path;
+      case "executable":
+        return entry.launch.program;
+      case "playnite":
+        return `Playnite game ${entry.launch.game_id}`;
+    }
   }
 
   export function countLabel(count: number, more: unknown): string {

@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
-const context = vm.createContext({ FormData, Error });
+const context = vm.createContext({ FormData, Error, TextEncoder });
 vm.runInContext(
   ts.transpile(readFileSync("src/model.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
@@ -21,12 +21,18 @@ test("executable arguments stay literal and application metadata is not executed
   form.set("path", "/opt/example");
   form.set("arguments", '["--flag", "$(do-not-run)", "a b"]');
   form.set("tags", "arcade, co-op, ");
+  form.set("auto_detach", "on");
+  form.set("wait_all", "on");
+  form.set("exit_timeout_seconds", "5");
   const entry = ordinary(model.entryFromForm(form));
   assert.deepEqual(entry.launch, {
     kind: "executable",
     program: "/opt/example",
     arguments: ["--flag", "$(do-not-run)", "a b"],
     working_directory: null,
+    auto_detach: true,
+    wait_all: true,
+    exit_timeout_seconds: 5,
   });
   assert.equal(entry.name, "Example");
   assert.deepEqual(entry.tags, ["arcade", "co-op"]);
@@ -36,6 +42,53 @@ test("invalid argument arrays fail before sending mutations", () => {
   for (const value of ["{}", "[1]", "[null]", '["ok", {}]', "not JSON"]) {
     assert.throws(() => model.parseArguments(value));
   }
+});
+
+test("application editor saves sparse FEC and executable lifecycle fields", () => {
+  const form = new FormData();
+  form.set("name", "Policy app");
+  form.set("kind", "executable");
+  form.set("path", "C:\\Games\\policy.exe");
+  form.set("arguments", '["--fullscreen"]');
+  form.set("working_directory", "");
+  form.set("wait_all", "on");
+  form.set("exit_timeout_seconds", "0");
+  form.set("fec_percentage", "37");
+  form.set("detached", "first --ordered\n\nsecond");
+  form.set(
+    "preparation",
+    JSON.stringify([{ run: { executable: "C:\\Tools\\prepare.exe" } }]),
+  );
+  const entry = ordinary(model.entryFromForm(form));
+  assert.deepEqual(entry.config_overrides, { fec_percentage: 37 });
+  assert.deepEqual(entry.launch, {
+    kind: "executable",
+    program: "C:\\Games\\policy.exe",
+    arguments: ["--fullscreen"],
+    working_directory: null,
+    auto_detach: false,
+    wait_all: true,
+    exit_timeout_seconds: 0,
+    detached: ["first --ordered", "second"],
+    preparation: [{ run: { executable: "C:\\Tools\\prepare.exe" } }],
+  });
+});
+
+test("blank FEC and timeout retain sparse inheritance and explicit bounds", () => {
+  assert.equal(model.parseFecOverride("  "), null);
+  assert.equal(model.parseExitTimeout(""), null);
+  assert.equal(model.parseExitTimeout("0"), 0);
+  assert.equal(model.parseExitTimeout("300"), 300);
+  assert.deepEqual(ordinary(model.parseDetachedCommands("one\n\n two ")), ["one", "two"]);
+  for (const value of ["0", "256", "1.5", "-1", "NaN"]) {
+    assert.throws(() => model.parseFecOverride(value));
+  }
+  for (const value of ["-1", "301", "1.5", "NaN"]) {
+    assert.throws(() => model.parseExitTimeout(value));
+  }
+  assert.throws(() => model.parseDetachedCommands(Array(17).fill("run").join("\n")));
+  assert.throws(() => model.parseDetachedCommands("bad\tcommand"));
+  assert.throws(() => model.parseDetachedCommands("é".repeat(1025)));
 });
 
 test("integer settings reject blank, fractional and unsafe integer values", () => {

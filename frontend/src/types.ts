@@ -15,18 +15,39 @@ namespace Amaterasu {
     scopes: string[];
     expires_at: number;
   }
-  export interface Launch {
-    kind: "application" | "executable";
-    path?: string;
-    program?: string;
-    arguments?: string[];
-    working_directory?: string | null;
+  export type Launch =
+    | { kind: "application"; path: string }
+    | {
+        kind: "executable";
+        program: string;
+        arguments?: string[];
+        working_directory?: string | null;
+        auto_detach?: boolean | null;
+        wait_all?: boolean | null;
+        exit_timeout_seconds?: number | null;
+        detached?: string[];
+        preparation?: PreparationStep[];
+      }
+    | { kind: "playnite"; game_id: string; exit_timeout_seconds: number };
+  export interface PreparationStep {
+    run: PreparationCommand;
+    undo?: PreparationCommand | null;
+  }
+  export interface PreparationCommand {
+    executable: string;
+    args?: string[];
+    environment?: Record<string, string>;
+    cwd?: string | null;
+    timeout_ms?: number;
   }
   export interface Entry {
     name: string;
     description: string;
     tags: string[];
     launch: Launch;
+    config_overrides?: {
+      fec_percentage?: number;
+    };
   }
   export interface CatalogRow {
     id: string;
