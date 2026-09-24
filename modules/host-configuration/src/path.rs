@@ -122,7 +122,7 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
@@ -187,8 +187,10 @@ mod tests {
         let root = temporary_root();
         fs::create_dir_all(&root).unwrap();
         let absolute = root.join("elsewhere").to_string_lossy().into_owned();
-        let mut document = Document::default();
-        document.log_path = absolute.clone();
+        let document = Document {
+            log_path: absolute.clone(),
+            ..Document::default()
+        };
         let effective = effective_settings(&document, &root.canonicalize().unwrap()).unwrap();
         assert_eq!(effective.log_path, absolute);
         fs::remove_dir_all(root).unwrap();
@@ -214,8 +216,10 @@ mod tests {
         let outside = temporary_root();
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join("redirect")).unwrap();
-        let mut document = Document::default();
-        document.log_path = "redirect/service.log".into();
+        let document = Document {
+            log_path: "redirect/service.log".into(),
+            ..Document::default()
+        };
         assert!(effective_settings(&document, &root.canonicalize().unwrap()).is_err());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();

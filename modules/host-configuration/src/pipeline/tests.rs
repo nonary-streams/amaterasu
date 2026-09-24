@@ -119,13 +119,11 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
             "log_path":"service.log","min_log_level":"warning"
         }),
     ));
-    let mut tick_number = 0;
     let mut state_read_revision = None;
     let mut state_write_payload = None;
     let mut completed = None;
 
-    for _ in 0..3 {
-        tick_number += 1;
+    for tick_number in 1..=3 {
         pipeline
             .tick(|command| match (tick_number, command) {
                 (1, Command::Poll {}) => Ok(incoming.take().unwrap_or(Response::Pending)),
