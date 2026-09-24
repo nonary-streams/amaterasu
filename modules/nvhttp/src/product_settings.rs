@@ -632,8 +632,8 @@ impl ProductSettings {
                                 self.queue_update_completion(
                                     request,
                                     self.settings_payload(),
-                                    require_listener_apply.then_some(port),
-                                    require_listener_apply.then_some(port),
+                                    (require_listener_apply && port_changed).then_some(port),
+                                    (require_listener_apply && port_changed).then_some(port),
                                 );
                             }
                         }
@@ -1203,6 +1203,37 @@ mod tests {
         assert_eq!(completion.payload["ok"], false);
         assert_eq!(completion.payload["code"], "listener_not_active");
         assert_eq!(completion.payload["persisted"], true);
+    }
+
+    #[test]
+    fn hostname_only_update_succeeds_without_waiting_for_rtsp_port_activation() {
+        let mut settings = ProductSettings::new("Computer Name".into(), settings::DEFAULT_PORT);
+        settings.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":2,"revision":1,
+                "values":{"hostname":"Old Host","port":47989}
+            }))
+            .unwrap(),
+        );
+        settings.finish_call(
+            Purpose::Update {
+                request: 12,
+                hostname: "New Host".into(),
+                port: 47_989,
+                expected_revision: 1,
+                require_listener_apply: true,
+            },
+            CallOutcome::Payload(json!({
+                "ok":true,"found":true,"version":2,"revision":2,
+                "values":{"hostname":"New Host","port":47989}
+            })),
+        );
+
+        let completion = settings.completions.front().unwrap();
+        assert_eq!(completion.payload["ok"], true);
+        assert_eq!(completion.payload["configured_hostname"], "New Host");
+        assert_eq!(completion.required_http_port, None);
+        assert_eq!(completion.required_rtsp_port, None);
     }
 
     #[test]
