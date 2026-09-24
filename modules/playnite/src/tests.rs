@@ -1,6 +1,47 @@
 use super::*;
 use serde_json::json;
 
+fn process(process_id: u32, path: &str) -> discovery::ProcessImage {
+    discovery::ProcessImage {
+        process_id,
+        path: path.into(),
+    }
+}
+
+#[test]
+fn immediate_stop_refresh_sees_restarted_playnite_during_discovery_throttle() {
+    let now = Instant::now();
+    let original = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let restarted = process(73, r"C:\Program Files\Playnite\Playnite.FullscreenApp.exe");
+    let mut last_discovery = discovery::Discovery {
+        running: true,
+        processes: vec![original.clone()],
+        executable_paths: vec![original.path.clone()],
+    };
+    let mut next_discovery = now + Duration::from_secs(2);
+    let mut discovery_calls = 0;
+
+    refresh_discovery_at(&mut last_discovery, &mut next_discovery, now, false, || {
+        discovery_calls += 1;
+        discovery::Discovery::default()
+    });
+    assert_eq!(discovery_calls, 0);
+    assert_eq!(last_discovery.processes, vec![original]);
+
+    refresh_discovery_at(&mut last_discovery, &mut next_discovery, now, true, || {
+        discovery_calls += 1;
+        discovery::Discovery {
+            running: true,
+            processes: vec![restarted.clone()],
+            executable_paths: vec![restarted.path.clone()],
+        }
+    });
+
+    assert_eq!(discovery_calls, 1);
+    assert_eq!(last_discovery.processes, vec![restarted]);
+    assert!(next_discovery > now);
+}
+
 #[test]
 fn settings_are_fixed_to_the_management_principal() {
     assert!(settings_caller_is_authorized("amaterasu.management"));

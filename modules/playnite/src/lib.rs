@@ -207,10 +207,25 @@ impl PlayniteModule {
     }
 
     fn refresh_discovery(&mut self) {
-        if Instant::now() >= self.next_discovery {
-            self.last_discovery = discovery::discover();
-            self.next_discovery = Instant::now() + Duration::from_secs(2);
-        }
+        refresh_discovery_at(
+            &mut self.last_discovery,
+            &mut self.next_discovery,
+            Instant::now(),
+            false,
+            discovery::discover,
+        );
+    }
+
+    fn refresh_discovery_for_stop(&mut self) {
+        // Stop/recovery needs the current PID after a Playnite restart. The launch
+        // coordinator still checks every refreshed path against the trusted install root.
+        refresh_discovery_at(
+            &mut self.last_discovery,
+            &mut self.next_discovery,
+            Instant::now(),
+            true,
+            discovery::discover,
+        );
     }
 
     fn poll_snapshot(&mut self) {
@@ -323,7 +338,7 @@ impl PlayniteModule {
                 ticket,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery();
+                self.refresh_discovery_for_stop();
                 let response = self.launches.stop(
                     &ticket,
                     exit_timeout_seconds,
@@ -336,7 +351,7 @@ impl PlayniteModule {
                 game_id,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery();
+                self.refresh_discovery_for_stop();
                 let response = self.launches.recover_stop(
                     &operation_id,
                     &game_id,
@@ -441,6 +456,19 @@ impl PlayniteModule {
             }
             response => Err(format!("Playnite request completion failed: {response:?}")),
         }
+    }
+}
+
+fn refresh_discovery_at(
+    last_discovery: &mut discovery::Discovery,
+    next_discovery: &mut Instant,
+    now: Instant,
+    force: bool,
+    discover: impl FnOnce() -> discovery::Discovery,
+) {
+    if force || now >= *next_discovery {
+        *last_discovery = discover();
+        *next_discovery = Instant::now() + Duration::from_secs(2);
     }
 }
 

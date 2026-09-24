@@ -162,7 +162,13 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             expected_revision,
         } => {
             check_revision(&document, expected_revision)?;
-            find_entry(&document, &id)?;
+            let existing = find_entry(&document, &id)?;
+            if matches!(&existing.launch, Launch::Playnite { .. }) {
+                return Err(error(
+                    "provider_entry_managed",
+                    "Playnite launch identity can only be changed by its provider",
+                ));
+            }
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;

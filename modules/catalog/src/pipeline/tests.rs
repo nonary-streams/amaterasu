@@ -1123,6 +1123,59 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
 }
 
 #[test]
+fn generic_management_update_cannot_replace_provider_owned_playnite_identity() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let imported = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(imported["ok"], true);
+    let id = "app-0000000000000001";
+    let original = backend.entries[id].clone();
+    let revision = backend.metadata["revision"].as_u64().unwrap();
+
+    let stale = backend.run_for(
+        &mut pipeline,
+        json!({
+            "action":"update",
+            "id":id,
+            "expected_revision":revision - 1,
+            "entry":entry("Forged executable replacement")
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+
+    let update = backend.run_for(
+        &mut pipeline,
+        json!({
+            "action":"update",
+            "id":id,
+            "expected_revision":revision,
+            "entry":entry("Forged executable replacement")
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(update["error"]["code"], "provider_entry_managed");
+    assert_eq!(backend.metadata["revision"], revision);
+    assert_eq!(backend.entries[id], original);
+    assert_eq!(
+        backend.entries[id]["launch"]["game_id"],
+        "a1b2c3d4-1234-5678-9abc-0123456789ab"
+    );
+}
+
+#[test]
 fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup() {
     let mut backend = Backend::default();
     let mut pipeline = playnite_importer();
