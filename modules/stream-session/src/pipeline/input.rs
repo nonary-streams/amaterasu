@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 const MAX_QUEUED_EVENTS: usize = 128;
 pub(super) const MAX_BATCH_EVENTS: usize = 64;
+const CONTROLLER_INPUT_SUPPORTED: bool = false;
 
 pub(super) fn configure_absolute_input(
     record: &mut Record,
@@ -46,9 +47,20 @@ pub(super) fn queue_control_input(
         record.rejected_controls = record.rejected_controls.saturating_add(1);
         return Ok(());
     }
+    // No current input backend advertises real virtual gamepad support. Keep
+    // these records unsupported at the stream boundary so they cannot poison a
+    // keyboard or mouse batch; the transport types still preserve their state.
+    if !CONTROLLER_INPUT_SUPPORTED && matches!(&input, Input::Controller(_)) {
+        record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+        return Ok(());
+    }
     let batch = match record.input_translator.translate(input) {
         Ok(batch) => batch,
         Err(TranslationError::InvalidPointer) => {
+            record.rejected_controls = record.rejected_controls.saturating_add(1);
+            return Ok(());
+        }
+        Err(TranslationError::InvalidController) => {
             record.rejected_controls = record.rejected_controls.saturating_add(1);
             return Ok(());
         }
@@ -341,5 +353,54 @@ fn event_payload(event: InputEvent) -> Value {
             },
             "amount": amount,
         }),
+        InputEvent::Controller(state) => json!({
+            "kind": "controller",
+            "number": state.number,
+            "active_mask": state.active_mask,
+            "buttons": state.buttons,
+            "left_trigger": state.left_trigger,
+            "right_trigger": state.right_trigger,
+            "left_x": state.left_x,
+            "left_y": state.left_y,
+            "right_x": state.right_x,
+            "right_y": state.right_y,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amaterasu_gamestream::control::ControllerState;
+
+    #[test]
+    fn controller_event_payload_preserves_each_decoded_field() {
+        let state = ControllerState {
+            number: 15,
+            active_mask: 0xa55a,
+            buttons: 0x89abcdef,
+            left_trigger: 0,
+            right_trigger: 255,
+            left_x: i16::MIN,
+            left_y: i16::MAX,
+            right_x: -1,
+            right_y: 1,
+        };
+
+        assert_eq!(
+            event_payload(InputEvent::Controller(state)),
+            json!({
+                "kind":"controller",
+                "number":15,
+                "active_mask":0xa55a,
+                "buttons":0x89abcdefu32,
+                "left_trigger":0,
+                "right_trigger":255,
+                "left_x":-32768,
+                "left_y":32767,
+                "right_x":-1,
+                "right_y":1,
+            })
+        );
     }
 }

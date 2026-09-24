@@ -86,6 +86,12 @@ impl Backend for WindowsBackend {
 
     fn validate(&self, event: &Event) -> InputResult<()> {
         event.validate()?;
+        if matches!(event, Event::Controller { .. }) {
+            return Err(InputError::new(
+                "unsupported_event",
+                "Windows SendInput does not create virtual gamepads",
+            ));
+        }
         if matches!(
             event,
             Event::Key {
@@ -297,6 +303,12 @@ fn native_input_with_plan(event: &Event, plan: KeyboardPlan) -> InputResult<INPU
             };
             mouse.mouseData = i32::from(*amount) as u32;
         }
+        Event::Controller { .. } => {
+            return Err(InputError::new(
+                "unsupported_event",
+                "Windows SendInput does not create virtual gamepads",
+            ));
+        }
         Event::Key { .. } => unreachable!("keyboard events handled above"),
     }
     Ok(INPUT {
@@ -345,6 +357,7 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{controller::Controller, model::Operation};
 
     fn key(code: u8, normalized: bool, state: KeyState) -> Event {
         Event::Key {
@@ -574,5 +587,58 @@ mod tests {
         let high_resolution = unsafe { high_resolution.Anonymous.mi };
         assert_eq!(high_resolution.mouseData as i32, -30);
         assert_eq!(high_resolution.dwFlags, MOUSEEVENTF_HWHEEL);
+    }
+
+    #[test]
+    fn send_input_rejects_controller_events_without_virtual_gamepad_support() {
+        let event = Event::Controller {
+            number: 0,
+            active_mask: 1,
+            buttons: 1,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        let backend = WindowsBackend::new(String::new());
+
+        assert_eq!(
+            backend.validate(&event).unwrap_err().code,
+            "unsupported_event"
+        );
+        assert_eq!(
+            native_input(&event).err().unwrap().code,
+            "unsupported_event"
+        );
+
+        let mut controller = Controller::new(backend, true);
+        let now = std::time::Instant::now();
+        let acquired = controller.handle(
+            "owner",
+            Operation::Acquire {
+                operation_id: None,
+                ttl_ms: Some(1000),
+            },
+            now,
+            &mut || Ok(()),
+        );
+        let lease = acquired["lease"].as_str().unwrap().to_owned();
+        let rejected = controller.handle(
+            "owner",
+            Operation::Batch {
+                lease: lease.clone(),
+                events: vec![event],
+            },
+            now,
+            &mut || Ok(()),
+        );
+        assert_eq!(rejected["error"]["code"], "unsupported_event");
+        assert!(rejected.get("accepted").is_none());
+
+        let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+        assert_eq!(status["lease"]["token"], lease);
+        assert_eq!(status["lease"]["pressed_count"], 0);
     }
 }

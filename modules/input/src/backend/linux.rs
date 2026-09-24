@@ -158,6 +158,7 @@ impl Backend for LinuxBackend {
         if matches!(
             event,
             Event::Absolute { .. }
+                | Event::Controller { .. }
                 | Event::Key {
                     key: Key::WindowsScan { .. },
                     ..
@@ -165,7 +166,7 @@ impl Backend for LinuxBackend {
         ) {
             return Err(InputError::new(
                 "unsupported_event",
-                "Linux requires evdev keys and relative pointer events; compositor-specific absolute mapping is unsupported",
+                "Linux requires evdev keys and relative pointer events; absolute pointer mapping and virtual gamepad injection are unsupported",
             ));
         }
         if let Event::Key { key, state } = event

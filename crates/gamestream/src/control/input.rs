@@ -39,7 +39,7 @@ pub enum Input<'a> {
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerState {
     pub number: u16,
     pub active_mask: u16,

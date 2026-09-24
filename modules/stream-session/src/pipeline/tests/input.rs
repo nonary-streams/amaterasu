@@ -68,6 +68,44 @@ fn synthetic_repeat_modifiers_survive_the_stream_session_wire_projection() {
     );
 }
 
+fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {
+    let mut payload = vec![0, 0, 0, 30, 0x0c, 0, 0, 0];
+    payload.extend_from_slice(&0x1au16.to_le_bytes());
+    payload.extend_from_slice(&15u16.to_le_bytes());
+    payload.extend_from_slice(&0xa55au16.to_le_bytes());
+    payload.extend_from_slice(&0x14u16.to_le_bytes());
+    payload.extend_from_slice(&0xcdefu16.to_le_bytes());
+    payload.extend_from_slice(&[0, 255]);
+    payload.extend_from_slice(&i16::MIN.to_le_bytes());
+    payload.extend_from_slice(&i16::MAX.to_le_bytes());
+    payload.extend_from_slice(&(-1i16).to_le_bytes());
+    payload.extend_from_slice(&1i16.to_le_bytes());
+    payload.extend_from_slice(&0x9cu16.to_le_bytes());
+    payload.extend_from_slice(&0x89abu16.to_le_bytes());
+    payload.extend_from_slice(&0x55u16.to_le_bytes());
+    crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload,
+        sequence,
+    }
+}
+
+#[test]
+fn controller_input_remains_unsupported_without_failing_an_active_stream() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    host.plane.borrow_mut().controls.push(controller_packet(1));
+    host.idle();
+
+    assert!(host.broker.input_events.is_empty());
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 1);
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert!(host.broker.input_lease.is_some());
+}
+
 fn relative(sequence: u64) -> crate::plane::ControlRecord {
     crate::plane::ControlRecord {
         message_type: 0x0206,

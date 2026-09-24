@@ -1,4 +1,4 @@
-use super::Input;
+use super::{ControllerState, Input};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyState {
@@ -51,6 +51,7 @@ pub enum InputEvent {
         axis: ScrollAxis,
         amount: i16,
     },
+    Controller(ControllerState),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -75,6 +76,7 @@ pub enum TranslationError {
     UnsupportedKeyboardEncoding,
     UnsupportedModifiers,
     InvalidPointer,
+    InvalidController,
 }
 
 /// An authoritative target rectangle in Windows virtual-desktop normalized
@@ -151,10 +153,13 @@ impl InputTranslator {
             Input::MouseButton { pressed, button } => self.button(pressed, button)?,
             Input::VerticalScroll { amount } => self.scroll(ScrollAxis::Vertical, amount),
             Input::HorizontalScroll { amount } => self.scroll(ScrollAxis::Horizontal, amount),
-            Input::Text(_)
-            | Input::Controller(_)
-            | Input::EnableHaptics { .. }
-            | Input::Unsupported { .. } => return Err(TranslationError::UnsupportedInput),
+            Input::Controller(state) if state.number < 16 => {
+                vec![InputEvent::Controller(state)]
+            }
+            Input::Controller(_) => return Err(TranslationError::InvalidController),
+            Input::Text(_) | Input::EnableHaptics { .. } | Input::Unsupported { .. } => {
+                return Err(TranslationError::UnsupportedInput);
+            }
         };
         debug_assert!(events.len() <= 7);
         Ok(InputBatch { events })
@@ -749,5 +754,36 @@ mod tests {
         assert_eq!(virtual_key_mapping(0xa3), Some(key(0x1d, true, 97)));
         assert_eq!(virtual_key_mapping(0x25), Some(key(0x4b, true, 105)));
         assert_eq!(virtual_key_mapping(0xff), None);
+    }
+
+    #[test]
+    fn controller_translation_preserves_full_state_and_rejects_invalid_slot() {
+        let state = ControllerState {
+            number: 15,
+            active_mask: 0xa55a,
+            buttons: 0x89abcdef,
+            left_trigger: 0,
+            right_trigger: 255,
+            left_x: i16::MIN,
+            left_y: i16::MAX,
+            right_x: -1,
+            right_y: 1,
+        };
+        let mut translator = InputTranslator::default();
+
+        assert_eq!(
+            translator
+                .translate(Input::Controller(state))
+                .unwrap()
+                .events(),
+            &[InputEvent::Controller(state)]
+        );
+        assert_eq!(
+            translator.translate(Input::Controller(ControllerState {
+                number: 16,
+                ..state
+            })),
+            Err(TranslationError::InvalidController)
+        );
     }
 }

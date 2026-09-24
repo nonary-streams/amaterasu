@@ -171,12 +171,41 @@ pub enum Axis {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
-    Key { key: Key, state: KeyState },
-    Button { button: Button, pressed: bool },
-    Relative { dx: i32, dy: i32 },
-    Absolute { x: u16, y: u16 },
-    Scroll { axis: Axis, steps: i32 },
-    ScrollUnits { axis: Axis, amount: i16 },
+    Key {
+        key: Key,
+        state: KeyState,
+    },
+    Button {
+        button: Button,
+        pressed: bool,
+    },
+    Relative {
+        dx: i32,
+        dy: i32,
+    },
+    Absolute {
+        x: u16,
+        y: u16,
+    },
+    Scroll {
+        axis: Axis,
+        steps: i32,
+    },
+    ScrollUnits {
+        axis: Axis,
+        amount: i16,
+    },
+    Controller {
+        number: u16,
+        active_mask: u16,
+        buttons: u32,
+        left_trigger: u8,
+        right_trigger: u8,
+        left_x: i16,
+        left_y: i16,
+        right_x: i16,
+        right_y: i16,
+    },
 }
 impl Event {
     pub fn enabled_by(&self, policy: DevicePolicy) -> bool {
@@ -187,6 +216,9 @@ impl Event {
             | Self::Absolute { .. }
             | Self::Scroll { .. }
             | Self::ScrollUnits { .. } => policy.mouse,
+            // Route controller records through the backend capability check;
+            // unsupported native backends reject the batch before it is applied.
+            Self::Controller { .. } => true,
         }
     }
 
@@ -238,6 +270,10 @@ impl Event {
             Self::ScrollUnits { amount, .. } if *amount == 0 => Err(InputError::new(
                 "invalid_event",
                 "high-resolution scroll units must be nonzero",
+            )),
+            Self::Controller { number, .. } if *number >= 16 => Err(InputError::new(
+                "invalid_event",
+                "controller number must be in the range 0..16",
             )),
             _ => Ok(()),
         }
@@ -510,5 +546,59 @@ mod tests {
                 state: KeyState::Down,
             }
         );
+    }
+
+    #[test]
+    fn controller_event_round_trips_all_bounded_wire_fields() {
+        let payload = json!({
+            "kind":"controller",
+            "number":15,
+            "active_mask":0xa55a,
+            "buttons":0x89abcdefu32,
+            "left_trigger":0,
+            "right_trigger":255,
+            "left_x":-32768,
+            "left_y":32767,
+            "right_x":-1,
+            "right_y":1,
+        });
+        let event: Event = serde_json::from_value(payload.clone()).unwrap();
+
+        assert_eq!(
+            event,
+            Event::Controller {
+                number: 15,
+                active_mask: 0xa55a,
+                buttons: 0x89abcdef,
+                left_trigger: 0,
+                right_trigger: 255,
+                left_x: -32768,
+                left_y: 32767,
+                right_x: -1,
+                right_y: 1,
+            }
+        );
+        assert!(event.validate().is_ok());
+        assert!(event.enabled_by(DevicePolicy::default()));
+        assert_eq!(serde_json::to_value(event).unwrap(), payload);
+    }
+
+    #[test]
+    fn controller_event_rejects_slots_outside_the_protocol_range() {
+        let event: Event = serde_json::from_value(json!({
+            "kind":"controller",
+            "number":16,
+            "active_mask":0,
+            "buttons":0,
+            "left_trigger":0,
+            "right_trigger":0,
+            "left_x":0,
+            "left_y":0,
+            "right_x":0,
+            "right_y":0,
+        }))
+        .unwrap();
+
+        assert_eq!(event.validate().unwrap_err().code, "invalid_event");
     }
 }
