@@ -4,10 +4,14 @@ use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySi
 use std::{
     ffi::c_void,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU16, Ordering},
+    },
 };
 
 static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TEST_BASE_PORT: AtomicU16 = AtomicU16::new(0);
 const TEST_BASE_PORT: u16 = 47_989;
 
 #[derive(Default)]
@@ -329,10 +333,33 @@ fn status_reports_all_bound_families_and_keeps_legacy_local_field() {
 }
 
 fn free_base_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port.saturating_sub(21).clamp(1_029, 65_514)
+    // On Windows, an ephemeral TCP port can sit in an excluded UDP range.
+    // Probe the actual RTSP and media ports before returning a base port.
+    let start = u32::from(NEXT_TEST_BASE_PORT.fetch_add(37, Ordering::Relaxed))
+        + std::process::id() % 18_000;
+    for offset in 0..1_000_u32 {
+        let base = 22_000 + ((start + offset * 37) % 18_000) as u16;
+        let rtsp_port = base + 21;
+        let Ok(_tcp_v4) = TcpListener::bind((Ipv4Addr::LOCALHOST, rtsp_port)) else {
+            continue;
+        };
+        let Ok(_tcp_v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, rtsp_port)) else {
+            continue;
+        };
+        let udp_v4 = (9..=11)
+            .map(|offset| UdpSocket::bind((Ipv4Addr::LOCALHOST, base + offset)))
+            .collect::<std::io::Result<Vec<_>>>();
+        let Ok(_udp_v4) = udp_v4 else {
+            continue;
+        };
+        let udp_v6 = (9..=11)
+            .map(|offset| UdpSocket::bind((Ipv6Addr::LOCALHOST, base + offset)))
+            .collect::<std::io::Result<Vec<_>>>();
+        if udp_v6.is_ok() {
+            return base;
+        }
+    }
+    panic!("no free RTSP test port range");
 }
 
 #[test]
