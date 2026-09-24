@@ -39,13 +39,15 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
 
 test("input policy editor preserves booleans and reports pending cleanup honestly", () => {
   const parsePolicy = context.Amaterasu.parseInputPolicy;
-  assert.deepEqual(ordinary(parsePolicy(false, true, false)), {
+  assert.deepEqual(ordinary(parsePolicy(false, true, false, false)), {
     keyboard: false,
     mouse: true,
     high_resolution_scrolling: false,
+    always_send_scancodes: false,
   });
-  assert.throws(() => parsePolicy("false", true, true));
-  assert.throws(() => parsePolicy(true, true, "false"));
+  assert.throws(() => parsePolicy("false", true, true, true));
+  assert.throws(() => parsePolicy(true, true, "false", true));
+  assert.throws(() => parsePolicy(true, true, true, "false"));
   const describe = context.Amaterasu.inputPolicyStatusDescription;
   const settings = {
     persisted: true,

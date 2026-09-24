@@ -268,12 +268,15 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(
                 object,
                 &["keyboard", "mouse", "expected_revision"],
-                &["high_resolution_scrolling"],
+                &["high_resolution_scrolling", "always_send_scancodes"],
             )?;
             if object.get("keyboard").and_then(Value::as_bool).is_none()
                 || object.get("mouse").and_then(Value::as_bool).is_none()
                 || object
                     .get("high_resolution_scrolling")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("always_send_scancodes")
                     .is_some_and(|value| value.as_bool().is_none())
                 || object
                     .get("expected_revision")
@@ -725,6 +728,7 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0}),
             serde_json::json!({"keyboard":false,"mouse":true,"expected_revision":u64::MAX}),
             serde_json::json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":false,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"always_send_scancodes":false,"expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_ok());
         }
@@ -735,6 +739,7 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0,"owner":"other"}),
             serde_json::json!({"keyboard":true,"mouse":false,"high_resolution_scrolling":"true","expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"high_resolution_scrolling":null,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"always_send_scancodes":"true","expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_err());
         }

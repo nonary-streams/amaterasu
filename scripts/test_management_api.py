@@ -337,13 +337,19 @@ def test_auth_and_crud(console, api):
     status, input_defaults, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and all(
         input_defaults["values"].get(key) is True
-        for key in ("keyboard", "mouse", "high_resolution_scrolling")
+        for key in (
+            "keyboard",
+            "mouse",
+            "high_resolution_scrolling",
+            "always_send_scancodes",
+        )
     ), input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
     input_policy_update = {
         "keyboard": False,
         "mouse": True,
         "high_resolution_scrolling": False,
+        "always_send_scancodes": False,
     }
     input_values = {**input_defaults["values"], **input_policy_update}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
@@ -355,6 +361,7 @@ def test_auth_and_crud(console, api):
         "keyboard": True,
         "mouse": True,
         "high_resolution_scrolling": True,
+        "always_send_scancodes": True,
         "expected_revision": input_defaults["revision"],
     }, administrator)
     assert status == 200 and input_conflict.get("error", {}).get("code") == "revision_conflict", input_conflict
@@ -363,8 +370,8 @@ def test_auth_and_crud(console, api):
     }, administrator)[0] == 400
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
-    # Legacy clients omit high_resolution_scrolling; their update must preserve
-    # the stored value while changing keyboard and mouse policy.
+    # Legacy clients omit both newer fields; the update must preserve their
+    # stored values while changing keyboard and mouse policy.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
         "keyboard": True, "mouse": True, "expected_revision": input_saved["revision"],
     }, administrator)
@@ -730,7 +737,7 @@ def main():
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy and restart persistence,")
     print("session restart invalidation,")
-    print("input keyboard/mouse/high-resolution scrolling CAS, legacy updates, restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input keyboard/mouse/scrolling/scancode CAS, legacy updates, restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

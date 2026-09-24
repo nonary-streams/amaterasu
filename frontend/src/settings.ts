@@ -24,17 +24,20 @@ namespace Amaterasu {
     keyboard: boolean,
     mouse: boolean,
     highResolutionScrolling: boolean,
+    alwaysSendScancodes: boolean,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
       typeof mouse !== "boolean" ||
-      typeof highResolutionScrolling !== "boolean"
+      typeof highResolutionScrolling !== "boolean" ||
+      typeof alwaysSendScancodes !== "boolean"
     )
-      throw new Error("Keyboard and mouse policy values must be enabled or disabled.");
+      throw new Error("Input policy values must be enabled or disabled.");
     return {
       keyboard,
       mouse,
       high_resolution_scrolling: highResolutionScrolling,
+      always_send_scancodes: alwaysSendScancodes,
     };
   }
 
@@ -1104,6 +1107,12 @@ namespace Amaterasu {
           "checkbox",
         );
         highResolutionScrolling.checked = settings.values.high_resolution_scrolling;
+        const alwaysSendScancodes = input(
+          "input_always_send_scancodes",
+          "",
+          "checkbox",
+        );
+        alwaysSendScancodes.checked = settings.values.always_send_scancodes;
         const status = el(
           "p",
           settings.applied ? "muted" : "error",
@@ -1128,6 +1137,11 @@ namespace Amaterasu {
             highResolutionScrolling,
             "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents.",
           ),
+          field(
+            "Always send scan codes",
+            alwaysSendScancodes,
+            "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping.",
+          ),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -1142,6 +1156,7 @@ namespace Amaterasu {
                     keyboard.checked,
                     mouse.checked,
                     highResolutionScrolling.checked,
+                    alwaysSendScancodes.checked,
                   ),
                   expected_revision: settings.revision,
                 },

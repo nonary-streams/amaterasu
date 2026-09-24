@@ -806,6 +806,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(high_resolution["high_resolution_scrolling"], false);
+        let scan_codes = payload(
+            update,
+            br#"{"keyboard":true,"mouse":false,"always_send_scancodes":false,"expected_revision":9}"#,
+        )
+        .unwrap();
+        assert_eq!(scan_codes["always_send_scancodes"], false);
         for rejected in [
             br#"{"keyboard":false,"mouse":true}"#.as_slice(),
             br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,

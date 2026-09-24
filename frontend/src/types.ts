@@ -177,6 +177,7 @@ namespace Amaterasu {
       keyboard: boolean;
       mouse: boolean;
       high_resolution_scrolling: boolean;
+      always_send_scancodes: boolean;
     };
   }
   export interface Session {
