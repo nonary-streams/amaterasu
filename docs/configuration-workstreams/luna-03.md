@@ -174,7 +174,9 @@ Reference evidence: pinned Vibeshine `src/config.h` defines `SUNSHINE_VIRTUAL_DI
 
 The service has no permanent-monitor creation backend. Product defaults and persistence, the reserved product-settings migration, management editing, per-application/per-client resolution and projection, and Windows qualification remain absent. Keep both IDs pending.
 
-Next slice: apply the configured permanent display count through the virtual-display driver protocol (runtime slice in progress). Then resume the pending `global:encoder` snapshot contract with Luna 02; preserve the v17 reservation and do not write foreign paths.
+The coordinator later confirmed the settings-boundary commits landed on main and directed this lane to continue only pending video-owned work. Permanent-monitor creation, persistence/projection, management authority, and Windows qualification remain pending with their owners; this lane did not start the driver-protocol runtime slice. Outbox `luna-03-0016-coordinator-main-landing.json` records the landing and direction.
+
+Next slice: correct the WGC timestamp path after tracing the existing capture controller's timestamp rewrite, then continue only with video/encode-owned work and confirmed interfaces.
 
 ## Slice 5: WGC source timestamp pacing
 
@@ -199,7 +201,7 @@ This slice covers `global:wgc_pacing_smoothing`, a global WGC pacing setting wit
 
 ### Behavior and evidence
 
-The capture plane now carries the source `CpuFrame.timestamp_us` alongside a local callback observation before the existing video timestamp and sequence are written into the encoder frame. WGC pacing pairs the first valid source timestamp with that local monotonic observation, then maps strictly increasing source deltas onto the stream-relative clock. Zero, duplicate, regressing, or unrepresentable source timestamps fall back to the local observation and start a fresh mapping. The existing snap window, hold limit, and encoder timestamp/sequence contract are unchanged.
+The initial candidate carried the available `CpuFrame.timestamp_us` alongside a local callback observation before video rewrote metadata for encoder submission. A later end-to-end trace found that `capture-wgc::Controller::stamp` had already replaced the WGC acquisition timestamp with a post-readback elapsed timestamp before it entered `CpuFrame`. Slice 5 therefore did not remove GPU readback delay from the source anchor; the follow-up v1.3 capture metadata extension is recorded in Slice 6. The source-clock mapper, fallback policy, snap window, hold limit, and encoder timestamp/sequence contract remain as described here.
 
 Pinned Vibeshine `src/platform/windows/display_base.cpp` anchors from `capture_pacing_timestamp`, falling back to the frame timestamp and then the local steady clock. Amaterasu's WGC capture records its timestamp at frame acquisition before readback; the local observation is sampled later at the video callback. Mapping source deltas removes callback/readback delay variation while preserving a monotonic epoch usable by the current video scheduler.
 
@@ -214,4 +216,50 @@ Pinned Vibeshine `src/platform/windows/display_base.cpp` anchors from `capture_p
 
 ### Remaining mismatches and next slice
 
-The current source path exposes global product persistence, management editing, and launch projection in foreign-owned `modules/nvhttp` paths; those consumers were inspected read-only and still need integration-owner confirmation. No per-application or per-client scope is assigned to this setting. Keep `global:wgc_pacing_smoothing` pending until its tests run and the Windows WGC runtime is qualified. Next slice: implement the configured permanent display count over the pinned Windows driver protocol, independent of temporary-display leases; keep the `global:encoder` selection contract request pending with Luna 02.
+The current source path exposes global product persistence, management editing, and launch projection in foreign-owned `modules/nvhttp` paths; those consumers were inspected read-only and still need integration-owner confirmation. No per-application or per-client scope is assigned to this setting. Slice 6 supplies the true WGC acquisition timestamp for the current v1.3 provider, but `global:wgc_pacing_smoothing` remains pending until tests run and Windows WGC runtime behavior is qualified. Older providers using v1.0-v1.2 retain the legacy post-readback timestamp fallback.
+
+## Slice 6: WGC acquisition timestamp ABI
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `02e4c438fe6888b7fc802f9d4588c2cbd7e2d8eb`
+- Candidate code SHA: `690cf08973e26fcdce69af72adb09ace2376deb8`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This slice completes the source-timestamp handoff needed by `global:wgc_pacing_smoothing` on the current WGC provider. It adds an optional additive capture API v1.3 metadata path; the ID remains `pending` until tests execute and Windows WGC behavior is qualified.
+
+### Changed paths
+
+- `crates/media/src/lib.rs`
+- `crates/media/src/tests.rs`
+- `modules/capture-wgc/README.md`
+- `modules/capture-wgc/src/controller.rs`
+- `modules/capture-wgc/src/model.rs`
+- `modules/capture-wgc/src/native.rs`
+- `modules/capture-wgc/src/readback.rs`
+- `modules/capture-wgc/src/tests.rs`
+- `modules/capture-wgc/src/worker.rs`
+- `modules/video/src/plane.rs`
+
+### Behavior and evidence
+
+WGC samples its acquisition timestamp before D3D11 readback and retains that value through `PendingTexture`, `Frame`, and the controller. Controller-generated `CpuFrame.timestamp_us` and sequence remain unchanged. The v1.3 capture table appends a callback that returns the acquisition timestamp beside the unchanged `CpuFrame`; the v1.0-v1.2 structures and table prefixes keep their original layouts. Video uses the v1.3 metadata callback when the advertised minor and table size both permit it, otherwise it falls back to the v1.2 freshness callback or the v1.0 frame prefix.
+
+Video pacing consumes the separate acquisition timestamp only for a fresh WGC frame. Cached reuse does not set a new arrival or re-anchor. Encoder submission still receives the video-generated timestamp and sequence, independent of capture pacing metadata.
+
+### Review and validation
+
+- Implementation worker: `/root/encode_inventory`, `gpt-6-luna` / `xhigh`; implemented the v1.3 media/capture/video path in the listed files.
+- Independent reviewer: `/root/review_virtual_display`, `gpt-6-luna` / `xhigh`; found no correctness or parity issue. It noted the lower-version negotiation test gap, which the parent addressed with a v1.0-v1.3 factory acceptance test.
+- Parent added that compatibility test and updated the WGC README to document the v1.3 callback.
+- Passed `rustfmt --edition 2024 --check crates/media/src/lib.rs crates/media/src/tests.rs modules/capture-wgc/src/controller.rs modules/capture-wgc/src/model.rs modules/capture-wgc/src/native.rs modules/capture-wgc/src/readback.rs modules/capture-wgc/src/tests.rs modules/capture-wgc/src/worker.rs modules/video/src/plane.rs` and `git diff --check` before commit.
+- Added tests cover ABI v1.3 sizes/offsets and sink validation, WGC source timestamp retention through controller timestamp rewriting and cached reuse, older v1.2 prefix usability, v1.0-v1.3 minimum query negotiation, and video pacing/encoder metadata separation. Cargo tests, builds, and Clippy were not run because this lightweight worktree is reserved for source-only work.
+- No Windows WGC runtime qualification was run.
+
+### Remaining mismatches and next slice
+
+Global product persistence, management editing, and launch projection for `global:wgc_pacing_smoothing` are in foreign-owned paths and need integration-owner confirmation; the ID is global-only in the assigned inventory. Providers limited to v1.0-v1.2 cannot supply a separate acquisition timestamp and retain the prior compatible fallback. Tests and Windows qualification remain outstanding. No additional self-contained video/encode setting candidate emerged without the pending capture/encoder snapshot and provider contracts; continue only when those interfaces or another video-owned runtime gap is confirmed. Keep the `global:encoder` contract request pending with Luna 02.
