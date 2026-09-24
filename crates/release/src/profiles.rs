@@ -138,11 +138,11 @@ const AUTHENTICATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.authentication",
     library: "amaterasu_authentication",
     provides: &["amaterasu.authentication/1"],
-    calls: &["amaterasu.state/1"],
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.state"],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration", "amaterasu.state"],
 };
 
 const PAIRING: ComponentDefinition = ComponentDefinition {

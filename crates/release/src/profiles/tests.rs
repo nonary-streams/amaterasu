@@ -224,7 +224,9 @@ fn installer_policy_enables_only_the_loopback_control_plane() {
 }
 
 #[test]
-fn authentication_token_ttls_are_durable_profile_settings() {
+fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_reload() {
+    assert!(AUTHENTICATION.calls.contains(&"amaterasu.configuration/1"));
+    assert!(AUTHENTICATION.dependencies.contains(&CONFIGURATION.id));
     let root =
         std::env::temp_dir().join(format!("amaterasu-auth-ttl-profile-{}", std::process::id()));
     let development = development_policy(&root).unwrap();
@@ -237,6 +239,11 @@ fn authentication_token_ttls_are_durable_profile_settings() {
         ),
     ] {
         let settings = &policy.settings["amaterasu.authentication"];
+        assert!(
+            policy.principals[AUTHENTICATION.id]
+                .call
+                .contains("amaterasu.configuration/1")
+        );
         assert_eq!(settings["session_token_ttl_seconds"], 7200);
         assert_eq!(settings["remember_me_refresh_token_ttl_seconds"], 604800);
 
