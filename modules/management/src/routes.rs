@@ -705,6 +705,31 @@ mod tests {
             });
             assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
         }
+        for bitrate in [
+            serde_json::Value::Null,
+            serde_json::json!(-2_147_483_648_i64),
+            serde_json::json!(0),
+            serde_json::json!(100_000),
+            serde_json::json!(2_147_483_647_i64),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room", "port":47989, "expected_revision":2,
+                "max_bitrate":bitrate,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for bitrate in [
+            serde_json::json!(-2_147_483_649_i64),
+            serde_json::json!(2_147_483_648_i64),
+            serde_json::json!(123.5),
+            serde_json::json!("5000"),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room", "port":47989, "expected_revision":2,
+                "max_bitrate":bitrate,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
+        }
         for output_name in [
             serde_json::json!(" "),
             serde_json::json!(" DISPLAY1"),

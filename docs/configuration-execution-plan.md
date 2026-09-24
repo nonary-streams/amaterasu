@@ -59,8 +59,14 @@ endpoint serves fixed-size image chunks; the catalog editor assembles and
 displays those chunks with revision and size checks. This covers local artwork
 discovery and browser display, while remote artwork sources and platform
 qualification remain pending. Manual catalog entries can preserve explicit
-Steam ID and install-directory metadata, but live process association still
-needs its runtime and platform gates.
+Steam ID and install-directory metadata. On Linux, a launch snapshots a
+baseline of same-user processes and associates new process identities only
+with executable or working-directory evidence inside the canonical install
+tree, plus their descendants. Stop signals only tracked identities through
+pidfds after revalidation; the Steam launcher/client is never signaled.
+Without a usable install directory, liveness remains unknown and stop only
+releases the stream. Linux runtime qualification, Windows Steam process
+tracking, and Gamescope handoff remain pending.
 
 The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
 IPv4 and IPv6 listeners can coexist where the startup policy requests both.
@@ -109,6 +115,16 @@ editor preserves raw 0..64 selections while reporting the effective fallback.
 Platform UDP segmentation offload and its compatibility behavior remain
 pending.
 
+The `max_bitrate` host option now stores a signed raw value in product document
+v8. Positive values cap Amaterasu's initial configured stream bitrate; zero and
+negative values mean no configured cap. The current encoder profile accepts
+100..100,000 kbps, so a positive cap below 100 kbps rejects the launch rather
+than exceeding the configured cap. Vibeshine's live `/bitrate` update, higher
+absolute ceiling, client-requested bitrate parsing, and encoder-specific
+range behavior remain pending. The
+`minimum_fps_target` source initializer is 20 even though its documentation
+lists zero. Its capture wait and duplicate-frame behavior remains pending.
+
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when
 the operating system rejects a release. High-resolution scrolling now
@@ -132,8 +148,10 @@ and zero disables this policy. Recent-selection cleanup can require a bounded
 replacement count, with both policies tied to a revision-checked provider
 inventory and reason-specific, replay-safe tombstones. Typed GUID launches use
 authenticated extension IPC and hold the session lease until correlated stop
-proof. Focus behavior, process verification, fullscreen entry, and extension
-management remain pending.
+proof. Windows focus retries use authenticated game-status metadata, exact
+executable matching when supplied, and a fixed bounded deadline with
+cancellation on stop. Fullscreen entry, extension management, and complete
+Windows process verification remain pending.
 
 Lutris now imports complete current-user Linux library snapshots with
 exclusions and optional Steam deduplication. Lutris settings and status have a

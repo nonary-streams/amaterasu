@@ -348,6 +348,7 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
                     "focus_attempts",
                     "focus_timeout_secs",
                     "focus_exit_on_first",
+                    "fullscreen_entry_enabled",
                     "sync_all_installed",
                     "recent_games",
                     "recent_max_age_days",
@@ -371,6 +372,7 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
                 "autosync_remove_uninstalled",
                 "autosync_require_replacement",
                 "focus_exit_on_first",
+                "fullscreen_entry_enabled",
                 "sync_all_installed",
             ] {
                 if object
@@ -882,6 +884,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "stream_audio",
                     "capture",
                     "video_max_batch_size_kb",
+                    "max_bitrate",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -944,6 +947,14 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             if object.get("video_max_batch_size_kb").is_some_and(|value| {
                 !value.is_null() && !value.as_u64().is_some_and(|size| size <= 64)
+            }) {
+                return Err(INVALID);
+            }
+            if object.get("max_bitrate").is_some_and(|value| {
+                !value.is_null()
+                    && !value
+                        .as_i64()
+                        .is_some_and(|bitrate| i32::try_from(bitrate).is_ok())
             }) {
                 return Err(INVALID);
             }
@@ -1280,6 +1291,7 @@ mod playnite_tests {
             "focus_attempts":2147483647,
             "focus_timeout_secs":2147483647,
             "focus_exit_on_first":false,
+            "fullscreen_entry_enabled":false,
             "recent_games":0,
             "recent_max_age_days":36500,
             "sync_categories":["Action", "RPG"],
@@ -1304,6 +1316,7 @@ mod playnite_tests {
             serde_json::json!({"enabled":false,"expected_revision":0,"focus_attempts":2147483648_u64}),
             serde_json::json!({"enabled":false,"expected_revision":0,"focus_timeout_secs":-1}),
             serde_json::json!({"enabled":false,"expected_revision":0,"focus_exit_on_first":"false"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"fullscreen_entry_enabled":"false"}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_games":10001}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_max_age_days":36501}),
             serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":"Action"}),

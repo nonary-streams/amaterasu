@@ -248,6 +248,16 @@ test("video batch size editor preserves default and bounded reference values", (
     assert.throws(() => parse(invalid));
 });
 
+test("maximum bitrate editor preserves signed source values and reset", () => {
+  const parse = context.Amaterasu.parseMaxBitrate;
+  assert.equal(parse(""), null);
+  assert.equal(parse("0"), 0);
+  assert.equal(parse("-2147483648"), -2147483648);
+  assert.equal(parse("2147483647"), 2147483647);
+  for (const value of ["+1", "01", "-0", "1.5", "2147483648", "-2147483649", "Infinity"])
+    assert.throws(() => parse(value));
+});
+
 test("Steam exclusions preserve valid ID and name objects without normalization", () => {
   const exclusions = [
     { id: "730", name: "Counter-Strike 2" },

@@ -172,6 +172,16 @@ namespace Amaterasu {
     return size;
   }
 
+  export function parseMaxBitrate(value: string): number | null {
+    if (value.trim() === "") return null;
+    if (!/^(0|-?[1-9][0-9]*)$/.test(value))
+      throw new Error("Maximum bitrate must be a signed 32-bit whole number in kbps.");
+    const bitrate = Number(value);
+    if (!Number.isInteger(bitrate) || bitrate < -2_147_483_648 || bitrate > 2_147_483_647)
+      throw new Error("Maximum bitrate must be a signed 32-bit whole number in kbps.");
+    return bitrate;
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -1499,6 +1509,13 @@ namespace Amaterasu {
         videoBatchSize.max = "64";
         videoBatchSize.step = "1";
         videoBatchSize.placeholder = "Default (64)";
+        const maxBitrate = input(
+          "max_bitrate",
+          settings.configured_max_bitrate === null
+            ? ""
+            : String(settings.configured_max_bitrate),
+        );
+        maxBitrate.placeholder = "No host cap";
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1537,6 +1554,11 @@ namespace Amaterasu {
             videoBatchSize,
             `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`,
           ),
+          field(
+            "Maximum bitrate (kbps)",
+            maxBitrate,
+            `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`,
+          ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           el(
             "p",
@@ -1564,6 +1586,7 @@ namespace Amaterasu {
               output_name: parseOutputNameSelection(outputName.value),
               stream_audio: streamAudio.checked,
               video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
+              max_bitrate: parseMaxBitrate(maxBitrate.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");
