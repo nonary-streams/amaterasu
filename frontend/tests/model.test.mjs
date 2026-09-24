@@ -133,6 +133,7 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     fec_percentage: null,
     stream_audio: null,
     audio_sink: null,
+    virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: null,
   });
@@ -140,6 +141,7 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     fec_percentage: 37,
     stream_audio: false,
     audio_sink: null,
+    virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: null,
   });
@@ -147,6 +149,7 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     fec_percentage: null,
     stream_audio: null,
     audio_sink: null,
+    virtual_sink: null,
     audio_sink_capture_only: false,
     back_button_timeout: null,
   });
@@ -154,6 +157,7 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     fec_percentage: null,
     stream_audio: null,
     audio_sink: null,
+    virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: -1,
   });
@@ -161,6 +165,11 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.equal(model.parseAudioSinkCaptureOnlyOverride("true"), true);
   assert.equal(model.parseAudioSinkCaptureOnlyOverride("false"), false);
   assert.throws(() => model.parseAudioSinkCaptureOnlyOverride("False"));
+  assert.equal(model.parseVirtualSinkOverride("inherit", ""), null);
+  assert.equal(model.parseVirtualSinkOverride("automatic", "ignored"), "");
+  assert.equal(model.parseVirtualSinkOverride("specific", "Steam Virtual Speakers"), "Steam Virtual Speakers");
+  assert.throws(() => model.parseVirtualSinkOverride("specific", "bad\nselector"));
+  assert.throws(() => model.parseVirtualSinkOverride("specific", "x".repeat(4097)));
   assert.equal(model.parseStreamAudioOverride(""), null);
   assert.equal(model.parseStreamAudioOverride("true"), true);
   assert.equal(model.parseStreamAudioOverride("false"), false);
@@ -178,6 +187,12 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.deepEqual(ordinary(model.entryFromForm(audioOnly).config_overrides), {
     stream_audio: false,
     audio_sink_capture_only: false,
+  });
+  audioOnly.set("virtual_sink_mode", "automatic");
+  assert.deepEqual(ordinary(model.entryFromForm(audioOnly).config_overrides), {
+    stream_audio: false,
+    audio_sink_capture_only: false,
+    virtual_sink: "",
   });
   assert.equal(model.parseExitTimeout(""), null);
   assert.equal(model.parseExitTimeout("0"), 0);

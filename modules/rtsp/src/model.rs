@@ -408,6 +408,10 @@ pub struct Open {
     #[serde(default)]
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
     pub capture: Capture,
     #[serde(default)]
@@ -462,9 +466,24 @@ impl Open {
             return Err("constant_rate_requires_wgc");
         }
         if !valid_label(&self.capture.output, 512)
-            || !valid_label(&self.capture.audio_endpoint, 4096)
+            || (!self.capture.audio_endpoint.is_empty()
+                && !valid_label(&self.capture.audio_endpoint, 4096))
         {
             return Err("invalid_profile");
+        }
+        match (&self.virtual_sink, self.channels) {
+            (None, None) if valid_label(&self.capture.audio_endpoint, 4096) => {}
+            (None, _) => return Err("invalid_virtual_sink_channels"),
+            (Some(selector), Some(channels))
+                if selector.len() <= 4096
+                    && !selector.chars().any(char::is_control)
+                    && matches!(channels, 2 | 6 | 8)
+                    && self.capture.audio_endpoint.is_empty()
+                    && !self.capture_sink_without_routing => {}
+            (Some(_), _) => return Err("invalid_virtual_sink_channels"),
+        }
+        if self.stream_audio && self.channels.is_some_and(|channels| channels != 2) {
+            return Err("unsupported_audio_channels");
         }
         Ok(())
     }
@@ -534,6 +553,8 @@ impl Open {
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
                 "capture_sink_without_routing": self.capture_sink_without_routing,
+                "virtual_sink": self.virtual_sink,
+                "channels": self.channels,
                 "back_button_timeout": self.back_button_timeout,
                 "device_name": self.device_name,
                 "configuration": {
@@ -1235,6 +1256,35 @@ mod tests {
             selected_timeout.arm(42)["configuration"]["back_button_timeout"],
             -1
         );
+    }
+
+    #[test]
+    fn virtual_sink_selection_and_stereo_layout_reach_stream_session() {
+        let mut value = open_json();
+        value["capture"]["audio_endpoint"] = json!("");
+        value["virtual_sink"] = json!("Steam Streaming Speakers");
+        value["channels"] = json!(2);
+        let request: Open = serde_json::from_value(value).unwrap();
+        assert!(request.validate(false).is_ok());
+        let configuration = request.arm(41)["configuration"].clone();
+        assert_eq!(configuration["audio_endpoint"], "");
+        assert_eq!(configuration["virtual_sink"], "Steam Streaming Speakers");
+        assert_eq!(configuration["channels"], 2);
+
+        for channels in [4, 6, 8] {
+            let mut value = open_json();
+            value["capture"]["audio_endpoint"] = json!("");
+            value["virtual_sink"] = json!("Steam Streaming Speakers");
+            value["channels"] = json!(channels);
+            let request: Open = serde_json::from_value(value).unwrap();
+            let expected = if channels == 4 {
+                "invalid_virtual_sink_channels"
+            } else {
+                // RTSP/media packetization is currently stereo-only.
+                "unsupported_audio_channels"
+            };
+            assert_eq!(request.validate(false), Err(expected));
+        }
     }
 
     #[test]

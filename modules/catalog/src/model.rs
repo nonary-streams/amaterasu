@@ -63,6 +63,8 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink_capture_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
@@ -83,6 +85,13 @@ impl ConfigOverrides {
         {
             return Err("audio_sink must be a bounded endpoint ID without controls");
         }
+        if self
+            .virtual_sink
+            .as_deref()
+            .is_some_and(|selector| selector.len() > 4096 || selector.chars().any(char::is_control))
+        {
+            return Err("virtual_sink must be a bounded device selector without controls");
+        }
         Ok(())
     }
 
@@ -90,6 +99,7 @@ impl ConfigOverrides {
         self.fec_percentage.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
+            && self.virtual_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
     }
@@ -544,6 +554,35 @@ mod tests {
             let override_value: ConfigOverrides =
                 serde_json::from_value(json!({"audio_sink":endpoint})).unwrap();
             assert!(override_value.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn virtual_sink_override_preserves_inherit_empty_and_exact_selector() {
+        let inherited = ConfigOverrides::default();
+        assert_eq!(inherited.virtual_sink, None);
+        assert!(inherited.is_empty());
+
+        for selector in [
+            "",
+            "Steam Streaming Speakers",
+            "{0.0.1.00000000}.{endpoint-guid}",
+        ] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"virtual_sink":selector})).unwrap();
+            assert_eq!(overrides.virtual_sink.as_deref(), Some(selector));
+            assert!(overrides.validate().is_ok());
+            assert!(!overrides.is_empty());
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap()["virtual_sink"],
+                selector
+            );
+        }
+
+        for selector in ["bad\nselector", &"x".repeat(4097)] {
+            let overrides: ConfigOverrides =
+                serde_json::from_value(json!({"virtual_sink":selector})).unwrap();
+            assert!(overrides.validate().is_err());
         }
     }
 

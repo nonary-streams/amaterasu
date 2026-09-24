@@ -224,8 +224,31 @@ stream-session to input lease acquisition. Explicit negative values, including
 `-1`, disable the Back timeout; an absent value lets input use its durable global
 policy and snapshot it when the lease starts.
 
-Amaterasu does not currently model `virtual_sink`, so it cannot apply Vibeshine's
-virtual-sink exclusion. That runtime condition remains incomplete.
+## Virtual audio sink
+
+Product document v15 stores nullable `virtual_sink`; documents v1 through v14
+migrate with it unset. Settings reads return `configured_virtual_sink`. An
+omitted update preserves it, `null` clears it, and a string up to 4096 bytes
+without control characters is stored exactly, including explicit empty. Signed
+management settings expose the same distinction.
+
+Each new stream resolves the authenticated client's selector, then the
+application selector, then the global selector. A scoped explicit empty string
+clears inherited managed selection and resumes regular endpoint precedence. A
+nonempty selector overrides regular endpoint choices and is forwarded through
+RTSP and stream-session to AudioCapture with an empty regular endpoint and
+`channels: 2`; the global capture-only preference remains stored, but the
+effective capture-only flag is false for virtual capture. Windows selection
+matches exact ID, friendly name, device description, then adapter name. An
+unavailable selected device fails without falling back.
+
+The current stream transport and Opus encoder support stereo only. Although the
+AudioCapture backend accepts 5.1 and 7.1 layouts, this path cannot yet packetize
+those layouts. Amaterasu also has no host-audio toggle or complete source fallback
+that selects the default Steam virtual endpoint when host audio is disabled or
+the regular endpoint is empty. Thus an explicit empty selector is preserved, but
+does not trigger that Sunshine fallback. Full cross-platform virtual-sink parity
+and surround streaming remain incomplete.
 
 ## Global video batch allowance
 

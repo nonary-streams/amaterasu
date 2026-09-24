@@ -34,10 +34,11 @@ namespace Amaterasu {
     return timeout;
   }
 
-  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = ""): {
+  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = ""): {
     fec_percentage: number | null;
     stream_audio: boolean | null;
     audio_sink: string | null;
+    virtual_sink: string | null;
     audio_sink_capture_only: boolean | null;
     back_button_timeout: number | null;
   } {
@@ -45,6 +46,7 @@ namespace Amaterasu {
       fec_percentage: parseFecOverride(value),
       stream_audio: parseStreamAudioOverride(streamAudioValue),
       audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
+      virtual_sink: parseVirtualSinkOverride(virtualSinkMode, virtualSinkSelector),
       audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
       back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
     };
@@ -59,6 +61,17 @@ namespace Amaterasu {
       /[\u0000-\u001f\u007f-\u009f]/.test(endpoint)
     ) throw new Error("Choose an audio endpoint ID of at most 4096 UTF-8 bytes without control characters.");
     return endpoint;
+  }
+
+  export function parseVirtualSinkOverride(mode: string, selector: string): string | null {
+    if (mode === "inherit") return null;
+    if (mode === "automatic") return "";
+    if (
+      mode !== "specific" || selector.length === 0 ||
+      new TextEncoder().encode(selector).length > 4096 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(selector)
+    ) throw new Error("Choose a virtual sink selector of at most 4096 UTF-8 bytes without control characters.");
+    return selector;
   }
 
   export function parseStreamAudioOverride(value: string): boolean | null {
@@ -169,16 +182,18 @@ namespace Amaterasu {
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
     const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
     const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
+    const virtualSink = parseVirtualSinkOverride(text("virtual_sink_mode") || "inherit", String(data.get("virtual_sink_selector") ?? ""));
     const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
+      fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
             ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
             ...(audioSink === null ? {} : { audio_sink: audioSink }),
+            ...(virtualSink === null ? {} : { virtual_sink: virtualSink }),
             ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
             ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
           };

@@ -45,6 +45,8 @@ pub struct Record {
     pub global_stream_audio: bool,
     pub global_audio_sink_capture_only: bool,
     pub global_configured_audio_sink: Option<String>,
+    pub global_configured_virtual_sink: Option<String>,
+    pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
     /// Sparse client-over-application timeout override captured for this launch.
     /// Input resolves `None` against its authoritative global policy at acquire.
@@ -101,6 +103,7 @@ impl Record {
         global_stream_audio: bool,
         global_audio_sink_capture_only: bool,
         global_configured_audio_sink: Option<String>,
+        global_configured_virtual_sink: Option<String>,
         global_ping_timeout_ms: u32,
         global_video_max_batch_size_kb: u8,
         global_max_bitrate_kbps: Option<u32>,
@@ -126,6 +129,8 @@ impl Record {
             global_stream_audio,
             global_audio_sink_capture_only,
             global_configured_audio_sink,
+            global_configured_virtual_sink,
+            resolved_virtual_sink: None,
             capture_sink_without_routing: false,
             scoped_back_button_timeout: None,
             global_ping_timeout_ms,

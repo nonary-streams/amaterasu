@@ -162,6 +162,11 @@ impl Router {
         self.launches.set_audio_sink_settings(configured_audio_sink);
     }
 
+    pub fn set_virtual_sink_settings(&mut self, configured_virtual_sink: Option<&str>) {
+        self.launches
+            .set_virtual_sink_settings(configured_virtual_sink);
+    }
+
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
         self.launches.set_audio_sink_capture_only(enabled);
     }
@@ -543,6 +548,7 @@ pub(super) struct ClientConfigOverrides {
     pub(super) fec_percentage: Option<u8>,
     pub(super) stream_audio: Option<bool>,
     pub(super) audio_sink: Option<String>,
+    pub(super) virtual_sink: Option<String>,
     pub(super) audio_sink_capture_only: Option<bool>,
     pub(super) back_button_timeout: Option<i32>,
 }

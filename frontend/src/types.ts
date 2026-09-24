@@ -53,6 +53,7 @@ namespace Amaterasu {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;
+      virtual_sink?: string;
       audio_sink_capture_only?: boolean;
       back_button_timeout?: number;
     };
@@ -102,6 +103,7 @@ namespace Amaterasu {
     configured_ping_timeout_ms: number | null;
     effective_ping_timeout_ms: number;
     configured_audio_sink: string | null;
+    configured_virtual_sink: string | null;
     audio_sink_capture_only: boolean;
     configured_external_ip: string | null;
     effective_audio_sink: string;
@@ -218,6 +220,7 @@ namespace Amaterasu {
       fec_percentage?: number;
       stream_audio?: boolean;
       audio_sink?: string;
+      virtual_sink?: string;
       audio_sink_capture_only?: boolean;
       back_button_timeout?: number;
     };

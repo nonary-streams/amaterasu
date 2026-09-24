@@ -23,7 +23,8 @@ const WGC_PACING_SMOOTHING_SETTINGS_VERSION: u64 = 11;
 const EXTERNAL_IP_SETTINGS_VERSION: u64 = 12;
 const PING_TIMEOUT_SETTINGS_VERSION: u64 = 13;
 const AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION: u64 = 14;
-const SETTINGS_VERSION: u64 = AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION;
+const VIRTUAL_SINK_SETTINGS_VERSION: u64 = 15;
+const SETTINGS_VERSION: u64 = VIRTUAL_SINK_SETTINGS_VERSION;
 const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const DEFAULT_PING_TIMEOUT_MS: u32 = 10_000;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
@@ -41,6 +42,7 @@ pub enum AdminAction {
         bind_address: FieldUpdate<String>,
         output_name: FieldUpdate<String>,
         audio_sink: FieldUpdate<String>,
+        virtual_sink: FieldUpdate<String>,
         audio_sink_capture_only: FieldUpdate<bool>,
         external_ip: FieldUpdate<String>,
         stream_audio: FieldUpdate<bool>,
@@ -118,6 +120,7 @@ enum Purpose {
         target: NetworkTarget,
         output_name: Option<String>,
         audio_sink: Option<String>,
+        virtual_sink: Option<String>,
         audio_sink_capture_only: bool,
         external_ip: Option<String>,
         stream_audio: bool,
@@ -157,6 +160,7 @@ struct ProductDocument {
     bind_address: Option<String>,
     output_name: Option<String>,
     audio_sink: Option<String>,
+    virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
     external_ip: Option<String>,
     stream_audio: bool,
@@ -171,6 +175,7 @@ struct ProductDocument {
 #[derive(Clone)]
 struct ProductStreamingSettings {
     audio_sink: Option<String>,
+    virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
     external_ip: Option<String>,
     stream_audio: bool,
@@ -197,6 +202,7 @@ pub struct ProductSettings {
     configured_bind_address: Option<String>,
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
+    configured_virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
     configured_external_ip: Option<String>,
     configured_capture: CaptureMode,
@@ -295,6 +301,7 @@ impl ProductSettings {
             configured_bind_address: None,
             configured_output_name: None,
             configured_audio_sink: None,
+            configured_virtual_sink: None,
             audio_sink_capture_only: false,
             configured_external_ip: None,
             configured_capture: CaptureMode::Auto,
@@ -340,6 +347,10 @@ impl ProductSettings {
 
     pub fn configured_audio_sink(&self) -> Option<&str> {
         self.configured_audio_sink.as_deref()
+    }
+
+    pub fn configured_virtual_sink(&self) -> Option<&str> {
+        self.configured_virtual_sink.as_deref()
     }
 
     pub fn audio_sink_capture_only(&self) -> bool {
@@ -889,6 +900,7 @@ impl ProductSettings {
                 bind_address,
                 output_name,
                 audio_sink,
+                virtual_sink,
                 audio_sink_capture_only,
                 external_ip,
                 stream_audio,
@@ -939,6 +951,19 @@ impl ProductSettings {
                             return;
                         }
                     };
+                let virtual_sink = match apply_virtual_sink_update(
+                    virtual_sink,
+                    self.configured_virtual_sink.clone(),
+                ) {
+                    Ok(virtual_sink) => virtual_sink,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure("invalid_virtual_sink", "virtual_sink is invalid"),
+                        );
+                        return;
+                    }
+                };
                 let audio_sink_capture_only = match apply_boolean_update(
                     audio_sink_capture_only,
                     self.audio_sink_capture_only,
@@ -1090,6 +1115,7 @@ impl ProductSettings {
                         output_name.as_deref(),
                         ProductStreamingSettings {
                             audio_sink: audio_sink.clone(),
+                            virtual_sink: virtual_sink.clone(),
                             audio_sink_capture_only,
                             external_ip: external_ip.clone(),
                             stream_audio,
@@ -1109,6 +1135,7 @@ impl ProductSettings {
                         target,
                         output_name,
                         audio_sink,
+                        virtual_sink,
                         audio_sink_capture_only,
                         external_ip,
                         stream_audio,
@@ -1230,6 +1257,7 @@ impl ProductSettings {
                 target,
                 output_name,
                 audio_sink,
+                virtual_sink,
                 audio_sink_capture_only,
                 external_ip,
                 stream_audio,
@@ -1249,6 +1277,7 @@ impl ProductSettings {
                         target: &target,
                         output_name: output_name.as_deref(),
                         audio_sink: audio_sink.as_deref(),
+                        virtual_sink: virtual_sink.as_deref(),
                         audio_sink_capture_only,
                         external_ip: external_ip.as_deref(),
                         stream_audio,
@@ -1543,6 +1572,7 @@ impl ProductSettings {
         self.configured_bind_address = document.bind_address;
         self.configured_output_name = document.output_name;
         self.configured_audio_sink = document.audio_sink;
+        self.configured_virtual_sink = document.virtual_sink;
         self.audio_sink_capture_only = document.audio_sink_capture_only;
         self.configured_external_ip = document.external_ip;
         self.stream_audio = document.stream_audio;
@@ -1568,6 +1598,7 @@ impl ProductSettings {
             "configured_bind_address":self.configured_bind_address,
             "configured_output_name":self.configured_output_name,
             "configured_audio_sink":self.configured_audio_sink,
+            "configured_virtual_sink":self.configured_virtual_sink,
             "audio_sink_capture_only":self.audio_sink_capture_only,
             "configured_external_ip":self.configured_external_ip,
             "effective_audio_sink":self.effective_audio_sink(),
@@ -1652,6 +1683,7 @@ fn product_update_payload(
             "bind_address":target.bind_address,
             "output_name":output_name,
             "audio_sink":streaming.audio_sink,
+            "virtual_sink":streaming.virtual_sink,
             "audio_sink_capture_only":streaming.audio_sink_capture_only,
             "external_ip":streaming.external_ip,
             "stream_audio":streaming.stream_audio,
@@ -1706,6 +1738,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             bind_address: None,
             output_name: None,
             audio_sink: None,
+            virtual_sink: None,
             audio_sink_capture_only: false,
             external_ip: None,
             stream_audio: true,
@@ -1738,6 +1771,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | EXTERNAL_IP_SETTINGS_VERSION
             | PING_TIMEOUT_SETTINGS_VERSION
             | AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION
+            | VIRTUAL_SINK_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -1759,6 +1793,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         EXTERNAL_IP_SETTINGS_VERSION => 13,
         PING_TIMEOUT_SETTINGS_VERSION => 14,
         AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION => 15,
+        VIRTUAL_SINK_SETTINGS_VERSION => 16,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1780,6 +1815,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= PING_TIMEOUT_SETTINGS_VERSION && !values.contains_key("ping_timeout_ms"))
         || (version >= AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION
             && !values.contains_key("audio_sink_capture_only"))
+        || (version >= VIRTUAL_SINK_SETTINGS_VERSION && !values.contains_key("virtual_sink"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1832,6 +1868,16 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             Some(Value::String(value)) => normalize_audio_sink(value)
                 .map_err(|_| invalid_state("persisted audio sink is invalid"))?,
             _ => return Err(invalid_state("persisted audio sink is invalid")),
+        }
+    } else {
+        None
+    };
+    let virtual_sink = if version >= VIRTUAL_SINK_SETTINGS_VERSION {
+        match values.get("virtual_sink") {
+            Some(Value::Null) => None,
+            Some(Value::String(value)) => normalize_virtual_sink(value)
+                .map_err(|_| invalid_state("persisted virtual sink is invalid"))?,
+            _ => return Err(invalid_state("persisted virtual sink is invalid")),
         }
     } else {
         None
@@ -1950,6 +1996,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         bind_address,
         output_name,
         audio_sink,
+        virtual_sink,
         audio_sink_capture_only,
         external_ip,
         stream_audio,
@@ -1969,6 +2016,7 @@ struct UpdateExpectation<'a> {
     target: &'a NetworkTarget,
     output_name: Option<&'a str>,
     audio_sink: Option<&'a str>,
+    virtual_sink: Option<&'a str>,
     audio_sink_capture_only: bool,
     external_ip: Option<&'a str>,
     stream_audio: bool,
@@ -1988,7 +2036,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v14 settings"));
+        return Err(invalid_state("product_update did not confirm v15 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -1997,6 +2045,7 @@ fn update_result(
         || document.bind_address != expected.target.bind_address
         || document.output_name.as_deref() != expected.output_name
         || document.audio_sink.as_deref() != expected.audio_sink
+        || document.virtual_sink.as_deref() != expected.virtual_sink
         || document.audio_sink_capture_only != expected.audio_sink_capture_only
         || document.external_ip.as_deref() != expected.external_ip
         || document.stream_audio != expected.stream_audio
@@ -2067,6 +2116,13 @@ fn normalize_audio_sink(value: &str) -> Result<Option<String>, ()> {
     Ok(Some(value.to_owned()))
 }
 
+fn normalize_virtual_sink(value: &str) -> Result<Option<String>, ()> {
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
+}
+
 fn normalize_external_ip(value: &str) -> Result<Option<String>, ()> {
     if value.is_empty() {
         return Ok(None);
@@ -2096,6 +2152,17 @@ fn apply_audio_sink_update(
         FieldUpdate::Omitted => Ok(current),
         FieldUpdate::Null => Ok(None),
         FieldUpdate::Value(value) => normalize_audio_sink(&value),
+    }
+}
+
+fn apply_virtual_sink_update(
+    update: FieldUpdate<String>,
+    current: Option<String>,
+) -> Result<Option<String>, ()> {
+    match update {
+        FieldUpdate::Omitted => Ok(current),
+        FieldUpdate::Null => Ok(None),
+        FieldUpdate::Value(value) => normalize_virtual_sink(&value),
     }
 }
 
@@ -2906,6 +2973,7 @@ mod tests {
             None,
             ProductStreamingSettings {
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: true,
@@ -2918,7 +2986,7 @@ mod tests {
             },
         );
 
-        assert_eq!(payload["version"], 14);
+        assert_eq!(payload["version"], 15);
         assert_eq!(payload["values"]["ping_timeout_ms"], Value::Null);
     }
 
@@ -2953,6 +3021,7 @@ mod tests {
                         bind_address: FieldUpdate::Omitted,
                         output_name: FieldUpdate::Omitted,
                         audio_sink: FieldUpdate::Omitted,
+                        virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -2970,7 +3039,7 @@ mod tests {
             product.start_next();
             let pending = product.pending.take().expect("product update request");
             let expected_raw = expected.map_or(Value::Null, |value| json!(value));
-            assert_eq!(pending.payload["version"], 14);
+            assert_eq!(pending.payload["version"], 15);
             assert_eq!(
                 pending.payload["values"]["wgc_pacing_smoothing"],
                 expected_raw
@@ -2979,9 +3048,9 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":14,"revision":revision + 1,
+                    "ok":true,"found":true,"version":15,"revision":revision + 1,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
-                        "bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,
+                        "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
                         "max_bitrate":null,"minimum_fps_target":20.0,
                         "wgc_pacing_smoothing":expected_raw,"ping_timeout_ms":null,"audio_sink_capture_only":false}
@@ -3022,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_sink_capture_only_defaults_false_then_persists_with_revisioned_v14_write() {
+    fn audio_sink_capture_only_defaults_false_then_persists_with_revisioned_v15_write() {
         let legacy = json!({
             "ok":true,"found":true,"version":13,"revision":11,
             "values":{
@@ -3049,6 +3118,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     audio_sink: FieldUpdate::Omitted,
+                    virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Value(true),
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -3064,12 +3134,12 @@ mod tests {
             )
             .unwrap();
         product.start_next();
-        let pending = product.pending.take().expect("v14 product update");
-        assert_eq!(pending.payload["version"], 14);
+        let pending = product.pending.take().expect("v15 product update");
+        assert_eq!(pending.payload["version"], 15);
         assert_eq!(pending.payload["expected_revision"], 11);
         assert_eq!(pending.payload["values"]["audio_sink_capture_only"], true);
         let response = json!({
-            "ok":true,"found":true,"version":14,"revision":12,
+            "ok":true,"found":true,"version":15,"revision":12,
             "values":pending.payload["values"].clone()
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
@@ -3115,6 +3185,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     audio_sink: FieldUpdate::Value("render.selected".into()),
+                    virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -3131,14 +3202,14 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 14);
+        assert_eq!(pending.payload["version"], 15);
         assert_eq!(pending.payload["values"]["audio_sink"], "render.selected");
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":14,"revision":9,
+                "ok":true,"found":true,"version":15,"revision":9,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
-                    "bind_address":null,"output_name":null,"audio_sink":"render.selected","external_ip":null,
+                    "bind_address":null,"output_name":null,"audio_sink":"render.selected","virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
                     "max_bitrate":null,"minimum_fps_target":20.0,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             })),
@@ -3180,6 +3251,7 @@ mod tests {
                         bind_address: FieldUpdate::Omitted,
                         output_name: FieldUpdate::Omitted,
                         audio_sink: FieldUpdate::Omitted,
+                        virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -3196,7 +3268,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 14);
+            assert_eq!(pending.payload["version"], 15);
             assert_eq!(
                 pending.payload["values"]["minimum_fps_target"],
                 expected_raw
@@ -3209,9 +3281,9 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":14,"revision":reply_revision,
+                    "ok":true,"found":true,"version":15,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
-                        "bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,
+                        "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":32,"max_bitrate":null,
                         "minimum_fps_target":persisted_value,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
@@ -3256,6 +3328,7 @@ mod tests {
                         bind_address: FieldUpdate::Omitted,
                         output_name: FieldUpdate::Omitted,
                         audio_sink: FieldUpdate::Omitted,
+                        virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -3272,16 +3345,16 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 14);
+            assert_eq!(pending.payload["version"], 15);
             assert_eq!(
                 pending.payload["values"]["max_bitrate"],
                 expected.map_or(Value::Null, |value| json!(value))
             );
 
             let response = json!({
-                "ok":true,"found":true,"version":14,"revision":revision + 1,
+                "ok":true,"found":true,"version":15,"revision":revision + 1,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
-                    "bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"auto",
                     "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             });
@@ -3422,8 +3495,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":14,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":15,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -3436,6 +3509,7 @@ mod tests {
             target: &target,
             output_name: None,
             audio_sink: None,
+            virtual_sink: None,
             audio_sink_capture_only: false,
             external_ip: None,
             stream_audio: true,
@@ -3488,8 +3562,8 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":14,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":15,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
         });
         assert_eq!(
             update_result(
@@ -3507,8 +3581,8 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":14,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":15,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
         });
         assert_eq!(
             update_result(
@@ -3573,6 +3647,7 @@ mod tests {
             "configured_bind_address":null,
                 "configured_output_name":null,
                 "configured_audio_sink":null,
+                "configured_virtual_sink":null,
                 "audio_sink_capture_only":false,
                 "configured_external_ip":null,
             "effective_audio_sink":"",
@@ -3669,6 +3744,7 @@ mod tests {
                 },
                 output_name: None,
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: true,
@@ -3684,9 +3760,9 @@ mod tests {
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":14,
+                "version":15,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             })),
         );
 
@@ -3732,6 +3808,7 @@ mod tests {
                 },
                 output_name: None,
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: true,
@@ -3745,8 +3822,8 @@ mod tests {
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":14,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "ok":true,"found":true,"version":15,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             })),
         );
 
@@ -3908,6 +3985,7 @@ mod tests {
                 },
                 output_name: None,
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: true,
@@ -3921,8 +3999,8 @@ mod tests {
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":14,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "ok":true,"found":true,"version":15,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             })),
         );
 
@@ -3963,7 +4041,133 @@ mod tests {
     }
 
     #[test]
-    fn v14_product_update_payload_keeps_nullable_values_exact() {
+    fn virtual_sink_update_preserves_omission_clear_and_explicit_empty() {
+        let legacy_v14 = json!({
+            "ok":true,"found":true,"version":14,"revision":1,
+            "values":{
+                "hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"audio_sink":"render.regular",
+                "external_ip":null,"stream_audio":true,"capture":"auto",
+                "video_max_batch_size_kb":32,"max_bitrate":null,
+                "minimum_fps_target":20.0,"wgc_pacing_smoothing":null,
+                "ping_timeout_ms":null,"audio_sink_capture_only":true
+            }
+        });
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&legacy_v14).unwrap());
+        assert_eq!(product.configured_virtual_sink(), None);
+
+        let enqueue_update = |product: &mut ProductSettings,
+                              virtual_sink: FieldUpdate<String>,
+                              expected_revision| {
+            product
+                .enqueue(
+                    41,
+                    5_000,
+                    AdminAction::Update {
+                        hostname: "Host".into(),
+                        port: 47_989,
+                        address_family: FieldUpdate::Omitted,
+                        bind_address: FieldUpdate::Omitted,
+                        output_name: FieldUpdate::Omitted,
+                        audio_sink: FieldUpdate::Omitted,
+                        virtual_sink,
+                        audio_sink_capture_only: FieldUpdate::Omitted,
+                        external_ip: FieldUpdate::Omitted,
+                        stream_audio: FieldUpdate::Omitted,
+                        capture: FieldUpdate::Omitted,
+                        video_max_batch_size_kb: FieldUpdate::Omitted,
+                        max_bitrate: FieldUpdate::Omitted,
+                        minimum_fps_target: FieldUpdate::Omitted,
+                        wgc_pacing_smoothing: FieldUpdate::Omitted,
+                        ping_timeout_ms: FieldUpdate::Omitted,
+                        expected_revision,
+                        require_listener_apply: false,
+                    },
+                )
+                .unwrap();
+            product.start_next();
+        };
+
+        enqueue_update(&mut product, FieldUpdate::Value(String::new()), 1);
+        let pending = product
+            .pending
+            .take()
+            .expect("explicit empty selector write");
+        assert_eq!(pending.payload["version"], 15);
+        assert_eq!(pending.payload["values"]["virtual_sink"], "");
+        let response = json!({
+            "ok":true,"found":true,"version":15,"revision":2,
+            "values":pending.payload["values"].clone()
+        });
+        product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
+        assert_eq!(product.configured_virtual_sink(), Some(""));
+        assert_eq!(product.settings_payload()["configured_virtual_sink"], "");
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&response).unwrap());
+        assert_eq!(restarted.configured_virtual_sink(), Some(""));
+
+        enqueue_update(&mut product, FieldUpdate::Omitted, 2);
+        let pending = product.pending.take().expect("omitted selector write");
+        assert_eq!(pending.payload["values"]["virtual_sink"], "");
+        product.finish_call(
+            pending.purpose,
+            CallOutcome::Payload(json!({
+                "ok":true,"found":true,"version":15,"revision":3,
+                "values":pending.payload["values"].clone()
+            })),
+        );
+        assert_eq!(product.configured_virtual_sink(), Some(""));
+
+        enqueue_update(
+            &mut product,
+            FieldUpdate::Value("Steam Streaming Speakers".into()),
+            3,
+        );
+        let pending = product.pending.take().expect("named selector write");
+        assert_eq!(
+            pending.payload["values"]["virtual_sink"],
+            "Steam Streaming Speakers"
+        );
+        let response = json!({
+            "ok":true,"found":true,"version":15,"revision":4,
+            "values":pending.payload["values"].clone()
+        });
+        product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
+        assert_eq!(
+            product.configured_virtual_sink(),
+            Some("Steam Streaming Speakers")
+        );
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&response).unwrap());
+        assert_eq!(
+            restarted.configured_virtual_sink(),
+            Some("Steam Streaming Speakers")
+        );
+
+        enqueue_update(&mut product, FieldUpdate::Null, 4);
+        let pending = product.pending.take().expect("selector reset");
+        assert!(pending.payload["values"]["virtual_sink"].is_null());
+        product.finish_call(
+            pending.purpose,
+            CallOutcome::Payload(json!({
+                "ok":true,"found":true,"version":15,"revision":5,
+                "values":pending.payload["values"].clone()
+            })),
+        );
+        assert_eq!(product.configured_virtual_sink(), None);
+
+        assert_eq!(normalize_virtual_sink(""), Ok(Some(String::new())));
+        assert_eq!(
+            normalize_virtual_sink("Steam Streaming Speakers"),
+            Ok(Some("Steam Streaming Speakers".into()))
+        );
+        assert_eq!(normalize_virtual_sink("bad\nselector"), Err(()));
+        assert_eq!(normalize_virtual_sink(&"x".repeat(4097)), Err(()));
+    }
+
+    #[test]
+    fn v15_product_update_payload_keeps_nullable_values_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -3975,6 +4179,7 @@ mod tests {
             None,
             ProductStreamingSettings {
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: false,
@@ -3986,7 +4191,7 @@ mod tests {
                 ping_timeout_ms: None,
             },
         );
-        assert_eq!(reset["version"], 14);
+        assert_eq!(reset["version"], 15);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
@@ -4007,6 +4212,7 @@ mod tests {
             Some("stable-display-id"),
             ProductStreamingSettings {
                 audio_sink: None,
+                virtual_sink: None,
                 audio_sink_capture_only: false,
                 external_ip: None,
                 stream_audio: true,
@@ -4088,6 +4294,7 @@ mod tests {
                         bind_address: FieldUpdate::Omitted,
                         output_name: FieldUpdate::Omitted,
                         audio_sink: FieldUpdate::Omitted,
+                        virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
@@ -4104,7 +4311,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 14);
+            assert_eq!(pending.payload["version"], 15);
             assert_eq!(
                 pending.payload["values"]["video_max_batch_size_kb"],
                 expected_raw
@@ -4117,9 +4324,9 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":14,"revision":reply_revision,
+                    "ok":true,"found":true,"version":15,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
-                        "bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,
+                        "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":persisted_value,"max_bitrate":null,
                     "minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
@@ -4158,6 +4365,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     audio_sink: FieldUpdate::Omitted,
+                    virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -4174,7 +4382,7 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 14);
+        assert_eq!(payload["version"], 15);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
         assert_eq!(payload["values"]["capture"], "auto");
@@ -4199,6 +4407,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     audio_sink: FieldUpdate::Omitted,
+                    virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Null,
@@ -4243,6 +4452,7 @@ mod tests {
                     bind_address: FieldUpdate::Omitted,
                     output_name: FieldUpdate::Omitted,
                     audio_sink: FieldUpdate::Omitted,
+                    virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
@@ -4259,15 +4469,15 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 14);
+        assert_eq!(pending.payload["version"], 15);
         assert_eq!(pending.payload["values"]["capture"], "wgcc");
 
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":14,"revision":5,
+                "ok":true,"found":true,"version":15,"revision":5,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
-                    "bind_address":null,"output_name":null,"audio_sink":null,"external_ip":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"wgcc",
                     "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
             })),

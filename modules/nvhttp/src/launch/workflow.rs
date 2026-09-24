@@ -175,6 +175,8 @@ impl Controller {
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
                         "capture_sink_without_routing": record.capture_sink_without_routing,
+                        "virtual_sink": record.resolved_virtual_sink,
+                        "channels": record.resolved_virtual_sink.as_ref().map(|_| 2),
                         "back_button_timeout": record.scoped_back_button_timeout,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
@@ -270,17 +272,38 @@ impl Controller {
                                     .client_audio_sink
                                     .as_deref()
                                     .or(application_overrides.audio_sink.as_deref());
-                                let resolved_configured_audio_sink = match scoped_audio_sink {
-                                    Some("") => None,
-                                    Some(audio_sink) => Some(audio_sink.to_owned()),
-                                    None => record.global_configured_audio_sink.clone(),
-                                };
-                                record.audio_endpoint = resolved_configured_audio_sink
+                                // An explicit virtual selector wins over regular endpoint settings.
+                                // Empty means no managed selector; source host-audio fallback is
+                                // unavailable because Amaterasu has no host-audio toggle yet.
+                                let configured_virtual_sink = record
+                                    .peer
+                                    .client_virtual_sink
                                     .as_deref()
-                                    .unwrap_or(&record.bootstrap_audio_endpoint)
-                                    .to_owned();
-                                // The endpoint has now been resolved using global, application,
-                                // then client precedence. Amaterasu has no virtual-sink setting.
+                                    .or(application_overrides.virtual_sink.as_deref())
+                                    .or(record.global_configured_virtual_sink.as_deref());
+                                record.resolved_virtual_sink = configured_virtual_sink
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned);
+                                let resolved_configured_audio_sink =
+                                    if record.resolved_virtual_sink.is_some() {
+                                        None
+                                    } else {
+                                        match scoped_audio_sink {
+                                            Some("") => None,
+                                            Some(audio_sink) => Some(audio_sink.to_owned()),
+                                            None => record.global_configured_audio_sink.clone(),
+                                        }
+                                    };
+                                record.audio_endpoint = if record.resolved_virtual_sink.is_some() {
+                                    String::new()
+                                } else {
+                                    resolved_configured_audio_sink
+                                        .as_deref()
+                                        .unwrap_or(&record.bootstrap_audio_endpoint)
+                                        .to_owned()
+                                };
+                                // A selected virtual sink wins over all regular endpoint
+                                // overrides. Empty scoped selectors explicitly clear inheritance.
                                 record.capture_sink_without_routing = capture_sink_without_routing(
                                     record.global_audio_sink_capture_only,
                                     AudioSinkCaptureOnlyOverrides {
@@ -289,7 +312,7 @@ impl Controller {
                                     },
                                     resolved_configured_audio_sink.as_deref(),
                                     &record.audio_endpoint,
-                                    None,
+                                    record.resolved_virtual_sink.as_deref(),
                                 );
                                 record.scoped_back_button_timeout = record
                                     .peer
@@ -629,6 +652,7 @@ struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
+    virtual_sink: Option<String>,
     audio_sink_capture_only: Option<bool>,
     back_button_timeout: Option<i32>,
 }
@@ -651,6 +675,13 @@ fn application_config_overrides(
             .audio_sink
             .as_deref()
             .is_some_and(|value| !super::valid_audio_sink_override(value))
+    {
+        return Err("invalid_application_response");
+    }
+    if config_overrides
+        .virtual_sink
+        .as_deref()
+        .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
     {
         return Err("invalid_application_response");
     }

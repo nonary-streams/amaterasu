@@ -37,6 +37,15 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
   }
 });
 
+test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
+  const parseSelection = context.Amaterasu.parseVirtualSinkSelection;
+  assert.equal(parseSelection(false, "unused value"), null);
+  assert.equal(parseSelection(true, ""), "");
+  assert.equal(parseSelection(true, "virtual-device-id"), "virtual-device-id");
+  assert.throws(() => parseSelection(true, "bad\nselector"));
+  assert.throws(() => parseSelection(true, "x".repeat(4097)));
+});
+
 test("input policy editor validates key repeat settings and reports cleanup honestly", () => {
   const parsePolicy = context.Amaterasu.parseInputPolicy;
   assert.deepEqual(ordinary(parsePolicy(false, true, false, false, true, 0, 0)), {

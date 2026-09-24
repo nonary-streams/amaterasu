@@ -294,7 +294,9 @@ impl Record {
             Resource::AudioCapture => {
                 let start = self.start.as_ref().expect("validated start workflow");
                 json!({"action":"open","endpoint":start.audio_endpoint,
-                    "capture_sink_without_routing":start.capture_sink_without_routing})
+                    "capture_sink_without_routing":start.capture_sink_without_routing,
+                    "virtual_sink":start.virtual_sink,
+                    "channels":start.channels})
             }
         };
         payload["operation_id"] = json!(self.operation(resource));

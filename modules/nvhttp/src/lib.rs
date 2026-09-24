@@ -42,6 +42,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        virtual_sink: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink_capture_only: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         external_ip: FieldUpdate<String>,
@@ -179,6 +181,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.configured_output_name(),
             );
             router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
+            router.set_virtual_sink_settings(self.product_settings.configured_virtual_sink());
             router.set_audio_sink_capture_only(self.product_settings.audio_sink_capture_only());
             router.set_global_stream_audio(self.product_settings.stream_audio());
             router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
@@ -441,6 +444,7 @@ impl NvhttpModule {
                                 bind_address,
                                 output_name,
                                 audio_sink,
+                                virtual_sink,
                                 audio_sink_capture_only,
                                 external_ip,
                                 stream_audio,
@@ -473,6 +477,7 @@ impl NvhttpModule {
                                     bind_address,
                                     output_name,
                                     audio_sink,
+                                    virtual_sink,
                                     audio_sink_capture_only,
                                     external_ip,
                                     stream_audio,
@@ -766,5 +771,38 @@ mod tests {
             panic!("settings update expected");
         };
         assert_eq!(audio_sink_capture_only, FieldUpdate::Value(false));
+    }
+
+    #[test]
+    fn virtual_sink_update_keeps_omitted_null_and_explicit_empty_distinct() {
+        let deserialize = |value: Option<serde_json::Value>| {
+            let mut request = json!({
+                "action":"settings_update","hostname":"Host","port":48000,
+                "expected_revision":2
+            });
+            if let Some(value) = value {
+                request["virtual_sink"] = value;
+            }
+            let Operation::SettingsUpdate { virtual_sink, .. } =
+                serde_json::from_value(request).unwrap()
+            else {
+                panic!("settings update expected");
+            };
+            virtual_sink
+        };
+
+        assert_eq!(deserialize(None), FieldUpdate::Omitted);
+        assert_eq!(
+            deserialize(Some(serde_json::Value::Null)),
+            FieldUpdate::Null
+        );
+        assert_eq!(
+            deserialize(Some(json!(""))),
+            FieldUpdate::Value(String::new())
+        );
+        assert_eq!(
+            deserialize(Some(json!("Steam Streaming Speakers"))),
+            FieldUpdate::Value("Steam Streaming Speakers".into())
+        );
     }
 }

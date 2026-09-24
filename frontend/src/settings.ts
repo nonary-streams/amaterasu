@@ -5,6 +5,17 @@ namespace Amaterasu {
   const maxInputBackButtonTimeoutMs = 0x7fff_ffff;
   const maxHistoryLimit = 0x7fff_ffff;
 
+  export function parseVirtualSinkSelection(
+    enabled: boolean,
+    selector: string,
+  ): string | null {
+    if (typeof enabled !== "boolean" || typeof selector !== "string")
+      throw new Error("Virtual sink selection is invalid.");
+    if (new TextEncoder().encode(selector).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/u.test(selector))
+      throw new Error("Virtual sink selector must be at most 4096 UTF-8 bytes without control characters.");
+    return enabled ? selector : null;
+  }
+
   export function parseHistorySettings(
     enabled: boolean,
     ttlDays: number,
@@ -1314,6 +1325,26 @@ namespace Amaterasu {
           const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
           audioSinkMode.addEventListener("change", updateAudioSink);
           updateAudioSink();
+          const virtualSinkMode = el("select");
+          virtualSinkMode.setAttribute("aria-label", `Virtual sink override for ${client.name}`);
+          for (const [value, label] of [
+            ["inherit", "Inherit application/host"],
+            ["automatic", "Clear inherited virtual sink"],
+            ["specific", "Specific virtual sink selector"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            virtualSinkMode.append(option);
+          }
+          const currentVirtualSink = client.config_overrides?.virtual_sink;
+          virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
+          const virtualSinkSelector = input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
+          virtualSinkSelector.maxLength = 4096;
+          virtualSinkSelector.placeholder = "Exact ID or device name";
+          virtualSinkSelector.setAttribute("aria-label", `Specific virtual sink selector for ${client.name}`);
+          const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
+          virtualSinkMode.addEventListener("change", updateVirtualSink);
+          updateVirtualSink();
           const captureOnly = el("select");
           captureOnly.setAttribute("aria-label", `Capture-only audio override for ${client.name}`);
           for (const [value, label] of [
@@ -1341,6 +1372,7 @@ namespace Amaterasu {
                     back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeout.value),
                     stream_audio: parseStreamAudioOverride(streamAudio.value),
                     audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                    virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
                     audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
                   },
                 });
@@ -1364,9 +1396,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), captureOnly, el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -1785,6 +1817,14 @@ namespace Amaterasu {
           audioSink.append(saved);
         }
         audioSink.value = settings.configured_audio_sink ?? "";
+        const virtualSinkEnabled = input("virtual_sink_enabled", "", "checkbox");
+        virtualSinkEnabled.checked = settings.configured_virtual_sink !== null;
+        const virtualSink = input("virtual_sink", settings.configured_virtual_sink ?? "");
+        virtualSink.maxLength = 4096;
+        virtualSink.placeholder = "Exact device ID or name";
+        const updateVirtualSink = () => { virtualSink.disabled = !virtualSinkEnabled.checked; };
+        virtualSinkEnabled.addEventListener("change", updateVirtualSink);
+        updateVirtualSink();
         const audioSinkCaptureOnly = input("audio_sink_capture_only", "", "checkbox");
         audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
         const externalIp = input("external_ip", settings.configured_external_ip ?? "");
@@ -1868,6 +1908,8 @@ namespace Amaterasu {
             `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`,
           ),
           field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
+          field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."),
+          field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."),
           field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
           field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
           field(
@@ -1922,6 +1964,7 @@ namespace Amaterasu {
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
               ping_timeout_ms: parsePingTimeout(pingTimeout.value),
               audio_sink: parseAudioSinkSelection(audioSink.value),
+              virtual_sink: parseVirtualSinkSelection(virtualSinkEnabled.checked, virtualSink.value),
               audio_sink_capture_only: audioSinkCaptureOnly.checked,
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),

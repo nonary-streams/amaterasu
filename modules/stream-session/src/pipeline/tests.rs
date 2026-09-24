@@ -123,6 +123,48 @@ fn capture_only_snapshot_reaches_audio_capture_open() {
 }
 
 #[test]
+fn virtual_sink_selector_and_stereo_layout_reach_audio_capture_open() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["audio_endpoint"] = json!("");
+    request["configuration"]["virtual_sink"] = json!("Steam Streaming Speakers");
+    request["configuration"]["channels"] = json!(2);
+    request["configuration"]["capture_sink_without_routing"] = json!(true);
+
+    assert_ne!(host.response(2, request)["state"], "active");
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .all(|call| call.service != Resource::AudioCapture.service())
+    );
+
+    let mut request = start(id);
+    request["configuration"]["audio_endpoint"] = json!("");
+    request["configuration"]["virtual_sink"] = json!("Steam Streaming Speakers");
+    request["configuration"]["channels"] = json!(2);
+    request["configuration"]["capture_sink_without_routing"] = json!(false);
+    assert_eq!(host.response(3, request)["state"], "active");
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("virtual audio capture open");
+    assert_eq!(audio_open.payload["endpoint"], "");
+    assert_eq!(
+        audio_open.payload["virtual_sink"],
+        "Steam Streaming Speakers"
+    );
+    assert_eq!(audio_open.payload["channels"], 2);
+    assert_eq!(audio_open.payload["capture_sink_without_routing"], false);
+}
+
+#[test]
 fn selected_video_batch_limit_reaches_media_transport_open() {
     let mut host = Harness::new();
     let mut request = prepare();

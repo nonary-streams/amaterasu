@@ -290,6 +290,10 @@ pub struct StartConfig {
     /// Moonlight's device name for the session; independent from capture output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u32>,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,
@@ -311,11 +315,30 @@ impl StartConfig {
             return Err("constant_rate_requires_wgc");
         }
         if !valid_label(&self.output, 512)
-            || (stream_audio && !valid_label(&self.audio_endpoint, 4096))
             || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))
             || !self.configuration.valid()
         {
             return Err("invalid_start_configuration");
+        }
+        match (&self.virtual_sink, self.channels) {
+            (None, None) => {
+                if stream_audio && !valid_label(&self.audio_endpoint, 4096) {
+                    return Err("invalid_start_configuration");
+                }
+            }
+            (None, Some(_)) => return Err("invalid_virtual_sink_channels"),
+            (Some(selector), Some(channels))
+                if selector.len() <= 4096
+                    && !selector.chars().any(char::is_control)
+                    && matches!(channels, 2 | 6 | 8)
+                    && self.audio_endpoint.is_empty()
+                    && !self.capture_sink_without_routing =>
+            {
+                if stream_audio && channels != 2 {
+                    return Err("unsupported_audio_channels");
+                }
+            }
+            (Some(_), _) => return Err("invalid_virtual_sink_channels"),
         }
         Ok(())
     }
@@ -452,6 +475,42 @@ mod tests {
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
             1
         );
+    }
+
+    #[test]
+    fn virtual_sink_start_requires_a_valid_selector_channel_pair_and_stereo_transport() {
+        let mut value = start_json();
+        value["audio_endpoint"] = json!("");
+        value["virtual_sink"] = json!("Steam Streaming Speakers");
+        value["channels"] = json!(2);
+        let stereo: StartConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(stereo.validate(true).is_ok());
+
+        value["channels"] = json!(4);
+        let invalid_channels: StartConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            invalid_channels.validate(true),
+            Err("invalid_virtual_sink_channels")
+        );
+
+        for channels in [6, 8] {
+            value["channels"] = json!(channels);
+            let surround: StartConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(surround.validate(true), Err("unsupported_audio_channels"));
+        }
+
+        value["channels"] = json!(2);
+        value["capture_sink_without_routing"] = json!(true);
+        let capture_only: StartConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            capture_only.validate(true),
+            Err("invalid_virtual_sink_channels")
+        );
+
+        let mut regular = start_json();
+        regular["channels"] = json!(2);
+        let regular: StartConfig = serde_json::from_value(regular).unwrap();
+        assert_eq!(regular.validate(true), Err("invalid_virtual_sink_channels"));
     }
 
     #[test]

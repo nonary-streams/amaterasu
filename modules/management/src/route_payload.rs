@@ -706,6 +706,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "fec_percentage",
             "stream_audio",
             "audio_sink",
+            "virtual_sink",
             "audio_sink_capture_only",
             "back_button_timeout",
         ],
@@ -725,6 +726,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
         return Err(INVALID);
     }
     optional_audio_sink(overrides)?;
+    optional_virtual_sink(overrides)?;
     optional_audio_sink_capture_only(overrides)?;
     optional_back_button_timeout(overrides)?;
     Ok(())
@@ -737,6 +739,22 @@ fn optional_audio_sink(overrides: &Object) -> Result<(), &'static str> {
             Value::Null => false,
             Value::String(endpoint) => {
                 endpoint.len() > 4096 || endpoint.chars().any(char::is_control)
+            }
+            _ => true,
+        })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_virtual_sink(overrides: &Object) -> Result<(), &'static str> {
+    if overrides
+        .get("virtual_sink")
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::String(selector) => {
+                selector.len() > 4096 || selector.chars().any(char::is_control)
             }
             _ => true,
         })
@@ -1041,6 +1059,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "max_bitrate",
                     "minimum_fps_target",
                     "audio_sink",
+                    "virtual_sink",
                     "audio_sink_capture_only",
                     "external_ip",
                     "wgc_pacing_smoothing",
@@ -1088,6 +1107,14 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                         if value.len() <= 512
                             && value.trim() == value
                             && !value.chars().any(char::is_control) => {}
+                    _ => return Err(INVALID),
+                }
+            }
+            if let Some(virtual_sink) = object.get("virtual_sink") {
+                match virtual_sink {
+                    Value::Null => {}
+                    Value::String(value)
+                        if value.len() <= 4096 && !value.chars().any(char::is_control) => {}
                     _ => return Err(INVALID),
                 }
             }
@@ -1298,6 +1325,44 @@ mod nvhttp_tests {
     }
 
     #[test]
+    fn virtual_sink_update_preserves_explicit_empty_and_rejects_controls() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for selector in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("Steam Streaming Speakers"),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "virtual_sink":selector,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for selector in [
+            serde_json::json!(42),
+            serde_json::json!("bad\nselector"),
+            serde_json::json!("x".repeat(4097)),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "virtual_sink":selector,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
     fn audio_sink_capture_only_accepts_only_explicit_booleans() {
         let route = Route {
             service: "amaterasu.nvhttp/1",
@@ -1439,6 +1504,71 @@ mod pairing_override_tests {
                 validate(route, payload.as_object().unwrap()).is_err(),
                 "{payload}"
             );
+        }
+    }
+
+    #[test]
+    fn virtual_sink_override_is_sparse_and_bounded_for_apps_and_clients() {
+        for (service, action, scope) in [
+            (
+                "amaterasu.catalog/1",
+                "update_provider_overrides",
+                "catalog.write",
+            ),
+            (
+                "amaterasu.pairing/1",
+                "update_client_config_overrides",
+                "pairing.admin",
+            ),
+        ] {
+            let route = Route {
+                service,
+                action,
+                scope: Some(scope),
+                requires_empty_body: false,
+            };
+            for selector in [
+                Value::Null,
+                serde_json::json!(""),
+                serde_json::json!("Steam Streaming Speakers"),
+            ] {
+                let payload = if service == "amaterasu.catalog/1" {
+                    serde_json::json!({
+                        "id":"app-0000000000000001", "expected_revision":4,
+                        "config_overrides":{"virtual_sink":selector},
+                    })
+                } else {
+                    serde_json::json!({
+                        "certificate_id":"a".repeat(64), "expected_revision":4,
+                        "config_overrides":{"virtual_sink":selector},
+                    })
+                };
+                assert!(
+                    validate(route, payload.as_object().unwrap()).is_ok(),
+                    "{payload}"
+                );
+            }
+            for selector in [
+                serde_json::json!(42),
+                serde_json::json!("bad\nselector"),
+                serde_json::json!("x".repeat(4097)),
+            ] {
+                let payload = if service == "amaterasu.catalog/1" {
+                    serde_json::json!({
+                        "id":"app-0000000000000001", "expected_revision":4,
+                        "config_overrides":{"virtual_sink":selector},
+                    })
+                } else {
+                    serde_json::json!({
+                        "certificate_id":"a".repeat(64), "expected_revision":4,
+                        "config_overrides":{"virtual_sink":selector},
+                    })
+                };
+                assert!(
+                    validate(route, payload.as_object().unwrap()).is_err(),
+                    "{payload}"
+                );
+            }
         }
     }
 
@@ -1615,6 +1745,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "fec_percentage",
                     "stream_audio",
                     "audio_sink",
+                    "virtual_sink",
                     "audio_sink_capture_only",
                     "back_button_timeout",
                 ],
@@ -1634,6 +1765,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 return Err(INVALID);
             }
             optional_audio_sink(config_overrides)?;
+            optional_virtual_sink(config_overrides)?;
             optional_audio_sink_capture_only(config_overrides)?;
             optional_back_button_timeout(config_overrides)?;
             Ok(())

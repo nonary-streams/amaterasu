@@ -34,11 +34,12 @@ var Amaterasu;
         return timeout;
     }
     Amaterasu.parseBackButtonTimeoutOverride = parseBackButtonTimeoutOverride;
-    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "") {
+    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = "") {
         return {
             fec_percentage: parseFecOverride(value),
             stream_audio: parseStreamAudioOverride(streamAudioValue),
             audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
+            virtual_sink: parseVirtualSinkOverride(virtualSinkMode, virtualSinkSelector),
             audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
             back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
         };
@@ -56,6 +57,18 @@ var Amaterasu;
         return endpoint;
     }
     Amaterasu.parseAudioSinkOverride = parseAudioSinkOverride;
+    function parseVirtualSinkOverride(mode, selector) {
+        if (mode === "inherit")
+            return null;
+        if (mode === "automatic")
+            return "";
+        if (mode !== "specific" || selector.length === 0 ||
+            new TextEncoder().encode(selector).length > 4096 ||
+            /[\u0000-\u001f\u007f-\u009f]/.test(selector))
+            throw new Error("Choose a virtual sink selector of at most 4096 UTF-8 bytes without control characters.");
+        return selector;
+    }
+    Amaterasu.parseVirtualSinkOverride = parseVirtualSinkOverride;
     function parseStreamAudioOverride(value) {
         if (value === "")
             return null;
@@ -165,15 +178,17 @@ var Amaterasu;
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
         const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
         const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
+        const virtualSink = parseVirtualSinkOverride(text("virtual_sink_mode") || "inherit", String(data.get("virtual_sink_selector") ?? ""));
         const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
         const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
-        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
+        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
             ? undefined
             : {
                 ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
                 ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
                 ...(audioSink === null ? {} : { audio_sink: audioSink }),
+                ...(virtualSink === null ? {} : { virtual_sink: virtualSink }),
                 ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
                 ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
             };
@@ -701,6 +716,31 @@ var Amaterasu;
             controls: Amaterasu.el("div", "form-grid", Amaterasu.field("Audio capture endpoint", mode, "Inherit the host, choose automatic, or use an exact endpoint ID."), Amaterasu.field("Specific endpoint ID", id, "Used only when a specific endpoint is selected.")),
         };
     }
+    function virtualSinkOverrideControls(current) {
+        const mode = Amaterasu.el("select");
+        mode.name = "virtual_sink_mode";
+        for (const [value, label] of [
+            ["inherit", "Inherit application/host"],
+            ["automatic", "Clear inherited virtual sink"],
+            ["specific", "Specific virtual sink selector"],
+        ]) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value ?? "";
+            mode.append(option);
+        }
+        mode.value = current === undefined ? "inherit" : current === "" ? "automatic" : "specific";
+        const selector = Amaterasu.input("virtual_sink_selector", current ?? "");
+        selector.maxLength = 4096;
+        selector.placeholder = "Exact ID or device name";
+        const update = () => { selector.disabled = mode.value !== "specific"; };
+        mode.addEventListener("change", update);
+        update();
+        return {
+            mode,
+            selector,
+            controls: Amaterasu.el("div", "form-grid", Amaterasu.field("Virtual audio sink", mode, "Inherit the next scope, clear inherited selection, or choose a virtual device."), Amaterasu.field("Virtual sink ID or name", selector, "Used for a specific device; Windows matches IDs and names exactly.")),
+        };
+    }
     function renderCatalog(context) {
         const { content, api, notify } = context;
         const search = Amaterasu.input("search");
@@ -831,6 +871,7 @@ var Amaterasu;
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
+            const virtualSink = virtualSinkOverrideControls(row.entry.config_overrides?.virtual_sink);
             const captureOnly = audioOverrideSelect("audio_sink_capture_only", row.entry.config_overrides?.audio_sink_capture_only);
             const backButtonTimeout = Amaterasu.input("back_button_timeout", row.entry.config_overrides?.back_button_timeout?.toString() ?? "", "number");
             backButtonTimeout.min = String(-0x8000_0000);
@@ -838,7 +879,7 @@ var Amaterasu;
             backButtonTimeout.step = "1";
             backButtonTimeout.placeholder = "Inherit";
             backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."));
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -849,7 +890,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value);
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -968,6 +1009,7 @@ var Amaterasu;
         fec.step = "1";
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
+        const virtualSink = virtualSinkOverrideControls(entry?.config_overrides?.virtual_sink);
         const captureOnly = audioOverrideSelect("audio_sink_capture_only", entry?.config_overrides?.audio_sink_capture_only);
         const backButtonTimeout = Amaterasu.input("back_button_timeout", entry?.config_overrides?.back_button_timeout?.toString() ?? "", "number");
         backButtonTimeout.min = String(-0x8000_0000);
@@ -1003,7 +1045,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -1015,6 +1057,14 @@ var Amaterasu;
     const minInputBackButtonTimeoutMs = -0x8000_0000;
     const maxInputBackButtonTimeoutMs = 0x7fff_ffff;
     const maxHistoryLimit = 0x7fff_ffff;
+    function parseVirtualSinkSelection(enabled, selector) {
+        if (typeof enabled !== "boolean" || typeof selector !== "string")
+            throw new Error("Virtual sink selection is invalid.");
+        if (new TextEncoder().encode(selector).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/u.test(selector))
+            throw new Error("Virtual sink selector must be at most 4096 UTF-8 bytes without control characters.");
+        return enabled ? selector : null;
+    }
+    Amaterasu.parseVirtualSinkSelection = parseVirtualSinkSelection;
     function parseHistorySettings(enabled, ttlDays, sizeLimitMb) {
         if (typeof enabled !== "boolean" ||
             !Number.isSafeInteger(ttlDays) ||
@@ -1937,6 +1987,26 @@ var Amaterasu;
                     const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
                     audioSinkMode.addEventListener("change", updateAudioSink);
                     updateAudioSink();
+                    const virtualSinkMode = Amaterasu.el("select");
+                    virtualSinkMode.setAttribute("aria-label", `Virtual sink override for ${client.name}`);
+                    for (const [value, label] of [
+                        ["inherit", "Inherit application/host"],
+                        ["automatic", "Clear inherited virtual sink"],
+                        ["specific", "Specific virtual sink selector"],
+                    ]) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value ?? "";
+                        virtualSinkMode.append(option);
+                    }
+                    const currentVirtualSink = client.config_overrides?.virtual_sink;
+                    virtualSinkMode.value = currentVirtualSink === undefined ? "inherit" : currentVirtualSink === "" ? "automatic" : "specific";
+                    const virtualSinkSelector = Amaterasu.input(`virtual_sink_${client.certificate_id}`, currentVirtualSink ?? "");
+                    virtualSinkSelector.maxLength = 4096;
+                    virtualSinkSelector.placeholder = "Exact ID or device name";
+                    virtualSinkSelector.setAttribute("aria-label", `Specific virtual sink selector for ${client.name}`);
+                    const updateVirtualSink = () => { virtualSinkSelector.disabled = virtualSinkMode.value !== "specific"; };
+                    virtualSinkMode.addEventListener("change", updateVirtualSink);
+                    updateVirtualSink();
                     const captureOnly = Amaterasu.el("select");
                     captureOnly.setAttribute("aria-label", `Capture-only audio override for ${client.name}`);
                     for (const [value, label] of [
@@ -1962,6 +2032,7 @@ var Amaterasu;
                                     back_button_timeout: Amaterasu.parseBackButtonTimeoutOverride(backButtonTimeout.value),
                                     stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
                                     audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                                    virtual_sink: Amaterasu.parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
                                     audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
                                 },
                             });
@@ -1979,9 +2050,9 @@ var Amaterasu;
                     }), "primary");
                     save.disabled = !context.api.allows("pairing.admin");
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), captureOnly, Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
@@ -2259,6 +2330,14 @@ var Amaterasu;
                     audioSink.append(saved);
                 }
                 audioSink.value = settings.configured_audio_sink ?? "";
+                const virtualSinkEnabled = Amaterasu.input("virtual_sink_enabled", "", "checkbox");
+                virtualSinkEnabled.checked = settings.configured_virtual_sink !== null;
+                const virtualSink = Amaterasu.input("virtual_sink", settings.configured_virtual_sink ?? "");
+                virtualSink.maxLength = 4096;
+                virtualSink.placeholder = "Exact device ID or name";
+                const updateVirtualSink = () => { virtualSink.disabled = !virtualSinkEnabled.checked; };
+                virtualSinkEnabled.addEventListener("change", updateVirtualSink);
+                updateVirtualSink();
                 const audioSinkCaptureOnly = Amaterasu.input("audio_sink_capture_only", "", "checkbox");
                 audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
                 const externalIp = Amaterasu.input("external_ip", settings.configured_external_ip ?? "");
@@ -2292,7 +2371,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -2309,6 +2388,7 @@ var Amaterasu;
                             minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
                             ping_timeout_ms: parsePingTimeout(pingTimeout.value),
                             audio_sink: parseAudioSinkSelection(audioSink.value),
+                            virtual_sink: parseVirtualSinkSelection(virtualSinkEnabled.checked, virtualSink.value),
                             audio_sink_capture_only: audioSinkCaptureOnly.checked,
                             external_ip: parseExternalIp(externalIp.value),
                             wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),

@@ -109,6 +109,39 @@ namespace Amaterasu {
     };
   }
 
+  function virtualSinkOverrideControls(current: string | undefined): {
+    mode: HTMLSelectElement;
+    selector: HTMLInputElement;
+    controls: HTMLElement;
+  } {
+    const mode = el("select");
+    mode.name = "virtual_sink_mode";
+    for (const [value, label] of [
+      ["inherit", "Inherit application/host"],
+      ["automatic", "Clear inherited virtual sink"],
+      ["specific", "Specific virtual sink selector"],
+    ]) {
+      const option = el("option", "", label);
+      option.value = value ?? "";
+      mode.append(option);
+    }
+    mode.value = current === undefined ? "inherit" : current === "" ? "automatic" : "specific";
+    const selector = input("virtual_sink_selector", current ?? "");
+    selector.maxLength = 4096;
+    selector.placeholder = "Exact ID or device name";
+    const update = () => { selector.disabled = mode.value !== "specific"; };
+    mode.addEventListener("change", update);
+    update();
+    return {
+      mode,
+      selector,
+      controls: el("div", "form-grid",
+        field("Virtual audio sink", mode, "Inherit the next scope, clear inherited selection, or choose a virtual device."),
+        field("Virtual sink ID or name", selector, "Used for a specific device; Windows matches IDs and names exactly."),
+      ),
+    };
+  }
+
   export function renderCatalog(context: PageContext): void {
     const { content, api, notify } = context;
     const search = input("search");
@@ -312,6 +345,7 @@ namespace Amaterasu {
         row.entry.config_overrides?.stream_audio,
       );
       const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
+      const virtualSink = virtualSinkOverrideControls(row.entry.config_overrides?.virtual_sink);
       const captureOnly = audioOverrideSelect(
         "audio_sink_capture_only",
         row.entry.config_overrides?.audio_sink_capture_only,
@@ -336,6 +370,7 @@ namespace Amaterasu {
         ),
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
+        virtualSink.controls,
         field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
         field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
       );
@@ -348,12 +383,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -520,6 +555,7 @@ namespace Amaterasu {
       entry?.config_overrides?.stream_audio,
     );
     const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
+    const virtualSink = virtualSinkOverrideControls(entry?.config_overrides?.virtual_sink);
     const captureOnly = audioOverrideSelect(
       "audio_sink_capture_only",
       entry?.config_overrides?.audio_sink_capture_only,
@@ -592,6 +628,7 @@ namespace Amaterasu {
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       audioSink.controls,
+      virtualSink.controls,
       field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
       field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
       steamIdField,

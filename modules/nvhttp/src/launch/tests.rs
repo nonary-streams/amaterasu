@@ -70,6 +70,36 @@ fn peer_with_capture_options(
         .unwrap()
 }
 
+fn peer_with_virtual_sink(marker: u8, selector: Option<&str>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                virtual_sink: selector.map(str::to_owned),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+fn opened_rtsp_payload(broker: &Broker) -> Value {
+    broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .expect("RTSP open")
+}
+
 fn peer_with_settings(
     marker: u8,
     fec_percentage: Option<u8>,
@@ -584,6 +614,75 @@ fn client_audio_sink_override_does_not_leak_to_another_client() {
 }
 
 #[test]
+fn virtual_sink_overrides_follow_client_app_global_precedence_and_empty_clears_inheritance() {
+    fn launch_payload(
+        client_selector: Option<&str>,
+        application_selector: Option<&str>,
+        expected_selector: Option<&str>,
+        expected_endpoint: &str,
+        expected_capture_only: bool,
+    ) -> Value {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_audio_sink_settings(Some("endpoint.global"));
+        controller.set_audio_sink_capture_only(true);
+        controller.set_virtual_sink_settings(Some("virtual.global"));
+        let peer = peer_with_virtual_sink(1, client_selector);
+        let mut broker = Broker {
+            application_virtual_sink: application_selector.map(str::to_owned),
+            application_audio_sink: Some("endpoint.application".into()),
+            ..Broker::default()
+        };
+
+        assert!(controller.launch(10, request(1), peer, now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        let payload = opened_rtsp_payload(&broker);
+        if let Some(expected_selector) = expected_selector {
+            assert_eq!(payload["virtual_sink"], expected_selector);
+        } else {
+            assert!(payload["virtual_sink"].is_null());
+        }
+        let expected_channels = expected_selector.map_or(Value::Null, |_| json!(2));
+        assert_eq!(payload["channels"], expected_channels);
+        assert_eq!(payload["capture"]["audio_endpoint"], expected_endpoint);
+        assert_eq!(
+            payload["capture_sink_without_routing"],
+            expected_capture_only
+        );
+        payload
+    }
+
+    launch_payload(None, None, Some("virtual.global"), "", false);
+    launch_payload(
+        None,
+        Some("virtual.application"),
+        Some("virtual.application"),
+        "",
+        false,
+    );
+    launch_payload(
+        Some("virtual.client"),
+        Some("virtual.application"),
+        Some("virtual.client"),
+        "",
+        false,
+    );
+    // Explicit empty in the client scope clears inherited virtual selectors, then
+    // regular endpoint resolution continues from the application preference.
+    launch_payload(
+        Some(""),
+        Some("virtual.application"),
+        None,
+        "endpoint.application",
+        true,
+    );
+    // Explicit empty in the app scope clears the global selector while the
+    // regular application endpoint keeps its capture-only policy.
+    launch_payload(None, Some(""), None, "endpoint.application", true);
+}
+
+#[test]
 fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
     let now = Instant::now();
     let selected = "unavailable-display-id";
@@ -636,6 +735,7 @@ struct Broker {
     application_fec_percentage: Option<u8>,
     application_stream_audio: Option<bool>,
     application_audio_sink: Option<String>,
+    application_virtual_sink: Option<String>,
     application_audio_sink_capture_only: Option<bool>,
     application_back_button_timeout: Option<i32>,
 }
@@ -665,6 +765,7 @@ impl Default for Broker {
             application_fec_percentage: None,
             application_stream_audio: None,
             application_audio_sink: None,
+            application_virtual_sink: None,
             application_audio_sink_capture_only: None,
             application_back_button_timeout: None,
         }
@@ -779,6 +880,7 @@ impl Broker {
             if self.application_fec_percentage.is_some()
                 || self.application_stream_audio.is_some()
                 || self.application_audio_sink.is_some()
+                || self.application_virtual_sink.is_some()
                 || self.application_audio_sink_capture_only.is_some()
                 || self.application_back_button_timeout.is_some()
             {
@@ -791,6 +893,9 @@ impl Broker {
                 }
                 if let Some(audio_sink) = &self.application_audio_sink {
                     config_overrides["audio_sink"] = json!(audio_sink);
+                }
+                if let Some(virtual_sink) = &self.application_virtual_sink {
+                    config_overrides["virtual_sink"] = json!(virtual_sink);
                 }
                 if let Some(capture_only) = self.application_audio_sink_capture_only {
                     config_overrides["audio_sink_capture_only"] = json!(capture_only);

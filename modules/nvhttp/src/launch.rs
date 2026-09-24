@@ -51,6 +51,7 @@ pub struct PeerIdentity {
     client_fec_percentage: Option<u8>,
     client_stream_audio: Option<bool>,
     client_audio_sink: Option<String>,
+    client_virtual_sink: Option<String>,
     client_audio_sink_capture_only: Option<bool>,
     client_back_button_timeout: Option<i32>,
 }
@@ -71,6 +72,7 @@ impl PeerIdentity {
             client_fec_percentage: None,
             client_stream_audio: None,
             client_audio_sink: None,
+            client_virtual_sink: None,
             client_audio_sink_capture_only: None,
             client_back_button_timeout: None,
         })
@@ -86,6 +88,7 @@ impl PeerIdentity {
             fec_percentage,
             stream_audio,
             audio_sink,
+            virtual_sink,
             audio_sink_capture_only,
             back_button_timeout,
         } = config_overrides;
@@ -96,6 +99,9 @@ impl PeerIdentity {
             || audio_sink
                 .as_deref()
                 .is_some_and(|value| !valid_audio_sink_override(value))
+            || virtual_sink
+                .as_deref()
+                .is_some_and(|value| !valid_audio_sink_override(value))
         {
             return Err("invalid_paired_identity");
         }
@@ -104,6 +110,7 @@ impl PeerIdentity {
         self.client_fec_percentage = fec_percentage;
         self.client_stream_audio = stream_audio;
         self.client_audio_sink = audio_sink;
+        self.client_virtual_sink = virtual_sink;
         self.client_audio_sink_capture_only = audio_sink_capture_only;
         self.client_back_button_timeout = back_button_timeout;
         Ok(self)
@@ -294,6 +301,7 @@ pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
+    configured_virtual_sink: Option<String>,
     global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
@@ -322,6 +330,7 @@ impl Controller {
             config,
             configured_output_name: None,
             configured_audio_sink: None,
+            configured_virtual_sink: None,
             global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
@@ -351,6 +360,10 @@ impl Controller {
 
     pub fn set_audio_sink_settings(&mut self, configured_audio_sink: Option<&str>) {
         self.configured_audio_sink = configured_audio_sink.map(str::to_owned);
+    }
+
+    pub fn set_virtual_sink_settings(&mut self, configured_virtual_sink: Option<&str>) {
+        self.configured_virtual_sink = configured_virtual_sink.map(str::to_owned);
     }
 
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
@@ -507,6 +520,7 @@ impl Controller {
             global_stream_audio,
             global_audio_sink_capture_only,
             self.configured_audio_sink.clone(),
+            self.configured_virtual_sink.clone(),
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
