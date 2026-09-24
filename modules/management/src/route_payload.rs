@@ -318,6 +318,7 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
                 &["enabled", "expected_revision"],
                 &[
                     "auto_sync",
+                    "autosync_remove_uninstalled",
                     "sync_all_installed",
                     "recent_games",
                     "recent_max_age_days",
@@ -336,7 +337,11 @@ fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
-            for field in ["auto_sync", "sync_all_installed"] {
+            for field in [
+                "auto_sync",
+                "autosync_remove_uninstalled",
+                "sync_all_installed",
+            ] {
                 if object
                     .get(field)
                     .is_some_and(|value| value.as_bool().is_none())
@@ -1136,6 +1141,7 @@ mod playnite_tests {
             "enabled":false,
             "expected_revision":7,
             "sync_all_installed":true,
+            "autosync_remove_uninstalled":false,
             "recent_games":0,
             "recent_max_age_days":36500,
             "sync_categories":["Action", "RPG"],
@@ -1153,6 +1159,7 @@ mod playnite_tests {
             serde_json::json!({"enabled":0,"expected_revision":0}),
             serde_json::json!({"enabled":false,"expected_revision":-1}),
             serde_json::json!({"enabled":false,"expected_revision":0,"auto_sync":"true"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"autosync_remove_uninstalled":"false"}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_games":10001}),
             serde_json::json!({"enabled":false,"expected_revision":0,"recent_max_age_days":36501}),
             serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":"Action"}),

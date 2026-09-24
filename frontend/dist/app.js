@@ -1040,6 +1040,7 @@ var Amaterasu;
         if (typeof values.enabled !== "boolean" ||
             typeof values.auto_sync !== "boolean" ||
             typeof values.sync_all_installed !== "boolean" ||
+            typeof values.autosync_remove_uninstalled !== "boolean" ||
             !Number.isSafeInteger(values.recent_games) ||
             values.recent_games < 0 ||
             values.recent_games > 10_000 ||
@@ -1051,6 +1052,7 @@ var Amaterasu;
             enabled: values.enabled,
             auto_sync: values.auto_sync,
             sync_all_installed: values.sync_all_installed,
+            autosync_remove_uninstalled: values.autosync_remove_uninstalled,
             recent_games: values.recent_games,
             recent_max_age_days: values.recent_max_age_days,
             sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -1367,6 +1369,8 @@ var Amaterasu;
                 autoSync.checked = settings.values.auto_sync;
                 const syncAllInstalled = Amaterasu.input("playnite_sync_all_installed", "", "checkbox");
                 syncAllInstalled.checked = settings.values.sync_all_installed;
+                const removeUninstalled = Amaterasu.input("playnite_autosync_remove_uninstalled", "", "checkbox");
+                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
                 const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
@@ -1411,7 +1415,7 @@ var Amaterasu;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
@@ -1420,6 +1424,7 @@ var Amaterasu;
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
                                 sync_all_installed: syncAllInstalled.checked,
+                                autosync_remove_uninstalled: removeUninstalled.checked,
                                 recent_games: recentGames.valueAsNumber,
                                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                                 sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),

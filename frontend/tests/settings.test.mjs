@@ -93,6 +93,7 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     enabled: true,
     auto_sync: false,
     sync_all_installed: true,
+    autosync_remove_uninstalled: false,
     recent_games: 0,
     recent_max_age_days: 36500,
     sync_categories: ["Action"],
@@ -127,6 +128,7 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     { ...values, recent_games: 10001 },
     { ...values, recent_max_age_days: 36501 },
     { ...values, enabled: "true" },
+    { ...values, autosync_remove_uninstalled: "false" },
     { ...values, exclude_games: Array.from({ length: 256 }, (_, index) => `game-${index}-${"x".repeat(500)}`) },
   ]) {
     assert.throws(() => parseSettings(invalid));

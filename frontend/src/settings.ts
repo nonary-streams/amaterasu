@@ -322,6 +322,7 @@ namespace Amaterasu {
       typeof values.enabled !== "boolean" ||
       typeof values.auto_sync !== "boolean" ||
       typeof values.sync_all_installed !== "boolean" ||
+      typeof values.autosync_remove_uninstalled !== "boolean" ||
       !Number.isSafeInteger(values.recent_games) ||
       values.recent_games < 0 ||
       values.recent_games > 10_000 ||
@@ -334,6 +335,7 @@ namespace Amaterasu {
       enabled: values.enabled,
       auto_sync: values.auto_sync,
       sync_all_installed: values.sync_all_installed,
+      autosync_remove_uninstalled: values.autosync_remove_uninstalled,
       recent_games: values.recent_games,
       recent_max_age_days: values.recent_max_age_days,
       sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -823,6 +825,12 @@ namespace Amaterasu {
           "checkbox",
         );
         syncAllInstalled.checked = settings.values.sync_all_installed;
+        const removeUninstalled = input(
+          "playnite_autosync_remove_uninstalled",
+          "",
+          "checkbox",
+        );
+        removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
         const recentGames = input(
           "playnite_recent_games",
           String(settings.values.recent_games),
@@ -914,6 +922,11 @@ namespace Amaterasu {
             "When off, import recent games plus installed games selected by category or plugin filters.",
           ),
           field(
+            "Remove uninstalled Playnite games",
+            removeUninstalled,
+            "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot.",
+          ),
+          field(
             "Recent games to import",
             recentGames,
             "Maximum number of recent games (0–10000); zero disables recent-game selection.",
@@ -960,6 +973,7 @@ namespace Amaterasu {
                 enabled: enabled.checked,
                 auto_sync: autoSync.checked,
                 sync_all_installed: syncAllInstalled.checked,
+                autosync_remove_uninstalled: removeUninstalled.checked,
                 recent_games: recentGames.valueAsNumber,
                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                 sync_categories: parsePlayniteFilterList(

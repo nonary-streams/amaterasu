@@ -143,6 +143,7 @@ namespace Amaterasu {
       enabled: boolean;
       auto_sync: boolean;
       sync_all_installed: boolean;
+      autosync_remove_uninstalled: boolean;
       recent_games: number;
       recent_max_age_days: number;
       sync_categories: string[];
