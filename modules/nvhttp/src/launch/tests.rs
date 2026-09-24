@@ -525,6 +525,54 @@ fn global_video_batch_size_reaches_rtsp_open_and_is_snapshotted_at_admission() {
 }
 
 #[test]
+fn global_max_bitrate_caps_rtsp_profile_and_is_snapshotted_at_admission() {
+    for (configured, later_value, expected) in [
+        (Some(5_000), Some(8_000), 5_000),
+        (Some(200_000), None, 10_000),
+        (None, Some(5_000), 10_000),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_max_bitrate_kbps(configured);
+        let mut broker = Broker::default();
+
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        controller.set_global_max_bitrate_kbps(later_value);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["profile"]["bitrate_kbps"], expected);
+    }
+}
+
+#[test]
+fn maximum_bitrate_below_encoder_minimum_fails_before_launch_work() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(99));
+
+    let reply = controller
+        .launch(10, request(1), peer(1), now)
+        .expect("unsupported configured cap rejects launch");
+    assert_eq!(reply.status, 503);
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("below the supported 100 kbps encoder minimum")
+    );
+    assert!(!controller.busy());
+}
+
+#[test]
 fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
     for (mode, bootstrap_provider, expected_provider, expected_constant_rate) in [
         (

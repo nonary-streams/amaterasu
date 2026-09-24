@@ -249,6 +249,7 @@ pub struct Controller {
     output_settings_ready: bool,
     global_stream_audio: bool,
     global_video_max_batch_size_kb: u8,
+    global_max_bitrate_kbps: Option<u32>,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -270,6 +271,7 @@ impl Controller {
             output_settings_ready: true,
             global_stream_audio: true,
             global_video_max_batch_size_kb: 64,
+            global_max_bitrate_kbps: None,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -302,6 +304,10 @@ impl Controller {
         };
     }
 
+    pub fn set_global_max_bitrate_kbps(&mut self, value: Option<u32>) {
+        self.global_max_bitrate_kbps = value;
+    }
+
     pub fn busy(&self) -> bool {
         self.records.values().any(|record| !record.state.terminal())
     }
@@ -322,6 +328,15 @@ impl Controller {
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
+        if self
+            .global_max_bitrate_kbps
+            .is_some_and(|bitrate| bitrate < 100)
+        {
+            return Some(private_error(
+                503,
+                "configured maximum bitrate is below the supported 100 kbps encoder minimum",
+            ));
+        }
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
             || !config.profile.accepts(&request)
@@ -331,6 +346,7 @@ impl Controller {
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
+        let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -385,6 +401,7 @@ impl Controller {
             global_fec_percentage,
             global_stream_audio,
             global_video_max_batch_size_kb,
+            global_max_bitrate_kbps,
             capture_output,
             capture_provider,
             constant_rate,

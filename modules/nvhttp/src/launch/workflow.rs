@@ -178,7 +178,11 @@ impl Controller {
                             "width": record.request.width,
                             "height": record.request.height,
                             "fps": record.request.fps,
-                            "bitrate_kbps": config.profile.bitrate_kbps,
+                            "bitrate_kbps": record
+                                .global_max_bitrate_kbps
+                                .map_or(config.profile.bitrate_kbps, |limit| {
+                                    config.profile.bitrate_kbps.min(limit)
+                                }),
                             "max_reference_frames": config.profile.max_reference_frames,
                             "packet_size": config.profile.packet_size,
                             "fec_percentage": record.effective_fec_percentage,

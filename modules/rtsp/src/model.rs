@@ -1094,6 +1094,16 @@ mod tests {
     }
 
     #[test]
+    fn capped_profile_bitrate_reaches_stream_session_start_in_bits_per_second() {
+        let mut request = open();
+        request.profile = matching_profile();
+        request.profile.bitrate_kbps = 7_500;
+
+        let arm = request.arm(41);
+        assert_eq!(arm["configuration"]["configuration"]["bitrate"], 7_500_000);
+    }
+
+    #[test]
     fn constant_rate_capture_is_wgc_only_and_reaches_session_start() {
         let mut request = open();
         assert!(!request.capture.constant_rate);

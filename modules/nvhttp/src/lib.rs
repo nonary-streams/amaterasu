@@ -45,6 +45,8 @@ enum Operation {
         capture: FieldUpdate<CaptureMode>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         video_max_batch_size_kb: FieldUpdate<u8>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        max_bitrate: FieldUpdate<i32>,
         expected_revision: u64,
     },
 }
@@ -169,6 +171,7 @@ impl ManagedModule for NvhttpModule {
             router.set_global_video_max_batch_size_kb(
                 self.product_settings.effective_video_max_batch_size_kb(),
             );
+            router.set_global_max_bitrate_kbps(self.product_settings.effective_max_bitrate_kbps());
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -419,6 +422,7 @@ impl NvhttpModule {
                                 stream_audio,
                                 capture,
                                 video_max_batch_size_kb,
+                                max_bitrate,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -444,6 +448,7 @@ impl NvhttpModule {
                                     stream_audio,
                                     capture,
                                     video_max_batch_size_kb,
+                                    max_bitrate,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -583,6 +588,7 @@ mod tests {
             stream_audio: omitted_audio,
             capture: omitted_capture,
             video_max_batch_size_kb: omitted_batch_size,
+            max_bitrate: omitted_max_bitrate,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -597,6 +603,7 @@ mod tests {
         assert_eq!(omitted_audio, FieldUpdate::Omitted);
         assert_eq!(omitted_capture, FieldUpdate::Omitted);
         assert_eq!(omitted_batch_size, FieldUpdate::Omitted);
+        assert_eq!(omitted_max_bitrate, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -605,11 +612,12 @@ mod tests {
             stream_audio: null_audio,
             capture: null_capture,
             video_max_batch_size_kb: null_batch_size,
+            max_bitrate: null_max_bitrate,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"stream_audio":null,"capture":null,
-            "video_max_batch_size_kb":null
+            "video_max_batch_size_kb":null,"max_bitrate":null
         }))
         .unwrap()
         else {
@@ -621,6 +629,7 @@ mod tests {
         assert_eq!(null_audio, FieldUpdate::Null);
         assert_eq!(null_capture, FieldUpdate::Null);
         assert_eq!(null_batch_size, FieldUpdate::Null);
+        assert_eq!(null_max_bitrate, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -629,11 +638,12 @@ mod tests {
             stream_audio,
             capture,
             video_max_batch_size_kb,
+            max_bitrate,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false,"capture":"wgcc",
-            "video_max_batch_size_kb":32
+            "video_max_batch_size_kb":32,"max_bitrate":-15000
         }))
         .unwrap()
         else {
@@ -645,6 +655,7 @@ mod tests {
         assert_eq!(stream_audio, FieldUpdate::Value(false));
         assert_eq!(capture, FieldUpdate::Value(CaptureMode::Wgcc));
         assert_eq!(video_max_batch_size_kb, FieldUpdate::Value(32));
+        assert_eq!(max_bitrate, FieldUpdate::Value(-15_000));
 
         assert!(
             serde_json::from_value::<Operation>(json!({

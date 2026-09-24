@@ -90,10 +90,11 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. Product document versions 1 through 7
+active_http_port/active_https_port values. Product document versions 1 through 8
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
 address policy, v4 adds the global capture output, v5 adds audio enablement, v6
-adds the global capture mode, and v7 adds the global video batch allowance.
+adds the global capture mode, v7 adds the global video batch allowance, and v8
+adds the global maximum bitrate.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -203,6 +204,31 @@ and stream-session to the media transport. It changes the per-frame software sen
 allowance while preserving the aggregate 64-send fairness bound. Platform UDP
 segmentation offload (USO/GSO) is not implemented yet, so this is not full transport
 batching parity.
+
+## Global maximum bitrate
+
+Product document v8 stores nullable `max_bitrate` as a signed 32-bit integer. The
+settings API accepts any signed 32-bit value: omission preserves the stored value,
+and `null` clears it. Reads return the exact nullable value as
+`configured_max_bitrate` and a positive-only cap as `effective_max_bitrate_kbps`;
+zero and negative values have no effective cap. Product documents v1 through v7
+migrate with no configured cap.
+
+NVHTTP snapshots the effective cap when a stream is admitted and limits Amaterasu's
+configured startup profile bitrate passed to RTSP. A cap above the configured
+profile does not raise its bitrate. `LaunchRequest` currently has no bitrate field,
+so the client-requested bitrate cap used by Vibeshine is still pending. The current NVHTTP profile accepts 100 through
+100,000 kbps, and the Windows video encoder accepts 100,000 through 100,000,000
+bits per second. A positive configured cap below 100 kbps is retained but causes
+launch to fail with an explicit encoder-minimum error instead of starting above
+the configured-profile cap. This slice applies only at launch; Amaterasu has no live
+`/bitrate` update route, so changing the setting does not modify active streams.
+
+Vibeshine's live `/bitrate` consumer applies a 500,000 kbps ceiling. That runtime
+path and ceiling are not implemented here; the current Amaterasu startup profile
+has a lower 100,000 kbps maximum. `minimum_fps_target` also remains pending: the
+reference initializer uses 20 while its documentation says 0, and its capture
+wait/duplicate-frame behavior needs a separate pacing design before implementation.
 
 ## Wire routes
 

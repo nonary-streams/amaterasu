@@ -165,6 +165,10 @@ impl Router {
             .set_global_video_max_batch_size_kb(max_batch_size_kb);
     }
 
+    pub fn set_global_max_bitrate_kbps(&mut self, max_bitrate_kbps: Option<u32>) {
+        self.launches.set_global_max_bitrate_kbps(max_bitrate_kbps);
+    }
+
     pub fn set_capture_mode(&mut self, capture: crate::launch::CaptureMode) {
         self.launches.set_capture_mode(capture);
     }
