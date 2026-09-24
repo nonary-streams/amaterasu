@@ -16,7 +16,12 @@ pub use transport::*;
 
 pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;
+/// Capture API v1.1 adds physical desktop geometry.
 pub const CAPTURE_INTERFACE_MINOR: u32 = 1;
+/// Capture API v1.2 adds per-delivery source freshness metadata.
+pub const CAPTURE_FRESHNESS_INTERFACE_MINOR: u32 = 2;
+pub const CAPTURE_FRAME_CACHED_REUSE: u32 = 0;
+pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
 pub const PIXEL_NV12: u32 = 2;
 pub const CODEC_H264: u32 = 1;
@@ -182,6 +187,20 @@ pub struct CaptureApi {
     pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
 }
 
+/// Additive v1.2 capture table. Bind the legacy prefix first, then read this
+/// tail only when both the advertised minor and table size cover v1.2.
+#[repr(C)]
+pub struct CaptureApiV1_2 {
+    pub base: NativeInterface,
+    pub read_frame: unsafe extern "C" fn(*mut c_void, u64, FrameSink) -> Status,
+    pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
+    /// Reports whether this delivery came from a newly captured source frame
+    /// or reused cached pixels. Freshness describes source acquisition only;
+    /// it does not guarantee encoder acceptance.
+    pub read_frame_with_freshness:
+        unsafe extern "C" fn(*mut c_void, u64, FreshFrameSinkV1_2) -> Status,
+}
+
 /// The v1.0 prefix retained so consumers can bind older capture providers
 /// without reading the optional v1.1 geometry callback past their table.
 #[repr(C)]
@@ -191,6 +210,32 @@ pub struct CaptureApiPrefix {
 }
 
 pub const CAPTURE_API_V1_0_SIZE: u32 = size_of::<CaptureApiPrefix>() as u32;
+pub const CAPTURE_API_V1_1_SIZE: u32 = size_of::<CaptureApi>() as u32;
+pub const CAPTURE_API_V1_2_SIZE: u32 = size_of::<CaptureApiV1_2>() as u32;
+
+/// Receives one borrowed frame and its source freshness in a single callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FreshFrameSinkV1_2 {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const CpuFrame, u32) -> Status,
+}
+
+impl FreshFrameSinkV1_2 {
+    /// # Safety
+    /// The sink context/callback and frame allocation must remain valid until
+    /// this call returns. The callback must not retain borrowed frame bytes.
+    pub unsafe fn send(&self, frame: &CpuFrame, freshness: u32) -> Status {
+        if let Err(status) = frame.validate() {
+            return status;
+        }
+        if !matches!(freshness, CAPTURE_FRAME_CACHED_REUSE | CAPTURE_FRAME_FRESH) {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: callback lifetime and frame ownership are guaranteed by caller.
+        unsafe { (self.write)(self.context, frame, freshness) }
+    }
+}
 
 #[repr(C)]
 pub struct EncoderApi {

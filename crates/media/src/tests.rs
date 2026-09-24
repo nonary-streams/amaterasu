@@ -160,6 +160,56 @@ fn media_records_have_explicit_64_bit_c_layouts() {
     assert_eq!(std::mem::size_of::<CaptureApiPrefix>(), 40);
     assert_eq!(CAPTURE_API_V1_0_SIZE, 40);
     assert_eq!(std::mem::size_of::<CaptureApi>(), 48);
+    assert_eq!(CAPTURE_API_V1_1_SIZE, 48);
+    assert_eq!(std::mem::size_of::<CaptureApiV1_2>(), 56);
+    assert_eq!(CAPTURE_API_V1_2_SIZE, 56);
+    assert_eq!(
+        std::mem::offset_of!(CaptureApiV1_2, read_frame_with_freshness),
+        48
+    );
     assert_eq!(std::mem::size_of::<EncoderApi>(), 56);
     assert_eq!(std::mem::size_of::<VideoApi>(), 40);
+}
+
+#[test]
+fn freshness_sink_accepts_only_defined_provenance_values() {
+    unsafe extern "C" fn record(
+        context: *mut c_void,
+        _: *const CpuFrame,
+        freshness: u32,
+    ) -> Status {
+        // SAFETY: the test passes a writable u32 for this synchronous callback.
+        unsafe { context.cast::<u32>().write(freshness) };
+        STATUS_OK
+    }
+
+    let bytes = [0u8; 4];
+    let frame = CpuFrame {
+        width: 1,
+        height: 1,
+        format: PIXEL_BGRA8,
+        stride: 4,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 0,
+        sequence: 1,
+    };
+    let mut observed = u32::MAX;
+    let sink = FreshFrameSinkV1_2 {
+        context: (&mut observed as *mut u32).cast(),
+        write: record,
+    };
+
+    // SAFETY: frame bytes and callback context both outlive the synchronous send.
+    assert_eq!(unsafe { sink.send(&frame, CAPTURE_FRAME_FRESH) }, STATUS_OK);
+    assert_eq!(observed, CAPTURE_FRAME_FRESH);
+    // SAFETY: same synchronous callback contract as above.
+    assert_eq!(
+        unsafe { sink.send(&frame, CAPTURE_FRAME_CACHED_REUSE) },
+        STATUS_OK
+    );
+    assert_eq!(observed, CAPTURE_FRAME_CACHED_REUSE);
+    // SAFETY: invalid freshness is rejected before the callback is called.
+    assert_eq!(unsafe { sink.send(&frame, 2) }, STATUS_INVALID_ARGUMENT);
+    assert_eq!(observed, CAPTURE_FRAME_CACHED_REUSE);
 }

@@ -74,6 +74,14 @@ pub struct Frame {
     pub bytes: Arc<Vec<u8>>,
 }
 
+/// Delivery provenance retained by the controller for the v1.2 native API.
+/// Fresh means a new frame arrived from the WGC session; cached reuse means the
+/// controller returned the prior owned pixels after the session had no frame.
+pub struct FrameDelivery {
+    pub frame: Frame,
+    pub is_fresh: bool,
+}
+
 #[cfg(any(windows, test))]
 pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     let stride = width.checked_mul(4).ok_or_else(invalid_frame)?;

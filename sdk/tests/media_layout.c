@@ -16,6 +16,12 @@ _Static_assert(AMATERASU_CAPTURE_API_V1_0_SIZE == 40, "legacy capture minimum si
 _Static_assert(sizeof(AmaterasuCaptureApi) == 48, "capture table layout");
 _Static_assert(offsetof(AmaterasuCaptureApi, read_frame) == 32, "capture prefix callback offset");
 _Static_assert(offsetof(AmaterasuCaptureApi, geometry) == 40, "capture geometry callback offset");
+_Static_assert(AMATERASU_CAPTURE_API_V1_1_SIZE == 48, "capture v1.1 minimum size");
+_Static_assert(AMATERASU_CAPTURE_FRESHNESS_INTERFACE_MINOR == 2u, "capture freshness ABI minor");
+_Static_assert(sizeof(AmaterasuFreshFrameSinkV1_2) == 16, "fresh capture sink layout");
+_Static_assert(sizeof(AmaterasuCaptureApiV1_2) == 56, "capture v1.2 table layout");
+_Static_assert(AMATERASU_CAPTURE_API_V1_2_SIZE == 56, "capture v1.2 minimum size");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_2, read_frame_with_freshness) == 48, "capture freshness callback offset");
 _Static_assert(sizeof(AmaterasuEncoderApi) == 56, "encoder table layout");
 _Static_assert(sizeof(AmaterasuVideoApi) == 40, "video table layout");
 _Static_assert(sizeof(AmaterasuAudioFrame) == 56, "audio frame layout");

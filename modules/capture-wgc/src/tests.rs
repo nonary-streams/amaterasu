@@ -204,6 +204,22 @@ impl TestBinding {
         }
     }
 
+    fn read_freshness(&self, id: u64, values: &mut Vec<u32>) -> Status {
+        // SAFETY: capture-wgc binds a v1.2 table; the vector lives through the
+        // synchronous freshness callback and copies its scalar metadata.
+        unsafe {
+            let api = &*self.0.cast::<CaptureApiV1_2>();
+            (api.read_frame_with_freshness)(
+                api.base.context,
+                id,
+                FreshFrameSinkV1_2 {
+                    context: (values as *mut Vec<u32>).cast(),
+                    write: record_freshness,
+                },
+            )
+        }
+    }
+
     fn geometry(&self, id: u64) -> (Status, Option<CaptureGeometry>) {
         let mut geometry = std::mem::MaybeUninit::uninit();
         // SAFETY: binding owns the table and geometry is writable for this call.
@@ -244,6 +260,16 @@ unsafe extern "C" fn copy_frame(context: *mut c_void, frame: *const CpuFrame) ->
 
 unsafe extern "C" fn reject_frame(_: *mut c_void, _: *const CpuFrame) -> Status {
     STATUS_INVALID_ARGUMENT
+}
+
+unsafe extern "C" fn record_freshness(
+    context: *mut c_void,
+    _: *const CpuFrame,
+    freshness: u32,
+) -> Status {
+    // SAFETY: TestBinding::read_freshness passes a live Vec through the call.
+    unsafe { (&mut *context.cast::<Vec<u32>>()).push(freshness) };
+    STATUS_OK
 }
 
 #[test]
@@ -456,14 +482,27 @@ fn native_factory_rejects_incompatible_table_without_allocating_a_binding() {
     let (controller, _) = setup(true);
     let factory = native::Factory::new(controller.clone());
     let before = Arc::strong_count(&controller);
-    for (major, size) in [
-        (INTERFACE_MAJOR + 1, size_of::<CaptureApi>() as u32),
-        (INTERFACE_MAJOR, size_of::<CaptureApi>() as u32 + 1),
+    for (major, minor, size) in [
+        (
+            INTERFACE_MAJOR + 1,
+            CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            CAPTURE_API_V1_2_SIZE,
+        ),
+        (
+            INTERFACE_MAJOR,
+            CAPTURE_FRESHNESS_INTERFACE_MINOR,
+            CAPTURE_API_V1_2_SIZE + 1,
+        ),
+        (
+            INTERFACE_MAJOR,
+            CAPTURE_FRESHNESS_INTERFACE_MINOR + 1,
+            CAPTURE_API_V1_2_SIZE,
+        ),
     ] {
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
             interface_major: major,
-            min_minor: 0,
+            min_minor: minor,
             min_size: size,
         };
         let mut result = std::ptr::null();
@@ -652,6 +691,27 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
         controller.read("owner", stream, 0).unwrap_err().code,
         "not_found"
     );
+}
+
+#[test]
+fn v1_2_capture_callback_distinguishes_new_frames_from_cached_reuse() {
+    let events = VecDeque::from([Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))), Ok(None)]);
+    let controller = Arc::new(Mutex::new(Controller::new(
+        FakeBackend {
+            events: Arc::new(Mutex::new(events)),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        true,
+    )));
+    let stream = open_constant_rate(&mut controller.lock().unwrap(), "owner");
+    let factory = native::Factory::new(controller);
+    let binding = TestBinding::new(&factory, "owner");
+    let mut freshness = Vec::new();
+
+    assert_eq!(binding.read_freshness(stream, &mut freshness), STATUS_OK);
+    assert_eq!(binding.read_freshness(stream, &mut freshness), STATUS_OK);
+    assert_eq!(freshness, [CAPTURE_FRAME_FRESH, CAPTURE_FRAME_CACHED_REUSE]);
 }
 
 #[test]

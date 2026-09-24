@@ -1,7 +1,9 @@
 use crate::{backend::Backend, controller::Controller};
 use amaterasu_media::{
-    CAPTURE_INTERFACE_MINOR, CaptureApi, CaptureGeometry, CpuFrame, FrameSink, INTERFACE_MAJOR,
-    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
+    CAPTURE_API_V1_2_SIZE, CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH,
+    CAPTURE_FRESHNESS_INTERFACE_MINOR, CaptureApiV1_2, CaptureGeometry, CpuFrame, FrameSink,
+    FreshFrameSinkV1_2, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED,
+    MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -34,7 +36,7 @@ impl<B: Backend + 'static> Factory<B> {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApi,
+    api: CaptureApiV1_2,
     controller: SharedController<B>,
     caller: String,
 }
@@ -42,18 +44,19 @@ struct Binding<B: Backend> {
 impl<B: Backend> Binding<B> {
     fn new(controller: SharedController<B>, caller: String) -> Box<Self> {
         let mut binding = Box::new(Binding {
-            api: CaptureApi {
+            api: CaptureApiV1_2 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: size_of::<CaptureApi>() as u32,
+                        size: CAPTURE_API_V1_2_SIZE,
                         major: INTERFACE_MAJOR,
-                        minor: CAPTURE_INTERFACE_MINOR,
+                        minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
                     },
                     context: std::ptr::null_mut(),
                     release: Some(release::<B>),
                 },
                 read_frame: read_frame::<B>,
                 geometry: geometry::<B>,
+                read_frame_with_freshness: read_frame_with_freshness::<B>,
             },
             controller,
             caller,
@@ -63,13 +66,21 @@ impl<B: Backend> Binding<B> {
     }
 
     fn poll_frame(&self, stream: u64) -> Result<crate::model::Frame, Status> {
+        self.poll_frame_with_freshness(stream)
+            .map(|delivery| delivery.frame)
+    }
+
+    fn poll_frame_with_freshness(
+        &self,
+        stream: u64,
+    ) -> Result<crate::model::FrameDelivery, Status> {
         let mut controller = match self.controller.try_lock() {
             Ok(controller) => controller,
             Err(std::sync::TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
             Err(_) => return Err(MEDIA_BACKEND_ERROR),
         };
-        match controller.read(&self.caller, stream, 0) {
-            Ok(Some(frame)) => Ok(frame),
+        match controller.read_with_freshness(&self.caller, stream, 0) {
+            Ok(Some(delivery)) => Ok(delivery),
             Ok(None) => Err(MEDIA_PENDING),
             Err(error) => Err(capture_error_status(&error)),
         }
@@ -179,6 +190,47 @@ unsafe extern "C" fn read_frame<B: Backend>(
     .unwrap_or(STATUS_INTERNAL_ERROR)
 }
 
+unsafe extern "C" fn read_frame_with_freshness<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    sink: FreshFrameSinkV1_2,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: binding is retained by broker through this synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let delivery = match binding.poll_frame_with_freshness(stream) {
+            Ok(delivery) => delivery,
+            Err(status) => return status,
+        };
+        let frame = CpuFrame {
+            width: delivery.frame.width,
+            height: delivery.frame.height,
+            format: PIXEL_BGRA8,
+            stride: delivery.frame.stride,
+            data: delivery.frame.bytes.as_ptr(),
+            len: delivery.frame.bytes.len(),
+            timestamp_us: delivery.frame.timestamp_us,
+            sequence: delivery.frame.sequence,
+        };
+        let freshness = if delivery.is_fresh {
+            CAPTURE_FRAME_FRESH
+        } else {
+            CAPTURE_FRAME_CACHED_REUSE
+        };
+        // SAFETY: frame bytes remain owned by delivery through the synchronous
+        // callback; the callback must not retain either the descriptor or bytes.
+        let status = unsafe { sink.send(&frame, freshness) };
+        if status != STATUS_OK && status != MEDIA_BUSY {
+            binding.discard_cached_frame(stream);
+        }
+        status
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
 unsafe extern "C" fn geometry<B: Backend>(
     context: *mut c_void,
     stream: u64,
@@ -212,10 +264,10 @@ unsafe extern "C" fn geometry<B: Backend>(
 }
 
 fn supports_query(query: &NativeInterfaceQuery) -> bool {
-    if query.min_minor > CAPTURE_INTERFACE_MINOR {
+    if query.min_minor > CAPTURE_FRESHNESS_INTERFACE_MINOR {
         return false;
     }
     query.header.supports::<NativeInterfaceQuery>()
         && query.interface_major == INTERFACE_MAJOR
-        && query.min_size as usize <= size_of::<CaptureApi>()
+        && query.min_size <= CAPTURE_API_V1_2_SIZE
 }

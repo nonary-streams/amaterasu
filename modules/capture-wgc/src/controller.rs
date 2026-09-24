@@ -1,5 +1,7 @@
 use crate::backend::{Backend, CaptureSession};
-use crate::model::{CaptureError, CaptureResult, Frame, MAX_STREAMS, MAX_WAIT_MS, Operation};
+use crate::model::{
+    CaptureError, CaptureResult, Frame, FrameDelivery, MAX_STREAMS, MAX_WAIT_MS, Operation,
+};
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -215,7 +217,18 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    #[cfg(test)]
     pub fn read(&mut self, caller: &str, id: u64, wait_ms: u32) -> CaptureResult<Option<Frame>> {
+        self.read_with_freshness(caller, id, wait_ms)
+            .map(|delivery| delivery.map(|delivery| delivery.frame))
+    }
+
+    pub fn read_with_freshness(
+        &mut self,
+        caller: &str,
+        id: u64,
+        wait_ms: u32,
+    ) -> CaptureResult<Option<FrameDelivery>> {
         self.authorize(caller, id)?;
         if wait_ms > MAX_WAIT_MS {
             self.streams
@@ -233,7 +246,10 @@ impl<B: Backend> Controller<B> {
                 Ok(Some(mut frame)) if stream.constant_rate => match stream.stamp(&mut frame) {
                     Ok(()) => {
                         stream.last_frame = Some(frame.clone());
-                        Ok(Some(frame))
+                        Ok(Some(FrameDelivery {
+                            frame,
+                            is_fresh: true,
+                        }))
                     }
                     Err(error) => {
                         stream.last_frame = None;
@@ -247,7 +263,10 @@ impl<B: Backend> Controller<B> {
                     match stream.stamp(&mut frame) {
                         Ok(()) => {
                             stream.last_frame = Some(frame.clone());
-                            Ok(Some(frame))
+                            Ok(Some(FrameDelivery {
+                                frame,
+                                is_fresh: false,
+                            }))
                         }
                         Err(error) => {
                             stream.last_frame = None;
@@ -255,7 +274,10 @@ impl<B: Backend> Controller<B> {
                         }
                     }
                 }
-                Ok(frame) => Ok(frame),
+                Ok(frame) => Ok(frame.map(|frame| FrameDelivery {
+                    frame,
+                    is_fresh: true,
+                })),
                 Err(error) => {
                     stream.last_frame = None;
                     Err(error)

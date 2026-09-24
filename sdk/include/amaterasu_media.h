@@ -82,6 +82,15 @@ typedef struct {
     AmaterasuStatus (*write)(void *context, const AmaterasuCpuFrame *frame);
 } AmaterasuFrameSink;
 
+/* Freshness is source provenance, not encoder acceptance: FRESH identifies a
+ * newly acquired source frame; CACHED_REUSE identifies reused pixels. */
+#define AMATERASU_CAPTURE_FRAME_CACHED_REUSE 0u
+#define AMATERASU_CAPTURE_FRAME_FRESH 1u
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuCpuFrame *frame, uint32_t freshness);
+} AmaterasuFreshFrameSinkV1_2;
+
 /* H264 bytes are Annex B. EOS has flags=2, len=0, no payload.
  * When open selects packet_boundaries=true, flag 4 marks the last fragment of
  * one picture. Its fragments share sequence/timestamp. EOS never carries 4. */
@@ -117,6 +126,7 @@ typedef struct {
 } AmaterasuCaptureApiPrefix;
 
 #define AMATERASU_CAPTURE_INTERFACE_MINOR 1u
+#define AMATERASU_CAPTURE_FRESHNESS_INTERFACE_MINOR 2u
 #define AMATERASU_CAPTURE_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiPrefix))
 
 typedef struct {
@@ -128,6 +138,18 @@ typedef struct {
      * initializes geometry; UNSUPPORTED means unavailable. */
     AmaterasuStatus (*geometry)(void *context, uint64_t stream, AmaterasuCaptureGeometry *geometry);
 } AmaterasuCaptureApi;
+
+/* Optional v1.2 tail: access only after checking advertised minor >= 2 and
+ * table size >= sizeof(AmaterasuCaptureApiV1_2). The callback reports source
+ * freshness for each borrowed frame without overloading sequence/timestamp. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*read_frame)(void *context, uint64_t stream, AmaterasuFrameSink sink);
+    AmaterasuStatus (*geometry)(void *context, uint64_t stream, AmaterasuCaptureGeometry *geometry);
+    AmaterasuStatus (*read_frame_with_freshness)(void *context, uint64_t stream, AmaterasuFreshFrameSinkV1_2 sink);
+} AmaterasuCaptureApiV1_2;
+#define AMATERASU_CAPTURE_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuCaptureApi))
+#define AMATERASU_CAPTURE_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_2))
 
 typedef struct {
     AmaterasuNativeInterface base;
