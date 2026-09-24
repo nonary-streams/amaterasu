@@ -55,6 +55,8 @@ enum Operation {
         minimum_fps_target: FieldUpdate<f64>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         wgc_pacing_smoothing: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        ping_timeout_ms: FieldUpdate<i32>,
         expected_revision: u64,
     },
 }
@@ -176,6 +178,7 @@ impl ManagedModule for NvhttpModule {
             );
             router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
             router.set_global_stream_audio(self.product_settings.stream_audio());
+            router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
             router.set_capture_mode(self.product_settings.configured_capture());
             router.set_global_video_max_batch_size_kb(
                 self.product_settings.effective_video_max_batch_size_kb(),
@@ -442,6 +445,7 @@ impl NvhttpModule {
                                 max_bitrate,
                                 minimum_fps_target,
                                 wgc_pacing_smoothing,
+                                ping_timeout_ms,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -472,6 +476,7 @@ impl NvhttpModule {
                                     max_bitrate,
                                     minimum_fps_target,
                                     wgc_pacing_smoothing,
+                                    ping_timeout_ms,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -615,6 +620,7 @@ mod tests {
             max_bitrate: omitted_max_bitrate,
             minimum_fps_target: omitted_minimum_fps,
             wgc_pacing_smoothing: omitted_wgc_pacing,
+            ping_timeout_ms: omitted_ping_timeout,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -633,6 +639,7 @@ mod tests {
         assert_eq!(omitted_max_bitrate, FieldUpdate::Omitted);
         assert_eq!(omitted_minimum_fps, FieldUpdate::Omitted);
         assert_eq!(omitted_wgc_pacing, FieldUpdate::Omitted);
+        assert_eq!(omitted_ping_timeout, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -645,11 +652,12 @@ mod tests {
             max_bitrate: null_max_bitrate,
             minimum_fps_target: null_minimum_fps,
             wgc_pacing_smoothing: null_wgc_pacing,
+            ping_timeout_ms: null_ping_timeout,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"audio_sink":null,"stream_audio":null,"capture":null,
-            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null
+            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null
         }))
         .unwrap()
         else {
@@ -665,6 +673,7 @@ mod tests {
         assert_eq!(null_max_bitrate, FieldUpdate::Null);
         assert_eq!(null_minimum_fps, FieldUpdate::Null);
         assert_eq!(null_wgc_pacing, FieldUpdate::Null);
+        assert_eq!(null_ping_timeout, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -677,11 +686,12 @@ mod tests {
             max_bitrate,
             minimum_fps_target,
             wgc_pacing_smoothing,
+            ping_timeout_ms,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","audio_sink":"render.selected","stream_audio":false,"capture":"wgcc",
-            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false
+            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false,"ping_timeout_ms":-1
         }))
         .unwrap()
         else {
@@ -697,6 +707,7 @@ mod tests {
         assert_eq!(max_bitrate, FieldUpdate::Value(-15_000));
         assert_eq!(minimum_fps_target, FieldUpdate::Value(23.5));
         assert_eq!(wgc_pacing_smoothing, FieldUpdate::Value(false));
+        assert_eq!(ping_timeout_ms, FieldUpdate::Value(-1));
 
         assert!(
             serde_json::from_value::<Operation>(json!({
