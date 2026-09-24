@@ -2,11 +2,11 @@
 
 - Run: `f220bcaa-20260924-152010`
 - Clean source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b` on `main`
-- Current integration SHA: `998ea1a` (shared guide correction)
+- Current integration SHA: `30acd5de34ac5548ebf4d46086fc32ccad7b6913` (guide and ID assignment commits)
 - Source checkout for integration validation and final promotion: `C:\Users\Chase\sources\amaterasu`
 - Integration branch/worktree: `config-parity/integration` / `D:\sources\worktrees\amaterasu-config-integration`
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: dispatch preparation complete; lane sessions not started yet.
+- Status: all six lane CLI sessions are running; XHigh worker startup and work are tracked in the external run directory.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -316,3 +316,16 @@ No candidates submitted yet. Trial merges and full builds/tests occur in the cle
 ## Shared-resource queue
 
 No host-global audio, virtual-display, input-device, port, or installed-service tests scheduled yet.
+
+## Active Luna Max CLI sessions
+
+All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled, and three child slots defaulting to `gpt-6-luna` at `xhigh`. Outbox messages verify the model/worker configuration per lane; messages that are still pending are marked `launch-configured` until that lane reports its startup check. Runner PIDs identify the supervising PowerShell process; CLI session IDs are stable resume keys.
+
+| Lead | Session ID | Runner PID | Startup report |
+| --- | --- | ---: | --- |
+| luna-01 | `01a0d516-858e-7c40-b459-5de0bbf3d0dd` | 24488 | launch-configured |
+| luna-02 | `01a0d516-8616-7270-a509-547be018f212` | 42520 | XHigh workers confirmed |
+| luna-03 | `01a0d516-85d0-7261-b883-4dddf4473f99` | 21396 | startup verified |
+| luna-04 | `01a0d516-8713-7b83-87f1-d35c0828ae10` | 23168 | session verified; worker check pending |
+| luna-05 | `01a0d516-8830-7960-af1e-079a13415f97` | 23228 | XHigh workers starting |
+| luna-06 | `01a0d516-8960-7e02-ac81-3eee350f679a` | 43508 | launch-configured |
