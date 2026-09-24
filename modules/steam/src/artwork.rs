@@ -1,14 +1,24 @@
 //! Bounded local Steam artwork discovery for catalog synchronization.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use ureq::Agent;
+use ureq::tls::{RootCerts, TlsConfig};
 
 const MAX_ARTWORK_ROOTS: usize = 4;
 const MAX_USER_DIRECTORIES: usize = 32;
 const MAX_HASH_DIRECTORIES: usize = 32;
-const MAX_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_REMOTE_CACHE_IMAGES: usize = 4;
+const MAX_REMOTE_FAILURES: usize = 64;
+const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
+const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const REMOTE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 pub const ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -24,6 +34,373 @@ pub struct ArtworkChunk {
     pub next_offset: Option<u64>,
     pub mime_type: &'static str,
     pub data: String,
+}
+
+#[derive(Clone)]
+struct CachedRemoteArtwork {
+    app_id: u32,
+    revision: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct RemoteArtworkCache {
+    images: VecDeque<CachedRemoteArtwork>,
+    failed_until: BTreeMap<u32, Instant>,
+}
+
+pub struct RemoteArtworkRequest {
+    pub request_id: u64,
+    pub app_id: u32,
+    pub last_updated: u64,
+    pub revision: String,
+    pub offset: u64,
+    pub deadline: Instant,
+}
+
+pub struct RemoteArtworkCompletion {
+    pub request_id: u64,
+    pub app_id: u32,
+    pub revision: String,
+    pub offset: u64,
+    pub result: Result<ArtworkChunk, &'static str>,
+}
+
+#[derive(Default)]
+pub struct RemoteArtworkWorker {
+    requests: Option<mpsc::SyncSender<RemoteArtworkRequest>>,
+    completions: Option<mpsc::Receiver<RemoteArtworkCompletion>>,
+    stopped: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Stable opaque revision for the fixed Steam CDN portrait URL. Including the
+/// manifest's last-update stamp changes the reference when Steam replaces the
+/// installed app metadata, without exposing a URL or local path to the catalog.
+pub fn remote_revision(app_id: u32, last_updated: u64) -> Option<String> {
+    (app_id != 0).then(|| {
+        let identity = format!("steam-cdn:{app_id}:{last_updated}");
+        revision(Path::new(&identity), 0, 0)
+    })
+}
+
+fn remote_portrait_url(app_id: u32) -> Option<String> {
+    (app_id != 0).then(|| {
+        format!(
+            "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{app_id}/library_600x900_2x.jpg"
+        )
+    })
+}
+
+impl RemoteArtworkCache {
+    fn read_chunk_with(
+        &mut self,
+        app_id: u32,
+        last_updated: u64,
+        expected_revision: &str,
+        offset: u64,
+        now: Instant,
+        fetcher: impl FnOnce(u32) -> Result<Vec<u8>, &'static str>,
+    ) -> Result<ArtworkChunk, &'static str> {
+        if app_id == 0 {
+            return Err("artwork_unavailable");
+        }
+        if !offset.is_multiple_of(ARTWORK_CHUNK_BYTES as u64) || offset > MAX_ARTWORK_BYTES {
+            return Err("invalid_cursor");
+        }
+        let revision = remote_revision(app_id, last_updated).ok_or("artwork_unavailable")?;
+        if expected_revision != revision {
+            return Err("artwork_changed");
+        }
+
+        if let Some(index) = self
+            .images
+            .iter()
+            .position(|image| image.app_id == app_id && image.revision == revision)
+        {
+            let image = self
+                .images
+                .remove(index)
+                .expect("located cache item exists");
+            let result = chunk_from_bytes(&image.bytes, &image.revision, offset);
+            self.images.push_back(image);
+            return result;
+        }
+
+        if self
+            .failed_until
+            .get(&app_id)
+            .is_some_and(|failed_until| now < *failed_until)
+        {
+            return Err("artwork_unavailable");
+        }
+        self.failed_until.remove(&app_id);
+
+        let bytes = match fetcher(app_id).and_then(|bytes| {
+            validate_remote_artwork(&bytes)
+                .then_some(bytes)
+                .ok_or("unsupported_artwork")
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.remember_failure(app_id, now);
+                return Err(error);
+            }
+        };
+        if self.images.len() == MAX_REMOTE_CACHE_IMAGES {
+            self.images.pop_front();
+        }
+        self.failed_until.remove(&app_id);
+        self.images.push_back(CachedRemoteArtwork {
+            app_id,
+            revision: revision.clone(),
+            bytes,
+        });
+        let image = self.images.back().expect("new cache item exists");
+        chunk_from_bytes(&image.bytes, &image.revision, offset)
+    }
+
+    fn remember_failure(&mut self, app_id: u32, now: Instant) {
+        if !self.failed_until.contains_key(&app_id)
+            && self.failed_until.len() >= MAX_REMOTE_FAILURES
+        {
+            self.failed_until.pop_first();
+        }
+        self.failed_until
+            .insert(app_id, now + REMOTE_FAILURE_COOLDOWN);
+    }
+}
+
+impl RemoteArtworkWorker {
+    pub fn enqueue(&mut self, request: RemoteArtworkRequest) -> Result<(), &'static str> {
+        self.start_if_needed()?;
+        let Some(sender) = &self.requests else {
+            return Err("artwork_unavailable");
+        };
+        sender.try_send(request).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "artwork_busy",
+            mpsc::TrySendError::Disconnected(_) => "artwork_unavailable",
+        })
+    }
+
+    pub fn drain(&mut self) -> Vec<RemoteArtworkCompletion> {
+        let Some(receiver) = &self.completions else {
+            return Vec::new();
+        };
+        receiver.try_iter().collect()
+    }
+
+    fn start_if_needed(&mut self) -> Result<(), &'static str> {
+        self.start_with_fetcher(fetch_remote)
+    }
+
+    fn start_with_fetcher(
+        &mut self,
+        fetcher: impl Fn(u32) -> Result<Vec<u8>, &'static str> + Send + 'static,
+    ) -> Result<(), &'static str> {
+        if self.requests.is_some() {
+            return Ok(());
+        }
+
+        let (request_sender, request_receiver) =
+            mpsc::sync_channel::<RemoteArtworkRequest>(REMOTE_FETCH_QUEUE_CAPACITY);
+        let (completion_sender, completion_receiver) =
+            mpsc::sync_channel(REMOTE_FETCH_QUEUE_CAPACITY + 1);
+        let stopped = Arc::clone(&self.stopped);
+        let worker_thread = thread::Builder::new()
+            .name("steam-artwork-fetch".into())
+            .spawn(move || {
+                let mut cache = RemoteArtworkCache::default();
+                while let Ok(request) = request_receiver.recv() {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = if Instant::now() >= request.deadline {
+                        Err("request_ended")
+                    } else {
+                        cache.read_chunk_with(
+                            request.app_id,
+                            request.last_updated,
+                            &request.revision,
+                            request.offset,
+                            Instant::now(),
+                            &fetcher,
+                        )
+                    };
+                    let result = if Instant::now() >= request.deadline {
+                        Err("request_ended")
+                    } else {
+                        result
+                    };
+                    if completion_sender
+                        .send(RemoteArtworkCompletion {
+                            request_id: request.request_id,
+                            app_id: request.app_id,
+                            revision: request.revision,
+                            offset: request.offset,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| "artwork_unavailable")?;
+        self.requests = Some(request_sender);
+        self.completions = Some(completion_receiver);
+        self.thread = Some(worker_thread);
+        Ok(())
+    }
+}
+
+impl Drop for RemoteArtworkWorker {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        self.completions.take();
+        self.requests.take();
+        if let Some(worker_thread) = self.thread.take() {
+            let _ = worker_thread.join();
+        }
+    }
+}
+
+fn chunk_from_bytes(
+    bytes: &[u8],
+    revision: &str,
+    offset: u64,
+) -> Result<ArtworkChunk, &'static str> {
+    let mime_type =
+        image_mime_from_header(bytes.get(..12).unwrap_or(bytes)).ok_or("unsupported_artwork")?;
+    let total_bytes = bytes.len() as u64;
+    if offset >= total_bytes {
+        return Err("invalid_cursor");
+    }
+    let start = usize::try_from(offset).map_err(|_| "invalid_cursor")?;
+    let end = (start + ARTWORK_CHUNK_BYTES).min(bytes.len());
+    Ok(ArtworkChunk {
+        revision: revision.to_owned(),
+        total_bytes,
+        next_offset: (end < bytes.len()).then_some(end as u64),
+        mime_type,
+        data: base64_encode(&bytes[start..end]),
+    })
+}
+
+fn validate_remote_artwork(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_ARTWORK_BYTES as usize
+        && image_mime_from_header(bytes.get(..12).unwrap_or(bytes)) == Some("image/jpeg")
+        && jpeg_dimensions(bytes).is_some_and(|(width, height)| {
+            width >= 600 && height >= 900 && u64::from(width) * 3 == u64::from(height) * 2
+        })
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xff {
+            return None;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0xd9 || marker == 0xda {
+            return None;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset)?,
+            *bytes.get(offset + 1)?,
+        ]));
+        if length < 2 || offset.checked_add(length)? > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if length < 8 {
+                return None;
+            }
+            let height = u32::from(u16::from_be_bytes([
+                *bytes.get(offset + 3)?,
+                *bytes.get(offset + 4)?,
+            ]));
+            let width = u32::from(u16::from_be_bytes([
+                *bytes.get(offset + 5)?,
+                *bytes.get(offset + 6)?,
+            ]));
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        offset += length;
+    }
+    None
+}
+
+fn fetch_remote(app_id: u32) -> Result<Vec<u8>, &'static str> {
+    let url = remote_portrait_url(app_id).ok_or("artwork_unavailable")?;
+    let response = remote_agent()
+        .get(&url)
+        .header("accept", "image/jpeg")
+        .header("accept-encoding", "identity")
+        .call()
+        .map_err(|_| "artwork_unavailable")?;
+    if response.status() != 200 {
+        return Err("artwork_unavailable");
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("image/jpeg") {
+        return Err("unsupported_artwork");
+    }
+    if response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_ARTWORK_BYTES)
+    {
+        return Err("unsupported_artwork");
+    }
+
+    let mut body = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_ARTWORK_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| "artwork_unavailable")?;
+    if !validate_remote_artwork(&body) {
+        return Err("unsupported_artwork");
+    }
+    Ok(body)
+}
+
+fn remote_agent() -> &'static Agent {
+    static AGENT: OnceLock<Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let config = Agent::config_builder()
+            .https_only(true)
+            .max_redirects(0)
+            .timeout_global(Some(REMOTE_FETCH_TIMEOUT))
+            .max_response_header_size(8 * 1024)
+            .input_buffer_size(8 * 1024)
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .build();
+        Agent::new_with_config(config)
+    })
 }
 
 /// Finds an existing local portrait first, then a header or icon. It reads only
@@ -460,6 +837,264 @@ mod tests {
             read_chunk(&source_path, &revision, &[], 0).unwrap_err(),
             "artwork_outside_roots"
         );
+    }
+
+    fn synthetic_jpeg(width: u16, height: u16, total_bytes: usize) -> Vec<u8> {
+        let mut bytes = vec![
+            0xff,
+            0xd8,
+            0xff,
+            0xc0,
+            0x00,
+            0x11,
+            0x08,
+            (height >> 8) as u8,
+            height as u8,
+            (width >> 8) as u8,
+            width as u8,
+            0x03,
+            0x01,
+            0x11,
+            0x00,
+            0x02,
+            0x11,
+            0x00,
+            0x03,
+            0x11,
+            0x00,
+        ];
+        bytes.resize(total_bytes.saturating_sub(2).max(bytes.len()), 0x7f);
+        bytes.extend_from_slice(&[0xff, 0xd9]);
+        bytes
+    }
+
+    #[test]
+    fn remote_artwork_revision_and_url_are_stable_and_derived_only_from_app_id() {
+        assert_eq!(
+            remote_portrait_url(42).as_deref(),
+            Some(
+                "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/42/library_600x900_2x.jpg"
+            )
+        );
+        assert_eq!(remote_portrait_url(0), None);
+        let initial = remote_revision(42, 123).unwrap();
+        assert_eq!(remote_revision(42, 123).as_deref(), Some(initial.as_str()));
+        assert_ne!(remote_revision(42, 124).as_deref(), Some(initial.as_str()));
+        assert!(initial.len() <= 20);
+        assert!(initial.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+
+    #[test]
+    fn remote_artwork_cache_fetches_once_and_serves_the_same_chunk_contract() {
+        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 19);
+        let revision = remote_revision(42, 123).unwrap();
+        let mut cache = RemoteArtworkCache::default();
+        let now = Instant::now();
+        let first = cache
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .unwrap();
+        assert_eq!(first.mime_type, "image/jpeg");
+        assert_eq!(first.total_bytes, bytes.len() as u64);
+        assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
+        assert_eq!(first.data, base64_encode(&bytes[..ARTWORK_CHUNK_BYTES]));
+
+        let last = cache
+            .read_chunk_with(42, 123, &revision, ARTWORK_CHUNK_BYTES as u64, now, |_| {
+                panic!("cache hit must not fetch again")
+            })
+            .unwrap();
+        assert_eq!(last.next_offset, None);
+        assert_eq!(last.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
+        assert_eq!(last.revision, revision);
+    }
+
+    #[test]
+    fn stale_revisions_and_invalid_offsets_never_call_the_remote_fetcher() {
+        let revision = remote_revision(42, 123).unwrap();
+        let mut cache = RemoteArtworkCache::default();
+        assert_eq!(
+            cache
+                .read_chunk_with(42, 123, "1", 0, Instant::now(), |_| {
+                    panic!("stale revision must not fetch")
+                })
+                .unwrap_err(),
+            "artwork_changed"
+        );
+        assert_eq!(
+            cache
+                .read_chunk_with(42, 123, &revision, 1, Instant::now(), |_| {
+                    panic!("unaligned cursor must not fetch")
+                })
+                .unwrap_err(),
+            "invalid_cursor"
+        );
+    }
+
+    #[test]
+    fn failed_remote_artwork_uses_a_bounded_cooldown_then_allows_retry() {
+        let revision = remote_revision(42, 123).unwrap();
+        let mut cache = RemoteArtworkCache::default();
+        let now = Instant::now();
+        assert_eq!(
+            cache
+                .read_chunk_with(42, 123, &revision, 0, now, |_| Err("artwork_unavailable"))
+                .unwrap_err(),
+            "artwork_unavailable"
+        );
+        assert_eq!(
+            cache
+                .read_chunk_with(
+                    42,
+                    123,
+                    &revision,
+                    0,
+                    now + Duration::from_secs(2),
+                    |_| panic!("cooldown must suppress retries"),
+                )
+                .unwrap_err(),
+            "artwork_unavailable"
+        );
+        let bytes = synthetic_jpeg(600, 900, 64);
+        assert!(
+            cache
+                .read_chunk_with(
+                    42,
+                    123,
+                    &revision,
+                    0,
+                    now + REMOTE_FAILURE_COOLDOWN + Duration::from_millis(1),
+                    |_| Ok(bytes),
+                )
+                .is_ok()
+        );
+        assert!(cache.failed_until.len() <= MAX_REMOTE_FAILURES);
+    }
+
+    #[test]
+    fn remote_jpeg_validation_rejects_wrong_dimensions_and_oversized_data() {
+        assert!(validate_remote_artwork(&synthetic_jpeg(600, 900, 64)));
+        assert!(!validate_remote_artwork(&synthetic_jpeg(599, 900, 64)));
+        assert!(!validate_remote_artwork(&synthetic_jpeg(600, 899, 64)));
+        assert!(!validate_remote_artwork(&synthetic_jpeg(
+            600,
+            900,
+            MAX_ARTWORK_BYTES as usize + 1
+        )));
+    }
+
+    #[test]
+    fn artwork_fetch_runs_off_the_calling_thread() {
+        let mut worker = RemoteArtworkWorker::default();
+        let bytes = synthetic_jpeg(600, 900, 64);
+        worker
+            .start_with_fetcher(move |_| {
+                thread::sleep(Duration::from_millis(250));
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        let revision = remote_revision(42, 123).unwrap();
+        let started = Instant::now();
+        worker
+            .enqueue(RemoteArtworkRequest {
+                request_id: 7,
+                app_id: 42,
+                last_updated: 123,
+                revision: revision.clone(),
+                offset: 0,
+                deadline: started + Duration::from_secs(2),
+            })
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(150));
+
+        for _ in 0..100 {
+            if let Some(completion) = worker.drain().into_iter().next() {
+                assert_eq!(completion.request_id, 7);
+                assert_eq!(completion.app_id, 42);
+                assert_eq!(completion.revision, revision);
+                assert_eq!(completion.result.unwrap().mime_type, "image/jpeg");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("background artwork fetch did not complete");
+    }
+
+    #[test]
+    fn artwork_worker_queue_is_bounded_while_a_fetch_is_running() {
+        let mut worker = RemoteArtworkWorker::default();
+        let bytes = synthetic_jpeg(600, 900, 64);
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+        let fetch_release = Arc::clone(&release_receiver);
+        worker
+            .start_with_fetcher(move |_| {
+                started_sender.send(()).unwrap();
+                fetch_release.lock().unwrap().recv().unwrap();
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request = |request_id| {
+            let app_id = 41 + u32::try_from(request_id).unwrap();
+            RemoteArtworkRequest {
+                request_id,
+                app_id,
+                last_updated: 123,
+                revision: remote_revision(app_id, 123).unwrap(),
+                offset: 0,
+                deadline,
+            }
+        };
+
+        worker.enqueue(request(1)).unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should start the first fetch");
+        worker.enqueue(request(2)).unwrap();
+        assert_eq!(worker.enqueue(request(3)).unwrap_err(), "artwork_busy");
+
+        release_sender.send(()).unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should process its one queued request");
+        release_sender.send(()).unwrap();
+        let mut completed = 0;
+        for _ in 0..100 {
+            completed += worker.drain().len();
+            if completed == 2 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("bounded artwork jobs did not complete");
+    }
+
+    #[test]
+    fn expired_artwork_requests_do_not_start_network_fetches() {
+        let mut worker = RemoteArtworkWorker::default();
+        worker
+            .start_with_fetcher(|_| panic!("expired request must not fetch"))
+            .unwrap();
+        worker
+            .enqueue(RemoteArtworkRequest {
+                request_id: 9,
+                app_id: 42,
+                last_updated: 123,
+                revision: remote_revision(42, 123).unwrap(),
+                offset: 0,
+                deadline: Instant::now() - Duration::from_millis(1),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if let Some(completion) = worker.drain().into_iter().next() {
+                assert_eq!(completion.request_id, 9);
+                assert_eq!(completion.result.unwrap_err(), "request_ended");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("expired artwork request did not complete");
     }
 
     #[test]

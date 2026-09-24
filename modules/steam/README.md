@@ -97,8 +97,18 @@ regardless of this setting. Cleanup is fixed to the authenticated importer's own
 provider markers, runs only after a complete scan, and preserves detached manual
 edits.
 
-This still does not provide complete Vibeshine Steam sync parity. Artwork and
-richer catalog metadata are unavailable.
+This still does not provide complete Vibeshine Steam sync parity. Steam artwork
+is local-first: a supported portrait found in Steam's library cache or user grid
+is served from that file; otherwise list records carry a stable opaque reference
+to the fixed Steam CDN portrait. The authenticated
+`POST /v1/steam/artwork_read` action fetches that image on demand and returns the
+same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
+an eight-second timeout, accepts only bounded JPEG portraits, keeps up to four
+images in memory, and cools down failed app IDs for ten minutes. Failed remote
+fetches leave the UI to use its existing icon fallback. The current 8 MiB
+end-to-end limit is lower than Vibeshine's 16 MiB remote response cap; the
+management and frontend chunk contract must be widened before matching that
+limit. Remote images are not persisted or converted to PNG, unlike Vibeshine.
 Unlike Vibeshine's legacy host config parser, the product API rejects negative
 counts and ages as malformed unsigned values instead of clamping them to zero.
 
@@ -149,13 +159,15 @@ string keys at 8192 bytes and values per record at 32768. A scan visits at most
 100000 directory entries, retains at most 20000 apps, and reads at most 64 user
 accounts per root and 256 localconfig files per scan. Limit exhaustion makes
 the relevant metadata source incomplete, so catalog cleanup waits for another
-scan. Filesystem operations advance over ticks, with no background threads
-outliving the library; an individual filesystem call can still block on
-unavailable storage.
+scan. Filesystem operations advance over ticks; a dedicated single worker
+handles remote image requests, with one queued request and bounded network
+timeout. The worker is joined during module destruction. An individual
+filesystem call can still block on unavailable storage.
 
-Behavior reference: sibling Vibeshine `src/steam_integration.h`; source was not
-copied or translated. Other missing parity includes automatic per-session root
-discovery, artwork and conversion, uninstalled owned games, app type filtering,
-play-history selection, launch options/Proton resolution, launch/process
-tracking, watchers, and Steam broker environment handling. This provider neither
-modifies Steam files.
+Behavior reference: sibling Vibeshine `src/steam_integration.h` and
+`src/steam_artwork.cpp`; source was not copied or translated. Other missing
+parity includes automatic per-session root
+discovery, persistent artwork caching and conversion, uninstalled owned games,
+app type filtering, play-history selection, launch options/Proton resolution,
+launch/process tracking, watchers, and Steam broker environment handling. This
+provider neither modifies Steam files.

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use settings::{Exclusion, ProductSettings, StartupSettings};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.steam/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
@@ -67,6 +68,7 @@ struct Provider {
     warning_count: u64,
     appinfo_complete: bool,
     history_complete: bool,
+    remote_artwork: artwork::RemoteArtworkWorker,
 }
 
 impl Provider {
@@ -183,39 +185,83 @@ impl Provider {
                 app_id,
                 revision,
                 offset,
-            } => ActionResult::Immediate(self.read_artwork(app_id, &revision, offset)),
+            } => ActionResult::ArtworkRead {
+                app_id,
+                revision,
+                offset,
+            },
         }
     }
 
-    fn read_artwork(&self, app_id: u32, revision: &str, offset: u64) -> Value {
+    fn read_artwork(
+        &mut self,
+        request_id: u64,
+        app_id: u32,
+        revision: &str,
+        offset: u64,
+        remaining_ms: u64,
+    ) -> Result<Option<Value>, &'static str> {
         if app_id == 0 {
-            return json!({"ok":false,"code":"invalid_request"});
+            return Err("invalid_request");
         }
         let Some(game) = self.games.get(&app_id) else {
-            return json!({"ok":false,"code":"artwork_unavailable"});
+            return Err("artwork_unavailable");
         };
         if game.artwork_revision.as_deref() != Some(revision) {
-            return json!({"ok":false,"code":"artwork_changed"});
+            return Err("artwork_changed");
+        }
+        if game.artwork_is_remote {
+            let last_updated = game.last_updated;
+            if !offset.is_multiple_of(artwork::ARTWORK_CHUNK_BYTES as u64)
+                || offset > artwork::MAX_ARTWORK_BYTES
+            {
+                return Err("invalid_cursor");
+            }
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(remaining_ms))
+                .ok_or("invalid_request")?;
+            self.remote_artwork.enqueue(artwork::RemoteArtworkRequest {
+                request_id,
+                app_id,
+                last_updated,
+                revision: revision.to_owned(),
+                offset,
+                deadline,
+            })?;
+            return Ok(None);
         }
         let Some(source_path) = game.artwork_source_path.as_deref() else {
-            return json!({"ok":false,"code":"artwork_unavailable"});
+            return Err("artwork_unavailable");
         };
 
         let mut allowed_roots = vec![PathBuf::from(&game.library_directory)];
         allowed_roots.extend(self.roots.iter().cloned());
-        match artwork::read_chunk(source_path, revision, &allowed_roots, offset) {
-            Ok(chunk) => json!({
-                "ok":true,
-                "app_id":app_id,
-                "revision":chunk.revision,
-                "offset":offset,
-                "next_offset":chunk.next_offset,
-                "total_bytes":chunk.total_bytes,
-                "mime_type":chunk.mime_type,
-                "data":chunk.data
-            }),
-            Err(code) => json!({"ok":false,"code":code}),
-        }
+        let chunk = artwork::read_chunk(source_path, revision, &allowed_roots, offset)?;
+        Ok(Some(artwork_chunk_payload(app_id, offset, chunk)))
+    }
+
+    fn drain_remote_artwork(&mut self) -> Vec<(u64, Value)> {
+        self.remote_artwork
+            .drain()
+            .into_iter()
+            .map(|completion| {
+                let still_current = self.games.get(&completion.app_id).is_some_and(|game| {
+                    game.artwork_is_remote
+                        && game.artwork_revision.as_deref() == Some(&completion.revision)
+                });
+                let payload = if !still_current {
+                    json!({"ok":false,"code":"artwork_changed"})
+                } else {
+                    match completion.result {
+                        Ok(chunk) => {
+                            artwork_chunk_payload(completion.app_id, completion.offset, chunk)
+                        }
+                        Err(code) => json!({"ok":false,"code":code}),
+                    }
+                };
+                (completion.request_id, payload)
+            })
+            .collect()
     }
 
     fn status(&self) -> Value {
@@ -259,8 +305,26 @@ impl Provider {
     }
 }
 
+fn artwork_chunk_payload(app_id: u32, offset: u64, chunk: artwork::ArtworkChunk) -> Value {
+    json!({
+        "ok":true,
+        "app_id":app_id,
+        "revision":chunk.revision,
+        "offset":offset,
+        "next_offset":chunk.next_offset,
+        "total_bytes":chunk.total_bytes,
+        "mime_type":chunk.mime_type,
+        "data":chunk.data
+    })
+}
+
 enum ActionResult {
     Immediate(Value),
+    ArtworkRead {
+        app_id: u32,
+        revision: String,
+        offset: u64,
+    },
     SettingsGet,
     SettingsUpdate {
         settings: ProductSettingsPatch,
@@ -336,6 +400,15 @@ impl ManagedModule for SteamModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.provider.tick();
+        for (request, payload) in self.provider.drain_remote_artwork() {
+            self.complete(
+                request,
+                with_catalog_sync_status(
+                    with_settings_ready(payload, self.configuration.is_ready()),
+                    self.catalog_sync.status(),
+                ),
+            )?;
+        }
         self.configuration
             .advance(&self.runtime, &mut self.provider)?;
         self.catalog_sync.tick(
@@ -402,6 +475,33 @@ impl SteamModule {
             ActionResult::SettingsGet => {
                 self.complete(id, self.configuration.management_response())
             }
+            ActionResult::ArtworkRead {
+                app_id,
+                revision,
+                offset,
+            } => match self
+                .provider
+                .read_artwork(id, app_id, &revision, offset, remaining_ms)
+            {
+                Ok(Some(payload)) => self.complete(
+                    id,
+                    with_catalog_sync_status(
+                        with_settings_ready(payload, self.configuration.is_ready()),
+                        self.catalog_sync.status(),
+                    ),
+                ),
+                Ok(None) => Ok(()),
+                Err(code) => self.complete(
+                    id,
+                    with_catalog_sync_status(
+                        with_settings_ready(
+                            json!({"ok":false,"code":code}),
+                            self.configuration.is_ready(),
+                        ),
+                        self.catalog_sync.status(),
+                    ),
+                ),
+            },
             ActionResult::SettingsUpdate {
                 settings: patch,
                 expected_revision,
@@ -449,6 +549,9 @@ impl Provider {
         match serde_json::from_value::<Action>(payload) {
             Ok(action) => match self.handle_action(action) {
                 ActionResult::Immediate(payload) => payload,
+                ActionResult::ArtworkRead { .. } => {
+                    json!({"ok":false,"code":"async_only"})
+                }
                 ActionResult::SettingsGet | ActionResult::SettingsUpdate { .. } => {
                     json!({"ok":false,"code":"management_only"})
                 }

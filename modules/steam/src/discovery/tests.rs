@@ -83,6 +83,7 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     finish(&mut scan);
     let first = scan.games.get(&42).unwrap();
     assert_eq!(first.artwork_source_path.as_deref(), artwork_path.to_str());
+    assert!(!first.artwork_is_remote);
     let first_revision = first.artwork_revision.clone().unwrap();
     let listed = serde_json::to_value(first).unwrap();
     assert_eq!(listed["artwork_revision"], first_revision);
@@ -95,6 +96,29 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
         refreshed.games[&42].artwork_revision.as_deref(),
         Some(first_revision.as_str())
     );
+}
+
+#[test]
+fn missing_local_artwork_exposes_only_a_stable_remote_artwork_revision() {
+    let fixture = Libraries::new();
+    let library = fixture.library("steam-install");
+    fixture.manifest(&library, 42, "Example", 4);
+
+    let mut scan = Scan::new(std::slice::from_ref(&library));
+    finish(&mut scan);
+    let game = scan.games.get(&42).unwrap();
+    let expected_revision = artwork::remote_revision(42, game.last_updated).unwrap();
+    assert!(game.artwork_is_remote);
+    assert!(game.artwork_source_path.is_none());
+    assert_eq!(
+        game.artwork_revision.as_deref(),
+        Some(expected_revision.as_str())
+    );
+
+    let listed = serde_json::to_value(game).unwrap();
+    assert_eq!(listed["artwork_revision"], expected_revision);
+    assert!(listed.get("artwork_source_path").is_none());
+    assert!(listed.get("artwork_is_remote").is_none());
 }
 
 fn finish(scan: &mut Scan) {
@@ -246,6 +270,7 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 last_played: None,
                 artwork_revision: None,
                 artwork_source_path: None,
+                artwork_is_remote: false,
             },
         );
     }

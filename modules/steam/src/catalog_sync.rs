@@ -761,6 +761,7 @@ mod tests {
             last_played: Some(2_000_000_000),
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         }
     }
 

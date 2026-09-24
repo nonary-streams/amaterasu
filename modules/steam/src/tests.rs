@@ -81,10 +81,14 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
             last_played: None,
             artwork_revision: artwork.revision,
             artwork_source_path: artwork.source_path,
+            artwork_is_remote: false,
         },
     );
 
-    let payload = provider.read_artwork(42, &revision, 0);
+    let payload = provider
+        .read_artwork(11, 42, &revision, 0, 1_000)
+        .unwrap()
+        .unwrap();
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["app_id"], 42);
     assert_eq!(payload["revision"], revision);
@@ -93,7 +97,10 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
     assert_eq!(payload["next_offset"], Value::Null);
     assert_eq!(payload["data"], "/9j/c3RlYW0gcG9ydHJhaXQ=");
     assert!(payload.get("path").is_none());
-    assert_eq!(provider.read_artwork(42, "1", 0)["code"], "artwork_changed");
+    assert_eq!(
+        provider.read_artwork(11, 42, "1", 0, 1_000).unwrap_err(),
+        "artwork_changed"
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -171,6 +178,7 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
             last_played: None,
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         },
     );
 
@@ -573,6 +581,7 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             last_played: None,
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         },
     );
     module.provider.games.insert(
@@ -590,6 +599,7 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             last_played: None,
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         },
     );
     module.provider.revision = 1;
@@ -658,6 +668,7 @@ fn catalog_cleanup_waits_for_appinfo_when_tool_filtering_is_active() {
             last_played: None,
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         },
     );
     module.provider.revision = 1;
@@ -706,6 +717,7 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             last_played: None,
             artwork_revision: None,
             artwork_source_path: None,
+            artwork_is_remote: false,
         },
     );
     module.provider.revision = 1;

@@ -29,6 +29,8 @@ pub struct Game {
     pub artwork_revision: Option<String>,
     #[serde(skip)]
     pub artwork_source_path: Option<String>,
+    #[serde(skip)]
+    pub artwork_is_remote: bool,
 }
 
 #[derive(Default)]
@@ -314,7 +316,12 @@ fn read_game(
     let state_flags = unsigned_field(app, "stateflags", true)?;
     let install_directory = library.join("steamapps").join("common").join(directory);
     let installed = state_flags & 4 != 0 && install_directory.is_dir();
+    let last_updated = unsigned_field(app, "lastupdated", false)?;
     let artwork = artwork::discover(expected_id, library, artwork_roots);
+    let artwork_is_remote = artwork.revision.is_none();
+    let artwork_revision = artwork
+        .revision
+        .or_else(|| artwork::remote_revision(expected_id, last_updated));
     let game = Game {
         stable_id: format!("steam:{expected_id}"),
         app_id: expected_id,
@@ -326,14 +333,15 @@ fn read_game(
         library_directory: library.to_str().ok_or("non-UTF8 library path")?.into(),
         state_flags,
         installed,
-        last_updated: unsigned_field(app, "lastupdated", false)?,
+        last_updated,
         app_type: match app.field("type") {
             Ok(value) => Some(value.text()?.to_owned()),
             Err(_) => None,
         },
         last_played: None,
-        artwork_revision: artwork.revision,
+        artwork_revision,
         artwork_source_path: artwork.source_path,
+        artwork_is_remote,
     };
     if serde_json::to_vec(&game)
         .map_err(|error| error.to_string())?
