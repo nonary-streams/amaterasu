@@ -42,6 +42,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        external_ip: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         stream_audio: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         capture: FieldUpdate<CaptureMode>,
@@ -433,6 +435,7 @@ impl NvhttpModule {
                                 bind_address,
                                 output_name,
                                 audio_sink,
+                                external_ip,
                                 stream_audio,
                                 capture,
                                 video_max_batch_size_kb,
@@ -462,6 +465,7 @@ impl NvhttpModule {
                                     bind_address,
                                     output_name,
                                     audio_sink,
+                                    external_ip,
                                     stream_audio,
                                     capture,
                                     video_max_batch_size_kb,

@@ -98,6 +98,7 @@ namespace Amaterasu {
     configured_minimum_fps_target: number | null;
     effective_minimum_fps_target: number;
     configured_audio_sink: string | null;
+    configured_external_ip: string | null;
     effective_audio_sink: string;
     configured_wgc_pacing_smoothing: boolean | null;
     effective_wgc_pacing_smoothing: boolean;

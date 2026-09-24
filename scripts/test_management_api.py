@@ -499,6 +499,7 @@ def test_auth_and_crud(console, api):
     assert host_settings["configured_minimum_fps_target"] is None, host_settings
     assert host_settings["effective_minimum_fps_target"] == 20, host_settings
     assert host_settings["configured_audio_sink"] is None, host_settings
+    assert host_settings["configured_external_ip"] is None, host_settings
     assert isinstance(host_settings["effective_audio_sink"], str), host_settings
     assert host_settings["configured_wgc_pacing_smoothing"] is None, host_settings
     assert host_settings["effective_wgc_pacing_smoothing"] is True, host_settings
@@ -539,6 +540,7 @@ def test_auth_and_crud(console, api):
         "max_bitrate": 50_000,
         "minimum_fps_target": 37.5,
         "audio_sink": "test-audio-endpoint",
+        "external_ip": "203.0.113.42",
         "wgc_pacing_smoothing": False,
         "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
@@ -555,6 +557,7 @@ def test_auth_and_crud(console, api):
     assert renamed_host["configured_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["effective_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["configured_audio_sink"] == "test-audio-endpoint", renamed_host
+    assert renamed_host["configured_external_ip"] == "203.0.113.42", renamed_host
     assert renamed_host["effective_audio_sink"] == "test-audio-endpoint", renamed_host
     assert renamed_host["configured_wgc_pacing_smoothing"] is False, renamed_host
     assert renamed_host["effective_wgc_pacing_smoothing"] is False, renamed_host
@@ -603,6 +606,12 @@ def test_auth_and_crud(console, api):
             "expected_revision": renamed_host["revision"],
             "audio_sink": invalid_sink,
         }, administrator)[0] == 400
+    for invalid_external_ip in ("bad\naddress", "x" * 4097, 42):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "external_ip": invalid_external_ip,
+        }, administrator)[0] == 400
     assert api.post("/v1/nvhttp/settings_update", {
         "hostname": "Living Room & Games", "port": renamed_host["port"],
         "expected_revision": renamed_host["revision"],
@@ -629,6 +638,7 @@ def test_auth_and_crud(console, api):
     assert moved_host["configured_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["effective_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["configured_audio_sink"] == "test-audio-endpoint", moved_host
+    assert moved_host["configured_external_ip"] == "203.0.113.42", moved_host
     assert moved_host["effective_audio_sink"] == "test-audio-endpoint", moved_host
     assert moved_host["configured_wgc_pacing_smoothing"] is False, moved_host
     assert moved_host["effective_wgc_pacing_smoothing"] is False, moved_host
@@ -1134,6 +1144,7 @@ def main():
             assert host_settings["configured_minimum_fps_target"] == 37.5, host_settings
             assert host_settings["effective_minimum_fps_target"] == 37.5, host_settings
             assert host_settings["configured_audio_sink"] == "test-audio-endpoint", host_settings
+            assert host_settings["configured_external_ip"] == "203.0.113.42", host_settings
             assert host_settings["effective_audio_sink"] == "test-audio-endpoint", host_settings
             assert host_settings["configured_wgc_pacing_smoothing"] is False, host_settings
             assert host_settings["effective_wgc_pacing_smoothing"] is False, host_settings
@@ -1190,6 +1201,7 @@ def main():
                 "max_bitrate": None,
                 "minimum_fps_target": None,
                 "audio_sink": None,
+                "external_ip": None,
                 "wgc_pacing_smoothing": None,
                 "stream_audio": True,
                 "expected_revision": reset_revision,
@@ -1207,6 +1219,7 @@ def main():
             assert reset_host["configured_minimum_fps_target"] is None, reset_host
             assert reset_host["effective_minimum_fps_target"] == 20, reset_host
             assert reset_host["configured_audio_sink"] is None, reset_host
+            assert reset_host["configured_external_ip"] is None, reset_host
             assert isinstance(reset_host["effective_audio_sink"], str), reset_host
             assert reset_host["configured_wgc_pacing_smoothing"] is None, reset_host
             assert reset_host["effective_wgc_pacing_smoothing"] is True, reset_host

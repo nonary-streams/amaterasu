@@ -279,6 +279,15 @@ test("audio sink editor preserves exact IDs and sparse automatic selection", () 
     assert.throws(() => parse(invalid));
 });
 
+test("external IP editor preserves exact text and automatic reset", () => {
+  const parse = context.Amaterasu.parseExternalIp;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  address  "), "  address  ");
+  assert.equal(parse("é".repeat(2048)), "é".repeat(2048));
+  for (const invalid of ["bad\naddress", "x".repeat(4097), "é".repeat(2049)])
+    assert.throws(() => parse(invalid));
+});
+
 test("WGC pacing editor preserves default and both explicit policies", () => {
   const parse = context.Amaterasu.parseWgcPacingSmoothing;
   assert.equal(parse(""), null);

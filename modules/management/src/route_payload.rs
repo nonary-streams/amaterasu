@@ -941,6 +941,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "max_bitrate",
                     "minimum_fps_target",
                     "audio_sink",
+                    "external_ip",
                     "wgc_pacing_smoothing",
                 ],
             )?;
@@ -1027,6 +1028,15 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                 Value::Null => false,
                 Value::String(endpoint) => {
                     endpoint.len() > 4096 || endpoint.chars().any(char::is_control)
+                }
+                _ => true,
+            }) {
+                return Err(INVALID);
+            }
+            if object.get("external_ip").is_some_and(|value| match value {
+                Value::Null => false,
+                Value::String(address) => {
+                    address.len() > 4096 || address.chars().any(char::is_control)
                 }
                 _ => true,
             }) {
@@ -1122,6 +1132,44 @@ mod nvhttp_tests {
             let payload = serde_json::json!({
                 "hostname": "Host", "port": 47989, "expected_revision": 0,
                 "audio_sink": endpoint,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_ip_update_preserves_exact_text_and_rejects_controls() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for address in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(" 203.0.113.42 "),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "external_ip":address,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for address in [
+            serde_json::json!(42),
+            serde_json::json!("bad\naddress"),
+            serde_json::json!("x".repeat(4097)),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "external_ip":address,
             });
             assert!(
                 validate(route, payload.as_object().unwrap()).is_err(),

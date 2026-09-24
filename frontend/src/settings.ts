@@ -199,6 +199,13 @@ namespace Amaterasu {
     return value;
   }
 
+  export function parseExternalIp(value: string): string | null {
+    if (value === "") return null;
+    if (new TextEncoder().encode(value).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/.test(value))
+      throw new Error("External IP text must contain at most 4096 UTF-8 bytes and no control characters.");
+    return value;
+  }
+
   export function parseWgcPacingSmoothing(value: string): boolean | null {
     if (value === "") return null;
     if (value === "true") return true;
@@ -1604,6 +1611,8 @@ namespace Amaterasu {
           audioSink.append(saved);
         }
         audioSink.value = settings.configured_audio_sink ?? "";
+        const externalIp = input("external_ip", settings.configured_external_ip ?? "");
+        externalIp.maxLength = 4096;
         const videoBatchSize = input(
           "video_max_batch_size_kb",
           settings.configured_video_max_batch_size_kb === null
@@ -1672,6 +1681,7 @@ namespace Amaterasu {
             `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`,
           ),
           field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
+          field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
           field(
             "Video batch size (KiB)",
             videoBatchSize,
@@ -1718,6 +1728,7 @@ namespace Amaterasu {
               max_bitrate: parseMaxBitrate(maxBitrate.value),
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
               audio_sink: parseAudioSinkSelection(audioSink.value),
+              external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
               expected_revision: settings.revision,
             });

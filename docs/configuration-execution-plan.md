@@ -87,6 +87,14 @@ Windows. Those IDs remain pending until every public listener and supported
 platform follows the effective policy without weakening the loopback control
 plane.
 
+The `external_ip` text field now persists in product document v12 and has a
+signed editor. Omitted updates preserve the value; null or empty resets to
+automatic, and nonempty text is retained exactly within the host's bounded
+input policy. The pinned Vibeshine source parses and displays this field but
+has no runtime reader; its documentation promises automatic detection when
+blank. Address detection and advertisement remain pending in Amaterasu, as
+does qualification of the source's unbounded text acceptance.
+
 `origin_web_ui_allowed` and `csrf_allowed_origins` remain pending. The first
 controls which remote peer networks may reach Vibeshine's web UI; Amaterasu's
 management listener currently enforces loopback peers. The second is a
