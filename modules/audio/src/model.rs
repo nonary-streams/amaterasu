@@ -83,6 +83,7 @@ pub struct Packet {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Health {
     pub failure: Option<&'static str>,
+    pub recovering: bool,
     pub discontinuities: u64,
     pub dropped_packets: u64,
 }

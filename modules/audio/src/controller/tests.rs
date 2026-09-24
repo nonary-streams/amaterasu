@@ -20,6 +20,7 @@ struct Observed {
     opens: Mutex<Vec<OpenCall>>,
     host_audio_settings: Mutex<Vec<bool>>,
     drops: AtomicUsize,
+    health: Mutex<Health>,
 }
 
 struct FakeBackend {
@@ -90,7 +91,7 @@ impl Source for FakeSource {
     }
 
     fn health(&self) -> Health {
-        Health::default()
+        self.observed.health.lock().unwrap().clone()
     }
 }
 
@@ -319,6 +320,19 @@ fn enabled_host_audio_policy_is_forwarded_and_reported_in_status() {
         observed.host_audio_settings.lock().unwrap().as_slice(),
         [true]
     );
+}
+
+#[test]
+fn status_reports_recovering_until_capture_produces_a_recovered_packet() {
+    let (mut controller, observed) = controller(true);
+    controller.handle("alice", open()).unwrap();
+    observed.health.lock().unwrap().recovering = true;
+
+    assert_eq!(
+        controller.status("alice", Some(1))["streams"][0]["state"],
+        "recovering"
+    );
+    assert_eq!(controller.status("bob", Some(1))["streams"], json!([]));
 }
 
 #[test]

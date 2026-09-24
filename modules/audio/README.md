@@ -84,7 +84,14 @@ callers. Format contains
 caller's streams, optionally filtered by ID. The route flag reports a failed
 final restoration attempt until a later routed open retries cleanup. Each stream
 includes its selected/requested endpoint, format,
-`state:"capturing"|"failed"`, `failure`, `discontinuities`, and `dropped_packets`.
+`state:"capturing"|"recovering"|"failed"`, `failure`, `discontinuities`, and
+`dropped_packets`. After WASAPI reports device loss, the worker reports
+`recovering` while it retries the originally selected endpoint every five
+seconds. Retry delays are cancelled by close or module shutdown. A reopened
+capture must keep the published PCM format; an incompatible format fails the
+stream with `audio_format_changed`. The first packet after recovery is marked
+discontinuous, and sequence/timestamp values continue across the new capture's
+timeline.
 Close returns `{ok:true}`. Missing/foreign lookup or close returns
 `{ok:false,code:"stream_not_found"}`; absent status returns an empty list.
 Driver error strings and PCM samples are never placed in control replies.
@@ -105,8 +112,9 @@ another caller's stream IDs. Each successful callback borrows one interleaved PC
 packet, valid only until return; the consumer must copy retained samples. Sink
 rejection retains the packet for retry. Concurrent or reentrant calls return
 `MEDIA_BUSY`; no packet returns `MEDIA_PENDING`; missing/closed returns
-`MEDIA_CLOSED`; device/worker failure returns `MEDIA_BACKEND_ERROR` and requires
-close/reopen. A provide/call grant for `amaterasu.audio/1` is required at the
+`MEDIA_CLOSED`; terminal device/worker failure returns `MEDIA_BACKEND_ERROR`. A
+device-loss recovery remains pending until another packet arrives. A provide/call
+grant for `amaterasu.audio/1` is required at the
 respective endpoint. These are trusted native modules, not a native-code sandbox.
 
 The Windows backend uses official `windows` crate COM bindings. Explicit routed

@@ -2,6 +2,7 @@
 use crate::{
     model::{AudioResult, Endpoint, Format, Packet},
     packet::{Timeline, copy_samples},
+    platform::RecoveryConfig,
     route_policy::{
         AcquirePlan, DefaultEndpoints, DefaultRole, ReleasePlan, RoleAssignment, RoutePolicy,
     },
@@ -648,8 +649,24 @@ pub struct Capture {
     endpoint: String,
     format: Format,
     timeline: Timeline,
+    recovery_config: RecoveryConfig,
     _route_lease: RouteLease,
     _apartment: Apartment,
+}
+
+fn validate_render_device(device: &IMMDevice) -> AudioResult<()> {
+    // SAFETY: the device was obtained from the current COM apartment's enumerator.
+    unsafe {
+        let endpoint_type: IMMEndpoint = device.cast().map_err(|_| "invalid_endpoint")?;
+        if endpoint_type
+            .GetDataFlow()
+            .map_err(|_| "invalid_endpoint")?
+            != eRender
+        {
+            return Err("not_render_endpoint");
+        }
+        Ok(())
+    }
 }
 
 impl Capture {
@@ -701,21 +718,72 @@ impl Capture {
                 enumerator.GetDevice(PCWSTR(wide.as_ptr()))
             }
             .map_err(|_| "endpoint_not_found")?;
-            let endpoint_type: IMMEndpoint = device.cast().map_err(|_| "invalid_endpoint")?;
-            if endpoint_type
-                .GetDataFlow()
-                .map_err(|_| "invalid_endpoint")?
-                != eRender
-            {
-                return Err("not_render_endpoint");
-            }
+            validate_render_device(&device)?;
             let endpoint = identifier(&device)?;
-            let route_lease = RouteLease::acquire(&enumerator, &endpoint, effective_capture_only)?;
+            Self::open_selected(
+                apartment,
+                &enumerator,
+                device,
+                endpoint,
+                desired_layout,
+                preferred_valid_bits,
+                effective_capture_only,
+            )
+        }
+    }
+
+    pub fn reopen(config: &RecoveryConfig) -> AudioResult<Self> {
+        let apartment = Apartment::start()?;
+        let enumerator = enumerator()?;
+        let wide: Vec<u16> = config.endpoint.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the endpoint ID was returned by this backend and all COM
+        // interfaces remain local to the worker's apartment thread.
+        unsafe {
+            let device = enumerator
+                .GetDevice(PCWSTR(wide.as_ptr()))
+                .map_err(|_| "endpoint_not_found")?;
+            validate_render_device(&device)?;
+            let endpoint = identifier(&device)?;
+            if endpoint != config.endpoint {
+                return Err("audio_endpoint_changed");
+            }
+            let desired_layout = config.virtual_channels.map(channel_layout).transpose()?;
+            Self::open_selected(
+                apartment,
+                &enumerator,
+                device,
+                endpoint,
+                desired_layout,
+                config.preferred_valid_bits,
+                config.capture_sink_without_routing,
+            )
+        }
+    }
+
+    pub fn recovery_config(&self) -> RecoveryConfig {
+        self.recovery_config.clone()
+    }
+
+    fn open_selected(
+        apartment: Apartment,
+        enumerator: &IMMDeviceEnumerator,
+        device: IMMDevice,
+        endpoint: String,
+        desired_layout: Option<ChannelLayout>,
+        preferred_valid_bits: Option<u16>,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Self> {
+        // SAFETY: the caller created this device and enumerator in the live
+        // worker apartment; all COM operations remain on that thread.
+        unsafe {
+            let route_lease =
+                RouteLease::acquire(enumerator, &endpoint, capture_sink_without_routing)?;
             let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
                 (Some(layout), Some(valid_bits)) => {
                     Some(set_virtual_device_layout(&endpoint, layout, valid_bits)?)
                 }
-                _ => None,
+                (None, None) => None,
+                _ => return Err("virtual_sink_format_unavailable"),
             };
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
@@ -764,16 +832,22 @@ impl Capture {
                 .GetService()
                 .map_err(|_| "audio_capture_unavailable")?;
             client.Start().map_err(|_| "audio_start_failed")?;
-            let capture = Self {
+            let recovery_config = RecoveryConfig {
+                endpoint: endpoint.clone(),
+                virtual_channels: desired_layout.map(|layout| layout.channels),
+                preferred_valid_bits,
+                capture_sink_without_routing,
+            };
+            Ok(Self {
                 capture,
                 client,
                 endpoint,
                 format,
                 timeline: Timeline::new(),
+                recovery_config,
                 _route_lease: route_lease,
                 _apartment: apartment,
-            };
-            Ok(capture)
+            })
         }
     }
 

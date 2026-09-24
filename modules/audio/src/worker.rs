@@ -1,6 +1,7 @@
 //! Worker-owned COM capture feeds a bounded queue; no COM interface is Send.
 use crate::{
     model::{AudioResult, Endpoint, Format, Health, Packet},
+    packet::Continuity,
     platform,
 };
 use amaterasu_media::AUDIO_DISCONTINUITY;
@@ -11,13 +12,36 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const QUEUE_PACKETS: usize = 16;
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 pub trait Source: Send {
     fn read(&mut self) -> AudioResult<Option<Packet>>;
     fn health(&self) -> Health;
+}
+
+trait CaptureDevice {
+    fn endpoint(&self) -> &str;
+    fn format(&self) -> Format;
+    fn read(&mut self) -> AudioResult<Option<Packet>>;
+}
+
+impl CaptureDevice for platform::Capture {
+    fn endpoint(&self) -> &str {
+        platform::Capture::endpoint(self)
+    }
+
+    fn format(&self) -> Format {
+        platform::Capture::format(self)
+    }
+
+    fn read(&mut self) -> AudioResult<Option<Packet>> {
+        platform::Capture::read(self)
+    }
 }
 
 pub struct Opened {
@@ -91,7 +115,7 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-loopback".into())
             .spawn(move || {
-                let mut capture = match platform::Capture::open(
+                let capture = match platform::Capture::open(
                     &endpoint,
                     virtual_sink.as_deref(),
                     channels,
@@ -110,20 +134,22 @@ impl Worker {
                 {
                     return;
                 }
-                while !thread_stop.load(Ordering::Acquire) {
-                    match capture.read() {
-                        Ok(Some(packet)) => {
-                            if !enqueue(&sender, &thread_health, packet) {
-                                break;
-                            }
-                        }
-                        Ok(None) => thread::sleep(Duration::from_millis(2)),
-                        Err(error) => {
-                            fail(&thread_health, error);
-                            break;
-                        }
-                    }
-                }
+                let endpoint = capture.endpoint().to_owned();
+                let format = capture.format();
+                let recovery_config = capture.recovery_config();
+                run_capture_loop(
+                    Box::new(capture),
+                    move || {
+                        platform::Capture::reopen(&recovery_config)
+                            .map(|capture| Box::new(capture) as Box<dyn CaptureDevice>)
+                    },
+                    endpoint,
+                    format,
+                    &sender,
+                    &thread_health,
+                    &thread_stop,
+                    RECOVERY_RETRY_DELAY,
+                );
             })
             .map_err(|_| "audio_worker_failed")?;
         // Never detach DLL code still running in a COM activation. Initialization
@@ -180,6 +206,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
             let _ = thread.join();
         }
     }
@@ -188,6 +215,98 @@ impl Drop for Worker {
 fn fail(health: &Mutex<Health>, error: &'static str) {
     if let Ok(mut health) = health.lock() {
         health.failure = Some(error);
+        health.recovering = false;
+    }
+}
+
+fn set_recovering(health: &Mutex<Health>, recovering: bool) {
+    if let Ok(mut health) = health.lock()
+        && health.failure.is_none()
+    {
+        health.recovering = recovering;
+    }
+}
+
+fn run_capture_loop<F>(
+    mut capture: Box<dyn CaptureDevice>,
+    mut reopen: F,
+    expected_endpoint: String,
+    expected_format: Format,
+    sender: &SyncSender<Packet>,
+    health: &Mutex<Health>,
+    stop: &AtomicBool,
+    retry_delay: Duration,
+) where
+    F: FnMut() -> AudioResult<Box<dyn CaptureDevice>>,
+{
+    let mut continuity = Continuity::new();
+    while !stop.load(Ordering::Acquire) {
+        match capture.read() {
+            Ok(Some(mut packet)) => {
+                let recovered_packet = match continuity.normalize(&mut packet) {
+                    Ok(recovered_packet) => recovered_packet,
+                    Err(error) => {
+                        fail(health, error);
+                        break;
+                    }
+                };
+                if recovered_packet {
+                    set_recovering(health, false);
+                }
+                if !enqueue(sender, health, packet) {
+                    break;
+                }
+            }
+            Ok(None) => thread::park_timeout(POLL_INTERVAL),
+            Err("device_lost") => {
+                set_recovering(health, true);
+                continuity.begin_recovery();
+                drop(capture);
+                loop {
+                    if !wait_for_retry(stop, retry_delay) {
+                        return;
+                    }
+                    match reopen() {
+                        Ok(reopened) => {
+                            if reopened.endpoint() != expected_endpoint {
+                                fail(health, "audio_endpoint_changed");
+                                return;
+                            }
+                            if reopened.format() != expected_format {
+                                fail(health, "audio_format_changed");
+                                return;
+                            }
+                            capture = reopened;
+                            break;
+                        }
+                        Err(error) if error == "audio_endpoint_changed" => {
+                            fail(health, error);
+                            return;
+                        }
+                        Err(_) if stop.load(Ordering::Acquire) => return,
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(error) => {
+                fail(health, error);
+                break;
+            }
+        }
+    }
+}
+
+fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = delay.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::park_timeout(remaining);
     }
 }
 
@@ -222,6 +341,51 @@ pub fn enumerate() -> AudioResult<Vec<Endpoint>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, sync::atomic::AtomicUsize};
+
+    struct FakeCapture {
+        endpoint: String,
+        format: Format,
+        events: VecDeque<AudioResult<Option<Packet>>>,
+    }
+
+    impl FakeCapture {
+        fn new(
+            format: Format,
+            events: impl IntoIterator<Item = AudioResult<Option<Packet>>>,
+        ) -> Self {
+            Self {
+                endpoint: "render.fixed".into(),
+                format,
+                events: events.into_iter().collect(),
+            }
+        }
+    }
+
+    impl CaptureDevice for FakeCapture {
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn format(&self) -> Format {
+            self.format
+        }
+
+        fn read(&mut self) -> AudioResult<Option<Packet>> {
+            self.events.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    fn packet(timestamp_us: u64, sequence: u64) -> Packet {
+        Packet {
+            frames: 1,
+            flags: 0,
+            bytes: vec![0; 4],
+            timestamp_us,
+            sequence,
+        }
+    }
+
     #[test]
     fn full_queue_is_terminal_visible_and_preserves_queued_packets() {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -240,5 +404,121 @@ mod tests {
         assert_eq!(health.dropped_packets, 1);
         assert_eq!(health.discontinuities, 2);
         assert_eq!(receiver.try_recv().unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn device_loss_retries_open_and_preserves_packet_clock() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Ok(Some(packet(1_000, 0))), Err("device_lost")]);
+        let (sender, packets) = mpsc::sync_channel(4);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            move || {
+                let mut recovery_attempt = 0;
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        recovery_attempt += 1;
+                        if recovery_attempt == 1 {
+                            return Err("endpoint_not_found");
+                        }
+                        Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
+                            as Box<dyn CaptureDevice>)
+                    },
+                    "render.fixed".into(),
+                    format,
+                    &sender,
+                    &health,
+                    &stop,
+                    Duration::ZERO,
+                );
+            }
+        });
+
+        let first = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+
+        assert_eq!((first.sequence, first.timestamp_us), (0, 1_000));
+        assert_eq!(recovered.sequence, 1);
+        assert!(recovered.timestamp_us > first.timestamp_us);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let health = health.lock().unwrap();
+        assert!(!health.recovering);
+        assert_eq!(health.failure, None);
+        assert_eq!(health.discontinuities, 1);
+    }
+
+    #[test]
+    fn recovery_wait_is_promptly_cancelled_by_shutdown() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    move || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err("endpoint_not_found")
+                    },
+                    "render.fixed".into(),
+                    format,
+                    &sender,
+                    &health,
+                    &stop,
+                    Duration::from_secs(30),
+                );
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !health.lock().unwrap().recovering && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(health.lock().unwrap().recovering);
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn incompatible_reopened_format_is_terminal() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let incompatible = Format::new(48_000, 1, amaterasu_media::PCM_I16).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Mutex::new(Health::default());
+        let stop = AtomicBool::new(false);
+        run_capture_loop(
+            Box::new(initial),
+            || Ok(Box::new(FakeCapture::new(incompatible, [])) as Box<dyn CaptureDevice>),
+            "render.fixed".into(),
+            format,
+            &sender,
+            &health,
+            &stop,
+            Duration::ZERO,
+        );
+        let health = health.lock().unwrap();
+        assert_eq!(health.failure, Some("audio_format_changed"));
+        assert!(!health.recovering);
     }
 }
