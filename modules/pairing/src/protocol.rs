@@ -212,6 +212,8 @@ pub struct Client {
 pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_audio: Option<bool>,
 }
 
 impl ClientConfigOverrides {
@@ -226,7 +228,7 @@ impl ClientConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none()
+        self.fec_percentage.is_none() && self.stream_audio.is_none()
     }
 }
 impl Document {
@@ -273,6 +275,7 @@ fn identifier(value: &str, max: usize) -> bool {
 fn hex_length(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
 pub fn error(code: &str) -> Value {
     json!({"ok":false,"paired":0,"code":code})
 }
@@ -286,4 +289,41 @@ pub fn valid_host_id(value: &str) -> bool {
                 byte.is_ascii_hexdigit()
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn client_audio_override_is_sparse_and_preserves_legacy_fec_records() {
+        let legacy: ClientConfigOverrides =
+            serde_json::from_value(json!({"fec_percentage":73})).unwrap();
+        assert_eq!(legacy.fec_percentage, Some(73));
+        assert_eq!(legacy.stream_audio, None);
+        legacy.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            json!({"fec_percentage":73})
+        );
+
+        let inherited = ClientConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        let disabled: ClientConfigOverrides = serde_json::from_value(json!({
+            "fec_percentage":73,
+            "stream_audio":false
+        }))
+        .unwrap();
+        assert_eq!(disabled.fec_percentage, Some(73));
+        assert_eq!(disabled.stream_audio, Some(false));
+        assert!(!disabled.is_empty());
+        disabled.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            json!({"fec_percentage":73,"stream_audio":false})
+        );
+    }
 }

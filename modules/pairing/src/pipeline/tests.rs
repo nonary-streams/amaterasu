@@ -720,7 +720,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
             "action": "update_client_config_overrides",
             "certificate_id": certificate_id,
             "expected_revision": initial_revision,
-            "config_overrides": {"fec_percentage": 47}
+            "config_overrides": {"fec_percentage":47,"stream_audio":false}
         }),
         now(),
     );
@@ -736,6 +736,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         certificate_readback["config_overrides"]["fec_percentage"],
         47
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["stream_audio"],
+        false
     );
     let duplicate_client_id_readback = state.request(
         &mut pipeline,
@@ -755,6 +759,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["fec_percentage"],
         47
+    );
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["stream_audio"],
+        false
     );
 
     // A second administrator holding the same pre-write revision must reload
@@ -781,6 +789,42 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         now(),
     );
     assert_eq!(unchanged["config_overrides"]["fec_percentage"], 47);
+    assert_eq!(unchanged["config_overrides"]["stream_audio"], false);
+}
+
+#[test]
+fn old_paired_fec_override_document_loads_without_audio_migration() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action":"import_client",
+                "client_id":"legacy-client",
+                "name":"Legacy client",
+                "certificate_pem":CLIENT_CERT
+            }),
+            now()
+        )["ok"],
+        true
+    );
+    state.document.as_mut().unwrap()["clients"][0]["config_overrides"] =
+        json!({"fec_percentage":73});
+    let writes_before_read = state.writes;
+
+    let result = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(result["paired"], 1);
+    assert_eq!(result["config_overrides"]["fec_percentage"], 73);
+    assert!(result["config_overrides"].get("stream_audio").is_none());
+    assert_eq!(state.writes, writes_before_read);
 }
 
 #[test]

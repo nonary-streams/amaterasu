@@ -25,6 +25,8 @@ pub struct Entry {
 pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_audio: Option<bool>,
 }
 
 impl ConfigOverrides {
@@ -39,7 +41,7 @@ impl ConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none()
+        self.fec_percentage.is_none() && self.stream_audio.is_none()
     }
 }
 
@@ -355,6 +357,50 @@ pub fn parse_id(id: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stream_audio_override_preserves_absence_false_and_existing_fec() {
+        let legacy: Entry = serde_json::from_value(json!({
+            "name":"Legacy entry",
+            "config_overrides":{"fec_percentage":37},
+            "launch":{"kind":"executable","program":"/games/example"}
+        }))
+        .unwrap();
+        legacy.validate().unwrap();
+        assert_eq!(legacy.config_overrides.fec_percentage, Some(37));
+        assert_eq!(legacy.config_overrides.stream_audio, None);
+        let legacy_json = serde_json::to_value(legacy).unwrap();
+        assert_eq!(legacy_json["config_overrides"]["fec_percentage"], 37);
+        assert!(
+            legacy_json["config_overrides"]
+                .get("stream_audio")
+                .is_none()
+        );
+
+        let inherited: Entry = serde_json::from_value(json!({
+            "name":"Inherited entry",
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        inherited.validate().unwrap();
+        assert!(inherited.config_overrides.is_empty());
+        assert!(
+            serde_json::to_value(inherited)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
+
+        let disabled: ConfigOverrides =
+            serde_json::from_value(json!({"fec_percentage":37,"stream_audio":false})).unwrap();
+        assert_eq!(disabled.fec_percentage, Some(37));
+        assert_eq!(disabled.stream_audio, Some(false));
+        assert!(!disabled.is_empty());
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            json!({"fec_percentage":37,"stream_audio":false})
+        );
+    }
 
     #[test]
     fn playnite_target_requires_a_canonical_guid_and_bounded_exit_timeout() {
