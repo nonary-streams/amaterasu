@@ -6,7 +6,7 @@
 - Branch: `config-parity/foundation`
 - Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
 - Lane starting/base commit: `30acd5de34ac5548ebf4d46086fc32ccad7b6913`
-- Latest implementation candidate: `78fae895a3794f637c61639eddb5389ef50af0ef` (lane cherry-pick of test correction child commit `13272ef6ad22bbddb1e40b4776f7cf0892fd6448`)
+- Latest implementation candidate: `e80ee741a86d2673bcef40c1cbc98dba936d9d08` (lane cherry-pick of authentication test correction child commit `dccf6e3234d2a83d12ba4a0b34ca4b304c848a1d`)
 - Reference: Vibeshine `vibe-test` commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d`; used as behavioral evidence, not copied source.
 - Session: `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, `gpt-6-luna`, reasoning `max`.
 - Lane status: all seven assigned IDs remain `pending`. The coordinator owns the shared coverage ledger and decides when evidence is sufficient to close an ID.
@@ -21,6 +21,7 @@ At startup I verified the repository root, branch, starting HEAD, source baselin
 - `3902a21de4c3534cc3ac0c083219784b818753d6` — preserve configured aliases in migration snapshots, safely handle validated in-root links, and match Windows path casing with `CompareStringOrdinal`.
 - `c8bed167242d475a21abc02c5d4e036b23ffe47d` — fix the coordinator's Windows sigma alias failure and `needless_return` finding; this is the lane cherry-pick of child commit `68e3d33df1b579ee39b72daa30aaa9b1e70da9ac`.
 - `78fae895a3794f637c61639eddb5389ef50af0ef` — correct the Windows sigma regression test to expect rejection for a path that is not a Windows ordinal case variant; this is the lane cherry-pick of child commit `13272ef6ad22bbddb1e40b4776f7cf0892fd6448`.
+- `e80ee741a86d2673bcef40c1cbc98dba936d9d08` — import the authentication session document version in its pipeline test; this is the lane cherry-pick of child commit `dccf6e3234d2a83d12ba4a0b34ca4b304c848a1d`.
 
 Each lane commit includes the required `Orchestrated By: GPT-6 Luna Max` and `Planned By: GPT-6 Astra High` lines.
 
@@ -41,6 +42,14 @@ The coordinator reran `cargo test -p amaterasu-package` after `c8bed167` and fou
 The isolated child worktree was `D:/sources/worktrees/amaterasu-config-package-test-fix` on branch `config-parity/package-test-fix`, based on lane HEAD `ca38a57f3aa4f25435b9e46ed7789a55cd545d68`. CLI worker thread `01a0d57a-a2e1-7c63-bdbb-c4322bf9a054` was verified from `state_5.sqlite` as `gpt-6-luna/xhigh` before edits were authorized. It changed only `crates/package/src/migration/tests.rs`, renamed the case to `configured_identity_path_windows_sigma_mismatch_is_rejected`, and asserts collection rejects the mismatched configured spelling. The separate positive ASCII and É/é case-insensitive tests were preserved. The lane lead reviewed the one-file diff and cherry-picked child commit `13272ef6ad22bbddb1e40b4776f7cf0892fd6448` to this lane as `78fae895a3794f637c61639eddb5389ef50af0ef`.
 
 `rustfmt --edition 2024 --check crates/package/src/migration.rs crates/package/src/migration/tests.rs` and `git diff --check` passed in both lightweight worktrees; the lane checked its committed test correction with `git diff --check HEAD^ HEAD`. No tests, builds, or Clippy were run. The coordinator must rerun `cargo test -p amaterasu-package` and strict package Clippy on main to confirm the corrected expectation and prior implementation findings.
+
+## Coordinator authentication test compile correction
+
+The coordinator cherry-picked the authentication session/TTL candidate `f863bbbe` to main as `e805ca54`. Its `cargo fmt --check --package amaterasu-authentication` passed, but `cargo test -p amaterasu-authentication` failed to compile the test at `modules/authentication/src/pipeline/tests.rs:721` because `SESSION_DOCUMENT_VERSION` was not imported; rustc suggested `crate::protocol::SESSION_DOCUMENT_VERSION`.
+
+The isolated child worktree was `D:/sources/worktrees/amaterasu-config-auth-test-import-fix` on branch `config-parity/auth-test-import-fix`, based on lane HEAD `d6eee5c05290633fea656219b34dc3c6c5eb6a0c`. CLI worker thread `01a0d58d-825f-7922-b732-071a0e697a03` was verified from `state_5.sqlite` as `gpt-6-luna/xhigh` before edits were authorized. It changed only `modules/authentication/src/pipeline/tests.rs`, adding `use crate::protocol::SESSION_DOCUMENT_VERSION;`; behavior and test assertions are unchanged. The lane lead reviewed the one-line diff and cherry-picked child commit `dccf6e3234d2a83d12ba4a0b34ca4b304c848a1d` to this lane as `e80ee741a86d2673bcef40c1cbc98dba936d9d08`.
+
+`rustfmt --edition 2024 --check modules/authentication/src/pipeline/tests.rs` and `git diff --check` passed in the child. The same rustfmt check and `git diff --check HEAD^ HEAD` passed in the lane. No Cargo tests, builds, or Clippy were run. The coordinator should rerun `cargo test -p amaterasu-authentication` and strict authentication Clippy on main. Luna-01 did not edit main.
 
 ## Exact changed paths
 
@@ -98,6 +107,7 @@ Dependencies and blockers:
 - `state_paths_worker` (`gpt-6-luna/xhigh`) implemented the package migration slices in the two package paths above. `state_paths_reviewer` (`gpt-6-luna/xhigh`) reviewed the source changes, including the Windows FFI and sigma case; the coordinator's package execution later found the pre-canonicalization lookup failure documented above.
 - The isolated package correction worker used CLI thread `01a0d569-2c09-7110-8fc5-97e583cf30d6`; its actual model and effort were verified from session state as `gpt-6-luna/xhigh` before edits were authorized. It changed only `crates/package/src/migration.rs` and created child commit `68e3d33df1b579ee39b72daa30aaa9b1e70da9ac`.
 - The isolated Windows sigma test correction worker used CLI thread `01a0d57a-a2e1-7c63-bdbb-c4322bf9a054`; its actual model and effort were verified from session state as `gpt-6-luna/xhigh` before edits were authorized. It changed only `crates/package/src/migration/tests.rs` and created child commit `13272ef6ad22bbddb1e40b4776f7cf0892fd6448`.
+- The isolated authentication test import worker used CLI thread `01a0d58d-825f-7922-b732-071a0e697a03`; its actual model and effort were verified from session state as `gpt-6-luna/xhigh` before edits were authorized. It changed only `modules/authentication/src/pipeline/tests.rs` and created child commit `dccf6e3234d2a83d12ba4a0b34ca4b304c848a1d`.
 - `ttl_worker` (`gpt-6-luna/xhigh`) implemented the authentication sidecar and settings operations in the five authentication paths. An independent review found no actionable findings.
 - `host_config_worker` (`gpt-6-luna/xhigh`) implemented the provider in `modules/host-configuration/**` and performed a read-only host startup/logging investigation. A separate review found no actionable findings in the provider and trusted-root injection.
 - Package, authentication, provider, and host-loading files passed `rustfmt --edition 2024 --check`; `git diff --check` passed. `cargo metadata --locked --offline --no-deps --format-version 1` passed after adding the provider crate.
