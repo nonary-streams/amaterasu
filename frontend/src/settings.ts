@@ -361,6 +361,7 @@ namespace Amaterasu {
       typeof values.autosync_remove_uninstalled !== "boolean" ||
       typeof values.autosync_require_replacement !== "boolean" ||
       typeof values.focus_exit_on_first !== "boolean" ||
+      typeof values.fullscreen_entry_enabled !== "boolean" ||
       !Number.isSafeInteger(values.autosync_delete_after_days) ||
       values.autosync_delete_after_days < 0 ||
       values.autosync_delete_after_days > 2_147_483_647 ||
@@ -388,6 +389,7 @@ namespace Amaterasu {
       focus_attempts: values.focus_attempts,
       focus_timeout_secs: values.focus_timeout_secs,
       focus_exit_on_first: values.focus_exit_on_first,
+      fullscreen_entry_enabled: values.fullscreen_entry_enabled,
       recent_games: values.recent_games,
       recent_max_age_days: values.recent_max_age_days,
       sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -918,6 +920,8 @@ namespace Amaterasu {
         focusTimeoutSecs.step = "1";
         const focusExitOnFirst = input("playnite_focus_exit_on_first", "", "checkbox");
         focusExitOnFirst.checked = settings.values.focus_exit_on_first;
+        const fullscreenEntryEnabled = input("playnite_fullscreen_entry_enabled", "", "checkbox");
+        fullscreenEntryEnabled.checked = settings.values.fullscreen_entry_enabled;
         const recentGames = input(
           "playnite_recent_games",
           String(settings.values.recent_games),
@@ -1039,6 +1043,11 @@ namespace Amaterasu {
             "When enabled, stop retrying once the game is confirmed in the foreground.",
           ),
           field(
+            "Show Playnite Fullscreen in the catalog",
+            fullscreenEntryEnabled,
+            "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available.",
+          ),
+          field(
             "Recent games to import",
             recentGames,
             "Maximum number of recent games (0–10000); zero disables recent-game selection.",
@@ -1091,6 +1100,7 @@ namespace Amaterasu {
                 focus_attempts: focusAttempts.valueAsNumber,
                 focus_timeout_secs: focusTimeoutSecs.valueAsNumber,
                 focus_exit_on_first: focusExitOnFirst.checked,
+                fullscreen_entry_enabled: fullscreenEntryEnabled.checked,
                 recent_games: recentGames.valueAsNumber,
                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                 sync_categories: parsePlayniteFilterList(

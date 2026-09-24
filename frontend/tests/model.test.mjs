@@ -44,6 +44,26 @@ test("invalid argument arrays fail before sending mutations", () => {
   }
 });
 
+test("manual Playnite Fullscreen entries use a typed bounded launch", () => {
+  const form = new FormData();
+  form.set("name", "Fullscreen");
+  form.set("kind", "playnite_fullscreen");
+  form.set("path", "C:\\Ignored\\Playnite.exe");
+  form.set("steam_id", "123");
+  form.set("steam_install_dir", "C:\\Ignored");
+  form.set("fullscreen_exit_timeout_seconds", "0");
+  const entry = ordinary(model.entryFromForm(form));
+  assert.deepEqual(entry.launch, { kind: "playnite_fullscreen", exit_timeout_seconds: 0 });
+  assert.equal(Object.hasOwn(entry, "steam_id"), false);
+  assert.equal(Object.hasOwn(entry, "steam_install_dir"), false);
+  form.delete("fullscreen_exit_timeout_seconds");
+  assert.equal(model.entryFromForm(form).launch.exit_timeout_seconds, 10);
+  for (const timeout of ["-1", "301", "1.5", "NaN"]) {
+    form.set("fullscreen_exit_timeout_seconds", timeout);
+    assert.throws(() => model.entryFromForm(form));
+  }
+});
+
 test("application editor saves sparse FEC and executable lifecycle fields", () => {
   const form = new FormData();
   form.set("name", "Policy app");

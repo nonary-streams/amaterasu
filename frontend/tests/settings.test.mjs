@@ -99,6 +99,7 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     focus_attempts: 3,
     focus_timeout_secs: 15,
     focus_exit_on_first: false,
+    fullscreen_entry_enabled: true,
     recent_games: 0,
     recent_max_age_days: 36500,
     sync_categories: ["Action"],
@@ -142,6 +143,7 @@ test("Playnite editor validates complete sparse settings and bounded filter list
     { ...values, focus_attempts: 2_147_483_648 },
     { ...values, focus_timeout_secs: 1.5 },
     { ...values, focus_exit_on_first: "false" },
+    { ...values, fullscreen_entry_enabled: "true" },
     { ...values, exclude_games: Array.from({ length: 256 }, (_, index) => `game-${index}-${"x".repeat(500)}`) },
   ]) {
     assert.throws(() => parseSettings(invalid));

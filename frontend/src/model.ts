@@ -125,11 +125,15 @@ namespace Amaterasu {
 
   export function entryFromForm(data: FormData): Entry {
     const text = (name: string) => String(data.get(name) ?? "").trim();
-    const kind = text("kind") === "executable" ? "executable" : "application";
+    const kind = text("kind") === "executable"
+      ? "executable"
+      : text("kind") === "playnite_fullscreen"
+        ? "playnite_fullscreen"
+        : "application";
     const fecPercentage = parseFecOverride(text("fec_percentage"));
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
-    const steamId = parseSteamId(String(data.get("steam_id") ?? ""));
-    const steamInstallDir = parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
+    const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
+    const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
       fecPercentage === null && streamAudio === null
         ? undefined
@@ -140,8 +144,9 @@ namespace Amaterasu {
     const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
     const detached = parseDetachedCommands(text("detached"));
     const preparation = parsePreparation(text("preparation"));
-    const launch: Launch =
-      kind === "application"
+    const launch: Launch = kind === "playnite_fullscreen"
+      ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
+      : kind === "application"
         ? { kind, path: text("path") }
         : {
             kind,
@@ -226,6 +231,8 @@ namespace Amaterasu {
         return entry.launch.program;
       case "playnite":
         return `Playnite game ${entry.launch.game_id}`;
+      case "playnite_fullscreen":
+        return "Playnite Fullscreen";
     }
   }
 

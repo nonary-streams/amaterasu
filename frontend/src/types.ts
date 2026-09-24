@@ -28,7 +28,8 @@ namespace Amaterasu {
         detached?: string[];
         preparation?: PreparationStep[];
       }
-    | { kind: "playnite"; game_id: string; exit_timeout_seconds: number };
+    | { kind: "playnite"; game_id: string; exit_timeout_seconds: number }
+    | { kind: "playnite_fullscreen"; exit_timeout_seconds: number };
   export interface PreparationStep {
     run: PreparationCommand;
     undo?: PreparationCommand | null;
@@ -163,6 +164,7 @@ namespace Amaterasu {
       focus_attempts: number;
       focus_timeout_secs: number;
       focus_exit_on_first: boolean;
+      fullscreen_entry_enabled: boolean;
       recent_games: number;
       recent_max_age_days: number;
       sync_categories: string[];

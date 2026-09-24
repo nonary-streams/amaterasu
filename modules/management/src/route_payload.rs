@@ -631,6 +631,16 @@ fn catalog_launch(value: &Value) -> Result<(), &'static str> {
             fields(launch, &["kind", "path"], &[])?;
             text(launch, "path")?;
         }
+        "playnite_fullscreen" => {
+            fields(launch, &["kind", "exit_timeout_seconds"], &[])?;
+            if !launch
+                .get("exit_timeout_seconds")
+                .and_then(Value::as_u64)
+                .is_some_and(|timeout| timeout <= 300)
+            {
+                return Err(INVALID);
+            }
+        }
         "executable" => {
             fields(
                 launch,
@@ -1430,6 +1440,8 @@ mod catalog_tests {
 
     #[test]
     fn catalog_routes_reject_unowned_fields_and_out_of_range_overrides() {
+        let fullscreen = serde_json::json!({"expected_revision":0,"entry":{"name":"Fullscreen","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":0}}});
+        assert!(validate(route("create"), fullscreen.as_object().unwrap()).is_ok());
         let invalid = [
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","owner":"other","launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":0},"launch":{"kind":"application","path":"/x"}}}),
@@ -1449,6 +1461,10 @@ mod catalog_tests {
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","exit-timeout":301}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","detached":["bad\ncommand"]}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab","exit_timeout_seconds":10}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":301}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":-1}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":10,"path":"/forged"}}}),
             serde_json::json!({"id":"app-0000000000000001","expected_revision":0,"action":"delete"}),
         ];
         for value in invalid {

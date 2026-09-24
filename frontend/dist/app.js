@@ -119,11 +119,15 @@ var Amaterasu;
     }
     function entryFromForm(data) {
         const text = (name) => String(data.get(name) ?? "").trim();
-        const kind = text("kind") === "executable" ? "executable" : "application";
+        const kind = text("kind") === "executable"
+            ? "executable"
+            : text("kind") === "playnite_fullscreen"
+                ? "playnite_fullscreen"
+                : "application";
         const fecPercentage = parseFecOverride(text("fec_percentage"));
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
-        const steamId = parseSteamId(String(data.get("steam_id") ?? ""));
-        const steamInstallDir = parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
+        const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
+        const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
         const configOverrides = fecPercentage === null && streamAudio === null
             ? undefined
             : {
@@ -133,21 +137,23 @@ var Amaterasu;
         const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
         const detached = parseDetachedCommands(text("detached"));
         const preparation = parsePreparation(text("preparation"));
-        const launch = kind === "application"
-            ? { kind, path: text("path") }
-            : {
-                kind,
-                program: text("path"),
-                arguments: parseArguments(String(data.get("arguments") ?? "[]")),
-                working_directory: text("working_directory") || null,
-                auto_detach: data.has("auto_detach"),
-                wait_all: data.has("wait_all"),
-                ...(exitTimeoutSeconds === null
-                    ? {}
-                    : { exit_timeout_seconds: exitTimeoutSeconds }),
-                ...(detached.length ? { detached } : {}),
-                ...(preparation.length ? { preparation } : {}),
-            };
+        const launch = kind === "playnite_fullscreen"
+            ? { kind, exit_timeout_seconds: parseExitTimeout(text("fullscreen_exit_timeout_seconds")) ?? 10 }
+            : kind === "application"
+                ? { kind, path: text("path") }
+                : {
+                    kind,
+                    program: text("path"),
+                    arguments: parseArguments(String(data.get("arguments") ?? "[]")),
+                    working_directory: text("working_directory") || null,
+                    auto_detach: data.has("auto_detach"),
+                    wait_all: data.has("wait_all"),
+                    ...(exitTimeoutSeconds === null
+                        ? {}
+                        : { exit_timeout_seconds: exitTimeoutSeconds }),
+                    ...(detached.length ? { detached } : {}),
+                    ...(preparation.length ? { preparation } : {}),
+                };
         return {
             name: text("name"),
             description: text("description"),
@@ -209,6 +215,8 @@ var Amaterasu;
                 return entry.launch.program;
             case "playnite":
                 return `Playnite game ${entry.launch.game_id}`;
+            case "playnite_fullscreen":
+                return "Playnite Fullscreen";
         }
     }
     Amaterasu.launchPath = launchPath;
@@ -844,6 +852,7 @@ var Amaterasu;
         for (const [value, text] of [
             ["application", "Application / bundle"],
             ["executable", "Executable with arguments"],
+            ["playnite_fullscreen", "Playnite Fullscreen"],
         ]) {
             const option = Amaterasu.el("option", "", text);
             option.value = value ?? "";
@@ -887,18 +896,33 @@ var Amaterasu;
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
         steamInstallDir.maxLength = 1024;
+        const fullscreenTimeout = Amaterasu.input("fullscreen_exit_timeout_seconds", String(entry?.launch.kind === "playnite_fullscreen" ? entry.launch.exit_timeout_seconds : 10), "number");
+        fullscreenTimeout.min = "0";
+        fullscreenTimeout.max = "300";
+        fullscreenTimeout.step = "1";
+        fullscreenTimeout.required = true;
         const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
+        const pathField = Amaterasu.field("Absolute application path", path);
+        const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
+        const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+        const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
+            const isFullscreen = kind.value === "playnite_fullscreen";
+            fullscreen.hidden = !isFullscreen;
+            pathField.hidden = isFullscreen;
+            path.required = !isFullscreen;
+            steamIdField.hidden = isFullscreen;
+            steamInstallDirField.hidden = isFullscreen;
             path.placeholder =
                 kind.value === "executable"
                     ? "/opt/games/example"
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking."), Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it."), executable);
         return form;
     }
 })(Amaterasu || (Amaterasu = {}));
@@ -1225,6 +1249,7 @@ var Amaterasu;
             typeof values.autosync_remove_uninstalled !== "boolean" ||
             typeof values.autosync_require_replacement !== "boolean" ||
             typeof values.focus_exit_on_first !== "boolean" ||
+            typeof values.fullscreen_entry_enabled !== "boolean" ||
             !Number.isSafeInteger(values.autosync_delete_after_days) ||
             values.autosync_delete_after_days < 0 ||
             values.autosync_delete_after_days > 2_147_483_647 ||
@@ -1251,6 +1276,7 @@ var Amaterasu;
             focus_attempts: values.focus_attempts,
             focus_timeout_secs: values.focus_timeout_secs,
             focus_exit_on_first: values.focus_exit_on_first,
+            fullscreen_entry_enabled: values.fullscreen_entry_enabled,
             recent_games: values.recent_games,
             recent_max_age_days: values.recent_max_age_days,
             sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
@@ -1588,6 +1614,8 @@ var Amaterasu;
                 focusTimeoutSecs.step = "1";
                 const focusExitOnFirst = Amaterasu.input("playnite_focus_exit_on_first", "", "checkbox");
                 focusExitOnFirst.checked = settings.values.focus_exit_on_first;
+                const fullscreenEntryEnabled = Amaterasu.input("playnite_fullscreen_entry_enabled", "", "checkbox");
+                fullscreenEntryEnabled.checked = settings.values.fullscreen_entry_enabled;
                 const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
@@ -1632,7 +1660,7 @@ var Amaterasu;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
@@ -1647,6 +1675,7 @@ var Amaterasu;
                                 focus_attempts: focusAttempts.valueAsNumber,
                                 focus_timeout_secs: focusTimeoutSecs.valueAsNumber,
                                 focus_exit_on_first: focusExitOnFirst.checked,
+                                fullscreen_entry_enabled: fullscreenEntryEnabled.checked,
                                 recent_games: recentGames.valueAsNumber,
                                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                                 sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),

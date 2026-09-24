@@ -410,6 +410,7 @@ namespace Amaterasu {
     for (const [value, text] of [
       ["application", "Application / bundle"],
       ["executable", "Executable with arguments"],
+      ["playnite_fullscreen", "Playnite Fullscreen"],
     ]) {
       const option = el("option", "", text);
       option.value = value ?? "";
@@ -472,6 +473,15 @@ namespace Amaterasu {
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
     steamInstallDir.maxLength = 1024;
+    const fullscreenTimeout = input(
+      "fullscreen_exit_timeout_seconds",
+      String(entry?.launch.kind === "playnite_fullscreen" ? entry.launch.exit_timeout_seconds : 10),
+      "number",
+    );
+    fullscreenTimeout.min = "0";
+    fullscreenTimeout.max = "300";
+    fullscreenTimeout.step = "1";
+    fullscreenTimeout.required = true;
     const processPolicy = el(
       "div",
       "form-grid",
@@ -492,26 +502,37 @@ namespace Amaterasu {
       processPolicy,
       preparation,
     );
+    const pathField = field("Absolute application path", path);
+    const steamIdField = field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
+    const steamInstallDirField = field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+    const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful Playnite Fullscreen close window, from 0 to 300 seconds.");
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
+      const isFullscreen = kind.value === "playnite_fullscreen";
+      fullscreen.hidden = !isFullscreen;
+      pathField.hidden = isFullscreen;
+      path.required = !isFullscreen;
+      steamIdField.hidden = isFullscreen;
+      steamInstallDirField.hidden = isFullscreen;
       path.placeholder =
         kind.value === "executable"
           ? "/opt/games/example"
           : "/Applications/Example.app";
     };
     kind.addEventListener("change", showKind);
-    showKind();
     form.append(
       el("div", "form-grid", field("Name", name), field("Launch type", kind)),
       field("Description", description),
       field("Tags", tags, "Separate tags with commas."),
-      field("Absolute application path", path),
+      pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
-      field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking."),
-      field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it."),
+      steamIdField,
+      steamInstallDirField,
+      fullscreen,
       executable,
     );
+    showKind();
     return form;
   }
 }
