@@ -32,17 +32,18 @@ application/client override independently. Keep genuinely unsupported behavior
 Workers should report concrete changed files, test commands and results, and
 unimplemented behavior. Sol integrates only when the ownership boundary is clear
 and the option's observable effect is tested. The current increment establishes
-the inventory and settings foundation, plus partial NVHTTP and Steam slices; it
+the inventory and settings foundation, host and application lifecycle controls,
+session renewal, network port behavior, and Steam provider reconciliation. It
 does not pass the final parity gate.
 
-The Steam import options `steam_include_tools`, `steam_exclude_games`, and
-`steam_recent_games` depend on catalog reconciliation, app type and play-history
-data. Vibeshine applies them to import and launch eligibility. Filtering the raw
-discovery feed would change that behavior, so these IDs remain pending until the
-catalog integration owns those effects.
+Steam catalog reconciliation now owns explicit game exclusions, while
+`steam_include_tools` and `steam_recent_games` still need app type and
+play-history data. Vibeshine applies them to import and launch eligibility.
+Filtering the raw discovery feed would change that behavior. The Steam IDs
+remain pending until the whole reference behavior is verified.
 
-The live NVHTTP HTTP/HTTPS base-port slice does not close `global:port` yet.
-Vibeshine derives RTSP and streaming UDP ports from the same base, while those
-Amaterasu services still use separate startup settings. `address_family` and
-`bind_address` likewise remain pending until every listener follows their
+The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
+`global:port` remains pending until listener moves, startup recovery, and
+platform behavior are verified as one configuration contract. `address_family`
+and `bind_address` remain pending until every public listener follows their
 policy without weakening the loopback control plane.
