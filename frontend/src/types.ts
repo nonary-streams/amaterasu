@@ -49,6 +49,7 @@ namespace Amaterasu {
     artwork?: { provider: "steam"; app_id: number; revision: string };
     steam_id?: string;
     steam_install_dir?: string;
+    exclude_global_prep_cmd?: boolean;
     config_overrides?: {
       fec_percentage?: number;
       stream_audio?: boolean;
@@ -109,6 +110,7 @@ namespace Amaterasu {
     effective_audio_sink: string;
     configured_wgc_pacing_smoothing: boolean | null;
     effective_wgc_pacing_smoothing: boolean;
+    configured_global_preparation: PreparationStep[];
     stream_audio: boolean;
     http_addresses: string[] | null;
     https_addresses: string[] | null;

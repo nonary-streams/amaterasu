@@ -154,18 +154,98 @@ var Amaterasu;
         return seconds;
     }
     Amaterasu.parseExitTimeout = parseExitTimeout;
-    function parsePreparation(value) {
-        const parsed = JSON.parse(value || "[]");
-        if (!Array.isArray(parsed) ||
-            parsed.some((step) => step === null ||
+    function parsePreparationSteps(value) {
+        let parsed;
+        try {
+            parsed = JSON.parse(value || "[]");
+        }
+        catch {
+            throw new Error("Preparation commands must be a valid JSON array.");
+        }
+        if (!Array.isArray(parsed) || parsed.length > 8)
+            throw new Error("Preparation commands must be a JSON array with at most 8 steps.");
+        for (const step of parsed) {
+            if (step === null ||
                 Array.isArray(step) ||
                 typeof step !== "object" ||
-                !step.run ||
-                Array.isArray(step.run) ||
-                typeof step.run !== "object")) {
-            throw new Error("Existing preparation commands are malformed; reload before saving.");
+                !("run" in step) ||
+                Object.keys(step).some((key) => !["run", "undo"].includes(key)))
+                throw new Error("Each preparation step must contain run and an optional undo command.");
+            validatePreparationCommand(step.run);
+            if (step.undo != null)
+                validatePreparationCommand(step.undo);
         }
         return parsed;
+    }
+    Amaterasu.parsePreparationSteps = parsePreparationSteps;
+    function validatePreparationCommand(value) {
+        if (value === null ||
+            Array.isArray(value) ||
+            typeof value !== "object" ||
+            !("executable" in value) ||
+            Object.keys(value).some((key) => !["executable", "args", "environment", "cwd", "timeout_ms"].includes(key)))
+            throw new Error("Each preparation command needs an executable and only supported fields.");
+        const command = value;
+        if (typeof command.executable !== "string" ||
+            !isAbsolutePreparationPath(command.executable) ||
+            new TextEncoder().encode(command.executable).length > 1024 ||
+            command.executable.includes("\0") ||
+            /\.(bat|cmd)$/i.test(command.executable))
+            throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes; batch files need an explicit interpreter.");
+        if (command.cwd != null &&
+            (typeof command.cwd !== "string" ||
+                !isAbsolutePreparationPath(command.cwd) ||
+                new TextEncoder().encode(command.cwd).length > 1024 ||
+                command.cwd.includes("\0")))
+            throw new Error("Preparation working directory must be a native absolute path of at most 1024 bytes.");
+        if (command.args !== undefined) {
+            if (!Array.isArray(command.args) ||
+                command.args.length > 64 ||
+                command.args.some((argument) => typeof argument !== "string" ||
+                    new TextEncoder().encode(argument).length > 1024 ||
+                    argument.includes("\0")) ||
+                command.args.reduce((bytes, argument) => bytes + (typeof argument === "string" ? new TextEncoder().encode(argument).length : 0), 0) > 8192)
+                throw new Error("Preparation arguments exceed the 64 item and 8192 byte limits.");
+        }
+        if (command.timeout_ms !== undefined && (!Number.isSafeInteger(command.timeout_ms) ||
+            command.timeout_ms < 1 ||
+            command.timeout_ms > 30000))
+            throw new Error("Preparation timeout must be a whole number from 1 to 30000 milliseconds.");
+        if (command.environment !== undefined) {
+            const environment = command.environment;
+            if (environment === null || Array.isArray(environment) || typeof environment !== "object")
+                throw new Error("Preparation environment must be a JSON object.");
+            const entries = Object.entries(environment);
+            const foldedNames = new Set();
+            let totalBytes = 0;
+            for (const [key, rawValue] of entries) {
+                if (key.length === 0 ||
+                    new TextEncoder().encode(key).length > 128 ||
+                    !/^[A-Za-z0-9_]+$/.test(key) ||
+                    typeof rawValue !== "string" ||
+                    new TextEncoder().encode(rawValue).length > 1024 ||
+                    rawValue.includes("\0") ||
+                    foldedNames.has(key.toUpperCase()))
+                    throw new Error("Preparation environment names and values exceed their limits or are invalid.");
+                foldedNames.add(key.toUpperCase());
+                totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
+            }
+            if (entries.length > 32 || totalBytes > 4096)
+                throw new Error("Preparation environment exceeds the 32 variable and 4096 byte limits.");
+        }
+    }
+    function isAbsolutePreparationPath(value) {
+        return value.startsWith("/") ||
+            /^[A-Za-z]:[\\/]/.test(value) ||
+            /^\\\\[^\\/]+[\\/][^\\/]+/.test(value);
+    }
+    function parsePreparation(value) {
+        try {
+            return parsePreparationSteps(value);
+        }
+        catch {
+            throw new Error("Existing preparation commands are malformed or outside supported bounds; reload before saving.");
+        }
     }
     function entryFromForm(data) {
         const text = (name) => String(data.get(name) ?? "").trim();
@@ -219,6 +299,7 @@ var Amaterasu;
                 .split(",")
                 .map((tag) => tag.trim())
                 .filter(Boolean),
+            exclude_global_prep_cmd: data.has("exclude_global_prep_cmd"),
             launch,
             ...(steamId === null ? {} : { steam_id: steamId }),
             ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),
@@ -963,6 +1044,10 @@ var Amaterasu;
         description.maxLength = 1024;
         description.rows = 2;
         const tags = Amaterasu.input("tags", entry?.tags?.join(", ") ?? "");
+        const excludeGlobalPreparation = Amaterasu.el("input");
+        excludeGlobalPreparation.type = "checkbox";
+        excludeGlobalPreparation.name = "exclude_global_prep_cmd";
+        excludeGlobalPreparation.checked = entry?.exclude_global_prep_cmd ?? false;
         const kind = Amaterasu.el("select");
         kind.name = "kind";
         for (const [value, text] of [
@@ -1045,7 +1130,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -2419,6 +2504,32 @@ var Amaterasu;
                 const updateVirtualSink = () => { virtualSink.disabled = !virtualSinkEnabled.checked; };
                 virtualSinkEnabled.addEventListener("change", updateVirtualSink);
                 updateVirtualSink();
+                const globalPreparation = Amaterasu.el("textarea");
+                globalPreparation.name = "global_preparation";
+                globalPreparation.rows = 10;
+                globalPreparation.value = JSON.stringify(settings.configured_global_preparation, null, 2);
+                const globalPreparationValidation = Amaterasu.el("p", "muted");
+                const updateGlobalPreparationValidation = () => {
+                    try {
+                        const steps = Amaterasu.parsePreparationSteps(globalPreparation.value);
+                        globalPreparation.setCustomValidity("");
+                        globalPreparationValidation.className = "muted";
+                        globalPreparationValidation.textContent =
+                            "Valid preparation list with " +
+                                steps.length +
+                                " step" +
+                                (steps.length === 1 ? "" : "s") +
+                                ".";
+                    }
+                    catch (error) {
+                        const message = Amaterasu.messageOf(error);
+                        globalPreparation.setCustomValidity(message);
+                        globalPreparationValidation.className = "error";
+                        globalPreparationValidation.textContent = message;
+                    }
+                };
+                globalPreparation.addEventListener("input", updateGlobalPreparationValidation);
+                updateGlobalPreparationValidation();
                 const audioSinkCaptureOnly = Amaterasu.input("audio_sink_capture_only", "", "checkbox");
                 audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
                 const externalIp = Amaterasu.input("external_ip", settings.configured_external_ip ?? "");
@@ -2452,9 +2563,11 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
+                    if (!form.reportValidity())
+                        return;
                     void Amaterasu.runAction(save, status, async () => {
                         const network = parseNvhttpNetworkOverrides(addressFamily.value, useStartupBindAddress.checked, bindAddress.value);
                         await context.api.post("nvhttp/settings_update", {
@@ -2473,13 +2586,14 @@ var Amaterasu;
                             audio_sink_capture_only: audioSinkCaptureOnly.checked,
                             external_ip: parseExternalIp(externalIp.value),
                             wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
+                            global_preparation: Amaterasu.parsePreparationSteps(globalPreparation.value),
                             expected_revision: settings.revision,
                         });
                         context.notify("Host settings saved.");
                         await loadHost();
                     });
                 });
-                hostArea.replaceChildren(Amaterasu.panel("Moonlight host name", form));
+                hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form));
             }
             catch (error) {
                 if (context.content.isConnected)

@@ -152,23 +152,120 @@ namespace Amaterasu {
     return seconds;
   }
 
-  function parsePreparation(value: string): PreparationStep[] {
-    const parsed: unknown = JSON.parse(value || "[]");
-    if (
-      !Array.isArray(parsed) ||
-      parsed.some(
-        (step) =>
-          step === null ||
-          Array.isArray(step) ||
-          typeof step !== "object" ||
-          !step.run ||
-          Array.isArray(step.run) ||
-          typeof step.run !== "object",
+  export function parsePreparationSteps(value: string): PreparationStep[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value || "[]");
+    } catch {
+      throw new Error("Preparation commands must be a valid JSON array.");
+    }
+    if (!Array.isArray(parsed) || parsed.length > 8)
+      throw new Error("Preparation commands must be a JSON array with at most 8 steps.");
+    for (const step of parsed) {
+      if (
+        step === null ||
+        Array.isArray(step) ||
+        typeof step !== "object" ||
+        !("run" in step) ||
+        Object.keys(step).some((key) => !["run", "undo"].includes(key))
       )
-    ) {
-      throw new Error("Existing preparation commands are malformed; reload before saving.");
+        throw new Error("Each preparation step must contain run and an optional undo command.");
+      validatePreparationCommand(step.run);
+      if (step.undo != null) validatePreparationCommand(step.undo);
     }
     return parsed as PreparationStep[];
+  }
+
+  function validatePreparationCommand(value: unknown): void {
+    if (
+      value === null ||
+      Array.isArray(value) ||
+      typeof value !== "object" ||
+      !("executable" in value) ||
+      Object.keys(value).some(
+        (key) => !["executable", "args", "environment", "cwd", "timeout_ms"].includes(key),
+      )
+    )
+      throw new Error("Each preparation command needs an executable and only supported fields.");
+    const command = value as Record<string, unknown>;
+    if (
+      typeof command.executable !== "string" ||
+      !isAbsolutePreparationPath(command.executable) ||
+      new TextEncoder().encode(command.executable).length > 1024 ||
+      command.executable.includes("\0") ||
+      /\.(bat|cmd)$/i.test(command.executable)
+    )
+      throw new Error("Preparation executable must be a native absolute path of at most 1024 bytes; batch files need an explicit interpreter.");
+    if (
+      command.cwd != null &&
+      (typeof command.cwd !== "string" ||
+        !isAbsolutePreparationPath(command.cwd) ||
+        new TextEncoder().encode(command.cwd).length > 1024 ||
+        command.cwd.includes("\0"))
+    )
+      throw new Error("Preparation working directory must be a native absolute path of at most 1024 bytes.");
+    if (command.args !== undefined) {
+      if (
+        !Array.isArray(command.args) ||
+        command.args.length > 64 ||
+        command.args.some(
+          (argument) =>
+            typeof argument !== "string" ||
+            new TextEncoder().encode(argument).length > 1024 ||
+            argument.includes("\0"),
+        ) ||
+        command.args.reduce(
+          (bytes, argument) =>
+            bytes + (typeof argument === "string" ? new TextEncoder().encode(argument).length : 0),
+          0,
+        ) > 8192
+      )
+        throw new Error("Preparation arguments exceed the 64 item and 8192 byte limits.");
+    }
+    if (command.timeout_ms !== undefined && (
+      !Number.isSafeInteger(command.timeout_ms) ||
+      (command.timeout_ms as number) < 1 ||
+      (command.timeout_ms as number) > 30000
+    ))
+      throw new Error("Preparation timeout must be a whole number from 1 to 30000 milliseconds.");
+    if (command.environment !== undefined) {
+      const environment = command.environment;
+      if (environment === null || Array.isArray(environment) || typeof environment !== "object")
+        throw new Error("Preparation environment must be a JSON object.");
+      const entries = Object.entries(environment as Record<string, unknown>);
+      const foldedNames = new Set<string>();
+      let totalBytes = 0;
+      for (const [key, rawValue] of entries) {
+        if (
+          key.length === 0 ||
+          new TextEncoder().encode(key).length > 128 ||
+          !/^[A-Za-z0-9_]+$/.test(key) ||
+          typeof rawValue !== "string" ||
+          new TextEncoder().encode(rawValue).length > 1024 ||
+          rawValue.includes("\0") ||
+          foldedNames.has(key.toUpperCase())
+        )
+          throw new Error("Preparation environment names and values exceed their limits or are invalid.");
+        foldedNames.add(key.toUpperCase());
+        totalBytes += new TextEncoder().encode(key).length + new TextEncoder().encode(rawValue).length;
+      }
+      if (entries.length > 32 || totalBytes > 4096)
+        throw new Error("Preparation environment exceeds the 32 variable and 4096 byte limits.");
+    }
+  }
+
+  function isAbsolutePreparationPath(value: string): boolean {
+    return value.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(value) ||
+      /^\\\\[^\\/]+[\\/][^\\/]+/.test(value);
+  }
+
+  function parsePreparation(value: string): PreparationStep[] {
+    try {
+      return parsePreparationSteps(value);
+    } catch {
+      throw new Error("Existing preparation commands are malformed or outside supported bounds; reload before saving.");
+    }
   }
 
   export function entryFromForm(data: FormData): Entry {
@@ -224,6 +321,7 @@ namespace Amaterasu {
         .split(",")
         .map((tag) => tag.trim())
         .filter(Boolean),
+      exclude_global_prep_cmd: data.has("exclude_global_prep_cmd"),
       launch,
       ...(steamId === null ? {} : { steam_id: steamId }),
       ...(steamInstallDir === null ? {} : { steam_install_dir: steamInstallDir }),

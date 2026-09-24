@@ -4,6 +4,7 @@ use crate::routes::Route;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 
 type Object = Map<String, Value>;
 const INVALID: &str = "unexpected or malformed route fields";
@@ -659,8 +660,22 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             "config_overrides",
             "steam_id",
             "steam_install_dir",
+            "exclude_global_prep_cmd",
+            "exclude-global-prep-cmd",
         ],
     )?;
+    if entry.contains_key("exclude_global_prep_cmd")
+        && entry.contains_key("exclude-global-prep-cmd")
+    {
+        return Err(INVALID);
+    }
+    if entry
+        .get("exclude_global_prep_cmd")
+        .or_else(|| entry.get("exclude-global-prep-cmd"))
+        .is_some_and(|value| value.as_bool().is_none())
+    {
+        return Err(INVALID);
+    }
     let name = text(entry, "name")?;
     if name.trim().is_empty() || name.len() > 160 || name.chars().any(char::is_control) {
         return Err(INVALID);
@@ -962,6 +977,51 @@ fn catalog_preparation(value: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn global_preparation(value: &Value) -> Result<(), &'static str> {
+    if value.is_null() {
+        return Ok(());
+    }
+    catalog_preparation(value)?;
+    let steps = value.as_array().ok_or(INVALID)?;
+    for step in steps {
+        let step = step.as_object().ok_or(INVALID)?;
+        validate_global_preparation_command(step.get("run").ok_or(INVALID)?)?;
+        if let Some(undo) = step.get("undo")
+            && !undo.is_null()
+        {
+            validate_global_preparation_command(undo)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_global_preparation_command(value: &Value) -> Result<(), &'static str> {
+    let command = value.as_object().ok_or(INVALID)?;
+    let executable = text(command, "executable")?;
+    let executable_path = Path::new(executable);
+    if executable.is_empty()
+        || executable.len() > 1024
+        || executable.contains('\0')
+        || !executable_path.is_absolute()
+        || executable_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+            })
+    {
+        return Err(INVALID);
+    }
+    if let Some(cwd) = command.get("cwd").filter(|cwd| !cwd.is_null()) {
+        let cwd = cwd.as_str().ok_or(INVALID)?;
+        if cwd.is_empty() || cwd.len() > 1024 || cwd.contains('\0') || !Path::new(cwd).is_absolute()
+        {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
+}
+
 fn catalog_command(value: &Value) -> Result<(), &'static str> {
     let command = value.as_object().ok_or(INVALID)?;
     fields(
@@ -1101,6 +1161,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "external_ip",
                     "wgc_pacing_smoothing",
                     "ping_timeout_ms",
+                    "global_preparation",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -1227,6 +1288,9 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                         .is_some_and(|timeout| (-1..=i32::MAX as i64).contains(&timeout))
             }) {
                 return Err(INVALID);
+            }
+            if let Some(preparation) = object.get("global_preparation") {
+                global_preparation(preparation)?;
             }
             Ok(())
         }
@@ -1497,6 +1561,82 @@ mod nvhttp_tests {
             assert!(
                 validate(route, payload.as_object().unwrap()).is_err(),
                 "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_preparation_update_is_sparse_clearable_and_strictly_bounded() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        let executable = std::env::current_exe().unwrap();
+        let overlong_executable = format!("{}{}", executable.display(), "x".repeat(1025));
+        let overlong_cwd = format!(
+            "{}{}",
+            std::env::current_dir().unwrap().display(),
+            "x".repeat(1025)
+        );
+        let command = serde_json::json!({
+            "executable": executable,
+            "args": ["--prepare"],
+            "environment": {"MODE":"safe"},
+            "cwd": std::env::current_dir().unwrap(),
+            "timeout_ms": 30000,
+        });
+        for preparation in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([{"run":command,"undo":null}]),
+            serde_json::json!([{"run":command.clone(),"undo":command.clone()}]),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "global_preparation":preparation,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "rejected valid preparation: {payload}"
+            );
+        }
+        let omitted = serde_json::json!({
+            "hostname":"Host", "port":47989, "expected_revision":0,
+        });
+        assert!(validate(route, omitted.as_object().unwrap()).is_ok());
+
+        let invalid = [
+            Value::Bool(false),
+            serde_json::json!({}),
+            serde_json::json!([{"run":{"executable":"relative.exe"}}]),
+            serde_json::json!([{"run":{"executable":std::env::current_exe().unwrap(),"cwd":"relative"}}]),
+            serde_json::json!([{"run":{"executable":format!("{}.cmd", executable.display())}}]),
+            serde_json::json!([{"run":{"executable":format!("{}\0", executable.display())}}]),
+            serde_json::json!([{"run":{"executable":overlong_executable}}]),
+            serde_json::json!([{"run":{"executable":executable,"cwd":overlong_cwd}}]),
+            serde_json::json!([{"run":{"executable":executable,"timeout_ms":0}}]),
+            serde_json::json!([{"run":{"executable":executable,"unknown":true}}]),
+            serde_json::json!([{"run":{"executable":executable,"args":[1]}}]),
+            serde_json::json!([{"run":{"executable":executable,"args":std::iter::repeat_n("x", 9).map(|_| "x".repeat(1024)).collect::<Vec<_>>()}}]),
+            serde_json::json!([{"run":{"executable":executable,"environment":{"PATH":"a","Path":"b"}}}]),
+            serde_json::json!(
+                std::iter::repeat_n(
+                    serde_json::json!({"run":{"executable":std::env::current_exe().unwrap()}}),
+                    9,
+                )
+                .collect::<Vec<_>>()
+            ),
+        ];
+        for preparation in invalid {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "global_preparation":preparation,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "accepted invalid preparation: {payload}"
             );
         }
     }
@@ -2193,6 +2333,7 @@ mod catalog_tests {
                 "name": "Configured app",
                 "steam_id": "4294967295",
                 "steam_install_dir": "C:\\Games\\Configured",
+                "exclude_global_prep_cmd": true,
                 "config_overrides": {"fec_percentage": 255, "stream_audio": false},
                 "launch": {
                     "kind": "executable",
@@ -2216,6 +2357,19 @@ mod catalog_tests {
             "expected_revision": 0
         });
         assert!(validate(route("create"), legacy.as_object().unwrap()).is_ok());
+        for key in ["exclude_global_prep_cmd", "exclude-global-prep-cmd"] {
+            let entry = serde_json::json!({
+                "expected_revision":0,
+                "entry":{"name":"Excluded","exclude_global_prep_cmd":true,"launch":{"kind":"application","path":"/opt/example"}}
+            });
+            let mut entry = entry;
+            if key == "exclude-global-prep-cmd" {
+                let fields = entry["entry"].as_object_mut().unwrap();
+                fields.remove("exclude_global_prep_cmd");
+                fields.insert(key.into(), Value::Bool(true));
+            }
+            assert!(validate(route("create"), entry.as_object().unwrap()).is_ok());
+        }
     }
 
     #[test]
@@ -2270,6 +2424,8 @@ mod catalog_tests {
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":256},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":"37"},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"stream_audio":"false"},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","exclude_global_prep_cmd":"true","launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","exclude_global_prep_cmd":true,"exclude-global-prep-cmd":false,"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"0","launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"0001","launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","steam_id":"4294967296","launch":{"kind":"application","path":"/x"}}}),

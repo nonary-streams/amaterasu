@@ -490,6 +490,10 @@ namespace Amaterasu {
     description.maxLength = 1024;
     description.rows = 2;
     const tags = input("tags", entry?.tags?.join(", ") ?? "");
+    const excludeGlobalPreparation = el("input");
+    excludeGlobalPreparation.type = "checkbox";
+    excludeGlobalPreparation.name = "exclude_global_prep_cmd";
+    excludeGlobalPreparation.checked = entry?.exclude_global_prep_cmd ?? false;
     const kind = el("select");
     kind.name = "kind";
     for (const [value, text] of [
@@ -624,6 +628,11 @@ namespace Amaterasu {
       el("div", "form-grid", field("Name", name), field("Launch type", kind)),
       field("Description", description),
       field("Tags", tags, "Separate tags with commas."),
+      field(
+        "Skip global preparation commands",
+        excludeGlobalPreparation,
+        "Do not run the host-wide preparation commands for this application.",
+      ),
       pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),

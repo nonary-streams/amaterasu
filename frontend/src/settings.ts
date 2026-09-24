@@ -1944,6 +1944,31 @@ namespace Amaterasu {
         const updateVirtualSink = () => { virtualSink.disabled = !virtualSinkEnabled.checked; };
         virtualSinkEnabled.addEventListener("change", updateVirtualSink);
         updateVirtualSink();
+        const globalPreparation = el("textarea");
+        globalPreparation.name = "global_preparation";
+        globalPreparation.rows = 10;
+        globalPreparation.value = JSON.stringify(settings.configured_global_preparation, null, 2);
+        const globalPreparationValidation = el("p", "muted");
+        const updateGlobalPreparationValidation = () => {
+          try {
+            const steps = parsePreparationSteps(globalPreparation.value);
+            globalPreparation.setCustomValidity("");
+            globalPreparationValidation.className = "muted";
+            globalPreparationValidation.textContent =
+              "Valid preparation list with " +
+              steps.length +
+              " step" +
+              (steps.length === 1 ? "" : "s") +
+              ".";
+          } catch (error) {
+            const message = messageOf(error);
+            globalPreparation.setCustomValidity(message);
+            globalPreparationValidation.className = "error";
+            globalPreparationValidation.textContent = message;
+          }
+        };
+        globalPreparation.addEventListener("input", updateGlobalPreparationValidation);
+        updateGlobalPreparationValidation();
         const audioSinkCaptureOnly = input("audio_sink_capture_only", "", "checkbox");
         audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
         const externalIp = input("external_ip", settings.configured_external_ip ?? "");
@@ -2029,6 +2054,12 @@ namespace Amaterasu {
           field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
           field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."),
           field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."),
+          field(
+            "Global preparation commands (JSON)",
+            globalPreparation,
+            "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list.",
+          ),
+          globalPreparationValidation,
           field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
           field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
           field(
@@ -2065,6 +2096,7 @@ namespace Amaterasu {
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
+          if (!form.reportValidity()) return;
           void runAction(save, status, async () => {
             const network = parseNvhttpNetworkOverrides(
               addressFamily.value,
@@ -2087,13 +2119,14 @@ namespace Amaterasu {
               audio_sink_capture_only: audioSinkCaptureOnly.checked,
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
+              global_preparation: parsePreparationSteps(globalPreparation.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");
             await loadHost();
           });
         });
-        hostArea.replaceChildren(panel("Moonlight host name", form));
+        hostArea.replaceChildren(panel("Moonlight host settings", form));
       } catch (error) {
         if (context.content.isConnected)
           hostArea.replaceChildren(errorPanel(error, loadHost));

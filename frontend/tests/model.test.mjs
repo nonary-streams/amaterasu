@@ -44,6 +44,37 @@ test("invalid argument arrays fail before sending mutations", () => {
   }
 });
 
+test("global preparation editor validates bounded native command steps", () => {
+  const parse = model.parsePreparationSteps;
+  assert.deepEqual(ordinary(parse("")), []);
+  const valid = [
+    {
+      run: {
+        executable: "/opt/tools/prepare",
+        args: ["--safe", "é"],
+        environment: { MODE: "safe" },
+        cwd: "/opt/tools",
+        timeout_ms: 30000,
+      },
+      undo: null,
+    },
+  ];
+  assert.deepEqual(ordinary(parse(JSON.stringify(valid))), valid);
+  for (const value of [
+    "{",
+    "{}",
+    JSON.stringify(Array(9).fill({ run: { executable: "/bin/true" } })),
+    JSON.stringify([{ run: { executable: "relative.exe" } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool.cmd" } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", cwd: "relative" } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", timeout_ms: 0 } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", unsupported: true } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", args: Array(65).fill("x") } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", environment: { PATH: "a", Path: "b" } } }]),
+    JSON.stringify([{ run: { executable: "/bin/tool", environment: { "BAD-KEY": "x" } } }]),
+  ]) assert.throws(() => parse(value));
+});
+
 test("manual Playnite Fullscreen entries use a typed bounded launch", () => {
   const form = new FormData();
   form.set("name", "Fullscreen");
@@ -107,12 +138,14 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
   form.set("fec_percentage", "37");
   form.set("stream_audio", "false");
   form.set("back_button_timeout", "-1");
+  form.set("exclude_global_prep_cmd", "on");
   form.set("detached", "first --ordered\n\nsecond");
   form.set(
     "preparation",
     JSON.stringify([{ run: { executable: "C:\\Tools\\prepare.exe" } }]),
   );
   const entry = ordinary(model.entryFromForm(form));
+  assert.equal(entry.exclude_global_prep_cmd, true);
   assert.deepEqual(entry.config_overrides, { fec_percentage: 37, stream_audio: false, back_button_timeout: -1 });
   assert.deepEqual(entry.launch, {
     kind: "executable",
@@ -125,6 +158,8 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
     detached: ["first --ordered", "second"],
     preparation: [{ run: { executable: "C:\\Tools\\prepare.exe" } }],
   });
+  form.delete("exclude_global_prep_cmd");
+  assert.equal(model.entryFromForm(form).exclude_global_prep_cmd, false);
 });
 
 test("blank FEC and timeout retain sparse inheritance and explicit bounds", () => {
