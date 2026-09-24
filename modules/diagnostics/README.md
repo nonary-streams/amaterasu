@@ -84,9 +84,17 @@ restart.
 
 This is a host diagnostics sink, not a capture of all host or native-library
 logs. Service supervisor messages on stderr and worker protocol lines on stdout
-remain outside this file sink. The settings are a worker-start snapshot and
-require restart to take effect; live `min_log_level` changes and changing the
-active file path without restart remain unimplemented. The library does not
-inspect process state, credentials, or network traffic, capture crashes,
-implement tracing spans, or supply a diagnostics UI. Native modules remain
-trusted code; API grants are not a native-code sandbox.
+remain outside this file sink. The host-provided logging policy opens an initial
+sink while the diagnostics module asynchronously reads the persisted
+`amaterasu.host-configuration/1` document. A ready document with revision above
+zero replaces the bootstrap policy, and the module polls every 30 seconds to
+apply later path or level revisions. An absent revision-zero document, an
+unavailable provider, or an invalid response keeps the trusted bootstrap policy
+active and retries without blocking diagnostics requests. The host release
+profile must grant diagnostics read access to the host-configuration service;
+until that profile is integrated, only the bootstrap policy is available.
+
+This sink does not capture all host or native-library logs, inspect process
+state, credentials, or network traffic, capture crashes, implement tracing
+spans, or supply a diagnostics UI. Native modules remain trusted code; API
+grants are not a native-code sandbox.

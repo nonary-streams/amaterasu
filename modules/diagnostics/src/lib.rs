@@ -1,16 +1,22 @@
 //! Caller-scoped diagnostics with bounded, in-memory retention and no automatic collection.
+mod host_logging;
 mod journal;
 mod logging;
 mod protocol;
 pub use journal::Journal;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use host_logging::HostLoggingConfigurationReader;
+use std::path::PathBuf;
+use std::time::Instant;
 
 pub const SERVICE: &str = "amaterasu.diagnostics/1";
 
 pub struct DiagnosticsModule {
     runtime: RuntimeClient,
     journal: Journal,
+    host_logging: HostLoggingConfigurationReader,
+    logging_state_root: Option<PathBuf>,
 }
 
 impl ManagedModule for DiagnosticsModule {
@@ -24,6 +30,7 @@ impl ManagedModule for DiagnosticsModule {
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
         )?;
+        let logging_state_root = logging_settings.state_root.clone();
         let (journal, logging_warning) = Journal::with_logging(logging_settings);
         if let Some(warning) = logging_warning {
             eprintln!("amaterasu diagnostics: file logging unavailable: {warning}");
@@ -31,10 +38,36 @@ impl ManagedModule for DiagnosticsModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self { runtime, journal })
+        Ok(Self {
+            runtime,
+            journal,
+            host_logging: HostLoggingConfigurationReader::default(),
+            logging_state_root,
+        })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        if let Some(configuration) = self
+            .host_logging
+            .tick(Instant::now(), |command| self.runtime.send(command))
+        {
+            match logging::LoggingSettings::from_host_configuration(
+                &configuration,
+                self.logging_state_root.as_deref(),
+            ) {
+                Ok(settings) => {
+                    if let Some(warning) = self.journal.configure_logging(settings) {
+                        eprintln!(
+                            "amaterasu diagnostics: persisted file logging unavailable: {warning}"
+                        );
+                    }
+                }
+                Err(warning) => {
+                    eprintln!("amaterasu diagnostics: persisted logging policy ignored: {warning}");
+                }
+            }
+        }
+
         match self.runtime.send(Command::Poll {})? {
             Response::Request {
                 id,

@@ -27,14 +27,15 @@ pub struct Journal {
 
 impl Journal {
     pub(crate) fn with_logging(settings: LoggingSettings) -> (Self, Option<String>) {
+        let mut journal = Self::default();
+        let warning = journal.configure_logging(settings);
+        (journal, warning)
+    }
+
+    pub(crate) fn configure_logging(&mut self, settings: LoggingSettings) -> Option<String> {
         let (logger, warning) = SessionLogger::open(settings);
-        (
-            Self {
-                callers: BTreeMap::new(),
-                logger,
-            },
-            warning,
-        )
+        self.logger = logger;
+        warning
     }
 
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {

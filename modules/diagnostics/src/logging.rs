@@ -1,7 +1,7 @@
 //! Bounded session log output for accepted diagnostics records.
 use crate::protocol::Record;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -57,6 +57,55 @@ impl LoggingSettings {
             log_path,
             state_root,
         })
+    }
+
+    pub(crate) fn from_host_configuration(
+        payload: &Value,
+        state_root: Option<&Path>,
+    ) -> Result<Self, String> {
+        if payload.get("ok").and_then(Value::as_bool) != Some(true)
+            || payload.get("ready").and_then(Value::as_bool) != Some(true)
+            || payload.get("version").and_then(Value::as_u64) != Some(1)
+            || payload.get("revision").and_then(Value::as_u64).unwrap_or(0) == 0
+        {
+            return Err("host configuration did not return a persisted v1 document".into());
+        }
+
+        let values = payload
+            .get("values")
+            .and_then(Value::as_object)
+            .ok_or("host configuration values are not an object")?;
+        let log_path = values
+            .get("log_path")
+            .and_then(Value::as_str)
+            .ok_or("host configuration omitted log_path")?;
+        let effective = payload
+            .get("effective")
+            .and_then(Value::as_object)
+            .ok_or("host configuration effective values are not an object")?;
+        let minimum_level = match effective
+            .get("min_log_level")
+            .and_then(Value::as_str)
+            .ok_or("host configuration omitted effective min_log_level")?
+        {
+            "verbose" => 0,
+            "debug" => 1,
+            "info" => 2,
+            "warning" => 3,
+            "error" => 4,
+            "fatal" => 5,
+            "none" => 6,
+            _ => return Err("host configuration returned an unknown minimum log level".into()),
+        };
+        let state_root = state_root
+            .ok_or("diagnostics settings are missing the trusted state root")?
+            .to_string_lossy();
+
+        Self::from_value(json!({
+            "min_log_level":minimum_level,
+            "log_path":log_path,
+            "state_root":state_root,
+        }))
     }
 }
 
@@ -310,13 +359,31 @@ fn extract_session_label(filename: &str, base_name: &str) -> Option<String> {
     let prefix = format!("{base_name}-");
     let suffix = filename.strip_prefix(&prefix)?;
     let log_suffix = suffix.find(LOG_SUFFIX)?;
+    let session_fields = &suffix[..log_suffix];
     let rollover = &suffix[log_suffix + LOG_SUFFIX.len()..];
-    if !rollover.is_empty()
-        && (!rollover.starts_with('.') || !rollover[1..].bytes().all(|byte| byte.is_ascii_digit()))
+    let mut fields = session_fields.split('-');
+    let timestamp = fields.next()?;
+    let process_id = fields.next()?;
+    let attempt = fields.next()?;
+    if fields.next().is_some()
+        || timestamp.len() != 20
+        || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        || process_id.len() != 10
+        || !process_id.bytes().all(|byte| byte.is_ascii_digit())
+        || attempt.len() != 2
+        || !attempt.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
-    Some(format!("{prefix}{}", &suffix[..log_suffix]))
+    if !rollover.is_empty() {
+        let rollover_index = rollover.strip_prefix('.')?.parse::<usize>().ok()?;
+        if !(1..=ROLLOVER_COUNT).contains(&rollover_index)
+            || rollover_index.to_string() != &rollover[1..]
+        {
+            return None;
+        }
+    }
+    Some(format!("{prefix}{session_fields}"))
 }
 
 fn rollover_path(root: &Path, label: &str, index: usize) -> PathBuf {
@@ -428,6 +495,62 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn persisted_host_configuration_maps_effective_levels_and_preserves_stored_paths() {
+        let state_root = temp_root();
+        let configuration = json!({
+            "ok":true,
+            "ready":true,
+            "version":1,
+            "revision":3,
+            "values":{"log_path":"custom/logs/daemon.log"},
+            "effective":{
+                "log_path":state_root.join("custom/logs/daemon.log").to_string_lossy(),
+                "min_log_level":"warning",
+            },
+        });
+
+        let settings =
+            LoggingSettings::from_host_configuration(&configuration, Some(&state_root)).unwrap();
+
+        assert_eq!(settings.minimum_level, 3);
+        assert_eq!(
+            settings.log_path,
+            Some(PathBuf::from("custom/logs/daemon.log"))
+        );
+        assert_eq!(settings.state_root.as_deref(), Some(state_root.as_path()));
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn persisted_host_configuration_rejects_unready_or_unsupported_levels() {
+        let state_root = temp_root();
+        let mut configuration = json!({
+            "ok":true,
+            "ready":true,
+            "version":1,
+            "revision":1,
+            "values":{"log_path":"daemon.log"},
+            "effective":{
+                "log_path":state_root.join("daemon.log").to_string_lossy(),
+                "min_log_level":"info",
+            },
+        });
+
+        assert!(
+            LoggingSettings::from_host_configuration(
+                &json!({"ok":false,"ready":false,"version":1,"revision":0}),
+                Some(&state_root)
+            )
+            .is_err()
+        );
+        configuration["effective"]["min_log_level"] = json!("trace");
+        assert!(
+            LoggingSettings::from_host_configuration(&configuration, Some(&state_root)).is_err()
+        );
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
     fn temp_root() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "amaterasu-diagnostics-{}-{}",
@@ -493,7 +616,7 @@ mod tests {
     #[test]
     fn startup_retention_caps_existing_session_groups_at_twenty_nine() {
         let state_root = temp_root();
-        let root = state_root.join("logs");
+        let root = state_root.join("capture");
         fs::create_dir_all(&root).unwrap();
         for index in 0..30 {
             fs::write(
@@ -502,7 +625,17 @@ mod tests {
             )
             .unwrap();
         }
-        let _session = SessionLog::new(Path::new("capture.log"), &state_root).unwrap();
+        let unrelated_files = [
+            "capture-notes.log",
+            "capture-00000000000000000000-0000000000-0.log",
+            "capture-00000000000000000000-0000000000-00.log.backup",
+            "capture-00000000000000000000-0000000000-00.log.",
+        ];
+        for filename in unrelated_files {
+            fs::write(root.join(filename), b"keep").unwrap();
+        }
+
+        let _session = SessionLog::new(Path::new("capture"), &state_root).unwrap();
         let session_count = fs::read_dir(root)
             .unwrap()
             .filter_map(Result::ok)
@@ -515,6 +648,9 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         assert_eq!(session_count, 30);
+        for filename in unrelated_files {
+            assert_eq!(fs::read(root.join(filename)).unwrap(), b"keep");
+        }
         fs::remove_dir_all(state_root).unwrap();
     }
 }
