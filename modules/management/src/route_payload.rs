@@ -24,6 +24,34 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
 
 fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
+        "settings_get" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(
+                object,
+                &[
+                    "session_token_ttl_seconds",
+                    "remember_me_refresh_token_ttl_seconds",
+                    "expected_revision",
+                ],
+                &[],
+            )?;
+            let session_ttl = object
+                .get("session_token_ttl_seconds")
+                .and_then(Value::as_u64);
+            let refresh_ttl = object
+                .get("remember_me_refresh_token_ttl_seconds")
+                .and_then(Value::as_u64);
+            if !session_ttl.is_some_and(|value| (1..=i32::MAX as u64).contains(&value))
+                || !refresh_ttl.is_some_and(|value| (1..=i32::MAX as u64).contains(&value))
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "login" => {
             fields(object, &["username", "password"], &["remember_me"])?;
             text(object, "username")?;

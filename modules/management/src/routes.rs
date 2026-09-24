@@ -15,6 +15,16 @@ pub fn resolve(path: &str) -> Option<Route> {
         ("auth", "login") => ("amaterasu.authentication/1", "login", None),
         ("auth", "refresh") => ("amaterasu.authentication/1", "refresh", None),
         ("auth", "logout") => ("amaterasu.authentication/1", "logout", None),
+        ("auth", "settings") => (
+            "amaterasu.authentication/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("auth", "settings_update") => (
+            "amaterasu.authentication/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -392,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn authentication_routes_only_expose_login_refresh_and_pair_logout() {
+    fn authentication_routes_expose_login_refresh_logout_and_admin_settings() {
         let login = resolve("/v1/auth/login").unwrap();
         assert_eq!(login.service, "amaterasu.authentication/1");
         assert_eq!(login.action, "login");
@@ -449,6 +459,36 @@ mod tests {
             )
             .is_err()
         );
+
+        let settings = resolve("/v1/auth/settings").unwrap();
+        assert_eq!(settings.service, "amaterasu.authentication/1");
+        assert_eq!(settings.action, "settings_get");
+        assert_eq!(settings.scope, Some("configuration.read"));
+        assert_eq!(
+            payload(settings, br#"{}"#).unwrap()["action"],
+            "settings_get"
+        );
+        assert!(payload(settings, br#"{"owner":"amaterasu.other"}"#).is_err());
+
+        let update = resolve("/v1/auth/settings_update").unwrap();
+        assert_eq!(update.scope, Some("configuration.write"));
+        assert_eq!(
+            payload(
+                update,
+                br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0}"#
+            )
+            .unwrap()["action"],
+            "settings_update"
+        );
+        for rejected in [
+            br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200}"#.as_slice(),
+            br#"{"session_token_ttl_seconds":0,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0}"#,
+            br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":2147483648,"expected_revision":0}"#,
+            br#"{"session_token_ttl_seconds":3600.5,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0}"#,
+            br#"{"session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0,"owner":"amaterasu.other"}"#,
+        ] {
+            assert!(payload(update, rejected).is_err());
+        }
     }
 
     #[test]

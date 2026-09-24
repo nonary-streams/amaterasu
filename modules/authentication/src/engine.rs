@@ -1,4 +1,5 @@
 use crate::crypto;
+use crate::product_settings::TokenLifetimes;
 use crate::protocol::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,6 +130,7 @@ impl Engine {
                 "ok": true,
                 "verifier_available": document.credential.is_some(),
             }))),
+            Operation::SettingsGet {} | Operation::SettingsUpdate { .. } => Err("invalid_request"),
             Operation::Setup { username, password } => Self::setup(document, username, password),
             Operation::ChangePassword { password } => Self::change_password(document, password),
             Operation::ListSessions { offset, limit } => self.list_sessions(offset, limit),
@@ -422,6 +424,12 @@ impl Engine {
     pub fn clear_sessions(&mut self) {
         self.sessions.clear();
         self.refresh_index.clear();
+    }
+
+    pub fn set_token_lifetimes(&mut self, lifetimes: TokenLifetimes) {
+        self.settings.session_token_ttl_seconds = lifetimes.session_token_ttl_seconds;
+        self.settings.remember_me_refresh_token_ttl_seconds =
+            lifetimes.remember_me_refresh_token_ttl_seconds;
     }
 
     fn authorize_scopes(

@@ -17,20 +17,30 @@ administrator operations):
 The administrator list is restricted to 16 runtime principals. Scope names are
 exact strings, maximum 64 names of 64 bytes. Access-session lifetime defaults to
 7,200 seconds and remembered refresh lifetime defaults to 604,800 seconds. Both
-settings accept integers from 1 through 2,147,483,647 seconds. Non-remembered
+settings accept integers from 1 through 2,147,483,647 seconds. Configured
+administrator callers can read and update these lifetimes with `settings_get`
+and `settings_update`; updates use an expected revision and are stored in the
+caller-fixed `product/amaterasu.authentication` configuration document. The
+product document uses schema version 1 and preserves packaged defaults for
+known fields omitted by older partial v1 documents. Non-remembered
 refresh lifetime is fixed at 86,400 seconds. There are no wildcard or implied
 scopes. Deployments choose the vocabulary together with consumers. The module
-needs a `provide` grant for authentication and a `call` grant for
-`amaterasu.state/1`. Consumers need authentication call permission. State requests
+needs a `provide` grant for authentication and `call` grants for
+`amaterasu.state/1` and `amaterasu.configuration/1`. Consumers need
+authentication call permission. State requests
 preserve their parent, so current runtime delegation rules also require the
-initiating consumer to possess a state call grant; state still isolates records
-by the immediate provider identity. Never use payload caller, username, token
+initiating consumer to possess a state call grant; configuration requests
+similarly require the initiating consumer's configuration call grant. State and
+product configuration isolate records by the immediate provider identity. Never
+use payload caller, username, token
 subject, or HTTP-supplied role claims as runtime authority.
 
 The following strict JSON actions are supported:
 
 ```json
 {"action":"setup","username":"admin","password":"a long administrator password"}
+{"action":"settings_get"}
+{"action":"settings_update","session_token_ttl_seconds":3600,"remember_me_refresh_token_ttl_seconds":259200,"expected_revision":0}
 {"action":"login","username":"admin","password":"a long administrator password","remember_me":true}
 {"action":"refresh","refresh_token":"ama_<64 lowercase hex digits>"}
 {"action":"change_password","password":"a new long administrator password"}
@@ -43,9 +53,13 @@ The following strict JSON actions are supported:
 {"action":"revoke_token","token_id":"<64 lowercase hex digest digits>"}
 ```
 
-Setup, password rotation, session administration, token issuance, listing, and
-revocation require the immediate runtime
-caller to appear in administrator settings. Setup succeeds only once. A caller
+Setup, lifetime settings, password rotation, session administration, token
+issuance, listing, and revocation require the immediate runtime caller to appear
+in administrator settings. Lifetime updates are persisted before acknowledgment
+and use compare-and-swap revisions; login and refresh load the committed values
+before issuing tokens. A changed lifetime applies to subsequently issued or
+renewed tokens. Existing sessions keep their original access and absolute refresh
+expiries. Setup succeeds only once. A caller
 can list/revoke only tokens that caller issued; missing and foreign token IDs
 both return `token_not_found`. An administrator login does not grant its frontend
 runtime principal permission to administer credentials or tokens. API token
@@ -91,11 +105,12 @@ and does not revoke API tokens. Session metadata listings include access and
 refresh expiration plus the remember-me flag, but never either secret.
 
 Sessions and refresh-token digests are held only in memory. Module restart and
-browser reload lose active authentication; login is then required again. Browser
-clients should keep both secrets in tab memory rather than durable browser storage.
-The packaged runtime profile supplies default TTL settings, but this module has no
-administrator-facing live settings editor. These limitations mean the complete
-remember-me persistence and operator-editable TTL behavior is not yet implemented.
+browser reload lose active authentication; login is then required again. The
+administrator token lifetime settings remain durable across module restarts.
+Browser clients should keep both secrets in tab memory rather than durable browser
+storage. The packaged runtime profile supplies default TTL settings, and the
+management API and settings editor expose administrator-facing lifetime controls.
+Remember-me refresh tokens remain in-memory and do not survive restart.
 There are at most 128 active sessions. Verify returns identity/scope/expiry
 metadata without the bearer, with kind `administrator_session` or `api_token`; a
 token's subject is its issuing runtime principal. All required scopes must match.

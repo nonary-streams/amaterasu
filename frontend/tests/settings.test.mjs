@@ -14,6 +14,29 @@ vm.runInContext(
 const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 
+test("authentication lifetime editor accepts bounded whole seconds", () => {
+  const parseAuth = context.Amaterasu.parseAuthTokenLifetimes;
+  assert.deepEqual(ordinary(parseAuth(7200, 604800)), {
+    session_token_ttl_seconds: 7200,
+    remember_me_refresh_token_ttl_seconds: 604800,
+  });
+  assert.deepEqual(ordinary(parseAuth(1, 0x7fff_ffff)), {
+    session_token_ttl_seconds: 1,
+    remember_me_refresh_token_ttl_seconds: 0x7fff_ffff,
+  });
+  for (const [session, refresh] of [
+    [0, 60],
+    [1.5, 60],
+    [Number.NaN, 60],
+    [0x8000_0000, 60],
+    [60, 0],
+    [60, 1.5],
+    [60, 0x8000_0000],
+  ]) {
+    assert.throws(() => parseAuth(session, refresh));
+  }
+});
+
 test("Steam exclusions preserve valid ID and name objects without normalization", () => {
   const exclusions = [
     { id: "730", name: "Counter-Strike 2" },

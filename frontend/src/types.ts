@@ -71,6 +71,13 @@ namespace Amaterasu {
     id?: string;
     name?: string;
   }
+  export interface AuthTokenSettings {
+    revision: number;
+    values: {
+      session_token_ttl_seconds: number;
+      remember_me_refresh_token_ttl_seconds: number;
+    };
+  }
   export interface Session {
     id: number;
     key: string;

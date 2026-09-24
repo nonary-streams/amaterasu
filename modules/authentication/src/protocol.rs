@@ -71,6 +71,12 @@ pub enum Operation {
         #[serde(default = "session_page_limit")]
         limit: usize,
     },
+    SettingsGet {},
+    SettingsUpdate {
+        session_token_ttl_seconds: u64,
+        remember_me_refresh_token_ttl_seconds: u64,
+        expected_revision: u64,
+    },
     RevokeSession {
         session_id: String,
     },
@@ -107,6 +113,16 @@ impl Operation {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self {
             Self::Status {} => true,
+            Self::SettingsGet {} => true,
+            Self::SettingsUpdate {
+                session_token_ttl_seconds,
+                remember_me_refresh_token_ttl_seconds,
+                ..
+            } => {
+                (1..=MAX_CONFIGURED_TTL_SECONDS).contains(session_token_ttl_seconds)
+                    && (1..=MAX_CONFIGURED_TTL_SECONDS)
+                        .contains(remember_me_refresh_token_ttl_seconds)
+            }
             Self::Setup { username, password } => {
                 identifier(username, 64) && (12..=256).contains(&password.len())
             }
@@ -151,6 +167,8 @@ impl Operation {
             self,
             Self::Setup { .. }
                 | Self::ChangePassword { .. }
+                | Self::SettingsGet { .. }
+                | Self::SettingsUpdate { .. }
                 | Self::ListSessions { .. }
                 | Self::RevokeSession { .. }
                 | Self::IssueToken { .. }
@@ -286,6 +304,33 @@ mod scope_tests {
                 settings.remember_me_refresh_token_ttl_seconds = value.as_u64().unwrap();
             }
             assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn editable_ttl_actions_require_admin_and_keep_strict_bounds() {
+        let get: Operation = serde_json::from_value(json!({"action":"settings_get"})).unwrap();
+        assert!(get.validate().is_ok());
+        assert!(get.requires_administrator());
+
+        let update: Operation = serde_json::from_value(json!({
+            "action":"settings_update",
+            "session_token_ttl_seconds":3600,
+            "remember_me_refresh_token_ttl_seconds":259200,
+            "expected_revision":0
+        }))
+        .unwrap();
+        assert!(update.validate().is_ok());
+        assert!(update.requires_administrator());
+
+        for payload in [
+            json!({"action":"settings_update","session_token_ttl_seconds":0,"remember_me_refresh_token_ttl_seconds":60,"expected_revision":0}),
+            json!({"action":"settings_update","session_token_ttl_seconds":60,"remember_me_refresh_token_ttl_seconds":i32::MAX as u64 + 1,"expected_revision":0}),
+            json!({"action":"settings_update","session_token_ttl_seconds":60,"remember_me_refresh_token_ttl_seconds":60}),
+            json!({"action":"settings_update","session_token_ttl_seconds":60,"remember_me_refresh_token_ttl_seconds":60,"expected_revision":0,"owner":"amaterasu.other"}),
+        ] {
+            let operation = serde_json::from_value::<Operation>(payload);
+            assert!(operation.is_err() || operation.unwrap().validate().is_err());
         }
     }
 

@@ -3,6 +3,7 @@ mod crypto;
 mod engine;
 pub mod migration;
 mod pipeline;
+mod product_settings;
 mod protocol;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};

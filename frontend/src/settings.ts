@@ -1,4 +1,25 @@
 namespace Amaterasu {
+  const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
+
+  export function parseAuthTokenLifetimes(
+    sessionTokenTtlSeconds: number,
+    rememberMeRefreshTokenTtlSeconds: number,
+  ): AuthTokenSettings["values"] {
+    if (
+      !Number.isSafeInteger(sessionTokenTtlSeconds) ||
+      sessionTokenTtlSeconds < 1 ||
+      sessionTokenTtlSeconds > maxConfiguredAuthTtlSeconds ||
+      !Number.isSafeInteger(rememberMeRefreshTokenTtlSeconds) ||
+      rememberMeRefreshTokenTtlSeconds < 1 ||
+      rememberMeRefreshTokenTtlSeconds > maxConfiguredAuthTtlSeconds
+    )
+      throw new Error("Authentication lifetimes must be whole seconds from 1 to 2147483647.");
+    return {
+      session_token_ttl_seconds: sessionTokenTtlSeconds,
+      remember_me_refresh_token_ttl_seconds: rememberMeRefreshTokenTtlSeconds,
+    };
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -72,6 +93,7 @@ namespace Amaterasu {
 
   export function renderSettings(context: PageContext): void {
     const area = el("div");
+    const authArea = el("div");
     const hostArea = el("div");
     const steamArea = el("div");
     context.content.append(
@@ -80,14 +102,77 @@ namespace Amaterasu {
         "Edit host options and values registered for this management console.",
         button("Refresh", () => {
           void load();
+          void loadAuth();
           void loadHost();
           void loadSteam();
         }),
       ),
       area,
+      authArea,
       hostArea,
       steamArea,
     );
+    async function loadAuth(): Promise<void> {
+      authArea.replaceChildren(el("p", "muted", "Loading authentication lifetimes…"));
+      try {
+        const settings = await context.api.post<AuthTokenSettings>("auth/settings");
+        if (!context.content.isConnected) return;
+        const form = el("form", "settings-form");
+        const sessionTtl = input(
+          "session_token_ttl_seconds",
+          String(settings.values.session_token_ttl_seconds),
+          "number",
+        );
+        const refreshTtl = input(
+          "remember_me_refresh_token_ttl_seconds",
+          String(settings.values.remember_me_refresh_token_ttl_seconds),
+          "number",
+        );
+        for (const control of [sessionTtl, refreshTtl]) {
+          control.required = true;
+          control.min = "1";
+          control.max = String(maxConfiguredAuthTtlSeconds);
+          control.step = "1";
+        }
+        const status = el("div");
+        const save = el("button", "button primary", "Save authentication settings");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        form.append(
+          field(
+            "Administrator session lifetime (seconds)",
+            sessionTtl,
+            "Access sessions default to 7200 seconds. Existing sessions keep their issued expiry; new logins and refreshes use this value.",
+          ),
+          field(
+            "Remembered device lifetime (seconds)",
+            refreshTtl,
+            "Remember-me refresh tokens default to 604800 seconds. Non-remembered refresh tokens remain fixed at 86400 seconds.",
+          ),
+          status,
+          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void runAction(save, status, async () => {
+            const values = parseAuthTokenLifetimes(
+              sessionTtl.valueAsNumber,
+              refreshTtl.valueAsNumber,
+            );
+            await context.api.post("auth/settings_update", {
+              ...values,
+              expected_revision: settings.revision,
+            });
+            context.notify("Authentication lifetimes saved.");
+            await loadAuth();
+          });
+        });
+        authArea.replaceChildren(panel("Authentication session lifetimes", form));
+      } catch (error) {
+        if (context.content.isConnected)
+          authArea.replaceChildren(errorPanel(error, loadAuth));
+      }
+    }
     async function loadSteam(): Promise<void> {
       steamArea.replaceChildren(el("p", "muted", "Loading Steam settings…"));
       try {
@@ -323,6 +408,7 @@ namespace Amaterasu {
       }
     }
     void load();
+    void loadAuth();
     void loadHost();
     void loadSteam();
   }

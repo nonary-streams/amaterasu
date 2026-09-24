@@ -131,6 +131,40 @@ def test_auth_and_crud(console, api):
     assert status == 200 and logged_in["ok"], logged_in
     assert headers["Access-Control-Allow-Origin"] == ORIGIN
     administrator = logged_in["bearer"]
+    status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
+    assert status == 200 and auth_settings["ok"], auth_settings
+    assert auth_settings["values"] == {
+        "session_token_ttl_seconds": 7200,
+        "remember_me_refresh_token_ttl_seconds": 604800,
+    }, auth_settings
+    auth_values = {
+        "session_token_ttl_seconds": 1800,
+        "remember_me_refresh_token_ttl_seconds": 3600,
+    }
+    status, saved_auth_settings, _ = api.post(
+        "/v1/auth/settings_update",
+        {**auth_values, "expected_revision": auth_settings["revision"]},
+        administrator,
+    )
+    assert status == 200 and saved_auth_settings["ok"], saved_auth_settings
+    assert saved_auth_settings["values"] == auth_values, saved_auth_settings
+    status, auth_conflict, _ = api.post(
+        "/v1/auth/settings_update",
+        {**auth_values, "expected_revision": auth_settings["revision"]},
+        administrator,
+    )
+    assert status == 200 and auth_conflict["error"]["code"] == "revision_conflict", auth_conflict
+    status, old_session_settings, _ = api.post("/v1/auth/settings", token=administrator)
+    assert status == 200 and old_session_settings["values"] == auth_values, old_session_settings
+    issued_at = int(time.time())
+    status, new_login, _ = api.post(
+        "/v1/auth/login",
+        {"username": "administrator", "password": PASSWORD, "remember_me": True},
+    )
+    assert status == 200 and new_login["ok"], new_login
+    assert 0 <= new_login["expires_at"] - issued_at <= 1801, new_login
+    assert new_login["refresh_expires_at"] - new_login["expires_at"] == 1800, new_login
+    assert api.post("/v1/catalog/list", token=administrator)[0] == 200
     status, failure, _ = api.post("/v1/catalog/list", token=administrator, origin="https://evil.invalid")
     assert status == 403 and administrator not in json.dumps(failure), failure
     status, catalog, _ = api.post("/v1/catalog/list", token=administrator)
@@ -264,7 +298,7 @@ def test_auth_and_crud(console, api):
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
     assert api.post("/v1/runtime/request", {"service": "amaterasu.state/1"}, administrator)[0] == 404
-    return token, administrator, moved_port, steam_values
+    return token, administrator, moved_port, steam_values, auth_values, saved_auth_settings["revision"]
 
 
 def test_http_framing(api):
@@ -308,7 +342,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -322,6 +356,9 @@ def main():
             # login confirms product settings survived without leaking access.
             status, relogged, _ = api.post("/v1/auth/login", {"username": "administrator", "password": PASSWORD})
             assert status == 200 and relogged["ok"], relogged
+            status, auth_settings, _ = api.post("/v1/auth/settings", token=relogged["bearer"])
+            assert status == 200 and auth_settings["values"] == auth_values, auth_settings
+            assert auth_settings["revision"] == auth_revision, auth_settings
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings

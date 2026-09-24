@@ -21,9 +21,15 @@ struct StateHarness {
     stored: Option<Value>,
     revision: u64,
     state_response: Option<Response>,
+    product_response: Option<Response>,
     incoming: Option<Response>,
     output: Option<Value>,
     writes: usize,
+    product_revision: u64,
+    product_values: Option<Value>,
+    product_writes: usize,
+    released_results: usize,
+    release_failures_remaining: usize,
     fail_write: bool,
     cancelled: bool,
 }
@@ -33,9 +39,15 @@ impl StateHarness {
             stored: None,
             revision: 0,
             state_response: None,
+            product_response: None,
             incoming: None,
             output: None,
             writes: 0,
+            product_revision: 0,
+            product_values: None,
+            product_writes: 0,
+            released_results: 0,
+            release_failures_remaining: 0,
             fail_write: false,
             cancelled: false,
         }
@@ -49,27 +61,71 @@ impl StateHarness {
                 payload,
                 ..
             } => {
-                assert_eq!(service, STATE_SERVICE);
                 assert_eq!(parent, Some(7));
-                assert_eq!(payload["key"], STATE_KEY);
-                let response = if payload["action"] == "get" {
-                    json!({"ok":true,"revision":self.revision,"found":self.stored.is_some(),"value":self.stored})
-                } else {
-                    assert_eq!(payload["expected_revision"], self.revision);
-                    self.writes += 1;
-                    if self.fail_write {
-                        json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                if service == STATE_SERVICE {
+                    assert_eq!(payload["key"], STATE_KEY);
+                    let response = if payload["action"] == "get" {
+                        json!({"ok":true,"revision":self.revision,"found":self.stored.is_some(),"value":self.stored})
                     } else {
-                        self.stored = Some(payload["value"].clone());
-                        self.revision += 1;
-                        json!({"ok":true,"revision":self.revision})
-                    }
-                };
-                self.state_response = Some(Response::Result { payload: response });
-                Response::Accepted { id: 50 }
+                        assert_eq!(payload["expected_revision"], self.revision);
+                        self.writes += 1;
+                        if self.fail_write {
+                            json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                        } else {
+                            self.stored = Some(payload["value"].clone());
+                            self.revision += 1;
+                            json!({"ok":true,"revision":self.revision})
+                        }
+                    };
+                    self.state_response = Some(Response::Result { payload: response });
+                    Response::Accepted { id: 50 }
+                } else {
+                    assert_eq!(service, CONFIGURATION_SERVICE);
+                    assert_eq!(payload["version"].as_u64().unwrap_or(1), 1);
+                    let response = if payload["action"] == "product_get" {
+                        match &self.product_values {
+                            Some(values) => json!({
+                                "ok":true,"found":true,"version":1,
+                                "revision":self.product_revision,"values":values
+                            }),
+                            None => json!({
+                                "ok":true,"found":false,"version":null,
+                                "revision":0,"values":{}
+                            }),
+                        }
+                    } else {
+                        assert_eq!(payload["action"], "product_update");
+                        let expected_revision = payload["expected_revision"].as_u64().unwrap();
+                        if expected_revision != self.product_revision {
+                            json!({"ok":false,"error":{"code":"revision_conflict","message":"revision differs","current_revision":self.product_revision}})
+                        } else {
+                            self.product_writes += 1;
+                            self.product_revision += 1;
+                            self.product_values = Some(payload["values"].clone());
+                            json!({
+                                "ok":true,"found":true,"version":payload["version"],
+                                "revision":self.product_revision,"values":self.product_values
+                            })
+                        }
+                    };
+                    self.product_response = Some(Response::Result { payload: response });
+                    Response::Accepted { id: 60 }
+                }
             }
             Command::TakeResult { request: 50 } => {
                 self.state_response.take().unwrap_or(Response::Pending)
+            }
+            Command::TakeResult { request: 60 } => {
+                self.product_response.take().unwrap_or(Response::Pending)
+            }
+            Command::ReleaseResult { request: 50 | 60 } => {
+                if self.release_failures_remaining > 0 {
+                    self.release_failures_remaining -= 1;
+                    Response::error("temporary", "release temporarily failed")
+                } else {
+                    self.released_results += 1;
+                    Response::Ok
+                }
             }
             Command::Complete {
                 request: 7,
@@ -101,7 +157,7 @@ impl StateHarness {
             payload,
         });
         self.output = None;
-        for _ in 0..5 {
+        for _ in 0..12 {
             pipeline.tick_at(now, |command| self.send(command)).unwrap();
             if let Some(output) = self.output.take() {
                 return output;
@@ -186,6 +242,131 @@ fn credential_persistence_wrong_password_and_frontend_role_boundary() {
         )["code"],
         "unauthorized"
     );
+}
+
+#[test]
+fn administrator_ttl_settings_use_cas_persist_and_apply_to_later_logins_after_restart() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"settings_get"}),
+            100,
+        )["code"],
+        "forbidden"
+    );
+    let defaults = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"settings_get"}),
+        100,
+    );
+    assert_eq!(defaults["revision"], 0);
+    assert_eq!(defaults["values"]["session_token_ttl_seconds"], 7200);
+    assert_eq!(
+        defaults["values"]["remember_me_refresh_token_ttl_seconds"],
+        604800
+    );
+
+    let original_session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        100,
+    );
+    assert_eq!(original_session["expires_at"], 7_300);
+    assert_eq!(original_session["refresh_expires_at"], 604_900);
+
+    state.release_failures_remaining = 1;
+    let saved = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"settings_update",
+            "session_token_ttl_seconds":3600,
+            "remember_me_refresh_token_ttl_seconds":259200,
+            "expected_revision":0
+        }),
+        101,
+    );
+    assert_eq!(saved["ok"], true);
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(saved["values"]["session_token_ttl_seconds"], 3600);
+    assert_eq!(
+        saved["values"]["remember_me_refresh_token_ttl_seconds"],
+        259200
+    );
+    assert_eq!(
+        state.product_writes, 1,
+        "release retry must not repeat the mutation"
+    );
+
+    let stale = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"settings_update",
+            "session_token_ttl_seconds":60,
+            "remember_me_refresh_token_ttl_seconds":60,
+            "expected_revision":0
+        }),
+        102,
+    );
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+    assert_eq!(stale["error"]["current_revision"], 1);
+    assert_eq!(state.product_writes, 1);
+
+    let still_live = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"verify","bearer":original_session["bearer"],"required_scopes":[]}),
+        103,
+    );
+    assert_eq!(still_live["ok"], true);
+    assert_eq!(still_live["expires_at"], 7_300);
+
+    let refreshed = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"refresh","refresh_token":original_session["refresh_token"]}),
+        103,
+    );
+    assert_eq!(refreshed["expires_at"], 3_703);
+    assert_eq!(refreshed["refresh_expires_at"], 604_900);
+    assert_eq!(refreshed["remember_me"], true);
+
+    let new_session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        104,
+    );
+    assert_eq!(new_session["expires_at"], 3_704);
+    assert_eq!(new_session["refresh_expires_at"], 259_304);
+
+    let mut restarted = Pipeline::new(settings());
+    let after_restart = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        200,
+    );
+    assert_eq!(after_restart["expires_at"], 3_800);
+    assert_eq!(after_restart["refresh_expires_at"], 259_400);
+}
+
+#[test]
+fn release_failure_retries_terminal_result_without_repeating_state_write() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.release_failures_remaining = 1;
+    state.setup(&mut pipeline);
+    assert_eq!(state.writes, 1);
+    assert!(state.released_results >= 2);
 }
 
 #[test]
@@ -696,14 +877,16 @@ fn cancelled_state_read_does_not_hash_or_issue_and_releases_pending_request() {
     let mut pipeline = Pipeline::new(settings());
     pipeline.pending = Some(Pending {
         request: Request { id:7, caller:"console".into(), deadline: Instant::now() + Duration::from_secs(30) },
-        state_request:50,
+        child_request:50,
         stage: Stage::Loading(serde_json::from_value(json!({"action":"setup","username":"admin","password":"correct horse battery staple"})).unwrap()),
+        phase: PendingPhase::Waiting,
     });
     let mut completed = false;
     pipeline
         .tick_at(100, |command| {
             Ok(match command {
                 Command::TakeResult { request: 50 } => Response::error("cancelled", "parent ended"),
+                Command::ReleaseResult { request: 50 } => Response::Ok,
                 Command::Complete { payload, .. } => {
                     assert_eq!(payload, error("state_unavailable"));
                     completed = true;
