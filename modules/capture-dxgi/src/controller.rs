@@ -114,7 +114,11 @@ impl<B: Backend> Controller<B> {
             .streams
             .iter()
             .filter(|(_, stream)| stream.owner == caller)
-            .map(|(id, stream)| stream_reply(*id, &stream.output, stream.geometry))
+            .map(|(id, stream)| {
+                let mut reply = stream_reply(*id, &stream.output, stream.geometry);
+                reply["device_adapter"] = stream.session.device_adapter();
+                reply
+            })
             .collect();
         json!({
             "ok": true,

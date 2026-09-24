@@ -1,10 +1,14 @@
 use crate::model::{CaptureResult, Frame, Output};
 use amaterasu_media::CaptureGeometry;
+use serde_json::{Value, json};
 
 pub trait CaptureSession: Send {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>>;
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {
         Ok(None)
+    }
+    fn device_adapter(&self) -> Value {
+        json!({})
     }
 }
 

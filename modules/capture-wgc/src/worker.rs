@@ -18,10 +18,21 @@ mod implementation {
     }
 
     impl Worker {
+        #[cfg(test)]
         pub fn start<S, F>(initialize: F) -> CaptureResult<Self>
         where
             S: FrameSource + 'static,
             F: FnOnce() -> CaptureResult<S> + Send + 'static,
+        {
+            Self::start_with_metadata(move || initialize().map(|source| (source, ())))
+                .map(|(worker, ())| worker)
+        }
+
+        pub fn start_with_metadata<S, M, F>(initialize: F) -> CaptureResult<(Self, M)>
+        where
+            S: FrameSource + 'static,
+            M: Send + 'static,
+            F: FnOnce() -> CaptureResult<(S, M)> + Send + 'static,
         {
             let (requests, request_receiver) = mpsc::sync_channel(1);
             let (reply_sender, replies) = mpsc::sync_channel(1);
@@ -29,14 +40,14 @@ mod implementation {
             let thread = thread::Builder::new()
                 .name("amaterasu-wgc".into())
                 .spawn(move || {
-                    let mut source = match initialize() {
-                        Ok(source) => source,
+                    let (mut source, metadata) = match initialize() {
+                        Ok(value) => value,
                         Err(error) => {
                             let _ = ready_sender.send(Err(error));
                             return;
                         }
                     };
-                    if ready_sender.send(Ok(())).is_err() {
+                    if ready_sender.send(Ok(metadata)).is_err() {
                         return;
                     }
                     while request_receiver.recv().is_ok() {
@@ -53,8 +64,8 @@ mod implementation {
                 thread: Some(thread),
                 waiting: false,
             };
-            ready.recv().map_err(|_| worker_ended())??;
-            Ok(worker)
+            let metadata = ready.recv().map_err(|_| worker_ended())??;
+            Ok((worker, metadata))
         }
     }
 

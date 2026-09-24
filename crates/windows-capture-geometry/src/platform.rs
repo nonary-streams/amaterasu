@@ -1,22 +1,23 @@
 use crate::{
-    model::{unavailable, CcdSnapshot, DisplaySnapshot, Topology},
     CaptureSelection, GeometryError, SelectedOutput,
+    model::{CcdSnapshot, DisplaySnapshot, Topology, unavailable},
 };
 use amaterasu_media::DesktopRect;
 use std::collections::BTreeMap;
-use windows::core::BOOL;
 use windows::Win32::{
     Devices::Display::*,
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LPARAM, RECT},
     Graphics::{
-        Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND},
+        Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1},
         Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW},
     },
     UI::HiDpi::{
-        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
-        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetThreadDpiAwarenessContext,
+        SetThreadDpiAwarenessContext,
     },
 };
+use windows::core::BOOL;
 
 const MAX_DISPLAYS: usize = 64;
 

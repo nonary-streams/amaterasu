@@ -1,6 +1,6 @@
 //! Development-only signed hardware qualification.  This component is present
 //! only in `PackageProfile::MediaProbe`, never the production installer policy.
-//! It chooses a finite DXGI output and Intel H.264 MFT through normal managed
+//! It chooses a finite physical output and its correlated H.264 MFT identity through normal managed
 //! controls, then reads copied H.264 packets through the existing native video
 //! API.  It returns only packet metadata and a digest, never screen pixels.
 use amaterasu_media::{
@@ -25,6 +25,8 @@ enum Stage {
     OpenVideo,
     ForceIdr,
     Collect,
+    SuccessVideoStatus,
+    SuccessCaptureStatus,
     FailureVideoStatus,
     FailureCaptureStatus,
     FailureEncoderStatus,
@@ -37,7 +39,7 @@ pub struct HardwareVideoProbe {
     stage: Stage,
     output: Option<Output>,
     provider: Provider,
-    encoder: Option<u32>,
+    encoder: Option<Value>,
     stream: Option<u64>,
     collected: Collected,
     deadline: Instant,
@@ -50,6 +52,7 @@ pub struct HardwareVideoProbe {
 #[derive(Clone)]
 struct Output {
     id: String,
+    adapter_vendor_id: Option<u32>,
     left: i32,
     top: i32,
     width: u32,
@@ -138,6 +141,22 @@ impl HardwareVideoProbe {
                 self.stage = Stage::Collect;
                 Ok(false)
             }
+            Stage::SuccessVideoStatus => {
+                self.diagnostics.insert("video".into(), payload);
+                self.pending = request_service(
+                    runtime,
+                    self.request,
+                    self.provider.service(),
+                    json!({"action":"status"}),
+                    "hardware-capture-success-status",
+                )?;
+                self.stage = Stage::SuccessCaptureStatus;
+                Ok(false)
+            }
+            Stage::SuccessCaptureStatus => {
+                self.diagnostics.insert("capture".into(), payload);
+                self.close(runtime, None)
+            }
             Stage::FailureVideoStatus => self.capture_diagnostics(runtime, payload),
             Stage::FailureCaptureStatus => self.encoder_diagnostics(runtime, payload),
             Stage::FailureEncoderStatus => {
@@ -156,6 +175,8 @@ impl HardwareVideoProbe {
         else {
             return self.fail(runtime, "no_usable_dxgi_output".into());
         };
+        self.diagnostics
+            .insert("selected_capture_output".into(), payload.clone());
         self.output = Some(output);
         self.pending = request_service(
             runtime,
@@ -169,14 +190,16 @@ impl HardwareVideoProbe {
     }
 
     fn select_encoder(&mut self, runtime: &RuntimeClient, payload: Value) -> ModuleResult<bool> {
-        let Some(encoder) = select_intel_h264(&payload) else {
-            return self.fail(runtime, "no_intel_h264_mft".into());
-        };
         let output = self
             .output
             .as_ref()
             .expect("output selected before encoder");
-        self.encoder = Some(encoder);
+        let Some((encoder, selection)) = select_h264(&payload, output.adapter_vendor_id) else {
+            return self.fail(runtime, "no_h264_mft_for_capture_adapter".into());
+        };
+        self.diagnostics
+            .insert("encoder_selection".into(), selection);
+        self.encoder = Some(encoder.clone());
         self.pending = request_service(
             runtime,
             self.request,
@@ -236,7 +259,15 @@ impl HardwareVideoProbe {
             && self.collected.keyframe
             && self.collected.annex_b
         {
-            return self.close(runtime, None);
+            self.pending = request_service(
+                runtime,
+                self.request,
+                VIDEO,
+                json!({"action":"status","stream":stream}),
+                "hardware-video-success-status",
+            )?;
+            self.stage = Stage::SuccessVideoStatus;
+            return Ok(false);
         }
         Ok(false)
     }
@@ -259,6 +290,9 @@ impl HardwareVideoProbe {
         runtime: &RuntimeClient,
         payload: Value,
     ) -> ModuleResult<bool> {
+        if self.error.as_deref() == Some("hardware_video_timeout") {
+            self.error = Some(timeout_classification(&payload).into());
+        }
         self.diagnostics.insert("video".into(), payload);
         self.pending = request_service(
             runtime,
@@ -370,6 +404,9 @@ fn parse_output(value: &Value) -> Option<Output> {
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())?;
     let id = value["id"].as_str()?;
+    let adapter_vendor_id = value["adapter_vendor_id"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
     let left = value["left"]
         .as_i64()
         .and_then(|value| i32::try_from(value).ok())?;
@@ -383,6 +420,7 @@ fn parse_output(value: &Value) -> Option<Output> {
         && height.is_multiple_of(2))
     .then(|| Output {
         id: id.into(),
+        adapter_vendor_id,
         left,
         top,
         width,
@@ -390,19 +428,61 @@ fn parse_output(value: &Value) -> Option<Output> {
     })
 }
 
-fn select_intel_h264(payload: &Value) -> Option<u32> {
-    payload["encoders"].as_array()?.iter().find_map(|encoder| {
-        let name = encoder["name"].as_str()?;
-        (encoder["codec"] == "h264"
+fn select_h264(payload: &Value, capture_vendor: Option<u32>) -> Option<(Value, Value)> {
+    let encoders = payload["encoders"].as_array()?;
+    let usable = encoders.iter().filter(|encoder| {
+        encoder["codec"] == "h264"
             && encoder["hardware"] == true
-            && name.to_ascii_lowercase().contains("intel"))
-        .then(|| {
-            encoder["index"]
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-        })
-        .flatten()
-    })
+            && valid_encoder_identity(&encoder["identity"])
+    });
+    let vendor = capture_vendor?;
+    let encoder = usable
+        .clone()
+        .find(|encoder| encoder["vendor_id"].as_u64() == Some(u64::from(vendor)))
+        .or_else(|| {
+            vendor_name(vendor).and_then(|name| {
+                usable.clone().find(|encoder| {
+                    encoder["name"]
+                        .as_str()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(name))
+                })
+            })
+        })?;
+    let method = if encoder["vendor_id"].as_u64() == Some(u64::from(vendor)) {
+        "mft_vendor_attribute"
+    } else {
+        "friendly_name_fallback"
+    };
+    Some((
+        encoder["identity"].clone(),
+        json!({"capture_vendor_id":vendor,"method":method,"identity":encoder["identity"]}),
+    ))
+}
+
+fn valid_encoder_identity(value: &Value) -> bool {
+    value["clsid"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+        && value["friendly_name"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && (value["hardware_url"].is_null() || value["hardware_url"].is_string())
+}
+
+fn timeout_classification(video: &Value) -> &'static str {
+    if video["submitted_frames"].as_u64() == Some(0) && video["error"].is_null() {
+        "hardware_video_static_capture_timeout"
+    } else {
+        "hardware_video_encoder_stall"
+    }
+}
+
+fn vendor_name(vendor: u32) -> Option<&'static str> {
+    match vendor {
+        0x10de => Some("nvidia"),
+        0x8086 => Some("intel"),
+        _ => None,
+    }
 }
 
 unsafe extern "C" fn collect_packet(
@@ -436,7 +516,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_selects_attached_even_supported_outputs_and_intel_h264() {
+    fn selects_attached_output_and_prefers_its_h264_vendor_capability() {
         let output =
             json!({"id":"display","attached":true,"left":0,"top":0,"width":1920,"height":1080});
         assert_eq!(parse_output(&output).unwrap().id, "display");
@@ -452,12 +532,36 @@ mod tests {
             )
             .is_none()
         );
+        let (identity, selection) = select_h264(
+            &json!({"encoders":[
+                {"name":"NVIDIA H.264","codec":"h264","hardware":true,"vendor_id":4318,"identity":{"clsid":"nvidia","hardware_url":"nvidia://0","friendly_name":"NVIDIA H.264"}},
+                {"name":"Intel(R) Quick Sync H.264","codec":"h264","hardware":true,"vendor_id":32902,"identity":{"clsid":"intel","hardware_url":"intel://0","friendly_name":"Intel H.264"}}
+            ]}),
+            Some(0x10de),
+        )
+        .unwrap();
+        assert_eq!(identity["clsid"], "nvidia");
+        assert_eq!(selection["method"], "mft_vendor_attribute");
+    }
+
+    #[test]
+    fn refuses_implicit_encoder_when_capture_adapter_is_unknown() {
+        assert!(select_h264(
+            &json!({"encoders":[{"name":"NVIDIA H.264","codec":"h264","hardware":true,"identity":{"clsid":"nvidia","hardware_url":null,"friendly_name":"NVIDIA H.264"}}]}),
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn distinguishes_static_capture_from_encoder_stall() {
         assert_eq!(
-            select_intel_h264(&json!({"encoders":[
-                {"index":0,"name":"NVIDIA H.264","codec":"h264","hardware":true},
-                {"index":1,"name":"Intel(R) Quick Sync H.264","codec":"h264","hardware":true}
-            ]})),
-            Some(1)
+            timeout_classification(&json!({"submitted_frames":0,"error":null})),
+            "hardware_video_static_capture_timeout"
+        );
+        assert_eq!(
+            timeout_classification(&json!({"submitted_frames":1,"error":null})),
+            "hardware_video_encoder_stall"
         );
     }
 }

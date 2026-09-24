@@ -29,6 +29,9 @@ pub type CaptureResult<T> = Result<T, CaptureError>;
 pub struct Output {
     pub id: String,
     pub adapter: String,
+    pub adapter_vendor_id: u32,
+    pub adapter_device_id: u32,
+    pub adapter_description: String,
     pub device_name: String,
     pub attached: bool,
     pub left: i32,

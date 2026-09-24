@@ -1,18 +1,18 @@
 use super::{Backend, CaptureSession};
-use crate::model::{frame_layout, CaptureError, CaptureResult, Frame, Output};
+use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout};
 use crate::worker::{FrameSource, Worker};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
-    resolve_with, with_verified_physical_topology, GeometryError, SelectedOutput,
+    GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
 };
+use serde_json::Value;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
-use windows::core::{IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -21,13 +21,14 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::core::{IInspectable, Interface};
 
 #[path = "monitors.rs"]
 mod monitors;
 #[path = "readback.rs"]
 mod readback;
-use readback::{native_error, Readback};
+use readback::{Readback, native_error};
 
 pub struct WindowsBackend {
     capture_cursor: Option<bool>,
@@ -74,17 +75,20 @@ impl Backend for WindowsBackend {
         let worker_output = output_id.clone();
         let worker_target = target_id.clone();
         let capture_cursor = self.capture_cursor;
-        let worker = Worker::start(move || {
+        let (worker, device_adapter) = Worker::start_with_metadata(move || {
             let monitor = match worker_target {
                 Some(target) => resolve_monitor(&worker_output, Some(&target))?.1,
                 None => find_monitor(&worker_output)?,
             };
-            Session::open(monitor, capture_cursor)
+            let session = Session::open(monitor, capture_cursor)?;
+            let device_adapter = session.readback.device_adapter();
+            Ok((session, device_adapter))
         })?;
         Ok(Box::new(WindowsSession {
             worker,
             output_id,
             target_id,
+            device_adapter,
         }))
     }
 }
@@ -93,6 +97,7 @@ struct WindowsSession {
     worker: Worker,
     output_id: String,
     target_id: Option<String>,
+    device_adapter: Value,
 }
 
 impl CaptureSession for WindowsSession {
@@ -106,6 +111,10 @@ impl CaptureSession for WindowsSession {
         };
         resolve_monitor(&self.output_id, Some(target_id))
             .map(|(selection, _)| Some(selection.geometry))
+    }
+
+    fn device_adapter(&self) -> Value {
+        self.device_adapter.clone()
     }
 }
 

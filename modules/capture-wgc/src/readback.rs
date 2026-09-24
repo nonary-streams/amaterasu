@@ -1,5 +1,5 @@
-use crate::model::{copy_bgra_rows, frame_layout, CaptureError, CaptureResult, Frame};
-use windows::core::Interface;
+use crate::model::{CaptureError, CaptureResult, Frame, copy_bgra_rows, frame_layout};
+use serde_json::{Value, json};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -7,6 +7,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
+use windows::core::Interface;
 
 pub struct Readback {
     device: ID3D11Device,
@@ -72,6 +73,22 @@ impl Readback {
 
     pub fn pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub fn device_adapter(&self) -> Value {
+        let result = (|| {
+            let dxgi_device: IDXGIDevice = self.device.cast().ok()?;
+            let adapter = unsafe { dxgi_device.GetAdapter().ok()? };
+            let description = unsafe { adapter.GetDesc().ok()? };
+            Some(json!({
+                "luid": format!("{:08x}:{:08x}", description.AdapterLuid.HighPart as u32, description.AdapterLuid.LowPart),
+                "vendor_id": description.VendorId,
+                "device_id": description.DeviceId,
+                "description": wide_string(&description.Description),
+                "ownership": "wgc_readback_device",
+            }))
+        })();
+        result.unwrap_or_else(|| json!({"ownership":"wgc_readback_device","available":false}))
     }
 
     pub fn submit(
@@ -177,6 +194,15 @@ impl Readback {
         self.pending = None;
         Ok(Some(result))
     }
+}
+
+fn wide_string(value: &[u16]) -> String {
+    String::from_utf16_lossy(
+        &value[..value
+            .iter()
+            .position(|word| *word == 0)
+            .unwrap_or(value.len())],
+    )
 }
 
 pub fn native_error(error: windows::core::Error) -> CaptureError {

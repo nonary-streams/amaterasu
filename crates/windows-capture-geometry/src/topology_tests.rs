@@ -1,6 +1,6 @@
 use crate::{
-    model::{CcdSnapshot, DisplaySnapshot, Topology},
     GeometryError, SelectedOutput,
+    model::{CcdSnapshot, DisplaySnapshot, Topology},
 };
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 

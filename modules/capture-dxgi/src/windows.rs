@@ -1,16 +1,17 @@
 use super::{Backend, CaptureSession};
-use crate::model::{copy_bgra_rows, frame_layout, CaptureError, CaptureResult, Frame, Output};
+use crate::model::{CaptureError, CaptureResult, Frame, Output, copy_bgra_rows, frame_layout};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
-    resolve_with, with_verified_physical_topology, GeometryError, SelectedOutput,
+    GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
 };
+use serde_json::{Value, json};
 use std::time::Instant;
-use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::core::Interface;
 
 pub struct WindowsBackend;
 
@@ -120,25 +121,29 @@ fn describe_output(
 ) -> CaptureResult<NativeOutput> {
     // SAFETY: the COM wrapper retains the output through GetDesc and owns the
     // returned description by value. Adapter ownership is cloned into the result.
-    let description = unsafe { output.GetDesc() }.map_err(native_error)?;
-    let device_name = wide_string(&description.DeviceName);
-    let rectangle = description.DesktopCoordinates;
+    let adapter_description = unsafe { adapter.GetDesc1() }.map_err(native_error)?;
+    let output_description = unsafe { output.GetDesc() }.map_err(native_error)?;
+    let device_name = wide_string(&output_description.DeviceName);
+    let rectangle = output_description.DesktopCoordinates;
     let width = rectangle_extent(rectangle.left, rectangle.right)?;
     let height = rectangle_extent(rectangle.top, rectangle.bottom)?;
     let metadata = Output {
         id: format!("{adapter_id}/{device_name}"),
         adapter: adapter_id.into(),
+        adapter_vendor_id: adapter_description.VendorId,
+        adapter_device_id: adapter_description.DeviceId,
+        adapter_description: wide_string(&adapter_description.Description),
         device_name,
-        attached: description.AttachedToDesktop.as_bool(),
+        attached: output_description.AttachedToDesktop.as_bool(),
         left: rectangle.left,
         top: rectangle.top,
         width,
         height,
-        rotation: description.Rotation.0 as u32,
+        rotation: output_description.Rotation.0 as u32,
     };
     Ok(NativeOutput {
         metadata,
-        monitor_handle: description.Monitor.0 as usize,
+        monitor_handle: output_description.Monitor.0 as usize,
         adapter: adapter.clone(),
         output,
     })
@@ -181,6 +186,7 @@ struct PendingTexture {
 struct Session {
     output_id: String,
     target_id: Option<String>,
+    adapter: Output,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
@@ -192,6 +198,7 @@ struct Session {
 impl Session {
     fn open(output: NativeOutput, target_id: Option<String>) -> CaptureResult<Self> {
         let output_id = output.metadata.id.clone();
+        let adapter = output.metadata.clone();
         let mut device = None;
         let mut context = None;
         // SAFETY: stack output slots are writable for the synchronous call;
@@ -222,6 +229,7 @@ impl Session {
         Ok(Self {
             output_id,
             target_id,
+            adapter,
             device,
             context,
             duplication,
@@ -363,6 +371,16 @@ impl CaptureSession for Session {
         };
         resolve_output(&self.output_id, Some(target_id))
             .map(|(selection, _)| Some(selection.geometry))
+    }
+
+    fn device_adapter(&self) -> Value {
+        json!({
+            "luid": self.adapter.adapter,
+            "vendor_id": self.adapter.adapter_vendor_id,
+            "device_id": self.adapter.adapter_device_id,
+            "description": self.adapter.adapter_description,
+            "ownership": "dxgi_output_adapter",
+        })
     }
 }
 

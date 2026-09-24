@@ -29,6 +29,12 @@ pub type CaptureResult<T> = Result<T, CaptureError>;
 pub struct Output {
     pub id: String,
     pub adapter: String,
+    /// The physical DXGI adapter that owns this monitor, correlated by its
+    /// device name and desktop rectangle. WGC must not guess an encoder when
+    /// this mapping is unavailable.
+    pub adapter_vendor_id: Option<u32>,
+    pub adapter_device_id: Option<u32>,
+    pub adapter_description: Option<String>,
     pub device_name: String,
     pub attached: bool,
     pub left: i32,
