@@ -98,9 +98,10 @@ provider markers, runs only after a complete scan, and preserves detached manual
 edits.
 
 This still does not provide complete Vibeshine Steam sync parity. Steam artwork
-is local-first: a supported portrait found in Steam's library cache or user grid
-is served from that file; otherwise list records carry a stable opaque reference
-to the fixed Steam CDN portrait. The authenticated
+is local-first: discovery prefers portraits over headers and icons, then picks
+the largest bounded image of that class across the configured Steam roots. A
+supported local image is served from its source file; otherwise list records
+carry a stable opaque reference to the fixed Steam CDN portrait. The authenticated
 `POST /v1/steam/artwork_read` action fetches that image on demand and returns the
 same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
 an eight-second timeout, accepts only JPEG portraits up to 16 MiB, keeps up to
@@ -109,7 +110,9 @@ authenticated chunk route and frontend assembly use the same 16 MiB image
 limit. Failed remote fetches leave the UI to use its existing icon fallback.
 Vibeshine retains persistent converted covers through transient remote failures
 and replaces low-resolution local art when a full portrait is available; those
-behaviors remain pending. Remote images are not persisted or converted to PNG.
+behaviors remain pending. Amaterasu has no Steam-authorized product cache root
+or host service for persistent artwork, so remote images are not persisted or
+converted to PNG and a low-resolution local portrait is not replaced remotely.
 Unlike Vibeshine's legacy host config parser, the product API rejects negative
 counts and ages as malformed unsigned values instead of clamping them to zero.
 

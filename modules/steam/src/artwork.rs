@@ -13,6 +13,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 const MAX_ARTWORK_ROOTS: usize = 4;
 const MAX_USER_DIRECTORIES: usize = 32;
 const MAX_HASH_DIRECTORIES: usize = 32;
+const MAX_DIMENSION_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const MAX_REMOTE_FAILURES: usize = 64;
@@ -25,6 +26,26 @@ pub const ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
 pub struct ArtworkMetadata {
     pub source_path: Option<String>,
     pub revision: Option<String>,
+}
+
+struct LocalArtworkCandidate {
+    metadata: ArtworkMetadata,
+    role_priority: u8,
+    pixel_area: u64,
+    width: u32,
+    height: u32,
+}
+
+impl LocalArtworkCandidate {
+    fn is_better_than(&self, previous: &Self) -> bool {
+        (self.role_priority, self.pixel_area, self.width, self.height)
+            > (
+                previous.role_priority,
+                previous.pixel_area,
+                previous.width,
+                previous.height,
+            )
+    }
 }
 
 #[derive(Debug)]
@@ -299,6 +320,13 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
         return None;
     }
+    jpeg_dimensions_from_prefix(bytes)
+}
+
+fn jpeg_dimensions_from_prefix(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
     let mut offset = 2;
     while offset + 4 <= bytes.len() {
         if bytes[offset] != 0xff {
@@ -421,100 +449,116 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
         }
     }
 
+    let mut best_candidate: Option<LocalArtworkCandidate> = None;
     for root in roots {
-        if let Some(metadata) =
-            from_library_cache(app_id, &root).or_else(|| from_user_grid(app_id, &root))
-        {
-            return metadata;
+        for candidate in local_candidates(app_id, &root) {
+            let replace = best_candidate
+                .as_ref()
+                .is_none_or(|previous| candidate.is_better_than(previous));
+            if replace {
+                best_candidate = Some(candidate);
+            }
         }
     }
-    ArtworkMetadata::default()
+    best_candidate
+        .map(|candidate| candidate.metadata)
+        .unwrap_or_default()
 }
 
-fn from_library_cache(app_id: u32, root: &Path) -> Option<ArtworkMetadata> {
+fn local_candidates(app_id: u32, root: &Path) -> Vec<LocalArtworkCandidate> {
+    let mut candidates = Vec::new();
     let cache_directories = [
         root.join("appcache/librarycache"),
         root.join("librarycache"),
     ];
     let file_suffixes = [
-        "_library_600x900_2x",
-        "_library_600x900",
-        "_header",
-        "_icon",
+        ("_library_600x900_2x", 3),
+        ("_library_600x900", 3),
+        ("_header", 2),
+        ("_icon", 1),
     ];
     let extensions = ["jpg", "png", "webp"];
 
     for cache in &cache_directories {
-        for suffix in file_suffixes {
+        for (suffix, role_priority) in file_suffixes {
             for extension in extensions {
                 let candidate = cache.join(format!("{app_id}{suffix}.{extension}"));
-                if let Some(metadata) = inspect_candidate(&candidate, root) {
-                    return Some(metadata);
+                if let Some(candidate) = inspect_candidate(&candidate, root, role_priority) {
+                    candidates.push(candidate);
                 }
             }
         }
-        if let Some(metadata) = from_hashed_library_cache(app_id, cache, root) {
-            return Some(metadata);
-        }
+        candidates.extend(from_hashed_library_cache(app_id, cache, root));
     }
-    None
+    candidates.extend(from_user_grid(app_id, root));
+    candidates
 }
 
 fn from_hashed_library_cache(
     app_id: u32,
     cache: &Path,
     canonical_root: &Path,
-) -> Option<ArtworkMetadata> {
+) -> Vec<LocalArtworkCandidate> {
     let app_directory = cache.join(app_id.to_string());
-    let mut hash_directories = bounded_directories(&app_directory, MAX_HASH_DIRECTORIES)?;
+    let Some(mut hash_directories) = bounded_directories(&app_directory, MAX_HASH_DIRECTORIES)
+    else {
+        return Vec::new();
+    };
     hash_directories.sort();
+    let mut candidates = Vec::new();
     for hash_directory in hash_directories {
-        for name in [
-            "library_600x900_2x.jpg",
-            "library_600x900_2x.png",
-            "library_600x900_2x.webp",
-            "library_600x900.jpg",
-            "library_600x900.png",
-            "library_600x900.webp",
-            "library_capsule.jpg",
-            "library_capsule.png",
-            "library_capsule.webp",
-            "library_header.jpg",
-            "library_header.png",
-            "library_header.webp",
+        for (name, role_priority) in [
+            ("library_600x900_2x.jpg", 3),
+            ("library_600x900_2x.png", 3),
+            ("library_600x900_2x.webp", 3),
+            ("library_600x900.jpg", 3),
+            ("library_600x900.png", 3),
+            ("library_600x900.webp", 3),
+            ("library_capsule.jpg", 3),
+            ("library_capsule.png", 3),
+            ("library_capsule.webp", 3),
+            ("library_header.jpg", 2),
+            ("library_header.png", 2),
+            ("library_header.webp", 2),
         ] {
-            if let Some(metadata) = inspect_candidate(&hash_directory.join(name), canonical_root) {
-                return Some(metadata);
+            if let Some(candidate) =
+                inspect_candidate(&hash_directory.join(name), canonical_root, role_priority)
+            {
+                candidates.push(candidate);
             }
         }
     }
-    None
+    candidates
 }
 
-fn from_user_grid(app_id: u32, root: &Path) -> Option<ArtworkMetadata> {
-    let mut users = bounded_directories(&root.join("userdata"), MAX_USER_DIRECTORIES)?;
+fn from_user_grid(app_id: u32, root: &Path) -> Vec<LocalArtworkCandidate> {
+    let Some(mut users) = bounded_directories(&root.join("userdata"), MAX_USER_DIRECTORIES) else {
+        return Vec::new();
+    };
     users.sort();
     let suffixes = [
-        "p.png",
-        "p.jpg",
-        "_p.png",
-        "_p.jpg",
-        "_hero.png",
-        "_hero.jpg",
-        "_icon.png",
-        "_icon.jpg",
-        ".png",
+        ("p.png", 3),
+        ("p.jpg", 3),
+        ("_p.png", 3),
+        ("_p.jpg", 3),
+        ("_hero.png", 2),
+        ("_hero.jpg", 2),
+        ("_icon.png", 1),
+        ("_icon.jpg", 1),
+        (".png", 1),
     ];
+    let mut candidates = Vec::new();
     for user in users {
         let grid = user.join("config/grid");
-        for suffix in suffixes {
-            if let Some(metadata) = inspect_candidate(&grid.join(format!("{app_id}{suffix}")), root)
+        for (suffix, role_priority) in suffixes {
+            if let Some(candidate) =
+                inspect_candidate(&grid.join(format!("{app_id}{suffix}")), root, role_priority)
             {
-                return Some(metadata);
+                candidates.push(candidate);
             }
         }
     }
-    None
+    candidates
 }
 
 fn bounded_directories(directory: &Path, limit: usize) -> Option<Vec<PathBuf>> {
@@ -532,7 +576,11 @@ fn bounded_directories(directory: &Path, limit: usize) -> Option<Vec<PathBuf>> {
     Some(directories)
 }
 
-fn inspect_candidate(candidate: &Path, canonical_root: &Path) -> Option<ArtworkMetadata> {
+fn inspect_candidate(
+    candidate: &Path,
+    canonical_root: &Path,
+    role_priority: u8,
+) -> Option<LocalArtworkCandidate> {
     let file_type = fs::symlink_metadata(candidate).ok()?.file_type();
     if !file_type.is_file() {
         return None;
@@ -546,16 +594,67 @@ fn inspect_candidate(candidate: &Path, canonical_root: &Path) -> Option<ArtworkM
         return None;
     }
     image_mime(&canonical_path)?;
+    let (width, height) = image_dimensions(&canonical_path).unwrap_or_default();
     let modified_nanos = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |modified| modified.as_nanos());
     let revision = revision(&canonical_path, metadata.len(), modified_nanos);
-    Some(ArtworkMetadata {
-        source_path: canonical_path.to_str().map(str::to_owned),
-        revision: Some(revision),
+    Some(LocalArtworkCandidate {
+        metadata: ArtworkMetadata {
+            source_path: canonical_path.to_str().map(str::to_owned),
+            revision: Some(revision),
+        },
+        role_priority,
+        pixel_area: u64::from(width) * u64::from(height),
+        width,
+        height,
     })
+}
+
+fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let file = File::open(path).ok()?;
+    let mut header = Vec::with_capacity(MAX_DIMENSION_HEADER_BYTES);
+    file.take(MAX_DIMENSION_HEADER_BYTES as u64)
+        .read_to_end(&mut header)
+        .ok()?;
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") && header.len() >= 24 {
+        let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+        return (width > 0 && height > 0).then_some((width, height));
+    }
+    if header.starts_with(&[0xff, 0xd8]) {
+        return jpeg_dimensions_from_prefix(&header);
+    }
+    webp_dimensions(&header)
+}
+
+fn webp_dimensions(header: &[u8]) -> Option<(u32, u32)> {
+    if header.len() < 30 || &header[..4] != b"RIFF" || &header[8..12] != b"WEBP" {
+        return None;
+    }
+    match &header[12..16] {
+        b"VP8X" if header.len() >= 30 => {
+            let width = 1 + u32::from_le_bytes([header[24], header[25], header[26], 0]);
+            let height = 1 + u32::from_le_bytes([header[27], header[28], header[29], 0]);
+            Some((width, height))
+        }
+        b"VP8 " if header[23..26] == [0x9d, 0x01, 0x2a] => {
+            let width = u32::from(u16::from_le_bytes([header[26], header[27]]) & 0x3fff);
+            let height = u32::from(u16::from_le_bytes([header[28], header[29]]) & 0x3fff);
+            (width > 0 && height > 0).then_some((width, height))
+        }
+        b"VP8L" if header[20] == 0x2f => {
+            let width = 1 + u32::from(header[21]) + (u32::from(header[22] & 0x3f) << 8);
+            let height = 1
+                + (u32::from(header[22] & 0xc0) >> 6)
+                + (u32::from(header[23]) << 2)
+                + (u32::from(header[24] & 0x0f) << 10);
+            Some((width, height))
+        }
+        _ => None,
+    }
 }
 
 pub fn read_chunk(
@@ -760,6 +859,51 @@ mod tests {
         let second = discover(42, &root.0, &[]);
         assert_eq!(second.source_path.as_deref(), portrait.to_str());
         assert_ne!(second.revision, first.revision);
+    }
+
+    #[test]
+    fn selects_the_largest_local_portrait_across_roots_before_a_larger_header() {
+        let primary_root = TemporaryRoot::new();
+        let secondary_root = TemporaryRoot::new();
+        let primary_cache = primary_root.0.join("appcache/librarycache");
+        let secondary_cache = secondary_root.0.join("appcache/librarycache");
+        fs::create_dir_all(&primary_cache).unwrap();
+        fs::create_dir_all(&secondary_cache).unwrap();
+
+        let low_resolution_portrait = primary_cache.join("42_library_600x900_2x.png");
+        let large_header = primary_cache.join("42_header.png");
+        let high_resolution_portrait = secondary_cache.join("42_library_600x900.png");
+        fs::write(&low_resolution_portrait, synthetic_png(300, 450)).unwrap();
+        fs::write(&large_header, synthetic_png(3840, 2160)).unwrap();
+        fs::write(&high_resolution_portrait, synthetic_png(1200, 1800)).unwrap();
+
+        let artwork = discover(42, &primary_root.0, std::slice::from_ref(&secondary_root.0));
+
+        assert_eq!(
+            artwork.source_path.as_deref(),
+            high_resolution_portrait.to_str()
+        );
+    }
+
+    #[test]
+    fn reads_bounded_dimensions_from_supported_local_image_headers() {
+        let root = TemporaryRoot::new();
+        let jpeg_path = root.0.join("portrait.jpg");
+        let png_path = root.0.join("portrait.png");
+        fs::write(&jpeg_path, synthetic_jpeg(600, 900, 64)).unwrap();
+        fs::write(&png_path, synthetic_png(1200, 1800)).unwrap();
+
+        assert_eq!(image_dimensions(&jpeg_path), Some((600, 900)));
+        assert_eq!(image_dimensions(&png_path), Some((1200, 1800)));
+    }
+
+    fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 24];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes
     }
 
     #[test]
