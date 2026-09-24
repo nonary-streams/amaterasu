@@ -702,7 +702,12 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     fields(
         overrides,
         &[],
-        &["fec_percentage", "stream_audio", "audio_sink"],
+        &[
+            "fec_percentage",
+            "stream_audio",
+            "audio_sink",
+            "audio_sink_capture_only",
+        ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
         && !fec.is_null()
@@ -719,6 +724,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
         return Err(INVALID);
     }
     optional_audio_sink(overrides)?;
+    optional_audio_sink_capture_only(overrides)?;
     Ok(())
 }
 
@@ -732,6 +738,16 @@ fn optional_audio_sink(overrides: &Object) -> Result<(), &'static str> {
             }
             _ => true,
         })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_audio_sink_capture_only(overrides: &Object) -> Result<(), &'static str> {
+    if overrides
+        .get("audio_sink_capture_only")
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
     {
         return Err(INVALID);
     }
@@ -1011,6 +1027,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "max_bitrate",
                     "minimum_fps_target",
                     "audio_sink",
+                    "audio_sink_capture_only",
                     "external_ip",
                     "wgc_pacing_smoothing",
                     "ping_timeout_ms",
@@ -1102,6 +1119,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                 }
                 _ => true,
             }) {
+                return Err(INVALID);
+            }
+            if object
+                .get("audio_sink_capture_only")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
                 return Err(INVALID);
             }
             if object.get("external_ip").is_some_and(|value| match value {
@@ -1261,6 +1284,36 @@ mod nvhttp_tests {
     }
 
     #[test]
+    fn audio_sink_capture_only_accepts_only_explicit_booleans() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let payload = serde_json::json!({
+                "hostname": "Host", "port": 47989, "expected_revision": 0,
+                "audio_sink_capture_only": value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for value in [Value::Null, serde_json::json!(1), serde_json::json!("true")] {
+            let payload = serde_json::json!({
+                "hostname": "Host", "port": 47989, "expected_revision": 0,
+                "audio_sink_capture_only": value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
     fn external_ip_update_preserves_exact_text_and_rejects_controls() {
         let route = Route {
             service: "amaterasu.nvhttp/1",
@@ -1374,6 +1427,38 @@ mod pairing_override_tests {
             );
         }
     }
+
+    #[test]
+    fn capture_only_override_preserves_false_and_rejects_other_types() {
+        let pairing = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        for value in [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ] {
+            let overrides = serde_json::json!({"audio_sink_capture_only": value});
+            let pairing_payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            assert!(validate(pairing, pairing_payload.as_object().unwrap()).is_ok());
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+        for value in [serde_json::json!(0), serde_json::json!("false")] {
+            let overrides = serde_json::json!({"audio_sink_capture_only": value});
+            let pairing_payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":overrides,
+            });
+            assert!(validate(pairing, pairing_payload.as_object().unwrap()).is_err());
+            assert!(catalog_config_overrides(&overrides).is_err());
+        }
+    }
 }
 
 fn safe_bind_address(value: &str) -> Option<IpAddr> {
@@ -1451,7 +1536,12 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(
                 config_overrides,
                 &[],
-                &["fec_percentage", "stream_audio", "audio_sink"],
+                &[
+                    "fec_percentage",
+                    "stream_audio",
+                    "audio_sink",
+                    "audio_sink_capture_only",
+                ],
             )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
                 && !percentage.is_null()
@@ -1468,6 +1558,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 return Err(INVALID);
             }
             optional_audio_sink(config_overrides)?;
+            optional_audio_sink_capture_only(config_overrides)?;
             Ok(())
         }
         _ => Err(INVALID),

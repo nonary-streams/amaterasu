@@ -22,11 +22,12 @@ var Amaterasu;
         return percentage;
     }
     Amaterasu.parseFecOverride = parseFecOverride;
-    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "") {
+    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "") {
         return {
             fec_percentage: parseFecOverride(value),
             stream_audio: parseStreamAudioOverride(streamAudioValue),
             audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
+            audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
         };
     }
     Amaterasu.providerConfigOverrides = providerConfigOverrides;
@@ -52,6 +53,16 @@ var Amaterasu;
         throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
     }
     Amaterasu.parseStreamAudioOverride = parseStreamAudioOverride;
+    function parseAudioSinkCaptureOnlyOverride(value) {
+        if (value === "")
+            return null;
+        if (value === "true")
+            return true;
+        if (value === "false")
+            return false;
+        throw new Error("Choose Inherit, Capture only, or Route defaults for audio output.");
+    }
+    Amaterasu.parseAudioSinkCaptureOnlyOverride = parseAudioSinkCaptureOnlyOverride;
     function parseSteamId(value) {
         if (value === "")
             return null;
@@ -140,14 +151,16 @@ var Amaterasu;
         const fecPercentage = parseFecOverride(text("fec_percentage"));
         const streamAudio = parseStreamAudioOverride(text("stream_audio"));
         const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
+        const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
         const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
-        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null
+        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null
             ? undefined
             : {
                 ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
                 ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
                 ...(audioSink === null ? {} : { audio_sink: audioSink }),
+                ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
@@ -803,7 +816,8 @@ var Amaterasu;
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls);
+            const captureOnly = audioOverrideSelect("audio_sink_capture_only", row.entry.config_overrides?.audio_sink_capture_only);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -814,7 +828,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value);
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -933,6 +947,7 @@ var Amaterasu;
         fec.step = "1";
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
+        const captureOnly = audioOverrideSelect("audio_sink_capture_only", entry?.config_overrides?.audio_sink_capture_only);
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -962,7 +977,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -1890,6 +1905,20 @@ var Amaterasu;
                     const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
                     audioSinkMode.addEventListener("change", updateAudioSink);
                     updateAudioSink();
+                    const captureOnly = Amaterasu.el("select");
+                    captureOnly.setAttribute("aria-label", `Capture-only audio override for ${client.name}`);
+                    for (const [value, label] of [
+                        ["", "Inherit"],
+                        ["true", "Capture without routing"],
+                        ["false", "Allow default-output routing"],
+                    ]) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value ?? "";
+                        captureOnly.append(option);
+                    }
+                    captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
+                        ? ""
+                        : String(client.config_overrides.audio_sink_capture_only);
                     const status = Amaterasu.el("div");
                     const save = Amaterasu.button("Save", () => Amaterasu.runAction(save, status, async () => {
                         try {
@@ -1900,6 +1929,7 @@ var Amaterasu;
                                     ...parseClientFecOverride(fec.value),
                                     stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
                                     audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                                    audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
                                 },
                             });
                             context.notify(`Streaming override saved for ${client.name}.`);
@@ -1916,9 +1946,9 @@ var Amaterasu;
                     }), "primary");
                     save.disabled = !context.api.allows("pairing.admin");
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), captureOnly, Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
@@ -2196,6 +2226,8 @@ var Amaterasu;
                     audioSink.append(saved);
                 }
                 audioSink.value = settings.configured_audio_sink ?? "";
+                const audioSinkCaptureOnly = Amaterasu.input("audio_sink_capture_only", "", "checkbox");
+                audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
                 const externalIp = Amaterasu.input("external_ip", settings.configured_external_ip ?? "");
                 externalIp.maxLength = 4096;
                 const videoBatchSize = Amaterasu.input("video_max_batch_size_kb", settings.configured_video_max_batch_size_kb === null
@@ -2227,7 +2259,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -2244,6 +2276,7 @@ var Amaterasu;
                             minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
                             ping_timeout_ms: parsePingTimeout(pingTimeout.value),
                             audio_sink: parseAudioSinkSelection(audioSink.value),
+                            audio_sink_capture_only: audioSinkCaptureOnly.checked,
                             external_ip: parseExternalIp(externalIp.value),
                             wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
                             expected_revision: settings.revision,

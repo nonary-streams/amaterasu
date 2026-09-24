@@ -120,12 +120,24 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     fec_percentage: null,
     stream_audio: null,
     audio_sink: null,
+    audio_sink_capture_only: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("37", "false")), {
     fec_percentage: 37,
     stream_audio: false,
     audio_sink: null,
+    audio_sink_capture_only: null,
   });
+  assert.deepEqual(ordinary(model.providerConfigOverrides("", "", "inherit", "", "false")), {
+    fec_percentage: null,
+    stream_audio: null,
+    audio_sink: null,
+    audio_sink_capture_only: false,
+  });
+  assert.equal(model.parseAudioSinkCaptureOnlyOverride(""), null);
+  assert.equal(model.parseAudioSinkCaptureOnlyOverride("true"), true);
+  assert.equal(model.parseAudioSinkCaptureOnlyOverride("false"), false);
+  assert.throws(() => model.parseAudioSinkCaptureOnlyOverride("False"));
   assert.equal(model.parseStreamAudioOverride(""), null);
   assert.equal(model.parseStreamAudioOverride("true"), true);
   assert.equal(model.parseStreamAudioOverride("false"), false);
@@ -138,6 +150,11 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   audioOnly.set("stream_audio", "false");
   assert.deepEqual(ordinary(model.entryFromForm(audioOnly).config_overrides), {
     stream_audio: false,
+  });
+  audioOnly.set("audio_sink_capture_only", "false");
+  assert.deepEqual(ordinary(model.entryFromForm(audioOnly).config_overrides), {
+    stream_audio: false,
+    audio_sink_capture_only: false,
   });
   assert.equal(model.parseExitTimeout(""), null);
   assert.equal(model.parseExitTimeout("0"), 0);

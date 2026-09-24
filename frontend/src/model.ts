@@ -23,15 +23,17 @@ namespace Amaterasu {
     return percentage;
   }
 
-  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = ""): {
+  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = ""): {
     fec_percentage: number | null;
     stream_audio: boolean | null;
     audio_sink: string | null;
+    audio_sink_capture_only: boolean | null;
   } {
     return {
       fec_percentage: parseFecOverride(value),
       stream_audio: parseStreamAudioOverride(streamAudioValue),
       audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
+      audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
     };
   }
 
@@ -51,6 +53,13 @@ namespace Amaterasu {
     if (value === "true") return true;
     if (value === "false") return false;
     throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
+  }
+
+  export function parseAudioSinkCaptureOnlyOverride(value: string): boolean | null {
+    if (value === "") return null;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    throw new Error("Choose Inherit, Capture only, or Route defaults for audio output.");
   }
 
   export function parseSteamId(value: string): string | null {
@@ -146,15 +155,17 @@ namespace Amaterasu {
     const fecPercentage = parseFecOverride(text("fec_percentage"));
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
     const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
+    const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null && audioSink === null
+      fecPercentage === null && streamAudio === null && audioSink === null && audioSinkCaptureOnly === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
             ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
             ...(audioSink === null ? {} : { audio_sink: audioSink }),
+            ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

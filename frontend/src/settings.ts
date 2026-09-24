@@ -1304,6 +1304,20 @@ namespace Amaterasu {
           const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
           audioSinkMode.addEventListener("change", updateAudioSink);
           updateAudioSink();
+          const captureOnly = el("select");
+          captureOnly.setAttribute("aria-label", `Capture-only audio override for ${client.name}`);
+          for (const [value, label] of [
+            ["", "Inherit"],
+            ["true", "Capture without routing"],
+            ["false", "Allow default-output routing"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            captureOnly.append(option);
+          }
+          captureOnly.value = client.config_overrides?.audio_sink_capture_only === undefined
+            ? ""
+            : String(client.config_overrides.audio_sink_capture_only);
           const status = el("div");
           const save = button(
             "Save",
@@ -1316,6 +1330,7 @@ namespace Amaterasu {
                     ...parseClientFecOverride(fec.value),
                     stream_audio: parseStreamAudioOverride(streamAudio.value),
                     audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
+                    audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
                   },
                 });
                 context.notify(`Streaming override saved for ${client.name}.`);
@@ -1338,9 +1353,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", save, status)];
+          return [identity, fec, streamAudio, el("div", "", audioSinkMode, audioSinkId), captureOnly, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", "Capture only", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -1759,6 +1774,8 @@ namespace Amaterasu {
           audioSink.append(saved);
         }
         audioSink.value = settings.configured_audio_sink ?? "";
+        const audioSinkCaptureOnly = input("audio_sink_capture_only", "", "checkbox");
+        audioSinkCaptureOnly.checked = settings.audio_sink_capture_only;
         const externalIp = input("external_ip", settings.configured_external_ip ?? "");
         externalIp.maxLength = 4096;
         const videoBatchSize = input(
@@ -1840,6 +1857,7 @@ namespace Amaterasu {
             `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`,
           ),
           field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
+          field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."),
           field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."),
           field(
             "Video batch size (KiB)",
@@ -1893,6 +1911,7 @@ namespace Amaterasu {
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
               ping_timeout_ms: parsePingTimeout(pingTimeout.value),
               audio_sink: parseAudioSinkSelection(audioSink.value),
+              audio_sink_capture_only: audioSinkCaptureOnly.checked,
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
               expected_revision: settings.revision,

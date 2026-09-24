@@ -312,6 +312,10 @@ namespace Amaterasu {
         row.entry.config_overrides?.stream_audio,
       );
       const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
+      const captureOnly = audioOverrideSelect(
+        "audio_sink_capture_only",
+        row.entry.config_overrides?.audio_sink_capture_only,
+      );
       const form = el(
         "form",
         "editor-form",
@@ -322,6 +326,7 @@ namespace Amaterasu {
         ),
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
+        field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -332,12 +337,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; audio_sink_capture_only?: boolean };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -504,6 +509,10 @@ namespace Amaterasu {
       entry?.config_overrides?.stream_audio,
     );
     const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
+    const captureOnly = audioOverrideSelect(
+      "audio_sink_capture_only",
+      entry?.config_overrides?.audio_sink_capture_only,
+    );
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -563,6 +572,7 @@ namespace Amaterasu {
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       audioSink.controls,
+      field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
       steamIdField,
       steamInstallDirField,
       fullscreen,
