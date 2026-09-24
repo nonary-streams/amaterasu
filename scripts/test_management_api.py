@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import random
 import socket
 import sys
 import tempfile
@@ -22,12 +23,15 @@ PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" /
 
 
 def available_moonlight_port_pair():
-    for _ in range(30):
+    # Windows can assign TCP ephemeral ports inside UDP exclusion ranges. Probe
+    # non-ephemeral candidates as a fallback so this integration test can find
+    # the entire Moonlight port set without relying on the TCP allocator.
+    for candidate in [0] * 30 + random.sample(range(10000, 45000), 100):
         probes = []
         try:
             http_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             probes.append(http_socket)
-            http_socket.bind(("127.0.0.1", 0))
+            http_socket.bind(("127.0.0.1", candidate))
             port = http_socket.getsockname()[1]
             if not 1029 <= port <= 65514:
                 continue
@@ -971,7 +975,8 @@ def main():
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
-    print("Moonlight hostname/port live rebind, certificate-bound FEC override CAS and restart persistence,")
+    print("Moonlight hostname/port live rebind, capture output and audio policy persistence,")
+    print("certificate-bound FEC/audio override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
