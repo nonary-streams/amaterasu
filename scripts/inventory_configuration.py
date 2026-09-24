@@ -511,6 +511,32 @@ def specialized_host_defaults() -> dict[str, tuple[str, Any, str, int]]:
                 if not known:
                     value = None
             result[key] = (type_names[type_name], value, path, base_line + offset)
+
+    # Authentication defaults are initialized in the global config aggregate,
+    # rather than in a dedicated integration struct. Keep the distinct web
+    # default so a disagreement remains visible in the generated inventory.
+    config_lines = reference_text("src/config.cpp").splitlines()
+    authentication_defaults = (
+        (
+            "session_token_ttl_seconds",
+            r"std::chrono::hours\s*\{\s*2\s*\}.*//\s*session_token_ttl default 2h",
+            2 * 60 * 60,
+        ),
+        (
+            "remember_me_refresh_token_ttl_seconds",
+            r"std::chrono::hours\s*\{\s*24\s*\*\s*7\s*\}.*//\s*remember_me_refresh_token_ttl default 7d",
+            7 * 24 * 60 * 60,
+        ),
+    )
+    for key, pattern, seconds in authentication_defaults:
+        matching_lines = [
+            number
+            for number, line in enumerate(config_lines, 1)
+            if re.search(pattern, line)
+        ]
+        if len(matching_lines) != 1:
+            raise ValueError(f"authentication host default for {key} was not found exactly once")
+        result[key] = ("integer", seconds, "src/config.cpp", matching_lines[0])
     return result
 
 

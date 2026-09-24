@@ -56,10 +56,11 @@
     "backend_web_override_lists_match": true,
     "typed_options": 238,
     "options_with_ui_default": 164,
-    "options_with_host_default": 30,
+    "options_with_host_default": 32,
     "default_conflicts": [
       "global:playnite_autosync_delete_after_days",
-      "global:playnite_recent_max_age_days"
+      "global:playnite_recent_max_age_days",
+      "global:session_token_ttl_seconds"
     ],
     "options_with_platform_classification": 201
   },
@@ -6582,6 +6583,11 @@
         },
         {
           "path": "src/config.cpp",
+          "line": 1084,
+          "role": "host_default_declaration"
+        },
+        {
+          "path": "src/config.cpp",
           "line": 2222,
           "role": "config_parser",
           "detail": "int_between_f"
@@ -6604,7 +6610,8 @@
       ],
       "type": "integer",
       "defaults": {
-        "web_schema": 604800
+        "web_schema": 604800,
+        "host": 604800
       },
       "domain": "Config Files",
       "platform": [
@@ -7416,6 +7423,11 @@
         },
         {
           "path": "src/config.cpp",
+          "line": 1083,
+          "role": "host_default_declaration"
+        },
+        {
+          "path": "src/config.cpp",
           "line": 2214,
           "role": "config_parser",
           "detail": "int_between_f"
@@ -7438,7 +7450,12 @@
       ],
       "type": "integer",
       "defaults": {
-        "web_schema": 86400
+        "web_schema": 86400,
+        "host": 7200
+      },
+      "default_conflict": {
+        "web_schema": 86400,
+        "host": 7200
       },
       "domain": "Config Files",
       "platform": [

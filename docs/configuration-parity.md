@@ -39,7 +39,8 @@ The pinned inventory contains 197 global setting keys, 41 per-application
 explicit legacy aliases. It records 193 global parser keys, 172 configuration
 guide headings, and 188 web settings or integration policy keys. All 238
 inventory rows have an assigned type; 164 include a web-supplied default and
-30 include a host default from a specialized integration struct.
+32 include a pinned host default from a specialized integration struct or
+the authentication configuration aggregate.
 
 The backend and current web editor have identical lists for the 103 keys that
 may be overridden per application or client. These keys inherit the global
@@ -54,6 +55,12 @@ are preserved in the JSON so implementation can make an explicit decision:
 | --- | ---: | ---: |
 | `global:playnite_autosync_delete_after_days` | `0` | `14` |
 | `global:playnite_recent_max_age_days` | `0` | `30` |
+| `global:session_token_ttl_seconds` | `86400` | `7200` |
+
+The session-token host default is two hours in Vibeshine's configuration
+aggregate and its guide. The web extended-settings default is 24 hours. The
+inventory preserves both; matching host behavior uses the two-hour default
+until a saved override is present.
 
 The coverage arrays list parser keys without a guide heading or web setting,
 and web settings without a global parser. These include consumed legacy HDR
