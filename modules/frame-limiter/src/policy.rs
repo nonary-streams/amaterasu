@@ -138,10 +138,18 @@ pub fn should_consider_apply(settings: &EffectiveSettings, context: PolicyContex
     settings.enable
         || (context.virtual_display_active
             && settings.auto_virtual_framegen != AutoVirtualFramegenMode::Disabled)
-        || context.physical_framegen_capture
+        || frame_generation_policy_is_active(context)
         || context
             .lossless_scaling_limit
             .is_some_and(|limit| !limit.is_follow_stream())
+}
+
+fn frame_generation_policy_is_active(context: PolicyContext) -> bool {
+    context.physical_framegen_capture
+        || matches!(
+            context.frame_generation_provider,
+            FrameGenerationProvider::GameProvided | FrameGenerationProvider::NvidiaSmoothMotion
+        )
 }
 
 pub fn resolve_effective_limit(
@@ -344,7 +352,7 @@ pub fn resolve_rtss_sync_limiter(
             .auto_virtual_framegen
             .automatic_virtual_limiter_enabled();
     let frame_generation_policy_active =
-        virtual_display_policy_active || context.physical_framegen_capture;
+        virtual_display_policy_active || frame_generation_policy_is_active(context);
     if !frame_generation_policy_active {
         return RtssSyncLimiterDecision {
             value: settings.rtss_frame_limit_type,
@@ -359,7 +367,8 @@ pub fn resolve_rtss_sync_limiter(
         && (game_provided || !settings.rtss_allow_virtual_display_override);
     let virtual_display_sync_overridden = context.virtual_display_active
         && settings.rtss_allow_virtual_display_override
-        && !virtual_display_reflex_required;
+        && !virtual_display_reflex_required
+        && !game_provided;
     if virtual_display_sync_overridden {
         return RtssSyncLimiterDecision {
             value: settings.rtss_frame_limit_type,

@@ -1,35 +1,57 @@
-# Frame limiter policy
+# Frame limiter service and policy
 
-This crate defines typed global frame-limiter settings, inventory-scoped override
-resolution, and pure provider and RTSS policy decisions. FPS settings are stored
-as exact millihertz values. The legacy `rtss_disable_vsync_ullm` input is folded
-into `frame_limiter_disable_vsync`; callers should persist only the canonical
-key.
+This crate defines typed global frame-limiter settings, inventory-scoped
+override resolution, and provider and RTSS policy decisions. It builds as a
+managed module and registers `amaterasu.frame-limiter/1`.
 
-`ProviderPlan` is an ordered list of candidate backends and fallback conditions.
-It does not start a provider, change an operating-system setting, or report that
-a setting was applied. The decision model includes virtual-display and frame
-generation context so a future adapter can keep the RTSS Reflex safety default
-and honor explicit scoped overrides.
+The version 1 `apply` request contains the immutable effective settings for one
+launch plus optional stream, Lossless Scaling, explicit client display-mode,
+virtual-display, and frame-generation context. Missing or null context is
+unknown; the launch adapter must not infer a client display override from
+stream dimensions. Rate values are exact unsigned millihertz, and zero means
+the known follow-stream/no-rate value. The launch adapter resolves the six
+application/client overridable fields with client-over-application-over-global
+precedence. Other settings remain global. The legacy
+`rtss_disable_vsync_ullm` configuration input folds into
+`frame_limiter_disable_vsync`, and callers persist only the canonical field.
+The RTSS install path is accepted only on Windows; empty selects auto-detection.
 
-The Windows RTSS selector changes the configured sync type only for an active
+The service currently evaluates policy without detecting or invoking native
+providers. `apply` reports `state: "policy_only"`,
+`provider_availability: "unknown"`, and `applied: false`; it creates no lease.
+`status` and `restore` report `state: "runtime_unavailable"` and do not claim
+provider state or restoration. Unknown higher-priority rate sources make the
+effective limit null. Unknown apply context makes `should_consider_apply`
+null. The response exposes no provider candidates because this module does not
+detect hardware or backends. Provider detection, OS apply/restore, lease
+ownership, crash recovery, and platform qualification remain pending.
+
+The Windows RTSS policy changes the configured sync type only for an active
 frame-generation policy with Auto or RTSS selected. Smooth Motion uses Front
-Edge Sync. Automatic virtual display selects Reflex only while its global
-override is off and NVIDIA is present without an AMD adapter. Game-provided
-frame generation retains Reflex on that hardware even when the global override
-is on. Explicit scoped sync overrides remain authoritative. A zero FPS limit
-uses, in order, a lossless scaling limit, client display-mode rate, and then an
-authoritative requested-stream FPS. When that rate is absent or zero, the result
-remains `FollowStream`; the future runtime adapter must supply it. Windows RTSS
-relative install paths are resolved under Program Files by the future adapter.
+Edge Sync. Automatic virtual-display policy selects Reflex only when enabled,
+the global override is off, and NVIDIA is present without an AMD adapter.
+Active game-provided frame generation selects Reflex on supported NVIDIA
+hardware even when the virtual-display automatic mode or global override is
+off; an explicit application/client RTSS type takes priority. A zero configured
+FPS limit uses, in order, a Lossless Scaling limit, explicit client display-mode
+rate, and authoritative requested-stream FPS. When those sources are known to
+be absent or zero, the result remains `FollowStream`.
 
-Integration remains pending for workspace registration, product settings
-versioning and persistence, management UI/edit authority, scoped override
-storage, NVHTTP launch projection, OS apply/restore, and virtual-display runtime
-coordination. macOS and unsupported explicit provider choices produce policy
-diagnostics and no candidate backend.
+On Windows, RTSS install paths may be absolute or relative Windows paths;
+relative install-path resolution belongs to the provider runtime and is not
+implemented here.
 
-Focused unit tests are included in `src/tests.rs`. This lightweight worktree is
-not build-enabled, so those tests have not been run here. Integration validation
-must register the crate and run `cargo test -p amaterasu-frame-limiter` in the
-reserved clean source checkout.
+Product settings versioning and persistence, management UI and edit authority,
+scoped override storage, NVHTTP launch projection, app lifecycle apply/restore,
+and provider runtime integration are owned by other lanes. The combined
+product-settings migration is reserved at v17. Unsupported explicit provider
+choices and macOS without a backend are returned as policy diagnostics; hardware
+availability remains unknown and is not reported as a detected backend result.
+
+Focused unit tests cover settings and policy in `src/tests.rs`; service wire and
+validation tests are inline in `src/service.rs`. The lane worktree is not
+build-enabled, so Cargo tests, builds, and Clippy have not been run here. The
+coordinator should run `cargo test -p amaterasu-frame-limiter` and
+`cargo clippy -p amaterasu-frame-limiter --all-targets -- -D warnings` in the
+reserved clean source checkout. Windows RTSS/NVCP and Linux Proton/MangoHUD
+runtime qualification remain outstanding.

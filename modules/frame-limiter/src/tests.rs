@@ -156,6 +156,15 @@ fn path_validation_is_target_specific_and_allows_windows_install_subfolders() {
         settings.validate(Platform::Windows),
         Err(SettingsError::InvalidRtssInstallPath)
     );
+    assert_eq!(
+        settings.validate(Platform::Linux),
+        Err(SettingsError::InvalidRtssInstallPath)
+    );
+    assert_eq!(
+        settings.validate(Platform::Macos),
+        Err(SettingsError::InvalidRtssInstallPath)
+    );
+    settings.rtss_install_path.clear();
     assert!(settings.validate(Platform::Linux).is_ok());
     assert!(settings.validate(Platform::Macos).is_ok());
     settings.rtss_install_path = "opt/rtss".into();
@@ -501,6 +510,22 @@ fn game_framegen_uses_reflex_only_on_supported_windows_and_yields_to_scoped_over
         RtssSyncLimiterReason::GameFrameGenerationSafety
     );
 
+    let inferred_physical_game_framegen = PolicyContext {
+        frame_generation_provider: FrameGenerationProvider::GameProvided,
+        nvidia_gpu_present: true,
+        ..PolicyContext::default()
+    };
+    assert!(should_consider_apply(
+        &settings,
+        inferred_physical_game_framegen
+    ));
+    let decision = resolve_rtss_sync_limiter(&settings, inferred_physical_game_framegen);
+    assert_eq!(decision.value, RtssFrameLimitType::NvidiaReflex);
+    assert_eq!(
+        decision.reason,
+        RtssSyncLimiterReason::GameFrameGenerationSafety
+    );
+
     let virtual_game_framegen = PolicyContext {
         virtual_display_active: true,
         frame_generation_provider: FrameGenerationProvider::GameProvided,
@@ -564,6 +589,24 @@ fn automatic_virtual_reflex_requires_policy_mode_global_opt_in_and_supported_gpu
         resolve_rtss_sync_limiter(&no_automatic_mode, virtual_context).value,
         RtssFrameLimitType::BackEdgeSync
     );
+    let game_framegen_without_virtual_policy = PolicyContext {
+        frame_generation_provider: FrameGenerationProvider::GameProvided,
+        ..virtual_context
+    };
+    assert!(should_consider_apply(
+        &no_automatic_mode,
+        game_framegen_without_virtual_policy
+    ));
+    let game_framegen_decision =
+        resolve_rtss_sync_limiter(&no_automatic_mode, game_framegen_without_virtual_policy);
+    assert_eq!(
+        game_framegen_decision.value,
+        RtssFrameLimitType::NvidiaReflex
+    );
+    assert_eq!(
+        game_framegen_decision.reason,
+        RtssSyncLimiterReason::GameFrameGenerationSafety
+    );
 
     let global_override = EffectiveSettings {
         rtss_allow_virtual_display_override: true,
@@ -572,6 +615,19 @@ fn automatic_virtual_reflex_requires_policy_mode_global_opt_in_and_supported_gpu
     assert_eq!(
         resolve_rtss_sync_limiter(&global_override, virtual_context).value,
         RtssFrameLimitType::BackEdgeSync
+    );
+    let game_framegen_with_global_override = EffectiveSettings {
+        rtss_allow_virtual_display_override: true,
+        ..no_automatic_mode
+    };
+    let decision = resolve_rtss_sync_limiter(
+        &game_framegen_with_global_override,
+        game_framegen_without_virtual_policy,
+    );
+    assert_eq!(decision.value, RtssFrameLimitType::NvidiaReflex);
+    assert_eq!(
+        decision.reason,
+        RtssSyncLimiterReason::GameFrameGenerationSafety
     );
 
     for unsupported in [
@@ -606,6 +662,16 @@ fn rtss_framegen_sync_policy_respects_smooth_motion_provider_and_platform() {
         ..PolicyContext::default()
     };
     let decision = resolve_rtss_sync_limiter(&settings, smooth_motion);
+    assert_eq!(decision.value, RtssFrameLimitType::FrontEdgeSync);
+    assert_eq!(decision.reason, RtssSyncLimiterReason::NvidiaSmoothMotion);
+
+    let inferred_smooth_motion = PolicyContext {
+        frame_generation_provider: FrameGenerationProvider::NvidiaSmoothMotion,
+        nvidia_gpu_present: true,
+        ..PolicyContext::default()
+    };
+    assert!(should_consider_apply(&settings, inferred_smooth_motion));
+    let decision = resolve_rtss_sync_limiter(&settings, inferred_smooth_motion);
     assert_eq!(decision.value, RtssFrameLimitType::FrontEdgeSync);
     assert_eq!(decision.reason, RtssSyncLimiterReason::NvidiaSmoothMotion);
 

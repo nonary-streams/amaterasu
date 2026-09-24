@@ -494,7 +494,7 @@ fn is_valid_install_path(value: &str, platform: Platform) -> bool {
         Platform::Windows => {
             is_absolute_windows_path(value) || is_relative_windows_install_path(value)
         }
-        Platform::Linux | Platform::Macos => value.starts_with('/'),
+        Platform::Linux | Platform::Macos => false,
     }
 }
 
@@ -505,7 +505,7 @@ fn is_relative_windows_install_path(value: &str) -> bool {
     !starts_at_root && !has_drive_prefix
 }
 
-fn is_absolute_windows_path(value: &str) -> bool {
+pub(crate) fn is_absolute_windows_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     let has_drive_root = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
