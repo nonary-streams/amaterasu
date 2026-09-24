@@ -2,6 +2,7 @@
 mod controller;
 mod model;
 mod native;
+mod open_policy;
 #[cfg(any(windows, test))]
 mod packet;
 mod platform;
@@ -76,6 +77,7 @@ impl ManagedModule for AudioModule {
                 let result = if service == SERVICE {
                     serde_json::from_value::<Operation>(payload)
                         .map_err(|_| "invalid_request")
+                        .map(open_policy::normalize)
                         .and_then(|operation| {
                             self.controller
                                 .lock()
