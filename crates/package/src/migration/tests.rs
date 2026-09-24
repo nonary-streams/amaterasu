@@ -104,10 +104,24 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
     let predecessor = fixture.path().join("Sunshine");
     write(
         &predecessor.join("sunshine.conf"),
-        b"pkey = private/key.pem\ncert = private/cert.pem\n",
+        b"pkey = credentials/key.pem # retained key path\ncert = credentials/cert.pem # retained cert path\n",
     );
-    write(&predecessor.join("private/key.pem"), b"key");
-    write(&predecessor.join("private/cert.pem"), b"cert");
+    write(&predecessor.join("credentials/key.pem"), b"key");
+    write(&predecessor.join("credentials/cert.pem"), b"cert");
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    for configured in [
+        PathBuf::from("credentials/key.pem"),
+        PathBuf::from("credentials/cert.pem"),
+    ] {
+        assert_eq!(
+            collected
+                .files
+                .iter()
+                .filter(|path| path.as_path() == configured.as_path())
+                .count(),
+            1
+        );
+    }
     let legacy_source = source(LegacyProduct::Sunshine, &predecessor);
     let plan = preflight_legacy_configuration_with_sensitive_sources(
         std::slice::from_ref(&legacy_source),
@@ -133,16 +147,131 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
     assert!(
         destination
             .join(LEGACY_IMPORT_DIRECTORY)
-            .join("sunshine/private/key.pem")
+            .join("sunshine/credentials/key.pem")
             .is_file()
     );
 
     write(
         &predecessor.join("sunshine.conf"),
-        b"pkey = ../outside.pem\ncert = private/cert.pem\n",
+        b"pkey = ../outside.pem\ncert = credentials/cert.pem\n",
     );
     assert!(
         analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).is_err()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn configured_identity_path_case_variants_share_one_snapshot_entry() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"pkey = CREDENTIALS/key.pem\n",
+    );
+    write(&predecessor.join("credentials/Key.PEM"), b"private key");
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    assert_eq!(
+        collected
+            .files
+            .iter()
+            .filter(|path| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("key.pem")))
+            .count(),
+        1
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn configured_identity_path_unicode_case_variants_share_one_snapshot_entry() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        "pkey = CREDENTIALS/ÉTAT.PEM\n".as_bytes(),
+    );
+    write(&predecessor.join("credentials/état.pem"), b"private key");
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    assert_eq!(
+        collected
+            .files
+            .iter()
+            .filter(|path| path
+                .file_name()
+                .is_some_and(|name| { name.to_string_lossy().to_lowercase() == "état.pem" }))
+            .count(),
+        1
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn configured_identity_path_windows_ordinal_case_variants_share_one_snapshot_entry() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        "pkey = CREDENTIALS/Σ.PEM\n".as_bytes(),
+    );
+    write(&predecessor.join("credentials/ς.pem"), b"private key");
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    assert_eq!(
+        collected
+            .files
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == std::ffi::OsStr::new("Σ.PEM"))
+            })
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshots_contained_sensitive_symlink_targets_under_the_configured_alias() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"pkey = credentials/key-alias.pem # source uses this alias\n",
+    );
+    write(&predecessor.join("private/key.pem"), b"private key");
+    fs::create_dir_all(predecessor.join("credentials")).unwrap();
+    symlink(
+        "../private/key.pem",
+        predecessor.join("credentials/key-alias.pem"),
+    )
+    .unwrap();
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Sunshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: false,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(
+            destination
+                .join(LEGACY_IMPORT_DIRECTORY)
+                .join("sunshine/credentials/key-alias.pem")
+        )
+        .unwrap(),
+        b"private key"
     );
 }
 
@@ -412,6 +541,48 @@ fn rejects_configured_state_symlinks_that_escape_the_predecessor_root() {
         b"vibeshine_file_state = external/not_created_yet.json\n",
     );
     assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshots_contained_configured_state_symlink_targets_under_the_configured_alias() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = credentials/state-alias.json\n",
+    );
+    write(&predecessor.join("private/state.json"), br#"{"root":{}}"#);
+    fs::create_dir_all(predecessor.join("credentials")).unwrap();
+    symlink(
+        "../private/state.json",
+        predecessor.join("credentials/state-alias.json"),
+    )
+    .unwrap();
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Sunshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: false,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(
+            destination
+                .join(LEGACY_IMPORT_DIRECTORY)
+                .join("sunshine/credentials/state-alias.json")
+        )
+        .unwrap(),
+        br#"{"root":{}}"#
+    );
 }
 
 #[test]

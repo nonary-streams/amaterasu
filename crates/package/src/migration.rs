@@ -153,6 +153,7 @@ pub struct PlanItem {
 
 struct CollectedConfigurationFiles {
     files: Vec<PathBuf>,
+    copy_sources: BTreeMap<PathBuf, PathBuf>,
     configured_state_files: BTreeSet<PathBuf>,
 }
 
@@ -678,7 +679,12 @@ fn snapshot_sources(
         let mut copied = Vec::with_capacity(collected.files.len());
         for relative in collected.files {
             let destination = directory.join(&relative);
-            copy_regular_file(&source.root.join(&relative), &destination)?;
+            let source_path = collected
+                .copy_sources
+                .get(&relative)
+                .cloned()
+                .unwrap_or_else(|| source.root.join(&relative));
+            copy_regular_file(&source_path, &destination)?;
             copied.push(SnapshotFile {
                 relative,
                 sha256: digest_regular_file(&destination)?,
@@ -739,6 +745,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
     }
 
     let mut files = Vec::new();
+    let mut copy_sources = BTreeMap::new();
     let mut configured_state_files = BTreeSet::new();
     for name in CONFIGURATION_FILES {
         let path = root.join(name);
@@ -747,17 +754,29 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
             files.push(PathBuf::from(name));
         }
     }
-    collect_configured_sensitive_files(root, &mut files)?;
-    collect_configured_state_files(root, &mut files, &mut configured_state_files)?;
+    collect_configured_sensitive_files(root, &mut files, &mut copy_sources)?;
+    collect_configured_state_files(
+        root,
+        &mut files,
+        &mut configured_state_files,
+        &mut copy_sources,
+    )?;
     for name in CONFIGURATION_DIRECTORIES {
         let path = root.join(name);
         if path.try_exists().map_err(io_error)? {
-            collect_directory_files(root, &path, &mut files)?;
+            collect_directory_files(root, &path, &mut files, &copy_sources)?;
         }
     }
+    deduplicate_collected_paths(
+        root,
+        &mut files,
+        &mut copy_sources,
+        &mut configured_state_files,
+    )?;
     files.sort();
     Ok((!files.is_empty()).then_some(CollectedConfigurationFiles {
         files,
+        copy_sources,
         configured_state_files,
     }))
 }
@@ -766,7 +785,11 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
 /// file remains inside the predecessor root. This makes an approved custom
 /// `pkey`, `cert`, or `credentials_file` usable after copy without allowing a
 /// legacy config to cause an elevated installer to read another location.
-fn collect_configured_sensitive_files(root: &Path, files: &mut Vec<PathBuf>) -> PackageResult<()> {
+fn collect_configured_sensitive_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
+) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
     for name in [
         "apollo.conf",
@@ -782,6 +805,10 @@ fn collect_configured_sensitive_files(root: &Path, files: &mut Vec<PathBuf>) -> 
             "predecessor configuration contains a non-text settings file".to_owned()
         })?;
         for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
@@ -801,17 +828,16 @@ fn collect_configured_sensitive_files(root: &Path, files: &mut Vec<PathBuf>) -> 
                     "predecessor configuration has an unsafe configured identity path".into(),
                 );
             }
-            let canonical = root.join(relative).canonicalize().map_err(io_error)?;
+            let configured_path = root.join(relative);
+            let canonical = configured_path.canonicalize().map_err(io_error)?;
             if !canonical.starts_with(&canonical_root) {
                 return Err(
                     "predecessor configuration has an escaping configured identity path".into(),
                 );
             }
             validate_regular_file(&canonical)?;
-            let copied = canonical
-                .strip_prefix(&canonical_root)
-                .map_err(|_| "predecessor configuration layout is invalid")?
-                .to_path_buf();
+            let copied = relative.to_path_buf();
+            copy_sources.insert(copied.clone(), canonical);
             if !files.contains(&copied) {
                 files.push(copied);
             }
@@ -827,6 +853,7 @@ fn collect_configured_state_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
     configured_state_files: &mut BTreeSet<PathBuf>,
+    copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
 ) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
     let mut configured = BTreeMap::<String, PathBuf>::new();
@@ -876,11 +903,9 @@ fn collect_configured_state_files(
             else {
                 continue;
             };
-            let copied = canonical
-                .strip_prefix(&canonical_root)
-                .map_err(|_| "predecessor configuration layout is invalid")?
-                .to_path_buf();
+            let copied = relative.to_path_buf();
             configured_state_files.insert(copied.clone());
+            copy_sources.insert(copied.clone(), canonical);
             if !files.contains(&copied) {
                 files.push(copied);
             }
@@ -933,19 +958,45 @@ fn collect_directory_files(
     root: &Path,
     directory: &Path,
     files: &mut Vec<PathBuf>,
+    copy_sources: &BTreeMap<PathBuf, PathBuf>,
 ) -> PackageResult<()> {
-    if !is_real_directory(directory)? {
+    let directory_metadata = fs::symlink_metadata(directory).map_err(io_error)?;
+    if is_reparse_or_symlink(&directory_metadata) {
+        let relative = directory
+            .strip_prefix(root)
+            .map_err(|_| "predecessor configuration layout is invalid")?;
+        for configured in copy_sources.keys() {
+            if configured_alias_covers_entry(root, configured, relative)? {
+                return Ok(());
+            }
+        }
+        return Err("predecessor configuration directory is unsafe".into());
+    }
+    if !directory_metadata.is_dir() {
         return Err("predecessor configuration directory is unsafe".into());
     }
     for entry in fs::read_dir(directory).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
-        if metadata.file_type().is_symlink() {
+        if is_reparse_or_symlink(&metadata) {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "predecessor configuration layout is invalid")?;
+            let mut is_configured_alias = false;
+            for configured in copy_sources.keys() {
+                if configured_alias_covers_entry(root, configured, relative)? {
+                    is_configured_alias = true;
+                    break;
+                }
+            }
+            if is_configured_alias {
+                continue;
+            }
             return Err("predecessor configuration contains a symbolic link".into());
         }
         if metadata.is_dir() {
-            collect_directory_files(root, &path, files)?;
+            collect_directory_files(root, &path, files, copy_sources)?;
         } else if metadata.is_file() {
             validate_regular_file(&path)?;
             let relative = path
@@ -959,20 +1010,178 @@ fn collect_directory_files(
     Ok(())
 }
 
+fn deduplicate_collected_paths(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
+    configured_state_files: &mut BTreeSet<PathBuf>,
+) -> PackageResult<()> {
+    let mut path_by_identity = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut unique_files = Vec::with_capacity(files.len());
+    for relative in files.drain(..) {
+        let identity = resolved_existing_relative_path(root, &relative)?;
+        if let Some(existing_relative) = path_by_identity.get(&identity) {
+            if let Some(source) = copy_sources.remove(&relative) {
+                copy_sources
+                    .entry(existing_relative.clone())
+                    .or_insert(source);
+            }
+            if configured_state_files.remove(&relative) {
+                configured_state_files.insert(existing_relative.clone());
+            }
+        } else {
+            path_by_identity.insert(identity, relative.clone());
+            unique_files.push(relative);
+        }
+    }
+    *files = unique_files;
+    Ok(())
+}
+
+fn configured_alias_covers_entry(
+    root: &Path,
+    configured: &Path,
+    entry: &Path,
+) -> PackageResult<bool> {
+    let entry_component_count = entry.components().count();
+    let configured_components: Vec<_> = configured.components().collect();
+    if configured_components.len() < entry_component_count {
+        return Ok(false);
+    }
+    let mut configured_prefix = PathBuf::new();
+    for component in configured_components
+        .into_iter()
+        .take(entry_component_count)
+    {
+        configured_prefix.push(component.as_os_str());
+    }
+    Ok(resolved_existing_relative_path(root, &configured_prefix)?
+        == resolved_existing_relative_path(root, entry)?)
+}
+
+/// Resolves the directory-entry spelling without following the final symlink.
+/// On Windows this gives case-insensitive paths the same identity while keeping
+/// distinct entries in case-sensitive directories separate.
+fn resolved_existing_relative_path(root: &Path, relative: &Path) -> PackageResult<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        return Ok(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let mut current = root.to_path_buf();
+        let mut resolved = PathBuf::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(requested) = component else {
+                return Err("predecessor configuration path is not relative".into());
+            };
+            let mut insensitive_match = None;
+            let mut ambiguous_match = false;
+            for entry in fs::read_dir(&current).map_err(io_error)? {
+                let name = entry.map_err(io_error)?.file_name();
+                if name.as_os_str() == requested {
+                    insensitive_match = Some(name);
+                    ambiguous_match = false;
+                    break;
+                }
+                if windows_path_component_matches(requested, &name)? {
+                    if insensitive_match.is_some() {
+                        ambiguous_match = true;
+                    } else {
+                        insensitive_match = Some(name);
+                    }
+                }
+            }
+            if ambiguous_match {
+                return Err("predecessor configuration path casing is ambiguous".into());
+            }
+            let name =
+                insensitive_match.ok_or("predecessor configuration path cannot be resolved")?;
+            current.push(&name);
+            resolved.push(name);
+        }
+        Ok(resolved)
+    }
+}
+
+#[cfg(windows)]
+fn windows_path_component_matches(
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> PackageResult<bool> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let left_units: Vec<u16> = left.encode_wide().collect();
+    let right_units: Vec<u16> = right.encode_wide().collect();
+    if left_units.is_empty() || right_units.is_empty() {
+        return Ok(left_units.is_empty() && right_units.is_empty());
+    }
+    let left_length = i32::try_from(left_units.len())
+        .map_err(|_| "predecessor path component is too long to compare")?;
+    let right_length = i32::try_from(right_units.len())
+        .map_err(|_| "predecessor path component is too long to compare")?;
+    // SAFETY: both buffers remain alive for the call, and their lengths are the
+    // exact UTF-16 code-unit counts passed to CompareStringOrdinal.
+    let comparison = unsafe {
+        compare_string_ordinal(
+            left_units.as_ptr(),
+            left_length,
+            right_units.as_ptr(),
+            right_length,
+            1,
+        )
+    };
+    match comparison {
+        1 | 3 => Ok(false),
+        2 => Ok(true),
+        _ => Err("Windows could not compare predecessor path casing".into()),
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CompareStringOrdinal"]
+    fn compare_string_ordinal(
+        left: *const u16,
+        left_length: i32,
+        right: *const u16,
+        right_length: i32,
+        ignore_case: i32,
+    ) -> i32;
+}
+
 fn is_real_directory(path: &Path) -> PackageResult<bool> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    Ok(metadata.is_dir() && !metadata.file_type().is_symlink())
+    Ok(metadata.is_dir() && !is_reparse_or_symlink(&metadata))
 }
 
 fn validate_regular_file(path: &Path) -> PackageResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
         return Err("predecessor configuration contains an unsafe file".into());
     }
     if metadata.len() > MAX_CONFIGURATION_FILE_BYTES {
         return Err("predecessor configuration file exceeds the migration limit".into());
     }
     Ok(())
+}
+
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn copy_regular_file(source: &Path, destination: &Path) -> PackageResult<()> {
