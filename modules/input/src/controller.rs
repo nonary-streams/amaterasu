@@ -257,6 +257,7 @@ impl<B: Backend> Controller<B> {
                     now,
                     self.backend.name(),
                     self.backend.absolute_pointer(),
+                    self.backend.controller_input_supported(),
                 ));
             }
             if let Some(terminal) = self
@@ -317,6 +318,7 @@ impl<B: Backend> Controller<B> {
             now,
             self.backend.name(),
             self.backend.absolute_pointer(),
+            self.backend.controller_input_supported(),
         ))
     }
 
@@ -330,6 +332,7 @@ impl<B: Backend> Controller<B> {
                 now,
                 self.backend.name(),
                 self.backend.absolute_pointer(),
+                self.backend.controller_input_supported(),
             ));
         }
         if let Some(terminal) = self
@@ -417,6 +420,18 @@ impl<B: Backend> Controller<B> {
                 }
             });
             if let Err(error) = result {
+                if matches!(event, Event::Controller { .. })
+                    && error.code == "controller_unavailable"
+                {
+                    // Keep the active lease and let its owner decide whether to
+                    // drop this gamepad packet. The backend retains any virtual
+                    // device whose neutral release or destroy still needs retry.
+                    let mut reply = self.failure(error);
+                    reply["lease"] = json!(token);
+                    reply["accepted"] = accepted.into();
+                    reply["partial_event_possible"] = true.into();
+                    return reply;
+                }
                 let _ = self.finish_lease(Instant::now(), "failed");
                 let mut reply = self.failure(error);
                 reply["accepted"] = accepted.into();
@@ -693,13 +708,21 @@ impl<B: Backend> Controller<B> {
             self.retry_at = now + Duration::from_millis(100);
             return Err(InputError::new("release_failed", error.message));
         }
+        if self.lease.is_some()
+            && let Err(error) = self.backend.stop()
+        {
+            if let Some(lease) = &mut self.lease {
+                lease.cleanup_required = true;
+            }
+            self.retry_at = now + Duration::from_millis(100);
+            return Err(InputError::new("release_failed", error.message));
+        }
         let Some(lease) = self.lease.take() else {
             self.reset_scroll_remainders();
             self.retry_at = now;
             return Ok(());
         };
         self.reset_scroll_remainders();
-        self.backend.stop();
         if let Some(operation_id) = lease.operation_id {
             self.terminal_acquires.push_back(TerminalAcquire {
                 owner: lease.owner,
@@ -723,7 +746,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -741,12 +764,18 @@ impl<B: Backend> Drop for Controller<B> {
         // destroys its owned uinput devices; Windows cannot undo OS rejection.
         let _ = self.finish_lease(Instant::now(), "cancelled");
         if self.lease.is_some() {
-            self.backend.stop();
+            let _ = self.backend.stop();
         }
     }
 }
 
-fn active_lease(lease: &Lease, now: Instant, backend: &str, absolute_pointer: bool) -> Value {
+fn active_lease(
+    lease: &Lease,
+    now: Instant,
+    backend: &str,
+    absolute_pointer: bool,
+    controller_input: bool,
+) -> Value {
     json!({
         "ok": true,
         "state": "active",
@@ -756,6 +785,7 @@ fn active_lease(lease: &Lease, now: Instant, backend: &str, absolute_pointer: bo
         "expires_in_ms": lease.expires.saturating_duration_since(now).as_millis() as u64,
         "backend": backend,
         "absolute_pointer": absolute_pointer,
+        "controller_input": controller_input,
         "cleanup_required": lease.cleanup_required,
     })
 }

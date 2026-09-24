@@ -1,6 +1,8 @@
-//! Caller-owned keyboard and mouse injection with bounded leases and cleanup.
+//! Caller-owned keyboard, mouse, and capability-gated gamepad input with leases.
 mod backend;
 mod controller;
+#[cfg(any(target_os = "linux", test))]
+mod gamepad;
 mod model;
 mod product_settings;
 

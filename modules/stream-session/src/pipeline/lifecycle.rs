@@ -108,7 +108,7 @@ impl Pipeline {
             record.input_lookup_required = true;
         }
         if job.step == Step::InputBatch {
-            record.input_inflight = record.input_events.len().min(MAX_BATCH_EVENTS);
+            record.input_inflight = next_input_batch_size(record);
         }
         let (service, payload) = job.command(record);
         self.sequence = match self.sequence.checked_add(1) {
@@ -145,6 +145,14 @@ impl Pipeline {
             return self.consume_cleanup(record, job, payload, send);
         }
         if payload["ok"] != true {
+            if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
+            {
+                match accept_controller_batch_failure(record, &payload) {
+                    Ok(()) => return false,
+                    Err(code) => job.fail(record, code, now),
+                }
+                return true;
+            }
             job.fail(record, "dependency_rejected", now);
             return true;
         }

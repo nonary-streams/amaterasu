@@ -1,0 +1,585 @@
+use crate::model::{InputError, InputResult};
+
+pub(crate) const GAMEPAD_SLOT_COUNT: usize = 16;
+
+const EV_KEY: u16 = 1;
+const EV_ABS: u16 = 3;
+
+const BTN_SOUTH: u16 = 0x130;
+const BTN_EAST: u16 = 0x131;
+const BTN_NORTH: u16 = 0x133;
+const BTN_WEST: u16 = 0x134;
+const BTN_TL: u16 = 0x136;
+const BTN_TR: u16 = 0x137;
+const BTN_TL2: u16 = 0x138;
+const BTN_TR2: u16 = 0x139;
+const BTN_SELECT: u16 = 0x13a;
+const BTN_START: u16 = 0x13b;
+const BTN_MODE: u16 = 0x13c;
+const BTN_THUMBL: u16 = 0x13d;
+const BTN_THUMBR: u16 = 0x13e;
+const BTN_DPAD_UP: u16 = 0x220;
+const BTN_DPAD_DOWN: u16 = 0x221;
+const BTN_DPAD_LEFT: u16 = 0x222;
+const BTN_DPAD_RIGHT: u16 = 0x223;
+const BTN_TRIGGER_HAPPY1: u16 = 0x2c0;
+
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_Z: u16 = 0x02;
+const ABS_RX: u16 = 0x03;
+const ABS_RY: u16 = 0x04;
+const ABS_RZ: u16 = 0x05;
+
+pub(crate) const GAMEPAD_ABSOLUTE_AXES: [(u16, i32, i32); 6] = [
+    (ABS_X, i16::MIN as i32, i16::MAX as i32),
+    (ABS_Y, i16::MIN as i32, i16::MAX as i32),
+    (ABS_Z, 0, u8::MAX as i32),
+    (ABS_RX, i16::MIN as i32, i16::MAX as i32),
+    (ABS_RY, i16::MIN as i32, i16::MAX as i32),
+    (ABS_RZ, 0, u8::MAX as i32),
+];
+
+// These bit values follow Vibeshine's pinned controller packet constants.
+// Bit 11 and bits 22..31 have no assigned button in that protocol and are
+// ignored just as Vibeshine's native button projections ignore them.
+const BUTTON_MAP: [(u32, u16); 21] = [
+    (1 << 0, BTN_DPAD_UP),
+    (1 << 1, BTN_DPAD_DOWN),
+    (1 << 2, BTN_DPAD_LEFT),
+    (1 << 3, BTN_DPAD_RIGHT),
+    (1 << 4, BTN_START),
+    (1 << 5, BTN_SELECT),
+    (1 << 6, BTN_THUMBL),
+    (1 << 7, BTN_THUMBR),
+    (1 << 8, BTN_TL),
+    (1 << 9, BTN_TR),
+    (1 << 10, BTN_MODE),
+    (1 << 12, BTN_SOUTH),
+    (1 << 13, BTN_EAST),
+    (1 << 14, BTN_WEST),
+    (1 << 15, BTN_NORTH),
+    (1 << 16, BTN_TRIGGER_HAPPY1),
+    (1 << 17, BTN_TRIGGER_HAPPY1 + 1),
+    (1 << 18, BTN_TRIGGER_HAPPY1 + 2),
+    (1 << 19, BTN_TRIGGER_HAPPY1 + 3),
+    (1 << 20, BTN_TRIGGER_HAPPY1 + 4),
+    (1 << 21, BTN_TRIGGER_HAPPY1 + 5),
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ControllerSnapshot {
+    pub buttons: u32,
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+    pub left_x: i16,
+    pub left_y: i16,
+    pub right_x: i16,
+    pub right_y: i16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeGamepadEvent {
+    pub event_type: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
+pub(crate) fn possible_controller_state_after_write_failure(
+    previous: ControllerSnapshot,
+    next: ControllerSnapshot,
+) -> ControllerSnapshot {
+    ControllerSnapshot {
+        buttons: previous.buttons | next.buttons,
+        left_trigger: previous.left_trigger.max(next.left_trigger),
+        right_trigger: previous.right_trigger.max(next.right_trigger),
+        left_x: possible_axis(previous.left_x, next.left_x),
+        left_y: possible_axis(previous.left_y, next.left_y),
+        right_x: possible_axis(previous.right_x, next.right_x),
+        right_y: possible_axis(previous.right_y, next.right_y),
+    }
+}
+
+fn possible_axis(previous: i16, next: i16) -> i16 {
+    if next == 0 { previous } else { next }
+}
+
+pub(crate) fn controller_state_events(
+    previous: ControllerSnapshot,
+    next: ControllerSnapshot,
+) -> Vec<NativeGamepadEvent> {
+    let mut events = Vec::with_capacity(BUTTON_MAP.len() + 8);
+    for (mask, code) in BUTTON_MAP {
+        let was_pressed = previous.buttons & mask != 0;
+        let is_pressed = next.buttons & mask != 0;
+        if was_pressed != is_pressed {
+            events.push(NativeGamepadEvent {
+                event_type: EV_KEY,
+                code,
+                value: i32::from(is_pressed),
+            });
+        }
+    }
+
+    for (was_pressed, is_pressed, code) in [
+        (previous.left_trigger != 0, next.left_trigger != 0, BTN_TL2),
+        (
+            previous.right_trigger != 0,
+            next.right_trigger != 0,
+            BTN_TR2,
+        ),
+    ] {
+        if was_pressed != is_pressed {
+            events.push(NativeGamepadEvent {
+                event_type: EV_KEY,
+                code,
+                value: i32::from(is_pressed),
+            });
+        }
+    }
+
+    for (previous, next, code) in [
+        (previous.left_x, next.left_x, ABS_X),
+        (previous.left_y, next.left_y, ABS_Y),
+        (
+            i16::from(previous.left_trigger),
+            i16::from(next.left_trigger),
+            ABS_Z,
+        ),
+        (previous.right_x, next.right_x, ABS_RX),
+        (previous.right_y, next.right_y, ABS_RY),
+        (
+            i16::from(previous.right_trigger),
+            i16::from(next.right_trigger),
+            ABS_RZ,
+        ),
+    ] {
+        if previous != next {
+            events.push(NativeGamepadEvent {
+                event_type: EV_ABS,
+                code,
+                value: i32::from(next),
+            });
+        }
+    }
+
+    events
+}
+
+pub(crate) fn gamepad_key_codes() -> impl Iterator<Item = u16> {
+    BUTTON_MAP
+        .into_iter()
+        .map(|(_, code)| code)
+        .chain([BTN_TL2, BTN_TR2])
+}
+
+pub(crate) trait GamepadDevice {
+    fn update(&mut self, state: ControllerSnapshot) -> InputResult<()>;
+
+    fn release(&mut self) -> InputResult<()> {
+        self.update(ControllerSnapshot::default())
+    }
+}
+
+/// Owns the client-relative controller slots for one input lease.
+pub(crate) struct GamepadSlots<Device> {
+    devices: [Option<Device>; GAMEPAD_SLOT_COUNT],
+}
+
+impl<Device: GamepadDevice> GamepadSlots<Device> {
+    pub(crate) fn new() -> Self {
+        Self {
+            devices: std::array::from_fn(|_| None),
+        }
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        number: u16,
+        active_mask: u16,
+        state: ControllerSnapshot,
+        mut create: impl FnMut(u8) -> InputResult<Device>,
+    ) -> InputResult<()> {
+        if usize::from(number) >= GAMEPAD_SLOT_COUNT {
+            return Err(InputError::new(
+                "invalid_event",
+                "controller number must be in the range 0..16",
+            ));
+        }
+
+        for (slot, slot_device) in self.devices.iter_mut().enumerate() {
+            if active_mask & (1 << slot) == 0
+                && let Some(device) = slot_device.as_mut()
+            {
+                device.release()?;
+                *slot_device = None;
+            }
+        }
+
+        let slot = usize::from(number);
+        if active_mask & (1 << slot) == 0 {
+            return Ok(());
+        }
+        if self.devices[slot].is_none() {
+            self.devices[slot] = Some(create(number as u8)?);
+        }
+        self.devices[slot]
+            .as_mut()
+            .expect("active gamepad slot was created")
+            .update(state)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.devices.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn stop(&mut self) -> InputResult<()> {
+        let mut first_error = None;
+        for slot_device in &mut self.devices {
+            if let Some(device) = slot_device.as_mut() {
+                match device.release() {
+                    Ok(()) => *slot_device = None,
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl<Device: GamepadDevice> Default for GamepadSlots<Device> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Trace {
+        created: Vec<u8>,
+        updates: Vec<(u8, ControllerSnapshot)>,
+        dropped: Vec<u8>,
+    }
+
+    struct FakeDevice {
+        slot: u8,
+        trace: Rc<RefCell<Trace>>,
+    }
+
+    impl GamepadDevice for FakeDevice {
+        fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+            self.trace.borrow_mut().updates.push((self.slot, state));
+            Ok(())
+        }
+    }
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            self.trace.borrow_mut().dropped.push(self.slot);
+        }
+    }
+
+    fn create_device(trace: Rc<RefCell<Trace>>, slot: u8) -> InputResult<FakeDevice> {
+        trace.borrow_mut().created.push(slot);
+        Ok(FakeDevice { slot, trace })
+    }
+
+    #[test]
+    fn controller_mapping_covers_each_defined_button_and_releases_each_one() {
+        let all_buttons = BUTTON_MAP.iter().fold(0, |flags, (mask, _)| flags | mask);
+        let pressed = controller_state_events(
+            ControllerSnapshot::default(),
+            ControllerSnapshot {
+                buttons: all_buttons,
+                ..ControllerSnapshot::default()
+            },
+        );
+
+        assert_eq!(pressed.len(), BUTTON_MAP.len());
+        assert!(
+            pressed
+                .iter()
+                .all(|event| event.event_type == EV_KEY && event.value == 1)
+        );
+        assert!(BUTTON_MAP.iter().all(|(_, code)| {
+            pressed
+                .iter()
+                .any(|event| event.code == *code && event.value == 1)
+        }));
+
+        let released = controller_state_events(
+            ControllerSnapshot {
+                buttons: all_buttons,
+                ..ControllerSnapshot::default()
+            },
+            ControllerSnapshot::default(),
+        );
+        assert_eq!(released.len(), BUTTON_MAP.len());
+        assert!(
+            released
+                .iter()
+                .all(|event| event.event_type == EV_KEY && event.value == 0)
+        );
+    }
+
+    #[test]
+    fn controller_mapping_keeps_signed_axes_and_full_trigger_ranges() {
+        let events = controller_state_events(
+            ControllerSnapshot::default(),
+            ControllerSnapshot {
+                left_trigger: u8::MAX,
+                right_trigger: 1,
+                left_x: i16::MIN,
+                left_y: i16::MAX,
+                right_x: -1,
+                right_y: 1,
+                ..ControllerSnapshot::default()
+            },
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EV_ABS)
+                .map(|event| (event.code, event.value))
+                .collect::<Vec<_>>(),
+            [
+                (ABS_X, i32::from(i16::MIN)),
+                (ABS_Y, i32::from(i16::MAX)),
+                (ABS_Z, 255),
+                (ABS_RX, -1),
+                (ABS_RY, 1),
+                (ABS_RZ, 1),
+            ]
+        );
+        assert!(events.contains(&NativeGamepadEvent {
+            event_type: EV_KEY,
+            code: BTN_TL2,
+            value: 1,
+        }));
+        assert!(events.contains(&NativeGamepadEvent {
+            event_type: EV_KEY,
+            code: BTN_TR2,
+            value: 1,
+        }));
+    }
+
+    #[test]
+    fn ambiguous_partial_writes_retain_a_state_that_can_release_every_prior_press() {
+        let previous = ControllerSnapshot {
+            buttons: 1 << 4,
+            left_trigger: 30,
+            left_x: 100,
+            ..ControllerSnapshot::default()
+        };
+        let next = ControllerSnapshot {
+            buttons: 1 << 5,
+            right_trigger: 70,
+            left_y: -200,
+            ..ControllerSnapshot::default()
+        };
+        let possible = possible_controller_state_after_write_failure(previous, next);
+        assert_eq!(possible.buttons, (1 << 4) | (1 << 5));
+        assert_eq!(possible.left_trigger, 30);
+        assert_eq!(possible.right_trigger, 70);
+        assert_eq!(possible.left_x, 100);
+        assert_eq!(possible.left_y, -200);
+
+        let release = controller_state_events(possible, ControllerSnapshot::default());
+        assert!(
+            release
+                .iter()
+                .any(|event| event.code == BTN_START && event.value == 0)
+        );
+        assert!(
+            release
+                .iter()
+                .any(|event| event.code == BTN_SELECT && event.value == 0)
+        );
+        assert!(
+            release
+                .iter()
+                .any(|event| event.code == ABS_X && event.value == 0)
+        );
+        assert!(
+            release
+                .iter()
+                .any(|event| event.code == ABS_Y && event.value == 0)
+        );
+    }
+
+    #[test]
+    fn unassigned_button_bits_are_ignored() {
+        let events = controller_state_events(
+            ControllerSnapshot::default(),
+            ControllerSnapshot {
+                buttons: (1 << 11) | (1 << 22) | (1 << 31),
+                ..ControllerSnapshot::default()
+            },
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn special_home_and_extended_button_bits_match_the_pinned_protocol() {
+        assert!(BUTTON_MAP.contains(&(0x00000400, BTN_MODE)));
+        assert!(BUTTON_MAP.contains(&(0x00010000, BTN_TRIGGER_HAPPY1)));
+        assert!(BUTTON_MAP.contains(&(0x00020000, BTN_TRIGGER_HAPPY1 + 1)));
+        assert!(BUTTON_MAP.contains(&(0x00040000, BTN_TRIGGER_HAPPY1 + 2)));
+        assert!(BUTTON_MAP.contains(&(0x00080000, BTN_TRIGGER_HAPPY1 + 3)));
+        assert!(BUTTON_MAP.contains(&(0x00100000, BTN_TRIGGER_HAPPY1 + 4)));
+        assert!(BUTTON_MAP.contains(&(0x00200000, BTN_TRIGGER_HAPPY1 + 5)));
+    }
+
+    #[test]
+    fn virtual_device_capabilities_cover_the_mapped_buttons_and_axes() {
+        assert_eq!(
+            gamepad_key_codes().collect::<Vec<_>>(),
+            [
+                BTN_DPAD_UP,
+                BTN_DPAD_DOWN,
+                BTN_DPAD_LEFT,
+                BTN_DPAD_RIGHT,
+                BTN_START,
+                BTN_SELECT,
+                BTN_THUMBL,
+                BTN_THUMBR,
+                BTN_TL,
+                BTN_TR,
+                BTN_MODE,
+                BTN_SOUTH,
+                BTN_EAST,
+                BTN_WEST,
+                BTN_NORTH,
+                BTN_TRIGGER_HAPPY1,
+                BTN_TRIGGER_HAPPY1 + 1,
+                BTN_TRIGGER_HAPPY1 + 2,
+                BTN_TRIGGER_HAPPY1 + 3,
+                BTN_TRIGGER_HAPPY1 + 4,
+                BTN_TRIGGER_HAPPY1 + 5,
+                BTN_TL2,
+                BTN_TR2,
+            ]
+        );
+        assert_eq!(
+            GAMEPAD_ABSOLUTE_AXES,
+            [
+                (ABS_X, -32768, 32767),
+                (ABS_Y, -32768, 32767),
+                (ABS_Z, 0, 255),
+                (ABS_RX, -32768, 32767),
+                (ABS_RY, -32768, 32767),
+                (ABS_RZ, 0, 255),
+            ]
+        );
+    }
+
+    #[test]
+    fn lease_slots_are_created_by_client_number_removed_by_mask_and_released_on_stop() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let state = ControllerSnapshot {
+            buttons: 1,
+            ..ControllerSnapshot::default()
+        };
+
+        slots
+            .apply(0, 0b1000_0000_0000_0001, state, |slot| {
+                create_device(trace.clone(), slot)
+            })
+            .unwrap();
+        slots
+            .apply(15, 0b1000_0000_0000_0001, state, |slot| {
+                create_device(trace.clone(), slot)
+            })
+            .unwrap();
+        assert_eq!(trace.borrow().created, [0, 15]);
+        assert_eq!(trace.borrow().updates, [(0, state), (15, state)]);
+
+        slots
+            .apply(0, 1, ControllerSnapshot::default(), |slot| {
+                create_device(trace.clone(), slot)
+            })
+            .unwrap();
+        assert_eq!(trace.borrow().dropped, [15]);
+        assert_eq!(
+            trace.borrow().updates.last(),
+            Some(&(0, ControllerSnapshot::default()))
+        );
+
+        slots.stop().unwrap();
+        assert_eq!(trace.borrow().dropped, [15, 0]);
+        assert_eq!(
+            trace.borrow().updates.last(),
+            Some(&(0, ControllerSnapshot::default()))
+        );
+    }
+
+    #[test]
+    fn inactive_packets_remove_stale_slots_without_allocating_the_current_slot() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        slots
+            .apply(3, 1 << 3, ControllerSnapshot::default(), |slot| {
+                create_device(trace.clone(), slot)
+            })
+            .unwrap();
+        slots
+            .apply(3, 0, ControllerSnapshot::default(), |slot| {
+                create_device(trace.clone(), slot)
+            })
+            .unwrap();
+
+        assert_eq!(trace.borrow().created, [3]);
+        assert_eq!(trace.borrow().dropped, [3]);
+    }
+
+    #[test]
+    fn failed_neutral_release_retains_the_slot_for_cleanup_retry() {
+        struct FailingDevice {
+            fail_release: Rc<std::cell::Cell<bool>>,
+        }
+        impl GamepadDevice for FailingDevice {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                if state == ControllerSnapshot::default() && self.fail_release.get() {
+                    Err(InputError::new("injection_failed", "test release failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let fail_release = Rc::new(std::cell::Cell::new(true));
+        let mut slots = GamepadSlots::new();
+        slots
+            .apply(
+                0,
+                1,
+                ControllerSnapshot {
+                    buttons: 1,
+                    ..ControllerSnapshot::default()
+                },
+                |_| {
+                    Ok(FailingDevice {
+                        fail_release: fail_release.clone(),
+                    })
+                },
+            )
+            .unwrap();
+
+        assert_eq!(slots.stop().unwrap_err().code, "injection_failed");
+        assert!(!slots.is_empty());
+        fail_release.set(false);
+        slots.stop().unwrap();
+        assert!(slots.is_empty());
+    }
+}

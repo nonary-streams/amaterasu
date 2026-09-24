@@ -166,8 +166,9 @@ impl Backend for WindowsBackend {
         self.key_rightalt_to_key_win = enabled;
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> InputResult<()> {
         self.held_key_plans.clear();
+        Ok(())
     }
 }
 
@@ -604,6 +605,7 @@ mod tests {
         };
         let backend = WindowsBackend::new(String::new());
 
+        assert!(!backend.controller_input_supported());
         assert_eq!(
             backend.validate(&event).unwrap_err().code,
             "unsupported_event"
@@ -625,6 +627,7 @@ mod tests {
             &mut || Ok(()),
         );
         let lease = acquired["lease"].as_str().unwrap().to_owned();
+        assert_eq!(acquired["controller_input"], false);
         let rejected = controller.handle(
             "owner",
             Operation::Batch {
@@ -638,6 +641,7 @@ mod tests {
         assert!(rejected.get("accepted").is_none());
 
         let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+        assert_eq!(status["controller_input"], false);
         assert_eq!(status["lease"]["token"], lease);
         assert_eq!(status["lease"]["pressed_count"], 0);
     }

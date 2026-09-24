@@ -106,6 +106,65 @@ fn controller_input_remains_unsupported_without_failing_an_active_stream() {
     assert!(host.broker.input_lease.is_some());
 }
 
+#[test]
+fn controller_state_is_forwarded_when_the_input_lease_advertises_support() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let active = host.response(2, start(id));
+    assert_eq!(active["state"], "active");
+    assert_eq!(active["controller_input"], true);
+
+    host.plane.borrow_mut().controls.push(controller_packet(1));
+    host.idle();
+
+    assert_eq!(
+        host.broker.input_events,
+        [json!({
+            "kind":"controller",
+            "number":15,
+            "active_mask":0xa55a,
+            "buttons":0x89abcdefu32,
+            "left_trigger":0,
+            "right_trigger":255,
+            "left_x":-32768,
+            "left_y":32767,
+            "right_x":-1,
+            "right_y":1,
+        })]
+    );
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 1);
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 0);
+}
+
+#[test]
+fn unavailable_virtual_gamepad_is_dropped_without_stopping_the_stream_or_input_lease() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker.fail_controller_input = true;
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    host.plane
+        .borrow_mut()
+        .controls
+        .extend([controller_packet(1), controller_packet(2)]);
+    host.idle();
+
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.pipeline.records[&id].unsupported_controls, 1);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 1);
+    assert!(host.pipeline.records[&id].input_lease.is_some());
+
+    host.plane.borrow_mut().controls.push(relative(3));
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 2);
+    assert!(host.pipeline.records[&id].input_lease.is_some());
+}
+
 fn relative(sequence: u64) -> crate::plane::ControlRecord {
     crate::plane::ControlRecord {
         message_type: 0x0206,
@@ -510,6 +569,19 @@ fn absent_geometry_is_unsupported_and_malformed_geometry_fails_startup() {
     assert_eq!(failed["state"], "failed");
     assert_eq!(failed["error"], "invalid_input_response");
     assert!(malformed_capability.broker.input_lease.is_none());
+
+    let mut malformed_controller_capability = Harness::new();
+    enable_input(&mut malformed_controller_capability);
+    malformed_controller_capability
+        .broker
+        .input_controller_supported = Some(json!(1));
+    let id = malformed_controller_capability.response(1, prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let failed = malformed_controller_capability.response(2, start(id));
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["error"], "invalid_input_response");
+    assert!(malformed_controller_capability.broker.input_lease.is_none());
 }
 
 #[test]

@@ -43,7 +43,9 @@ impl Backend for TestBackend {
             Ok(())
         }
     }
-    fn stop(&mut self) {}
+    fn stop(&mut self) -> InputResult<()> {
+        Ok(())
+    }
 }
 
 struct Script {

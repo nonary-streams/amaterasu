@@ -95,6 +95,7 @@ pub(super) struct Record {
     pub input_ttl_ms: u64,
     pub capture_geometry: Option<CaptureGeometry>,
     pub input_absolute_pointer: bool,
+    pub input_controller_supported: bool,
     pub input_translator: InputTranslator,
     pub input_attempted: bool,
     pub input_lookup_required: bool,
@@ -145,6 +146,7 @@ impl Record {
             input_ttl_ms,
             capture_geometry: None,
             input_absolute_pointer: false,
+            input_controller_supported: false,
             input_translator: InputTranslator::default(),
             input_attempted: false,
             input_lookup_required: false,
@@ -241,6 +243,8 @@ impl Record {
             "absolute_input": self.input_lease.is_some()
                 && self.capture_geometry.is_some()
                 && self.input_absolute_pointer,
+            "controller_input": self.input_lease.is_some()
+                && self.input_controller_supported,
             "input_events_sent": self.input_events_sent,
             "input_batches": self.input_batches,
         })

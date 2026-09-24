@@ -10,7 +10,10 @@ struct FakeBackend {
     stops: usize,
     fail_next: bool,
     fail_release: bool,
+    fail_stop: bool,
+    fail_controller_input: bool,
     reject_absolute: bool,
+    controller_input_supported: bool,
 }
 impl Backend for FakeBackend {
     fn name(&self) -> &'static str {
@@ -21,6 +24,9 @@ impl Backend for FakeBackend {
     }
     fn absolute_pointer(&self) -> bool {
         !self.reject_absolute
+    }
+    fn controller_input_supported(&self) -> bool {
+        self.controller_input_supported
     }
     fn key_encoding(&self) -> &'static str {
         "test_only"
@@ -38,6 +44,14 @@ impl Backend for FakeBackend {
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.trace.borrow_mut().push(event.clone());
+        if matches!(event, Event::Controller { .. })
+            && std::mem::take(&mut self.fail_controller_input)
+        {
+            return Err(InputError::new(
+                "controller_unavailable",
+                "test virtual gamepad failure",
+            ));
+        }
         if std::mem::take(&mut self.fail_next)
             || (self.fail_release && event.transition().is_some_and(|(_, down)| !down))
         {
@@ -48,8 +62,16 @@ impl Backend for FakeBackend {
         }
         Ok(())
     }
-    fn stop(&mut self) {
+    fn stop(&mut self) -> InputResult<()> {
         self.stops += 1;
+        if self.fail_stop {
+            Err(InputError::new(
+                "injection_failed",
+                "virtual device still active",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 fn key(code: u16, state: KeyState) -> Event {
@@ -85,6 +107,73 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
     assert_eq!(response["ok"], true);
     response["lease"].as_str().unwrap().into()
 }
+
+#[test]
+fn controller_capability_is_present_in_status_and_active_lease_responses() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("gamepad-capability".into()),
+            ttl_ms: Some(1000),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["controller_input"], true);
+
+    let lookup = controller.handle(
+        "owner",
+        Operation::Lookup {
+            operation_id: "gamepad-capability".into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(lookup["controller_input"], true);
+
+    let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(status["controller_input"], true);
+}
+
+#[test]
+fn failed_backend_stop_keeps_lease_for_cleanup_retry() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_stop: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    let rejected_release = controller.handle(
+        "owner",
+        Operation::Release {
+            lease: token.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(rejected_release["error"]["code"], "release_failed");
+    assert_eq!(rejected_release["cleanup_required"], true);
+
+    let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(status["lease"]["token"], token);
+    assert_eq!(status["lease"]["cleanup_required"], true);
+
+    controller.backend.fail_stop = false;
+    controller.expire(now + Duration::from_millis(101));
+    assert!(controller.lease.is_none());
+    assert_eq!(controller.backend.stops, 2);
+}
 fn batch(controller: &mut Controller<FakeBackend>, lease: &str, events: Vec<Event>) -> Value {
     controller.handle(
         "owner",
@@ -96,6 +185,45 @@ fn batch(controller: &mut Controller<FakeBackend>, lease: &str, events: Vec<Even
         &mut || Ok(()),
     )
 }
+
+fn controller_event() -> Event {
+    Event::Controller {
+        number: 0,
+        active_mask: 1,
+        buttons: 1 << 4,
+        left_trigger: 0,
+        right_trigger: 0,
+        left_x: 0,
+        left_y: 0,
+        right_x: 0,
+        right_y: 0,
+    }
+}
+
+#[test]
+fn unavailable_gamepad_keeps_the_input_lease_for_other_events_and_cleanup() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            fail_controller_input: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let token = acquire(&mut controller, Instant::now());
+
+    let failure = batch(&mut controller, &token, vec![controller_event()]);
+    assert_eq!(failure["error"]["code"], "controller_unavailable");
+    assert_eq!(failure["accepted"], 0);
+    assert_eq!(failure["partial_event_possible"], true);
+    assert!(controller.lease.is_some());
+    assert_eq!(controller.backend.stops, 0);
+
+    let accepted = batch(&mut controller, &token, vec![key(30, KeyState::Down)]);
+    assert_eq!(accepted["ok"], true);
+    assert!(controller.lease.is_some());
+}
+
 #[test]
 fn lease_owner_and_generation_gate_all_input_and_renewal() {
     let mut controller = Controller::new(FakeBackend::default(), true);

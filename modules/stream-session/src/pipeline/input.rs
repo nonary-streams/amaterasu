@@ -8,7 +8,19 @@ use serde_json::{Value, json};
 
 const MAX_QUEUED_EVENTS: usize = 128;
 pub(super) const MAX_BATCH_EVENTS: usize = 64;
-const CONTROLLER_INPUT_SUPPORTED: bool = false;
+
+pub(super) fn next_input_batch_size(record: &Record) -> usize {
+    let Some(first) = record.input_events.front() else {
+        return 0;
+    };
+    let controller_batch = first["kind"] == "controller";
+    record
+        .input_events
+        .iter()
+        .take(MAX_BATCH_EVENTS)
+        .take_while(|event| (event["kind"] == "controller") == controller_batch)
+        .count()
+}
 
 pub(super) fn configure_absolute_input(
     record: &mut Record,
@@ -47,10 +59,9 @@ pub(super) fn queue_control_input(
         record.rejected_controls = record.rejected_controls.saturating_add(1);
         return Ok(());
     }
-    // No current input backend advertises real virtual gamepad support. Keep
-    // these records unsupported at the stream boundary so they cannot poison a
-    // keyboard or mouse batch; the transport types still preserve their state.
-    if !CONTROLLER_INPUT_SUPPORTED && matches!(&input, Input::Controller(_)) {
+    // Require an explicit capability from the active backend lease so a host
+    // without virtual gamepad support can keep processing keyboard and mouse.
+    if matches!(&input, Input::Controller(_)) && !record.input_controller_supported {
         record.unsupported_controls = record.unsupported_controls.saturating_add(1);
         return Ok(());
     }
@@ -128,7 +139,16 @@ pub(super) fn accept_input_lease(
         None => false,
         Some(_) => return Err("invalid_input_response"),
     };
+    let controller_input_supported = match payload
+        .as_object()
+        .and_then(|object| object.get("controller_input"))
+    {
+        Some(Value::Bool(supported)) => *supported,
+        None => false,
+        Some(_) => return Err("invalid_input_response"),
+    };
     record.input_lease = Some(lease.to_owned());
+    record.input_controller_supported = controller_input_supported;
     record.input_expires_at = now.saturating_add(expires_in_ms).min(
         record
             .input_request_started_at
@@ -209,6 +229,42 @@ pub(super) fn accept_input_batch(record: &mut Record, payload: &Value) -> Result
     Ok(())
 }
 
+pub(super) fn accept_controller_batch_failure(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    let accepted = payload["accepted"]
+        .as_u64()
+        .and_then(|accepted| usize::try_from(accepted).ok())
+        .filter(|accepted| *accepted < record.input_inflight)
+        .ok_or("input_batch_failed")?;
+    if record.input_inflight == 0
+        || !record.input_controller_supported
+        || payload["lease"] != json!(record.input_lease)
+        || payload["partial_event_possible"] != true
+        || payload["error"]["code"] != "controller_unavailable"
+        || record
+            .input_events
+            .iter()
+            .take(record.input_inflight)
+            .any(|event| event["kind"] != "controller")
+    {
+        return Err("input_batch_failed");
+    }
+
+    for _ in 0..accepted {
+        record.input_events.pop_front();
+    }
+    record.input_events.pop_front();
+    record.input_events_sent = record.input_events_sent.saturating_add(accepted as u64);
+    if accepted != 0 {
+        record.input_batches = record.input_batches.saturating_add(1);
+    }
+    record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+    record.input_inflight = 0;
+    Ok(())
+}
+
 pub(super) fn accept_input_release(
     record: &mut Record,
     payload: &Value,
@@ -246,6 +302,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_expires_at = 0;
     record.input_renew_at = 0;
     record.input_absolute_pointer = false;
+    record.input_controller_supported = false;
     record.input_events.clear();
     record.input_inflight = 0;
     record.input_translator = Default::default();

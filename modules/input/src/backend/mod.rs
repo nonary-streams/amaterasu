@@ -4,6 +4,9 @@ pub trait Backend {
     fn name(&self) -> &'static str;
     fn supported(&self) -> bool;
     fn absolute_pointer(&self) -> bool;
+    fn controller_input_supported(&self) -> bool {
+        false
+    }
     fn key_encoding(&self) -> &'static str;
     fn validate(&self, event: &Event) -> InputResult<()>;
     fn start(&mut self) -> InputResult<()>;
@@ -14,7 +17,7 @@ pub trait Backend {
     /// Maps the host's right-Alt virtual key to the left Windows key. Backends
     /// preserve the selected mapping for matching key-up events.
     fn set_key_rightalt_to_key_win(&mut self, _enabled: bool) {}
-    fn stop(&mut self);
+    fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]
 mod windows;
@@ -55,7 +58,9 @@ impl Backend for NativeBackend {
     fn inject(&mut self, _: &Event) -> InputResult<()> {
         unsupported()
     }
-    fn stop(&mut self) {}
+    fn stop(&mut self) -> InputResult<()> {
+        Ok(())
+    }
 }
 #[cfg(not(any(windows, target_os = "linux")))]
 fn unsupported() -> InputResult<()> {

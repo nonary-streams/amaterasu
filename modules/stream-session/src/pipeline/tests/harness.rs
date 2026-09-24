@@ -61,9 +61,11 @@ pub struct Broker {
     pub input_terminal: bool,
     pub input_events: Vec<Value>,
     pub fail_input_batch: bool,
+    pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
     pub input_expires_in_ms: Option<u64>,
     pub input_absolute_pointer: Option<Value>,
+    pub input_controller_supported: Option<Value>,
 }
 
 impl Broker {
@@ -407,6 +409,17 @@ impl Broker {
                 }
                 let events = payload["events"].as_array().unwrap();
                 self.input_events.extend(events.iter().cloned());
+                if self.fail_controller_input
+                    && events
+                        .first()
+                        .is_some_and(|event| event["kind"] == "controller")
+                {
+                    self.fail_controller_input = false;
+                    return json!({"ok":false,"lease":self.input_lease,
+                        "accepted":events.len().saturating_sub(1),
+                        "partial_event_possible":true,
+                        "error":{"code":"controller_unavailable","message":"virtual gamepad unavailable"}});
+                }
                 if self.fail_input_batch {
                     self.input_lease = None;
                     self.input_terminal = true;
@@ -439,6 +452,9 @@ impl Broker {
         });
         if let Some(supported) = &self.input_absolute_pointer {
             reply["absolute_pointer"] = supported.clone();
+        }
+        if let Some(supported) = &self.input_controller_supported {
+            reply["controller_input"] = supported.clone();
         }
         reply
     }
