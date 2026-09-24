@@ -59,6 +59,76 @@ test("input policy editor preserves booleans and reports pending cleanup honestl
   assert.match(describe(settings), /policy is active/);
 });
 
+test("Playnite editor validates complete sparse settings and bounded filter lists", () => {
+  const parseSettings = context.Amaterasu.parsePlayniteSettings;
+  const values = {
+    enabled: true,
+    auto_sync: false,
+    sync_all_installed: true,
+    recent_games: 0,
+    recent_max_age_days: 36500,
+    sync_categories: ["Action"],
+    exclude_categories: [],
+    sync_plugins: ["plugin.example"],
+    exclude_plugins: [],
+    exclude_games: ["game-id"],
+  };
+  assert.deepEqual(ordinary(parseSettings(values)), values);
+  assert.deepEqual(
+    ordinary(context.Amaterasu.parsePlayniteFilterList('["Action","RPG"]', "Categories")),
+    ["Action", "RPG"],
+  );
+  assert.deepEqual(
+    ordinary(context.Amaterasu.parsePlayniteFilterList(JSON.stringify(["é".repeat(256)]), "Filters")),
+    ["é".repeat(256)],
+  );
+  for (const source of [
+    "not JSON",
+    "{}",
+    JSON.stringify(["Action", "action"]),
+    JSON.stringify(["  "]),
+    JSON.stringify(["bad\nname"]),
+    JSON.stringify(["é".repeat(257)]),
+    JSON.stringify([1]),
+    JSON.stringify(Array.from({ length: 257 }, (_, index) => `filter-${index}`)),
+  ]) {
+    assert.throws(() => context.Amaterasu.parsePlayniteFilterList(source, "Filters"));
+  }
+  for (const invalid of [
+    { ...values, recent_games: -1 },
+    { ...values, recent_games: 10001 },
+    { ...values, recent_max_age_days: 36501 },
+    { ...values, enabled: "true" },
+    { ...values, exclude_games: Array.from({ length: 256 }, (_, index) => `game-${index}-${"x".repeat(500)}`) },
+  ]) {
+    assert.throws(() => parseSettings(invalid));
+  }
+});
+
+test("Playnite status explains disabled, unavailable, and active scan states", () => {
+  const describe = context.Amaterasu.playniteStatusDescription;
+  const status = {
+    ok: true,
+    settings_ready: true,
+    enabled: true,
+    auto_sync: true,
+    playnite_running: true,
+    playnite_paths: [],
+    snapshot_pending: false,
+    snapshot_game_count: 12,
+    launchable_game_count: 3,
+    active_provider_launches: 0,
+    catalog_sync: null,
+    last_error: null,
+    revision: 4,
+  };
+  assert.match(describe({ ...status, settings_ready: false }), /still loading/);
+  assert.match(describe({ ...status, enabled: false }), /disabled/);
+  assert.match(describe({ ...status, playnite_running: false }), /discovery is currently available on Windows/);
+  assert.match(describe({ ...status, snapshot_pending: true }), /snapshot is in progress/);
+  assert.match(describe({ ...status, last_error: "pipe unavailable" }), /pipe unavailable/);
+});
+
 test("client FEC override editor preserves sparse inherit and validates bounded integers", () => {
   const parseFec = context.Amaterasu.parseClientFecOverride;
   assert.deepEqual(ordinary(parseFec("")), { fec_percentage: null });

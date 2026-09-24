@@ -20,6 +20,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.nvhttp/1" => nvhttp(route.action, object),
         "amaterasu.steam/1" => steam(route.action, object),
         "amaterasu.lutris/1" => lutris(route.action, object),
+        "amaterasu.playnite/1" => playnite(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
         _ => Ok(()),
     }
@@ -285,6 +286,88 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
         }
         _ => Err(INVALID),
     }
+}
+
+fn playnite(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" | "status" | "refresh" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(
+                object,
+                &["enabled", "expected_revision"],
+                &[
+                    "auto_sync",
+                    "sync_all_installed",
+                    "recent_games",
+                    "recent_max_age_days",
+                    "sync_categories",
+                    "exclude_categories",
+                    "sync_plugins",
+                    "exclude_plugins",
+                    "exclude_games",
+                ],
+            )?;
+            if object.get("enabled").and_then(Value::as_bool).is_none()
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            for field in ["auto_sync", "sync_all_installed"] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| value.as_bool().is_none())
+                {
+                    return Err(INVALID);
+                }
+            }
+            for (field, maximum) in [
+                ("recent_games", 10_000_u64),
+                ("recent_max_age_days", 36_500_u64),
+            ] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| !value.as_u64().is_some_and(|value| value <= maximum))
+                {
+                    return Err(INVALID);
+                }
+            }
+            for field in [
+                "sync_categories",
+                "exclude_categories",
+                "sync_plugins",
+                "exclude_plugins",
+                "exclude_games",
+            ] {
+                if let Some(values) = object.get(field) {
+                    playnite_filter_values(values)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn playnite_filter_values(value: &Value) -> Result<(), &'static str> {
+    let values = value.as_array().ok_or(INVALID)?;
+    if values.len() > 256 {
+        return Err(INVALID);
+    }
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let value = value.as_str().ok_or(INVALID)?;
+        if value.trim().is_empty()
+            || value.len() > 512
+            || value.chars().any(char::is_control)
+            || !unique.insert(value.to_lowercase())
+        {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
 }
 
 fn steam_exclusions(value: &Value) -> Result<(), &'static str> {
@@ -654,6 +737,67 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"high_resolution_scrolling":null,"expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod playnite_tests {
+    use super::*;
+
+    #[test]
+    fn playnite_update_is_patch_compatible_and_enforces_product_bounds() {
+        let route = Route {
+            service: "amaterasu.playnite/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        let valid = serde_json::json!({
+            "enabled":false,
+            "expected_revision":7,
+            "sync_all_installed":true,
+            "recent_games":0,
+            "recent_max_age_days":36500,
+            "sync_categories":["Action", "RPG"],
+            "exclude_categories":[],
+            "sync_plugins":["example.plugin"],
+            "exclude_plugins":[],
+            "exclude_games":["game-id"]
+        });
+        assert!(validate(route, valid.as_object().unwrap()).is_ok());
+        let partial = serde_json::json!({"enabled":true,"expected_revision":u64::MAX});
+        assert!(validate(route, partial.as_object().unwrap()).is_ok());
+
+        let mut invalid = vec![
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":0,"expected_revision":0}),
+            serde_json::json!({"enabled":false,"expected_revision":-1}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"auto_sync":"true"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"recent_games":10001}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"recent_max_age_days":36501}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":"Action"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":[1]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":["  "]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":["bad\nname"]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"sync_categories":["Action", "action"]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"owner":"other"}),
+        ];
+        invalid.push(serde_json::json!({
+            "enabled":false,
+            "expected_revision":0,
+            "exclude_games":(0..257).map(|index| format!("game-{index}")).collect::<Vec<_>>()
+        }));
+        invalid.push(serde_json::json!({
+            "enabled":false,
+            "expected_revision":0,
+            "exclude_games":["x".repeat(513)]
+        }));
+        for value in invalid {
+            assert!(
+                validate(route, value.as_object().unwrap()).is_err(),
+                "accepted malformed Playnite settings payload: {value}"
+            );
         }
     }
 }

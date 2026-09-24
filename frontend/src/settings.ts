@@ -289,6 +289,89 @@ namespace Amaterasu {
     return `Lutris discovery is available · ${status.game_count} games · ${pending}`;
   }
 
+  export function parsePlayniteFilterList(source: string, label: string): string[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(source);
+    } catch {
+      throw new Error(`${label} must be a JSON array of strings.`);
+    }
+    return validatePlayniteFilterList(parsed, label);
+  }
+
+  export function parsePlayniteSettings(
+    values: PlayniteSettings["values"],
+  ): PlayniteSettings["values"] {
+    if (
+      typeof values.enabled !== "boolean" ||
+      typeof values.auto_sync !== "boolean" ||
+      typeof values.sync_all_installed !== "boolean" ||
+      !Number.isSafeInteger(values.recent_games) ||
+      values.recent_games < 0 ||
+      values.recent_games > 10_000 ||
+      !Number.isSafeInteger(values.recent_max_age_days) ||
+      values.recent_max_age_days < 0 ||
+      values.recent_max_age_days > 36_500
+    )
+      throw new Error("Playnite settings contain values outside their supported ranges.");
+    const parsed = {
+      enabled: values.enabled,
+      auto_sync: values.auto_sync,
+      sync_all_installed: values.sync_all_installed,
+      recent_games: values.recent_games,
+      recent_max_age_days: values.recent_max_age_days,
+      sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
+      exclude_categories: validatePlayniteFilterList(values.exclude_categories, "Excluded categories"),
+      sync_plugins: validatePlayniteFilterList(values.sync_plugins, "Sync plugin IDs"),
+      exclude_plugins: validatePlayniteFilterList(values.exclude_plugins, "Excluded plugin IDs"),
+      exclude_games: validatePlayniteFilterList(values.exclude_games, "Excluded game IDs"),
+    };
+    const maximumUpdate = { ...parsed, expected_revision: Number.MAX_SAFE_INTEGER };
+    const encoder = new TextEncoder();
+    if (
+      encoder.encode(JSON.stringify(parsed)).length > 12_000 ||
+      encoder.encode(JSON.stringify(maximumUpdate)).length > 12_000
+    )
+      throw new Error("Playnite settings exceed the 12000 byte document or request size limit.");
+    return parsed;
+  }
+
+  export function playniteStatusDescription(status: PlayniteStatus): string {
+    if (!status.settings_ready)
+      return "Playnite settings are still loading; runtime state is not confirmed.";
+    if (!status.enabled)
+      return "Playnite catalog synchronization is disabled.";
+    if (!status.playnite_running)
+      return "No Playnite process was detected. Process discovery is currently available on Windows.";
+    if (status.last_error)
+      return `Playnite is running · ${status.snapshot_game_count} games in the last snapshot · Last issue: ${status.last_error}`;
+    const sync = status.snapshot_pending
+      ? "A catalog snapshot is in progress."
+      : "No catalog snapshot is in progress.";
+    return `Playnite is running · ${status.snapshot_game_count} games in the last snapshot · ${sync}`;
+  }
+
+  function validatePlayniteFilterList(value: unknown, label: string): string[] {
+    if (!Array.isArray(value) || value.length > 256)
+      throw new Error(`${label} must contain at most 256 strings.`);
+    const encoder = new TextEncoder();
+    const unique = new Set<string>();
+    for (const item of value) {
+      if (
+        typeof item !== "string" ||
+        item.trim().length === 0 ||
+        encoder.encode(item).length > 512 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(item) ||
+        unique.has(item.toLowerCase())
+      )
+        throw new Error(
+          `${label} must contain unique, printable strings of at most 512 UTF-8 bytes.`,
+        );
+      unique.add(item.toLowerCase());
+    }
+    return [...value];
+  }
+
   export function parseSteamImportSettings(
     includeTools: boolean,
     syncAllInstalled: boolean,
@@ -346,6 +429,7 @@ namespace Amaterasu {
     const hostArea = el("div");
     const steamArea = el("div");
     const lutrisArea = el("div");
+    const playniteArea = el("div");
     const inputArea = el("div");
     const pairingArea = el("div");
     context.content.append(
@@ -358,6 +442,7 @@ namespace Amaterasu {
           void loadHost();
           void loadSteam();
           void loadLutris();
+          void loadPlaynite();
           void loadInput();
           void loadPairing();
         }),
@@ -367,6 +452,7 @@ namespace Amaterasu {
       hostArea,
       steamArea,
       lutrisArea,
+      playniteArea,
       inputArea,
       pairingArea,
     );
@@ -690,6 +776,230 @@ namespace Amaterasu {
       for (let attempt = 0; ; attempt += 1) {
         try {
           return await context.api.post<LutrisSettings>("lutris/settings");
+        } catch (error) {
+          if (
+            !(error instanceof ApiError) ||
+            !["settings_loading", "settings_busy"].includes(error.code) ||
+            attempt >= 7
+          ) {
+            throw error;
+          }
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, 50 * (attempt + 1));
+          });
+        }
+      }
+    }
+    async function loadPlaynite(): Promise<void> {
+      playniteArea.replaceChildren(el("p", "muted", "Loading Playnite settings…"));
+      try {
+        const settings = await loadPlayniteSettings();
+        const runtime = await context.api.post<PlayniteStatus>("playnite/status");
+        if (!context.content.isConnected) return;
+        const form = el("form", "settings-form");
+        const enabled = input("playnite_enabled", "", "checkbox");
+        enabled.checked = settings.values.enabled;
+        const autoSync = input("playnite_auto_sync", "", "checkbox");
+        autoSync.checked = settings.values.auto_sync;
+        const syncAllInstalled = input(
+          "playnite_sync_all_installed",
+          "",
+          "checkbox",
+        );
+        syncAllInstalled.checked = settings.values.sync_all_installed;
+        const recentGames = input(
+          "playnite_recent_games",
+          String(settings.values.recent_games),
+          "number",
+        );
+        recentGames.required = true;
+        recentGames.min = "0";
+        recentGames.max = "10000";
+        recentGames.step = "1";
+        const recentMaxAgeDays = input(
+          "playnite_recent_max_age_days",
+          String(settings.values.recent_max_age_days),
+          "number",
+        );
+        recentMaxAgeDays.required = true;
+        recentMaxAgeDays.min = "0";
+        recentMaxAgeDays.max = "36500";
+        recentMaxAgeDays.step = "1";
+        const filterList = (name: string, values: string[]): HTMLTextAreaElement => {
+          const control = el("textarea");
+          control.name = name;
+          control.rows = 5;
+          control.maxLength = 12_000;
+          control.spellcheck = false;
+          control.value = JSON.stringify(values, null, 2);
+          return control;
+        };
+        const syncCategories = filterList(
+          "playnite_sync_categories",
+          settings.values.sync_categories,
+        );
+        const excludeCategories = filterList(
+          "playnite_exclude_categories",
+          settings.values.exclude_categories,
+        );
+        const syncPlugins = filterList(
+          "playnite_sync_plugins",
+          settings.values.sync_plugins,
+        );
+        const excludePlugins = filterList(
+          "playnite_exclude_plugins",
+          settings.values.exclude_plugins,
+        );
+        const excludeGames = filterList(
+          "playnite_exclude_games",
+          settings.values.exclude_games,
+        );
+        const runtimeStatus = el(
+          "p",
+          runtime.last_error ? "error" : "muted",
+          playniteStatusDescription(runtime),
+        );
+        const saveStatus = el("div");
+        const refreshStatus = el("div");
+        const save = el("button", "button primary", "Save Playnite settings");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        const refresh = button(
+          "Refresh now",
+          () => runAction(refresh, refreshStatus, async () => {
+            await context.api.post("playnite/refresh");
+            context.notify("Playnite refresh requested.");
+            await loadPlaynite();
+          }),
+        );
+        const updateRefreshAvailability = (): void => {
+          refresh.disabled =
+            !context.api.allows("configuration.write") ||
+            !enabled.checked ||
+            !runtime.playnite_running ||
+            runtime.snapshot_pending;
+        };
+        updateRefreshAvailability();
+        enabled.addEventListener("change", updateRefreshAvailability);
+        form.append(
+          field(
+            "Enable Playnite synchronization",
+            enabled,
+            "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable.",
+          ),
+          field(
+            "Automatic synchronization",
+            autoSync,
+            "Periodically scan Playnite while its desktop or fullscreen client is running.",
+          ),
+          field(
+            "Synchronize all installed games",
+            syncAllInstalled,
+            "When off, import recent games plus installed games selected by category or plugin filters.",
+          ),
+          field(
+            "Recent games to import",
+            recentGames,
+            "Maximum number of recent games (0–10000); zero disables recent-game selection.",
+          ),
+          field(
+            "Recent game age limit (days)",
+            recentMaxAgeDays,
+            "Ignore recent games older than this age (0–36500); zero disables the age cutoff.",
+          ),
+          field(
+            "Included categories (JSON)",
+            syncCategories,
+            "Additional installed games whose category matches any listed value; an empty list adds no category matches.",
+          ),
+          field(
+            "Excluded categories (JSON)",
+            excludeCategories,
+            "Games in these categories are excluded even if another setting would include them.",
+          ),
+          field(
+            "Included plugin IDs (JSON)",
+            syncPlugins,
+            "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches.",
+          ),
+          field(
+            "Excluded plugin IDs (JSON)",
+            excludePlugins,
+            "Games from these plugin IDs are excluded even if another setting would include them.",
+          ),
+          field(
+            "Excluded game IDs (JSON)",
+            excludeGames,
+            "Game IDs to omit from every import selection.",
+          ),
+          runtimeStatus,
+          saveStatus,
+          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void runAction(save, saveStatus, async () => {
+            try {
+              const values = parsePlayniteSettings({
+                enabled: enabled.checked,
+                auto_sync: autoSync.checked,
+                sync_all_installed: syncAllInstalled.checked,
+                recent_games: recentGames.valueAsNumber,
+                recent_max_age_days: recentMaxAgeDays.valueAsNumber,
+                sync_categories: parsePlayniteFilterList(
+                  syncCategories.value,
+                  "Sync categories",
+                ),
+                exclude_categories: parsePlayniteFilterList(
+                  excludeCategories.value,
+                  "Excluded categories",
+                ),
+                sync_plugins: parsePlayniteFilterList(
+                  syncPlugins.value,
+                  "Sync plugin IDs",
+                ),
+                exclude_plugins: parsePlayniteFilterList(
+                  excludePlugins.value,
+                  "Excluded plugin IDs",
+                ),
+                exclude_games: parsePlayniteFilterList(
+                  excludeGames.value,
+                  "Excluded game IDs",
+                ),
+              });
+              await context.api.post("playnite/settings_update", {
+                ...values,
+                expected_revision: settings.revision,
+              });
+              context.notify("Playnite settings saved.");
+              await loadPlaynite();
+            } catch (error) {
+              if (error instanceof ApiError && error.code === "revision_conflict") {
+                context.notify("Playnite settings changed elsewhere. The latest values have been reloaded.");
+                await loadPlaynite();
+                return;
+              }
+              throw error;
+            }
+          });
+        });
+        refreshStatus.className = "muted";
+        playniteArea.replaceChildren(
+          panel(
+            "Playnite",
+            form,
+            el("div", "actions", refresh, refreshStatus),
+          ),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          playniteArea.replaceChildren(errorPanel(error, loadPlaynite));
+      }
+    }
+    async function loadPlayniteSettings(): Promise<PlayniteSettings> {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await context.api.post<PlayniteSettings>("playnite/settings");
         } catch (error) {
           if (
             !(error instanceof ApiError) ||
@@ -1085,6 +1395,7 @@ namespace Amaterasu {
     void loadHost();
     void loadSteam();
     void loadLutris();
+    void loadPlaynite();
     void loadInput();
     void loadPairing();
   }

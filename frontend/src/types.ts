@@ -115,6 +115,37 @@ namespace Amaterasu {
     refresh_pending: boolean;
     last_error: string | null;
   }
+  export interface PlayniteSettings {
+    ok: boolean;
+    revision: number;
+    values: {
+      enabled: boolean;
+      auto_sync: boolean;
+      sync_all_installed: boolean;
+      recent_games: number;
+      recent_max_age_days: number;
+      sync_categories: string[];
+      exclude_categories: string[];
+      sync_plugins: string[];
+      exclude_plugins: string[];
+      exclude_games: string[];
+    };
+  }
+  export interface PlayniteStatus {
+    ok: boolean;
+    settings_ready: boolean;
+    enabled: boolean;
+    auto_sync: boolean;
+    playnite_running: boolean;
+    playnite_paths: string[];
+    snapshot_pending: boolean;
+    snapshot_game_count: number;
+    launchable_game_count: number;
+    active_provider_launches: number;
+    catalog_sync: unknown;
+    last_error: string | null;
+    revision: number;
+  }
   export interface AuthTokenSettings {
     revision: number;
     values: {

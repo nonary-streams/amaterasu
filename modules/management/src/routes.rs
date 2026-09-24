@@ -114,6 +114,22 @@ pub fn resolve(path: &str) -> Option<Route> {
         ),
         ("lutris", "status") => ("amaterasu.lutris/1", "status", Some("configuration.read")),
         ("lutris", "refresh") => ("amaterasu.lutris/1", "refresh", Some("configuration.write")),
+        ("playnite", "settings") => (
+            "amaterasu.playnite/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("playnite", "settings_update") => (
+            "amaterasu.playnite/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
+        ("playnite", "status") => ("amaterasu.playnite/1", "status", Some("configuration.read")),
+        ("playnite", "refresh") => (
+            "amaterasu.playnite/1",
+            "refresh",
+            Some("configuration.write"),
+        ),
         ("input", "settings_get") => (
             "amaterasu.input/1",
             "settings_get",
@@ -801,5 +817,40 @@ mod tests {
             assert!(payload(update, rejected).is_err());
         }
         assert!(resolve("/v1/input/status").is_none());
+    }
+
+    #[test]
+    fn playnite_routes_pin_settings_status_and_refresh_actions() {
+        for (path, action, scope) in [
+            (
+                "/v1/playnite/settings",
+                "settings_get",
+                "configuration.read",
+            ),
+            (
+                "/v1/playnite/settings_update",
+                "settings_update",
+                "configuration.write",
+            ),
+            ("/v1/playnite/status", "status", "configuration.read"),
+            ("/v1/playnite/refresh", "refresh", "configuration.write"),
+        ] {
+            let route = resolve(path).unwrap();
+            assert_eq!(route.service, "amaterasu.playnite/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+        }
+
+        let settings = resolve("/v1/playnite/settings").unwrap();
+        assert_eq!(
+            payload(settings, br#"{}"#).unwrap()["action"],
+            "settings_get"
+        );
+        let status = resolve("/v1/playnite/status").unwrap();
+        assert_eq!(payload(status, br#"{}"#).unwrap()["action"], "status");
+        let refresh = resolve("/v1/playnite/refresh").unwrap();
+        assert_eq!(payload(refresh, br#"{}"#).unwrap()["action"], "refresh");
+        assert!(payload(status, br#"{"action":"launch_start"}"#).is_err());
+        assert!(resolve("/v1/playnite/launch/start").is_none());
     }
 }

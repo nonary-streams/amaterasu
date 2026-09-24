@@ -500,12 +500,69 @@ def test_auth_and_crud(console, api):
         assert status == 200 and not rejected_refresh["ok"], rejected_refresh
         assert rejected_refresh["code"] == "lutris_disabled", rejected_refresh
     lutris_revision = lutris_readback["revision"]
+    deadline = time.monotonic() + 5
+    while True:
+        status, playnite_status, _ = api.post("/v1/playnite/status", token=administrator)
+        assert status == 200 and playnite_status["ok"], playnite_status
+        if playnite_status["settings_ready"]:
+            break
+        assert time.monotonic() < deadline, playnite_status
+        time.sleep(0.02)
+    status, playnite_defaults, _ = api.post("/v1/playnite/settings", token=administrator)
+    assert status == 200 and playnite_defaults["ok"], playnite_defaults
+    assert playnite_defaults["values"] == {
+        "enabled": sys.platform == "win32",
+        "auto_sync": True,
+        "sync_all_installed": False,
+        "recent_games": 10,
+        "recent_max_age_days": 30,
+        "sync_categories": [],
+        "exclude_categories": [],
+        "sync_plugins": [],
+        "exclude_plugins": [],
+        "exclude_games": [],
+    }, playnite_defaults
+    playnite_values = {
+        "enabled": False,
+        "auto_sync": False,
+        "sync_all_installed": True,
+        "recent_games": 25,
+        "recent_max_age_days": 45,
+        "sync_categories": ["Action", "RPG"],
+        "exclude_categories": ["Excluded category"],
+        "sync_plugins": ["plugin.include"],
+        "exclude_plugins": ["plugin.exclude"],
+        "exclude_games": ["game-excluded"],
+    }
+    status, playnite_saved, _ = api.post(
+        "/v1/playnite/settings_update",
+        {**playnite_values, "expected_revision": playnite_defaults["revision"]},
+        administrator,
+    )
+    assert status == 200 and playnite_saved["ok"], playnite_saved
+    assert playnite_saved["values"] == playnite_values, playnite_saved
+    playnite_revision = playnite_saved["revision"]
+    status, playnite_conflict, _ = api.post(
+        "/v1/playnite/settings_update",
+        {"enabled": True, "expected_revision": playnite_defaults["revision"]},
+        administrator,
+    )
+    assert status == 200 and playnite_conflict.get("error", {}).get("code") == "revision_conflict", playnite_conflict
+    status, playnite_readback, _ = api.post("/v1/playnite/settings", token=administrator)
+    assert status == 200 and playnite_readback["values"] == playnite_values, playnite_readback
+    assert playnite_readback["revision"] == playnite_revision, playnite_readback
+    status, blocked_playnite_refresh, _ = api.post("/v1/playnite/refresh", token=administrator)
+    assert status == 200 and not blocked_playnite_refresh["ok"], blocked_playnite_refresh
+    assert blocked_playnite_refresh["code"] == "playnite_disabled", blocked_playnite_refresh
     token = console.request("amaterasu.authentication/1", {"action": "issue_token", "scopes": ["catalog.read"], "ttl_seconds": 3600})
     assert token["ok"], token
     status, result, _ = api.post("/v1/catalog/list", token=token["bearer"])
     assert status == 200 and result["ok"], result
     assert api.post("/v1/lutris/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/lutris/status", token=token["bearer"])[0] == 403
+    assert api.post("/v1/playnite/settings", token=token["bearer"])[0] == 403
+    assert api.post("/v1/playnite/status", token=token["bearer"])[0] == 403
+    assert api.post("/v1/playnite/refresh", token=token["bearer"])[0] == 403
     status, result, _ = api.post(
         "/v1/lutris/settings_update",
         {**lutris_values, "expected_revision": lutris_revision},
@@ -529,6 +586,12 @@ def test_auth_and_crud(console, api):
     assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/steam/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/input/settings_get", token=token["bearer"])[0] == 403
+    status, result, _ = api.post(
+        "/v1/playnite/settings_update",
+        {**playnite_values, "expected_revision": playnite_revision},
+        token["bearer"],
+    )
+    assert status == 403 and not result["ok"], result
     assert token["bearer"] not in json.dumps(result)
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
@@ -545,6 +608,8 @@ def test_auth_and_crud(console, api):
         first_client["certificate_id"],
         lutris_values,
         lutris_revision,
+        playnite_values,
+        playnite_revision,
     )
 
 
@@ -589,7 +654,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -630,6 +695,11 @@ def main():
             assert lutris_settings["revision"] == lutris_revision, lutris_settings
             status, lutris_status, _ = api.post("/v1/lutris/status", token=relogged["bearer"])
             assert status == 200 and lutris_status["platform_supported"] == sys.platform.startswith("linux"), lutris_status
+            status, playnite_settings, _ = api.post("/v1/playnite/settings", token=relogged["bearer"])
+            assert status == 200 and playnite_settings["values"] == playnite_values, playnite_settings
+            assert playnite_settings["revision"] == playnite_revision, playnite_settings
+            status, playnite_status, _ = api.post("/v1/playnite/status", token=relogged["bearer"])
+            assert status == 200 and playnite_status["settings_ready"] and not playnite_status["enabled"], playnite_status
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -658,6 +728,7 @@ def main():
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
+    print("Playnite settings CAS, refresh policy and restart persistence,")
     print("session restart invalidation,")
     print("input keyboard/mouse/high-resolution scrolling CAS, legacy updates, restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
