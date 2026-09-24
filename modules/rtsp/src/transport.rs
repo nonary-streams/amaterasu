@@ -114,6 +114,46 @@ impl Transport {
             .collect()
     }
 
+    /// Replaces every listener while preserving ticket history and crypto state.
+    /// Callers defer network changes until active connections are drained.
+    pub fn rebind_all(
+        &mut self,
+        addresses: Vec<SocketAddr>,
+        allow_remote: bool,
+    ) -> TransportResult<()> {
+        if self.connection_count() != 0 {
+            return Err("tcp_listener_active");
+        }
+        let previous_addresses = self.local_addrs()?;
+        match Self::bind_all(addresses.clone(), allow_remote) {
+            Ok(replacement) => {
+                self.listeners = replacement.listeners;
+                self.allow_remote = allow_remote;
+                Ok(())
+            }
+            Err(preflight_error) => {
+                // Same-port wildcard expansion can overlap an existing specific
+                // bind. Release all listeners together, retry, and restore the
+                // old set if any member of the new set still fails.
+                drop(std::mem::take(&mut self.listeners));
+                match Self::bind_all(addresses, allow_remote) {
+                    Ok(replacement) => {
+                        self.listeners = replacement.listeners;
+                        self.allow_remote = allow_remote;
+                        Ok(())
+                    }
+                    Err(replacement_error) => {
+                        self.listeners = Self::bind_all(previous_addresses, self.allow_remote)
+                            .map_err(|_| "tcp_rebind_rollback_failed")?
+                            .listeners;
+                        let _ = preflight_error;
+                        Err(replacement_error)
+                    }
+                }
+            }
+        }
+    }
+
     pub fn add_ticket(&mut self, id: u64, peer: IpAddr, key: &[u8; 16]) -> TransportResult<()> {
         if !valid_peer(peer) || (!self.allow_remote && !peer.is_loopback()) {
             return Err("invalid_peer_address");

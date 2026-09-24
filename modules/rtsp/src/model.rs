@@ -14,7 +14,7 @@ const VIDEO_OFFSET: u16 = 9;
 const CONTROL_OFFSET: u16 = 10;
 const AUDIO_OFFSET: u16 = 11;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AddressFamily {
     #[default]
@@ -22,7 +22,7 @@ pub enum AddressFamily {
     Both,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
@@ -133,6 +133,12 @@ impl Settings {
             port.checked_sub(RTSP_SETUP_OFFSET)
                 .filter(|base| (MIN_BASE_PORT..=MAX_BASE_PORT).contains(base))
         }
+    }
+
+    pub fn set_base_port(&mut self, base_port: u16) -> Result<(), &'static str> {
+        validate_base_port(base_port)?;
+        self.bind.set_port(base_port + RTSP_SETUP_OFFSET);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -495,10 +501,22 @@ impl Open {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Open(Open),
-    NetworkConfigure { port: u16 },
-    Close { ticket: u64 },
-    Status { ticket: Option<u64> },
-    Lookup { operation_id: String },
+    NetworkConfigure {
+        port: u16,
+        #[serde(default)]
+        address_family: Option<AddressFamily>,
+        #[serde(default)]
+        bind_address: Option<String>,
+    },
+    Close {
+        ticket: u64,
+    },
+    Status {
+        ticket: Option<u64>,
+    },
+    Lookup {
+        operation_id: String,
+    },
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -735,18 +753,22 @@ mod tests {
             "bind": "127.0.0.1:48010"
         }))
         .unwrap();
+        let base_port = (20_000..=30_000)
+            .find(|port| settings.probe_media_binds(*port).is_ok())
+            .expect("find an available local UDP bind set");
         settings
-            .probe_media_binds(DEFAULT_BASE_PORT)
+            .probe_media_binds(base_port)
             .expect("all six family-specific UDP sockets bind together");
 
-        let occupied_address: SocketAddr = "[::]:47998".parse().unwrap();
+        let occupied_address =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), base_port + VIDEO_OFFSET);
         let blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         blocker.set_only_v6(true).unwrap();
         blocker.bind(&SockAddr::from(occupied_address)).unwrap();
         let _blocker = UdpSocket::from(blocker);
 
         assert_eq!(
-            settings.probe_media_binds(DEFAULT_BASE_PORT),
+            settings.probe_media_binds(base_port),
             Err("udp_bind_failed"),
             "a conflict on only the IPv6 video bind must defer network activation"
         );

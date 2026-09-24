@@ -1,5 +1,5 @@
 //! Reconciles the persisted NVHTTP base port with the RTSP and UDP endpoint owners.
-use crate::product_settings::ProductSettings;
+use crate::product_settings::{NetworkTarget, ProductSettings};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -11,6 +11,8 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub struct NetworkSettings {
     active_base_port: Option<u16>,
+    active_target: Option<NetworkTarget>,
+    active_addresses: Option<Vec<String>>,
     error: Option<String>,
     pending: Option<PendingCall>,
     sequence: u64,
@@ -20,7 +22,7 @@ pub struct NetworkSettings {
 
 struct PendingCall {
     operation_id: String,
-    port: u16,
+    target: NetworkTarget,
     parent: Option<u64>,
     state: CallState,
 }
@@ -40,6 +42,8 @@ impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
             active_base_port: None,
+            active_target: None,
+            active_addresses: None,
             error: None,
             pending: None,
             sequence: 0,
@@ -50,6 +54,7 @@ impl Default for NetworkSettings {
 }
 
 impl NetworkSettings {
+    #[cfg(test)]
     pub fn active_base_port(&self) -> Option<u16> {
         self.active_base_port
     }
@@ -66,13 +71,19 @@ impl NetworkSettings {
         {
             return Ok(());
         }
-        if self.active_base_port == Some(port) || Instant::now() < self.next_retry {
-            settings.set_active_rtsp_base_port(self.active_base_port);
+        let mut target = settings.rtsp_target();
+        target.port = port;
+        if self.active_target.as_ref() == Some(&target) || Instant::now() < self.next_retry {
+            settings.set_active_rtsp_state(
+                self.active_target.clone(),
+                self.active_base_port,
+                self.active_addresses.clone(),
+            );
             return Ok(());
         }
         let Some(sequence) = self.sequence.checked_add(1) else {
             self.record_failure(
-                port,
+                &target,
                 "resource_exhausted".into(),
                 "network configuration operation identifier exhausted".into(),
                 settings,
@@ -82,8 +93,8 @@ impl NetworkSettings {
         self.sequence = sequence;
         self.pending = Some(PendingCall {
             operation_id: format!("nvhttp.network_settings.{sequence}"),
-            port,
-            parent: settings.rtsp_completion_request(port),
+            target: target.clone(),
+            parent: settings.rtsp_completion_request(&target),
             state: CallState::Submitting,
         });
         Ok(())
@@ -98,7 +109,12 @@ impl NetworkSettings {
         match &mut pending.state {
             CallState::Submitting => match runtime.send(Command::Request {
                 service: RTSP_SERVICE.into(),
-                payload: json!({"action":"network_configure","port":pending.port}),
+                payload: json!({
+                    "action":"network_configure",
+                    "port":pending.target.port,
+                    "address_family":pending.target.address_family,
+                    "bind_address":pending.target.bind_address,
+                }),
                 timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
                 operation_id: pending.operation_id.clone(),
                 parent: pending.parent,
@@ -109,12 +125,12 @@ impl NetworkSettings {
                     return Ok(false);
                 }
                 Ok(Response::Error { code, message }) => {
-                    self.record_failure(pending.port, code, message, settings);
+                    self.record_failure(&pending.target, code, message, settings);
                     return Ok(true);
                 }
                 Ok(response) => {
                     self.record_failure(
-                        pending.port,
+                        &pending.target,
                         "invalid_response".into(),
                         format!("RTSP configuration request returned {response:?}"),
                         settings,
@@ -141,7 +157,7 @@ impl NetworkSettings {
                         };
                     }
                     Ok(Response::Error { code, message }) if code == "not_found" => {
-                        self.record_failure(pending.port, code, message, settings);
+                        self.record_failure(&pending.target, code, message, settings);
                         return Ok(true);
                     }
                     Ok(Response::Error { code, message }) => {
@@ -176,11 +192,11 @@ impl NetworkSettings {
         };
         match runtime.send(Command::ReleaseResult { request: child }) {
             Ok(Response::Ok) => {
-                self.finish(pending.port, outcome, settings);
+                self.finish(&pending.target, outcome, settings);
                 Ok(true)
             }
             Ok(Response::Error { code, .. }) if code == "not_found" => {
-                self.finish(pending.port, outcome, settings);
+                self.finish(&pending.target, outcome, settings);
                 Ok(true)
             }
             Ok(Response::Error { code, message }) => {
@@ -204,23 +220,47 @@ impl NetworkSettings {
         }
     }
 
-    fn finish(&mut self, port: u16, outcome: ChildOutcome, settings: &mut ProductSettings) {
+    fn finish(
+        &mut self,
+        target: &NetworkTarget,
+        outcome: ChildOutcome,
+        settings: &mut ProductSettings,
+    ) {
         match outcome {
             ChildOutcome::Payload(payload) => {
                 let reported_active_port = payload["active_base_port"]
                     .as_u64()
                     .and_then(|value| u16::try_from(value).ok());
+                let reported_family =
+                    serde_json::from_value(payload["active_address_family"].clone()).ok();
+                let reported_bind = payload["active_bind_address"].as_str().map(str::to_owned);
                 let fully_applied = payload["ok"] == true
-                    && payload["desired_port"].as_u64() == Some(u64::from(port))
+                    && payload["desired_port"].as_u64() == Some(u64::from(target.port))
+                    && payload["desired_address_family"] == json!(target.address_family)
+                    && payload["desired_bind_address"] == json!(target.bind_address)
                     && payload["active"] == true
                     && payload["udp_binds_preflighted"] == true
-                    && reported_active_port == Some(port);
+                    && reported_active_port == Some(target.port)
+                    && reported_family == target.address_family
+                    && reported_bind == target.bind_address;
                 if fully_applied {
                     self.active_base_port = reported_active_port;
+                    self.active_target = Some(target.clone());
+                    self.active_addresses = payload["rtsp_addresses"].as_array().map(|addresses| {
+                        addresses
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    });
                     self.error = None;
                     self.retry_delay = INITIAL_RETRY_DELAY;
                     self.next_retry = Instant::now() + self.retry_delay;
-                    settings.set_active_rtsp_base_port(reported_active_port);
+                    settings.set_active_rtsp_state(
+                        self.active_target.clone(),
+                        reported_active_port,
+                        self.active_addresses.clone(),
+                    );
                     settings.record_rtsp_apply_success();
                 } else {
                     if payload["active"] == false && payload["udp_binds_preflighted"] == false {
@@ -236,26 +276,30 @@ impl NetworkSettings {
                         })
                         .unwrap_or("RTSP did not activate the requested base port")
                         .to_owned();
-                    self.record_failure(port, "listener_apply_pending".into(), message, settings);
-                    settings.set_active_rtsp_base_port(self.active_base_port);
+                    self.record_failure(target, "listener_apply_pending".into(), message, settings);
+                    settings.set_active_rtsp_state(
+                        self.active_target.clone(),
+                        self.active_base_port,
+                        self.active_addresses.clone(),
+                    );
                 }
             }
             ChildOutcome::Failure { code, message } => {
-                self.record_failure(port, code, message, settings);
+                self.record_failure(target, code, message, settings);
             }
         }
     }
 
     fn record_failure(
         &mut self,
-        port: u16,
+        target: &NetworkTarget,
         code: String,
         message: String,
         settings: &mut ProductSettings,
     ) {
         let description = format!("{code}: {message}");
         self.error = Some(description.clone());
-        settings.record_rtsp_apply_failure(port, description);
+        settings.record_rtsp_apply_failure(target, description);
         self.next_retry = Instant::now() + self.retry_delay;
         self.retry_delay = (self.retry_delay * 2).min(MAX_RETRY_DELAY);
     }

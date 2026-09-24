@@ -94,6 +94,7 @@ impl Server {
 
     /// Rebinds the HTTP pair while retaining existing accepted connections.
     /// Both replacement sockets are prepared before either current listener is dropped.
+    #[cfg(test)]
     pub fn rebind_port(&mut self, http_port: u16) -> Result<(), String> {
         crate::settings::validate_port(http_port).map_err(str::to_owned)?;
         let https_port = crate::settings::https_port(http_port);
@@ -123,6 +124,76 @@ impl Server {
         self.http = http;
         self.https = https;
         Ok(())
+    }
+
+    /// Rebinds both protocols and all requested address families as one swap.
+    /// Existing accepted connections keep their original sockets and state.
+    pub fn rebind_settings(&mut self, settings: &Settings) -> Result<(), String> {
+        settings.validate().map_err(str::to_owned)?;
+        let http_addresses = settings.resolved_http_binds().map_err(str::to_owned)?;
+        let https_addresses = settings.resolved_https_binds().map_err(str::to_owned)?;
+        let old_http_addresses = self.http_addresses();
+        let old_https_addresses = self.https_addresses();
+        if old_http_addresses == http_addresses && old_https_addresses == https_addresses {
+            return Ok(());
+        }
+
+        let preflight = (|| {
+            let http = replacement_listeners(&http_addresses, &self.http, &self.https, "HTTP")?;
+            let https = replacement_listeners(&https_addresses, &self.http, &self.https, "HTTPS")?;
+            Ok::<_, String>((http, https))
+        })();
+        match preflight {
+            Ok((http, https)) => {
+                self.http = http;
+                self.https = https;
+                Ok(())
+            }
+            Err(preflight_error) => {
+                if !listener_sets_overlap(
+                    [&old_http_addresses, &old_https_addresses],
+                    [&http_addresses, &https_addresses],
+                ) {
+                    Err(preflight_error)
+                } else {
+                    // Some operating systems reject a wildcard bind while a more
+                    // specific old listener owns the same port. Release both old
+                    // groups together, then either install the complete replacement
+                    // or restore the complete old pair before returning.
+                    drop(std::mem::take(&mut self.http));
+                    drop(std::mem::take(&mut self.https));
+                    let replacement = (|| {
+                        let http = bind_listeners(http_addresses, "HTTP")?;
+                        let https = bind_listeners(https_addresses, "HTTPS")?;
+                        Ok::<_, String>((http, https))
+                    })();
+                    match replacement {
+                        Ok((http, https)) => {
+                            self.http = http;
+                            self.https = https;
+                            Ok(())
+                        }
+                        Err(replacement_error) => {
+                            let restored = (|| {
+                                let http = bind_listeners(old_http_addresses, "HTTP rollback")?;
+                                let https = bind_listeners(old_https_addresses, "HTTPS rollback")?;
+                                Ok::<_, String>((http, https))
+                            })();
+                            match restored {
+                                Ok((http, https)) => {
+                                    self.http = http;
+                                    self.https = https;
+                                    Err(replacement_error)
+                                }
+                                Err(rollback_error) => Err(format!(
+                                    "listener replacement failed ({replacement_error}); rollback failed ({rollback_error}); preflight was ({preflight_error})"
+                                )),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn connections(&self) -> usize {
@@ -354,6 +425,29 @@ fn replacement_listeners(
         replacements.push(listener);
     }
     Ok(replacements)
+}
+
+fn listener_sets_overlap<const OLD: usize, const NEW: usize>(
+    old_groups: [&[SocketAddr]; OLD],
+    new_groups: [&[SocketAddr]; NEW],
+) -> bool {
+    let old_addresses = old_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .collect::<Vec<_>>();
+    new_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|new| !old_addresses.contains(new))
+        .any(|new| {
+            old_addresses.iter().any(|old| {
+                old.port() == new.port()
+                    && old.is_ipv4() == new.is_ipv4()
+                    && (old.ip() == new.ip()
+                        || old.ip().is_unspecified()
+                        || new.ip().is_unspecified())
+            })
+        })
 }
 
 fn normalize_ip(address: IpAddr) -> IpAddr {
@@ -641,6 +735,9 @@ fn simple_reply(status: u16, message: &str) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static FIXED_PORT_LOCK: Mutex<()> = Mutex::new(());
     #[test]
     fn strict_http_framing_rejects_smuggling_and_waits_for_complete_bodies() {
         assert!(
@@ -820,6 +917,7 @@ mod tests {
 
     #[test]
     fn port_rebind_retains_both_listener_families() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let settings: Settings = serde_json::from_value(serde_json::json!({
             "enabled": true,
             "address_family": "both",
@@ -875,6 +973,7 @@ mod tests {
 
     #[test]
     fn port_rebind_changes_both_live_listeners_and_preserves_accepted_connections() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let settings = Settings {
             enabled: true,
             http_bind: "127.0.0.1:0".parse().unwrap(),
@@ -911,6 +1010,7 @@ mod tests {
 
     #[test]
     fn overlapping_port_moves_reuse_old_listener_sockets_in_both_directions() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let base_port = available_port_pair();
         let settings = Settings {
             enabled: true,
@@ -942,6 +1042,7 @@ mod tests {
 
     #[test]
     fn failed_second_listener_bind_keeps_the_current_pair_intact() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let settings = Settings {
             enabled: true,
             http_bind: "127.0.0.1:0".parse().unwrap(),
@@ -972,6 +1073,109 @@ mod tests {
         assert!(server.rebind_port(base_port).is_err());
         assert_eq!(server.http_address(), old_http);
         assert_eq!(server.https_address(), old_https);
+    }
+
+    #[test]
+    fn same_port_wildcard_expansion_rebinds_all_families_before_reporting_active() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
+        let base_port = available_port_pair();
+        let startup = Settings {
+            enabled: true,
+            allow_remote: true,
+            http_bind: SocketAddr::from(([127, 0, 0, 1], base_port)),
+            https_bind: SocketAddr::from(([127, 0, 0, 1], crate::settings::https_port(base_port))),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&startup).unwrap();
+        let mut target = startup.clone();
+        target.address_family = Some(crate::settings::AddressFamily::Both);
+        target.bind_address = Some(String::new());
+
+        server.rebind_settings(&target).unwrap();
+
+        assert!(
+            server
+                .http_addresses()
+                .iter()
+                .any(|address| address.is_ipv4())
+        );
+        assert!(
+            server
+                .http_addresses()
+                .iter()
+                .any(|address| address.is_ipv6())
+        );
+        assert!(
+            server
+                .http_addresses()
+                .iter()
+                .all(|address| address.ip().is_unspecified())
+        );
+        assert!(
+            server
+                .https_addresses()
+                .iter()
+                .all(|address| address.ip().is_unspecified())
+        );
+        let clients = [
+            TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], base_port))).unwrap(),
+            TcpStream::connect(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), base_port))
+                .unwrap(),
+        ];
+        let _ = server.tick();
+        assert_eq!(server.connections(), 2);
+        drop(clients);
+    }
+
+    #[test]
+    fn unrelated_occupied_target_port_does_not_drop_current_listeners() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
+        let startup = Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&startup).unwrap();
+        let old_http = server.http_addresses();
+        let old_https = server.https_addresses();
+        let target_port = available_port_pair();
+        let occupied = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], target_port))).unwrap();
+        let mut target = startup;
+        target.http_bind.set_port(target_port);
+        target
+            .https_bind
+            .set_port(crate::settings::https_port(target_port));
+
+        assert!(server.rebind_settings(&target).is_err());
+        assert_eq!(server.http_addresses(), old_http);
+        assert_eq!(server.https_addresses(), old_https);
+        drop(occupied);
+    }
+
+    #[test]
+    fn unchanged_listener_does_not_trigger_release_for_unrelated_occupied_peer_port() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
+        let base_port = available_port_pair();
+        let startup = Settings {
+            enabled: true,
+            http_bind: SocketAddr::from(([127, 0, 0, 1], base_port)),
+            https_bind: SocketAddr::from(([127, 0, 0, 1], crate::settings::https_port(base_port))),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&startup).unwrap();
+        let old_http = server.http_addresses();
+        let old_https = server.https_addresses();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut target = startup;
+        target
+            .https_bind
+            .set_port(occupied.local_addr().unwrap().port());
+
+        assert!(server.rebind_settings(&target).is_err());
+        assert_eq!(server.http_addresses(), old_http);
+        assert_eq!(server.https_addresses(), old_https);
+        drop(occupied);
     }
 
     fn available_port_pair() -> u16 {

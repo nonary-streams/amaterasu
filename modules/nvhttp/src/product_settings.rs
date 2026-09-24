@@ -1,5 +1,5 @@
 //! Caller-scoped NVHTTP product settings persisted by the configuration service.
-use crate::settings;
+use crate::settings::{self, AddressFamily, Settings};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 const LEGACY_SETTINGS_VERSION: u64 = 1;
-const SETTINGS_VERSION: u64 = 2;
+const PORT_SETTINGS_VERSION: u64 = 2;
+const SETTINGS_VERSION: u64 = 3;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -18,15 +19,49 @@ pub enum AdminAction {
     Update {
         hostname: String,
         port: u16,
+        address_family: FieldUpdate<AddressFamily>,
+        bind_address: FieldUpdate<String>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum FieldUpdate<T> {
+    #[default]
+    Omitted,
+    Null,
+    Value(T),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkTarget {
+    pub port: u16,
+    pub address_family: Option<AddressFamily>,
+    pub bind_address: Option<String>,
+}
+
+impl From<u16> for NetworkTarget {
+    fn from(port: u16) -> Self {
+        Self {
+            port,
+            address_family: None,
+            bind_address: None,
+        }
+    }
+}
+
+impl From<&NetworkTarget> for NetworkTarget {
+    fn from(target: &NetworkTarget) -> Self {
+        target.clone()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSettings {
     pub hostname: String,
     pub port: u16,
+    pub address_family: Option<AddressFamily>,
+    pub bind_address: Option<String>,
 }
 
 struct AdminRequest {
@@ -51,7 +86,7 @@ enum Purpose {
     Update {
         request: u64,
         hostname: String,
-        port: u16,
+        target: NetworkTarget,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -78,19 +113,31 @@ struct ProductDocument {
     revision: u64,
     hostname: Option<String>,
     port: Option<u16>,
+    address_family: Option<AddressFamily>,
+    bind_address: Option<String>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
 pub struct ProductSettings {
+    bootstrap_settings: Settings,
     bootstrap_hostname: String,
     bootstrap_port: u16,
+    bootstrap_address_family: Option<AddressFamily>,
+    bootstrap_bind_address: Option<String>,
+    bootstrap_http_ip: std::net::IpAddr,
     hostname: String,
     configured_hostname: String,
     port: u16,
-    port_configured: bool,
+    configured_address_family: Option<AddressFamily>,
+    configured_bind_address: Option<String>,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
     active_rtsp_base_port: Option<u16>,
+    active_http_addresses: Option<Vec<String>>,
+    active_https_addresses: Option<Vec<String>>,
+    active_rtsp_addresses: Option<Vec<String>>,
+    active_http_target: Option<NetworkTarget>,
+    active_rtsp_target: Option<NetworkTarget>,
     revision: u64,
     loaded: bool,
     last_error: Option<String>,
@@ -107,27 +154,77 @@ pub struct ProductSettings {
 struct Completion {
     request: u64,
     payload: Value,
-    required_http_port: Option<u16>,
-    required_rtsp_port: Option<u16>,
+    required_http_target: Option<NetworkTarget>,
+    required_rtsp_target: Option<NetworkTarget>,
 }
 
 impl ProductSettings {
+    #[cfg(test)]
     pub fn new(bootstrap_hostname: String, bootstrap_port: u16) -> Self {
+        Self::with_bootstrap_listener(
+            bootstrap_hostname,
+            bootstrap_port,
+            None,
+            None,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            false,
+            Settings::default(),
+        )
+    }
+
+    pub fn with_bootstrap_settings(bootstrap_hostname: String, settings: &Settings) -> Self {
+        Self::with_bootstrap_listener(
+            bootstrap_hostname,
+            settings.http_bind.port(),
+            settings.address_family,
+            settings.bind_address.clone(),
+            settings.http_bind.ip(),
+            settings.allow_remote,
+            settings.clone(),
+        )
+    }
+
+    fn with_bootstrap_listener(
+        bootstrap_hostname: String,
+        bootstrap_port: u16,
+        bootstrap_address_family: Option<AddressFamily>,
+        bootstrap_bind_address: Option<String>,
+        bootstrap_http_ip: std::net::IpAddr,
+        bootstrap_allow_remote: bool,
+        mut bootstrap_settings: Settings,
+    ) -> Self {
         let bootstrap_port = if settings::validate_port(bootstrap_port).is_ok() {
             bootstrap_port
         } else {
             settings::DEFAULT_PORT
         };
+        bootstrap_settings.http_bind.set_port(bootstrap_port);
+        bootstrap_settings
+            .https_bind
+            .set_port(settings::https_port(bootstrap_port));
+        bootstrap_settings.address_family = bootstrap_address_family;
+        bootstrap_settings.bind_address = bootstrap_bind_address.clone();
+        bootstrap_settings.allow_remote = bootstrap_allow_remote;
         Self {
+            bootstrap_settings,
             hostname: bootstrap_hostname.clone(),
             configured_hostname: String::new(),
             bootstrap_hostname,
             bootstrap_port,
+            bootstrap_address_family,
+            bootstrap_bind_address,
+            bootstrap_http_ip,
             port: bootstrap_port,
-            port_configured: false,
+            configured_address_family: None,
+            configured_bind_address: None,
             active_http_port: None,
             active_https_port: None,
             active_rtsp_base_port: None,
+            active_http_addresses: None,
+            active_https_addresses: None,
+            active_rtsp_addresses: None,
+            active_http_target: None,
+            active_rtsp_target: None,
             revision: 0,
             loaded: false,
             last_error: None,
@@ -154,6 +251,62 @@ impl ProductSettings {
         self.port
     }
 
+    pub fn http_target(&self) -> NetworkTarget {
+        NetworkTarget {
+            port: self.port,
+            address_family: self
+                .configured_address_family
+                .or(self.bootstrap_address_family),
+            bind_address: self
+                .configured_bind_address
+                .clone()
+                .or_else(|| self.bootstrap_bind_address.clone()),
+        }
+    }
+
+    /// `None` values deliberately pass through to RTSP's own startup binds.
+    pub fn rtsp_target(&self) -> NetworkTarget {
+        NetworkTarget {
+            port: self.port,
+            address_family: self.configured_address_family,
+            bind_address: self.configured_bind_address.clone(),
+        }
+    }
+
+    pub fn effective_address_family(&self) -> AddressFamily {
+        if let Some(addresses) = &self.active_http_addresses {
+            let has_v6 = addresses
+                .iter()
+                .filter_map(|address| address.parse::<std::net::SocketAddr>().ok())
+                .any(|address| address.is_ipv6());
+            return if has_v6 {
+                AddressFamily::Both
+            } else {
+                AddressFamily::Ipv4
+            };
+        }
+        let target = self.http_target();
+        self.bootstrap_settings.effective_address_family(
+            target.address_family,
+            target.bind_address.as_deref(),
+            self.bootstrap_http_ip,
+        )
+    }
+
+    pub fn effective_bind_address(&self) -> String {
+        self.active_http_addresses
+            .as_ref()
+            .and_then(|addresses| addresses.first())
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.ip().to_string())
+            .or_else(|| {
+                self.http_target()
+                    .bind_address
+                    .filter(|address| !address.trim().is_empty())
+            })
+            .unwrap_or_else(|| self.bootstrap_http_ip.to_string())
+    }
+
     pub fn loaded(&self) -> bool {
         self.loaded
     }
@@ -168,14 +321,57 @@ impl ProductSettings {
         self.rtsp_listener_error.as_deref()
     }
 
-    pub fn set_active_rtsp_base_port(&mut self, port: Option<u16>) {
-        self.active_rtsp_base_port = port;
+    pub fn set_active_http_state(
+        &mut self,
+        target: Option<NetworkTarget>,
+        http_addresses: Option<Vec<String>>,
+        https_addresses: Option<Vec<String>>,
+    ) {
+        self.active_http_target = target;
+        self.set_active_http_addresses(http_addresses, https_addresses);
     }
 
-    pub fn rtsp_completion_request(&self, port: u16) -> Option<u64> {
+    pub fn set_active_http_addresses(
+        &mut self,
+        http_addresses: Option<Vec<String>>,
+        https_addresses: Option<Vec<String>>,
+    ) {
+        self.active_http_addresses = http_addresses;
+        self.active_https_addresses = https_addresses;
+        self.active_http_port = self
+            .active_http_addresses
+            .as_ref()
+            .and_then(|addresses| addresses.first())
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.port());
+        self.active_https_port = self
+            .active_https_addresses
+            .as_ref()
+            .and_then(|addresses| addresses.first())
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .map(|address| address.port());
+    }
+
+    pub fn set_active_http_target(&mut self, target: NetworkTarget) {
+        self.active_http_target = Some(target);
+    }
+
+    pub fn set_active_rtsp_state(
+        &mut self,
+        target: Option<NetworkTarget>,
+        port: Option<u16>,
+        addresses: Option<Vec<String>>,
+    ) {
+        self.active_rtsp_target = target;
+        self.active_rtsp_base_port = port;
+        self.active_rtsp_addresses = addresses;
+    }
+
+    pub fn rtsp_completion_request(&self, target: impl Into<NetworkTarget>) -> Option<u64> {
+        let target = target.into();
         self.completions
             .iter()
-            .find(|completion| completion.required_rtsp_port == Some(port))
+            .find(|completion| completion.required_rtsp_target.as_ref() == Some(&target))
             .map(|completion| completion.request)
     }
 
@@ -187,31 +383,57 @@ impl ProductSettings {
             .map(|completion| &completion.payload)
     }
 
-    pub fn port_needs_application(&self) -> bool {
-        self.loaded
-            && self.port_configured
-            && (self.active_http_port != Some(self.port)
-                || self.active_https_port != Some(settings::https_port(self.port)))
+    pub fn listeners_need_application(&self) -> bool {
+        if !self.loaded || self.active_http_target.as_ref() == Some(&self.http_target()) {
+            return false;
+        }
+        let bootstrap_target = NetworkTarget {
+            port: self.bootstrap_port,
+            address_family: self.bootstrap_address_family,
+            bind_address: self.bootstrap_bind_address.clone(),
+        };
+        self.active_http_target.is_some() || self.http_target() != bootstrap_target
     }
 
-    pub fn port_is_active(&self) -> bool {
-        self.loaded
-            && self.port_configured
-            && self.active_http_port == Some(self.port)
-            && self.active_https_port == Some(settings::https_port(self.port))
+    #[cfg(test)]
+    fn port_needs_application(&self) -> bool {
+        self.listeners_need_application()
     }
 
+    #[cfg(test)]
     pub fn set_active_ports(&mut self, http_port: Option<u16>, https_port: Option<u16>) {
         self.active_http_port = http_port;
         self.active_https_port = https_port;
+        if let Some(port) = http_port {
+            let mut target = self.http_target();
+            target.port = port;
+            self.active_http_target = Some(target);
+        }
     }
 
-    pub fn record_port_apply_failure(&mut self, port: u16, message: String) {
+    #[cfg(test)]
+    pub(crate) fn set_active_rtsp_base_port(&mut self, port: Option<u16>) {
+        self.active_rtsp_base_port = port;
+        self.active_rtsp_target = port.map(|port| {
+            let mut target = self.rtsp_target();
+            target.port = port;
+            target
+        });
+    }
+
+    #[cfg(test)]
+    fn record_port_apply_failure(&mut self, port: u16, message: String) {
+        let mut target = self.http_target();
+        target.port = port;
+        self.record_listener_apply_failure(&target, message);
+    }
+
+    pub fn record_listener_apply_failure(&mut self, target: &NetworkTarget, message: String) {
         self.listener_error = Some(message.clone());
         if let Some(completion) = self
             .completions
             .iter_mut()
-            .find(|completion| completion.required_http_port == Some(port))
+            .find(|completion| completion.required_http_target.as_ref() == Some(target))
         {
             completion.payload = json!({
                 "ok":false,
@@ -219,30 +441,41 @@ impl ProductSettings {
                 "message":format!("settings were persisted but listener rebinding failed: {message}"),
                 "persisted":true,
             });
-            completion.required_http_port = None;
+            completion.required_http_target = None;
         }
     }
 
-    pub fn record_port_apply_success(&mut self) {
+    pub fn record_listener_apply_success(&mut self) {
         self.listener_error = None;
     }
 
-    pub fn record_rtsp_apply_failure(&mut self, port: u16, message: String) {
+    pub fn record_rtsp_apply_failure(&mut self, target: impl Into<NetworkTarget>, message: String) {
+        let target = target.into();
         self.rtsp_listener_error = Some(message.clone());
+        let hostname = self.hostname.clone();
+        let revision = self.revision;
+        let address_family = self.effective_address_family();
+        let bind_address = self.effective_bind_address();
+        let configured_address_family = self.configured_address_family;
+        let configured_bind_address = self.configured_bind_address.clone();
         if let Some(completion) = self
             .completions
             .iter_mut()
-            .find(|completion| completion.required_rtsp_port == Some(port))
+            .find(|completion| completion.required_rtsp_target.as_ref() == Some(&target))
         {
             completion.payload = json!({
                 "ok":false,
                 "code":"listener_apply_pending",
                 "message":format!("settings were persisted but RTSP/UDP listeners are not active: {message}"),
                 "persisted":true,
-                "hostname":self.hostname,
-                "revision":self.revision,
+                "hostname":hostname,
+                "revision":revision,
+                "address_family":address_family,
+                "bind_address":bind_address,
+                "configured_address_family":configured_address_family,
+                "configured_bind_address":configured_bind_address,
             });
-            completion.required_rtsp_port = None;
+            completion.required_rtsp_target = None;
         }
     }
 
@@ -251,7 +484,7 @@ impl ProductSettings {
     }
 
     pub fn record_listener_disabled(&mut self) {
-        if self.port_needs_application() {
+        if self.listeners_need_application() {
             self.listener_error =
                 Some("NVHTTP listener is disabled; stored port will apply when enabled".into());
         }
@@ -296,16 +529,19 @@ impl ProductSettings {
     /// Returns a hostname only after a complete read or committed update confirms it.
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<Option<RuntimeSettings>> {
         let previous_hostname = self.hostname.clone();
-        let previous_port = self.port;
+        let previous_target = self.http_target();
         self.advance_pending(runtime);
         self.expire_queued();
         if self.pending.is_none() {
             self.start_next();
         }
-        let changed = self.hostname != previous_hostname || self.port != previous_port;
+        let target = self.http_target();
+        let changed = self.hostname != previous_hostname || target != previous_target;
         Ok(changed.then(|| RuntimeSettings {
             hostname: self.hostname.clone(),
-            port: self.port,
+            port: target.port,
+            address_family: target.address_family,
+            bind_address: target.bind_address,
         }))
     }
 
@@ -438,7 +674,7 @@ impl ProductSettings {
 
     fn start_next(&mut self) {
         if self.completions.iter().any(|completion| {
-            completion.required_http_port.is_some() || completion.required_rtsp_port.is_some()
+            completion.required_http_target.is_some() || completion.required_rtsp_target.is_some()
         }) {
             return;
         }
@@ -461,6 +697,8 @@ impl ProductSettings {
             AdminAction::Update {
                 hostname,
                 port,
+                address_family,
+                bind_address,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -475,6 +713,44 @@ impl ProductSettings {
                     self.queue_completion(
                         request.request,
                         failure("invalid_port", "port is outside the supported range"),
+                    );
+                    return;
+                }
+                let target = NetworkTarget {
+                    port,
+                    address_family: apply_field_update(
+                        address_family,
+                        self.configured_address_family,
+                    ),
+                    bind_address: apply_field_update(
+                        bind_address,
+                        self.configured_bind_address.clone(),
+                    ),
+                };
+                let mut validation_settings = self.bootstrap_settings.clone();
+                validation_settings.http_bind.set_port(port);
+                validation_settings
+                    .https_bind
+                    .set_port(settings::https_port(port));
+                validation_settings.address_family =
+                    target.address_family.or(self.bootstrap_address_family);
+                validation_settings.bind_address = target
+                    .bind_address
+                    .clone()
+                    .or_else(|| self.bootstrap_bind_address.clone());
+                if validation_settings
+                    .validate_network_policy(
+                        validation_settings.address_family,
+                        validation_settings.bind_address.as_deref(),
+                    )
+                    .is_err()
+                {
+                    self.queue_completion(
+                        request.request,
+                        failure(
+                            "invalid_network_policy",
+                            "listener address policy is invalid",
+                        ),
                     );
                     return;
                 }
@@ -493,18 +769,13 @@ impl ProductSettings {
                     return;
                 }
                 self.start_call(
-                    json!({
-                        "action":"product_update",
-                        "expected_revision":expected_revision,
-                        "version":SETTINGS_VERSION,
-                        "values":{"hostname":hostname,"port":port},
-                    }),
+                    product_update_payload(expected_revision, &hostname, &target),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
                     Purpose::Update {
                         request: request.request,
                         hostname,
-                        port,
+                        target,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -585,11 +856,20 @@ impl ProductSettings {
                     }),
                 };
                 match result {
-                    Ok(document) => {
+                    Ok(document) if self.validate_document(&document).is_ok() => {
                         self.apply_document(document);
                         self.record_load_success();
                         if let Some(followup) = followup {
                             self.complete_followup(followup, Ok(()));
+                        }
+                    }
+                    Ok(_) => {
+                        let error = invalid_state("persisted listener address policy is invalid");
+                        let description = format!("{}: {}", error.code, error.message);
+                        self.record_load_failure(description.clone());
+                        self.fail_queued(&description);
+                        if let Some(followup) = followup {
+                            self.complete_followup(followup, Err(error));
                         }
                     }
                     Err(error) => {
@@ -605,19 +885,24 @@ impl ProductSettings {
             Purpose::Update {
                 request,
                 hostname,
-                port,
+                target,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
                 CallOutcome::Payload(payload) => {
-                    match update_result(&payload, expected_revision, &hostname, port) {
-                        Ok(document) => {
-                            let port_changed = self.port != port;
+                    match update_result(&payload, expected_revision, &hostname, &target) {
+                        Ok(document) if self.validate_document(&document).is_ok() => {
+                            let previous_http_target = self.http_target();
+                            let previous_rtsp_target = self.rtsp_target();
                             self.apply_document(document);
+                            let desired_http_target = self.http_target();
+                            let desired_rtsp_target = self.rtsp_target();
+                            let network_changed = previous_http_target != desired_http_target
+                                || previous_rtsp_target != desired_rtsp_target;
                             self.record_load_success();
-                            if !require_listener_apply && port_changed {
+                            if !require_listener_apply && network_changed {
                                 self.listener_error = Some(
-                                    "NVHTTP listener is disabled; stored port is not active".into(),
+                                    "NVHTTP listener is disabled; stored network settings are not active".into(),
                                 );
                                 self.queue_completion(
                                     request,
@@ -629,13 +914,26 @@ impl ProductSettings {
                                     }),
                                 );
                             } else {
-                                self.queue_update_completion(
+                                self.queue_listener_update_completion(
                                     request,
                                     self.settings_payload(),
-                                    (require_listener_apply && port_changed).then_some(port),
-                                    (require_listener_apply && port_changed).then_some(port),
+                                    (require_listener_apply
+                                        && self.active_http_target.as_ref()
+                                            != Some(&desired_http_target))
+                                    .then_some(desired_http_target),
+                                    (require_listener_apply
+                                        && self.active_rtsp_target.as_ref()
+                                            != Some(&desired_rtsp_target))
+                                    .then_some(desired_rtsp_target),
                                 );
                             }
+                        }
+                        Ok(_) => {
+                            self.start_load(Some(Followup::Unknown {
+                                request,
+                                reason: "product_update committed an invalid listener policy"
+                                    .into(),
+                            }));
                         }
                         Err(error) if error.code == "revision_conflict" => {
                             let revision = error.current_revision;
@@ -706,11 +1004,27 @@ impl ProductSettings {
         self.completions.push_back(Completion {
             request,
             payload,
-            required_http_port: None,
-            required_rtsp_port: None,
+            required_http_target: None,
+            required_rtsp_target: None,
         });
     }
 
+    pub(crate) fn queue_listener_update_completion(
+        &mut self,
+        request: u64,
+        payload: Value,
+        required_http_target: Option<NetworkTarget>,
+        required_rtsp_target: Option<NetworkTarget>,
+    ) {
+        self.completions.push_back(Completion {
+            request,
+            payload,
+            required_http_target,
+            required_rtsp_target,
+        });
+    }
+
+    #[cfg(test)]
     pub(crate) fn queue_update_completion(
         &mut self,
         request: u64,
@@ -718,27 +1032,41 @@ impl ProductSettings {
         required_http_port: Option<u16>,
         required_rtsp_port: Option<u16>,
     ) {
-        self.completions.push_back(Completion {
-            request,
-            payload,
-            required_http_port,
-            required_rtsp_port,
+        let http_target = required_http_port.map(|port| {
+            let mut target = self.http_target();
+            target.port = port;
+            target
         });
+        let rtsp_target = required_rtsp_port.map(|port| {
+            let mut target = self.rtsp_target();
+            target.port = port;
+            target
+        });
+        self.queue_listener_update_completion(request, payload, http_target, rtsp_target);
     }
 
     pub fn flush_completion(&mut self, runtime: &RuntimeClient) {
         let Some(completion) = self.completions.front() else {
             return;
         };
-        if completion.required_http_port.is_some_and(|port| {
-            self.active_http_port != Some(port)
-                || self.active_https_port != Some(settings::https_port(port))
-        }) {
+        if completion
+            .required_http_target
+            .as_ref()
+            .is_some_and(|target| {
+                self.active_http_target.as_ref() != Some(target)
+                    || self.active_http_port != Some(target.port)
+                    || self.active_https_port != Some(settings::https_port(target.port))
+            })
+        {
             return;
         }
         if completion
-            .required_rtsp_port
-            .is_some_and(|port| self.active_rtsp_base_port != Some(port))
+            .required_rtsp_target
+            .as_ref()
+            .is_some_and(|target| {
+                self.active_rtsp_target.as_ref() != Some(target)
+                    || self.active_rtsp_base_port != Some(target.port)
+            })
         {
             return;
         }
@@ -747,6 +1075,9 @@ impl ProductSettings {
             payload["active_http_port"] = json!(self.active_http_port);
             payload["active_https_port"] = json!(self.active_https_port);
             payload["active_rtsp_port"] = json!(self.active_rtsp_base_port);
+            payload["http_addresses"] = json!(self.active_http_addresses);
+            payload["https_addresses"] = json!(self.active_https_addresses);
+            payload["rtsp_addresses"] = json!(self.active_rtsp_addresses);
             payload["listener_error"] = json!(self.listener_error);
             payload["rtsp_listener_error"] = json!(self.rtsp_listener_error);
         }
@@ -768,6 +1099,27 @@ impl ProductSettings {
         }
     }
 
+    fn validate_document(&self, document: &ProductDocument) -> Result<(), SettingFailure> {
+        let mut validation_settings = self.bootstrap_settings.clone();
+        let port = document.port.unwrap_or(self.bootstrap_port);
+        validation_settings.http_bind.set_port(port);
+        validation_settings
+            .https_bind
+            .set_port(settings::https_port(port));
+        validation_settings.address_family =
+            document.address_family.or(self.bootstrap_address_family);
+        validation_settings.bind_address = document
+            .bind_address
+            .clone()
+            .or_else(|| self.bootstrap_bind_address.clone());
+        validation_settings
+            .validate_network_policy(
+                validation_settings.address_family,
+                validation_settings.bind_address.as_deref(),
+            )
+            .map_err(|_| invalid_state("persisted listener address policy is invalid"))
+    }
+
     fn apply_document(&mut self, document: ProductDocument) {
         self.revision = document.revision;
         self.configured_hostname = document.hostname.unwrap_or_default();
@@ -776,8 +1128,9 @@ impl ProductSettings {
         } else {
             self.configured_hostname.clone()
         };
-        self.port_configured = document.port.is_some();
         self.port = document.port.unwrap_or(self.bootstrap_port);
+        self.configured_address_family = document.address_family;
+        self.configured_bind_address = document.bind_address;
         self.loaded = true;
     }
 
@@ -788,10 +1141,17 @@ impl ProductSettings {
             "configured_hostname":self.configured_hostname,
             "port":self.port,
             "https_port":settings::https_port(self.port),
+            "address_family":self.effective_address_family(),
+            "bind_address":self.effective_bind_address(),
+            "configured_address_family":self.configured_address_family,
+            "configured_bind_address":self.configured_bind_address,
             "active_http_port":self.active_http_port,
             "active_https_port":self.active_https_port,
+            "http_addresses":self.active_http_addresses,
+            "https_addresses":self.active_https_addresses,
             "listener_error":self.listener_error,
             "active_rtsp_port":self.active_rtsp_base_port,
+            "rtsp_addresses":self.active_rtsp_addresses,
             "rtsp_listener_error":self.rtsp_listener_error,
             "revision":self.revision,
         })
@@ -833,6 +1193,20 @@ fn request_command(pending: &PendingCall) -> Command {
     }
 }
 
+fn product_update_payload(expected_revision: u64, hostname: &str, target: &NetworkTarget) -> Value {
+    json!({
+        "action":"product_update",
+        "expected_revision":expected_revision,
+        "version":SETTINGS_VERSION,
+        "values":{
+            "hostname":hostname,
+            "port":target.port,
+            "address_family":target.address_family,
+            "bind_address":target.bind_address,
+        },
+    })
+}
+
 #[derive(Debug)]
 struct SettingFailure {
     code: String,
@@ -870,6 +1244,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             revision: 0,
             hostname: None,
             port: None,
+            address_family: None,
+            bind_address: None,
         });
     }
 
@@ -877,19 +1253,26 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         .get("version")
         .and_then(Value::as_u64)
         .ok_or_else(|| invalid_state("product settings version is missing"))?;
-    if !matches!(version, LEGACY_SETTINGS_VERSION | SETTINGS_VERSION) || revision == 0 {
+    if !matches!(
+        version,
+        LEGACY_SETTINGS_VERSION | PORT_SETTINGS_VERSION | SETTINGS_VERSION
+    ) || revision == 0
+    {
         return Err(invalid_state(
             "product settings version or revision is unsupported",
         ));
     }
-    let expected_value_count = if version == LEGACY_SETTINGS_VERSION {
-        1
-    } else {
-        2
+    let expected_value_count = match version {
+        LEGACY_SETTINGS_VERSION => 1,
+        PORT_SETTINGS_VERSION => 2,
+        SETTINGS_VERSION => 4,
+        _ => unreachable!(),
     };
     if values.len() != expected_value_count
         || !values.contains_key("hostname")
-        || (version == SETTINGS_VERSION && !values.contains_key("port"))
+        || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
+        || (version == SETTINGS_VERSION
+            && (!values.contains_key("address_family") || !values.contains_key("bind_address")))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -913,10 +1296,25 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             .map_err(|_| invalid_state("persisted product port is outside the supported range"))?;
         Some(port)
     };
+    let (address_family, bind_address) = if version == SETTINGS_VERSION {
+        let address_family = serde_json::from_value::<Option<AddressFamily>>(
+            values.get("address_family").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| invalid_state("persisted address_family is invalid"))?;
+        let bind_address = serde_json::from_value::<Option<String>>(
+            values.get("bind_address").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| invalid_state("persisted bind_address is invalid"))?;
+        (address_family, bind_address)
+    } else {
+        (None, None)
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
         port,
+        address_family,
+        bind_address,
     })
 }
 
@@ -924,14 +1322,21 @@ fn update_result(
     payload: &Value,
     expected_revision: u64,
     hostname: &str,
-    port: u16,
+    target: &NetworkTarget,
 ) -> Result<ProductDocument, SettingFailure> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(parse_failure(payload));
     }
+    if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
+        return Err(invalid_state(
+            "product_update did not confirm the v3 network settings",
+        ));
+    }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(hostname)
-        || document.port != Some(port)
+        || document.port != Some(target.port)
+        || document.address_family != target.address_family
+        || document.bind_address != target.bind_address
         || expected_revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -939,6 +1344,14 @@ fn update_result(
         ));
     }
     Ok(document)
+}
+
+fn apply_field_update<T>(update: FieldUpdate<T>, current: Option<T>) -> Option<T> {
+    match update {
+        FieldUpdate::Omitted => current,
+        FieldUpdate::Null => None,
+        FieldUpdate::Value(value) => Some(value),
+    }
 }
 
 fn parse_failure(payload: &Value) -> SettingFailure {
@@ -1047,38 +1460,53 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":2,"revision":4,"values":{"hostname":"New Host","port":48000}
+            "ok":true,"found":true,"version":3,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null}
         });
+        let target = NetworkTarget {
+            port: 48_000,
+            address_family: None,
+            bind_address: None,
+        };
         assert_eq!(
-            update_result(&success, 3, "New Host", 48_000)
+            update_result(&success, 3, "New Host", &target)
                 .unwrap()
                 .revision,
             4
         );
         assert_eq!(
-            update_result(&success, 2, "New Host", 48_000)
+            update_result(&success, 2, "New Host", &target)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
         );
         assert_eq!(
-            update_result(&success, 3, "Other Host", 48_000)
+            update_result(&success, 3, "Other Host", &target)
                 .unwrap_err()
                 .code,
             "invalid_state_response"
         );
         assert_eq!(
-            update_result(&success, 3, "New Host", 48_001)
-                .unwrap_err()
-                .code,
+            update_result(
+                &success,
+                3,
+                "New Host",
+                &NetworkTarget {
+                    port: 48_001,
+                    ..target.clone()
+                }
+            )
+            .unwrap_err()
+            .code,
             "invalid_state_response"
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":2,"revision":5,"values":{"hostname":"","port":48000}
+            "ok":true,"found":true,"version":3,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null}
         });
         assert_eq!(
-            update_result(&reset_to_machine_name, 4, "", 48_000)
+            update_result(&reset_to_machine_name, 4, "", &target)
                 .unwrap()
                 .hostname
                 .as_deref(),
@@ -1115,9 +1543,16 @@ mod tests {
                 "configured_hostname":"",
                 "port":47989,
                 "https_port":47984,
+                "address_family":"ipv4",
+                "bind_address":"127.0.0.1",
+                "configured_address_family":null,
+                "configured_bind_address":null,
                 "active_http_port":null,
                 "active_https_port":null,
+                "http_addresses":null,
+                "https_addresses":null,
                 "active_rtsp_port":null,
+                "rtsp_addresses":null,
                 "listener_error":null,
                 "rtsp_listener_error":null,
                 "revision":3,
@@ -1183,16 +1618,20 @@ mod tests {
             Purpose::Update {
                 request: 12,
                 hostname: "New Host".into(),
-                port: 48_000,
+                target: NetworkTarget {
+                    port: 48_000,
+                    address_family: None,
+                    bind_address: None,
+                },
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":2,
+                "version":3,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null}
             })),
         );
 
@@ -1215,25 +1654,41 @@ mod tests {
             }))
             .unwrap(),
         );
+        let http_target = settings.http_target();
+        let rtsp_target = settings.rtsp_target();
+        settings.set_active_http_state(
+            Some(http_target),
+            Some(vec!["127.0.0.1:47989".into()]),
+            Some(vec!["127.0.0.1:47984".into()]),
+        );
+        settings.set_active_rtsp_state(
+            Some(rtsp_target),
+            Some(47_989),
+            Some(vec!["127.0.0.1:48010".into()]),
+        );
         settings.finish_call(
             Purpose::Update {
                 request: 12,
                 hostname: "New Host".into(),
-                port: 47_989,
+                target: NetworkTarget {
+                    port: 47_989,
+                    address_family: None,
+                    bind_address: None,
+                },
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":2,"revision":2,
-                "values":{"hostname":"New Host","port":47989}
+                "ok":true,"found":true,"version":3,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null}
             })),
         );
 
         let completion = settings.completions.front().unwrap();
         assert_eq!(completion.payload["ok"], true);
         assert_eq!(completion.payload["configured_hostname"], "New Host");
-        assert_eq!(completion.required_http_port, None);
-        assert_eq!(completion.required_rtsp_port, None);
+        assert_eq!(completion.required_http_target, None);
+        assert_eq!(completion.required_rtsp_target, None);
     }
 
     #[test]
@@ -1254,7 +1709,7 @@ mod tests {
         assert_eq!(completion.payload["ok"], false);
         assert_eq!(completion.payload["code"], "listener_apply_failed");
         assert_eq!(completion.payload["persisted"], true);
-        assert_eq!(completion.required_http_port, None);
+        assert_eq!(completion.required_http_target, None);
     }
 
     #[test]
@@ -1289,5 +1744,173 @@ mod tests {
             settings.settings_payload()["rtsp_listener_error"],
             "listener_apply_pending: active stream"
         );
+    }
+
+    #[test]
+    fn v3_preserves_null_and_explicit_empty_bind_address_distinctly() {
+        let cleared = parse_document(&json!({
+            "ok":true,"found":true,"version":3,"revision":8,
+            "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}
+        }))
+        .unwrap();
+        let empty = parse_document(&json!({
+            "ok":true,"found":true,"version":3,"revision":9,
+            "values":{"hostname":"Host","port":47989,"address_family":"both","bind_address":""}
+        }))
+        .unwrap();
+        assert_eq!(cleared.address_family, None);
+        assert_eq!(cleared.bind_address, None);
+        assert_eq!(empty.address_family, Some(AddressFamily::Both));
+        assert_eq!(empty.bind_address.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn resetting_the_last_network_override_reapplies_startup_listener_policy() {
+        let bootstrap = Settings {
+            address_family: Some(AddressFamily::Ipv4),
+            bind_address: Some("127.0.0.1".into()),
+            ..Settings::default()
+        };
+        let mut product = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        let overridden = parse_document(&json!({
+            "ok":true,"found":true,"version":3,"revision":4,
+            "values":{"hostname":"Host","port":47989,"address_family":"both","bind_address":"::1"}
+        }))
+        .unwrap();
+        product.apply_document(overridden);
+        product.set_active_http_state(
+            Some(product.http_target()),
+            Some(vec!["[::1]:47989".into()]),
+            Some(vec!["[::1]:47984".into()]),
+        );
+        assert!(!product.listeners_need_application());
+
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":3,"revision":5,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}
+            }))
+            .unwrap(),
+        );
+        assert!(product.listeners_need_application());
+        assert_eq!(
+            product.http_target().address_family,
+            Some(AddressFamily::Ipv4)
+        );
+        assert_eq!(
+            product.http_target().bind_address.as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn persisted_null_reset_waits_for_startup_bind_to_reapply() {
+        let bootstrap = Settings {
+            address_family: Some(AddressFamily::Ipv4),
+            bind_address: Some(String::new()),
+            ..Settings::default()
+        };
+        let mut product = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":3,"revision":3,
+                "values":{"hostname":"Host","port":47989,"address_family":"both","bind_address":"::1"}
+            }))
+            .unwrap(),
+        );
+        let old_http = product.http_target();
+        let old_rtsp = product.rtsp_target();
+        product.set_active_http_state(
+            Some(old_http),
+            Some(vec!["[::1]:47989".into()]),
+            Some(vec!["[::1]:47984".into()]),
+        );
+        product.set_active_rtsp_state(
+            Some(old_rtsp),
+            Some(47_989),
+            Some(vec!["[::1]:48010".into()]),
+        );
+
+        product.finish_call(
+            Purpose::Update {
+                request: 21,
+                hostname: "Host".into(),
+                target: NetworkTarget {
+                    port: 47_989,
+                    address_family: None,
+                    bind_address: None,
+                },
+                expected_revision: 3,
+                require_listener_apply: true,
+            },
+            CallOutcome::Payload(json!({
+                "ok":true,"found":true,"version":3,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null}
+            })),
+        );
+
+        let completion = product.completions.front().unwrap();
+        assert_eq!(completion.required_http_target, Some(product.http_target()));
+        assert_eq!(completion.required_rtsp_target, Some(product.rtsp_target()));
+        assert!(product.listeners_need_application());
+    }
+
+    #[test]
+    fn persisted_remote_override_is_rejected_when_bootstrap_disallows_remote_access() {
+        let product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        let document = parse_document(&json!({
+            "ok":true,"found":true,"version":3,"revision":2,
+            "values":{"hostname":"Host","port":47989,"address_family":"ipv4","bind_address":"0.0.0.0"}
+        }))
+        .unwrap();
+        assert_eq!(
+            product.validate_document(&document).unwrap_err().code,
+            "invalid_state_response"
+        );
+    }
+
+    #[test]
+    fn omitted_update_fields_preserve_while_null_clears_overrides() {
+        assert_eq!(
+            apply_field_update(FieldUpdate::Omitted, Some(AddressFamily::Both)),
+            Some(AddressFamily::Both)
+        );
+        assert_eq!(
+            apply_field_update::<AddressFamily>(FieldUpdate::Null, Some(AddressFamily::Both)),
+            None
+        );
+        assert_eq!(
+            apply_field_update(FieldUpdate::Value(String::new()), Some("127.0.0.1".into())),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn v3_product_update_payload_keeps_nulls_and_blank_overrides_exact() {
+        let reset = product_update_payload(
+            7,
+            "Host",
+            &NetworkTarget {
+                port: 48_000,
+                address_family: None,
+                bind_address: None,
+            },
+        );
+        assert_eq!(reset["version"], 3);
+        assert_eq!(reset["expected_revision"], 7);
+        assert_eq!(reset["values"]["address_family"], Value::Null);
+        assert_eq!(reset["values"]["bind_address"], Value::Null);
+
+        let explicit_blank = product_update_payload(
+            8,
+            "Host",
+            &NetworkTarget {
+                port: 48_000,
+                address_family: Some(AddressFamily::Both),
+                bind_address: Some(String::new()),
+            },
+        );
+        assert_eq!(explicit_blank["values"]["address_family"], "both");
+        assert_eq!(explicit_blank["values"]["bind_address"], "");
     }
 }

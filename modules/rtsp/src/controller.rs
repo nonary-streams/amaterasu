@@ -43,9 +43,14 @@ struct PendingNetwork {
 
 pub struct Controller {
     settings: Settings,
+    bootstrap_settings: Settings,
     network_base_port: Option<u16>,
+    network_address_family: Option<crate::model::AddressFamily>,
+    network_bind_address: Option<String>,
     listener_base_port: Option<u16>,
     active_network_base_port: Option<u16>,
+    active_address_family: Option<crate::model::AddressFamily>,
+    active_bind_address: Option<String>,
     network_error: Option<&'static str>,
     network_retry_at: u64,
     transport: Option<Transport>,
@@ -71,8 +76,13 @@ impl Controller {
             (None, Vec::new(), None)
         };
         Ok(Self {
+            bootstrap_settings: settings.clone(),
+            active_address_family: None,
+            active_bind_address: None,
             settings,
             network_base_port,
+            network_address_family: None,
+            network_bind_address: None,
             listener_base_port: network_base_port,
             active_network_base_port: None,
             network_error: None,
@@ -137,13 +147,20 @@ impl Controller {
             .retain(|pending| pending.ticket != ticket);
     }
 
-    pub(super) fn configure_network_port(
+    pub(super) fn configure_network_policy(
         &mut self,
         port: u16,
+        address_family: Option<crate::model::AddressFamily>,
+        bind_address: Option<String>,
         now: u64,
     ) -> Result<Value, &'static str> {
         crate::model::validate_base_port(port)?;
+        let candidate =
+            self.candidate_network_settings(port, address_family, bind_address.clone())?;
+        candidate.validate()?;
         self.network_base_port = Some(port);
+        self.network_address_family = address_family;
+        self.network_bind_address = bind_address;
         self.network_error = None;
         let applied = self.try_apply_network_port();
         if let Err(error) = applied {
@@ -154,6 +171,15 @@ impl Controller {
             self.network_retry_at = 0;
         }
         Ok(self.network_status(applied.is_ok_and(|applied| applied)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn configure_network_port(
+        &mut self,
+        port: u16,
+        now: u64,
+    ) -> Result<Value, &'static str> {
+        self.configure_network_policy(port, None, None, now)
     }
 
     pub(super) fn media_binds_for_open(
@@ -216,11 +242,21 @@ impl Controller {
         let Some(base_port) = self.network_base_port else {
             return Ok(false);
         };
-        let binds = self.settings.rtsp_binds_for_base(base_port)?;
-        if self.active_network_base_port == Some(base_port) && self.locals == binds {
+        let candidate = self.candidate_network_settings(
+            base_port,
+            self.network_address_family,
+            self.network_bind_address.clone(),
+        )?;
+        candidate.validate()?;
+        let binds = candidate.rtsp_binds_for_base(base_port)?;
+        if self.active_network_base_port == Some(base_port)
+            && self.active_address_family == self.network_address_family
+            && self.active_bind_address == self.network_bind_address
+            && self.locals == binds
+        {
             return Ok(true);
         }
-        if !self.settings.enabled
+        if !candidate.enabled
             || self.records.values().any(|record| !record.state.terminal())
             || self
                 .transport
@@ -230,32 +266,57 @@ impl Controller {
             return Ok(false);
         }
 
-        self.settings.probe_media_binds(base_port)?;
+        candidate.probe_media_binds(base_port)?;
         if self.locals == binds {
             self.listener_base_port = Some(base_port);
             self.active_network_base_port = Some(base_port);
+            self.active_address_family = self.network_address_family;
+            self.active_bind_address = self.network_bind_address.clone();
+            self.settings = candidate;
             self.network_error = None;
             return Ok(true);
         }
-        let replacement = Transport::bind_all(binds, self.settings.allow_remote)?;
-        let locals = replacement.local_addrs()?;
+        let transport = self.transport.as_mut().ok_or("tcp_listener_unavailable")?;
+        transport.rebind_all(binds, candidate.allow_remote)?;
+        let locals = transport.local_addrs()?;
         let local = locals.first().copied().ok_or("tcp_address_failed")?;
-        self.transport = Some(replacement);
         self.local = Some(local);
         self.locals = locals;
-        self.settings.bind = local;
+        self.settings = candidate;
         self.listener_base_port = Some(base_port);
         self.active_network_base_port = Some(base_port);
+        self.active_address_family = self.network_address_family;
+        self.active_bind_address = self.network_bind_address.clone();
         self.network_error = None;
         Ok(true)
+    }
+
+    fn candidate_network_settings(
+        &self,
+        base_port: u16,
+        address_family: Option<crate::model::AddressFamily>,
+        bind_address: Option<String>,
+    ) -> Result<Settings, &'static str> {
+        crate::model::validate_base_port(base_port)?;
+        let mut candidate = self.bootstrap_settings.clone();
+        candidate.set_base_port(base_port)?;
+        candidate.address_family = address_family.or(self.bootstrap_settings.address_family);
+        candidate.bind_address =
+            bind_address.or_else(|| self.bootstrap_settings.bind_address.clone());
+        Ok(candidate)
     }
 
     fn network_status(&self, applied: bool) -> Value {
         serde_json::json!({
             "ok": true,
             "desired_port": self.network_base_port,
+            "desired_address_family": self.network_address_family,
+            "desired_bind_address": self.network_bind_address,
             "rtsp_port": self.local.map(|address| address.port()),
             "active_base_port": self.active_network_base_port,
+            "active_address_family": self.active_address_family,
+            "active_bind_address": self.active_bind_address,
+            "rtsp_addresses": self.locals.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "active": applied,
             "pending": !applied,
             "udp_binds_preflighted": applied,

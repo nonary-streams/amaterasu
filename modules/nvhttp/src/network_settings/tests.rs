@@ -65,7 +65,12 @@ fn applied(port: u16) -> Value {
     json!({
         "ok":true,
         "desired_port":port,
+        "desired_address_family":null,
+        "desired_bind_address":null,
         "active_base_port":port,
+        "active_address_family":null,
+        "active_bind_address":null,
+        "rtsp_addresses":[format!("127.0.0.1:{}", port + 21)],
         "active":true,
         "pending":false,
         "udp_binds_preflighted":true,
@@ -77,7 +82,12 @@ fn pending(port: u16, active_port: Option<u16>) -> Value {
     json!({
         "ok":true,
         "desired_port":port,
+        "desired_address_family":null,
+        "desired_bind_address":null,
         "active_base_port":active_port,
+        "active_address_family":null,
+        "active_bind_address":null,
+        "rtsp_addresses":[format!("127.0.0.1:{}", active_port.unwrap_or(0) + 21)],
         "active":false,
         "pending":true,
         "udp_binds_preflighted":false,
@@ -89,7 +99,12 @@ fn listener_without_udp_preflight(port: u16) -> Value {
     json!({
         "ok":true,
         "desired_port":port,
+        "desired_address_family":null,
+        "desired_bind_address":null,
         "active_base_port":port,
+        "active_address_family":null,
+        "active_bind_address":null,
+        "rtsp_addresses":[format!("127.0.0.1:{}", port + 21)],
         "active":true,
         "pending":false,
         "udp_binds_preflighted":false,
@@ -142,7 +157,12 @@ fn a_fresh_runtime_reconciles_the_persisted_port_after_restart() {
     assert_eq!(request.0, RTSP_SERVICE);
     assert_eq!(
         request.1,
-        &json!({"action":"network_configure","port":port})
+        &json!({
+            "action":"network_configure",
+            "port":port,
+            "address_family":null,
+            "bind_address":null,
+        })
     );
     assert_eq!(*request.2, None, "startup has no management parent");
     assert_eq!(network.active_base_port(), Some(port));

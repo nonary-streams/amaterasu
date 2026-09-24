@@ -43,11 +43,17 @@ impl Controller {
     ) {
         match operation {
             Operation::Open(config) => self.open(request, caller, config, now, remaining, runtime),
-            Operation::NetworkConfigure { port } => {
+            Operation::NetworkConfigure {
+                port,
+                address_family,
+                bind_address,
+            } => {
                 if caller != "amaterasu.nvhttp" {
                     rpc::complete(runtime, request, error("permission_denied"));
                 } else {
-                    let payload = self.configure_network_port(port, now).unwrap_or_else(error);
+                    let payload = self
+                        .configure_network_policy(port, address_family, bind_address, now)
+                        .unwrap_or_else(error);
                     rpc::complete(runtime, request, payload);
                 }
             }

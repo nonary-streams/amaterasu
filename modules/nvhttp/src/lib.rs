@@ -9,8 +9,8 @@ mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use network_settings::NetworkSettings;
-use product_settings::{AdminAction, ProductSettings};
-use serde::Deserialize;
+use product_settings::{AdminAction, FieldUpdate, ProductSettings};
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use settings::Settings;
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ fn should_attempt_listener_rebind(
     server: Option<&server::Server>,
     product_settings: &ProductSettings,
 ) -> bool {
-    server.is_some() && product_settings.port_needs_application()
+    server.is_some() && product_settings.listeners_need_application()
 }
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -32,12 +32,28 @@ enum Operation {
     SettingsUpdate {
         hostname: String,
         port: u16,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        address_family: FieldUpdate<settings::AddressFamily>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        bind_address: FieldUpdate<String>,
         expected_revision: u64,
     },
 }
 
+fn deserialize_field_update<'de, D, T>(deserializer: D) -> Result<FieldUpdate<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| match value {
+        Some(value) => FieldUpdate::Value(value),
+        None => FieldUpdate::Null,
+    })
+}
+
 struct NvhttpModule {
     runtime: RuntimeClient,
+    startup_settings: Settings,
     server: Option<server::Server>,
     router: Option<wire::Router>,
     identity: Option<tls::Identity>,
@@ -60,7 +76,8 @@ impl ManagedModule for NvhttpModule {
             serde_json::from_value(payload).map_err(|_| "invalid nvhttp settings")?;
         settings.validate()?;
         let hostname = settings::effective_hostname(&settings.hostname);
-        let product_settings = ProductSettings::new(hostname.clone(), settings.http_bind.port());
+        let mut product_settings =
+            ProductSettings::with_bootstrap_settings(hostname.clone(), &settings);
         let (server, router, identity) = if settings.enabled {
             let identity = tls::Identity::bind(&runtime)?;
             let server = server::Server::bind(&settings)?;
@@ -77,11 +94,32 @@ impl ManagedModule for NvhttpModule {
         } else {
             (None, None, None)
         };
+        if let Some(server) = &server {
+            let target = product_settings.http_target();
+            product_settings.set_active_http_state(
+                Some(target),
+                Some(
+                    server
+                        .http_addresses()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+                Some(
+                    server
+                        .https_addresses()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+            );
+        }
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
+            startup_settings: settings,
             server,
             router,
             identity,
@@ -116,36 +154,44 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.port(),
                 &mut self.product_settings,
             )?;
-            self.product_settings
-                .set_active_rtsp_base_port(self.network_settings.active_base_port());
         }
         if self.server.is_none() {
             self.product_settings.record_listener_disabled();
         } else if should_attempt_listener_rebind(self.server.as_ref(), &self.product_settings)
             && Instant::now() >= self.next_listener_rebind
         {
-            let port = self.product_settings.port();
-            let result = self
-                .server
-                .as_mut()
-                .expect("a live listener is required to apply a port")
-                .rebind_port(port);
+            let target = self.product_settings.http_target();
+            let mut settings = self.startup_settings.clone();
+            settings.http_bind.set_port(target.port);
+            settings
+                .https_bind
+                .set_port(settings::https_port(target.port));
+            settings.address_family = target.address_family;
+            settings.bind_address = target.bind_address.clone();
+            let result = settings.validate().map_err(str::to_owned).and_then(|()| {
+                self.server
+                    .as_mut()
+                    .expect("a live listener is required to apply network settings")
+                    .rebind_settings(&settings)
+            });
             match result {
                 Ok(()) => {
+                    self.product_settings.set_active_http_target(target);
                     self.update_active_listener_ports();
-                    self.product_settings.record_port_apply_success();
+                    self.product_settings.record_listener_apply_success();
                     self.listener_rebind_delay = Duration::from_secs(1);
                     self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;
                 }
                 Err(error) => {
-                    self.product_settings.record_port_apply_failure(port, error);
+                    self.product_settings
+                        .record_listener_apply_failure(&target, error);
                     self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;
                     self.listener_rebind_delay =
                         (self.listener_rebind_delay * 2).min(Duration::from_secs(30));
                 }
             }
-        } else if self.server.is_some() && self.product_settings.port_is_active() {
-            self.product_settings.record_port_apply_success();
+        } else if self.server.is_some() && !self.product_settings.listeners_need_application() {
+            self.product_settings.record_listener_apply_success();
         }
         self.product_settings.flush_completion(&self.runtime);
         self.refresh_identity();
@@ -217,15 +263,18 @@ impl NvhttpModule {
         let addresses = self
             .server
             .as_ref()
-            .map(|server| (server.http_address().port(), server.https_address().port()));
-        if let Some((http_port, https_port)) = addresses {
+            .map(|server| (server.http_addresses(), server.https_addresses()));
+        if let Some((http, https)) = addresses {
             if let Some(router) = &mut self.router {
-                router.set_ports(http_port, https_port);
+                router.set_ports(http[0].port(), https[0].port());
             }
-            self.product_settings
-                .set_active_ports(Some(http_port), Some(https_port));
+            self.product_settings.set_active_http_addresses(
+                Some(http.iter().map(ToString::to_string).collect()),
+                Some(https.iter().map(ToString::to_string).collect()),
+            );
         } else {
-            self.product_settings.set_active_ports(None, None);
+            self.product_settings
+                .set_active_http_state(None, None, None);
         }
     }
 
@@ -319,6 +368,8 @@ impl NvhttpModule {
                             "settings_hostname":self.product_settings.hostname(),
                             "settings_configured_hostname":self.product_settings.configured_hostname(),
                             "settings_port":self.product_settings.port(),
+                            "settings_address_family":self.product_settings.effective_address_family(),
+                            "settings_bind_address":self.product_settings.effective_bind_address(),
                             "active_http_port":self.server.as_ref().map(|server|server.http_address().port()),
                             "active_https_port":self.server.as_ref().map(|server|server.https_address().port()),
                             "settings_loaded":self.product_settings.revision().is_some(),
@@ -340,6 +391,8 @@ impl NvhttpModule {
                             Operation::SettingsUpdate {
                                 hostname,
                                 port,
+                                address_family,
+                                bind_address,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -359,6 +412,8 @@ impl NvhttpModule {
                                 AdminAction::Update {
                                     hostname,
                                     port,
+                                    address_family,
+                                    bind_address,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -484,3 +539,55 @@ impl WarmIdentity {
 }
 
 amaterasu_module_sdk::export_module!(NvhttpModule);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_update_deserializer_distinguishes_omitted_null_and_values() {
+        let Operation::SettingsUpdate {
+            address_family: omitted_family,
+            bind_address: omitted_bind,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(omitted_family, FieldUpdate::Omitted);
+        assert_eq!(omitted_bind, FieldUpdate::Omitted);
+
+        let Operation::SettingsUpdate {
+            address_family: reset_family,
+            bind_address: blank_bind,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
+            "address_family":null,"bind_address":""
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(reset_family, FieldUpdate::Null);
+        assert_eq!(blank_bind, FieldUpdate::Value(String::new()));
+
+        let Operation::SettingsUpdate {
+            address_family: family,
+            bind_address: address,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
+            "address_family":"both","bind_address":"::1"
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(family, FieldUpdate::Value(settings::AddressFamily::Both));
+        assert_eq!(address, FieldUpdate::Value("::1".into()));
+    }
+}

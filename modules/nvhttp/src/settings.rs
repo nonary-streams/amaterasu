@@ -1,5 +1,5 @@
 use crate::launch::StreamingConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const FALLBACK_HOSTNAME: &str = "Amaterasu";
@@ -9,7 +9,7 @@ pub const MIN_PORT: u16 = 1_029;
 pub const MAX_PORT: u16 = 65_514;
 pub const HTTPS_PORT_OFFSET: u16 = 5;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AddressFamily {
     #[default]
@@ -17,7 +17,7 @@ pub enum AddressFamily {
     Both,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
@@ -80,16 +80,71 @@ impl Settings {
     }
 
     pub fn resolved_http_binds(&self) -> Result<Vec<SocketAddr>, &'static str> {
-        self.resolve_binds(self.http_bind)
+        self.resolved_http_binds_with(self.address_family, self.bind_address.as_deref())
     }
 
     pub fn resolved_https_binds(&self) -> Result<Vec<SocketAddr>, &'static str> {
-        self.resolve_binds(self.https_bind)
+        self.resolved_https_binds_with(self.address_family, self.bind_address.as_deref())
     }
 
-    fn resolve_binds(&self, legacy: SocketAddr) -> Result<Vec<SocketAddr>, &'static str> {
-        let family = self.resolved_address_family(legacy.ip());
-        let addresses = match self.bind_address.as_deref() {
+    pub fn resolved_http_binds_with(
+        &self,
+        address_family: Option<AddressFamily>,
+        bind_address: Option<&str>,
+    ) -> Result<Vec<SocketAddr>, &'static str> {
+        self.resolve_binds(self.http_bind, address_family, bind_address)
+    }
+
+    pub fn resolved_https_binds_with(
+        &self,
+        address_family: Option<AddressFamily>,
+        bind_address: Option<&str>,
+    ) -> Result<Vec<SocketAddr>, &'static str> {
+        self.resolve_binds(self.https_bind, address_family, bind_address)
+    }
+
+    pub fn validate_network_policy(
+        &self,
+        address_family: Option<AddressFamily>,
+        bind_address: Option<&str>,
+    ) -> Result<(), &'static str> {
+        let http_binds = self.resolve_binds(self.http_bind, address_family, bind_address)?;
+        let https_binds = self.resolve_binds(self.https_bind, address_family, bind_address)?;
+        if http_binds
+            .iter()
+            .any(|http| http.port() != 0 && https_binds.iter().any(|https| https == http))
+        {
+            return Err("listener_addresses_conflict");
+        }
+        Ok(())
+    }
+
+    pub fn effective_address_family(
+        &self,
+        address_family: Option<AddressFamily>,
+        bind_address: Option<&str>,
+        legacy_ip: IpAddr,
+    ) -> AddressFamily {
+        address_family.unwrap_or_else(|| {
+            let ip = bind_address
+                .and_then(|address| address.trim().parse::<IpAddr>().ok())
+                .unwrap_or(legacy_ip);
+            if ip.is_ipv4() {
+                AddressFamily::Ipv4
+            } else {
+                AddressFamily::Both
+            }
+        })
+    }
+
+    fn resolve_binds(
+        &self,
+        legacy: SocketAddr,
+        address_family: Option<AddressFamily>,
+        bind_address: Option<&str>,
+    ) -> Result<Vec<SocketAddr>, &'static str> {
+        let family = self.effective_address_family(address_family, bind_address, legacy.ip());
+        let addresses = match bind_address {
             None => vec![legacy.ip()],
             Some(address) if address.trim().is_empty() => match (family, self.allow_remote) {
                 (AddressFamily::Ipv4, true) => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
@@ -126,21 +181,6 @@ impl Settings {
                 Ok(SocketAddr::new(ip, legacy.port()))
             })
             .collect()
-    }
-
-    fn resolved_address_family(&self, legacy_ip: IpAddr) -> AddressFamily {
-        self.address_family.unwrap_or_else(|| {
-            let ip = self
-                .bind_address
-                .as_deref()
-                .and_then(|address| address.trim().parse::<IpAddr>().ok())
-                .unwrap_or(legacy_ip);
-            if ip.is_ipv4() {
-                AddressFamily::Ipv4
-            } else {
-                AddressFamily::Both
-            }
-        })
     }
 }
 

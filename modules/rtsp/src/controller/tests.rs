@@ -436,6 +436,67 @@ fn network_port_update_rebinds_both_family_listeners_and_udp_policy() {
 }
 
 #[test]
+fn network_policy_update_activates_requested_family_and_empty_bind_address() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("initial loopback listener");
+    let port = free_base_port();
+
+    let status = controller
+        .configure_network_policy(
+            port,
+            Some(crate::model::AddressFamily::Both),
+            Some(String::new()),
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(status["active"], true);
+    assert_eq!(status["udp_binds_preflighted"], true);
+    assert_eq!(status["active_address_family"], "both");
+    assert_eq!(status["active_bind_address"], "");
+    assert_eq!(controller.locals.len(), 2);
+    assert!(controller.locals.iter().any(|address| address.is_ipv4()));
+    assert!(controller.locals.iter().any(|address| address.is_ipv6()));
+    assert_eq!(
+        controller
+            .media_binds_for_open(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            .unwrap()
+            .video
+            .ip(),
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    );
+}
+
+#[test]
+fn null_network_overrides_confirm_rtsp_startup_policy_without_fabricating_overrides() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let base = free_base_port();
+    let settings = Settings {
+        enabled: true,
+        bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base + 21),
+        address_family: Some(crate::model::AddressFamily::Ipv4),
+        bind_address: Some(String::new()),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("startup policy listener");
+
+    let status = controller
+        .configure_network_policy(base, None, None, 0)
+        .unwrap();
+
+    assert_eq!(status["active"], true);
+    assert_eq!(status["active_address_family"], Value::Null);
+    assert_eq!(status["active_bind_address"], Value::Null);
+    assert_eq!(status["rtsp_addresses"].as_array().unwrap().len(), 1);
+    assert_eq!(controller.locals[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+}
+
+#[test]
 fn failed_startup_rebind_keeps_media_binds_aligned_with_the_bootstrap_listener() {
     let _guard = NETWORK_TEST_LOCK.lock().unwrap();
     let old_port = free_base_port();
@@ -487,7 +548,11 @@ fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_s
     controller.receive(
         10,
         "amaterasu.management".into(),
-        Operation::NetworkConfigure { port },
+        Operation::NetworkConfigure {
+            port,
+            address_family: None,
+            bind_address: None,
+        },
         0,
         5_000,
         &runtime,
@@ -498,7 +563,11 @@ fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_s
     controller.receive(
         11,
         "amaterasu.nvhttp".into(),
-        Operation::NetworkConfigure { port },
+        Operation::NetworkConfigure {
+            port,
+            address_family: None,
+            bind_address: None,
+        },
         0,
         5_000,
         &runtime,
