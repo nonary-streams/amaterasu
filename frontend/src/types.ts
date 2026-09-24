@@ -245,7 +245,17 @@ namespace Amaterasu {
       key_repeat_delay: number;
       key_repeat_frequency: number;
       back_button_timeout: number;
+      gamepad: string;
     };
+  }
+  export interface InputRuntimeStatus {
+    ok: boolean;
+    gamepad: string;
+    supported_profiles: string[];
+    effective_gamepad_profile: string | null;
+    gamepad_unavailable_reason: string | null;
+    controller_input: boolean;
+    lease: Record<string, unknown> | null;
   }
   export interface HistorySettingsReply {
     ok: boolean;

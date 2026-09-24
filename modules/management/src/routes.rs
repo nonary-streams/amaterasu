@@ -136,6 +136,7 @@ pub fn resolve(path: &str) -> Option<Route> {
             "settings_get",
             Some("configuration.read"),
         ),
+        ("input", "status") => ("amaterasu.input/1", "status", Some("configuration.read")),
         ("input", "settings_update") => (
             "amaterasu.input/1",
             "settings_update",
@@ -1007,13 +1008,19 @@ mod tests {
 
     #[test]
     fn input_settings_routes_pin_domain_scopes_and_bounded_payloads() {
+        let status = resolve("/v1/input/status").unwrap();
+        assert_eq!(status.service, "amaterasu.input/1");
+        assert_eq!(status.scope, Some("configuration.read"));
+        assert_eq!(payload(status, br#"{}"#).unwrap()["action"], "status");
+        assert!(payload(status, br#"{"owner":"other"}"#).is_err());
+
         let get = resolve("/v1/input/settings_get").unwrap();
         assert_eq!(get.service, "amaterasu.input/1");
         assert_eq!(get.scope, Some("configuration.read"));
         assert_eq!(payload(get, br#"{}"#).unwrap()["action"], "settings_get");
         for rejected in [
             br#"{"owner":"amaterasu.other"}"#.as_slice(),
-            br#"{"action":"status"}"#,
+            br#"{"owner":"other"}"#,
         ] {
             assert!(payload(get, rejected).is_err());
         }
@@ -1054,6 +1061,12 @@ mod tests {
         .unwrap();
         assert_eq!(repeat_policy["key_repeat_delay"], 0);
         assert_eq!(repeat_policy["key_repeat_frequency"], 31.25);
+        let gamepad = payload(
+            update,
+            br#"{"keyboard":true,"mouse":true,"gamepad":"auto","expected_revision":12}"#,
+        )
+        .unwrap();
+        assert_eq!(gamepad["gamepad"], "auto");
         for rejected in [
             br#"{"keyboard":false,"mouse":true}"#.as_slice(),
             br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,
@@ -1067,7 +1080,6 @@ mod tests {
         ] {
             assert!(payload(update, rejected).is_err());
         }
-        assert!(resolve("/v1/input/status").is_none());
     }
 
     #[test]

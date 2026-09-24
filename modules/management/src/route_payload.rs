@@ -375,6 +375,7 @@ fn valid_lutris_name(value: &str) -> Result<(), &'static str> {
 
 fn input(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
+        "status" => fields(object, &[], &[]),
         "settings_get" => fields(object, &[], &[]),
         "settings_update" => {
             fields(
@@ -387,6 +388,7 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     "key_repeat_delay",
                     "key_repeat_frequency",
                     "back_button_timeout",
+                    "gamepad",
                 ],
             )?;
             if object.get("keyboard").and_then(Value::as_bool).is_none()
@@ -413,6 +415,11 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                         .as_i64()
                         .is_none_or(|timeout| i32::try_from(timeout).is_err())
                 })
+                || object.get("gamepad").is_some_and(|value| {
+                    value
+                        .as_str()
+                        .is_none_or(|profile| !valid_gamepad_profile(profile))
+                })
                 || object
                     .get("expected_revision")
                     .and_then(Value::as_u64)
@@ -423,6 +430,32 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Err(INVALID),
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 
@@ -1964,6 +1997,11 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":0,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":2147483647,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":-2147483648,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"gamepad":"auto","expected_revision":0}),
+            #[cfg(windows)]
+            serde_json::json!({"keyboard":true,"mouse":true,"gamepad":"ds4","expected_revision":0}),
+            #[cfg(target_os = "linux")]
+            serde_json::json!({"keyboard":true,"mouse":true,"gamepad":"xone","expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_ok());
         }
@@ -1988,9 +2026,66 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":-2147483649i64,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":0.5,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"back_button_timeout":"-1","expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"gamepad":null,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"invented","expected_revision":0}),
+            #[cfg(windows)]
+            serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"xone","expected_revision":0}),
+            #[cfg(target_os = "linux")]
+            serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"vhf","expected_revision":0}),
+            #[cfg(not(any(windows, target_os = "linux")))]
+            serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"x360","expected_revision":0}),
         ] {
             assert!(validate(route, object.as_object().unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn input_status_route_accepts_only_an_empty_read_request() {
+        let route = Route {
+            service: "amaterasu.input/1",
+            action: "status",
+            scope: Some("configuration.read"),
+            requires_empty_body: false,
+        };
+        assert!(validate(route, &serde_json::Map::new()).is_ok());
+        assert!(
+            validate(
+                route,
+                serde_json::json!({"owner":"other"}).as_object().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gamepad_profile_validation_matches_source_platform_choices() {
+        #[cfg(windows)]
+        let (recognized, wrong_platform) = (
+            [
+                "auto",
+                "x360",
+                "vhf",
+                "vhf_xbox",
+                "vhf_xbox_one",
+                "vhf_ds4",
+                "vhf_ds5",
+                "vhf_switch",
+                "ds4",
+            ]
+            .as_slice(),
+            "xone",
+        );
+        #[cfg(target_os = "linux")]
+        let (recognized, wrong_platform) =
+            (["auto", "xone", "ds4", "ds5", "switch"].as_slice(), "vhf");
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let (recognized, wrong_platform) = (["auto"].as_slice(), "x360");
+
+        for profile in recognized {
+            assert!(valid_gamepad_profile(profile), "accepted {profile}");
+        }
+        assert!(!valid_gamepad_profile(wrong_platform));
+        assert!(!valid_gamepad_profile("unknown"));
     }
 }
 

@@ -57,6 +57,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     key_repeat_delay: 0,
     key_repeat_frequency: 0,
     back_button_timeout: -1,
+    gamepad: "auto",
   });
   assert.deepEqual(
     ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25, 2147483647)),
@@ -69,6 +70,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       key_repeat_delay: 2147483647,
       key_repeat_frequency: 31.25,
       back_button_timeout: 2147483647,
+      gamepad: "auto",
     },
   );
   assert.equal(
@@ -110,6 +112,55 @@ test("input policy editor validates key repeat settings and reports cleanup hone
   assert.match(describe({ ...settings, persisted: false }), /not been confirmed/);
   assert.match(describe({ ...settings, applied: false, cleanup_required: true }), /cleanup.*pending/);
   assert.match(describe(settings), /policy is active/);
+});
+
+test("gamepad editor uses backend profiles and labels a selected unavailable profile", () => {
+  const choices = context.Amaterasu.inputGamepadProfileChoices;
+  assert.deepEqual(ordinary(choices("ds4", ["auto", "x360"])), [
+    { value: "auto", label: "auto", available: true },
+    { value: "x360", label: "x360", available: true },
+    {
+      value: "ds4",
+      label: "ds4 (recognized, unavailable on this backend)",
+      available: false,
+    },
+  ]);
+  assert.deepEqual(ordinary(choices("xone", ["auto", "xone"])), [
+    { value: "auto", label: "auto", available: true },
+    { value: "xone", label: "xone", available: true },
+  ]);
+
+  const parsePolicy = context.Amaterasu.parseInputPolicy;
+  assert.equal(
+    ordinary(parsePolicy(true, true, true, true, false, 500, 24.9, -1, "ds4", ["auto", "x360", "ds4"]))
+      .gamepad,
+    "ds4",
+  );
+  assert.throws(() => parsePolicy(true, true, true, true, false, 500, 24.9, -1, "switch", ["auto", "x360", "ds4"]));
+
+  const describe = context.Amaterasu.inputGamepadStatusDescription;
+  assert.match(
+    describe("ds4", {
+      gamepad: "ds4",
+      supported_profiles: ["auto", "x360"],
+      effective_gamepad_profile: null,
+      gamepad_unavailable_reason: "ViGEm profile is not implemented",
+      controller_input: false,
+      lease: {},
+    }),
+    /recognized but unavailable.*not implemented/,
+  );
+  assert.match(
+    describe("auto", {
+      gamepad: "auto",
+      supported_profiles: ["auto", "x360"],
+      effective_gamepad_profile: null,
+      gamepad_unavailable_reason: null,
+      controller_input: false,
+      lease: null,
+    }),
+    /availability is checked when a stream starts/,
+  );
 });
 
 test("history settings preserve disabled pruning and enforce host integer bounds", () => {

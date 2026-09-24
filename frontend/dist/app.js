@@ -1091,7 +1091,7 @@ var Amaterasu;
         };
     }
     Amaterasu.parseAuthTokenLifetimes = parseAuthTokenLifetimes;
-    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1) {
+    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"]) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
             typeof highResolutionScrolling !== "boolean" ||
@@ -1104,7 +1104,10 @@ var Amaterasu;
             keyRepeatFrequency < 0 ||
             !Number.isSafeInteger(backButtonTimeout) ||
             backButtonTimeout < minInputBackButtonTimeoutMs ||
-            backButtonTimeout > maxInputBackButtonTimeoutMs)
+            backButtonTimeout > maxInputBackButtonTimeoutMs ||
+            typeof gamepadProfile !== "string" ||
+            !Array.isArray(selectableGamepadProfiles) ||
+            !selectableGamepadProfiles.includes(gamepadProfile))
             throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
         return {
             keyboard,
@@ -1115,9 +1118,61 @@ var Amaterasu;
             key_repeat_delay: keyRepeatDelay,
             key_repeat_frequency: keyRepeatFrequency,
             back_button_timeout: backButtonTimeout,
+            gamepad: gamepadProfile,
         };
     }
     Amaterasu.parseInputPolicy = parseInputPolicy;
+    function inputGamepadProfileChoices(selectedProfile, supportedProfiles) {
+        if (typeof selectedProfile !== "string" ||
+            !Array.isArray(supportedProfiles) ||
+            !supportedProfiles.every((profile) => typeof profile === "string"))
+            throw new Error("Gamepad profile status is invalid.");
+        const availableProfiles = [...new Set(supportedProfiles)];
+        if (availableProfiles.length === 0)
+            availableProfiles.push("auto");
+        const choices = availableProfiles.map((value) => ({
+            value,
+            label: value,
+            available: true,
+        }));
+        if (selectedProfile !== "" && !availableProfiles.includes(selectedProfile)) {
+            choices.push({
+                value: selectedProfile,
+                label: `${selectedProfile} (recognized, unavailable on this backend)`,
+                available: false,
+            });
+        }
+        return choices;
+    }
+    Amaterasu.inputGamepadProfileChoices = inputGamepadProfileChoices;
+    function inputGamepadStatusDescription(selectedProfile, status) {
+        if (!status || !Array.isArray(status.supported_profiles))
+            return "Current gamepad backend status is unavailable.";
+        const isSupported = status.supported_profiles.includes(selectedProfile);
+        if (!isSupported) {
+            const reason = status.gamepad === selectedProfile &&
+                typeof status.gamepad_unavailable_reason === "string" &&
+                status.gamepad_unavailable_reason !== ""
+                ? status.gamepad_unavailable_reason
+                : null;
+            return reason
+                ? `The selected ${selectedProfile} profile is recognized but unavailable: ${reason}`
+                : `The selected ${selectedProfile} profile is recognized but unavailable on this backend.`;
+        }
+        if (status.lease === null)
+            return `${selectedProfile} is supported by this backend; device availability is checked when a stream starts.`;
+        const reason = status.gamepad === selectedProfile &&
+            typeof status.gamepad_unavailable_reason === "string" &&
+            status.gamepad_unavailable_reason !== ""
+            ? status.gamepad_unavailable_reason
+            : null;
+        if (status.gamepad === selectedProfile && !status.controller_input)
+            return reason
+                ? `The ${selectedProfile} profile is selected, but controller input is currently unavailable: ${reason}`
+                : `The ${selectedProfile} profile is selected, but controller input is currently unavailable.`;
+        return `${selectedProfile} is supported by the current input backend.`;
+    }
+    Amaterasu.inputGamepadStatusDescription = inputGamepadStatusDescription;
     function parseClientFecOverride(value) {
         const trimmed = value.trim();
         if (trimmed === "")
@@ -1135,7 +1190,7 @@ var Amaterasu;
             return "The saved input policy has not been confirmed yet.";
         if (!settings.applied || settings.cleanup_required)
             return "The saved policy is active for new events, but cleanup of held native input is still pending.";
-        return "The saved keyboard and mouse policy is active.";
+        return "The saved keyboard, mouse, and gamepad policy is active.";
     }
     Amaterasu.inputPolicyStatusDescription = inputPolicyStatusDescription;
     function safeNvhttpBindFamily(value) {
@@ -2115,7 +2170,10 @@ var Amaterasu;
         async function loadInput() {
             inputArea.replaceChildren(Amaterasu.el("p", "muted", "Loading input policy…"));
             try {
-                const settings = await context.api.post("input/settings_get");
+                const [settings, runtimeStatus] = await Promise.all([
+                    context.api.post("input/settings_get"),
+                    context.api.post("input/status"),
+                ]);
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -2143,17 +2201,31 @@ var Amaterasu;
                 backButtonTimeout.min = String(minInputBackButtonTimeoutMs);
                 backButtonTimeout.max = String(maxInputBackButtonTimeoutMs);
                 backButtonTimeout.step = "1";
+                const gamepadProfile = Amaterasu.el("select");
+                gamepadProfile.name = "input_gamepad_profile";
+                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus.supported_profiles);
+                for (const choice of gamepadProfileChoices) {
+                    const option = Amaterasu.el("option", "", choice.label);
+                    option.value = choice.value;
+                    gamepadProfile.append(option);
+                }
+                gamepadProfile.value = settings.values.gamepad;
+                const selectedGamepadUnavailable = !runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
+                    (runtimeStatus.lease !== null &&
+                        runtimeStatus.gamepad === settings.values.gamepad &&
+                        !runtimeStatus.controller_input);
+                const gamepadStatus = Amaterasu.el("p", selectedGamepadUnavailable ? "error" : "muted", inputGamepadStatusDescription(settings.values.gamepad, runtimeStatus));
                 const status = Amaterasu.el("p", settings.applied ? "muted" : "error", inputPolicyStatusDescription(settings));
                 const save = Amaterasu.el("button", "button primary", "Save input policy");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other backends do not inject gamepads."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "On Linux and Windows, when controller input is available, holding Back for this many milliseconds pulses Guide for 100 milliseconds. Any negative value disables it; other platforms do not inject gamepads."), Amaterasu.field("Gamepad profile", gamepadProfile, "Profiles listed by input status are supported by this backend. A saved platform-recognized profile outside that list remains visible and is labeled unavailable."), gamepadStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
                         try {
                             const updated = await context.api.post("input/settings_update", {
-                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber),
+                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber, backButtonTimeout.valueAsNumber, gamepadProfile.value, gamepadProfileChoices.map((choice) => choice.value)),
                                 expected_revision: settings.revision,
                             });
                             context.notify(updated.applied
