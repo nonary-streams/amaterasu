@@ -2,6 +2,23 @@
 
 ## Current bounded slice
 
+- Lane candidate: `0c9e1fb9be6759827693ed93a11c6e678a479cfd` (`fix(audio): recover Windows capture after device loss`).
+- Worker source commit: `f6c4c8dd633c9d5924415e08dceaea52016c012e`; lane base: `87caa50f886965173a3cba09eedd5746a6daedc7`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable IDs advanced locally: `global:audio_sink`, `global:virtual_sink`; both remain pending full parity review.
+- Worker session `01a0d56e-93d9-74b3-8c74-02774f028536` was verified before edits as `gpt-6-luna`/`xhigh` from active session attribution metadata.
+- Changed paths: `modules/audio/README.md`, `modules/audio/src/controller.rs`, `modules/audio/src/controller/tests.rs`, `modules/audio/src/model.rs`, `modules/audio/src/packet.rs`, `modules/audio/src/platform/mod.rs`, `modules/audio/src/platform/windows.rs`, and `modules/audio/src/worker.rs`.
+
+After an initialized Windows capture reports `device_lost`, the worker releases it and retries reopening the same selected endpoint and effective capture configuration every five seconds until success or shutdown. Acquisition failures continue retrying. A changed endpoint or PCM format fails terminally so the existing `AudioCapture` format contract stays fixed. Retry and idle waits are interrupted by worker shutdown. A stream-level timeline keeps packet sequence and timestamps monotonic across capture resets and marks the first recovered packet discontinuous; status reports `recovering` until audio resumes.
+
+`rustfmt --edition 2024 --check` and `git diff --check 87caa50f886965173a3cba09eedd5746a6daedc7 HEAD` passed in the worker/lane checkouts. Cargo tests, builds, and Clippy were not run in these lightweight worktrees; coordinator validation is pending. Tests were added for acquisition retries, shutdown cancellation, timeline continuity, format mismatch, and recovering status, but were not executed. No Windows hardware/device-removal qualification was performed. Non-Windows audio capture remains unsupported.
+
+This slice does not complete `global:audio_sink` or `global:virtual_sink`. Opus encoding, configured speaker remapping, resampling, continuous silent audio, process-specific loopback, microphone capture, Linux/macOS capture, automatic endpoint switching, and full streaming audio parity remain unimplemented. Recovery stays pinned to the originally selected endpoint.
+
+The coordinator owns direct lane-commit cherry-picks into `main`; no integration branch is used. No main cherry-pick was performed in this lane.
+
+## Previous bounded slice: DS4 lease snapshot correction
+
 - Candidate source commit: `431acd70a632f6960b22be18a915cc49107c215a` (cherry-picked from worker candidate `bd03e85c2b26fb62dbe08e73a9a2c813e28092cb`).
 - Follow-up test expectation commit: `2f8775d230628f272c8290f802f6e193ab2b7de7` updates the v9 absent-document bootstrap default assertion discovered by the full package suite.
 - Base SHA: `3adbd51f434c2956dfedb6301e0fd9d008b4ce0e`.
@@ -113,16 +130,14 @@ The lane-start coverage snapshot reported all 23 IDs pending. This candidate doe
 
 ## Next bounded slice
 
-The next candidate is Windows audio capture recovery in `modules/audio/src/worker.rs` and its owned platform/packet files, for `global:audio_sink` and `global:virtual_sink`. The audit found that `device_lost` currently ends capture permanently, while the pinned reference retries acquisition until shutdown. Keep the AudioCapture API stable, make retry shutdown-cancellable, preserve packet sequence/timestamp continuity and mark the first recovered packet discontinuous. Add fake-source retry/continuity tests but do not execute them in this lightweight checkout.
+While cross-lane consumers integrate, continue independent input settings work on lane-owned paths. For audio, continue parity for `global:audio_sink`, `global:virtual_sink`, `global:audio_sink_capture_only`, and `global:stream_audio`: review product defaults/persistence, management and scoped caller resolution, and qualify Windows routing and recovery on device-removal/re-enumeration hardware. Leave these IDs pending until the coordinator has validated the full behavior and required platform evidence.
 
-Continue with independent audio and input settings work while cross-lane consumers integrate.
+## Earlier recovery attempt (stopped before code edits)
 
-## Recovery slice attempt (blocked before code edits)
-
-- Recovery base SHA: `4af446961b46a516305d49dc53376d7cf8a2d35e` (the DS4 handoff commit); no recovery code candidate exists.
+- Recovery attempt base SHA: `4af446961b46a516305d49dc53376d7cf8a2d35e` (the DS4 handoff commit); no code was changed in that attempt.
 - Blocker-record commit: `554ac24` (`docs(audio): record recovery worker effort blocker`).
 - IDs and scope: `global:audio_sink`, `global:virtual_sink`.
 - Proposed owned paths: `modules/audio/src/worker.rs`, `modules/audio/src/platform/windows.rs`, `modules/audio/src/platform/mod.rs`, `modules/audio/src/packet.rs`, `modules/audio/src/model.rs`, `modules/audio/src/controller.rs`, and `modules/audio/README.md`.
 - Tests: none run or added for capture recovery in that attempt; Windows capture/device qualification is unavailable here.
 - Worker request: `recovery_timeline` was requested as `gpt-6-luna`/`xhigh`, with exclusive ownership of `modules/audio/src/packet.rs` and a requirement to confirm settings before edits. Its runtime attribution reported session `01a0d516-8713-7b83-87f1-d35c0828ae10` as `gpt-6-luna`/`max`, so it made no changes and this recovery attempt stopped before code edits. The DS4 lease correction separately confirmed a native XHigh worker can start, but audio recovery was not assigned in that slice.
-- No recovery code was written. No platform evidence changed. Capture recovery remains pending for a separate bounded slice; it was not part of the DS4 lease correction.
+- That attempt was superseded by the current verified XHigh worker slice above. It did not modify the current implementation.
