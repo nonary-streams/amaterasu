@@ -8,7 +8,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_AUTO_DETACH: bool = true;
 const DEFAULT_WAIT_ALL: bool = true;
-const DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Deserialize)]
@@ -810,7 +810,7 @@ mod tests {
         }]));
         catalog_value["working_directory"] = json!("");
         let executable = Executable::from_catalog(&catalog_value).unwrap();
-        assert_eq!(executable.exit_timeout_seconds, 5);
+        assert_eq!(executable.exit_timeout_seconds, 10);
         let command = &executable.preparation[0].run;
         assert_eq!(
             executable.working_directory.as_deref(),
@@ -837,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_executable_defaults_to_five_but_preserves_explicit_zero_and_playnite_ten() {
+    fn ordinary_executable_defaults_to_ten_and_preserves_explicit_zero_and_playnite_ten() {
         let executable = std::env::current_exe().unwrap();
         let mut ordinary = json!({
             "kind":"executable",
@@ -848,7 +848,7 @@ mod tests {
             Executable::from_catalog(&ordinary)
                 .unwrap()
                 .exit_timeout_seconds,
-            5
+            10
         );
         ordinary["exit_timeout_seconds"] = json!(0);
         assert_eq!(

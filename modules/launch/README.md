@@ -47,14 +47,14 @@ environment, an optional native working directory, and a 1–30000 ms timeout
 native application bounds. Launch snapshots the supplied global list in the
 idempotency record, parses and validates the resolved catalog plan, and forwards
 the merged plan to the application provider. Reusing an operation ID with a
-different global list returns `operation_conflict`. It applies private process
-defaults only where the catalog has no per-application value (`auto_detach:true`,
-`wait_all:true`, `exit_timeout_seconds:5`). Typed Playnite targets default to a
-separate 10-second exit timeout. Playnite has no preparation lifecycle input yet;
-when global steps are present, launch returns
-`global_preparation_unsupported_target` unless the catalog entry explicitly
-excludes them. The application runs preparation before the main executable and
-owes reverse-order undo for every run command it started.
+different global list returns `operation_conflict`. It applies process defaults
+only where the catalog has no per-application value (`auto_detach:true`,
+`wait_all:true`, `exit_timeout_seconds:10`). Typed Playnite targets also default
+to a 10-second exit timeout. For Playnite and Playnite Fullscreen, global
+preparation must finish before the provider starts. Cleanup confirms the provider
+has stopped before running reverse-order undo, and retains the session lease if
+undo fails so the caller can retry. Executable launches merge global steps before
+catalog steps, and owe reverse-order undo for every run command they started.
 
 This payload does not implement Vibeshine's raw `do`/`undo` command strings,
 per-command `elevated`, or `$()` environment interpolation. A settings bridge must

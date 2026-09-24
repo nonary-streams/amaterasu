@@ -750,7 +750,7 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
     assert_eq!(application[0]["cwd"], json!(command.parent().unwrap()));
     assert_eq!(application[0]["auto_detach"], true);
     assert_eq!(application[0]["wait_all"], true);
-    assert_eq!(application[0]["exit_timeout_seconds"], 5);
+    assert_eq!(application[0]["exit_timeout_seconds"], 10);
     assert_eq!(application[0]["detached"], json!([]));
     assert_eq!(
         application[0]["preparation"],
