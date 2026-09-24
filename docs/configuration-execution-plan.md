@@ -49,6 +49,15 @@ in memory, requiring sign-in after reload or module restart. The active-session
 TTL arithmetic matches, but these visible fallback and retention differences
 keep both IDs pending.
 
+Session-history settings now use the central `amaterasu.configuration/1`
+revision for signed compare-and-swap updates. Startup migrates older SQLite
+history settings and leaves recording disabled until that product setting is
+confirmed. The stream lifecycle queues bounded, nonfatal begin/end writes and
+releases each result without holding up media work. The signed editor can
+change retention policy and read it after restart. Runtime stream metrics and
+remaining Vibeshine history semantics still require implementation and
+qualification, so the history IDs remain pending.
+
 Legacy migration now follows configured `file_state` and
 `vibeshine_file_state` auxiliary paths when they resolve to contained regular
 files. Missing auxiliary leaves are skipped after their existing ancestors are
@@ -153,9 +162,15 @@ loopback capture endpoint for each new stream. Sparse app and
 certificate-matched client overrides resolve client, then app, then global,
 then startup endpoint. An explicit empty scoped override chooses the startup
 automatic endpoint, while absence inherits. Windows default-role switching
-for `audio_sink_capture_only=false` and audio endpoint qualification on other
-supported platforms remain pending. The other shared override keys and their
-runtime consumers remain pending.
+now uses a lease for an explicitly selected `audio_sink`: when
+`audio_sink_capture_only` is false it temporarily selects that endpoint for
+Console, Multimedia, and Communications, then restores each role still owned
+by the lease. The flag persists globally and as sparse app/client overrides,
+and the resolved value reaches Audio Open for each stream. A failed restore is
+reported and retried before another routed Open. Live Windows endpoint and
+role-transition qualification, virtual-sink behavior, and audio endpoint
+qualification on other supported platforms remain pending. The other shared
+override keys and their runtime consumers remain pending.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
 
@@ -242,15 +257,20 @@ event and input model. On Linux, stream sessions forward snapshots only after
 the input service probes a working uinput controller device. Lease-owned slots
 then create and update up to 16 native controllers, remove slots absent from
 the active mask, and retain failed cleanup for retry. Controller failures are
-nonfatal to the stream. Windows `SendInput` does not create a virtual
-controller, and macOS reports native injection as unsupported. Linux still
-needs runtime device and permission qualification, the reference controller
-profile choices are incomplete, and `back_button_timeout` is not implemented.
+nonfatal to the stream. The Linux input service now persists a global
+`back_button_timeout` default of -1 ms and applies a per-slot Back/Select
+deadline. At expiry it suppresses Back and pulses Guide for 100 ms, cancelling
+the timer on release or slot teardown. Failed native updates retain a retry
+state. Windows `SendInput` does not create a virtual controller, and macOS
+reports native injection as unsupported. Linux still needs runtime device and
+permission qualification, the reference controller profile choices are
+incomplete, and scoped application/client timeout resolution is still being
+integrated.
 Persisting either setting or displaying an editor control alone would not
 complete gamepad parity.
 
-The live path follows this order; steps 1 and 2 and the initial Linux backend
-in step 3 are implemented:
+The live path follows this order; steps 1, 2, and 4 plus the initial Linux
+backend in step 3 are implemented:
 
 1. Preserve each decoded controller snapshot through the GameStream translator
    and stream-session queue into the input service, including the complete
