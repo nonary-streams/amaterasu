@@ -142,6 +142,15 @@ Windows. Those IDs remain pending until every public listener and supported
 platform follows the effective policy without weakening the loopback control
 plane.
 
+The configured host name now reaches `/serverinfo` and seeds each new stream's
+device name. Moonlight's optional `clientName` overrides it for that launch,
+and RTSP forwards the resulting label to stream-session history separately
+from the capture output. Legacy launch callers retain the output fallback.
+Vibeshine also uses `sunshine_name` when naming a launch-owned virtual display;
+Amaterasu's virtual-display leases currently have no launch/session ownership
+and retain caller-supplied labels. That lifecycle and platform discovery
+qualification keep `global:sunshine_name` pending.
+
 The `external_ip` text field now persists in product document v12 and has a
 signed editor. Omitted updates preserve the value; null or empty resets to
 automatic, and nonempty text is retained exactly within the host's bounded
