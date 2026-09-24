@@ -101,6 +101,7 @@ fn invalid_manifests_do_not_hide_valid_entries_and_partial_scan_is_visible() {
     )
     .unwrap();
     let mut provider = Provider {
+        enabled: true,
         roots: vec![root],
         ..Provider::default()
     };
@@ -125,6 +126,7 @@ fn pagination_requires_matching_snapshot_and_refresh_is_atomic() {
         fixture.manifest(&root, id, "Game", 4);
     }
     let mut provider = Provider {
+        enabled: true,
         roots: vec![root],
         ..Provider::default()
     };

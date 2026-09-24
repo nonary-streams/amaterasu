@@ -17,6 +17,28 @@ cross-user session broker. Every caller granted `call` for this service can read
 the configured library metadata and initiate refresh. Payloads cannot supply new
 filesystem roots. Provider requires `provide` for its service only.
 
+The domain-owned product setting `enabled` controls discovery. It defaults to
+false except on Linux, where the Vibeshine policy forces Steam enabled. A
+disabled provider rejects refresh and drops its in-memory scan and snapshot;
+enabling it allows callers with the Steam service grant to request an explicit
+refresh. Settings are stored through `amaterasu.configuration/1` as version 1
+product settings with revision-based compare-and-swap. Only the management
+principal can use the provider's `settings_get` and `settings_update` actions;
+the fixed management routes expose `/v1/steam/settings` and
+`/v1/steam/settings_update`. Startup roots remain bootstrap settings and cannot
+be changed through these product settings routes. While the initial product
+document loads or a write is pending, status and list requests remain available
+and include `settings_ready`; refresh waits for initial settings, and overlapping
+settings actions return `settings_loading` or `settings_busy`. If an update's
+result is ambiguous and the first durable readback fails, management receives an
+unknown-outcome error while Steam retries the readback with capped backoff; other
+Steam requests continue to be served during those retries.
+
+`steam_auto_sync` is not implemented. Vibeshine's option performs a 30-second
+catalog reconciliation, including installed game entries and artwork. This
+provider currently only discovers local manifests and has no catalog or artwork
+reconciliation service, so periodic discovery would not provide that behavior.
+
 ```json
 {"action":"refresh"}
 {"action":"status"}
@@ -58,8 +80,8 @@ manifest read runs per tick, with no background threads outliving the library.
 Individual filesystem operations can still block on unavailable storage.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h`; source was not
-copied or translated. Missing parity includes automatic per-session root
-discovery, provider/catalog reconciliation, artwork and conversion, uninstalled
-owned games, app type filtering, launch options/Proton resolution, launch/process
+copied or translated. Other missing parity includes automatic per-session root
+discovery, catalog reconciliation, artwork and conversion, uninstalled owned
+games, app type filtering, launch options/Proton resolution, launch/process
 tracking, watchers, and Steam broker environment handling. This provider neither
 launches Steam nor modifies Steam files or the application catalog.
