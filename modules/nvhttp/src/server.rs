@@ -50,15 +50,8 @@ pub struct Server {
 
 impl Server {
     pub fn bind(settings: &Settings) -> Result<Self, String> {
-        let http =
-            TcpListener::bind(settings.http_bind).map_err(|_| "HTTP listener unavailable")?;
-        let https =
-            TcpListener::bind(settings.https_bind).map_err(|_| "HTTPS listener unavailable")?;
-        http.set_nonblocking(true)
-            .map_err(|_| "HTTP nonblocking setup failed")?;
-        https
-            .set_nonblocking(true)
-            .map_err(|_| "HTTPS nonblocking setup failed")?;
+        let http = bind_listener(settings.http_bind, "HTTP")?;
+        let https = bind_listener(settings.https_bind, "HTTPS")?;
         Ok(Self {
             http,
             https,
@@ -75,6 +68,42 @@ impl Server {
     pub fn https_address(&self) -> SocketAddr {
         self.https.local_addr().expect("bound HTTPS listener")
     }
+
+    /// Rebinds the HTTP pair while retaining existing accepted connections.
+    /// Both replacement sockets are prepared before either current listener is dropped.
+    pub fn rebind_port(&mut self, http_port: u16) -> Result<(), String> {
+        crate::settings::validate_port(http_port).map_err(str::to_owned)?;
+        let https_port = crate::settings::https_port(http_port);
+        if self.http_address().port() == http_port && self.https_address().port() == https_port {
+            return Ok(());
+        }
+
+        let http_address = SocketAddr::new(self.http_address().ip(), http_port);
+        let https_address = SocketAddr::new(self.https_address().ip(), https_port);
+        let old_http_address = self.http_address();
+        let old_https_address = self.https_address();
+        let http = replacement_listener(
+            http_address,
+            old_http_address,
+            old_https_address,
+            &self.http,
+            &self.https,
+            "HTTP",
+        )?;
+        let https = replacement_listener(
+            https_address,
+            old_http_address,
+            old_https_address,
+            &self.http,
+            &self.https,
+            "HTTPS",
+        )?;
+
+        self.http = http;
+        self.https = https;
+        Ok(())
+    }
+
     pub fn connections(&self) -> usize {
         self.connections.len()
     }
@@ -237,6 +266,41 @@ impl Server {
 
     pub fn close(&mut self, id: u64) -> bool {
         self.connections.remove(&id).is_some()
+    }
+}
+
+fn bind_listener(address: SocketAddr, name: &str) -> Result<TcpListener, String> {
+    let listener =
+        TcpListener::bind(address).map_err(|_| format!("{name} listener unavailable"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| format!("{name} nonblocking setup failed"))?;
+    Ok(listener)
+}
+
+fn replacement_listener(
+    address: SocketAddr,
+    old_http_address: SocketAddr,
+    old_https_address: SocketAddr,
+    old_http: &TcpListener,
+    old_https: &TcpListener,
+    name: &str,
+) -> Result<TcpListener, String> {
+    // A TCP listener is protocol-neutral; TLS/plain handling is chosen by the
+    // accept call. Reusing a same-address listener for the other role is safe,
+    // while already accepted streams retain their own TLS/plain connection state.
+    let existing = if address == old_http_address {
+        Some(old_http)
+    } else if address == old_https_address {
+        Some(old_https)
+    } else {
+        None
+    };
+    match existing {
+        Some(listener) => listener
+            .try_clone()
+            .map_err(|_| format!("{name} listener clone failed")),
+        None => bind_listener(address, name),
     }
 }
 
@@ -570,6 +634,136 @@ mod tests {
         assert!(response.ends_with(b"hello"));
         assert!(delivered);
         assert_eq!(server.connections(), 0);
+    }
+
+    #[test]
+    fn port_rebind_changes_both_live_listeners_and_preserves_accepted_connections() {
+        let settings = Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&settings).unwrap();
+        let old_http = server.http_address();
+        let mut existing_client = TcpStream::connect(old_http).unwrap();
+        existing_client
+            .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+            .unwrap();
+        let existing_request = server.tick().requests.pop().unwrap();
+
+        let base_port = available_port_pair();
+        server.rebind_port(base_port).unwrap();
+
+        assert_eq!(server.http_address().port(), base_port);
+        assert_eq!(
+            server.https_address().port(),
+            crate::settings::https_port(base_port)
+        );
+        assert_eq!(server.connections(), 1);
+
+        let mut new_client = TcpStream::connect(server.http_address()).unwrap();
+        new_client
+            .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+            .unwrap();
+        let requests = server.tick().requests;
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0].id, existing_request.id);
+        assert_ne!(old_http.port(), base_port);
+    }
+
+    #[test]
+    fn overlapping_port_moves_reuse_old_listener_sockets_in_both_directions() {
+        let base_port = available_port_pair();
+        let settings = Settings {
+            enabled: true,
+            http_bind: SocketAddr::from(([127, 0, 0, 1], base_port)),
+            https_bind: SocketAddr::from(([127, 0, 0, 1], crate::settings::https_port(base_port))),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&settings).unwrap();
+        let mut accepted_client = TcpStream::connect(server.http_address()).unwrap();
+        accepted_client
+            .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+            .unwrap();
+        let accepted_request = server.tick().requests.pop().unwrap();
+
+        let raised_base_port = base_port + crate::settings::HTTPS_PORT_OFFSET;
+        server.rebind_port(raised_base_port).unwrap();
+        assert_eq!(server.http_address().port(), raised_base_port);
+        assert_eq!(server.https_address().port(), base_port);
+        assert!(server.connections.contains_key(&accepted_request.id));
+
+        server.rebind_port(base_port).unwrap();
+        assert_eq!(server.http_address().port(), base_port);
+        assert_eq!(
+            server.https_address().port(),
+            crate::settings::https_port(base_port)
+        );
+        assert!(server.connections.contains_key(&accepted_request.id));
+    }
+
+    #[test]
+    fn failed_second_listener_bind_keeps_the_current_pair_intact() {
+        let settings = Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&settings).unwrap();
+        let old_http = server.http_address();
+        let old_https = server.https_address();
+        let (_occupied_https, base_port) = (0..100)
+            .find_map(|_| {
+                let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+                let base_port = listener
+                    .local_addr()
+                    .ok()?
+                    .port()
+                    .checked_add(crate::settings::HTTPS_PORT_OFFSET)?;
+                if crate::settings::validate_port(base_port).is_err() {
+                    return None;
+                }
+                let http_probe =
+                    TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], base_port))).ok()?;
+                drop(http_probe);
+                Some((listener, base_port))
+            })
+            .expect("find a valid HTTPS port for the occupied-pair test");
+
+        assert!(server.rebind_port(base_port).is_err());
+        assert_eq!(server.http_address(), old_http);
+        assert_eq!(server.https_address(), old_https);
+    }
+
+    fn available_port_pair() -> u16 {
+        for _ in 0..100 {
+            let https = TcpListener::bind("127.0.0.1:0").unwrap();
+            let Some(base) = https
+                .local_addr()
+                .unwrap()
+                .port()
+                .checked_add(crate::settings::HTTPS_PORT_OFFSET)
+            else {
+                continue;
+            };
+            if crate::settings::validate_port(base).is_err() {
+                continue;
+            }
+            let Some(raised_base) = base.checked_add(crate::settings::HTTPS_PORT_OFFSET) else {
+                continue;
+            };
+            if crate::settings::validate_port(raised_base).is_err() {
+                continue;
+            }
+            let Ok(http) = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], base))) else {
+                continue;
+            };
+            drop((http, https));
+            return base;
+        }
+        panic!("could not reserve an unused local listener port pair");
     }
     #[test]
     fn deferred_request_has_pin_allowance_then_expires_and_reports_cancellation() {

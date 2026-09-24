@@ -1,21 +1,37 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 mod launch;
+mod product_settings;
 mod server;
 mod settings;
 mod tls;
 mod wire;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use product_settings::{AdminAction, ProductSettings};
 use serde::Deserialize;
 use serde_json::json;
 use settings::Settings;
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.nvhttp/1";
+const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
+
+fn should_attempt_listener_rebind(
+    server: Option<&server::Server>,
+    product_settings: &ProductSettings,
+) -> bool {
+    server.is_some() && product_settings.port_needs_application()
+}
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     Status,
+    SettingsGet,
+    SettingsUpdate {
+        hostname: String,
+        port: u16,
+        expected_revision: u64,
+    },
 }
 
 struct NvhttpModule {
@@ -27,6 +43,9 @@ struct NvhttpModule {
     tls_error: Option<&'static str>,
     next_refresh: Instant,
     warm: WarmIdentity,
+    product_settings: ProductSettings,
+    next_listener_rebind: Instant,
+    listener_rebind_delay: Duration,
 }
 
 impl ManagedModule for NvhttpModule {
@@ -37,13 +56,15 @@ impl ManagedModule for NvhttpModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid nvhttp settings")?;
         settings.validate()?;
+        let hostname = settings::effective_hostname(&settings.hostname);
+        let product_settings = ProductSettings::new(hostname.clone(), settings.http_bind.port());
         let (server, router, identity) = if settings.enabled {
             let identity = tls::Identity::bind(&runtime)?;
             let server = server::Server::bind(&settings)?;
             let launches = launch::Controller::new(settings.streaming.clone())?;
             let router = wire::Router::new(
                 wire::RouterConfig {
-                    hostname: settings.hostname,
+                    hostname: hostname.clone(),
                     http_port: server.http_address().port(),
                     https_port: server.https_address().port(),
                 },
@@ -65,10 +86,55 @@ impl ManagedModule for NvhttpModule {
             tls_error: None,
             next_refresh: Instant::now(),
             warm: WarmIdentity::new(),
+            product_settings,
+            next_listener_rebind: Instant::now(),
+            listener_rebind_delay: Duration::from_secs(1),
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.update_active_listener_ports();
+        if let Some(settings) = self.product_settings.tick(&self.runtime)? {
+            if let Some(router) = &mut self.router {
+                router.set_hostname(settings.hostname);
+            }
+            if self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.http_address().port() != settings.port)
+            {
+                self.next_listener_rebind = Instant::now();
+            }
+        }
+        if self.server.is_none() {
+            self.product_settings.record_listener_disabled();
+        } else if should_attempt_listener_rebind(self.server.as_ref(), &self.product_settings)
+            && Instant::now() >= self.next_listener_rebind
+        {
+            let port = self.product_settings.port();
+            let result = self
+                .server
+                .as_mut()
+                .expect("a live listener is required to apply a port")
+                .rebind_port(port);
+            match result {
+                Ok(()) => {
+                    self.update_active_listener_ports();
+                    self.product_settings.record_port_apply_success();
+                    self.listener_rebind_delay = Duration::from_secs(1);
+                    self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;
+                }
+                Err(error) => {
+                    self.product_settings.record_port_apply_failure(port, error);
+                    self.next_listener_rebind = Instant::now() + self.listener_rebind_delay;
+                    self.listener_rebind_delay =
+                        (self.listener_rebind_delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        } else if self.server.is_some() && self.product_settings.port_is_active() {
+            self.product_settings.record_port_apply_success();
+        }
+        self.product_settings.flush_completion(&self.runtime);
         self.refresh_identity();
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
             let revoked = router.revoke_untrusted(|certificate| {
@@ -134,6 +200,22 @@ impl ManagedModule for NvhttpModule {
 }
 
 impl NvhttpModule {
+    fn update_active_listener_ports(&mut self) {
+        let addresses = self
+            .server
+            .as_ref()
+            .map(|server| (server.http_address().port(), server.https_address().port()));
+        if let Some((http_port, https_port)) = addresses {
+            if let Some(router) = &mut self.router {
+                router.set_ports(http_port, https_port);
+            }
+            self.product_settings
+                .set_active_ports(Some(http_port), Some(https_port));
+        } else {
+            self.product_settings.set_active_ports(None, None);
+        }
+    }
+
     fn refresh_identity(&mut self) {
         let Some(identity) = &self.identity else {
             return;
@@ -179,37 +261,121 @@ impl NvhttpModule {
         }
     }
 
-    fn poll_control(&self) -> ModuleResult<()> {
+    fn poll_control(&mut self) -> ModuleResult<()> {
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
+                caller,
                 service,
                 payload,
+                remaining_ms,
                 ..
             } => {
-                let payload = if service != SERVICE
-                    || serde_json::from_value::<Operation>(payload).is_err()
-                {
-                    json!({"ok":false,"code":"invalid_request"})
-                } else {
-                    json!({"ok":true,"enabled":self.server.is_some(),"http_address":self.server.as_ref().map(|server|server.http_address().to_string()),"https_address":self.server.as_ref().map(|server|server.https_address().to_string()),"tls_ready":self.server.as_ref().is_some_and(|server|server.tls_ready()),"connections":self.server.as_ref().map_or(0,|server|server.connections()),"tls_error":self.tls_error})
-                };
-                match self.runtime.send(Command::Complete {
-                    request: id,
-                    payload,
-                })? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
-                        Ok(())
+                if service != SERVICE {
+                    return complete_control(
+                        &self.runtime,
+                        id,
+                        json!({"ok":false,"code":"invalid_request"}),
+                    );
+                }
+                let operation = match serde_json::from_value::<Operation>(payload) {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        return complete_control(
+                            &self.runtime,
+                            id,
+                            json!({"ok":false,"code":"invalid_request"}),
+                        );
                     }
-                    _ => Err("nvhttp response unavailable".into()),
+                };
+                match operation {
+                    Operation::Status => complete_control(
+                        &self.runtime,
+                        id,
+                        json!({
+                            "ok":true,
+                            "enabled":self.server.is_some(),
+                            "http_address":self.server.as_ref().map(|server|server.http_address().to_string()),
+                            "https_address":self.server.as_ref().map(|server|server.https_address().to_string()),
+                            "tls_ready":self.server.as_ref().is_some_and(|server|server.tls_ready()),
+                            "connections":self.server.as_ref().map_or(0,|server|server.connections()),
+                            "tls_error":self.tls_error,
+                            "settings_hostname":self.product_settings.hostname(),
+                            "settings_configured_hostname":self.product_settings.configured_hostname(),
+                            "settings_port":self.product_settings.port(),
+                            "active_http_port":self.server.as_ref().map(|server|server.http_address().port()),
+                            "active_https_port":self.server.as_ref().map(|server|server.https_address().port()),
+                            "settings_loaded":self.product_settings.revision().is_some(),
+                            "settings_revision":self.product_settings.revision(),
+                            "settings_error":self.product_settings.last_error(),
+                        }),
+                    ),
+                    settings_action @ (Operation::SettingsGet
+                    | Operation::SettingsUpdate { .. }) => {
+                        if caller != MANAGEMENT_PRINCIPAL {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        }
+                        let action = match settings_action {
+                            Operation::SettingsGet => AdminAction::Get,
+                            Operation::SettingsUpdate {
+                                hostname,
+                                port,
+                                expected_revision,
+                            } => {
+                                if settings::validate_configured_hostname(&hostname).is_err() {
+                                    return complete_control(
+                                        &self.runtime,
+                                        id,
+                                        json!({"ok":false,"code":"invalid_hostname"}),
+                                    );
+                                }
+                                if settings::validate_port(port).is_err() {
+                                    return complete_control(
+                                        &self.runtime,
+                                        id,
+                                        json!({"ok":false,"code":"invalid_port"}),
+                                    );
+                                }
+                                AdminAction::Update {
+                                    hostname,
+                                    port,
+                                    expected_revision,
+                                    require_listener_apply: self.server.is_some(),
+                                }
+                            }
+                            Operation::Status => unreachable!(),
+                        };
+                        if let Err(code) = self.product_settings.enqueue(id, remaining_ms, action) {
+                            complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"resource_exhausted","message":code}),
+                            )
+                        } else {
+                            Ok(())
+                        }
+                    }
                 }
             }
             _ => Err("nvhttp poll failed".into()),
         }
+    }
+}
+
+fn complete_control(
+    runtime: &RuntimeClient,
+    request: u64,
+    payload: serde_json::Value,
+) -> ModuleResult<()> {
+    match runtime.send(Command::Complete { request, payload })? {
+        Response::Ok => Ok(()),
+        Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
+        _ => Err("nvhttp response unavailable".into()),
     }
 }
 

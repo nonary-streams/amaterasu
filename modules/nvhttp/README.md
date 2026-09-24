@@ -5,16 +5,80 @@ Moonlight Gen7 pairing HTTP/XML adapter and the bounded transport described belo
 cryptography and durable client trust remain owned by `amaterasu.pairing/1` and
 `amaterasu.identity/1`. Native modules are trusted code, not sandboxed by grants.
 
-Startup defaults are disabled, hostname `Amaterasu`, HTTP `127.0.0.1:47989`, HTTPS
-`127.0.0.1:47984`, and `allow_remote:false`. The transport owns listener settings
-and reports the actual bound ports. Public routes do not initialize a private
-host identity: an administrator must initialize/import one through pairing first.
-The nvhttp principal needs pairing/state calls for delegated transcript operations
-and native use of the identity service for TLS signing and live client checks.
+Startup defaults are disabled, the machine hostname, HTTP `127.0.0.1:47989`,
+HTTPS `127.0.0.1:47984`, and `allow_remote:false`. If the platform hostname API
+fails or returns a value outside NVHTTP's bounds, startup uses `Amaterasu` as a
+last-resort name. A blank configured hostname means use the machine hostname;
+nonempty names are preserved without trimming or case normalization. The transport
+owns listener settings and reports the actual bound ports. Public routes do not
+initialize a private host identity: an administrator must initialize/import one
+through pairing first. The configured hostname is the bootstrap fallback. After
+startup, NVHTTP loads `product/amaterasu.nvhttp` from
+`amaterasu.configuration/1`; the committed effective hostname replaces the fallback
+in subsequent server-info replies. NVHTTP needs configuration calls in addition to
+pairing/state calls for delegated transcript operations and native use of the
+identity service for TLS signing and live client checks.
 Catalog export additionally requires a catalog call grant and an explicit catalog
 `export_principals` mapping from `amaterasu.nvhttp` to the desired owner (the
 platform profile uses `amaterasu.management`). The HTTP caller cannot select the
 owner. It does not need administrative PIN approval or unpair authority.
+
+## Product hostname settings
+
+The management API exposes `GET /v1/nvhttp/settings` and
+`POST /v1/nvhttp/settings_update`. Only requests authenticated and forwarded by
+`amaterasu.management` are accepted by NVHTTP. The frontend requires the
+`configuration.read` scope for reads and `configuration.write` for updates.
+
+Reads return both the effective value used by Moonlight and the configured override.
+An empty `configured_hostname` means the machine hostname is active; `hostname`
+remains the effective name for compatibility:
+
+```json
+{"ok":true,"hostname":"Studio PC","configured_hostname":"","port":47989,"https_port":47984,"active_http_port":47989,"active_https_port":47984,"listener_error":null,"revision":3}
+```
+
+An update sends a whole hostname replacement and its observed revision. Sending an
+empty name stores the default selection and uses the machine hostname:
+
+```json
+{"hostname":"Studio PC","port":47989,"expected_revision":3}
+```
+
+The successful update response has the same shape as a read and is returned only
+after the configuration service confirms the persisted write. The `hostname` and
+`configured_hostname` fields distinguish the effective Moonlight name from the
+stored override. Names are limited to 128 UTF-8 bytes and reject control
+characters. A stale revision returns `revision_conflict` with `current_revision`.
+When a write result is
+ambiguous, NVHTTP reads the product document again and returns
+`settings_outcome_unknown`; it never reports success based only on the requested
+hostname. The readback still updates server-info to the hostname currently stored.
+While configuration is unavailable, the bootstrap hostname remains active,
+settings reads and writes fail with a configuration error, and NVHTTP retries the
+load with backoff. A missing product document uses the bootstrap hostname and
+configured component port at revision 0; its first successful update creates
+revision 1.
+
+## Moonlight listener base port
+
+The NVHTTP product settings editor also stores a Moonlight HTTP base port. It
+accepts 1029 through 65514; the HTTP listener binds to that port and HTTPS to the
+base port minus five. This matches Vibeshine's NVHTTP port offsets and keeps both
+ports in range. Updating the base port prepares both replacement listeners before
+releasing either current listener, retains accepted connections, and updates
+/serverinfo to advertise the new bound ports. A successful update is acknowledged
+only after both listeners are active. If binding fails after persistence, NVHTTP
+returns listener_apply_failed with persisted:true, retains the previous active
+listeners, and retries applying the stored port with backoff.
+
+The live settings response includes the configured port, derived https_port, and
+active_http_port/active_https_port values. A legacy version 1 hostname-only product
+document remains readable and uses the component's configured HTTP port; the next
+update writes a version 2 document containing both hostname and port. This NVHTTP
+slice keeps its configured bind IPs unchanged and loopback restrictions intact. It
+does not yet apply the global address_family or bind_address settings, or remap the
+separate RTSP and UDP streaming ports, which remain startup-configured.
 
 Public streaming is a separate startup opt-in. Omitting `streaming` disables it.
 The complete settings object has no executable, arguments, environment, or catalog

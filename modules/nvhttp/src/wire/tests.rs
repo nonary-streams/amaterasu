@@ -444,6 +444,31 @@ fn configured_hostname_replaces_xml_noncharacters_and_escapes_quotes() {
 }
 
 #[test]
+fn committed_hostname_updates_are_visible_in_live_serverinfo_without_restart() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+
+    assert!(dispatch(&mut router, &mut broker, 1, "/serverinfo", now).is_none());
+    assert!(poll(&mut router, &mut broker, now).is_empty());
+    let initial = poll(&mut router, &mut broker, now);
+    assert_eq!(initial.len(), 1);
+    let initial_body = String::from_utf8(initial[0].1.body.clone()).unwrap();
+    assert!(initial_body.contains("<hostname>Amaterasu &amp; &lt;test&gt;</hostname>"));
+
+    router.set_hostname("Living Room & Games".into());
+    router.set_ports(48_000, 47_995);
+    assert!(dispatch(&mut router, &mut broker, 2, "/serverinfo", now).is_none());
+    assert!(poll(&mut router, &mut broker, now).is_empty());
+    let updated = poll(&mut router, &mut broker, now);
+    assert_eq!(updated.len(), 1);
+    let updated_body = String::from_utf8(updated[0].1.body.clone()).unwrap();
+    assert!(updated_body.contains("<hostname>Living Room &amp; Games</hostname>"));
+    assert!(updated_body.contains("<ExternalPort>48000</ExternalPort>"));
+    assert!(updated_body.contains("<HttpsPort>47995</HttpsPort>"));
+}
+
+#[test]
 fn cancellation_before_begin_dispatch_does_not_create_a_transcript() {
     let mut router = router();
     let mut broker = Broker::default();

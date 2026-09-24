@@ -137,6 +137,15 @@ impl Router {
         }
     }
 
+    pub fn set_hostname(&mut self, hostname: String) {
+        self.config.hostname = hostname;
+    }
+
+    pub fn set_ports(&mut self, http_port: u16, https_port: u16) {
+        self.config.http_port = http_port;
+        self.config.https_port = https_port;
+    }
+
     pub fn dispatch(
         &mut self,
         connection: u64,
