@@ -213,6 +213,8 @@ pub(crate) fn gamepad_key_codes() -> impl Iterator<Item = u16> {
 pub(crate) trait GamepadDevice {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()>;
 
+    fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) {}
+
     fn release(&mut self) -> InputResult<()> {
         self.update(ControllerSnapshot::default())
     }
@@ -319,6 +321,10 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
     fn disable_pending_back_timeout(&mut self) {
         self.back_deadline = None;
     }
+
+    fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+        self.device.set_ds4_back_as_touchpad_click(enabled);
+    }
 }
 
 /// Owns the client-relative controller slots for one input lease.
@@ -393,6 +399,12 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.devices.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+        for slot in self.devices.iter_mut().flatten() {
+            slot.set_ds4_back_as_touchpad_click(enabled);
+        }
     }
 
     pub(crate) fn stop(&mut self) -> InputResult<()> {

@@ -17,6 +17,7 @@ struct FakeBackend {
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
     gamepad_profile: GamepadProfile,
+    ds4_back_as_touchpad_click: bool,
     back_button_timeout_ms: i32,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
@@ -104,6 +105,9 @@ impl Backend for FakeBackend {
     fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
         self.gamepad_profile = profile;
     }
+    fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+        self.ds4_back_as_touchpad_click = enabled;
+    }
     fn disable_controller_input(&mut self) -> InputResult<()> {
         self.controller_disable_calls += 1;
         if std::mem::take(&mut self.fail_controller_disable) {
@@ -156,6 +160,7 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -190,6 +195,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             back_button_timeout: Some(-1),
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -224,6 +230,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -240,6 +247,78 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
 }
 
 #[test]
+fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("ds4-back-mapping".into()),
+            ttl_ms: None,
+            back_button_timeout: None,
+            controller: None,
+            gamepad: Some(GamepadProfile::Auto),
+            ds4_back_as_touchpad_click: Some(false),
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["ds4_back_as_touchpad_click"], false);
+    assert!(!controller.backend.ds4_back_as_touchpad_click);
+
+    controller.set_ds4_back_as_touchpad_click(false);
+    controller.set_ds4_back_as_touchpad_click(true);
+    assert!(!controller.backend.ds4_back_as_touchpad_click);
+
+    controller.handle(
+        "owner",
+        Operation::Release {
+            lease: acquired["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert!(controller.backend.ds4_back_as_touchpad_click);
+}
+
+#[test]
+fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquire = |enabled| Operation::Acquire {
+        operation_id: Some("ds4-back-retry".into()),
+        ttl_ms: None,
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click: Some(enabled),
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: None,
+        key_repeat_frequency: None,
+    };
+    assert_eq!(
+        controller.handle("owner", acquire(false), now, &mut || Ok(()))["ok"],
+        true
+    );
+    assert_eq!(
+        controller.handle("owner", acquire(true), now, &mut || Ok(()))["error"]["code"],
+        "operation_conflict"
+    );
+}
+
+#[test]
 fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
@@ -251,6 +330,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             back_button_timeout: Some(400),
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -271,6 +351,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -304,6 +385,7 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -354,6 +436,7 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -406,6 +489,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             back_button_timeout: None,
             controller: Some(true),
             gamepad: Some(GamepadProfile::Auto),
+            ds4_back_as_touchpad_click: None,
             keyboard: Some(true),
             mouse: Some(false),
             high_resolution_scrolling: None,
@@ -490,6 +574,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             back_button_timeout: None,
             controller: Some(true),
             gamepad: Some(global_gamepad),
+            ds4_back_as_touchpad_click: None,
             keyboard: Some(true),
             mouse: None,
             high_resolution_scrolling: None,
@@ -542,6 +627,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: Some(false),
@@ -649,6 +735,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1150,6 +1237,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1230,6 +1318,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1252,6 +1341,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1293,6 +1383,7 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1340,6 +1431,7 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1392,6 +1484,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         back_button_timeout: None,
         controller: None,
         gamepad: None,
+        ds4_back_as_touchpad_click: None,
         keyboard: None,
         mouse: None,
         high_resolution_scrolling: None,
@@ -1442,6 +1535,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,

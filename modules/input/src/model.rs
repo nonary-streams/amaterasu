@@ -35,6 +35,8 @@ pub enum Operation {
         #[serde(default)]
         gamepad: Option<GamepadProfile>,
         #[serde(default)]
+        ds4_back_as_touchpad_click: Option<bool>,
+        #[serde(default)]
         keyboard: Option<bool>,
         #[serde(default)]
         mouse: Option<bool>,
@@ -568,6 +570,7 @@ mod tests {
             "high_resolution_scrolling":false,
             "always_send_scancodes":false,
             "key_rightalt_to_key_win":true,
+            "ds4_back_as_touchpad_click":false,
             "key_repeat_delay":0,
             "key_repeat_frequency":0.0
         }))
@@ -577,6 +580,7 @@ mod tests {
             Operation::Acquire {
                 controller: Some(false),
                 gamepad: Some(GamepadProfile::Auto),
+                ds4_back_as_touchpad_click: Some(false),
                 keyboard: Some(true),
                 mouse: Some(false),
                 high_resolution_scrolling: Some(false),
@@ -616,6 +620,14 @@ mod tests {
                 );
             }
         }
+
+        assert!(
+            serde_json::from_value::<Operation>(json!({
+                "action":"acquire",
+                "ds4_back_as_touchpad_click":"false"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

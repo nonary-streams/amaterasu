@@ -281,6 +281,30 @@ fn product_v8_preserves_an_explicitly_disabled_controller_policy() {
     assert!(policy.keyboard);
     assert!(!policy.mouse);
     assert!(!policy.controller);
+    assert!(policy.ds4_back_as_touchpad_click);
+}
+
+#[test]
+fn product_v9_persists_ds4_back_mapping_and_defaults_legacy_documents_on() {
+    let (legacy, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":8,
+        "revision":23,
+        "values":{"keyboard":true,"mouse":true,"controller":true},
+    }))
+    .unwrap();
+    assert!(legacy.ds4_back_as_touchpad_click);
+
+    let (disabled, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":9,
+        "revision":24,
+        "values":{"keyboard":true,"mouse":true,"controller":true,"ds4_back_as_touchpad_click":false},
+    }))
+    .unwrap();
+    assert!(!disabled.ds4_back_as_touchpad_click);
 }
 
 #[test]
@@ -311,7 +335,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":9,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -338,7 +362,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v8_document() {
+fn update_requires_current_revision_and_sends_whole_v9_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -399,8 +423,8 @@ fn update_requires_current_revision_and_sends_whole_v8_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":8,
-            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto"},
+            "version":9,
+            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true},
         })
     );
 }
@@ -418,6 +442,7 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     settings.policy.key_repeat_frequency = 40.0;
     settings.policy.gamepad = selected_supported_profile();
     settings.policy.controller = false;
+    settings.policy.ds4_back_as_touchpad_click = false;
     let legacy_desired = settings.merge_update(InputPolicyUpdate {
         keyboard: false,
         mouse: true,
@@ -427,6 +452,7 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     assert!(!legacy_desired.always_send_scancodes);
     assert!(legacy_desired.key_rightalt_to_key_win);
     assert_eq!(legacy_desired.gamepad, selected_supported_profile());
+    assert!(!legacy_desired.ds4_back_as_touchpad_click);
     assert!(!legacy_desired.controller);
     settings
         .begin_update(90, 9, legacy_desired, 10_000)
@@ -434,10 +460,10 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 8);
+    assert_eq!(payload["version"], 9);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str()})
+        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false})
     );
     assert!(
         !settings
@@ -543,6 +569,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         key_repeat_frequency: 30.5,
         back_button_timeout: 1_250,
         gamepad: selected_supported_profile(),
+        ds4_back_as_touchpad_click: false,
     };
 
     settings
@@ -560,6 +587,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert!(controller.key_rightalt_to_key_win());
     assert_eq!(controller.back_button_timeout_ms(), 1_250);
     assert_eq!(controller.gamepad_profile(), selected_supported_profile());
+    assert!(!controller.ds4_back_as_touchpad_click());
     assert!(!controller.controller_enabled());
     assert_eq!(settings.get_response(&controller)["applied"], true);
     assert_eq!(
@@ -577,6 +605,10 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert_eq!(
         settings.get_response(&controller)["values"]["gamepad"],
         selected_supported_profile().as_str()
+    );
+    assert_eq!(
+        settings.get_response(&controller)["values"]["ds4_back_as_touchpad_click"],
+        false
     );
 }
 
@@ -747,6 +779,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
             back_button_timeout: None,
             controller: None,
             gamepad: None,
+            ds4_back_as_touchpad_click: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,

@@ -25,6 +25,7 @@ struct AcquireRequest {
     back_button_timeout: Option<i32>,
     controller: Option<bool>,
     gamepad: Option<GamepadProfile>,
+    ds4_back_as_touchpad_click: Option<bool>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
     high_resolution_scrolling: Option<bool>,
@@ -44,6 +45,7 @@ struct Lease {
     requested_back_button_timeout: Option<i32>,
     requested_controller: Option<bool>,
     requested_gamepad: Option<GamepadProfile>,
+    requested_ds4_back_as_touchpad_click: Option<bool>,
     requested_keyboard: Option<bool>,
     requested_mouse: Option<bool>,
     requested_high_resolution_scrolling: Option<bool>,
@@ -66,6 +68,7 @@ struct TerminalAcquire {
     requested_back_button_timeout: Option<i32>,
     requested_controller: Option<bool>,
     requested_gamepad: Option<GamepadProfile>,
+    requested_ds4_back_as_touchpad_click: Option<bool>,
     requested_keyboard: Option<bool>,
     requested_mouse: Option<bool>,
     requested_high_resolution_scrolling: Option<bool>,
@@ -95,6 +98,7 @@ pub struct Controller<B: Backend> {
     key_repeat_frequency_hz: f64,
     back_button_timeout_ms: i32,
     gamepad_profile: GamepadProfile,
+    ds4_back_as_touchpad_click: bool,
     controller_enabled: bool,
     controller_cleanup_pending: bool,
     repeating_key: Option<RepeatingKey>,
@@ -119,6 +123,7 @@ impl<B: Backend> Controller<B> {
             key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
             gamepad_profile: GamepadProfile::Auto,
+            ds4_back_as_touchpad_click: true,
             controller_enabled: true,
             controller_cleanup_pending: false,
             repeating_key: None,
@@ -146,6 +151,7 @@ impl<B: Backend> Controller<B> {
                 back_button_timeout,
                 controller,
                 gamepad,
+                ds4_back_as_touchpad_click,
                 keyboard,
                 mouse,
                 high_resolution_scrolling,
@@ -161,6 +167,7 @@ impl<B: Backend> Controller<B> {
                     back_button_timeout,
                     controller,
                     gamepad,
+                    ds4_back_as_touchpad_click,
                     keyboard,
                     mouse,
                     high_resolution_scrolling,
@@ -246,6 +253,13 @@ impl<B: Backend> Controller<B> {
             .as_ref()
             .and_then(|lease| lease.requested_gamepad)
             .unwrap_or(self.gamepad_profile)
+    }
+
+    fn effective_ds4_back_as_touchpad_click(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_ds4_back_as_touchpad_click)
+            .unwrap_or(self.ds4_back_as_touchpad_click)
     }
 
     fn effective_high_resolution_scrolling(&self) -> bool {
@@ -351,6 +365,19 @@ impl<B: Backend> Controller<B> {
         self.gamepad_profile = profile;
         self.backend
             .set_gamepad_profile(self.effective_gamepad_profile());
+    }
+
+    pub fn ds4_back_as_touchpad_click(&self) -> bool {
+        self.ds4_back_as_touchpad_click
+    }
+
+    pub fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+        let previous = self.effective_ds4_back_as_touchpad_click();
+        self.ds4_back_as_touchpad_click = enabled;
+        let effective = self.effective_ds4_back_as_touchpad_click();
+        if previous != effective {
+            self.backend.set_ds4_back_as_touchpad_click(effective);
+        }
     }
 
     pub fn controller_enabled(&self) -> bool {
@@ -467,6 +494,7 @@ impl<B: Backend> Controller<B> {
             back_button_timeout: requested_back_button_timeout,
             controller: requested_controller,
             gamepad: requested_gamepad,
+            ds4_back_as_touchpad_click: requested_ds4_back_as_touchpad_click,
             keyboard: requested_keyboard,
             mouse: requested_mouse,
             high_resolution_scrolling: requested_high_resolution_scrolling,
@@ -493,6 +521,8 @@ impl<B: Backend> Controller<B> {
                     || lease.requested_back_button_timeout != requested_back_button_timeout
                     || lease.requested_controller != requested_controller
                     || lease.requested_gamepad != requested_gamepad
+                    || lease.requested_ds4_back_as_touchpad_click
+                        != requested_ds4_back_as_touchpad_click
                     || lease.requested_keyboard != requested_keyboard
                     || lease.requested_mouse != requested_mouse
                     || lease.requested_high_resolution_scrolling
@@ -521,6 +551,8 @@ impl<B: Backend> Controller<B> {
                     || terminal.requested_back_button_timeout != requested_back_button_timeout
                     || terminal.requested_controller != requested_controller
                     || terminal.requested_gamepad != requested_gamepad
+                    || terminal.requested_ds4_back_as_touchpad_click
+                        != requested_ds4_back_as_touchpad_click
                     || terminal.requested_keyboard != requested_keyboard
                     || terminal.requested_mouse != requested_mouse
                     || terminal.requested_high_resolution_scrolling
@@ -575,6 +607,8 @@ impl<B: Backend> Controller<B> {
         let back_button_timeout_ms =
             requested_back_button_timeout.unwrap_or(self.back_button_timeout_ms);
         let gamepad_profile = requested_gamepad.unwrap_or(self.gamepad_profile);
+        let ds4_back_as_touchpad_click =
+            requested_ds4_back_as_touchpad_click.unwrap_or(self.ds4_back_as_touchpad_click);
         let high_resolution_scrolling =
             requested_high_resolution_scrolling.unwrap_or(self.high_resolution_scrolling);
         let always_send_scancodes =
@@ -587,6 +621,8 @@ impl<B: Backend> Controller<B> {
         self.backend.set_back_button_timeout(back_button_timeout_ms);
         self.backend.set_gamepad_profile(gamepad_profile);
         self.backend
+            .set_ds4_back_as_touchpad_click(ds4_back_as_touchpad_click);
+        self.backend
             .set_always_send_scancodes(always_send_scancodes);
         self.backend
             .set_key_rightalt_to_key_win(key_rightalt_to_key_win);
@@ -594,6 +630,8 @@ impl<B: Backend> Controller<B> {
             self.backend
                 .set_back_button_timeout(self.back_button_timeout_ms);
             self.backend.set_gamepad_profile(self.gamepad_profile);
+            self.backend
+                .set_ds4_back_as_touchpad_click(self.ds4_back_as_touchpad_click);
             self.backend
                 .set_always_send_scancodes(self.always_send_scancodes);
             self.backend
@@ -611,6 +649,7 @@ impl<B: Backend> Controller<B> {
             requested_back_button_timeout,
             requested_controller,
             requested_gamepad,
+            requested_ds4_back_as_touchpad_click,
             requested_keyboard,
             requested_mouse,
             requested_high_resolution_scrolling,
@@ -622,6 +661,7 @@ impl<B: Backend> Controller<B> {
             termination_reason: None,
             key_encoding: None,
             gamepad_profile,
+            ds4_back_as_touchpad_click,
             effective_gamepad_profile: self.backend.effective_gamepad_profile(),
             gamepad_unavailable_reason: self
                 .backend
@@ -1043,6 +1083,8 @@ impl<B: Backend> Controller<B> {
             .set_back_button_timeout(self.back_button_timeout_ms);
         self.backend.set_gamepad_profile(self.gamepad_profile);
         self.backend
+            .set_ds4_back_as_touchpad_click(self.ds4_back_as_touchpad_click);
+        self.backend
             .set_always_send_scancodes(self.always_send_scancodes);
         self.backend
             .set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
@@ -1060,6 +1102,7 @@ impl<B: Backend> Controller<B> {
                 requested_back_button_timeout: lease.requested_back_button_timeout,
                 requested_controller: lease.requested_controller,
                 requested_gamepad: lease.requested_gamepad,
+                requested_ds4_back_as_touchpad_click: lease.requested_ds4_back_as_touchpad_click,
                 requested_keyboard: lease.requested_keyboard,
                 requested_mouse: lease.requested_mouse,
                 requested_high_resolution_scrolling: lease.requested_high_resolution_scrolling,
@@ -1101,11 +1144,12 @@ impl<B: Backend> Controller<B> {
                 "key_repeat_delay":lease.requested_key_repeat_delay.unwrap_or(self.key_repeat_delay_ms),
                 "key_repeat_frequency":lease.requested_key_repeat_frequency.unwrap_or(self.key_repeat_frequency_hz),
                 "gamepad_profile":lease.gamepad_profile.as_str(),
+                "ds4_back_as_touchpad_click":lease.requested_ds4_back_as_touchpad_click.unwrap_or(lease.ds4_back_as_touchpad_click),
                 "effective_gamepad_profile":lease.effective_gamepad_profile,
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -1152,6 +1196,7 @@ fn active_lease(
         "absolute_pointer": absolute_pointer,
         "controller_input": controller_input,
         "gamepad_profile": lease.gamepad_profile.as_str(),
+        "ds4_back_as_touchpad_click": lease.ds4_back_as_touchpad_click,
         "effective_gamepad_profile": lease.effective_gamepad_profile,
         "gamepad_unavailable_reason": lease.gamepad_unavailable_reason,
         "cleanup_required": lease.cleanup_required,

@@ -197,6 +197,10 @@ impl Backend for WindowsBackend {
         self.gamepads.set_profile(profile);
     }
 
+    fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+        self.gamepads.set_ds4_back_as_touchpad_click(enabled);
+    }
+
     fn disable_controller_input(&mut self) -> InputResult<()> {
         self.gamepads.disable()
     }

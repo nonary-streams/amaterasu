@@ -66,7 +66,7 @@ impl GamepadProfile {
     pub const fn implemented_profiles() -> &'static [&'static str] {
         #[cfg(windows)]
         {
-            &["auto", "x360"]
+            &["auto", "x360", "ds4"]
         }
         #[cfg(target_os = "linux")]
         {

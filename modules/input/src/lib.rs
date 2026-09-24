@@ -70,6 +70,8 @@ enum SettingsOperation {
         back_button_timeout: Option<i32>,
         #[serde(default)]
         gamepad: Option<gamepad_profile::GamepadProfile>,
+        #[serde(default)]
+        ds4_back_as_touchpad_click: Option<bool>,
         expected_revision: u64,
     },
 }
@@ -221,6 +223,7 @@ impl InputModule {
                     key_repeat_frequency,
                     back_button_timeout,
                     gamepad,
+                    ds4_back_as_touchpad_click,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -241,6 +244,7 @@ impl InputModule {
                         key_repeat_frequency,
                         back_button_timeout,
                         gamepad,
+                        ds4_back_as_touchpad_click,
                     });
                     match self.product_settings.begin_update(
                         request.id,

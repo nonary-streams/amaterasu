@@ -115,9 +115,10 @@ unmapped raw keys are rejected during batch validation.
 With `gamepad:"auto"`, Windows probes a real ViGEmClient/ViGEmBus connection
 and selects `x360` only after that connection succeeds. Linux probes a temporary
 uinput Xbox-like device and selects its `xone` profile only after creation and
-destruction succeed. Explicit `x360` and `xone` make the same platform probe;
-other recognized explicit profiles return `controller_input:false` with a
-status reason, leave keyboard and mouse usable, and never fall back to `auto`.
+destruction succeed. Explicit `x360`, Windows `ds4`, and Linux `xone` select
+their corresponding platform probes; other recognized explicit profiles return
+`controller_input:false` with a status reason, leave keyboard and mouse usable,
+and never fall back to `auto`.
 Status reports the requested `gamepad`, `supported_profiles`, and the effective
 profile as `effective_gamepad_profile` (null until a real backend is available).
 An active lease retains the requested and effective profiles from acquisition.
@@ -144,12 +145,19 @@ snapshots with `controller_unavailable`. Windows creates
 targets only for active slots, projects complete button, trigger, and signed-axis
 snapshots, and removes targets when their active-mask bit clears or the lease
 ends. Timer-driven update failures stay dirty and retry on module ticks; failed
-detach remains owned for release retry. The global and per-lease Back timeout state
-machine is shared across Linux and Windows. Windows currently exposes only the
-wired Xbox 360 XUSB profile and does not select another profile when ViGEm is
-missing. Linux exposes the Xbox-like uinput backend under the pinned `xone`
-choice; it does not use Inputtino. DS4, DS5, Switch, VHF profiles, VHF/UMDF device
-creation, and Inputtino integration remain unimplemented. Linux runtime behavior
+detach remains owned for release retry. The global and per-lease Back timeout
+state machine is shared across Linux and Windows. Windows can expose a DualShock
+4 target when ViGEmClient provides its DS4 allocation and report exports. That
+report path maps d-pad, standard buttons, triggers, and sticks; it does not
+provide touch coordinates, motion, rumble, or controller feedback.
+`ds4_back_as_touchpad_click` defaults to enabled and adds the Back button to the
+DS4 touchpad-click control while preserving its Share mapping. Client touchpad
+and miscellaneous-button clicks also map to that DS4 control. The durable setting
+and sparse acquire override are accepted by the input module; management UI and
+NVHTTP scope resolution await their owning lanes. Windows does not select another
+profile when ViGEm is missing. Linux exposes the Xbox-like uinput backend under
+the pinned `xone` choice; it does not use Inputtino. DS5, Switch, VHF profiles,
+VHF/UMDF device creation, and Inputtino integration remain unimplemented. Linux runtime behavior
 has not been exercised on this Windows host, and
 Windows virtual-device delivery has not been qualified against an installed
 ViGEmBus driver, so platform-qualified controller parity remains pending.
