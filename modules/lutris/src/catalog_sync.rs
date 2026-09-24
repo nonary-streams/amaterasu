@@ -39,7 +39,7 @@ struct Transaction {
     source_revision: u64,
     settings_epoch: u64,
     remove_stale: bool,
-    entries: Vec<Vec<Value>>,
+    batches: Vec<SnapshotBatch>,
     generation: Option<u64>,
     catalog_revision: Option<u64>,
     sequence: u64,
@@ -52,12 +52,33 @@ struct Transaction {
     operation_id: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SnapshotBatch {
+    entries: Vec<Value>,
+    selection_remove_source_ids: Vec<String>,
+}
+
+impl SnapshotBatch {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.selection_remove_source_ids.is_empty()
+    }
+
+    fn intent_count(&self) -> usize {
+        self.entries.len() + self.selection_remove_source_ids.len()
+    }
+}
+
+struct PreparedSnapshot {
+    entries: Vec<Value>,
+    selection_remove_source_ids: Vec<String>,
+}
+
 impl Transaction {
     fn new(
         source_revision: u64,
         settings_epoch: u64,
         remove_stale: bool,
-        entries: Vec<Vec<Value>>,
+        batches: Vec<SnapshotBatch>,
     ) -> Self {
         let sync_id = new_sync_id(source_revision);
         let mut transaction = Self {
@@ -65,7 +86,7 @@ impl Transaction {
             source_revision,
             settings_epoch,
             remove_stale,
-            entries,
+            batches,
             generation: None,
             catalog_revision: None,
             sequence: 0,
@@ -96,7 +117,10 @@ impl Transaction {
                 "source_revision":self.source_revision,
                 "sequence":self.sequence,
                 "expected_revision":self.catalog_revision.expect("begin supplies revision"),
-                "entries":self.entries[self.batch_index],
+                "entries":self.batches[self.batch_index].entries,
+                "remove_source_ids":[],
+                "expire_source_ids":[],
+                "selection_remove_source_ids":self.batches[self.batch_index].selection_remove_source_ids,
             }),
             Stage::Finish => json!({
                 "action":"provider_snapshot_finish",
@@ -107,6 +131,7 @@ impl Transaction {
                 "next_sequence":self.sequence,
                 "complete":true,
                 "remove_stale":self.remove_stale,
+                "remove_selection":true,
             }),
         }
     }
@@ -179,7 +204,7 @@ impl Transaction {
                 }
                 self.generation = Some(generation);
                 self.catalog_revision = Some(revision);
-                self.stage = if self.entries.is_empty() {
+                self.stage = if self.batches.is_empty() {
                     Stage::Finish
                 } else {
                     Stage::Batch
@@ -199,7 +224,7 @@ impl Transaction {
                 self.catalog_revision = Some(revision);
                 self.sequence = next_sequence;
                 self.batch_index += 1;
-                self.stage = if self.batch_index == self.entries.len() {
+                self.stage = if self.batch_index == self.batches.len() {
                     Stage::Finish
                 } else {
                     Stage::Batch
@@ -212,6 +237,7 @@ impl Transaction {
                     || response.get("cleanup_pending").and_then(Value::as_bool) != Some(false)
                     || response.get("remove_stale").and_then(Value::as_bool)
                         != Some(self.remove_stale)
+                    || response.get("remove_selection").and_then(Value::as_bool) != Some(true)
                 {
                     return Err("catalog finish response is inconsistent".into());
                 }
@@ -246,9 +272,9 @@ impl CatalogSync {
         if self.transaction.is_some() {
             return Err("catalog_sync_busy".into());
         }
-        let entries = prepare_entries(snapshot, settings, steam_app_ids)?;
-        let count = entries.len();
-        let batches = batch_entries(entries)?;
+        let prepared = prepare_snapshot(snapshot, settings, steam_app_ids)?;
+        let count = prepared.entries.len();
+        let batches = batch_snapshot(prepared)?;
         self.last_import_count = count;
         self.skipped_steam_count = snapshot
             .games
@@ -435,33 +461,50 @@ impl CatalogSync {
     }
 }
 
-pub fn prepare_entries(
+#[cfg(test)]
+fn prepare_entries(
     snapshot: &Snapshot,
     settings: &ProductSettings,
     steam_app_ids: &BTreeSet<u32>,
 ) -> Result<Vec<Value>, String> {
+    Ok(prepare_snapshot(snapshot, settings, steam_app_ids)?.entries)
+}
+
+fn prepare_snapshot(
+    snapshot: &Snapshot,
+    settings: &ProductSettings,
+    steam_app_ids: &BTreeSet<u32>,
+) -> Result<PreparedSnapshot, String> {
     let executable = snapshot
         .lutris_executable
         .to_str()
         .filter(|path| Path::new(path).is_absolute())
         .ok_or_else(|| "lutris_executable_path_is_not_utf8_absolute".to_owned())?;
     let mut entries = Vec::new();
+    let mut selection_remove_source_ids = Vec::new();
     for game in &snapshot.games {
+        let source_id = game.id.to_string();
+        if game.id <= 0 {
+            return Err(format!("Lutris game {} has an invalid source ID", game.id));
+        }
         if settings
             .exclude_games
             .iter()
             .any(|value| value.matches(game.id, &game.name))
         {
+            selection_remove_source_ids.push(source_id);
             continue;
         }
         if game.steam_backed() {
             if !settings.include_steam {
+                selection_remove_source_ids.push(source_id);
                 continue;
             }
             let app_id = game.steam_app_id().ok_or_else(|| {
                 format!("Lutris Steam entry {} has no valid Steam app ID", game.id)
             })?;
             if steam_app_ids.contains(&app_id) {
+                selection_remove_source_ids.push(source_id);
                 continue;
             }
         }
@@ -481,11 +524,28 @@ pub fn prepare_entries(
         validate_catalog_entry(&entry, executable)
             .map_err(|error| format!("Lutris entry {} is not catalog-safe: {error}", game.id))?;
         entries.push(json!({
-            "source_id":game.id.to_string(),
+            "source_id":source_id,
             "entry":entry,
         }));
     }
-    Ok(entries)
+    for exclusion in &settings.exclude_games {
+        let excluded_id = match exclusion {
+            crate::settings::Exclusion::Id(id) => Some(id),
+            crate::settings::Exclusion::Metadata(metadata) if !metadata.id.is_empty() => {
+                Some(&metadata.id)
+            }
+            crate::settings::Exclusion::Metadata(_) => None,
+        };
+        if let Some(source_id) = excluded_id {
+            selection_remove_source_ids.push(source_id.clone());
+        }
+    }
+    selection_remove_source_ids.sort();
+    selection_remove_source_ids.dedup();
+    Ok(PreparedSnapshot {
+        entries,
+        selection_remove_source_ids,
+    })
 }
 
 fn runner_description(runner: &str) -> String {
@@ -545,29 +605,77 @@ fn printable_text(value: &str, max_bytes: usize) -> bool {
     value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
-fn batch_entries(entries: Vec<Value>) -> Result<Vec<Vec<Value>>, String> {
+fn batch_snapshot(prepared: PreparedSnapshot) -> Result<Vec<SnapshotBatch>, String> {
     let mut batches = Vec::new();
-    let mut batch = Vec::new();
-    for entry in entries {
-        batch.push(entry);
-        if batch.len() > MAX_BATCH_ENTRIES
-            || serde_json::to_vec(&batch).map_or(true, |bytes| bytes.len() > MAX_BATCH_BYTES)
-        {
-            let last = batch.pop().expect("the batch just received an entry");
+    let mut batch = SnapshotBatch::default();
+    let mut source_ids = BTreeSet::new();
+
+    for entry in prepared.entries {
+        let source_id = entry
+            .get("source_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Lutris catalog entry omitted its source ID".to_owned())?;
+        if !source_ids.insert(source_id.to_owned()) {
+            return Err("Lutris scan repeated a catalog source ID".into());
+        }
+        let mut candidate = batch.clone();
+        candidate.entries.push(entry);
+        if snapshot_batch_fits(&candidate) {
+            batch = candidate;
+        } else {
             if batch.is_empty() {
                 return Err("Lutris catalog entry exceeds the batch payload limit".into());
             }
             batches.push(std::mem::take(&mut batch));
-            batch.push(last);
-            if serde_json::to_vec(&batch).map_or(true, |bytes| bytes.len() > MAX_BATCH_BYTES) {
+            batch
+                .entries
+                .push(candidate.entries.pop().expect("entry was just added"));
+            if !snapshot_batch_fits(&batch) {
                 return Err("Lutris catalog entry exceeds the batch payload limit".into());
             }
         }
     }
+
+    for source_id in prepared.selection_remove_source_ids {
+        if !source_ids.insert(source_id.clone()) {
+            return Err("Lutris scan repeated a catalog source ID".into());
+        }
+        let mut candidate = batch.clone();
+        candidate.selection_remove_source_ids.push(source_id);
+        if snapshot_batch_fits(&candidate) {
+            batch = candidate;
+        } else {
+            if batch.is_empty() {
+                return Err("Lutris cleanup intent exceeds the batch payload limit".into());
+            }
+            batches.push(std::mem::take(&mut batch));
+            batch.selection_remove_source_ids.push(
+                candidate
+                    .selection_remove_source_ids
+                    .pop()
+                    .expect("intent was just added"),
+            );
+            if !snapshot_batch_fits(&batch) {
+                return Err("Lutris cleanup intent exceeds the batch payload limit".into());
+            }
+        }
+    }
+
     if !batch.is_empty() {
         batches.push(batch);
     }
     Ok(batches)
+}
+
+fn snapshot_batch_fits(batch: &SnapshotBatch) -> bool {
+    batch.intent_count() <= MAX_BATCH_ENTRIES
+        && serde_json::to_vec(&json!({
+            "entries":batch.entries,
+            "remove_source_ids":[],
+            "expire_source_ids":[],
+            "selection_remove_source_ids":batch.selection_remove_source_ids,
+        }))
+        .is_ok_and(|bytes| bytes.len() <= MAX_BATCH_BYTES)
 }
 
 fn new_sync_id(source_revision: u64) -> String {
@@ -713,6 +821,7 @@ mod tests {
         let payload = transaction.payload();
         assert_eq!(payload["complete"], true);
         assert_eq!(payload["remove_stale"], false);
+        assert_eq!(payload["remove_selection"], true);
     }
 
     #[test]
@@ -720,12 +829,140 @@ mod tests {
         let entries = (1..=19)
             .map(|id| json!({"source_id":id.to_string(),"entry":{"name":"Example"}}))
             .collect();
-        let batches = batch_entries(entries).unwrap();
-        assert!(batches.iter().all(|batch| batch.len() <= MAX_BATCH_ENTRIES));
+        let batches = batch_snapshot(PreparedSnapshot {
+            entries,
+            selection_remove_source_ids: (20..=27).map(|id| id.to_string()).collect(),
+        })
+        .unwrap();
         assert!(
             batches
                 .iter()
-                .all(|batch| serde_json::to_vec(batch).unwrap().len() <= MAX_BATCH_BYTES)
+                .all(|batch| batch.intent_count() <= MAX_BATCH_ENTRIES)
         );
+        assert!(batches.iter().all(snapshot_batch_fits));
+    }
+
+    #[test]
+    fn disabled_stale_removal_emits_selection_cleanup_but_preserves_absent_source_ids() {
+        let settings = ProductSettings {
+            exclude_games: vec![Exclusion::Id("2".into())],
+            ..ProductSettings::default()
+        };
+        let prepared = prepare_snapshot(
+            &snapshot(vec![
+                game(1, "Keep", "wine", "", ""),
+                game(2, "Excluded", "wine", "", ""),
+                game(3, "Steam filtered", "steam", "steam", "300"),
+            ]),
+            &settings,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared
+                .entries
+                .iter()
+                .map(|entry| entry["source_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(prepared.selection_remove_source_ids, ["2", "3"]);
+
+        // Source 88 is intentionally absent: it is not a selection change and
+        // therefore remains untouched when remove_stale is disabled.
+        let batches = batch_snapshot(prepared).unwrap();
+        let submitted_selection_removals = batches
+            .iter()
+            .flat_map(|batch| batch.selection_remove_source_ids.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(submitted_selection_removals, ["2", "3"]);
+        assert!(!submitted_selection_removals.contains(&"88"));
+
+        let mut transaction = Transaction::new(2, 1, false, batches);
+        transaction.generation = Some(3);
+        transaction.catalog_revision = Some(8);
+        transaction.stage = Stage::Batch;
+        let cleanup_batch = transaction.payload();
+        assert_eq!(cleanup_batch["entries"][0]["source_id"], "1");
+        assert_eq!(
+            cleanup_batch["selection_remove_source_ids"],
+            json!(["2", "3"])
+        );
+
+        transaction.stage = Stage::Finish;
+        let finish = transaction.payload();
+        assert_eq!(finish["remove_stale"], false);
+        assert_eq!(finish["remove_selection"], true);
+        assert!(
+            transaction
+                .consume(&json!({
+                    "ok":true,
+                    "revision":8,
+                    "generation":3,
+                    "complete":true,
+                    "cleanup_pending":false,
+                    "remove_stale":false,
+                    "remove_selection":true,
+                }))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_steam_shadow_is_a_selection_removal_and_retries_are_stable() {
+        let settings = ProductSettings {
+            include_steam: true,
+            ..ProductSettings::default()
+        };
+        let prepared = prepare_snapshot(
+            &snapshot(vec![
+                game(4, "Direct Steam copy", "steam", "steam", "400"),
+                game(5, "Lutris Steam", "steam", "steam", "500"),
+            ]),
+            &settings,
+            &[400].into(),
+        )
+        .unwrap();
+        assert_eq!(prepared.selection_remove_source_ids, ["4"]);
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.entries[0]["source_id"], "5");
+
+        let batches = batch_snapshot(prepared).unwrap();
+        let mut transaction = Transaction::new(7, 1, false, batches);
+        transaction.generation = Some(2);
+        transaction.catalog_revision = Some(9);
+        transaction.stage = Stage::Batch;
+        let payload_before_retry = transaction.payload();
+        assert_eq!(
+            payload_before_retry["selection_remove_source_ids"],
+            json!(["4"])
+        );
+        let operation_before_retry = transaction.operation_id.clone();
+        transaction.call = Call::Delay { ticks: 1 };
+        assert_eq!(transaction.payload(), payload_before_retry);
+        assert_eq!(transaction.operation_id, operation_before_retry);
+    }
+
+    #[test]
+    fn id_exclusion_removes_a_previously_imported_row_even_if_now_absent() {
+        let settings = ProductSettings {
+            autosync_remove_uninstalled: false,
+            exclude_games: vec![Exclusion::Id("99".into())],
+            ..ProductSettings::default()
+        };
+        let prepared = prepare_snapshot(
+            &snapshot(vec![game(1, "Present", "wine", "", "")]),
+            &settings,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(prepared.selection_remove_source_ids, ["99"]);
+
+        let batches = batch_snapshot(prepared).unwrap();
+        let submitted = batches
+            .iter()
+            .flat_map(|batch| batch.selection_remove_source_ids.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(submitted, ["99"]);
     }
 }
