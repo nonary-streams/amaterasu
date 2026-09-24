@@ -8,7 +8,7 @@ use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, Runti
 use backend::NativeBackend;
 use controller::Controller;
 use model::{InputError, MAX_QUEUED_REQUESTS, Operation};
-use product_settings::ProductSettings;
+use product_settings::{InputPolicyUpdate, ProductSettings};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -57,6 +57,10 @@ enum SettingsOperation {
         always_send_scancodes: Option<bool>,
         #[serde(default)]
         key_rightalt_to_key_win: Option<bool>,
+        #[serde(default)]
+        key_repeat_delay: Option<u32>,
+        #[serde(default)]
+        key_repeat_frequency: Option<f64>,
         expected_revision: u64,
     },
 }
@@ -203,6 +207,8 @@ impl InputModule {
                     high_resolution_scrolling,
                     always_send_scancodes,
                     key_rightalt_to_key_win,
+                    key_repeat_delay,
+                    key_repeat_frequency,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -212,13 +218,15 @@ impl InputModule {
                         .deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis() as u64;
-                    let desired = self.product_settings.merge_update(
+                    let desired = self.product_settings.merge_update(InputPolicyUpdate {
                         keyboard,
                         mouse,
                         high_resolution_scrolling,
                         always_send_scancodes,
                         key_rightalt_to_key_win,
-                    );
+                        key_repeat_delay,
+                        key_repeat_frequency,
+                    });
                     match self.product_settings.begin_update(
                         request.id,
                         expected_revision,
@@ -381,6 +389,8 @@ mod tests {
                 high_resolution_scrolling: None,
                 always_send_scancodes: None,
                 key_rightalt_to_key_win: None,
+                key_repeat_delay: None,
+                key_repeat_frequency: None,
                 ..
             }
         ));
@@ -392,6 +402,8 @@ mod tests {
             "high_resolution_scrolling":false,
             "always_send_scancodes":false,
             "key_rightalt_to_key_win":false,
+            "key_repeat_delay":250,
+            "key_repeat_frequency":30.5,
             "expected_revision":4,
         }))
         .unwrap();
@@ -401,6 +413,8 @@ mod tests {
                 high_resolution_scrolling: Some(false),
                 always_send_scancodes: Some(false),
                 key_rightalt_to_key_win: Some(false),
+                key_repeat_delay: Some(250),
+                key_repeat_frequency: Some(30.5),
                 ..
             }
         ));

@@ -26,7 +26,9 @@ impl WindowsBackend {
                 code: *code,
                 extended: *extended,
             }),
-            Key::MoonlightVk { code, normalized } => {
+            Key::MoonlightVk {
+                code, normalized, ..
+            } => {
                 let code = effective_virtual_key(*code, self.key_rightalt_to_key_win);
                 if *normalized {
                     normalized_keyboard_plan(code)
@@ -318,10 +320,12 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
             Key::MoonlightVk {
                 code,
                 normalized: true,
+                ..
             } => return native_input_with_plan(event, normalized_keyboard_plan(*code)?),
             Key::MoonlightVk {
                 code,
                 normalized: false,
+                ..
             } => raw_keyboard_plan(*code, true, |_| 0)?,
             Key::LinuxEvdev { .. } => {
                 return Err(InputError::new(
@@ -344,7 +348,12 @@ mod tests {
 
     fn key(code: u8, normalized: bool, state: KeyState) -> Event {
         Event::Key {
-            key: Key::MoonlightVk { code, normalized },
+            key: Key::MoonlightVk {
+                code,
+                normalized,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+            },
             state,
         }
     }

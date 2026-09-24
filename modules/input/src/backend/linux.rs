@@ -169,7 +169,9 @@ impl Backend for LinuxBackend {
             ));
         }
         if let Event::Key { key, state } = event
-            && let Key::MoonlightVk { code, normalized } = key
+            && let Key::MoonlightVk {
+                code, normalized, ..
+            } = key
             && self
                 .event_virtual_keycode(*code, *normalized, *state)
                 .is_none()
@@ -202,7 +204,9 @@ impl Backend for LinuxBackend {
         if let Event::Key { key, state } = event {
             let code = match key {
                 Key::LinuxEvdev { code } => *code,
-                Key::MoonlightVk { code, normalized } => self
+                Key::MoonlightVk {
+                    code, normalized, ..
+                } => self
                     .event_virtual_keycode(*code, *normalized, *state)
                     .ok_or_else(|| {
                         InputError::new("unsupported_event", "unmapped Moonlight key")
@@ -219,7 +223,12 @@ impl Backend for LinuxBackend {
                 Key::MoonlightVk { code, .. } => Some(*code),
                 _ => None,
             };
-            if let (Some(identity), Key::MoonlightVk { code, normalized }) = (identity, key)
+            if let (
+                Some(identity),
+                Key::MoonlightVk {
+                    code, normalized, ..
+                },
+            ) = (identity, key)
                 && *state == KeyState::Down
             {
                 // Retain the plan before the write; a failed write can have an

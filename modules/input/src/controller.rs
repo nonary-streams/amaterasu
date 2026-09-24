@@ -1,7 +1,8 @@
 use crate::backend::Backend;
 use crate::model::{
     DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS, MAX_PRESSED,
-    Operation, Pressed, lease_duration, validate_operation_id,
+    Operation, Pressed, is_temporary_modifier, lease_duration, repeat_modifiers,
+    validate_operation_id,
 };
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +14,8 @@ const MAX_ACQUIRE_OPERATIONS: usize = 64;
 const OPERATION_RETENTION: Duration = Duration::from_secs(300);
 const WHEEL_DELTA: i32 = 120;
 const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
+const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
+const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 
 struct Lease {
     owner: String,
@@ -32,6 +35,14 @@ struct TerminalAcquire {
     reason: &'static str,
     retained_until: Instant,
 }
+
+struct RepeatingKey {
+    key: crate::model::Key,
+    modifiers: u8,
+    next_due: Instant,
+    period: Duration,
+}
+
 pub struct Controller<B: Backend> {
     backend: B,
     enabled: bool,
@@ -39,6 +50,9 @@ pub struct Controller<B: Backend> {
     high_resolution_scrolling: bool,
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
+    key_repeat_delay_ms: u32,
+    key_repeat_frequency_hz: f64,
+    repeating_key: Option<RepeatingKey>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
     lease: Option<Lease>,
@@ -56,6 +70,9 @@ impl<B: Backend> Controller<B> {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            key_repeat_delay_ms: DEFAULT_KEY_REPEAT_DELAY_MS,
+            key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
+            repeating_key: None,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
             lease: None,
@@ -102,6 +119,10 @@ impl<B: Backend> Controller<B> {
                 .and_then(|lease| lease.termination_reason)
                 .unwrap_or("expired");
             let _ = self.finish_lease(now, reason);
+            return;
+        }
+        if self.lease.is_some() && !self.cleanup_required() && self.repeat_if_due(now).is_err() {
+            let _ = self.finish_lease(now, "failed");
         }
     }
 
@@ -138,6 +159,18 @@ impl<B: Backend> Controller<B> {
         self.backend.set_key_rightalt_to_key_win(enabled);
     }
 
+    pub fn key_repeat_policy(&self) -> (u32, f64) {
+        (self.key_repeat_delay_ms, self.key_repeat_frequency_hz)
+    }
+
+    pub fn set_key_repeat_policy(&mut self, delay_ms: u32, frequency_hz: f64) {
+        if self.key_repeat_delay_ms != delay_ms || self.key_repeat_frequency_hz != frequency_hz {
+            self.key_repeat_delay_ms = delay_ms;
+            self.key_repeat_frequency_hz = frequency_hz;
+            self.repeating_key = None;
+        }
+    }
+
     fn reset_scroll_remainders(&mut self) {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
@@ -148,6 +181,9 @@ impl<B: Backend> Controller<B> {
     /// releasing an already-held input needs a retry.
     pub fn set_device_policy(&mut self, policy: DevicePolicy, now: Instant) -> InputResult<()> {
         self.device_policy = policy;
+        if !policy.keyboard {
+            self.repeating_key = None;
+        }
         if !policy.mouse {
             self.reset_scroll_remainders();
         }
@@ -374,6 +410,7 @@ impl<B: Backend> Controller<B> {
                 }
                 if event.enabled_by(policy) {
                     self.inject_batch_event(event)
+                        .and_then(|()| self.update_repeat_after_event(event, Instant::now()))
                 } else {
                     suppressed += 1;
                     Ok(())
@@ -404,6 +441,38 @@ impl<B: Backend> Controller<B> {
                 continue;
             }
             self.backend.validate(event)?;
+            if let Event::Key { key, state } = event {
+                match state {
+                    KeyState::Down => {
+                        let required = repeat_modifiers(key);
+                        let available = held_temporary_modifier_mask(&pressed);
+                        if required & !available != 0 {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "repeat modifiers must be temporary modifiers held before the key-down",
+                            ));
+                        }
+                    }
+                    KeyState::Up => {
+                        let identity = Pressed::Key(key.canonical());
+                        let Some(Pressed::Key(held_key)) =
+                            pressed.iter().find(|held| **held == identity)
+                        else {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "key-up does not match a held key",
+                            ));
+                        };
+                        if is_temporary_modifier(held_key) != is_temporary_modifier(key) {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "key-up temporary modifier marker does not match its key-down",
+                            ));
+                        }
+                    }
+                    KeyState::Repeat => {}
+                }
+            }
             if let Event::Key { key, .. } = event {
                 let event_encoding = key.encoding();
                 if key_encoding.is_some_and(|encoding| encoding != event_encoding) {
@@ -495,7 +564,114 @@ impl<B: Backend> Controller<B> {
         }
         Ok(())
     }
+
+    fn update_repeat_after_event(&mut self, event: &Event, now: Instant) -> InputResult<()> {
+        let Event::Key { key, state } = event else {
+            return Ok(());
+        };
+        if is_temporary_modifier(key) {
+            return Ok(());
+        }
+        match state {
+            KeyState::Down => {
+                if self.key_repeat_delay_ms == 0 {
+                    self.repeating_key = None;
+                    return Ok(());
+                }
+                let period = repeat_period(self.key_repeat_frequency_hz);
+                let Some(next_due) =
+                    now.checked_add(Duration::from_millis(u64::from(self.key_repeat_delay_ms)))
+                else {
+                    self.repeating_key = None;
+                    return Ok(());
+                };
+                let mut repeating = key.clone();
+                repeating.clear_repeat_modifiers();
+                self.repeating_key = Some(RepeatingKey {
+                    key: repeating,
+                    modifiers: repeat_modifiers(key),
+                    next_due,
+                    period,
+                });
+            }
+            KeyState::Up => {
+                let released = Pressed::Key(key.canonical());
+                if self
+                    .repeating_key
+                    .as_ref()
+                    .is_some_and(|repeat| Pressed::Key(repeat.key.canonical()) == released)
+                {
+                    self.repeating_key = None;
+                }
+            }
+            KeyState::Repeat => {}
+        }
+        Ok(())
+    }
+
+    fn repeat_if_due(&mut self, now: Instant) -> InputResult<()> {
+        let Some(repeating) = self.repeating_key.as_ref() else {
+            return Ok(());
+        };
+        if now < repeating.next_due {
+            return Ok(());
+        }
+        let repeat = RepeatingKey {
+            key: repeating.key.clone(),
+            modifiers: repeating.modifiers,
+            next_due: repeating.next_due,
+            period: repeating.period,
+        };
+        if !self.pressed.contains(&Pressed::Key(repeat.key.canonical())) {
+            self.repeating_key = None;
+            return Ok(());
+        }
+
+        let requested_modifiers = [(1, 0x10), (2, 0x11), (4, 0x12)];
+        let synthetic: Vec<(u8, u8)> = requested_modifiers
+            .into_iter()
+            .filter(|(bit, _)| repeat.modifiers & bit != 0)
+            .filter(|(bit, _)| !self.modifier_is_held(*bit))
+            .collect();
+        for (_, code) in &synthetic {
+            self.inject(&temporary_modifier_event(
+                repeat.key.clone(),
+                *code,
+                KeyState::Down,
+            ))?;
+        }
+        let mut repeat_key = repeat.key.clone();
+        repeat_key.clear_repeat_modifiers();
+        self.inject(&Event::Key {
+            key: repeat_key,
+            state: KeyState::Repeat,
+        })?;
+        for (_, code) in synthetic.iter().rev() {
+            self.inject(&temporary_modifier_event(
+                repeat.key.clone(),
+                *code,
+                KeyState::Up,
+            ))?;
+        }
+        match next_repeat_deadline(repeat.next_due, now, repeat.period) {
+            Some(next_due) => {
+                if let Some(repeating) = &mut self.repeating_key {
+                    repeating.next_due = next_due;
+                }
+            }
+            None => self.repeating_key = None,
+        }
+        Ok(())
+    }
+
+    fn modifier_is_held(&self, bit: u8) -> bool {
+        self.pressed.iter().any(|pressed| match pressed {
+            Pressed::Key(key) => modifier_key_bit(key).is_some_and(|held_bit| held_bit == bit),
+            Pressed::Button(_) => false,
+        })
+    }
     fn finish_lease(&mut self, now: Instant, reason: &'static str) -> InputResult<()> {
+        self.repeating_key = None;
         if let Some(lease) = &mut self.lease {
             lease.termination_reason.get_or_insert(reason);
         }
@@ -547,7 +723,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -581,6 +757,81 @@ fn active_lease(lease: &Lease, now: Instant, backend: &str, absolute_pointer: bo
         "backend": backend,
         "absolute_pointer": absolute_pointer,
         "cleanup_required": lease.cleanup_required,
+    })
+}
+
+fn repeat_period(frequency_hz: f64) -> Duration {
+    let frequency_hz = if frequency_hz == 0.0 {
+        DEFAULT_KEY_REPEAT_FREQUENCY_HZ
+    } else {
+        frequency_hz
+    };
+    // Vibeshine schedules the initial delay before its periodic timer. Preserve
+    // that first repeat when a valid, very small frequency exceeds Duration's
+    // range; a later interval cannot be represented then.
+    Duration::try_from_secs_f64(1.0 / frequency_hz).unwrap_or(Duration::MAX)
+}
+
+fn next_repeat_deadline(previous: Instant, now: Instant, period: Duration) -> Option<Instant> {
+    if period.is_zero() {
+        return Some(now);
+    }
+    let elapsed_periods =
+        now.saturating_duration_since(previous).as_nanos() / period.as_nanos() + 1;
+    let Ok(periods) = u32::try_from(elapsed_periods) else {
+        return now.checked_add(period);
+    };
+    period
+        .checked_mul(periods)
+        .and_then(|advance| previous.checked_add(advance))
+        .or_else(|| now.checked_add(period))
+}
+
+fn temporary_modifier_event(template: crate::model::Key, code: u8, state: KeyState) -> Event {
+    let normalized = match template {
+        crate::model::Key::MoonlightVk { normalized, .. } => normalized,
+        _ => true,
+    };
+    Event::Key {
+        key: crate::model::Key::MoonlightVk {
+            code,
+            normalized,
+            repeat_modifiers: 0,
+            temporary_modifier: true,
+        },
+        state,
+    }
+}
+
+fn modifier_key_bit(key: &crate::model::Key) -> Option<u8> {
+    match key {
+        crate::model::Key::MoonlightVk { code, .. } => match code {
+            0x10 | 0xa0 | 0xa1 => Some(1),
+            0x11 | 0xa2 | 0xa3 => Some(2),
+            0x12 | 0xa4 | 0xa5 => Some(4),
+            _ => None,
+        },
+        crate::model::Key::WindowsScan { code, extended } => match (*code, *extended) {
+            (0x2a | 0x36, false) => Some(1),
+            (0x1d, _) => Some(2),
+            (0x38, _) => Some(4),
+            _ => None,
+        },
+        crate::model::Key::LinuxEvdev { code } => match code {
+            42 | 54 => Some(1),
+            29 | 97 => Some(2),
+            56 | 100 => Some(4),
+            _ => None,
+        },
+    }
+}
+
+fn held_temporary_modifier_mask(pressed: &[Pressed]) -> u8 {
+    pressed.iter().fold(0, |mask, value| match value {
+        Pressed::Key(key) if is_temporary_modifier(key) => {
+            mask | modifier_key_bit(key).unwrap_or(0)
+        }
+        _ => mask,
     })
 }
 

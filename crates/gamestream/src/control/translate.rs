@@ -27,6 +27,8 @@ pub enum InputEvent {
     Key {
         virtual_key: u8,
         normalized: bool,
+        repeat_modifiers: u8,
+        temporary_modifier: bool,
         state: KeyState,
     },
     Button {
@@ -186,15 +188,17 @@ impl InputTranslator {
             return Ok(vec![InputEvent::Key {
                 virtual_key: held.virtual_key,
                 normalized: held.normalized,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
                 state: KeyState::Up,
             }]);
         }
 
-        let state = if held.is_some() {
-            KeyState::Repeat
-        } else {
-            KeyState::Down
-        };
+        // Vibeshine ignores duplicate client downs and owns the repeat timer
+        // per client. The input service now schedules that repeat by lease.
+        if held.is_some() {
+            return Ok(Vec::new());
+        }
         let held_key = held.unwrap_or(HeldKey {
             virtual_key: if normalized { key_index } else { incoming_key },
             normalized,
@@ -214,16 +218,30 @@ impl InputTranslator {
         events.extend(synthetic.iter().map(|key| InputEvent::Key {
             virtual_key: *key,
             normalized,
+            repeat_modifiers: 0,
+            temporary_modifier: true,
             state: KeyState::Down,
         }));
+        let repeat_modifiers = synthetic.iter().fold(0, |mask, key| {
+            mask | match key {
+                0x10 => 1,
+                0x11 => 2,
+                0x12 => 4,
+                _ => 0,
+            }
+        });
         events.push(InputEvent::Key {
             virtual_key: held_key.virtual_key,
             normalized: held_key.normalized,
-            state,
+            repeat_modifiers,
+            temporary_modifier: false,
+            state: KeyState::Down,
         });
         events.extend(synthetic.iter().rev().map(|key| InputEvent::Key {
             virtual_key: *key,
             normalized,
+            repeat_modifiers: 0,
+            temporary_modifier: true,
             state: KeyState::Up,
         }));
         self.held_keys[usize::from(key_index)] = Some(held_key);
@@ -448,7 +466,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keyboard_tracks_repeats_and_synthesizes_only_missing_modifiers() {
+    fn keyboard_tracks_held_keys_and_synthesizes_only_missing_modifiers() {
         let mut translator = InputTranslator::default();
         let batch = translator
             .translate(Input::Keyboard {
@@ -464,31 +482,41 @@ mod tests {
                 InputEvent::Key {
                     virtual_key: 0x10,
                     normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: true,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x11,
                     normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: true,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x41,
                     normalized: true,
+                    repeat_modifiers: 3,
+                    temporary_modifier: false,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x11,
                     normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: true,
                     state: KeyState::Up
                 },
                 InputEvent::Key {
                     virtual_key: 0x10,
                     normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: true,
                     state: KeyState::Up
                 },
             ]
         );
-        assert_eq!(
+        assert!(
             translator
                 .translate(Input::Keyboard {
                     pressed: true,
@@ -497,40 +525,63 @@ mod tests {
                     flags: 0,
                 })
                 .unwrap()
-                .events(),
-            &[InputEvent::Key {
-                virtual_key: 0x41,
-                normalized: true,
-                state: KeyState::Repeat
-            }]
+                .events()
+                .is_empty()
         );
     }
 
     #[test]
     fn generic_and_left_modifier_packets_share_one_logical_key() {
         let mut translator = InputTranslator::default();
-        for (pressed, key_code, expected) in [
-            (true, 0x8010, KeyState::Down),
-            (true, 0x80a0, KeyState::Repeat),
-            (false, 0x8010, KeyState::Up),
-        ] {
-            assert_eq!(
-                translator
-                    .translate(Input::Keyboard {
-                        pressed,
-                        key_code,
-                        modifiers: u8::from(pressed),
-                        flags: 0,
-                    })
-                    .unwrap()
-                    .events(),
-                &[InputEvent::Key {
-                    virtual_key: 0xa0,
-                    normalized: true,
-                    state: expected,
-                }]
-            );
-        }
+        let down = translator
+            .translate(Input::Keyboard {
+                pressed: true,
+                key_code: 0x8010,
+                modifiers: 1,
+                flags: 0,
+            })
+            .unwrap();
+        assert_eq!(down.events().len(), 1);
+        assert_eq!(
+            down.events()[0],
+            InputEvent::Key {
+                virtual_key: 0xa0,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+                state: KeyState::Down,
+            }
+        );
+        assert!(
+            translator
+                .translate(Input::Keyboard {
+                    pressed: true,
+                    key_code: 0x80a0,
+                    modifiers: 0,
+                    flags: 0,
+                })
+                .unwrap()
+                .events()
+                .is_empty()
+        );
+        assert_eq!(
+            translator
+                .translate(Input::Keyboard {
+                    pressed: false,
+                    key_code: 0x8010,
+                    modifiers: 0,
+                    flags: 0,
+                })
+                .unwrap()
+                .events(),
+            &[InputEvent::Key {
+                virtual_key: 0xa0,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+                state: KeyState::Up,
+            }]
+        );
     }
 
     #[test]
@@ -656,6 +707,8 @@ mod tests {
             &[InputEvent::Key {
                 virtual_key: 0x41,
                 normalized: false,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
                 state: KeyState::Down,
             }]
         );
@@ -668,14 +721,7 @@ mod tests {
                 flags: 0,
             })
             .unwrap();
-        assert_eq!(
-            repeat_after_mode_change.events(),
-            &[InputEvent::Key {
-                virtual_key: 0x41,
-                normalized: false,
-                state: KeyState::Repeat,
-            }]
-        );
+        assert!(repeat_after_mode_change.events().is_empty());
 
         let up_after_mode_change = translator
             .translate(Input::Keyboard {
@@ -690,6 +736,8 @@ mod tests {
             &[InputEvent::Key {
                 virtual_key: 0x41,
                 normalized: false,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
                 state: KeyState::Up,
             }]
         );

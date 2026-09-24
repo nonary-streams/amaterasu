@@ -284,11 +284,19 @@ fn event_payload(event: InputEvent) -> Value {
         InputEvent::Key {
             virtual_key,
             normalized,
+            repeat_modifiers,
+            temporary_modifier,
             state,
         } => {
             let mut key = json!({"platform": "moonlight_vk", "code": virtual_key});
             if !normalized {
                 key["normalized"] = json!(false);
+            }
+            if repeat_modifiers != 0 {
+                key["repeat_modifiers"] = json!(repeat_modifiers);
+            }
+            if temporary_modifier {
+                key["temporary_modifier"] = json!(true);
             }
             json!({
                 "kind": "key",

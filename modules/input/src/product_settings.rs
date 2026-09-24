@@ -6,11 +6,13 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 4;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 5;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
+const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputPolicy {
     #[serde(default = "default_enabled")]
@@ -23,6 +25,21 @@ pub struct InputPolicy {
     pub always_send_scancodes: bool,
     #[serde(default)]
     pub key_rightalt_to_key_win: bool,
+    #[serde(default = "default_key_repeat_delay")]
+    pub key_repeat_delay: u32,
+    #[serde(default = "default_key_repeat_frequency")]
+    pub key_repeat_frequency: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputPolicyUpdate {
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub high_resolution_scrolling: Option<bool>,
+    pub always_send_scancodes: Option<bool>,
+    pub key_rightalt_to_key_win: Option<bool>,
+    pub key_repeat_delay: Option<u32>,
+    pub key_repeat_frequency: Option<f64>,
 }
 
 const fn default_enabled() -> bool {
@@ -44,7 +61,19 @@ impl InputPolicy {
             "high_resolution_scrolling":self.high_resolution_scrolling,
             "always_send_scancodes":self.always_send_scancodes,
             "key_rightalt_to_key_win":self.key_rightalt_to_key_win,
+            "key_repeat_delay":self.key_repeat_delay,
+            "key_repeat_frequency":self.key_repeat_frequency,
         })
+    }
+
+    fn validate(self) -> Result<(), &'static str> {
+        if self.key_repeat_delay > i32::MAX as u32 {
+            return Err("key_repeat_delay must not exceed 2147483647 milliseconds");
+        }
+        if !self.key_repeat_frequency.is_finite() || self.key_repeat_frequency < 0.0 {
+            return Err("key_repeat_frequency must be a finite nonnegative number");
+        }
+        Ok(())
     }
 
     fn update_payload(self, expected_revision: u64) -> Value {
@@ -57,6 +86,14 @@ impl InputPolicy {
     }
 }
 
+const fn default_key_repeat_delay() -> u32 {
+    DEFAULT_KEY_REPEAT_DELAY_MS
+}
+
+const fn default_key_repeat_frequency() -> f64 {
+    DEFAULT_KEY_REPEAT_FREQUENCY_HZ
+}
+
 impl Default for InputPolicy {
     fn default() -> Self {
         Self {
@@ -65,6 +102,8 @@ impl Default for InputPolicy {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            key_repeat_delay: DEFAULT_KEY_REPEAT_DELAY_MS,
+            key_repeat_frequency: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
         }
     }
 }
@@ -142,23 +181,25 @@ impl ProductSettings {
         self.pending.is_some()
     }
 
-    pub fn merge_update(
-        &self,
-        keyboard: bool,
-        mouse: bool,
-        high_resolution_scrolling: Option<bool>,
-        always_send_scancodes: Option<bool>,
-        key_rightalt_to_key_win: Option<bool>,
-    ) -> InputPolicy {
+    pub fn merge_update(&self, update: InputPolicyUpdate) -> InputPolicy {
         InputPolicy {
-            keyboard,
-            mouse,
-            high_resolution_scrolling: high_resolution_scrolling
+            keyboard: update.keyboard,
+            mouse: update.mouse,
+            high_resolution_scrolling: update
+                .high_resolution_scrolling
                 .unwrap_or(self.policy.high_resolution_scrolling),
-            always_send_scancodes: always_send_scancodes
+            always_send_scancodes: update
+                .always_send_scancodes
                 .unwrap_or(self.policy.always_send_scancodes),
-            key_rightalt_to_key_win: key_rightalt_to_key_win
+            key_rightalt_to_key_win: update
+                .key_rightalt_to_key_win
                 .unwrap_or(self.policy.key_rightalt_to_key_win),
+            key_repeat_delay: update
+                .key_repeat_delay
+                .unwrap_or(self.policy.key_repeat_delay),
+            key_repeat_frequency: update
+                .key_repeat_frequency
+                .unwrap_or(self.policy.key_repeat_frequency),
         }
     }
 
@@ -187,6 +228,9 @@ impl ProductSettings {
                 "ok":false,
                 "error":{"code":"revision_conflict","current_revision":self.revision}
             }));
+        }
+        if let Err(message) = desired.validate() {
+            return Err(json!({"ok":false,"error":{"code":"invalid_settings","message":message}}));
         }
         let timeout_ms = remaining_ms.min(CONFIGURATION_TIMEOUT_MS);
         if timeout_ms == 0 {
@@ -408,6 +452,10 @@ impl ProductSettings {
                         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
                         controller.set_always_send_scancodes(policy.always_send_scancodes);
                         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
+                        controller.set_key_repeat_policy(
+                            policy.key_repeat_delay,
+                            policy.key_repeat_frequency,
+                        );
                         let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
@@ -474,6 +522,10 @@ impl ProductSettings {
                         controller.set_high_resolution_scrolling(actual.high_resolution_scrolling);
                         controller.set_always_send_scancodes(actual.always_send_scancodes);
                         controller.set_key_rightalt_to_key_win(actual.key_rightalt_to_key_win);
+                        controller.set_key_repeat_policy(
+                            actual.key_repeat_delay,
+                            actual.key_repeat_frequency,
+                        );
                         let cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
@@ -512,6 +564,7 @@ impl ProductSettings {
         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
         controller.set_always_send_scancodes(policy.always_send_scancodes);
         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
+        controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
         let cleanup = controller
             .set_device_policy(policy.device_policy(), std::time::Instant::now())
             .is_err();
@@ -537,6 +590,11 @@ impl ProductSettings {
             && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
             && controller.always_send_scancodes() == self.policy.always_send_scancodes
             && controller.key_rightalt_to_key_win() == self.policy.key_rightalt_to_key_win
+            && controller.key_repeat_policy()
+                == (
+                    self.policy.key_repeat_delay,
+                    self.policy.key_repeat_frequency,
+                )
             && !cleanup_required;
         settings_response_with_state(
             self.policy,
@@ -609,7 +667,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=4)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=5)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -630,6 +688,16 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                         | "always_send_scancodes"
                         | "key_rightalt_to_key_win"
                 ),
+                5 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                ),
                 _ => true,
             });
             if has_unknown_key {
@@ -637,6 +705,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
             }
             let policy: InputPolicy = serde_json::from_value(payload["values"].clone())
                 .map_err(|_| "malformed input policy")?;
+            policy.validate()?;
             if revision == 0 {
                 return Err("found document has no revision");
             }

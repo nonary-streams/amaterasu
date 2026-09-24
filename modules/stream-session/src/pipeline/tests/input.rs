@@ -10,6 +10,15 @@ fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
 }
 
 fn keyboard_packet(pressed: bool, key_code: u16, flags: u8) -> crate::plane::ControlRecord {
+    keyboard_packet_with_modifiers(pressed, key_code, flags, 0)
+}
+
+fn keyboard_packet_with_modifiers(
+    pressed: bool,
+    key_code: u16,
+    flags: u8,
+    modifiers: u8,
+) -> crate::plane::ControlRecord {
     let magic = if pressed { 3 } else { 4 };
     let key_code = key_code.to_le_bytes();
     crate::plane::ControlRecord {
@@ -26,12 +35,37 @@ fn keyboard_packet(pressed: bool, key_code: u16, flags: u8) -> crate::plane::Con
             flags,
             key_code[0],
             key_code[1],
-            0,
+            modifiers,
             0,
             0,
         ],
         sequence: 1,
     }
+}
+
+#[test]
+fn synthetic_repeat_modifiers_survive_the_stream_session_wire_projection() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(keyboard_packet_with_modifiers(true, 0x8041, 0, 3));
+    host.idle();
+
+    assert_eq!(
+        host.broker.input_events,
+        [
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x10,"temporary_modifier":true},"state":"down"}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x11,"temporary_modifier":true},"state":"down"}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x41,"repeat_modifiers":3},"state":"down"}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x11,"temporary_modifier":true},"state":"up"}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x10,"temporary_modifier":true},"state":"up"}),
+        ]
+    );
 }
 
 fn relative(sequence: u64) -> crate::plane::ControlRecord {

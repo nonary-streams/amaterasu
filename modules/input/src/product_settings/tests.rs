@@ -78,7 +78,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false})
+        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9})
     );
     assert_eq!(revision, 0);
 }
@@ -112,6 +112,7 @@ fn product_v1_load_preserves_values_and_defaults_a_missing_legacy_field() {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            ..InputPolicy::default()
         }
     );
     assert_eq!(revision, 9);
@@ -158,6 +159,11 @@ fn product_v4_reads_right_alt_mapping_and_legacy_versions_default_it_off() {
     .unwrap();
     assert!(enabled.key_rightalt_to_key_win);
     assert!(enabled.always_send_scancodes);
+    assert_eq!(enabled.key_repeat_delay, DEFAULT_KEY_REPEAT_DELAY_MS);
+    assert_eq!(
+        enabled.key_repeat_frequency,
+        DEFAULT_KEY_REPEAT_FREQUENCY_HZ
+    );
 
     let (legacy, _) = read_document(&json!({
         "ok":true,
@@ -168,6 +174,31 @@ fn product_v4_reads_right_alt_mapping_and_legacy_versions_default_it_off() {
     }))
     .unwrap();
     assert!(!legacy.key_rightalt_to_key_win);
+    assert_eq!(legacy.key_repeat_delay, DEFAULT_KEY_REPEAT_DELAY_MS);
+    assert_eq!(legacy.key_repeat_frequency, DEFAULT_KEY_REPEAT_FREQUENCY_HZ);
+}
+
+#[test]
+fn product_v5_preserves_repeat_settings_and_zero_frequency_uses_default() {
+    let (policy, revision) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":5,
+        "revision":16,
+        "values":{
+            "keyboard":true,
+            "mouse":true,
+            "high_resolution_scrolling":true,
+            "always_send_scancodes":true,
+            "key_rightalt_to_key_win":false,
+            "key_repeat_delay":0,
+            "key_repeat_frequency":0.0,
+        },
+    }))
+    .unwrap();
+    assert_eq!(revision, 16);
+    assert_eq!(policy.key_repeat_delay, 0);
+    assert_eq!(policy.key_repeat_frequency, 0.0);
 }
 
 #[test]
@@ -198,7 +229,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -207,6 +238,10 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
         json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true,"always_send_scancodes":false}}),
         json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"always_send_scancodes":"true"}}),
         json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":"true"}}),
+        json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_delay":100}}),
+        json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
+        json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_delay":-1}}),
+        json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_frequency":-0.1}}),
         json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true}}),
         json!({"ok":true,"found":false,"version":null,"revision":1,"values":{}}),
     ] {
@@ -215,7 +250,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v4_document() {
+fn update_requires_current_revision_and_sends_whole_v5_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -231,6 +266,7 @@ fn update_requires_current_revision_and_sends_whole_v4_document() {
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
                 key_rightalt_to_key_win: false,
+                ..InputPolicy::default()
             },
             10_000,
         )
@@ -249,6 +285,7 @@ fn update_requires_current_revision_and_sends_whole_v4_document() {
                 high_resolution_scrolling: false,
                 always_send_scancodes: false,
                 key_rightalt_to_key_win: false,
+                ..InputPolicy::default()
             },
             10_000,
         )
@@ -274,8 +311,8 @@ fn update_requires_current_revision_and_sends_whole_v4_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":4,
-            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false},
+            "version":5,
+            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9},
         })
     );
 }
@@ -289,7 +326,13 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     settings.policy.high_resolution_scrolling = false;
     settings.policy.always_send_scancodes = false;
     settings.policy.key_rightalt_to_key_win = true;
-    let legacy_desired = settings.merge_update(false, true, None, None, None);
+    settings.policy.key_repeat_delay = 230;
+    settings.policy.key_repeat_frequency = 40.0;
+    let legacy_desired = settings.merge_update(InputPolicyUpdate {
+        keyboard: false,
+        mouse: true,
+        ..InputPolicyUpdate::default()
+    });
     assert!(!legacy_desired.high_resolution_scrolling);
     assert!(!legacy_desired.always_send_scancodes);
     assert!(legacy_desired.key_rightalt_to_key_win);
@@ -299,34 +342,59 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 4);
+    assert_eq!(payload["version"], 5);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true})
+        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0})
     );
     assert!(
         !settings
-            .merge_update(false, true, Some(true), None, None)
+            .merge_update(InputPolicyUpdate {
+                keyboard: false,
+                mouse: true,
+                high_resolution_scrolling: Some(true),
+                ..InputPolicyUpdate::default()
+            })
             .always_send_scancodes
     );
     assert!(
         settings
-            .merge_update(false, true, Some(true), Some(true), None)
+            .merge_update(InputPolicyUpdate {
+                keyboard: false,
+                mouse: true,
+                high_resolution_scrolling: Some(true),
+                always_send_scancodes: Some(true),
+                ..InputPolicyUpdate::default()
+            })
             .high_resolution_scrolling
     );
     assert!(
         settings
-            .merge_update(false, true, None, Some(true), None)
+            .merge_update(InputPolicyUpdate {
+                keyboard: false,
+                mouse: true,
+                always_send_scancodes: Some(true),
+                ..InputPolicyUpdate::default()
+            })
             .always_send_scancodes
     );
     assert!(
         settings
-            .merge_update(false, true, None, None, None)
+            .merge_update(InputPolicyUpdate {
+                keyboard: false,
+                mouse: true,
+                ..InputPolicyUpdate::default()
+            })
             .key_rightalt_to_key_win
     );
     assert!(
         !settings
-            .merge_update(false, true, None, None, Some(false))
+            .merge_update(InputPolicyUpdate {
+                keyboard: false,
+                mouse: true,
+                key_rightalt_to_key_win: Some(false),
+                ..InputPolicyUpdate::default()
+            })
             .key_rightalt_to_key_win
     );
 }
@@ -342,6 +410,8 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         high_resolution_scrolling: false,
         always_send_scancodes: false,
         key_rightalt_to_key_win: true,
+        key_repeat_delay: 250,
+        key_repeat_frequency: 30.5,
     };
 
     settings
@@ -377,6 +447,7 @@ fn management_readback_distinguishes_persisted_and_applied_policy() {
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
+            ..InputPolicy::default()
         },
         12,
         true,
@@ -461,6 +532,7 @@ fn terminal_configuration_result_is_retained_until_release_then_applied_once() {
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
                 key_rightalt_to_key_win: false,
+                ..InputPolicy::default()
             },
             10_000,
         )
@@ -572,6 +644,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
                 key_rightalt_to_key_win: false,
+                ..InputPolicy::default()
             },
         },
         call: Call::Releasing {

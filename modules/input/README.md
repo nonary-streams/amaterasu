@@ -20,15 +20,21 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 4 stores `keyboard`, `mouse`,
+after startup. Version 5 stores `keyboard`, `mouse`,
 `high_resolution_scrolling`, `always_send_scancodes`, and
-`key_rightalt_to_key_win`; an absent document enables keyboard, mouse,
-high-resolution scrolling, and scancode mode, while leaving right-Alt mapping
-disabled. Version 1 documents migrate in memory with high-resolution
+`key_rightalt_to_key_win`, `key_repeat_delay`, and
+`key_repeat_frequency`; an absent document enables keyboard, mouse,
+high-resolution scrolling, and scancode mode, leaves right-Alt mapping disabled,
+and uses a 500 ms initial key-repeat delay at 24.9 Hz. Versions 1 through 4
+migrate in memory with the new repeat defaults. Version 1 documents migrate in
+memory with high-resolution
 scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
 Version 2 documents preserve all three saved values and default scancode mode to
 enabled. Version 3 preserves all four earlier values and defaults right-Alt
-mapping to disabled. The next update writes the complete v4 document. The module needs calls to configuration and state
+mapping to disabled. The next update writes the complete v5 document. Delay is
+an integer from 0 through 2,147,483,647 milliseconds; zero disables repeat.
+Frequency is a finite nonnegative decimal in Hz. Zero keeps Vibeshine's 24.9 Hz
+default. The module needs calls to configuration and state
 and dependencies on both services; the configuration service uses the caller's
 delegated authority for its durable state read. Management cannot select another
 product namespace.
@@ -38,11 +44,12 @@ Administrators use the fixed management routes `/v1/input/settings_get` and
 `configuration.write`. An update body contains both keyboard and mouse fields,
 `expected_revision`, and may contain `high_resolution_scrolling`,
 `always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
-newer fields preserve their current durable values. Product settings
+newer fields preserve their current durable values. The update may also include
+`key_repeat_delay` and `key_repeat_frequency`. Product settings
 actions accept only the exact runtime caller `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -62,8 +69,9 @@ be polled. Settings reads do not block on the startup fetch; they return
 bootstrap defaults as persisted settings.
 
 The live global policy includes `keyboard`, `mouse`,
-`high_resolution_scrolling`, `always_send_scancodes`, and
-`key_rightalt_to_key_win`. When high-resolution
+`high_resolution_scrolling`, `always_send_scancodes`,
+`key_rightalt_to_key_win`, `key_repeat_delay`, and
+`key_repeat_frequency`. When high-resolution
 scrolling is disabled, the input controller accumulates signed wheel units
 separately per axis and emits legacy 120-unit detents. Fractional remainders are
 discarded on mode changes, mouse disable, and lease end. The default preserves
@@ -86,8 +94,20 @@ VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw
 Moonlight packets on Windows and Linux. The backend records the native key chosen
 at key-down so a setting change cannot send key-up for a different key. Linux
 maps VK_LWIN through its existing table to `KEY_LEFTMETA`; Linux runtime behavior
-has not been exercised on this Windows host. Repeat delay and frequency remain
-pending because this module does not yet have a lease-scoped repeat scheduler.
+has not been exercised on this Windows host.
+
+Key repeat belongs to the active input lease. A new key-down replaces that
+lease's current repeat key and starts the configured initial delay; the matching
+key-up, lease end, keyboard disable, native failure, or a repeat-policy change
+cancels it. Duplicate GameStream key-down packets are ignored, matching
+Vibeshine's client behavior. Each module tick emits at most one repeat and
+advances to the next scheduled deadline without replaying missed intervals.
+The input worker ticks every 10–20 ms, so actual cadence has that scheduler
+jitter. Captured synthetic Shift/Ctrl/Alt modifiers are pulsed only when no
+equivalent real modifier is held; their markers are validated across batches and
+remain tracked for lease cleanup on native failure. Linux emits the same
+repeat-event form through uinput, but runtime typing/repeat behavior has not
+been qualified on this Windows development host.
 
 ## JSON API
 

@@ -60,11 +60,27 @@ pub enum Key {
         /// clients omitted this field and therefore retain that behavior.
         #[serde(default = "default_true")]
         normalized: bool,
+        /// Synthetic modifier bits captured for the repeating key-down that
+        /// uses this key. Bits are Shift=1, Ctrl=2, Alt=4.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        repeat_modifiers: u8,
+        /// Marks a short-lived modifier synthesized around a Moonlight key
+        /// event. This lets input validation distinguish it from a held key.
+        #[serde(default, skip_serializing_if = "is_false")]
+        temporary_modifier: bool,
     },
 }
 
 const fn default_true() -> bool {
     true
+}
+
+const fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,23 +104,35 @@ impl Key {
             Self::MoonlightVk {
                 code: 0x10,
                 normalized,
+                repeat_modifiers,
+                temporary_modifier,
             } => Self::MoonlightVk {
                 code: 0xa0,
                 normalized: *normalized,
+                repeat_modifiers: *repeat_modifiers,
+                temporary_modifier: *temporary_modifier,
             },
             Self::MoonlightVk {
                 code: 0x11,
                 normalized,
+                repeat_modifiers,
+                temporary_modifier,
             } => Self::MoonlightVk {
                 code: 0xa2,
                 normalized: *normalized,
+                repeat_modifiers: *repeat_modifiers,
+                temporary_modifier: *temporary_modifier,
             },
             Self::MoonlightVk {
                 code: 0x12,
                 normalized,
+                repeat_modifiers,
+                temporary_modifier,
             } => Self::MoonlightVk {
                 code: 0xa4,
                 normalized: *normalized,
+                repeat_modifiers: *repeat_modifiers,
+                temporary_modifier: *temporary_modifier,
             },
             key => key.clone(),
         }
@@ -163,6 +191,9 @@ impl Event {
     }
 
     pub fn validate(&self) -> InputResult<()> {
+        if let Self::Key { key, state } = self {
+            validate_key_metadata(key, *state)?;
+        }
         match self {
             Self::Key {
                 key: Key::WindowsScan { code, .. },
@@ -183,6 +214,7 @@ impl Event {
                     Key::MoonlightVk {
                         code,
                         normalized: true,
+                        ..
                     },
                 ..
             } if amaterasu_gamestream::control::virtual_key_mapping(*code).is_none() => {
@@ -215,15 +247,81 @@ impl Event {
             Self::Key {
                 key,
                 state: KeyState::Down,
-            } => Some((Pressed::Key(key.canonical()), true)),
+            } => Some((Pressed::Key(key.clone()), true)),
             Self::Key {
                 key,
                 state: KeyState::Up,
-            } => Some((Pressed::Key(key.canonical()), false)),
+            } => Some((Pressed::Key(key.clone()), false)),
             Self::Button { button, pressed } => Some((Pressed::Button(*button), *pressed)),
             _ => None,
         }
     }
+}
+
+fn validate_key_metadata(key: &Key, state: KeyState) -> InputResult<()> {
+    let Key::MoonlightVk {
+        code,
+        repeat_modifiers,
+        temporary_modifier,
+        ..
+    } = key
+    else {
+        return Ok(());
+    };
+    if repeat_modifiers & !0b111 != 0 {
+        return Err(InputError::new(
+            "invalid_event",
+            "repeat modifier mask may contain only Shift, Ctrl, and Alt",
+        ));
+    }
+    if *temporary_modifier {
+        if !matches!(*code, 0x10..=0x12)
+            || !matches!(state, KeyState::Down | KeyState::Up)
+            || *repeat_modifiers != 0
+        {
+            return Err(InputError::new(
+                "invalid_event",
+                "temporary modifiers must be generic Shift, Ctrl, or Alt transitions",
+            ));
+        }
+    } else if *repeat_modifiers != 0 {
+        if state != KeyState::Down {
+            return Err(InputError::new(
+                "invalid_event",
+                "repeat modifiers are valid only on a key-down event",
+            ));
+        }
+        if is_modifier_virtual_key(*code) {
+            return Err(InputError::new(
+                "invalid_event",
+                "a modifier key cannot request synthetic repeat modifiers",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_modifier_virtual_key(code: u8) -> bool {
+    matches!(code, 0x10 | 0x11 | 0x12 | 0x5b | 0x5c | 0xa0..=0xa5)
+}
+
+pub(crate) fn repeat_modifiers(key: &Key) -> u8 {
+    match key {
+        Key::MoonlightVk {
+            repeat_modifiers, ..
+        } => *repeat_modifiers,
+        _ => 0,
+    }
+}
+
+pub(crate) fn is_temporary_modifier(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::MoonlightVk {
+            temporary_modifier: true,
+            ..
+        }
+    )
 }
 #[derive(Clone, Debug)]
 pub enum Pressed {
@@ -257,9 +355,18 @@ fn key_identity_eq(left: &Key, right: &Key) -> bool {
         ) => left_code == right_code && left_extended == right_extended,
         (Key::LinuxEvdev { code: left }, Key::LinuxEvdev { code: right }) => left == right,
         (Key::MoonlightVk { code: left, .. }, Key::MoonlightVk { code: right, .. }) => {
-            left == right
+            canonical_virtual_key(*left) == canonical_virtual_key(*right)
         }
         _ => false,
+    }
+}
+
+const fn canonical_virtual_key(code: u8) -> u8 {
+    match code {
+        0x10 => 0xa0,
+        0x11 => 0xa2,
+        0x12 => 0xa4,
+        code => code,
     }
 }
 
@@ -267,13 +374,41 @@ impl Pressed {
     pub fn release_event(&self) -> Event {
         match self {
             Self::Key(key) => Event::Key {
-                key: key.clone(),
+                key: key.without_repeat_modifiers(),
                 state: KeyState::Up,
             },
             Self::Button(button) => Event::Button {
                 button: *button,
                 pressed: false,
             },
+        }
+    }
+}
+
+impl Key {
+    pub(crate) fn clear_repeat_modifiers(&mut self) {
+        if let Self::MoonlightVk {
+            repeat_modifiers, ..
+        } = self
+        {
+            *repeat_modifiers = 0;
+        }
+    }
+
+    fn without_repeat_modifiers(&self) -> Self {
+        match self {
+            Self::MoonlightVk {
+                code,
+                normalized,
+                temporary_modifier,
+                ..
+            } => Self::MoonlightVk {
+                code: *code,
+                normalized: *normalized,
+                repeat_modifiers: 0,
+                temporary_modifier: *temporary_modifier,
+            },
+            key => key.clone(),
         }
     }
 }
@@ -349,6 +484,8 @@ mod tests {
                 key: Key::MoonlightVk {
                     code: 65,
                     normalized: true,
+                    repeat_modifiers: 0,
+                    temporary_modifier: false,
                 },
                 state: KeyState::Down,
             }
@@ -367,6 +504,8 @@ mod tests {
                 key: Key::MoonlightVk {
                     code: 255,
                     normalized: false,
+                    repeat_modifiers: 0,
+                    temporary_modifier: false,
                 },
                 state: KeyState::Down,
             }
