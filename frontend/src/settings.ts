@@ -1080,6 +1080,21 @@ namespace Amaterasu {
           fec.step = "1";
           fec.placeholder = "Inherit";
           fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+          const streamAudio = el("select");
+          streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
+          const audioChoices: Array<[string, string]> = [
+            ["", "Inherit"],
+            ["true", "Enabled"],
+            ["false", "Disabled"],
+          ];
+          for (const [value, label] of audioChoices) {
+            const option = el("option", "", label);
+            option.value = value;
+            streamAudio.append(option);
+          }
+          streamAudio.value = client.config_overrides?.stream_audio === undefined
+            ? ""
+            : String(client.config_overrides.stream_audio);
           const status = el("div");
           const save = button(
             "Save",
@@ -1088,7 +1103,10 @@ namespace Amaterasu {
                 await context.api.post("pairing/update_client_config_overrides", {
                   certificate_id: client.certificate_id,
                   expected_revision: settings.revision,
-                  config_overrides: parseClientFecOverride(fec.value),
+                  config_overrides: {
+                    ...parseClientFecOverride(fec.value),
+                    stream_audio: parseStreamAudioOverride(streamAudio.value),
+                  },
                 });
                 context.notify(`Streaming override saved for ${client.name}.`);
                 await loadPairing();
@@ -1110,9 +1128,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, el("div", "", save, status)];
+          return [identity, fec, streamAudio, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -1320,11 +1338,7 @@ namespace Amaterasu {
         });
         const outputName = el("select");
         outputName.name = "output_name";
-        const automaticOutput = el(
-          "option",
-          "",
-          `Automatic (startup output: ${settings.effective_output_name ?? "none"})`,
-        );
+        const automaticOutput = el("option", "", "Automatic (startup output)");
         automaticOutput.value = "";
         outputName.append(automaticOutput);
         let outputDiscoveryIssue: string | null = null;
@@ -1361,6 +1375,8 @@ namespace Amaterasu {
           outputName.append(saved);
         }
         outputName.value = settings.configured_output_name ?? "";
+        const streamAudio = input("stream_audio", "", "checkbox");
+        streamAudio.checked = settings.stream_audio;
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1388,6 +1404,7 @@ namespace Amaterasu {
             outputName,
             "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
           ),
+          field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           el(
             "p",
@@ -1412,6 +1429,7 @@ namespace Amaterasu {
               port: port.valueAsNumber,
               ...network,
               output_name: parseOutputNameSelection(outputName.value),
+              stream_audio: streamAudio.checked,
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");

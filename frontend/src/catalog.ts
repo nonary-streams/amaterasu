@@ -1,4 +1,17 @@
 namespace Amaterasu {
+  function audioOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
+    const select = el("select");
+    select.name = name;
+    const choices: Array<[string, string]> = [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]];
+    for (const [value, label] of choices) {
+      const option = el("option", "", label);
+      option.value = value;
+      select.append(option);
+    }
+    select.value = current === undefined ? "" : String(current);
+    return select;
+  }
+
   export function renderCatalog(context: PageContext): void {
     const { content, api, notify } = context;
     const search = input("search");
@@ -182,6 +195,10 @@ namespace Amaterasu {
       fec.step = "1";
       fec.placeholder = "Inherit";
       fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+      const streamAudio = audioOverrideSelect(
+        "stream_audio",
+        row.entry.config_overrides?.stream_audio,
+      );
       const form = el(
         "form",
         "editor-form",
@@ -190,6 +207,7 @@ namespace Amaterasu {
           fec,
           "Leave blank to inherit the global setting. Supported values are 1–255.",
         ),
+        field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -200,12 +218,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -366,6 +384,10 @@ namespace Amaterasu {
     fec.min = "1";
     fec.max = "255";
     fec.step = "1";
+    const streamAudio = audioOverrideSelect(
+      "stream_audio",
+      entry?.config_overrides?.stream_audio,
+    );
     const processPolicy = el(
       "div",
       "form-grid",
@@ -401,6 +423,7 @@ namespace Amaterasu {
       field("Tags", tags, "Separate tags with commas."),
       field("Absolute application path", path),
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
+      field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       executable,
     );
     return form;

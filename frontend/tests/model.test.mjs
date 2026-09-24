@@ -54,13 +54,14 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
   form.set("wait_all", "on");
   form.set("exit_timeout_seconds", "0");
   form.set("fec_percentage", "37");
+  form.set("stream_audio", "false");
   form.set("detached", "first --ordered\n\nsecond");
   form.set(
     "preparation",
     JSON.stringify([{ run: { executable: "C:\\Tools\\prepare.exe" } }]),
   );
   const entry = ordinary(model.entryFromForm(form));
-  assert.deepEqual(entry.config_overrides, { fec_percentage: 37 });
+  assert.deepEqual(entry.config_overrides, { fec_percentage: 37, stream_audio: false });
   assert.deepEqual(entry.launch, {
     kind: "executable",
     program: "C:\\Games\\policy.exe",
@@ -78,9 +79,24 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.equal(model.parseFecOverride("  "), null);
   assert.deepEqual(ordinary(model.providerConfigOverrides("")), {
     fec_percentage: null,
+    stream_audio: null,
   });
-  assert.deepEqual(ordinary(model.providerConfigOverrides("37")), {
+  assert.deepEqual(ordinary(model.providerConfigOverrides("37", "false")), {
     fec_percentage: 37,
+    stream_audio: false,
+  });
+  assert.equal(model.parseStreamAudioOverride(""), null);
+  assert.equal(model.parseStreamAudioOverride("true"), true);
+  assert.equal(model.parseStreamAudioOverride("false"), false);
+  for (const value of ["TRUE", "0", "off", " false "])
+    assert.throws(() => model.parseStreamAudioOverride(value));
+  const audioOnly = new FormData();
+  audioOnly.set("name", "Silent app");
+  audioOnly.set("kind", "application");
+  audioOnly.set("path", "/opt/silent");
+  audioOnly.set("stream_audio", "false");
+  assert.deepEqual(ordinary(model.entryFromForm(audioOnly).config_overrides), {
+    stream_audio: false,
   });
   assert.equal(model.parseExitTimeout(""), null);
   assert.equal(model.parseExitTimeout("0"), 0);

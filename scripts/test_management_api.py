@@ -280,7 +280,7 @@ def test_auth_and_crud(console, api):
         {
             "certificate_id": first_client["certificate_id"],
             "expected_revision": paired_clients["revision"],
-            "config_overrides": {"fec_percentage": 47},
+            "config_overrides": {"fec_percentage": 47, "stream_audio": True},
         },
         administrator,
     )
@@ -296,6 +296,7 @@ def test_auth_and_crud(console, api):
         if client["certificate_id"] == second_client["certificate_id"]
     )
     assert first_after_update.get("config_overrides", {}).get("fec_percentage") == 47, first_after_update
+    assert first_after_update.get("config_overrides", {}).get("stream_audio") is True, first_after_update
     assert second_after_update.get("config_overrides", {}).get("fec_percentage") is None, second_after_update
     status, stale_fec_update, _ = api.post(
         "/v1/pairing/update_client_config_overrides",
@@ -315,6 +316,7 @@ def test_auth_and_crud(console, api):
         if client["certificate_id"] == first_client["certificate_id"]
     )
     assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
+    assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
     status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
     assert status == 200 and auth_settings["ok"], auth_settings
     assert auth_settings["values"] == {
@@ -357,7 +359,7 @@ def test_auth_and_crud(console, api):
     prepare_path = r"C:\Tools\prepare.exe" if os.name == "nt" else "/opt/tools/prepare"
     entry = {
         "name": "HTTP Game",
-        "config_overrides": {"fec_percentage": 37},
+        "config_overrides": {"fec_percentage": 37, "stream_audio": False},
         "launch": {
             "kind": "executable",
             "program": game_path,
@@ -372,7 +374,7 @@ def test_auth_and_crud(console, api):
     status, created, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog["revision"]}, administrator)
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
-    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37}, found
+    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False}, found
     assert found["entry"]["launch"]["auto_detach"] is False, found
     assert found["entry"]["launch"]["wait_all"] is True, found
     assert found["entry"]["launch"]["exit_timeout_seconds"] == 0, found
@@ -381,7 +383,7 @@ def test_auth_and_crud(console, api):
     updated_entry = {
         **entry,
         "name": "Renamed",
-        "config_overrides": {"fec_percentage": 43},
+        "config_overrides": {"fec_percentage": 43, "stream_audio": False},
         "launch": {**entry["launch"], "auto_detach": True, "wait_all": False},
     }
     status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": updated_entry, "expected_revision": created["revision"]}, administrator)
@@ -395,7 +397,7 @@ def test_auth_and_crud(console, api):
     assert conflict["error"]["code"] == "revision_conflict", conflict
     status, saved_catalog_entry, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
-    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43}, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False}, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["exit_timeout_seconds"] == 0, saved_catalog_entry
@@ -421,6 +423,8 @@ def test_auth_and_crud(console, api):
     assert host_settings["bind_address"] == "127.0.0.1", host_settings
     assert host_settings["configured_address_family"] is None, host_settings
     assert host_settings["configured_bind_address"] is None, host_settings
+    assert host_settings["configured_output_name"] is None, host_settings
+    assert host_settings["stream_audio"] is True, host_settings
     assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
     assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
     assert host_settings["rtsp_addresses"] == [f"127.0.0.1:{host_settings['port'] + 21}"], host_settings
@@ -451,9 +455,14 @@ def test_auth_and_crud(console, api):
     status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
         "hostname": "Living Room & Games",
         "port": explicit_blank_host["port"],
+        "output_name": "test-output",
+        "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
     }, administrator)
     assert status == 200 and renamed_host["hostname"] == "Living Room & Games", renamed_host
+    assert renamed_host["configured_output_name"] == "test-output", renamed_host
+    assert renamed_host["effective_output_name"] == "test-output", renamed_host
+    assert renamed_host["stream_audio"] is False, renamed_host
     assert renamed_host["configured_address_family"] == "ipv4", renamed_host
     assert renamed_host["configured_bind_address"] == "", renamed_host
     status, conflict, _ = api.post("/v1/nvhttp/settings_update", {
@@ -465,6 +474,11 @@ def test_auth_and_crud(console, api):
         "hostname": "Foreign", "port": renamed_host["port"],
         "expected_revision": renamed_host["revision"],
         "owner": "amaterasu.other",
+    }, administrator)[0] == 400
+    assert api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games", "port": renamed_host["port"],
+        "expected_revision": renamed_host["revision"],
+        "output_name": " ",
     }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
@@ -479,6 +493,8 @@ def test_auth_and_crud(console, api):
         "expected_revision": renamed_host["revision"],
     }, administrator)
     assert status == 200 and moved_host["ok"], moved_host
+    assert moved_host["configured_output_name"] == "test-output", moved_host
+    assert moved_host["stream_audio"] is False, moved_host
     assert moved_host["active_http_port"] == moved_port, moved_host
     assert moved_host["active_https_port"] == moved_port - 5, moved_host
     connection = http.client.HTTPConnection(host, moved_port, timeout=5)
@@ -709,6 +725,7 @@ def test_auth_and_crud(console, api):
         "enabled": sys.platform == "win32",
         "auto_sync": True,
         "sync_all_installed": False,
+        "autosync_remove_uninstalled": True,
         "recent_games": 10,
         "recent_max_age_days": 30,
         "sync_categories": [],
@@ -721,6 +738,7 @@ def test_auth_and_crud(console, api):
         "enabled": False,
         "auto_sync": False,
         "sync_all_installed": True,
+        "autosync_remove_uninstalled": False,
         "recent_games": 25,
         "recent_max_age_days": 45,
         "sync_categories": ["Action", "RPG"],
@@ -890,6 +908,8 @@ def main():
             assert host_settings["address_family"] == "ipv4", host_settings
             assert host_settings["configured_address_family"] == "ipv4", host_settings
             assert host_settings["configured_bind_address"] == "", host_settings
+            assert host_settings["configured_output_name"] == "test-output", host_settings
+            assert host_settings["stream_audio"] is False, host_settings
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
             assert status == 200 and steam_settings["values"] == steam_values, steam_settings
@@ -900,6 +920,7 @@ def main():
                 if client["certificate_id"] == fec_client_id
             )
             assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
+            assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
             status, lutris_settings, _ = api.post("/v1/lutris/settings", token=relogged["bearer"])
             assert status == 200 and lutris_settings["values"] == lutris_values, lutris_settings
             assert lutris_settings["revision"] == lutris_revision, lutris_settings
@@ -934,11 +955,15 @@ def main():
             status, reset_host, _ = api.post("/v1/nvhttp/settings_update", {
                 "hostname": "Living Room & Games", "port": moved_port,
                 "address_family": None, "bind_address": None,
+                "output_name": "",
+                "stream_audio": True,
                 "expected_revision": reset_revision,
             }, relogged["bearer"])
             assert status == 200 and reset_host["ok"], reset_host
             assert reset_host["configured_address_family"] is None, reset_host
             assert reset_host["configured_bind_address"] is None, reset_host
+            assert reset_host["configured_output_name"] is None, reset_host
+            assert reset_host["stream_audio"] is True, reset_host
             assert reset_host["address_family"] == "ipv4", reset_host
             assert reset_host["bind_address"] == "127.0.0.1", reset_host
             console.eof()

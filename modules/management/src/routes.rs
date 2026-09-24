@@ -409,6 +409,10 @@ mod tests {
         ).is_ok());
         assert!(payload(
             update,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":37,"stream_audio":false}}"#,
+        ).is_ok());
+        assert!(payload(
+            update,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{}}"#,
         ).is_ok());
         for body in [
@@ -416,6 +420,7 @@ mod tests {
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":0}}"#,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":256}}"#,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":"37"}}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"stream_audio":"false"}}"#,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":37,"unknown":true}}"#,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":null}"#,
             br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":-1,"config_overrides":{"fec_percentage":37}}"#,
@@ -626,6 +631,24 @@ mod tests {
                 "output_name":output_name,
             });
             assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for stream_audio in [true, false] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "stream_audio":stream_audio,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for stream_audio in [serde_json::Value::Null, serde_json::json!("false")] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "stream_audio":stream_audio,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
         }
         for output_name in [
             serde_json::json!(" "),

@@ -47,6 +47,7 @@ namespace Amaterasu {
     launch: Launch;
     config_overrides?: {
       fec_percentage?: number;
+      stream_audio?: boolean;
     };
   }
   export interface CatalogRow {
@@ -83,6 +84,7 @@ namespace Amaterasu {
     configured_output_name: string | null;
     effective_output_name: string | null;
     capture_provider: "dxgi" | "wgc" | null;
+    stream_audio: boolean;
     http_addresses: string[] | null;
     https_addresses: string[] | null;
     rtsp_addresses: string[] | null;
@@ -185,6 +187,7 @@ namespace Amaterasu {
     paired_at: number;
     config_overrides?: {
       fec_percentage?: number;
+      stream_audio?: boolean;
     };
   }
   export interface PairingClients {

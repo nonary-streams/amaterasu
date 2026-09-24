@@ -519,12 +519,18 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
 
 fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     let overrides = value.as_object().ok_or(INVALID)?;
-    fields(overrides, &[], &["fec_percentage"])?;
+    fields(overrides, &[], &["fec_percentage", "stream_audio"])?;
     if let Some(fec) = overrides.get("fec_percentage")
         && !fec.is_null()
         && !fec
             .as_u64()
             .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
+    {
+        return Err(INVALID);
+    }
+    if overrides
+        .get("stream_audio")
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
     {
         return Err(INVALID);
     }
@@ -784,7 +790,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(
                 object,
                 &["hostname", "port", "expected_revision"],
-                &["address_family", "bind_address", "output_name"],
+                &[
+                    "address_family",
+                    "bind_address",
+                    "output_name",
+                    "stream_audio",
+                ],
             )?;
             let hostname = text(object, "hostname")?;
             let port = object.get("port").and_then(Value::as_u64);
@@ -829,6 +840,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                             && !value.chars().any(char::is_control) => {}
                     _ => return Err(INVALID),
                 }
+            }
+            if object
+                .get("stream_audio")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(INVALID);
             }
             Ok(())
         }
@@ -908,12 +925,18 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 .get("config_overrides")
                 .and_then(Value::as_object)
                 .ok_or(INVALID)?;
-            fields(config_overrides, &[], &["fec_percentage"])?;
+            fields(config_overrides, &[], &["fec_percentage", "stream_audio"])?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
                 && !percentage.is_null()
                 && !percentage
                     .as_u64()
                     .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
+            {
+                return Err(INVALID);
+            }
+            if config_overrides
+                .get("stream_audio")
+                .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
             {
                 return Err(INVALID);
             }
@@ -1217,7 +1240,7 @@ mod catalog_tests {
             "expected_revision": 4,
             "entry": {
                 "name": "Configured app",
-                "config_overrides": {"fec_percentage": 255},
+                "config_overrides": {"fec_percentage": 255, "stream_audio": false},
                 "launch": {
                     "kind": "executable",
                     "program": "C:\\Games\\game.exe",
@@ -1243,12 +1266,14 @@ mod catalog_tests {
     }
 
     #[test]
-    fn provider_override_route_accepts_only_sparse_fec_patch_and_revision() {
+    fn provider_override_route_accepts_sparse_streaming_patch_and_revision() {
         let route = route("update_provider_overrides");
         for body in [
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":1}}"#.as_slice(),
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":255}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":null}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":false}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":null}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{}}"#,
         ] {
             let value: Value = serde_json::from_slice(body).unwrap();
@@ -1262,6 +1287,7 @@ mod catalog_tests {
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":0}}"#.as_slice(),
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":256}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":"37"}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":"false"}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":37,"unknown":true}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":-1,"config_overrides":{"fec_percentage":37}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"client_id":"forged","config_overrides":{"fec_percentage":37}}"#,
@@ -1283,6 +1309,7 @@ mod catalog_tests {
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":0},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":256},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"fec_percentage":"37"},"launch":{"kind":"application","path":"/x"}}}),
+            serde_json::json!({"expected_revision":0,"entry":{"name":"x","config_overrides":{"stream_audio":"false"},"launch":{"kind":"application","path":"/x"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":"false"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","auto_detach":true,"auto-detach":false}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","exit-timeout":301}}}),

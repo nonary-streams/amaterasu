@@ -23,10 +23,21 @@ namespace Amaterasu {
     return percentage;
   }
 
-  export function providerConfigOverrides(value: string): {
+  export function providerConfigOverrides(value: string, streamAudioValue = ""): {
     fec_percentage: number | null;
+    stream_audio: boolean | null;
   } {
-    return { fec_percentage: parseFecOverride(value) };
+    return {
+      fec_percentage: parseFecOverride(value),
+      stream_audio: parseStreamAudioOverride(streamAudioValue),
+    };
+  }
+
+  export function parseStreamAudioOverride(value: string): boolean | null {
+    if (value === "") return null;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
   }
 
   export function parseDetachedCommands(value: string): string[] {
@@ -83,8 +94,14 @@ namespace Amaterasu {
     const text = (name: string) => String(data.get(name) ?? "").trim();
     const kind = text("kind") === "executable" ? "executable" : "application";
     const fecPercentage = parseFecOverride(text("fec_percentage"));
+    const streamAudio = parseStreamAudioOverride(text("stream_audio"));
     const configOverrides =
-      fecPercentage === null ? undefined : { fec_percentage: fecPercentage };
+      fecPercentage === null && streamAudio === null
+        ? undefined
+        : {
+            ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
+            ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
+          };
     const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
     const detached = parseDetachedCommands(text("detached"));
     const preparation = parsePreparation(text("preparation"));

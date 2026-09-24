@@ -22,10 +22,23 @@ var Amaterasu;
         return percentage;
     }
     Amaterasu.parseFecOverride = parseFecOverride;
-    function providerConfigOverrides(value) {
-        return { fec_percentage: parseFecOverride(value) };
+    function providerConfigOverrides(value, streamAudioValue = "") {
+        return {
+            fec_percentage: parseFecOverride(value),
+            stream_audio: parseStreamAudioOverride(streamAudioValue),
+        };
     }
     Amaterasu.providerConfigOverrides = providerConfigOverrides;
+    function parseStreamAudioOverride(value) {
+        if (value === "")
+            return null;
+        if (value === "true")
+            return true;
+        if (value === "false")
+            return false;
+        throw new Error("Choose Inherit, Enabled, or Disabled for audio streaming.");
+    }
+    Amaterasu.parseStreamAudioOverride = parseStreamAudioOverride;
     function parseDetachedCommands(value) {
         const commands = value
             .split(/\r?\n/)
@@ -68,7 +81,13 @@ var Amaterasu;
         const text = (name) => String(data.get(name) ?? "").trim();
         const kind = text("kind") === "executable" ? "executable" : "application";
         const fecPercentage = parseFecOverride(text("fec_percentage"));
-        const configOverrides = fecPercentage === null ? undefined : { fec_percentage: fecPercentage };
+        const streamAudio = parseStreamAudioOverride(text("stream_audio"));
+        const configOverrides = fecPercentage === null && streamAudio === null
+            ? undefined
+            : {
+                ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
+                ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
+            };
         const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
         const detached = parseDetachedCommands(text("detached"));
         const preparation = parsePreparation(text("preparation"));
@@ -501,6 +520,18 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function audioOverrideSelect(name, current) {
+        const select = Amaterasu.el("select");
+        select.name = name;
+        const choices = [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]];
+        for (const [value, label] of choices) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            select.append(option);
+        }
+        select.value = current === undefined ? "" : String(current);
+        return select;
+    }
     function renderCatalog(context) {
         const { content, api, notify } = context;
         const search = Amaterasu.input("search");
@@ -614,7 +645,8 @@ var Amaterasu;
             fec.step = "1";
             fec.placeholder = "Inherit";
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."));
+            const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -625,7 +657,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value);
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -741,6 +773,7 @@ var Amaterasu;
         fec.min = "1";
         fec.max = "255";
         fec.step = "1";
+        const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
         const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
         const showKind = () => {
@@ -752,7 +785,7 @@ var Amaterasu;
         };
         kind.addEventListener("change", showKind);
         showKind();
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), executable);
         return form;
     }
 })(Amaterasu || (Amaterasu = {}));
@@ -1500,13 +1533,31 @@ var Amaterasu;
                     fec.step = "1";
                     fec.placeholder = "Inherit";
                     fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+                    const streamAudio = Amaterasu.el("select");
+                    streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
+                    const audioChoices = [
+                        ["", "Inherit"],
+                        ["true", "Enabled"],
+                        ["false", "Disabled"],
+                    ];
+                    for (const [value, label] of audioChoices) {
+                        const option = Amaterasu.el("option", "", label);
+                        option.value = value;
+                        streamAudio.append(option);
+                    }
+                    streamAudio.value = client.config_overrides?.stream_audio === undefined
+                        ? ""
+                        : String(client.config_overrides.stream_audio);
                     const status = Amaterasu.el("div");
                     const save = Amaterasu.button("Save", () => Amaterasu.runAction(save, status, async () => {
                         try {
                             await context.api.post("pairing/update_client_config_overrides", {
                                 certificate_id: client.certificate_id,
                                 expected_revision: settings.revision,
-                                config_overrides: parseClientFecOverride(fec.value),
+                                config_overrides: {
+                                    ...parseClientFecOverride(fec.value),
+                                    stream_audio: Amaterasu.parseStreamAudioOverride(streamAudio.value),
+                                },
                             });
                             context.notify(`Streaming override saved for ${client.name}.`);
                             await loadPairing();
@@ -1522,9 +1573,9 @@ var Amaterasu;
                     }), "primary");
                     save.disabled = !context.api.allows("pairing.admin");
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, streamAudio, Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", ""], rows);
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Audio streaming", ""], rows);
                 pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
@@ -1642,7 +1693,7 @@ var Amaterasu;
                 });
                 const outputName = Amaterasu.el("select");
                 outputName.name = "output_name";
-                const automaticOutput = Amaterasu.el("option", "", `Automatic (startup output: ${settings.effective_output_name ?? "none"})`);
+                const automaticOutput = Amaterasu.el("option", "", "Automatic (startup output)");
                 automaticOutput.value = "";
                 outputName.append(automaticOutput);
                 let outputDiscoveryIssue = null;
@@ -1679,11 +1730,13 @@ var Amaterasu;
                     outputName.append(saved);
                 }
                 outputName.value = settings.configured_output_name ?? "";
+                const streamAudio = Amaterasu.input("stream_audio", "", "checkbox");
+                streamAudio.checked = settings.stream_audio;
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -1693,6 +1746,7 @@ var Amaterasu;
                             port: port.valueAsNumber,
                             ...network,
                             output_name: parseOutputNameSelection(outputName.value),
+                            stream_audio: streamAudio.checked,
                             expected_revision: settings.revision,
                         });
                         context.notify("Host settings saved.");
