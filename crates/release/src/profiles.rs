@@ -74,7 +74,8 @@ const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.session-history",
     library: "amaterasu_session_history",
     provides: &["amaterasu.session-history/1"],
-    calls: &["amaterasu.configuration/1"],
+    // Configuration delegates durable state calls under the original caller.
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],

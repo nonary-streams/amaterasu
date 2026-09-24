@@ -145,6 +145,7 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
 #[test]
 fn session_history_loads_its_policy_from_central_configuration() {
     assert!(SESSION_HISTORY.calls.contains(&"amaterasu.configuration/1"));
+    assert!(SESSION_HISTORY.calls.contains(&"amaterasu.state/1"));
     assert!(SESSION_HISTORY.dependencies.contains(&CONFIGURATION.id));
     for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
         let components = profile.components();
