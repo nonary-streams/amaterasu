@@ -145,6 +145,7 @@ namespace Amaterasu {
     values: {
       keyboard: boolean;
       mouse: boolean;
+      high_resolution_scrolling: boolean;
     };
   }
   export interface Session {

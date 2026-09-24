@@ -335,28 +335,43 @@ def test_auth_and_crud(console, api):
         connection.close()
     assert moved_info.findtext("hostname") == "Living Room & Games", ET.tostring(moved_info)
     status, input_defaults, _ = api.post("/v1/input/settings_get", token=administrator)
-    assert status == 200 and input_defaults["values"] == {
+    assert status == 200 and all(
+        input_defaults["values"].get(key) is True
+        for key in ("keyboard", "mouse", "high_resolution_scrolling")
+    ), input_defaults
+    assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
+    input_policy_update = {
+        "keyboard": False,
+        "mouse": True,
+        "high_resolution_scrolling": False,
+    }
+    input_values = {**input_defaults["values"], **input_policy_update}
+    status, input_updated, _ = api.post("/v1/input/settings_update", {
+        **input_policy_update, "expected_revision": input_defaults["revision"],
+    }, administrator)
+    assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
+    assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
+    status, input_conflict, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
         "mouse": True,
         "high_resolution_scrolling": True,
-    }, input_defaults
-    assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
-    input_values = {"keyboard": False, "mouse": True}
-    input_persisted_values = {**input_values, "high_resolution_scrolling": True}
-    status, input_updated, _ = api.post("/v1/input/settings_update", {
-        **input_values, "expected_revision": input_defaults["revision"],
-    }, administrator)
-    assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
-    assert input_updated["values"] == input_persisted_values and input_updated["revision"] == 1, input_updated
-    status, input_conflict, _ = api.post("/v1/input/settings_update", {
-        "keyboard": True, "mouse": True, "expected_revision": input_defaults["revision"],
+        "expected_revision": input_defaults["revision"],
     }, administrator)
     assert status == 200 and input_conflict.get("error", {}).get("code") == "revision_conflict", input_conflict
     assert api.post("/v1/input/settings_update", {
         "keyboard": True, "mouse": True, "expected_revision": 1, "owner": "amaterasu.other",
     }, administrator)[0] == 400
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
-    assert status == 200 and input_saved["values"] == input_persisted_values and input_saved["revision"] == 1, input_saved
+    assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
+    # Legacy clients omit high_resolution_scrolling; their update must preserve
+    # the stored value while changing keyboard and mouse policy.
+    status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
+        "keyboard": True, "mouse": True, "expected_revision": input_saved["revision"],
+    }, administrator)
+    input_values = {**input_values, "keyboard": True, "mouse": True}
+    assert status == 200 and input_legacy_updated["ok"] and input_legacy_updated["applied"], input_legacy_updated
+    assert input_legacy_updated["values"] == input_values and input_legacy_updated["revision"] == 2, input_legacy_updated
+    input_revision = input_legacy_updated["revision"]
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
     assert status == 200 and steam_settings["ok"], steam_settings
     assert steam_settings["values"] == {
@@ -525,8 +540,8 @@ def test_auth_and_crud(console, api):
         steam_values,
         auth_values,
         saved_auth_settings["revision"],
-        input_persisted_values,
-        input_saved["revision"],
+        input_values,
+        input_revision,
         first_client["certificate_id"],
         lutris_values,
         lutris_revision,
@@ -644,7 +659,7 @@ def main():
     print("Steam settings CAS, discovery and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("session restart invalidation,")
-    print("input keyboard/mouse CAS policy persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input keyboard/mouse/high-resolution scrolling CAS, legacy updates, restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

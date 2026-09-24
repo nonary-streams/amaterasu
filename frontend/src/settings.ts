@@ -23,10 +23,19 @@ namespace Amaterasu {
   export function parseInputPolicy(
     keyboard: boolean,
     mouse: boolean,
+    highResolutionScrolling: boolean,
   ): InputPolicySettings["values"] {
-    if (typeof keyboard !== "boolean" || typeof mouse !== "boolean")
+    if (
+      typeof keyboard !== "boolean" ||
+      typeof mouse !== "boolean" ||
+      typeof highResolutionScrolling !== "boolean"
+    )
       throw new Error("Keyboard and mouse policy values must be enabled or disabled.");
-    return { keyboard, mouse };
+    return {
+      keyboard,
+      mouse,
+      high_resolution_scrolling: highResolutionScrolling,
+    };
   }
 
   export function parseClientFecOverride(value: string): {
@@ -779,6 +788,12 @@ namespace Amaterasu {
         keyboard.checked = settings.values.keyboard;
         const mouse = input("input_mouse", "", "checkbox");
         mouse.checked = settings.values.mouse;
+        const highResolutionScrolling = input(
+          "input_high_resolution_scrolling",
+          "",
+          "checkbox",
+        );
+        highResolutionScrolling.checked = settings.values.high_resolution_scrolling;
         const status = el(
           "p",
           settings.applied ? "muted" : "error",
@@ -798,6 +813,11 @@ namespace Amaterasu {
             mouse,
             "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons.",
           ),
+          field(
+            "High-resolution scrolling",
+            highResolutionScrolling,
+            "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents.",
+          ),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -808,7 +828,11 @@ namespace Amaterasu {
               const updated = await context.api.post<InputPolicySettings>(
                 "input/settings_update",
                 {
-                  ...parseInputPolicy(keyboard.checked, mouse.checked),
+                  ...parseInputPolicy(
+                    keyboard.checked,
+                    mouse.checked,
+                    highResolutionScrolling.checked,
+                  ),
                   expected_revision: settings.revision,
                 },
               );
@@ -827,7 +851,7 @@ namespace Amaterasu {
             await loadInput();
           });
         });
-        inputArea.replaceChildren(panel("Keyboard and mouse input", form));
+        inputArea.replaceChildren(panel("Input policy", form));
       } catch (error) {
         if (context.content.isConnected)
           inputArea.replaceChildren(errorPanel(error, loadInput));

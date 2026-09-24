@@ -784,10 +784,17 @@ mod tests {
         assert_eq!(valid["action"], "settings_update");
         assert_eq!(valid["keyboard"], false);
         assert_eq!(valid["expected_revision"], 7);
+        let high_resolution = payload(
+            update,
+            br#"{"keyboard":true,"mouse":false,"high_resolution_scrolling":false,"expected_revision":8}"#,
+        )
+        .unwrap();
+        assert_eq!(high_resolution["high_resolution_scrolling"], false);
         for rejected in [
             br#"{"keyboard":false,"mouse":true}"#.as_slice(),
             br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":"true","expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":true,"high_resolution_scrolling":"true","expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":-1}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":0,"owner":"other"}"#,
         ] {
