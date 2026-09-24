@@ -192,6 +192,73 @@ repeat now applies configurable delay and frequency, including zero-delay
 disable and legacy document migration, with a signed editor. Controller,
 gamepad, and other platform-specific input effects remain pending.
 
+### Controller and gamepad implementation sequence
+
+`global:gamepad` and `global:back_button_timeout` remain `pending` in
+`configuration-coverage.json`. The GameStream controller packet decoder
+already produces a validated snapshot containing a controller number (0..15),
+the client's full active-controller mask, button flags, triggers, and four
+axes. The current translator rejects that snapshot as unsupported, so the
+stream session counts it but never sends it to `amaterasu.input/1`. The input
+module and native backends currently inject keyboard and mouse only; Windows
+`SendInput` does not create a virtual controller, Linux uinput currently creates
+only keyboard and pointer devices, and macOS reports native injection as
+unsupported. Persisting either setting or displaying an editor control alone
+would not implement gamepad behavior.
+
+Implement the live path in this order:
+
+1. Preserve each decoded controller snapshot through the GameStream translator
+   and stream-session queue into the input service, including the complete
+   active mask and signed axis values. Bound queued snapshots and keep controller
+   state separate from keyboard/mouse transitions.
+2. Add lease-owned slots for up to 16 controllers in the input module. Allocate
+   only for active slots, update a complete native state, and neutralize and
+   destroy slots removed by the full active mask, lease release/expiry, stream
+   failure, or module shutdown. Retain ownership when cleanup fails so release
+   can be retried and reported.
+3. Implement at least one genuine virtual-controller backend before exposing a
+   supported `gamepad` choice. Report only profiles the installed backend can
+   create; later add the pinned reference's automatic profile selection and
+   remaining per-platform choices. Keep unsupported profiles and platforms
+   explicit rather than returning successful no-op injection.
+4. Add `back_button_timeout` to the live input policy after snapshots reach a
+   real backend. A negative value disables the behavior. On a Back/Select press,
+   schedule a per-slot deadline; cancel it on release. At expiry, release Back,
+   pulse Home/Guide for 100 ms, then suppress Back until a later client snapshot
+   reports it released. Removing the slot or ending its lease cancels its timer
+   and resets reconciliation state. Use the input module's regular tick and
+   per-slot deadlines so a stale asynchronous callback cannot affect a reused
+   controller slot.
+
+The pinned reference is Vibeshine commit
+`457237db7e57f9c4be21c35bb07e28d1c100eb7d`. Its `gamepad` default is `auto`.
+Windows automatic selection prefers a working ViGEm backend and falls back to
+Vibeshine's VHF/UMDF backend only when ViGEm is unavailable; explicit VHF
+profiles require that driver and do not silently substitute another profile.
+VHF availability therefore requires a real installed, trusted driver package
+and its user-mode client protocol. ViGEm is a legacy driver prerequisite and
+should not be introduced as an unqualified dependency. Linux's reference choices
+are `auto`, `xone`, `ds4`, `ds5`, and `switch`, implemented through Inputtino
+virtual devices. A native Linux implementation also requires a working kernel
+uinput/UHID path and service-account permissions to create those devices.
+Amaterasu has no current gamepad output dependency or driver integration, so
+these are implementation and runtime qualification gates, not current support.
+The pinned macOS backend has no virtual gamepad implementation; keep it
+unsupported until a genuine macOS virtual HID provider is selected and tested.
+
+The reference timeout default is -1 ms. Tests should cover packet-to-service
+preservation, multi-slot active-mask changes, native allocation and update
+failure cleanup, lease teardown, timer behavior just before and at the deadline,
+release-before-expiry cancellation, the 100 ms Home/Guide pulse, Back-state
+reconciliation, and timer cancellation before slot reuse. Pure protocol and
+controller tests do not qualify native delivery: Linux still needs runtime
+uinput/UHID device and permission checks; Windows needs builds against the
+selected driver ABI plus an installed-driver integration gate. macOS remains
+an explicit unsupported-platform gate. Neither configuration ID can become
+`verified` until its management update, persisted default/validation,
+stream-to-device effect, cleanup behavior, and supported platform gates pass.
+
 Playnite now imports only complete, bounded extension snapshots through its
 own provider. Explicit uninstalled IDs can remove still-owned catalog entries
 when automatic synchronization and its durable cleanup setting are enabled;
