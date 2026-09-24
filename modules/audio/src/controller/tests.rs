@@ -294,6 +294,34 @@ fn empty_ordinary_sink_uses_default_endpoint_and_host_audio_policy_is_idempotent
 }
 
 #[test]
+fn enabled_host_audio_policy_is_forwarded_and_reported_in_status() {
+    let (mut controller, observed) = controller(true);
+    let opened = controller
+        .handle(
+            "alice",
+            Operation::Open {
+                endpoint: "render.explicit".into(),
+                virtual_sink: None,
+                channels: None,
+                host_audio_enabled: true,
+                operation_id: None,
+                capture_sink_without_routing: false,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(opened.payload["host_audio_enabled"], true);
+    assert_eq!(
+        controller.status("alice", Some(1))["streams"][0]["host_audio_enabled"],
+        true
+    );
+    assert_eq!(
+        observed.host_audio_settings.lock().unwrap().as_slice(),
+        [true]
+    );
+}
+
+#[test]
 fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
     let (mut controller, observed) = controller(true);
     let result = controller.handle(

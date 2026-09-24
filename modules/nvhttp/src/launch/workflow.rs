@@ -162,6 +162,7 @@ impl Controller {
                     "output":record.capture_output,
                     "encoder":config.capture.encoder,
                     "audio_endpoint":record.audio_endpoint,
+                    "host_audio_enabled":record.request.host_audio_enabled,
                 });
                 (
                     RTSP_SERVICE,

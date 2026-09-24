@@ -58,6 +58,15 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
     assert_eq!(active["state"], "active");
     assert_eq!(host.broker.leases(), 2);
     let record = &host.pipeline.records[&id];
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("audio capture open");
+    assert_eq!(audio_open.payload["host_audio_enabled"], false);
     assert_eq!(
         record.audio_endpoint.as_deref(),
         Some("resolved-canonical-endpoint")
@@ -100,6 +109,26 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
         .position(|call| call.payload["action"] == "finish_stop")
         .unwrap();
     assert!(release > final_lookup);
+}
+
+#[test]
+fn host_audio_policy_snapshot_reaches_audio_capture_open() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["host_audio_enabled"] = json!(true);
+
+    assert_eq!(host.response(2, request)["state"], "active");
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("audio capture open");
+    assert_eq!(audio_open.payload["host_audio_enabled"], true);
 }
 
 #[test]

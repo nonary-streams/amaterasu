@@ -168,6 +168,7 @@ fn request(key: u8) -> LaunchRequest {
         width: 1280,
         height: 720,
         fps: 60,
+        host_audio_enabled: false,
         device_name: None,
         remote_input_key: [key; 16],
         key_id: 17,

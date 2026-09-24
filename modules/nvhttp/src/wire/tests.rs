@@ -363,7 +363,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     let target = concat!(
         "/launch?appid=7&mode=1280x720x60&",
         "rikey=00112233445566778899aabbccddeeff&rikeyid=17&uniqueid=forged-client",
-        "&clientName=Moonlight+Desk"
+        "&clientName=Moonlight+Desk&localAudioPlayMode=1"
     );
     assert!(
         router
@@ -410,6 +410,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["profile"]["fec_percentage"], 49);
     assert_eq!(rtsp_open["stream_audio"], false);
     assert_eq!(rtsp_open["capture"]["audio_endpoint"], "endpoint.client");
+    assert_eq!(rtsp_open["capture"]["host_audio_enabled"], true);
     assert_eq!(rtsp_open["capture_sink_without_routing"], true);
     assert_eq!(rtsp_open["device_name"], "Moonlight Desk");
     // The authenticated certificate-scoped explicit disable wins over the app.

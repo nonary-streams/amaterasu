@@ -390,10 +390,13 @@ The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
 `surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpersist`, and
 `corever`. Unknown fields are rejected, including executable, path, arguments,
 environment, or catalog-owner overrides. The current profile accepts SDR,
-stereo remote playback, core version 1, and `sops=0`. HDR, surround audio, local
-audio playback, display optimization, and controller forwarding requests fail
-before the application service is called. `additionalStates` is accepted only as
-a decimal Boolean. These gates prevent successful XML from implying unsupported
+stereo remote playback, core version 1, and `sops=0`. `localAudioPlayMode` accepts
+only `0` or `1` and defaults to `0`; it snapshots whether audio capture should
+prefer host audio, with the Windows audio module applying its Steam-sink fallback
+when host audio is disabled or the ordinary sink is unavailable. HDR, surround
+audio, display optimization, and controller forwarding requests fail before the
+application service is called. `additionalStates` is accepted only as a decimal
+Boolean. These gates prevent successful XML from implying unsupported
 media or input behavior.
 
 The lifecycle calls the launch service's exported-app API with only the immutable

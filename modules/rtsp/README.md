@@ -21,9 +21,11 @@ Fixed mode requires both ports.
 Discovery mode requires them to be omitted or zero so caller-supplied ports cannot
 silently override discovery.
 Capture contains `capture_provider` (`dxgi` or `wgc`), optional `constant_rate`
-(default false), `output`, `encoder` and `audio_endpoint`. Constant-rate capture is
-accepted only with WGC and is forwarded to stream-session and Video as part of the
-per-open selection. The profile supplies dimensions, frame rate, bitrate in kbps,
+(default false), `output`, `encoder`, `audio_endpoint` and optional
+`host_audio_enabled` (default false). That flag snapshots Moonlight's
+`localAudioPlayMode` choice and is forwarded through stream-session to AudioCapture.
+Constant-rate capture is accepted only with WGC and is forwarded to stream-session
+and Video as part of the per-open selection. The profile supplies dimensions, frame rate, bitrate in kbps,
 reference-frame limit, video packet/FEC settings, Opus packet duration/bitrate and
 encryption policy. Unknown fields are rejected; network data cannot override these
 authorized settings.

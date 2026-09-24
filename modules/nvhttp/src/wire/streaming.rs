@@ -37,6 +37,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         .try_into()
         .map_err(|_| "remote input key must contain 16 bytes")?;
     let key_id = key_id(query.required("rikeyid")?)?;
+    let host_audio_enabled = query.get("localAudioPlayMode") == Some("1");
     let device_name = query.get("clientName").unwrap_or_default();
     if !device_name.is_empty()
         && (device_name.len() > 128 || device_name.chars().any(char::is_control))
@@ -48,6 +49,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         width,
         height,
         fps,
+        host_audio_enabled,
         device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
         remote_input_key,
         key_id,
@@ -94,12 +96,7 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         "",
         "HDR streaming is unsupported",
     )?;
-    require_optional_value(
-        query,
-        "localAudioPlayMode",
-        "0",
-        "local audio playback is unsupported",
-    )?;
+    optional_boolean(query, "localAudioPlayMode")?;
     require_optional_value(
         query,
         "surroundAudioInfo",
@@ -213,6 +210,7 @@ mod tests {
                 .as_slice()
         );
         assert_eq!(request.key_id, 0x8000_0000);
+        assert!(!request.host_audio_enabled);
     }
 
     #[test]
@@ -286,7 +284,7 @@ mod tests {
             "hdrMode=1",
             "sops=1",
             "surroundAudioInfo=393222",
-            "localAudioPlayMode=1",
+            "localAudioPlayMode=2",
             "remoteControllersBitmap=1",
             "gcmap=1",
             "gcpersist=1",
@@ -295,6 +293,24 @@ mod tests {
         ] {
             let fields = format!("{base}&{field}");
             assert!(parse(&fields).is_err(), "accepted {field:?}");
+        }
+    }
+
+    #[test]
+    fn local_audio_play_mode_defaults_off_and_accepts_only_zero_or_one() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        let defaulted = parse(base).unwrap();
+        assert!(!defaulted.host_audio_enabled);
+        let disabled = parse(&format!("{base}&localAudioPlayMode=0")).unwrap();
+        assert!(!disabled.host_audio_enabled);
+        let enabled = parse(&format!("{base}&localAudioPlayMode=1")).unwrap();
+        assert!(enabled.host_audio_enabled);
+
+        for value in ["2", "-1", "", "true"] {
+            assert!(
+                parse(&format!("{base}&localAudioPlayMode={value}")).is_err(),
+                "accepted {value:?}"
+            );
         }
     }
 }

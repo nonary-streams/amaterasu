@@ -306,6 +306,8 @@ pub struct StartConfig {
     pub encoder: u32,
     pub configuration: VideoConfiguration,
     pub audio_endpoint: String,
+    #[serde(default)]
+    pub host_audio_enabled: bool,
 }
 impl StartConfig {
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
@@ -492,6 +494,7 @@ mod tests {
         let start: StartConfig = serde_json::from_value(start_json()).unwrap();
         assert!(start.validate(true).is_ok());
         assert!(!start.capture_sink_without_routing);
+        assert!(!start.host_audio_enabled);
         let mut capture_only = start_json();
         capture_only["capture_sink_without_routing"] = json!(true);
         let capture_only: StartConfig = serde_json::from_value(capture_only).unwrap();
@@ -515,6 +518,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
             1
+        );
+    }
+
+    #[test]
+    fn host_audio_policy_defaults_off_and_accepts_an_explicit_snapshot() {
+        let mut value = start_json();
+        value["host_audio_enabled"] = json!(true);
+        let start: StartConfig = serde_json::from_value(value).unwrap();
+
+        assert!(start.host_audio_enabled);
+        assert!(start.validate(true).is_ok());
+        assert_eq!(
+            serde_json::to_value(&start).unwrap()["host_audio_enabled"],
+            true
         );
     }
 

@@ -261,6 +261,8 @@ pub struct Capture {
     pub output: String,
     pub encoder: u32,
     pub audio_endpoint: String,
+    #[serde(default)]
+    pub host_audio_enabled: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -552,6 +554,7 @@ impl Open {
                 "output": self.capture.output,
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
+                "host_audio_enabled": self.capture.host_audio_enabled,
                 "capture_sink_without_routing": self.capture_sink_without_routing,
                 "virtual_sink": self.virtual_sink,
                 "channels": self.channels,
@@ -1232,6 +1235,7 @@ mod tests {
     fn arm_forwards_capture_only_mode_and_legacy_open_defaults_to_routing() {
         let legacy = open();
         assert!(!legacy.capture_sink_without_routing);
+        assert!(!legacy.capture.host_audio_enabled);
         assert_eq!(
             legacy.arm(40)["configuration"]["capture_sink_without_routing"],
             false
@@ -1240,6 +1244,7 @@ mod tests {
             legacy.arm(40)["configuration"]["back_button_timeout"],
             Value::Null
         );
+        assert_eq!(legacy.arm(40)["configuration"]["host_audio_enabled"], false);
 
         let mut value = open_json();
         value["capture_sink_without_routing"] = json!(true);
@@ -1256,6 +1261,16 @@ mod tests {
             selected_timeout.arm(42)["configuration"]["back_button_timeout"],
             -1
         );
+    }
+
+    #[test]
+    fn host_audio_policy_is_snapshotted_into_stream_session_arm() {
+        let mut value = open_json();
+        value["capture"]["host_audio_enabled"] = json!(true);
+        let request: Open = serde_json::from_value(value).unwrap();
+
+        assert!(request.capture.host_audio_enabled);
+        assert_eq!(request.arm(41)["configuration"]["host_audio_enabled"], true);
     }
 
     #[test]

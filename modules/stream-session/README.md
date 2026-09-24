@@ -19,8 +19,9 @@ This library does not implement pairing, NVHTTP launch or a network RTSP server.
    A premature start leaves the prepared allocation available for a retry.
 3. `start` opens video with explicit access-unit boundaries, opens audio, validates
    48 kHz stereo PCM, acquires shared capture leases and activates the coordination
-   session. When trusted input policy is enabled, it also acquires the session's
-   exclusive input lease before reporting success.
+   session. `host_audio_enabled` is snapshotted with the start configuration and
+   passed to AudioCapture for sink policy. When trusted input policy is enabled, it
+   also acquires the session's exclusive input lease before reporting success.
 4. `stop` releases held input, stops new capture, drains video and Opus, waits for
    the local transport queue to empty, closes providers and releases session
    leases. This confirms local cleanup, not client receipt or playback.
