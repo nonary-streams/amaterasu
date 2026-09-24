@@ -210,7 +210,7 @@ fn configured_identity_path_unicode_case_variants_share_one_snapshot_entry() {
 
 #[cfg(windows)]
 #[test]
-fn configured_identity_path_windows_ordinal_case_variants_share_one_snapshot_entry() {
+fn configured_identity_path_windows_sigma_mismatch_is_rejected() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");
     write(
@@ -219,18 +219,7 @@ fn configured_identity_path_windows_ordinal_case_variants_share_one_snapshot_ent
     );
     write(&predecessor.join("credentials/ς.pem"), b"private key");
 
-    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
-    assert_eq!(
-        collected
-            .files
-            .iter()
-            .filter(|path| {
-                path.file_name()
-                    .is_some_and(|name| name == std::ffi::OsStr::new("Σ.PEM"))
-            })
-            .count(),
-        1
-    );
+    assert!(collect_configuration_files(&predecessor).is_err());
 }
 
 #[cfg(unix)]
