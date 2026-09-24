@@ -66,21 +66,36 @@ Per-application process lifecycle fields now preserve omitted values and apply
 explicit values at launch. `fec_percentage` now resolves from the global
 stream profile through a sparse app override and a certificate-matched paired
 client record. The management editor updates that sparse FEC value through
-the paired certificate record. The other shared override keys and their
-runtime consumers remain pending. Request-supplied client IDs are not used as
-authority.
+the paired certificate record and ordinary application entries. The editor
+also preserves explicit executable lifecycle values and preparation steps.
+Provider-owned Playnite entries can now edit FEC through a narrow catalog
+operation that preserves the provider launch identity and survives refresh;
+successful signed Playnite editing still needs a completed Playnite snapshot
+fixture. The other shared override keys and their runtime consumers remain
+pending. Request-supplied client IDs are not used as authority.
 
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when
-the operating system rejects a release. Scancode choice, high-resolution
-scrolling, controller/gamepad behavior, and platform-specific input effects
-remain pending.
+the operating system rejects a release. High-resolution scrolling now
+preserves Moonlight wheel units on Windows and emits Linux high-resolution
+wheel events with compatible detents. It has a signed management editor, but
+Linux runtime qualification remains pending. The scancode option now follows
+raw Moonlight key mode on Windows and preserves the native key release plan.
+It also has a signed management editor. Right Alt can now map to the Windows
+key with stable key-up behavior and a signed editor. Lease-scoped keyboard
+repeat now applies configurable delay and frequency, including zero-delay
+disable and legacy document migration, with a signed editor. Controller,
+gamepad, and other platform-specific input effects remain pending.
 
 Playnite now imports only complete, bounded extension snapshots through its
-own provider and leaves stale catalog entries intact. Its management editor,
-Playnite-ID launch support, targeted stale cleanup, focus behavior, fullscreen
-entry, and extension management remain pending. Lutris now imports complete
-current-user Linux library snapshots with exclusions and optional Steam
-deduplication. Cross-session discovery, generic-launch eligibility after
-disabling the provider, and selective cleanup when stale removal is disabled
-remain pending.
+own provider and leaves stale catalog entries intact. Its settings and status
+have a management editor. Typed GUID launches now use authenticated extension
+IPC and hold the session lease until correlated stop proof. Targeted stale
+cleanup, focus behavior, process verification, fullscreen entry, and extension
+management remain pending.
+
+Lutris now imports complete current-user Linux library snapshots with
+exclusions and optional Steam deduplication. Lutris settings and status have a
+signed management editor;
+cross-session discovery, generic-launch eligibility after disabling the
+provider, and selective cleanup when stale removal is disabled remain pending.

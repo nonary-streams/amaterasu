@@ -10,9 +10,68 @@ var Amaterasu;
         return parsed;
     }
     Amaterasu.parseArguments = parseArguments;
+    function parseFecOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^[0-9]+$/.test(trimmed))
+            throw new Error("FEC percentage must be a whole number from 1 to 255.");
+        const percentage = Number(trimmed);
+        if (!Number.isSafeInteger(percentage) || percentage < 1 || percentage > 255)
+            throw new Error("FEC percentage must be a whole number from 1 to 255.");
+        return percentage;
+    }
+    Amaterasu.parseFecOverride = parseFecOverride;
+    function providerConfigOverrides(value) {
+        return { fec_percentage: parseFecOverride(value) };
+    }
+    Amaterasu.providerConfigOverrides = providerConfigOverrides;
+    function parseDetachedCommands(value) {
+        const commands = value
+            .split(/\r?\n/)
+            .map((command) => command.trim())
+            .filter(Boolean);
+        if (commands.length > 16 ||
+            commands.some((command) => new TextEncoder().encode(command).length > 2048 ||
+                /[\u0000-\u001f\u007f]/.test(command))) {
+            throw new Error("Enter up to 16 detached commands, each at most 2048 bytes without control characters.");
+        }
+        return commands;
+    }
+    Amaterasu.parseDetachedCommands = parseDetachedCommands;
+    function parseExitTimeout(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^[0-9]+$/.test(trimmed))
+            throw new Error("Exit timeout must be a whole number from 0 to 300 seconds.");
+        const seconds = Number(trimmed);
+        if (!Number.isSafeInteger(seconds) || seconds > 300)
+            throw new Error("Exit timeout must be a whole number from 0 to 300 seconds.");
+        return seconds;
+    }
+    Amaterasu.parseExitTimeout = parseExitTimeout;
+    function parsePreparation(value) {
+        const parsed = JSON.parse(value || "[]");
+        if (!Array.isArray(parsed) ||
+            parsed.some((step) => step === null ||
+                Array.isArray(step) ||
+                typeof step !== "object" ||
+                !step.run ||
+                Array.isArray(step.run) ||
+                typeof step.run !== "object")) {
+            throw new Error("Existing preparation commands are malformed; reload before saving.");
+        }
+        return parsed;
+    }
     function entryFromForm(data) {
         const text = (name) => String(data.get(name) ?? "").trim();
         const kind = text("kind") === "executable" ? "executable" : "application";
+        const fecPercentage = parseFecOverride(text("fec_percentage"));
+        const configOverrides = fecPercentage === null ? undefined : { fec_percentage: fecPercentage };
+        const exitTimeoutSeconds = parseExitTimeout(text("exit_timeout_seconds"));
+        const detached = parseDetachedCommands(text("detached"));
+        const preparation = parsePreparation(text("preparation"));
         const launch = kind === "application"
             ? { kind, path: text("path") }
             : {
@@ -20,6 +79,13 @@ var Amaterasu;
                 program: text("path"),
                 arguments: parseArguments(String(data.get("arguments") ?? "[]")),
                 working_directory: text("working_directory") || null,
+                auto_detach: data.has("auto_detach"),
+                wait_all: data.has("wait_all"),
+                ...(exitTimeoutSeconds === null
+                    ? {}
+                    : { exit_timeout_seconds: exitTimeoutSeconds }),
+                ...(detached.length ? { detached } : {}),
+                ...(preparation.length ? { preparation } : {}),
             };
         return {
             name: text("name"),
@@ -29,6 +95,7 @@ var Amaterasu;
                 .map((tag) => tag.trim())
                 .filter(Boolean),
             launch,
+            ...(configOverrides ? { config_overrides: configOverrides } : {}),
         };
     }
     Amaterasu.entryFromForm = entryFromForm;
@@ -72,9 +139,14 @@ var Amaterasu;
     }
     Amaterasu.fieldValue = fieldValue;
     function launchPath(entry) {
-        return entry.launch.kind === "application"
-            ? (entry.launch.path ?? "")
-            : (entry.launch.program ?? "");
+        switch (entry.launch.kind) {
+            case "application":
+                return entry.launch.path;
+            case "executable":
+                return entry.launch.program;
+            case "playnite":
+                return `Playnite game ${entry.launch.game_id}`;
+        }
     }
     Amaterasu.launchPath = launchPath;
     function countLabel(count, more) {
@@ -502,8 +574,17 @@ var Amaterasu;
             reset();
         });
         function card(row) {
+            const providerLaunch = row.entry.launch.kind === "playnite";
             const edit = Amaterasu.button("Edit", () => showEditor(row));
-            edit.disabled = !api.allows("catalog.write");
+            edit.disabled = !api.allows("catalog.write") || providerLaunch;
+            if (providerLaunch)
+                edit.title = "Playnite launch targets are managed by the provider.";
+            const actions = [edit];
+            if (providerLaunch) {
+                const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row), "secondary");
+                configure.disabled = !api.allows("catalog.write");
+                actions.unshift(configure);
+            }
             const remove = Amaterasu.button("Delete", async () => {
                 if (!(await Amaterasu.confirmAction(`Delete ${row.entry.name}?`, "This removes its catalog entry. It does not remove files or stop a running application.", "Delete entry")))
                     return;
@@ -517,9 +598,63 @@ var Amaterasu;
                 });
             }, "quiet danger-text");
             remove.disabled = !api.allows("catalog.write");
+            actions.push(remove);
             return Amaterasu.el("article", "app-card", Amaterasu.el("div", "app-art", Amaterasu.el("span", "", row.entry.name.slice(0, 2).toUpperCase()), Amaterasu.badge(row.entry.launch.kind === "executable"
                 ? "Executable"
-                : "Application")), Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", edit, remove)));
+                : providerLaunch
+                    ? "Playnite"
+                    : "Application")), Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
+        }
+        function showProviderOverrideEditor(row) {
+            let editRevision = revision;
+            const currentFec = row.entry.config_overrides?.fec_percentage;
+            const fec = Amaterasu.input("fec_percentage", currentFec === undefined ? "" : String(currentFec), "number");
+            fec.min = "1";
+            fec.max = "255";
+            fec.step = "1";
+            fec.placeholder = "Inherit";
+            fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."));
+            const feedback = Amaterasu.el("div");
+            const save = Amaterasu.el("button", "button primary", "Save streaming settings");
+            save.type = "submit";
+            const cancel = Amaterasu.button("Cancel", () => editor.replaceChildren());
+            form.append(feedback, Amaterasu.el("div", "actions", save, cancel));
+            form.addEventListener("submit", (event) => {
+                event.preventDefault();
+                if (!form.reportValidity())
+                    return;
+                void Amaterasu.runAction(save, feedback, async () => {
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value);
+                    try {
+                        const reply = await api.post("catalog/update_provider_overrides", {
+                            id: row.id,
+                            expected_revision: editRevision,
+                            config_overrides,
+                        });
+                        editRevision = reply.revision;
+                        editor.replaceChildren();
+                        notify(reply.replayed
+                            ? `The earlier streaming override save for ${row.entry.name} is confirmed.`
+                            : reply.changed
+                                ? `Streaming override saved for ${row.entry.name}.`
+                                : `Streaming override for ${row.entry.name} is unchanged.`);
+                        await load();
+                    }
+                    catch (error) {
+                        if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                            editor.replaceChildren();
+                            await load();
+                            notify(`Streaming settings for ${row.entry.name} changed elsewhere. The latest value was reloaded; reopen the editor to review it.`);
+                            return;
+                        }
+                        throw error;
+                    }
+                });
+            });
+            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", `${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), form));
+            editor.scrollIntoView({ behavior: "smooth", block: "start" });
+            fec.focus();
         }
         function showEditor(row) {
             const editRevision = revision;
@@ -562,7 +697,7 @@ var Amaterasu;
         description.value = entry?.description ?? "";
         description.maxLength = 1024;
         description.rows = 2;
-        const tags = Amaterasu.input("tags", entry?.tags.join(", ") ?? "");
+        const tags = Amaterasu.input("tags", entry?.tags?.join(", ") ?? "");
         const kind = Amaterasu.el("select");
         kind.name = "kind";
         for (const [value, text] of [
@@ -577,12 +712,37 @@ var Amaterasu;
         const path = Amaterasu.input("path", entry ? Amaterasu.launchPath(entry) : "");
         path.required = true;
         path.placeholder = "/Applications/Example.app";
+        const executableLaunch = entry?.launch.kind === "executable" ? entry.launch : undefined;
         const argumentsField = Amaterasu.el("textarea");
         argumentsField.name = "arguments";
         argumentsField.rows = 2;
-        argumentsField.value = JSON.stringify(entry?.launch.arguments ?? []);
-        const directory = Amaterasu.input("working_directory", entry?.launch.working_directory ?? "");
-        const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."));
+        argumentsField.value = JSON.stringify(executableLaunch?.arguments ?? []);
+        const directory = Amaterasu.input("working_directory", entry?.launch.kind === "executable"
+            ? (entry.launch.working_directory ?? "")
+            : "");
+        const autoDetach = Amaterasu.el("input");
+        autoDetach.type = "checkbox";
+        autoDetach.name = "auto_detach";
+        autoDetach.checked = executableLaunch?.auto_detach ?? true;
+        const waitAll = Amaterasu.el("input");
+        waitAll.type = "checkbox";
+        waitAll.name = "wait_all";
+        waitAll.checked = executableLaunch?.wait_all ?? true;
+        const exitTimeout = Amaterasu.input("exit_timeout_seconds", String(executableLaunch?.exit_timeout_seconds ?? 5), "number");
+        exitTimeout.min = "0";
+        exitTimeout.max = "300";
+        exitTimeout.step = "1";
+        const detached = Amaterasu.el("textarea");
+        detached.name = "detached";
+        detached.rows = 3;
+        detached.value = executableLaunch?.detached?.join("\n") ?? "";
+        const preparation = Amaterasu.input("preparation", JSON.stringify(executableLaunch?.preparation ?? []), "hidden");
+        const fec = Amaterasu.input("fec_percentage", entry?.config_overrides?.fec_percentage?.toString() ?? "", "number");
+        fec.min = "1";
+        fec.max = "255";
+        fec.step = "1";
+        const processPolicy = Amaterasu.el("div", "form-grid", Amaterasu.field("Auto detach", autoDetach, "Retain a quick successful launcher."), Amaterasu.field("Wait for all processes", waitAll, "Keep the app active while its process group is running."), Amaterasu.field("Exit timeout (seconds)", exitTimeout, "0 skips the graceful shutdown window; maximum 300."), Amaterasu.field("Detached commands", detached, "One ordered command per line; up to 16."));
+        const executable = Amaterasu.el("div", "form-grid", Amaterasu.field("Arguments", argumentsField, 'A JSON array of literal arguments. Example: ["--fullscreen"]'), Amaterasu.field("Working directory", directory, "Optional absolute path."), processPolicy, preparation);
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
             path.placeholder =
@@ -592,13 +752,14 @@ var Amaterasu;
         };
         kind.addEventListener("change", showKind);
         showKind();
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Absolute application path", path), Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), executable);
         return form;
     }
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
     const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
+    const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
     function parseAuthTokenLifetimes(sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
         if (!Number.isSafeInteger(sessionTokenTtlSeconds) ||
             sessionTokenTtlSeconds < 1 ||
@@ -613,6 +774,49 @@ var Amaterasu;
         };
     }
     Amaterasu.parseAuthTokenLifetimes = parseAuthTokenLifetimes;
+    function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency) {
+        if (typeof keyboard !== "boolean" ||
+            typeof mouse !== "boolean" ||
+            typeof highResolutionScrolling !== "boolean" ||
+            typeof alwaysSendScancodes !== "boolean" ||
+            typeof keyRightAltToKeyWin !== "boolean" ||
+            !Number.isSafeInteger(keyRepeatDelay) ||
+            keyRepeatDelay < 0 ||
+            keyRepeatDelay > maxInputKeyRepeatDelayMs ||
+            !Number.isFinite(keyRepeatFrequency) ||
+            keyRepeatFrequency < 0)
+            throw new Error("Input policy values or key repeat settings are invalid.");
+        return {
+            keyboard,
+            mouse,
+            high_resolution_scrolling: highResolutionScrolling,
+            always_send_scancodes: alwaysSendScancodes,
+            key_rightalt_to_key_win: keyRightAltToKeyWin,
+            key_repeat_delay: keyRepeatDelay,
+            key_repeat_frequency: keyRepeatFrequency,
+        };
+    }
+    Amaterasu.parseInputPolicy = parseInputPolicy;
+    function parseClientFecOverride(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return { fec_percentage: null };
+        if (!/^(?:[1-9][0-9]{0,2})$/.test(trimmed))
+            throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
+        const percentage = Number(trimmed);
+        if (percentage > 255)
+            throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
+        return { fec_percentage: percentage };
+    }
+    Amaterasu.parseClientFecOverride = parseClientFecOverride;
+    function inputPolicyStatusDescription(settings) {
+        if (!settings.persisted)
+            return "The saved input policy has not been confirmed yet.";
+        if (!settings.applied || settings.cleanup_required)
+            return "The saved policy is active for new events, but cleanup of held native input is still pending.";
+        return "The saved keyboard and mouse policy is active.";
+    }
+    Amaterasu.inputPolicyStatusDescription = inputPolicyStatusDescription;
     function safeNvhttpBindFamily(value) {
         if (value === "")
             return null;
@@ -723,6 +927,177 @@ var Amaterasu;
         return parsed;
     }
     Amaterasu.parseSteamExclusions = parseSteamExclusions;
+    function parseLutrisExclusions(value) {
+        let parsed;
+        try {
+            parsed = JSON.parse(value);
+        }
+        catch {
+            throw new Error("Lutris exclusions must be valid JSON.");
+        }
+        if (!Array.isArray(parsed) || parsed.length > 256)
+            throw new Error("Lutris exclusions must be a JSON array with at most 256 entries.");
+        const identities = new Set();
+        const validateId = (id) => {
+            if (id.length === 0 ||
+                new TextEncoder().encode(id).length > 512 ||
+                !/^[0-9]+$/.test(id) ||
+                BigInt(id) === 0n ||
+                BigInt(id) > 18446744073709551615n)
+                throw new Error("Lutris exclusion IDs must be positive decimal integers.");
+        };
+        const validateName = (name) => {
+            if (name.trim().length === 0 ||
+                new TextEncoder().encode(name).length > 512 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(name))
+                throw new Error("Lutris exclusion names must be printable text of at most 512 UTF-8 bytes.");
+        };
+        const unique = (identity) => {
+            if (identities.has(identity))
+                throw new Error("Lutris exclusion IDs and name-only entries must be unique.");
+            identities.add(identity);
+        };
+        for (const item of parsed) {
+            if (typeof item === "string") {
+                validateId(item);
+                unique(`id:${item}`);
+                continue;
+            }
+            if (typeof item !== "object" || item === null || Array.isArray(item))
+                throw new Error("Each Lutris exclusion must be an ID string or object.");
+            const exclusion = item;
+            if (Object.keys(exclusion).some((key) => key !== "id" && key !== "name"))
+                throw new Error("Lutris exclusions may only contain id and name fields.");
+            const id = exclusion.id;
+            const name = exclusion.name;
+            if (id === undefined && name === undefined)
+                throw new Error("Each Lutris exclusion needs an ID or name.");
+            if (id !== undefined && typeof id !== "string")
+                throw new Error("Lutris exclusion IDs must be strings.");
+            if (name !== undefined && typeof name !== "string")
+                throw new Error("Lutris exclusion names must be strings.");
+            if (typeof id === "string" && id !== "") {
+                validateId(id);
+                if (typeof name === "string" && name !== "")
+                    validateName(name);
+                unique(`id:${id}`);
+            }
+            else if (typeof name === "string") {
+                validateName(name);
+                unique(`name:${name.toLowerCase()}`);
+            }
+            else {
+                throw new Error("Each Lutris exclusion needs a positive ID or nonempty name.");
+            }
+        }
+        const maximumSettings = {
+            enabled: true,
+            auto_sync: true,
+            autosync_remove_uninstalled: true,
+            include_steam: true,
+            exclude_games: parsed,
+        };
+        const maximumUpdate = {
+            ...maximumSettings,
+            expected_revision: Number.MAX_SAFE_INTEGER,
+        };
+        const encoder = new TextEncoder();
+        if (encoder.encode(JSON.stringify(maximumSettings)).length > 12_000 ||
+            encoder.encode(JSON.stringify(maximumUpdate)).length > 12_000)
+            throw new Error("Lutris exclusions exceed the product settings or management request size limit.");
+        return parsed;
+    }
+    Amaterasu.parseLutrisExclusions = parseLutrisExclusions;
+    function lutrisStatusDescription(status) {
+        if (!status.settings_ready)
+            return "Lutris settings are still loading; discovery state is not confirmed.";
+        if (!status.platform_supported)
+            return "Lutris discovery is supported only on Linux and is inactive on this platform.";
+        if (!status.enabled)
+            return "Lutris discovery is disabled.";
+        if (!status.database_available)
+            return "The current user's Lutris game database is unavailable.";
+        if (!status.executable_available)
+            return "The Lutris executable was not found in the current user's PATH.";
+        if (status.last_error)
+            return `Lutris discovery is available · ${status.game_count} games · Last scan issue: ${status.last_error}`;
+        const pending = status.refresh_pending ? "A catalog scan is in progress." : "No catalog scan is pending.";
+        return `Lutris discovery is available · ${status.game_count} games · ${pending}`;
+    }
+    Amaterasu.lutrisStatusDescription = lutrisStatusDescription;
+    function parsePlayniteFilterList(source, label) {
+        let parsed;
+        try {
+            parsed = JSON.parse(source);
+        }
+        catch {
+            throw new Error(`${label} must be a JSON array of strings.`);
+        }
+        return validatePlayniteFilterList(parsed, label);
+    }
+    Amaterasu.parsePlayniteFilterList = parsePlayniteFilterList;
+    function parsePlayniteSettings(values) {
+        if (typeof values.enabled !== "boolean" ||
+            typeof values.auto_sync !== "boolean" ||
+            typeof values.sync_all_installed !== "boolean" ||
+            !Number.isSafeInteger(values.recent_games) ||
+            values.recent_games < 0 ||
+            values.recent_games > 10_000 ||
+            !Number.isSafeInteger(values.recent_max_age_days) ||
+            values.recent_max_age_days < 0 ||
+            values.recent_max_age_days > 36_500)
+            throw new Error("Playnite settings contain values outside their supported ranges.");
+        const parsed = {
+            enabled: values.enabled,
+            auto_sync: values.auto_sync,
+            sync_all_installed: values.sync_all_installed,
+            recent_games: values.recent_games,
+            recent_max_age_days: values.recent_max_age_days,
+            sync_categories: validatePlayniteFilterList(values.sync_categories, "Sync categories"),
+            exclude_categories: validatePlayniteFilterList(values.exclude_categories, "Excluded categories"),
+            sync_plugins: validatePlayniteFilterList(values.sync_plugins, "Sync plugin IDs"),
+            exclude_plugins: validatePlayniteFilterList(values.exclude_plugins, "Excluded plugin IDs"),
+            exclude_games: validatePlayniteFilterList(values.exclude_games, "Excluded game IDs"),
+        };
+        const maximumUpdate = { ...parsed, expected_revision: Number.MAX_SAFE_INTEGER };
+        const encoder = new TextEncoder();
+        if (encoder.encode(JSON.stringify(parsed)).length > 12_000 ||
+            encoder.encode(JSON.stringify(maximumUpdate)).length > 12_000)
+            throw new Error("Playnite settings exceed the 12000 byte document or request size limit.");
+        return parsed;
+    }
+    Amaterasu.parsePlayniteSettings = parsePlayniteSettings;
+    function playniteStatusDescription(status) {
+        if (!status.settings_ready)
+            return "Playnite settings are still loading; runtime state is not confirmed.";
+        if (!status.enabled)
+            return "Playnite catalog synchronization is disabled.";
+        if (!status.playnite_running)
+            return "No Playnite process was detected. Process discovery is currently available on Windows.";
+        if (status.last_error)
+            return `Playnite is running · ${status.snapshot_game_count} games in the last snapshot · Last issue: ${status.last_error}`;
+        const sync = status.snapshot_pending
+            ? "A catalog snapshot is in progress."
+            : "No catalog snapshot is in progress.";
+        return `Playnite is running · ${status.snapshot_game_count} games in the last snapshot · ${sync}`;
+    }
+    Amaterasu.playniteStatusDescription = playniteStatusDescription;
+    function validatePlayniteFilterList(value, label) {
+        if (!Array.isArray(value) || value.length > 256)
+            throw new Error(`${label} must contain at most 256 strings.`);
+        const encoder = new TextEncoder();
+        const unique = new Set();
+        for (const item of value) {
+            if (typeof item !== "string" ||
+                item.trim().length === 0 ||
+                encoder.encode(item).length > 512 ||
+                /[\u0000-\u001f\u007f-\u009f]/.test(item) ||
+                unique.has(item.toLowerCase()))
+                throw new Error(`${label} must contain unique, printable strings of at most 512 UTF-8 bytes.`);
+            unique.add(item.toLowerCase());
+        }
+        return [...value];
+    }
     function parseSteamImportSettings(includeTools, syncAllInstalled, autosyncRemoveUninstalled, recentGames, recentMaxAgeDays) {
         if (typeof includeTools !== "boolean" ||
             typeof syncAllInstalled !== "boolean" ||
@@ -764,12 +1139,20 @@ var Amaterasu;
         const authArea = Amaterasu.el("div");
         const hostArea = Amaterasu.el("div");
         const steamArea = Amaterasu.el("div");
+        const lutrisArea = Amaterasu.el("div");
+        const playniteArea = Amaterasu.el("div");
+        const inputArea = Amaterasu.el("div");
+        const pairingArea = Amaterasu.el("div");
         context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
             void load();
             void loadAuth();
             void loadHost();
             void loadSteam();
-        })), area, authArea, hostArea, steamArea);
+            void loadLutris();
+            void loadPlaynite();
+            void loadInput();
+            void loadPairing();
+        })), area, authArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, pairingArea);
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {
@@ -868,6 +1251,330 @@ var Amaterasu;
             catch (error) {
                 if (context.content.isConnected)
                     steamArea.replaceChildren(Amaterasu.errorPanel(error, loadSteam));
+            }
+        }
+        async function loadLutris() {
+            lutrisArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Lutris settings…"));
+            try {
+                const [settings, runtime] = await Promise.all([
+                    loadLutrisSettings(),
+                    context.api.post("lutris/status"),
+                ]);
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const enabled = Amaterasu.input("lutris_enabled", "", "checkbox");
+                enabled.checked = settings.values.enabled;
+                enabled.disabled = !runtime.platform_supported;
+                const autoSync = Amaterasu.input("lutris_auto_sync", "", "checkbox");
+                autoSync.checked = settings.values.auto_sync;
+                const removeUninstalled = Amaterasu.input("lutris_autosync_remove_uninstalled", "", "checkbox");
+                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+                const includeSteam = Amaterasu.input("lutris_include_steam", "", "checkbox");
+                includeSteam.checked = settings.values.include_steam;
+                const exclusions = Amaterasu.el("textarea");
+                exclusions.name = "lutris_exclude_games";
+                exclusions.rows = 8;
+                exclusions.maxLength = 12_000;
+                exclusions.spellcheck = false;
+                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", lutrisStatusDescription(runtime));
+                const saveStatus = Amaterasu.el("div");
+                const refreshStatus = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save Lutris settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
+                    const updated = await context.api.post("lutris/refresh");
+                    runtimeStatus.className = updated.last_error ? "error" : "muted";
+                    runtimeStatus.textContent = lutrisStatusDescription(updated);
+                    context.notify("Lutris refresh requested.");
+                }));
+                refresh.disabled =
+                    !context.api.allows("configuration.write") ||
+                        !runtime.platform_supported ||
+                        !settings.values.enabled;
+                enabled.addEventListener("change", () => {
+                    refresh.disabled =
+                        !context.api.allows("configuration.write") ||
+                            !runtime.platform_supported ||
+                            !enabled.checked;
+                });
+                form.append(Amaterasu.field("Enable Lutris discovery", enabled, runtime.platform_supported
+                    ? "Controls discovery for the current Linux user."
+                    : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform."), Amaterasu.field("Automatic synchronization", autoSync, "Scan the current user's installed Lutris games automatically."), Amaterasu.field("Remove uninstalled games", removeUninstalled, "After a successful complete scan, remove Lutris-owned games that are no longer installed."), Amaterasu.field("Include matching Steam games", includeSteam, "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use a positive decimal ID string or an object with "id", "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, saveStatus, async () => {
+                        try {
+                            await context.api.post("lutris/settings_update", {
+                                enabled: enabled.checked,
+                                auto_sync: autoSync.checked,
+                                autosync_remove_uninstalled: removeUninstalled.checked,
+                                include_steam: includeSteam.checked,
+                                exclude_games: parseLutrisExclusions(exclusions.value),
+                                expected_revision: settings.revision,
+                            });
+                            context.notify("Lutris settings saved.");
+                            await loadLutris();
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                context.notify("Lutris settings changed elsewhere. The latest values have been reloaded.");
+                                await loadLutris();
+                                return;
+                            }
+                            throw error;
+                        }
+                    });
+                });
+                refreshStatus.className = "muted";
+                lutrisArea.replaceChildren(Amaterasu.panel("Lutris", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, loadLutris));
+            }
+        }
+        async function loadLutrisSettings() {
+            for (let attempt = 0;; attempt += 1) {
+                try {
+                    return await context.api.post("lutris/settings");
+                }
+                catch (error) {
+                    if (!(error instanceof Amaterasu.ApiError) ||
+                        !["settings_loading", "settings_busy"].includes(error.code) ||
+                        attempt >= 7) {
+                        throw error;
+                    }
+                    await new Promise((resolve) => {
+                        window.setTimeout(resolve, 50 * (attempt + 1));
+                    });
+                }
+            }
+        }
+        async function loadPlaynite() {
+            playniteArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Playnite settings…"));
+            try {
+                const settings = await loadPlayniteSettings();
+                const runtime = await context.api.post("playnite/status");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const enabled = Amaterasu.input("playnite_enabled", "", "checkbox");
+                enabled.checked = settings.values.enabled;
+                const autoSync = Amaterasu.input("playnite_auto_sync", "", "checkbox");
+                autoSync.checked = settings.values.auto_sync;
+                const syncAllInstalled = Amaterasu.input("playnite_sync_all_installed", "", "checkbox");
+                syncAllInstalled.checked = settings.values.sync_all_installed;
+                const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
+                recentGames.required = true;
+                recentGames.min = "0";
+                recentGames.max = "10000";
+                recentGames.step = "1";
+                const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                recentMaxAgeDays.required = true;
+                recentMaxAgeDays.min = "0";
+                recentMaxAgeDays.max = "36500";
+                recentMaxAgeDays.step = "1";
+                const filterList = (name, values) => {
+                    const control = Amaterasu.el("textarea");
+                    control.name = name;
+                    control.rows = 5;
+                    control.maxLength = 12_000;
+                    control.spellcheck = false;
+                    control.value = JSON.stringify(values, null, 2);
+                    return control;
+                };
+                const syncCategories = filterList("playnite_sync_categories", settings.values.sync_categories);
+                const excludeCategories = filterList("playnite_exclude_categories", settings.values.exclude_categories);
+                const syncPlugins = filterList("playnite_sync_plugins", settings.values.sync_plugins);
+                const excludePlugins = filterList("playnite_exclude_plugins", settings.values.exclude_plugins);
+                const excludeGames = filterList("playnite_exclude_games", settings.values.exclude_games);
+                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", playniteStatusDescription(runtime));
+                const saveStatus = Amaterasu.el("div");
+                const refreshStatus = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save Playnite settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
+                    await context.api.post("playnite/refresh");
+                    context.notify("Playnite refresh requested.");
+                    await loadPlaynite();
+                }));
+                const updateRefreshAvailability = () => {
+                    refresh.disabled =
+                        !context.api.allows("configuration.write") ||
+                            !enabled.checked ||
+                            !runtime.playnite_running ||
+                            runtime.snapshot_pending;
+                };
+                updateRefreshAvailability();
+                enabled.addEventListener("change", updateRefreshAvailability);
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, saveStatus, async () => {
+                        try {
+                            const values = parsePlayniteSettings({
+                                enabled: enabled.checked,
+                                auto_sync: autoSync.checked,
+                                sync_all_installed: syncAllInstalled.checked,
+                                recent_games: recentGames.valueAsNumber,
+                                recent_max_age_days: recentMaxAgeDays.valueAsNumber,
+                                sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),
+                                exclude_categories: parsePlayniteFilterList(excludeCategories.value, "Excluded categories"),
+                                sync_plugins: parsePlayniteFilterList(syncPlugins.value, "Sync plugin IDs"),
+                                exclude_plugins: parsePlayniteFilterList(excludePlugins.value, "Excluded plugin IDs"),
+                                exclude_games: parsePlayniteFilterList(excludeGames.value, "Excluded game IDs"),
+                            });
+                            await context.api.post("playnite/settings_update", {
+                                ...values,
+                                expected_revision: settings.revision,
+                            });
+                            context.notify("Playnite settings saved.");
+                            await loadPlaynite();
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                context.notify("Playnite settings changed elsewhere. The latest values have been reloaded.");
+                                await loadPlaynite();
+                                return;
+                            }
+                            throw error;
+                        }
+                    });
+                });
+                refreshStatus.className = "muted";
+                playniteArea.replaceChildren(Amaterasu.panel("Playnite", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, loadPlaynite));
+            }
+        }
+        async function loadPlayniteSettings() {
+            for (let attempt = 0;; attempt += 1) {
+                try {
+                    return await context.api.post("playnite/settings");
+                }
+                catch (error) {
+                    if (!(error instanceof Amaterasu.ApiError) ||
+                        !["settings_loading", "settings_busy"].includes(error.code) ||
+                        attempt >= 7) {
+                        throw error;
+                    }
+                    await new Promise((resolve) => {
+                        window.setTimeout(resolve, 50 * (attempt + 1));
+                    });
+                }
+            }
+        }
+        async function loadPairing() {
+            pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
+            try {
+                const settings = await context.api.post("pairing/list_clients");
+                if (!context.content.isConnected)
+                    return;
+                if (settings.clients.length === 0) {
+                    pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."), Amaterasu.badge(`Revision ${settings.revision}`)));
+                    return;
+                }
+                const rows = settings.clients.map((client) => {
+                    const fec = Amaterasu.input(`fec_${client.certificate_id}`, String(client.config_overrides?.fec_percentage ?? ""), "number");
+                    fec.min = "1";
+                    fec.max = "255";
+                    fec.step = "1";
+                    fec.placeholder = "Inherit";
+                    fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+                    const status = Amaterasu.el("div");
+                    const save = Amaterasu.button("Save", () => Amaterasu.runAction(save, status, async () => {
+                        try {
+                            await context.api.post("pairing/update_client_config_overrides", {
+                                certificate_id: client.certificate_id,
+                                expected_revision: settings.revision,
+                                config_overrides: parseClientFecOverride(fec.value),
+                            });
+                            context.notify(`Streaming override saved for ${client.name}.`);
+                            await loadPairing();
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                context.notify("Paired clients changed elsewhere. The list has been refreshed; review and save again.");
+                                await loadPairing();
+                                return;
+                            }
+                            throw error;
+                        }
+                    }), "primary");
+                    save.disabled = !context.api.allows("pairing.admin");
+                    const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
+                    return [identity, fec, Amaterasu.el("div", "", save, status)];
+                });
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", ""], rows);
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairing));
+            }
+        }
+        async function loadInput() {
+            inputArea.replaceChildren(Amaterasu.el("p", "muted", "Loading input policy…"));
+            try {
+                const settings = await context.api.post("input/settings_get");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const keyboard = Amaterasu.input("input_keyboard", "", "checkbox");
+                keyboard.checked = settings.values.keyboard;
+                const mouse = Amaterasu.input("input_mouse", "", "checkbox");
+                mouse.checked = settings.values.mouse;
+                const highResolutionScrolling = Amaterasu.input("input_high_resolution_scrolling", "", "checkbox");
+                highResolutionScrolling.checked = settings.values.high_resolution_scrolling;
+                const alwaysSendScancodes = Amaterasu.input("input_always_send_scancodes", "", "checkbox");
+                alwaysSendScancodes.checked = settings.values.always_send_scancodes;
+                const keyRightAltToKeyWin = Amaterasu.input("input_key_rightalt_to_key_win", "", "checkbox");
+                keyRightAltToKeyWin.checked = settings.values.key_rightalt_to_key_win;
+                const keyRepeatDelay = Amaterasu.input("input_key_repeat_delay", String(settings.values.key_repeat_delay), "number");
+                keyRepeatDelay.required = true;
+                keyRepeatDelay.min = "0";
+                keyRepeatDelay.max = String(maxInputKeyRepeatDelayMs);
+                keyRepeatDelay.step = "1";
+                const keyRepeatFrequency = Amaterasu.input("input_key_repeat_frequency", String(settings.values.key_repeat_frequency), "number");
+                keyRepeatFrequency.required = true;
+                keyRepeatFrequency.min = "0";
+                keyRepeatFrequency.step = "any";
+                const status = Amaterasu.el("p", settings.applied ? "muted" : "error", inputPolicyStatusDescription(settings));
+                const save = Amaterasu.el("button", "button primary", "Save input policy");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Keyboard input", keyboard, "Disabling keyboard input suppresses key events and releases held keys immediately."), Amaterasu.field("Mouse input", mouse, "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons."), Amaterasu.field("High-resolution scrolling", highResolutionScrolling, "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents."), Amaterasu.field("Always send scan codes", alwaysSendScancodes, "On Windows, maps non-normalized Moonlight key packets to scan codes. Linux persists this preference but uses its fixed key mapping."), Amaterasu.field("Map Right Alt to Left Windows", keyRightAltToKeyWin, "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes."), Amaterasu.field("Key repeat delay (milliseconds)", keyRepeatDelay, "Default is 500 milliseconds. Set to 0 to disable key repeat."), Amaterasu.field("Key repeat frequency (Hz)", keyRepeatFrequency, "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        try {
+                            const updated = await context.api.post("input/settings_update", {
+                                ...parseInputPolicy(keyboard.checked, mouse.checked, highResolutionScrolling.checked, alwaysSendScancodes.checked, keyRightAltToKeyWin.checked, keyRepeatDelay.valueAsNumber, keyRepeatFrequency.valueAsNumber),
+                                expected_revision: settings.revision,
+                            });
+                            context.notify(updated.applied
+                                ? "Input policy saved and applied."
+                                : "Input policy saved; native cleanup is pending.");
+                        }
+                        catch (error) {
+                            if (!(error instanceof Amaterasu.ApiError) || error.code !== "cleanup_pending")
+                                throw error;
+                            context.notify("Input policy was saved, but releasing held native input is pending.");
+                        }
+                        await loadInput();
+                    });
+                });
+                inputArea.replaceChildren(Amaterasu.panel("Input policy", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    inputArea.replaceChildren(Amaterasu.errorPanel(error, loadInput));
             }
         }
         async function loadSteamRuntimeStatus(target, context) {
@@ -1042,6 +1749,10 @@ var Amaterasu;
         void loadAuth();
         void loadHost();
         void loadSteam();
+        void loadLutris();
+        void loadPlaynite();
+        void loadInput();
+        void loadPairing();
     }
     Amaterasu.renderSettings = renderSettings;
 })(Amaterasu || (Amaterasu = {}));
