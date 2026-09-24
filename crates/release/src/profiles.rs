@@ -118,11 +118,20 @@ const STEAM: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.steam",
     library: "amaterasu_steam",
     provides: &["amaterasu.steam/1"],
-    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
+    calls: &[
+        "amaterasu.catalog/1",
+        "amaterasu.configuration/1",
+        "amaterasu.state/1",
+    ],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.configuration", "amaterasu.state"],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.state",
+    ],
 };
 
 const AUTHENTICATION: ComponentDefinition = ComponentDefinition {
@@ -660,6 +669,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "import_principals": {"amaterasu.steam": "amaterasu.management"},
             }),
         ),
         ("amaterasu.input".into(), json!({"allow_injection": false})),
@@ -678,6 +688,8 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.console"],
+                "session_token_ttl_seconds": 7200,
+                "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
@@ -734,12 +746,15 @@ pub fn installer_policy(
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "import_principals": {"amaterasu.steam": "amaterasu.management"},
             }),
         ),
         (
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.management"],
+                "session_token_ttl_seconds": 7200,
+                "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",

@@ -205,6 +205,64 @@ fn installer_policy_enables_only_the_loopback_control_plane() {
 }
 
 #[test]
+fn authentication_token_ttls_are_durable_profile_settings() {
+    let root =
+        std::env::temp_dir().join(format!("amaterasu-auth-ttl-profile-{}", std::process::id()));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    for policy in [
+        development,
+        installer_policy(
+            "__WEB__",
+            [("installer-release".into(), "11".repeat(32))].into(),
+        ),
+    ] {
+        let settings = &policy.settings["amaterasu.authentication"];
+        assert_eq!(settings["session_token_ttl_seconds"], 7200);
+        assert_eq!(settings["remember_me_refresh_token_ttl_seconds"], 604800);
+
+        let reloaded: RuntimeConfig =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.settings["amaterasu.authentication"]["session_token_ttl_seconds"],
+            7200
+        );
+        assert_eq!(
+            reloaded.settings["amaterasu.authentication"]["remember_me_refresh_token_ttl_seconds"],
+            604800
+        );
+    }
+}
+
+#[test]
+fn steam_imports_have_a_fixed_catalog_owner_and_narrow_service_grant() {
+    assert!(STEAM.calls.contains(&"amaterasu.catalog/1"));
+    assert!(STEAM.dependencies.contains(&CATALOG.id));
+
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-steam-import-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+    for policy in [development, installer] {
+        assert_eq!(
+            policy.settings[CATALOG.id]["import_principals"],
+            json!({"amaterasu.steam": "amaterasu.management"})
+        );
+        assert!(
+            policy.principals[STEAM.id]
+                .call
+                .contains("amaterasu.catalog/1")
+        );
+    }
+}
+
+#[test]
 fn public_launch_packages_preserve_transitive_delegation_and_identity_only_native_access() {
     for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
         let adapter = profile
