@@ -62,6 +62,8 @@ pub struct ConfigOverrides {
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_sink_capture_only: Option<bool>,
 }
 
 impl ConfigOverrides {
@@ -83,7 +85,10 @@ impl ConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none() && self.stream_audio.is_none() && self.audio_sink.is_none()
+        self.fec_percentage.is_none()
+            && self.stream_audio.is_none()
+            && self.audio_sink.is_none()
+            && self.audio_sink_capture_only.is_none()
     }
 }
 
@@ -537,6 +542,34 @@ mod tests {
                 serde_json::from_value(json!({"audio_sink":endpoint})).unwrap();
             assert!(override_value.validate().is_err());
         }
+    }
+
+    #[test]
+    fn audio_sink_capture_only_override_preserves_absence_and_explicit_false() {
+        let inherited = ConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(inherited.audio_sink_capture_only, None);
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        let disabled: ConfigOverrides =
+            serde_json::from_value(json!({"audio_sink_capture_only":false})).unwrap();
+        disabled.validate().unwrap();
+        assert_eq!(disabled.audio_sink_capture_only, Some(false));
+        assert!(!disabled.is_empty());
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            json!({"audio_sink_capture_only":false})
+        );
+
+        let enabled: ConfigOverrides =
+            serde_json::from_value(json!({"audio_sink_capture_only":true})).unwrap();
+        assert_eq!(enabled.audio_sink_capture_only, Some(true));
+        assert!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "audio_sink_capture_only":"false"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

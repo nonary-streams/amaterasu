@@ -57,6 +57,7 @@ struct Harness {
     catalog_steam_install_dir: Option<String>,
     catalog_fec_percentage: Option<u8>,
     catalog_audio_sink: Option<String>,
+    catalog_audio_sink_capture_only: Option<bool>,
     catalog_playnite_game_id: Option<String>,
     catalog_playnite_exit_timeout_seconds: u64,
     provider_launches: Vec<TestProviderLaunch>,
@@ -103,6 +104,7 @@ impl Harness {
             catalog_steam_install_dir: None,
             catalog_fec_percentage: None,
             catalog_audio_sink: None,
+            catalog_audio_sink_capture_only: None,
             catalog_playnite_game_id: None,
             catalog_playnite_exit_timeout_seconds: 10,
             provider_launches: Vec::new(),
@@ -460,6 +462,9 @@ impl Harness {
                         if let Some(audio_sink) = &self.catalog_audio_sink {
                             overrides.insert("audio_sink".into(), json!(audio_sink));
                         }
+                        if let Some(capture_only) = self.catalog_audio_sink_capture_only {
+                            overrides.insert("audio_sink_capture_only".into(), json!(capture_only));
+                        }
                         if !overrides.is_empty() {
                             reply["entry"]["config_overrides"] = json!(overrides);
                         }
@@ -708,16 +713,22 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     let mut harness = Harness::new();
     harness.catalog_fec_percentage = Some(37);
     harness.catalog_audio_sink = Some(String::new());
+    harness.catalog_audio_sink_capture_only = Some(false);
     let mut pipeline = pipeline();
 
     let started = harness.request(&mut pipeline, "nvhttp", launch_export("fec-snapshot"));
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(started["launch"]["config_overrides"]["fec_percentage"], 37);
     assert_eq!(started["launch"]["config_overrides"]["audio_sink"], "");
+    assert_eq!(
+        started["launch"]["config_overrides"]["audio_sink_capture_only"],
+        false
+    );
 
     // Later catalog edits do not replace the policy captured by this launch.
     harness.catalog_fec_percentage = Some(81);
     harness.catalog_audio_sink = Some("later-endpoint".into());
+    harness.catalog_audio_sink_capture_only = Some(true);
     let status = harness.request(
         &mut pipeline,
         "nvhttp",
@@ -725,6 +736,10 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     );
     assert_eq!(status["launch"]["config_overrides"]["fec_percentage"], 37);
     assert_eq!(status["launch"]["config_overrides"]["audio_sink"], "");
+    assert_eq!(
+        status["launch"]["config_overrides"]["audio_sink_capture_only"],
+        false
+    );
     assert_eq!(
         harness
             .commands
