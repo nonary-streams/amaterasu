@@ -57,8 +57,12 @@ The Steam importer now discovers bounded local artwork and persists opaque
 provider references instead of filesystem paths. The signed `steam.read`
 endpoint serves fixed-size image chunks; the catalog editor assembles and
 displays those chunks with revision and size checks. This covers local artwork
-discovery and browser display, while remote artwork sources and platform
-qualification remain pending. Manual catalog entries can preserve explicit
+discovery and browser display. A fixed official Steam CDN portrait can now be
+fetched when no local artwork exists, through a single bounded worker and
+revision-checked signed reads. The transfer accepts the reference's 16 MiB
+remote image limit; cached images do not survive restart, and
+low-resolution local art is not replaced or converted as in the reference.
+Platform qualification remains pending. Manual catalog entries can preserve explicit
 Steam ID and install-directory metadata. On Linux, a launch snapshots a
 baseline of same-user processes and associates new process identities only
 with executable or working-directory evidence inside the canonical install
@@ -81,6 +85,13 @@ Windows. Those IDs remain pending until every public listener and supported
 platform follows the effective policy without weakening the loopback control
 plane.
 
+`origin_web_ui_allowed` and `csrf_allowed_origins` remain pending. The first
+controls which remote peer networks may reach Vibeshine's web UI; Amaterasu's
+management listener currently enforces loopback peers. The second is a
+cookie-session CSRF bypass allowlist in the reference, whereas Amaterasu uses
+scoped bearer authorization. Its existing CORS `allowed_origins` setting does
+not grant authentication and must not be treated as either parity field.
+
 Per-application process lifecycle fields now preserve omitted values and apply
 explicit values at launch. `fec_percentage` resolves from the global stream
 profile through a sparse app override and a certificate-matched paired client
@@ -93,7 +104,14 @@ explicit `false` survives catalog and pairing persistence. Provider-owned
 Playnite entries can edit both overrides through a narrow catalog operation
 that preserves provider launch identity and survives refresh. Successful
 signed Playnite editing still needs a completed Playnite snapshot fixture.
-The other shared override keys and their runtime consumers remain pending.
+Global `audio_sink` persists in product document v10 and selects the exact
+loopback capture endpoint for each new stream. Sparse app and
+certificate-matched client overrides resolve client, then app, then global,
+then startup endpoint. An explicit empty scoped override chooses the startup
+automatic endpoint, while absence inherits. Windows default-role switching
+for `audio_sink_capture_only=false` and audio endpoint qualification on other
+supported platforms remain pending. The other shared override keys and their
+runtime consumers remain pending.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
 
@@ -110,6 +128,13 @@ launch; explicit WGC modes fail when that provider is unavailable. The `auto`
 mode retains the startup provider. Vibeshine's virtual-display/game-context
 selection for `auto`, per-app/client capture overrides, and Linux/macOS capture
 support remain pending.
+The Windows WGC pacing option now defaults enabled, persists as a nullable
+product document v11 setting, and snapshots into Video Open. After a missed
+capture slot, ordinary WGC streams keep the prior frame grid only when the
+next fresh frame lands within the source phase and hold bounds. Constant-rate
+WGC currently hides whether a returned frame is fresh, so that mode does not
+apply smoothing. The nonblocking capture pump also cannot reproduce the
+reference's 200 ms blocking wait; those two timing behaviors remain pending.
 
 The media transport now caps each software video send batch to a selected
 16, 32, or 64 KiB frame allowance. Product document v7 persists the nullable
@@ -159,8 +184,11 @@ inventory and reason-specific, replay-safe tombstones. Typed GUID launches use
 authenticated extension IPC and hold the session lease until correlated stop
 proof. Windows focus retries use authenticated game-status metadata, exact
 executable matching when supplied, and a fixed bounded deadline with
-cancellation on stop. Fullscreen entry, extension management, and complete
-Windows process verification remain pending.
+cancellation on stop. A typed Playnite Fullscreen target now supports manual
+catalog entries and an optional provider-owned generated row with correlated
+start, status, stop, and recovery. Active-game watchdog, return-to-Fullscreen
+behavior, complete extension management, and Windows process verification
+remain pending.
 
 Lutris now imports complete current-user Linux library snapshots with
 exclusions and optional Steam deduplication. Lutris settings and status have a

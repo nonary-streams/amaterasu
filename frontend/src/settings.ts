@@ -192,6 +192,20 @@ namespace Amaterasu {
     return target;
   }
 
+  export function parseAudioSinkSelection(value: string): string | null {
+    if (value === "") return null;
+    if (new TextEncoder().encode(value).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/.test(value))
+      throw new Error("The audio endpoint ID must contain at most 4096 UTF-8 bytes and no control characters.");
+    return value;
+  }
+
+  export function parseWgcPacingSmoothing(value: string): boolean | null {
+    if (value === "") return null;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    throw new Error("Choose the default, enabled, or disabled WGC pacing policy.");
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -1222,6 +1236,26 @@ namespace Amaterasu {
           streamAudio.value = client.config_overrides?.stream_audio === undefined
             ? ""
             : String(client.config_overrides.stream_audio);
+          const audioSinkMode = el("select");
+          audioSinkMode.setAttribute("aria-label", `Audio endpoint override for ${client.name}`);
+          for (const [value, label] of [
+            ["inherit", "Inherit application/host"],
+            ["automatic", "Automatic/default endpoint"],
+            ["specific", "Specific endpoint ID"],
+          ]) {
+            const option = el("option", "", label);
+            option.value = value ?? "";
+            audioSinkMode.append(option);
+          }
+          const currentAudioSink = client.config_overrides?.audio_sink;
+          audioSinkMode.value = currentAudioSink === undefined ? "inherit" : currentAudioSink === "" ? "automatic" : "specific";
+          const audioSinkId = input(`audio_sink_${client.certificate_id}`, currentAudioSink ?? "");
+          audioSinkId.maxLength = 4096;
+          audioSinkId.placeholder = "Exact endpoint ID";
+          audioSinkId.setAttribute("aria-label", `Specific audio endpoint ID for ${client.name}`);
+          const updateAudioSink = () => { audioSinkId.disabled = audioSinkMode.value !== "specific"; };
+          audioSinkMode.addEventListener("change", updateAudioSink);
+          updateAudioSink();
           const status = el("div");
           const save = button(
             "Save",
@@ -1233,6 +1267,7 @@ namespace Amaterasu {
                   config_overrides: {
                     ...parseClientFecOverride(fec.value),
                     stream_audio: parseStreamAudioOverride(streamAudio.value),
+                    audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                   },
                 });
                 context.notify(`Streaming override saved for ${client.name}.`);
@@ -1255,9 +1290,9 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, streamAudio, el("div", "", save, status)];
+          return [identity, fec, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Audio streaming", "Audio endpoint", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
@@ -1518,6 +1553,57 @@ namespace Amaterasu {
         outputName.value = settings.configured_output_name ?? "";
         const streamAudio = input("stream_audio", "", "checkbox");
         streamAudio.checked = settings.stream_audio;
+        const wgcPacing = el("select");
+        wgcPacing.name = "wgc_pacing_smoothing";
+        for (const [value, label] of [
+          ["", "Default (enabled)"],
+          ["true", "Enabled"],
+          ["false", "Disabled"],
+        ]) {
+          const option = el("option", "", label);
+          option.value = value ?? "";
+          wgcPacing.append(option);
+        }
+        wgcPacing.value = settings.configured_wgc_pacing_smoothing === null
+          ? ""
+          : String(settings.configured_wgc_pacing_smoothing);
+        const audioSink = el("select");
+        audioSink.name = "audio_sink";
+        const automaticAudioSink = el("option", "", "Automatic (startup audio endpoint)");
+        automaticAudioSink.value = "";
+        audioSink.append(automaticAudioSink);
+        let audioDiscoveryIssue: string | null = null;
+        if (context.api.allows("media.read")) {
+          try {
+            const discovered = await context.api.post<{
+              endpoints: Array<{ id: string; name: string; default_multimedia: boolean }>;
+            }>("media/audio_endpoints");
+            if (!context.content.isConnected) return;
+            for (const endpoint of discovered.endpoints) {
+              try {
+                if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
+                  continue;
+                const option = el("option", "", `${endpoint.name}${endpoint.default_multimedia ? " (default)" : ""} (${endpoint.id})`);
+                option.value = endpoint.id;
+                audioSink.append(option);
+              } catch {
+                // Invalid endpoint metadata cannot become an editable selection.
+              }
+            }
+          } catch {
+            audioDiscoveryIssue = "Audio endpoints could not be listed; the saved selection remains available.";
+          }
+        } else {
+          audioDiscoveryIssue = "Listing audio endpoints requires media.read.";
+        }
+        if (settings.configured_audio_sink && !Array.from(audioSink.options).some(
+          (option) => option.value === settings.configured_audio_sink,
+        )) {
+          const saved = el("option", "", `Saved endpoint: ${settings.configured_audio_sink}`);
+          saved.value = settings.configured_audio_sink;
+          audioSink.append(saved);
+        }
+        audioSink.value = settings.configured_audio_sink ?? "";
         const videoBatchSize = input(
           "video_max_batch_size_kb",
           settings.configured_video_max_batch_size_kb === null
@@ -1581,6 +1667,12 @@ namespace Amaterasu {
           ),
           field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
           field(
+            "WGC pacing smoothing",
+            wgcPacing,
+            `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`,
+          ),
+          field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`),
+          field(
             "Video batch size (KiB)",
             videoBatchSize,
             `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`,
@@ -1596,6 +1688,7 @@ namespace Amaterasu {
             `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`,
           ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
+          ...(audioDiscoveryIssue ? [el("p", "muted", audioDiscoveryIssue)] : []),
           el(
             "p",
             "muted",
@@ -1624,6 +1717,8 @@ namespace Amaterasu {
               video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
               max_bitrate: parseMaxBitrate(maxBitrate.value),
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
+              audio_sink: parseAudioSinkSelection(audioSink.value),
+              wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");

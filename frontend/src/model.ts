@@ -23,14 +23,27 @@ namespace Amaterasu {
     return percentage;
   }
 
-  export function providerConfigOverrides(value: string, streamAudioValue = ""): {
+  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = ""): {
     fec_percentage: number | null;
     stream_audio: boolean | null;
+    audio_sink: string | null;
   } {
     return {
       fec_percentage: parseFecOverride(value),
       stream_audio: parseStreamAudioOverride(streamAudioValue),
+      audio_sink: parseAudioSinkOverride(audioSinkMode, audioSinkId),
     };
+  }
+
+  export function parseAudioSinkOverride(mode: string, endpoint: string): string | null {
+    if (mode === "inherit") return null;
+    if (mode === "automatic") return "";
+    if (
+      mode !== "specific" || endpoint.length === 0 ||
+      new TextEncoder().encode(endpoint).length > 4096 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(endpoint)
+    ) throw new Error("Choose an audio endpoint ID of at most 4096 UTF-8 bytes without control characters.");
+    return endpoint;
   }
 
   export function parseStreamAudioOverride(value: string): boolean | null {
@@ -132,14 +145,16 @@ namespace Amaterasu {
         : "application";
     const fecPercentage = parseFecOverride(text("fec_percentage"));
     const streamAudio = parseStreamAudioOverride(text("stream_audio"));
+    const audioSink = parseAudioSinkOverride(text("audio_sink_mode") || "inherit", String(data.get("audio_sink_id") ?? ""));
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null
+      fecPercentage === null && streamAudio === null && audioSink === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
             ...(streamAudio === null ? {} : { stream_audio: streamAudio }),
+            ...(audioSink === null ? {} : { audio_sink: audioSink }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

@@ -288,7 +288,7 @@ def test_auth_and_crud(console, api):
         {
             "certificate_id": first_client["certificate_id"],
             "expected_revision": paired_clients["revision"],
-            "config_overrides": {"fec_percentage": 47, "stream_audio": True},
+            "config_overrides": {"fec_percentage": 47, "stream_audio": True, "audio_sink": "client-endpoint"},
         },
         administrator,
     )
@@ -305,6 +305,7 @@ def test_auth_and_crud(console, api):
     )
     assert first_after_update.get("config_overrides", {}).get("fec_percentage") == 47, first_after_update
     assert first_after_update.get("config_overrides", {}).get("stream_audio") is True, first_after_update
+    assert first_after_update.get("config_overrides", {}).get("audio_sink") == "client-endpoint", first_after_update
     assert second_after_update.get("config_overrides", {}).get("fec_percentage") is None, second_after_update
     status, stale_fec_update, _ = api.post(
         "/v1/pairing/update_client_config_overrides",
@@ -325,6 +326,7 @@ def test_auth_and_crud(console, api):
     )
     assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
     assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
+    assert persisted_client.get("config_overrides", {}).get("audio_sink") == "client-endpoint", persisted_client
     status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
     assert status == 200 and auth_settings["ok"], auth_settings
     assert auth_settings["values"] == {
@@ -370,7 +372,7 @@ def test_auth_and_crud(console, api):
         "name": "HTTP Game",
         "steam_id": "730",
         "steam_install_dir": steam_install_dir,
-        "config_overrides": {"fec_percentage": 37, "stream_audio": False},
+        "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": ""},
         "launch": {
             "kind": "executable",
             "program": game_path,
@@ -385,7 +387,7 @@ def test_auth_and_crud(console, api):
     status, created, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog["revision"]}, administrator)
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
-    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False}, found
+    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False, "audio_sink": ""}, found
     assert found["entry"]["steam_id"] == "730", found
     assert found["entry"]["steam_install_dir"] == steam_install_dir, found
     assert found["entry"]["launch"]["auto_detach"] is False, found
@@ -401,7 +403,7 @@ def test_auth_and_crud(console, api):
     updated_entry = {
         **entry,
         "name": "Renamed",
-        "config_overrides": {"fec_percentage": 43, "stream_audio": False},
+        "config_overrides": {"fec_percentage": 43, "stream_audio": False, "audio_sink": ""},
         "launch": {**entry["launch"], "auto_detach": True, "wait_all": False},
     }
     status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": updated_entry, "expected_revision": created["revision"]}, administrator)
@@ -417,7 +419,7 @@ def test_auth_and_crud(console, api):
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_id"] == "730", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_install_dir"] == steam_install_dir, saved_catalog_entry
-    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False}, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False, "audio_sink": ""}, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["exit_timeout_seconds"] == 0, saved_catalog_entry
@@ -496,6 +498,10 @@ def test_auth_and_crud(console, api):
     assert host_settings["effective_max_bitrate_kbps"] is None, host_settings
     assert host_settings["configured_minimum_fps_target"] is None, host_settings
     assert host_settings["effective_minimum_fps_target"] == 20, host_settings
+    assert host_settings["configured_audio_sink"] is None, host_settings
+    assert isinstance(host_settings["effective_audio_sink"], str), host_settings
+    assert host_settings["configured_wgc_pacing_smoothing"] is None, host_settings
+    assert host_settings["effective_wgc_pacing_smoothing"] is True, host_settings
     assert host_settings["stream_audio"] is True, host_settings
     assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
     assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
@@ -532,6 +538,8 @@ def test_auth_and_crud(console, api):
         "video_max_batch_size_kb": 20,
         "max_bitrate": 50_000,
         "minimum_fps_target": 37.5,
+        "audio_sink": "test-audio-endpoint",
+        "wgc_pacing_smoothing": False,
         "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
     }, administrator)
@@ -546,6 +554,10 @@ def test_auth_and_crud(console, api):
     assert renamed_host["effective_max_bitrate_kbps"] == 50_000, renamed_host
     assert renamed_host["configured_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["effective_minimum_fps_target"] == 37.5, renamed_host
+    assert renamed_host["configured_audio_sink"] == "test-audio-endpoint", renamed_host
+    assert renamed_host["effective_audio_sink"] == "test-audio-endpoint", renamed_host
+    assert renamed_host["configured_wgc_pacing_smoothing"] is False, renamed_host
+    assert renamed_host["effective_wgc_pacing_smoothing"] is False, renamed_host
     assert renamed_host["stream_audio"] is False, renamed_host
     assert renamed_host["configured_address_family"] == "ipv4", renamed_host
     assert renamed_host["configured_bind_address"] == "", renamed_host
@@ -585,6 +597,17 @@ def test_auth_and_crud(console, api):
             "expected_revision": renamed_host["revision"],
             "minimum_fps_target": invalid_target,
         }, administrator)[0] == 400
+    for invalid_sink in ("bad\nendpoint", "x" * 4097, 42):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "audio_sink": invalid_sink,
+        }, administrator)[0] == 400
+    assert api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games", "port": renamed_host["port"],
+        "expected_revision": renamed_host["revision"],
+        "wgc_pacing_smoothing": "false",
+    }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
         connection.request("GET", "/serverinfo")
@@ -605,6 +628,10 @@ def test_auth_and_crud(console, api):
     assert moved_host["effective_max_bitrate_kbps"] == 50_000, moved_host
     assert moved_host["configured_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["effective_minimum_fps_target"] == 37.5, moved_host
+    assert moved_host["configured_audio_sink"] == "test-audio-endpoint", moved_host
+    assert moved_host["effective_audio_sink"] == "test-audio-endpoint", moved_host
+    assert moved_host["configured_wgc_pacing_smoothing"] is False, moved_host
+    assert moved_host["effective_wgc_pacing_smoothing"] is False, moved_host
     assert moved_host["stream_audio"] is False, moved_host
     assert moved_host["active_http_port"] == moved_port, moved_host
     assert moved_host["active_https_port"] == moved_port - 5, moved_host
@@ -1106,6 +1133,10 @@ def main():
             assert host_settings["effective_max_bitrate_kbps"] == 50_000, host_settings
             assert host_settings["configured_minimum_fps_target"] == 37.5, host_settings
             assert host_settings["effective_minimum_fps_target"] == 37.5, host_settings
+            assert host_settings["configured_audio_sink"] == "test-audio-endpoint", host_settings
+            assert host_settings["effective_audio_sink"] == "test-audio-endpoint", host_settings
+            assert host_settings["configured_wgc_pacing_smoothing"] is False, host_settings
+            assert host_settings["effective_wgc_pacing_smoothing"] is False, host_settings
             assert host_settings["stream_audio"] is False, host_settings
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
@@ -1118,6 +1149,7 @@ def main():
             )
             assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
             assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
+            assert persisted_client.get("config_overrides", {}).get("audio_sink") == "client-endpoint", persisted_client
             status, lutris_settings, _ = api.post("/v1/lutris/settings", token=relogged["bearer"])
             assert status == 200 and lutris_settings["values"] == lutris_values, lutris_settings
             assert lutris_settings["revision"] == lutris_revision, lutris_settings
@@ -1157,6 +1189,8 @@ def main():
                 "video_max_batch_size_kb": None,
                 "max_bitrate": None,
                 "minimum_fps_target": None,
+                "audio_sink": None,
+                "wgc_pacing_smoothing": None,
                 "stream_audio": True,
                 "expected_revision": reset_revision,
             }, relogged["bearer"])
@@ -1172,6 +1206,10 @@ def main():
             assert reset_host["effective_max_bitrate_kbps"] is None, reset_host
             assert reset_host["configured_minimum_fps_target"] is None, reset_host
             assert reset_host["effective_minimum_fps_target"] == 20, reset_host
+            assert reset_host["configured_audio_sink"] is None, reset_host
+            assert isinstance(reset_host["effective_audio_sink"], str), reset_host
+            assert reset_host["configured_wgc_pacing_smoothing"] is None, reset_host
+            assert reset_host["effective_wgc_pacing_smoothing"] is True, reset_host
             assert reset_host["stream_audio"] is True, reset_host
             assert reset_host["address_family"] == "ipv4", reset_host
             assert reset_host["bind_address"] == "127.0.0.1", reset_host

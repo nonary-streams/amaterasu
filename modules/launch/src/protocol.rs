@@ -350,6 +350,8 @@ impl Executable {
 pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_sink: Option<String>,
 }
 
 impl ApplicationConfigOverrides {
@@ -357,11 +359,18 @@ impl ApplicationConfigOverrides {
         if self.fec_percentage == Some(0) {
             return Err("invalid_catalog_response");
         }
+        if self
+            .audio_sink
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
+        {
+            return Err("invalid_catalog_response");
+        }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none()
+        self.fec_percentage.is_none() && self.audio_sink.is_none()
     }
 }
 

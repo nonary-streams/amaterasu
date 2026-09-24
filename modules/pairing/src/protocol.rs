@@ -214,6 +214,8 @@ pub struct ClientConfigOverrides {
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_sink: Option<String>,
 }
 
 impl ClientConfigOverrides {
@@ -224,11 +226,18 @@ impl ClientConfigOverrides {
         {
             return Err("invalid_config_overrides");
         }
+        if self
+            .audio_sink
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
+        {
+            return Err("invalid_config_overrides");
+        }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none() && self.stream_audio.is_none()
+        self.fec_percentage.is_none() && self.stream_audio.is_none() && self.audio_sink.is_none()
     }
 }
 impl Document {
@@ -325,5 +334,22 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":73,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn client_audio_sink_preserves_explicit_automatic_and_rejects_controls() {
+        let automatic: ClientConfigOverrides =
+            serde_json::from_value(json!({"audio_sink":""})).unwrap();
+        automatic.validate().unwrap();
+        assert!(!automatic.is_empty());
+        assert_eq!(
+            serde_json::to_value(automatic).unwrap(),
+            json!({"audio_sink":""})
+        );
+        for endpoint in ["bad\nendpoint".to_owned(), "x".repeat(4097)] {
+            let override_value: ClientConfigOverrides =
+                serde_json::from_value(json!({"audio_sink":endpoint})).unwrap();
+            assert!(override_value.validate().is_err());
+        }
     }
 }

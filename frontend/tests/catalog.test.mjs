@@ -68,3 +68,27 @@ test("Steam artwork transfer stops on changed revision and invalid cursors", asy
   };
   await assert.rejects(readSteamArtwork(invalidCursor, reference), /Invalid Steam artwork cursor/);
 });
+
+test("Steam artwork accepts a 16 MiB transfer declaration but rejects larger images", async () => {
+  let calls = 0;
+  const api = {
+    async post(_path, request) {
+      calls++;
+      return {
+        ok: true, app_id: 730, revision: request.offset ? "43" : "42",
+        offset: request.offset, next_offset: 8192,
+        total_bytes: 16 * 1024 * 1024,
+        mime_type: "image/jpeg",
+        data: Buffer.alloc(8192).toString("base64"),
+      };
+    },
+  };
+  await assert.rejects(readSteamArtwork(api, reference), /changed during transfer/);
+  assert.equal(calls, 2);
+  calls = 0;
+  const oversized = { post: async (path, request) => ({
+    ...await api.post(path, request), total_bytes: 16 * 1024 * 1024 + 1,
+  }) };
+  await assert.rejects(readSteamArtwork(oversized, reference), /changed during transfer/);
+  assert.equal(calls, 1);
+});

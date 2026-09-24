@@ -67,6 +67,22 @@ test("manual Playnite Fullscreen entries use a typed bounded launch", () => {
   }
 });
 
+test("audio sink overrides distinguish inheritance from explicit automatic", () => {
+  assert.equal(model.parseAudioSinkOverride("inherit", "ignored"), null);
+  assert.equal(model.parseAudioSinkOverride("automatic", "ignored"), "");
+  assert.equal(model.parseAudioSinkOverride("specific", "  exact endpoint  "), "  exact endpoint  ");
+  for (const [mode, endpoint] of [["specific", ""], ["specific", "bad\nendpoint"], ["specific", "x".repeat(4097)], ["unknown", "id"]])
+    assert.throws(() => model.parseAudioSinkOverride(mode, endpoint));
+  const form = new FormData();
+  form.set("name", "Audio app");
+  form.set("kind", "application");
+  form.set("path", "/opt/audio");
+  form.set("audio_sink_mode", "automatic");
+  assert.equal(model.entryFromForm(form).config_overrides.audio_sink, "");
+  form.set("audio_sink_mode", "inherit");
+  assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
+});
+
 test("application editor saves sparse FEC and executable lifecycle fields", () => {
   const form = new FormData();
   form.set("name", "Policy app");
@@ -103,10 +119,12 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.deepEqual(ordinary(model.providerConfigOverrides("")), {
     fec_percentage: null,
     stream_audio: null,
+    audio_sink: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("37", "false")), {
     fec_percentage: 37,
     stream_audio: false,
+    audio_sink: null,
   });
   assert.equal(model.parseStreamAudioOverride(""), null);
   assert.equal(model.parseStreamAudioOverride("true"), true);

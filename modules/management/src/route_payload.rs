@@ -27,6 +27,29 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
     }
 }
 
+#[cfg(test)]
+mod steam_artwork_tests {
+    use super::*;
+
+    #[test]
+    fn artwork_cursor_accepts_the_sixteen_mib_contract_only_on_chunk_boundaries() {
+        let route = Route {
+            service: "amaterasu.steam/1",
+            action: "artwork_read",
+            scope: Some("steam.read"),
+            requires_empty_body: false,
+        };
+        for offset in [0, 8 * 1024 * 1024, 16 * 1024 * 1024] {
+            let request = serde_json::json!({"app_id":730,"revision":"42","offset":offset});
+            assert!(validate(route, request.as_object().unwrap()).is_ok());
+        }
+        for offset in [16 * 1024 * 1024 + 1, 16 * 1024 * 1024 + 8192] {
+            let request = serde_json::json!({"app_id":730,"revision":"42","offset":offset});
+            assert!(validate(route, request.as_object().unwrap()).is_err());
+        }
+    }
+}
+
 fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
@@ -122,7 +145,7 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
                 || !object
                     .get("offset")
                     .and_then(Value::as_u64)
-                    .is_some_and(|offset| offset <= 8 * 1024 * 1024 && offset % 8192 == 0)
+                    .is_some_and(|offset| offset <= 16 * 1024 * 1024 && offset % 8192 == 0)
             {
                 return Err(INVALID);
             }
@@ -606,7 +629,11 @@ fn valid_steam_install_dir(path: &str) -> bool {
 
 fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     let overrides = value.as_object().ok_or(INVALID)?;
-    fields(overrides, &[], &["fec_percentage", "stream_audio"])?;
+    fields(
+        overrides,
+        &[],
+        &["fec_percentage", "stream_audio", "audio_sink"],
+    )?;
     if let Some(fec) = overrides.get("fec_percentage")
         && !fec.is_null()
         && !fec
@@ -618,6 +645,23 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     if overrides
         .get("stream_audio")
         .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        return Err(INVALID);
+    }
+    optional_audio_sink(overrides)?;
+    Ok(())
+}
+
+fn optional_audio_sink(overrides: &Object) -> Result<(), &'static str> {
+    if overrides
+        .get("audio_sink")
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::String(endpoint) => {
+                endpoint.len() > 4096 || endpoint.chars().any(char::is_control)
+            }
+            _ => true,
+        })
     {
         return Err(INVALID);
     }
@@ -896,6 +940,8 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "video_max_batch_size_kb",
                     "max_bitrate",
                     "minimum_fps_target",
+                    "audio_sink",
+                    "wgc_pacing_smoothing",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -977,6 +1023,21 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }) {
                 return Err(INVALID);
             }
+            if object.get("audio_sink").is_some_and(|value| match value {
+                Value::Null => false,
+                Value::String(endpoint) => {
+                    endpoint.len() > 4096 || endpoint.chars().any(char::is_control)
+                }
+                _ => true,
+            }) {
+                return Err(INVALID);
+            }
+            if object
+                .get("wgc_pacing_smoothing")
+                .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+            {
+                return Err(INVALID);
+            }
             Ok(())
         }
         _ => Err(INVALID),
@@ -1023,6 +1084,121 @@ mod nvhttp_tests {
                 "port": 47989,
                 "expected_revision": 0,
                 "minimum_fps_target": target,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_sink_update_preserves_exact_endpoint_ids_and_rejects_controls() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for endpoint in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  Endpoint ID  "),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host", "port": 47989, "expected_revision": 0,
+                "audio_sink": endpoint,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for endpoint in [
+            serde_json::json!(42),
+            serde_json::json!("bad\nendpoint"),
+            serde_json::json!("x".repeat(4097)),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host", "port": 47989, "expected_revision": 0,
+                "audio_sink": endpoint,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn wgc_pacing_update_accepts_null_and_booleans_only() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for policy in [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "wgc_pacing_smoothing":policy,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for policy in [serde_json::json!("false"), serde_json::json!(0)] {
+            let payload = serde_json::json!({
+                "hostname":"Host", "port":47989, "expected_revision":0,
+                "wgc_pacing_smoothing":policy,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pairing_override_tests {
+    use super::*;
+
+    #[test]
+    fn audio_sink_override_is_sparse_and_bounded_for_paired_clients() {
+        let route = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        for endpoint in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("exact endpoint"),
+        ] {
+            let payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":{"audio_sink":endpoint},
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for endpoint in [
+            serde_json::json!(42),
+            serde_json::json!("bad\nendpoint"),
+            serde_json::json!("x".repeat(4097)),
+        ] {
+            let payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":{"audio_sink":endpoint},
             });
             assert!(
                 validate(route, payload.as_object().unwrap()).is_err(),
@@ -1104,7 +1280,11 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                 .get("config_overrides")
                 .and_then(Value::as_object)
                 .ok_or(INVALID)?;
-            fields(config_overrides, &[], &["fec_percentage", "stream_audio"])?;
+            fields(
+                config_overrides,
+                &[],
+                &["fec_percentage", "stream_audio", "audio_sink"],
+            )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
                 && !percentage.is_null()
                 && !percentage
@@ -1119,6 +1299,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
+            optional_audio_sink(config_overrides)?;
             Ok(())
         }
         _ => Err(INVALID),
@@ -1468,6 +1649,9 @@ mod catalog_tests {
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":null}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":false}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":null}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"audio_sink":""}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"audio_sink":"exact endpoint"}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"audio_sink":null}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{}}"#,
         ] {
             let value: Value = serde_json::from_slice(body).unwrap();
@@ -1482,6 +1666,8 @@ mod catalog_tests {
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":256}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":"37"}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"stream_audio":"false"}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"audio_sink":42}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"audio_sink":"bad\nendpoint"}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":37,"unknown":true}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":-1,"config_overrides":{"fec_percentage":37}}"#,
             br#"{"id":"app-0000000000000001","expected_revision":4,"client_id":"forged","config_overrides":{"fec_percentage":37}}"#,

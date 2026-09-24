@@ -52,6 +52,7 @@ namespace Amaterasu {
     config_overrides?: {
       fec_percentage?: number;
       stream_audio?: boolean;
+      audio_sink?: string;
     };
   }
   export interface CatalogRow {
@@ -96,6 +97,10 @@ namespace Amaterasu {
     effective_max_bitrate_kbps: number | null;
     configured_minimum_fps_target: number | null;
     effective_minimum_fps_target: number;
+    configured_audio_sink: string | null;
+    effective_audio_sink: string;
+    configured_wgc_pacing_smoothing: boolean | null;
+    effective_wgc_pacing_smoothing: boolean;
     stream_audio: boolean;
     http_addresses: string[] | null;
     https_addresses: string[] | null;
@@ -206,6 +211,7 @@ namespace Amaterasu {
     config_overrides?: {
       fec_percentage?: number;
       stream_audio?: boolean;
+      audio_sink?: string;
     };
   }
   export interface PairingClients {

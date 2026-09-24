@@ -860,8 +860,7 @@ mod tests {
         assert_eq!(route.service, "amaterasu.steam/1");
         assert_eq!(route.action, "artwork_read");
         assert_eq!(route.scope, Some("steam.read"));
-        let valid =
-            serde_json::json!({"app_id":42,"revision":"18446744073709551615","offset":8192});
+        let valid = serde_json::json!({"app_id":42,"revision":"18446744073709551615","offset":16*1024*1024});
         let forwarded = payload(route, &serde_json::to_vec(&valid).unwrap()).unwrap();
         assert_eq!(forwarded["action"], "artwork_read");
         for invalid in [
@@ -869,7 +868,7 @@ mod tests {
             serde_json::json!({"app_id":4294967296_u64,"revision":"1","offset":0}),
             serde_json::json!({"app_id":42,"revision":"../art","offset":0}),
             serde_json::json!({"app_id":42,"revision":"1","offset":1}),
-            serde_json::json!({"app_id":42,"revision":"1","offset":8*1024*1024+8192}),
+            serde_json::json!({"app_id":42,"revision":"1","offset":16*1024*1024+8192}),
             serde_json::json!({"app_id":42,"revision":"1","offset":0,"path":"C:\\other.png"}),
         ] {
             assert!(payload(route, &serde_json::to_vec(&invalid).unwrap()).is_err());

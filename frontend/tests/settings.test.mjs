@@ -270,6 +270,24 @@ test("minimum frame rate editor preserves default, zero, and fractional targets"
     assert.throws(() => parse(invalid));
 });
 
+test("audio sink editor preserves exact IDs and sparse automatic selection", () => {
+  const parse = context.Amaterasu.parseAudioSinkSelection;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  Endpoint ID  "), "  Endpoint ID  ");
+  assert.equal(parse("é".repeat(2048)), "é".repeat(2048));
+  for (const invalid of ["bad\nendpoint", "x".repeat(4097), "é".repeat(2049)])
+    assert.throws(() => parse(invalid));
+});
+
+test("WGC pacing editor preserves default and both explicit policies", () => {
+  const parse = context.Amaterasu.parseWgcPacingSmoothing;
+  assert.equal(parse(""), null);
+  assert.equal(parse("true"), true);
+  assert.equal(parse("false"), false);
+  for (const invalid of ["0", "TRUE", "on", " false "])
+    assert.throws(() => parse(invalid));
+});
+
 test("Steam exclusions preserve valid ID and name objects without normalization", () => {
   const exclusions = [
     { id: "730", name: "Counter-Strike 2" },

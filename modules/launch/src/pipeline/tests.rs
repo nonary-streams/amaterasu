@@ -56,6 +56,7 @@ struct Harness {
     catalog_steam_id: Option<String>,
     catalog_steam_install_dir: Option<String>,
     catalog_fec_percentage: Option<u8>,
+    catalog_audio_sink: Option<String>,
     catalog_playnite_game_id: Option<String>,
     catalog_playnite_exit_timeout_seconds: u64,
     provider_launches: Vec<TestProviderLaunch>,
@@ -101,6 +102,7 @@ impl Harness {
             catalog_steam_id: None,
             catalog_steam_install_dir: None,
             catalog_fec_percentage: None,
+            catalog_audio_sink: None,
             catalog_playnite_game_id: None,
             catalog_playnite_exit_timeout_seconds: 10,
             provider_launches: Vec::new(),
@@ -451,9 +453,15 @@ impl Harness {
                             |game_id| json!({"kind":"playnite","game_id":game_id,"exit_timeout_seconds":self.catalog_playnite_exit_timeout_seconds}),
                         );
                         let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":launch}});
+                        let mut overrides = serde_json::Map::new();
                         if let Some(fec_percentage) = self.catalog_fec_percentage {
-                            reply["entry"]["config_overrides"] =
-                                json!({"fec_percentage":fec_percentage});
+                            overrides.insert("fec_percentage".into(), json!(fec_percentage));
+                        }
+                        if let Some(audio_sink) = &self.catalog_audio_sink {
+                            overrides.insert("audio_sink".into(), json!(audio_sink));
+                        }
+                        if !overrides.is_empty() {
+                            reply["entry"]["config_overrides"] = json!(overrides);
                         }
                         if let Some(preparation) = &self.catalog_preparation {
                             reply["entry"]["launch"]["preparation"] = preparation.clone();
@@ -699,20 +707,24 @@ fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
 fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app() {
     let mut harness = Harness::new();
     harness.catalog_fec_percentage = Some(37);
+    harness.catalog_audio_sink = Some(String::new());
     let mut pipeline = pipeline();
 
     let started = harness.request(&mut pipeline, "nvhttp", launch_export("fec-snapshot"));
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(started["launch"]["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(started["launch"]["config_overrides"]["audio_sink"], "");
 
     // Later catalog edits do not replace the policy captured by this launch.
     harness.catalog_fec_percentage = Some(81);
+    harness.catalog_audio_sink = Some("later-endpoint".into());
     let status = harness.request(
         &mut pipeline,
         "nvhttp",
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(status["launch"]["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(status["launch"]["config_overrides"]["audio_sink"], "");
     assert_eq!(
         harness
             .commands

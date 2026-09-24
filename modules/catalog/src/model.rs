@@ -60,6 +60,8 @@ pub struct ConfigOverrides {
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_sink: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -70,11 +72,18 @@ impl ConfigOverrides {
         {
             return Err("fec_percentage must be between 1 and 255");
         }
+        if self
+            .audio_sink
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
+        {
+            return Err("audio_sink must be a bounded endpoint ID without controls");
+        }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none() && self.stream_audio.is_none()
+        self.fec_percentage.is_none() && self.stream_audio.is_none() && self.audio_sink.is_none()
     }
 }
 
@@ -509,6 +518,25 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":37,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn audio_sink_override_keeps_explicit_automatic_distinct_from_inherit() {
+        let inherited = ConfigOverrides::default();
+        assert!(inherited.is_empty());
+        let automatic: ConfigOverrides = serde_json::from_value(json!({"audio_sink":""})).unwrap();
+        automatic.validate().unwrap();
+        assert!(!automatic.is_empty());
+        assert_eq!(automatic.audio_sink.as_deref(), Some(""));
+        assert_eq!(
+            serde_json::to_value(automatic).unwrap(),
+            json!({"audio_sink":""})
+        );
+        for endpoint in ["bad\nendpoint".to_owned(), "x".repeat(4097)] {
+            let override_value: ConfigOverrides =
+                serde_json::from_value(json!({"audio_sink":endpoint})).unwrap();
+            assert!(override_value.validate().is_err());
+        }
     }
 
     #[test]

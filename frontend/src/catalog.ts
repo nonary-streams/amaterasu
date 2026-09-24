@@ -38,7 +38,7 @@ namespace Amaterasu {
         reply.offset !== offset ||
         !Number.isSafeInteger(reply.total_bytes) ||
         reply.total_bytes < 1 ||
-        reply.total_bytes > 8 * 1024 * 1024 ||
+        reply.total_bytes > 16 * 1024 * 1024 ||
         !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
         typeof reply.data !== "string" ||
         (totalBytes !== null && totalBytes !== reply.total_bytes) ||
@@ -75,6 +75,38 @@ namespace Amaterasu {
     }
     select.value = current === undefined ? "" : String(current);
     return select;
+  }
+
+  function audioSinkOverrideControls(current: string | undefined): {
+    mode: HTMLSelectElement;
+    id: HTMLInputElement;
+    controls: HTMLElement;
+  } {
+    const mode = el("select");
+    mode.name = "audio_sink_mode";
+    for (const [value, label] of [
+      ["inherit", "Inherit host endpoint"],
+      ["automatic", "Automatic/default endpoint"],
+      ["specific", "Specific endpoint ID"],
+    ]) {
+      const option = el("option", "", label);
+      option.value = value ?? "";
+      mode.append(option);
+    }
+    mode.value = current === undefined ? "inherit" : current === "" ? "automatic" : "specific";
+    const id = input("audio_sink_id", current ?? "");
+    id.maxLength = 4096;
+    const update = () => { id.disabled = mode.value !== "specific"; };
+    mode.addEventListener("change", update);
+    update();
+    return {
+      mode,
+      id,
+      controls: el("div", "form-grid",
+        field("Audio capture endpoint", mode, "Inherit the host, choose automatic, or use an exact endpoint ID."),
+        field("Specific endpoint ID", id, "Used only when a specific endpoint is selected."),
+      ),
+    };
   }
 
   export function renderCatalog(context: PageContext): void {
@@ -279,6 +311,7 @@ namespace Amaterasu {
         "stream_audio",
         row.entry.config_overrides?.stream_audio,
       );
+      const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
       const form = el(
         "form",
         "editor-form",
@@ -288,6 +321,7 @@ namespace Amaterasu {
           "Leave blank to inherit the global setting. Supported values are 1–255.",
         ),
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
+        audioSink.controls,
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -298,12 +332,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -469,6 +503,7 @@ namespace Amaterasu {
       "stream_audio",
       entry?.config_overrides?.stream_audio,
     );
+    const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -527,6 +562,7 @@ namespace Amaterasu {
       pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
+      audioSink.controls,
       steamIdField,
       steamInstallDirField,
       fullscreen,
