@@ -34,24 +34,49 @@ result is ambiguous and the first durable readback fails, management receives an
 unknown-outcome error while Steam retries the readback with capped backoff; other
 Steam requests continue to be served during those retries.
 
-The product document also contains `auto_sync` (default `false`) and
-`exclude_games` (default `[]`). `settings_update` accepts
-`{enabled,auto_sync,exclude_games,expected_revision}`. Exclusions are bounded to
-256 records of the form `{"id":"730","name":"Counter-Strike 2"}`; either a
-canonical decimal Steam app ID or printable name is required. When an ID is
-provided, matching uses the ID; a name-only exclusion matches exact names
-without case sensitivity. Existing version 1 documents that only contain
-`enabled` load with auto-sync off and no exclusions.
+The version 1 product document also contains `auto_sync` (`false`),
+`exclude_games` (`[]`), `include_tools` (`false`), `sync_all_installed`
+(`false`), `recent_games` (`10`), and `recent_max_age_days` (`30`). The provider
+accepts settings updates with `{enabled,auto_sync,exclude_games,include_tools,
+sync_all_installed,recent_games,recent_max_age_days,expected_revision}`. The
+new fields default when reading older version 1 documents. Older management
+updates that omit them preserve their current values. `recent_games` is bounded
+to 10000 and `recent_max_age_days` to 36500; either can be zero, with zero games
+selecting none and zero days disabling the age limit. The management HTTP
+projection/editor still needs to expose the new fields before users can change
+them through those routes.
+
+Exclusions are bounded to 256 records of the form
+`{"id":"730","name":"Counter-Strike 2"}`; either a canonical decimal Steam
+app ID or printable name is required. When an ID is provided, matching uses
+the ID; a name-only exclusion matches exact names without case sensitivity.
 
 With `auto_sync` enabled, Steam starts discovery when settings are applied and
-then requests another scan every 30 seconds. It imports a scan only when every
-configured library and manifest was read without warnings and a Steam client
-executable was resolved. Catalog entries use stable source IDs `steam:<appid>`
-and launch the resolved Steam client with `-applaunch <appid>`. Exclusions affect
-catalog imports only; the Steam provider's `list` action continues to show all
-discovered games. The provider uses the fixed catalog import mapping from
-`amaterasu.steam` to the management catalog and accepts no caller-supplied owner
-selector.
+then requests another scan every 30 seconds. With `sync_all_installed=false`,
+the provider selects installed games with nonzero local `LastPlayed`, keeps
+those within the configured age, orders newest first (App ID breaks ties), and
+takes at most `recent_games`. With `sync_all_installed=true`, every installed
+game is selected. Exclusions and tool filtering apply before recent-game
+ordering and limits. `include_tools=true` includes every installed app; the
+default filters Steam types `tool`, `config`, `dlc`, `driver`, `music`, and
+`video`, plus known runtime IDs and runtime-name fallbacks.
+
+App types are read from the configured Steam install's binary
+`appcache/appinfo.vdf`; play history is read from every numeric account's
+`userdata/<account>/config/localconfig.vdf`, taking the newest timestamp across
+accounts. These files are parsed locally and need no Steam Web API key. If the
+active selection policy needs app types or recent history and those sources are
+missing, malformed, oversized, or incomplete, the catalog is left unchanged.
+Configure the Steam installation root (or its `steamapps` directory) as well
+as library roots so those sidecars can be found. Discovery and list remain
+available when metadata is incomplete. Status includes
+`catalog_sources.appinfo` and `catalog_sources.play_history`.
+
+Catalog entries use stable source IDs `steam:<appid>` and launch the resolved
+Steam client with `-applaunch <appid>`. Exclusions affect catalog imports only;
+the Steam provider's `list` action continues to show all discovered games. The
+provider uses the fixed catalog import mapping from `amaterasu.steam` to the
+management catalog and accepts no caller-supplied owner selector.
 
 The snapshot protocol writes bounded batches and declares completion only after
 a successful full scan. Catalog ownership markers preserve manually changed or
@@ -63,11 +88,13 @@ finish already in flight may still complete, after which a later complete scan
 reconciles current settings. Status and list requests continue during catalog
 retries.
 
-This is installed-manifest reconciliation, not complete Vibeshine Steam sync
-parity. The current manifests do not expose local play history, Steam app type,
-or artwork, so recent-game selection and tool classification remain pending.
-Auto-sync imports installed manifests, and the `steam_autosync_remove_uninstalled`
-policy is not configurable yet.
+This still does not provide complete Vibeshine Steam sync parity. Catalog
+finish always removes stale Steam-owned entries after a successful full
+snapshot, so `steam_autosync_remove_uninstalled=false` is not configurable.
+Artwork and richer catalog metadata are also unavailable. The settings HTTP
+projection/editor follow-up is pending for the new tool/recent fields.
+Unlike Vibeshine's legacy host config parser, the product API rejects negative
+counts and ages as malformed unsigned values instead of clamping them to zero.
 
 ```json
 {"action":"refresh"}
@@ -79,7 +106,9 @@ policy is not configurable yet.
 Refresh starts incremental work; repeated refresh while scanning joins the same
 scan. The host must keep ticking to finish it. Status returns `scanning`,
 `revision`, `game_count`, `warning_count`, bounded `warnings`, `complete`, and
-`visited_entries` (current scan only). List returns `games`, `revision`,
+`catalog_sources`, and `visited_entries` (current scan only). `catalog_sources`
+reports whether appinfo and play-history metadata were complete for catalog
+selection. List returns `games`, `revision`,
 `next_after`, `scanning`, and `complete`. Continue with the same revision and
 returned `next_after`; null means finished. Page size is 1–32, default 16, and
 may be smaller to fit the 16 KiB runtime payload. Stale revisions fail with
@@ -87,11 +116,13 @@ may be smaller to fit the 16 KiB runtime payload. Stale revisions fail with
 
 Each game includes numeric `app_id`, stable provider ID `steam:<appid>`, name,
 library/install directories, raw `state_flags`, `installed`, and `last_updated`.
+When available, the record also includes Steam `app_type` and `last_played`.
 Installed requires the FullyInstalled flag (4) and an existing installation
 directory. A manifest cannot escape `steamapps/common` through dot segments or
-path separators in `installdir`. This does not classify games versus tools/DLC or
-resolve executable paths. Duplicate IDs prefer installed copies, then lexical
-library path, independent of directory order. Results sort by numeric App ID.
+path separators in `installdir`. This provider does not resolve per-game
+executable paths or user launch options. Duplicate IDs prefer installed copies,
+then lexical library path, independent of directory order. Results sort by
+numeric App ID.
 
 Completed scans atomically replace the in-memory snapshot, including empty scans
 when at least one configured root was successfully scanned. Invalid/unavailable
@@ -101,15 +132,20 @@ reported incomplete. During refresh the previous snapshot remains visible. There
 is no durable discovery snapshot or cursor epoch across module restarts; clients
 must discard old cursors after restart.
 
-The parser supports quoted/unquoted text, braces, line comments, UTF-8 names,
-escaped quotes/backslashes and common whitespace escapes. It rejects duplicates,
-truncated documents, NUL, directives/includes, excessive nesting or tokens. It
-does not parse binary appinfo/userdata or implement the entire KeyValues dialect.
-Each file is bounded to 1 MiB, nesting to 16 levels, tokens to 8192 bytes, and
-fields to 32768. A scan visits at most 100000 directory entries and retains at
-most 20000 apps; limit exhaustion makes the scan incomplete. One library open or
-manifest read runs per tick, with no background threads outliving the library.
-Individual filesystem operations can still block on unavailable storage.
+Manifest and localconfig parsing supports quoted/unquoted text, braces, line
+comments, UTF-8 names, escaped quotes/backslashes and common whitespace escapes.
+It rejects duplicates, truncated documents, NUL, directives/includes, excessive
+nesting or tokens. The binary appinfo parser reads only Steam's bounded app
+records and extracts `common.type`. Manifests are bounded to 1 MiB, localconfig
+files to 16 MiB, appinfo caches to 2 GiB (streamed), the appinfo key table to
+16 MiB, and an individual appinfo record to 16 MiB. Parsers cap nesting at 16,
+string keys at 8192 bytes and values per record at 32768. A scan visits at most
+100000 directory entries, retains at most 20000 apps, and reads at most 64 user
+accounts per root and 256 localconfig files per scan. Limit exhaustion makes
+the relevant metadata source incomplete, so catalog cleanup waits for another
+scan. Filesystem operations advance over ticks, with no background threads
+outliving the library; an individual filesystem call can still block on
+unavailable storage.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h`; source was not
 copied or translated. Other missing parity includes automatic per-session root

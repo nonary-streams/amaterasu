@@ -26,8 +26,12 @@ impl Value {
 }
 
 pub fn parse(source: &str) -> Result<Value, String> {
-    if source.len() > 1_048_576 {
-        return Err("manifest exceeds 1 MiB".into());
+    parse_bounded(source, 1_048_576)
+}
+
+pub fn parse_bounded(source: &str, max_bytes: usize) -> Result<Value, String> {
+    if source.len() > max_bytes {
+        return Err("KeyValues document exceeds its byte limit".into());
     }
     let mut parser = Parser {
         source: source.trim_start_matches('\u{feff}').as_bytes(),

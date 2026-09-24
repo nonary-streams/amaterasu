@@ -52,6 +52,22 @@ pub struct ProductSettings {
     pub auto_sync: bool,
     #[serde(default)]
     pub exclude_games: Vec<Exclusion>,
+    #[serde(default)]
+    pub include_tools: bool,
+    #[serde(default)]
+    pub sync_all_installed: bool,
+    #[serde(default = "default_recent_games")]
+    pub recent_games: u32,
+    #[serde(default = "default_recent_max_age_days")]
+    pub recent_max_age_days: u32,
+}
+
+pub(super) fn default_recent_games() -> u32 {
+    10
+}
+
+pub(super) fn default_recent_max_age_days() -> u32 {
+    30
 }
 
 #[allow(clippy::derivable_impls)] // The default follows Vibeshine's Linux policy.
@@ -61,6 +77,10 @@ impl Default for ProductSettings {
             enabled: cfg!(target_os = "linux"),
             auto_sync: false,
             exclude_games: Vec::new(),
+            include_tools: false,
+            sync_all_installed: false,
+            recent_games: default_recent_games(),
+            recent_max_age_days: default_recent_max_age_days(),
         }
     }
 }
@@ -74,6 +94,12 @@ impl ProductSettings {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.recent_games > 10_000 {
+            return Err("recent Steam game limit cannot exceed 10000");
+        }
+        if self.recent_max_age_days > 36_500 {
+            return Err("recent Steam age limit cannot exceed 36500 days");
+        }
         if self.exclude_games.len() > MAX_EXCLUSIONS {
             return Err("at most 256 excluded Steam games are allowed");
         }
@@ -199,7 +225,7 @@ mod tests {
                 "action":"product_update",
                 "expected_revision":0,
                 "version":1,
-                "values":{"enabled":cfg!(target_os = "linux"),"auto_sync":false,"exclude_games":[]}
+                "values":{"enabled":cfg!(target_os = "linux"),"auto_sync":false,"exclude_games":[],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30}
             })
         );
     }
@@ -223,6 +249,7 @@ mod tests {
                     enabled: true,
                     auto_sync: false,
                     exclude_games: Vec::new(),
+                    ..ProductSettings::default()
                 },
                 4
             )
@@ -252,9 +279,10 @@ mod tests {
                     id: Some("730".into()),
                     name: Some("Counter-Strike 2".into()),
                 }],
+                ..ProductSettings::default()
             }
             .management_response(8),
-            json!({"ok":true,"revision":8,"values":{"enabled":true,"auto_sync":true,"exclude_games":[{"id":"730","name":"Counter-Strike 2"}]}})
+            json!({"ok":true,"revision":8,"values":{"enabled":true,"auto_sync":true,"exclude_games":[{"id":"730","name":"Counter-Strike 2"}],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30}})
         );
     }
 

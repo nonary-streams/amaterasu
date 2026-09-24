@@ -18,6 +18,54 @@ fn product_settings_actions_require_the_management_principal() {
 }
 
 #[test]
+fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
+    let current = ProductSettings {
+        enabled: true,
+        auto_sync: true,
+        include_tools: true,
+        sync_all_installed: false,
+        recent_games: 6,
+        recent_max_age_days: 14,
+        ..ProductSettings::default()
+    };
+    let Action::SettingsUpdate {
+        enabled,
+        auto_sync,
+        exclude_games,
+        include_tools,
+        sync_all_installed,
+        recent_games,
+        recent_max_age_days,
+        ..
+    } = serde_json::from_value(json!({
+        "action":"settings_update",
+        "enabled":false,
+        "auto_sync":false,
+        "exclude_games":[],
+        "expected_revision":3
+    }))
+    .unwrap()
+    else {
+        panic!("expected settings update action");
+    };
+    let updated = ProductSettingsPatch {
+        enabled,
+        auto_sync,
+        exclude_games,
+        include_tools,
+        sync_all_installed,
+        recent_games,
+        recent_max_age_days,
+    }
+    .apply(&current);
+    assert!(!updated.enabled);
+    assert!(!updated.auto_sync);
+    assert!(updated.include_tools);
+    assert_eq!(updated.recent_games, 6);
+    assert_eq!(updated.recent_max_age_days, 14);
+}
+
+#[test]
 fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
     let mut provider = Provider::new(Vec::new());
     provider.enabled = true;
@@ -34,6 +82,8 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
             state_flags: 4,
             installed: true,
             last_updated: 0,
+            app_type: None,
+            last_played: None,
         },
     );
 
@@ -79,12 +129,28 @@ fn enabling_steam_allows_explicit_refresh_of_configured_roots() {
 }
 
 #[test]
-fn unsupported_tool_classification_cannot_be_smuggled_into_product_settings() {
-    let parsed = serde_json::from_value::<ProductSettings>(json!({
-        "enabled": true,
-        "include_tools": true
-    }));
-    assert!(parsed.is_err());
+fn product_settings_expose_bounded_tool_and_recent_game_policy() {
+    let defaults = ProductSettings::default();
+    assert!(!defaults.include_tools);
+    assert!(!defaults.sync_all_installed);
+    assert_eq!(defaults.recent_games, 10);
+    assert_eq!(defaults.recent_max_age_days, 30);
+    assert!(
+        ProductSettings {
+            recent_games: 10_001,
+            ..defaults.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        ProductSettings {
+            recent_max_age_days: 36_501,
+            ..defaults
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 #[derive(Default)]
@@ -260,7 +326,7 @@ fn persisted_settings_with_auto_sync(exclusions: Value, revision: u64) -> Respon
             "found":true,
             "version":1,
             "revision":revision,
-            "values":{"enabled":true,"auto_sync":true,"exclude_games":exclusions}
+            "values":{"enabled":true,"auto_sync":true,"exclude_games":exclusions,"sync_all_installed":true}
         }),
     }
 }
@@ -416,6 +482,8 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             state_flags: 4,
             installed: true,
             last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
         },
     );
     module.provider.games.insert(
@@ -429,10 +497,14 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             state_flags: 4,
             installed: true,
             last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
         },
     );
     module.provider.revision = 1;
     module.provider.snapshot_complete = true;
+    module.provider.appinfo_complete = true;
+    module.provider.history_complete = true;
 
     for _ in 0..8 {
         module.tick().unwrap();
@@ -463,6 +535,59 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
 }
 
 #[test]
+fn catalog_cleanup_waits_for_appinfo_when_tool_filtering_is_active() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results.push_back(Response::Result {
+        payload: json!({
+            "ok":true,
+            "found":true,
+            "version":1,
+            "revision":2,
+            "values":{"enabled":true,"auto_sync":true,"sync_all_installed":true}
+        }),
+    });
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module.provider.scan = None;
+    module.provider.steam_executable = Some(std::env::current_exe().unwrap());
+    module.provider.games.insert(
+        10,
+        Game {
+            stable_id: "steam:10".into(),
+            app_id: 10,
+            name: "Installed game".into(),
+            install_directory: "/Steam/steamapps/common/Game".into(),
+            library_directory: "/Steam".into(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
+        },
+    );
+    module.provider.revision = 1;
+    module.provider.snapshot_complete = true;
+    module.tick().unwrap();
+    assert!(host.catalog_requests.is_empty());
+    assert!(
+        module.catalog_sync.status()["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("appinfo")
+    );
+
+    module.provider.appinfo_complete = true;
+    module.provider.revision = 2;
+    module.tick().unwrap();
+    assert_eq!(
+        host.catalog_requests[0]["action"],
+        "provider_snapshot_begin"
+    );
+}
+
+#[test]
 fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
@@ -484,10 +609,14 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             state_flags: 4,
             installed: true,
             last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
         },
     );
     module.provider.revision = 1;
     module.provider.snapshot_complete = true;
+    module.provider.appinfo_complete = true;
+    module.provider.history_complete = true;
 
     module.tick().unwrap();
     assert_eq!(host.catalog_requests.len(), 1);
@@ -503,6 +632,7 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             id: Some("20".into()),
             name: None,
         }],
+        ..ProductSettings::default()
     };
     module.provider.revision = 2;
     module

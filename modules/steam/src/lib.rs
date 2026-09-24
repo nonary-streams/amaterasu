@@ -3,6 +3,7 @@ mod catalog_sync;
 mod configuration;
 mod discovery;
 mod keyvalues;
+mod metadata;
 mod settings;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -26,9 +27,16 @@ enum Action {
     SettingsUpdate {
         enabled: bool,
         #[serde(default)]
-        auto_sync: bool,
+        auto_sync: Option<bool>,
+        exclude_games: Option<Vec<Exclusion>>,
         #[serde(default)]
-        exclude_games: Vec<Exclusion>,
+        include_tools: Option<bool>,
+        #[serde(default)]
+        sync_all_installed: Option<bool>,
+        #[serde(default)]
+        recent_games: Option<u32>,
+        #[serde(default)]
+        recent_max_age_days: Option<u32>,
         expected_revision: u64,
     },
     List {
@@ -49,6 +57,8 @@ struct Provider {
     snapshot_complete: bool,
     warnings: Vec<String>,
     warning_count: u64,
+    appinfo_complete: bool,
+    history_complete: bool,
 }
 
 impl Provider {
@@ -71,6 +81,8 @@ impl Provider {
             self.games.clear();
             self.warnings.clear();
             self.warning_count = 0;
+            self.appinfo_complete = false;
+            self.history_complete = false;
             self.revision = self.revision.saturating_add(1);
             self.snapshot_complete = false;
         }
@@ -105,6 +117,8 @@ impl Provider {
             self.warnings = scan.warnings;
             self.warning_count = scan.warning_count;
             self.snapshot_complete = scan.warning_count == 0;
+            self.appinfo_complete = scan.appinfo_complete;
+            self.history_complete = scan.history_complete;
             self.revision = self.revision.saturating_add(1);
         }
     }
@@ -129,12 +143,20 @@ impl Provider {
                 enabled,
                 auto_sync,
                 exclude_games,
+                include_tools,
+                sync_all_installed,
+                recent_games,
+                recent_max_age_days,
                 expected_revision,
             } => ActionResult::SettingsUpdate {
-                settings: ProductSettings {
+                settings: ProductSettingsPatch {
                     enabled,
                     auto_sync,
                     exclude_games,
+                    include_tools,
+                    sync_all_installed,
+                    recent_games,
+                    recent_max_age_days,
                 },
                 expected_revision,
             },
@@ -154,6 +176,7 @@ impl Provider {
         json!({"ok":true,"enabled":self.enabled,"scanning":self.scan.is_some(),"revision":self.revision,
             "game_count":self.games.len(),"warning_count":self.warning_count,"warnings":self.warnings,
             "complete":self.has_complete_snapshot(),
+            "catalog_sources":{"appinfo":self.appinfo_complete,"play_history":self.history_complete},
             "visited_entries":self.scan.as_ref().map_or(0, |scan| scan.visited_entries)})
     }
 
@@ -194,9 +217,39 @@ enum ActionResult {
     Immediate(Value),
     SettingsGet,
     SettingsUpdate {
-        settings: ProductSettings,
+        settings: ProductSettingsPatch,
         expected_revision: u64,
     },
+}
+
+struct ProductSettingsPatch {
+    enabled: bool,
+    auto_sync: Option<bool>,
+    exclude_games: Option<Vec<Exclusion>>,
+    include_tools: Option<bool>,
+    sync_all_installed: Option<bool>,
+    recent_games: Option<u32>,
+    recent_max_age_days: Option<u32>,
+}
+
+impl ProductSettingsPatch {
+    fn apply(self, current: &ProductSettings) -> ProductSettings {
+        ProductSettings {
+            enabled: self.enabled,
+            auto_sync: self.auto_sync.unwrap_or(current.auto_sync),
+            exclude_games: self
+                .exclude_games
+                .unwrap_or_else(|| current.exclude_games.clone()),
+            include_tools: self.include_tools.unwrap_or(current.include_tools),
+            sync_all_installed: self
+                .sync_all_installed
+                .unwrap_or(current.sync_all_installed),
+            recent_games: self.recent_games.unwrap_or(current.recent_games),
+            recent_max_age_days: self
+                .recent_max_age_days
+                .unwrap_or(current.recent_max_age_days),
+        }
+    }
 }
 
 struct SteamModule {
@@ -296,9 +349,10 @@ impl SteamModule {
                 self.complete(id, self.configuration.management_response())
             }
             ActionResult::SettingsUpdate {
-                settings,
+                settings: patch,
                 expected_revision,
             } => {
+                let settings = patch.apply(self.configuration.settings());
                 match self
                     .configuration
                     .begin_update(id, settings, expected_revision, remaining_ms)

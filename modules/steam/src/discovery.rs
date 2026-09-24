@@ -1,4 +1,5 @@
 use crate::keyvalues::{self, Value};
+use crate::metadata::Scanner as MetadataScanner;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, ReadDir};
@@ -19,6 +20,10 @@ pub struct Game {
     pub state_flags: u64,
     pub installed: bool,
     pub last_updated: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<u64>,
 }
 
 #[derive(Default)]
@@ -31,11 +36,17 @@ pub struct Scan {
     pub warning_count: u64,
     pub visited_entries: usize,
     pub finished: bool,
+    pub appinfo_complete: bool,
+    pub history_complete: bool,
+    metadata: Option<MetadataScanner>,
 }
 
 impl Scan {
     pub fn new(roots: &[PathBuf]) -> Self {
-        let mut scan = Self::default();
+        let mut scan = Self {
+            metadata: Some(MetadataScanner::new(roots)),
+            ..Self::default()
+        };
         if roots.is_empty() {
             scan.warn("no_library_roots");
             return scan;
@@ -80,8 +91,9 @@ impl Scan {
         self.libraries.push_back(root);
     }
 
-    /// Reads at most one manifest or opens one library per tick. No scanner thread
-    /// survives module destruction. Individual filesystem calls may still block.
+    /// Reads one manifest, opens one library, or advances a bounded sidecar scan
+    /// per tick. No scanner thread survives destruction; individual filesystem
+    /// calls may still block.
     pub fn tick(&mut self) {
         if self.finished {
             return;
@@ -111,6 +123,13 @@ impl Scan {
             }
         } else if let Some(library) = self.libraries.pop_front() {
             self.open_library(library);
+        } else if let Some(metadata) = &mut self.metadata {
+            if metadata.tick(&mut self.games) {
+                let availability = metadata.availability();
+                self.appinfo_complete = availability.appinfo_complete;
+                self.history_complete = availability.history_complete;
+                self.finished = true;
+            }
         } else {
             self.finished = true;
         }
@@ -294,6 +313,11 @@ fn read_game(path: &Path, library: &Path, expected_id: u32) -> Result<Game, Stri
         state_flags,
         installed,
         last_updated: unsigned_field(app, "lastupdated", false)?,
+        app_type: match app.field("type") {
+            Ok(value) => Some(value.text()?.to_owned()),
+            Err(_) => None,
+        },
+        last_played: None,
     };
     if serde_json::to_vec(&game)
         .map_err(|error| error.to_string())?

@@ -214,6 +214,8 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 state_flags: 4,
                 installed: true,
                 last_updated: 0,
+                app_type: None,
+                last_played: None,
             },
         );
     }

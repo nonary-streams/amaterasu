@@ -299,8 +299,13 @@ impl CatalogSync {
             return;
         }
         if provider.has_complete_snapshot() {
-            self.sync_requested = true;
-            self.last_error = None;
+            if let Some(message) = catalog_source_error(provider, settings) {
+                self.sync_requested = false;
+                self.last_error = Some(message);
+            } else {
+                self.sync_requested = true;
+                self.last_error = None;
+            }
         } else {
             self.sync_requested = false;
             self.last_error =
@@ -314,10 +319,18 @@ impl CatalogSync {
         provider: &Provider,
         settings: &ProductSettings,
     ) -> ModuleResult<()> {
+        if let Some(message) = catalog_source_error(provider, settings) {
+            return Err(message);
+        }
         let steam_executable = provider.steam_executable.as_deref().ok_or_else(|| {
             "Steam client executable was not found; catalog was left unchanged".to_owned()
         })?;
-        let records = catalog_records(&provider.games, settings, steam_executable)?;
+        let records = catalog_records(
+            &provider.games,
+            settings,
+            steam_executable,
+            unix_timestamp_now(),
+        )?;
         let batches = chunk_records(records)?;
         self.transaction = Some(Transaction {
             sync_id: new_sync_id(provider.revision),
@@ -475,6 +488,7 @@ fn catalog_records(
     games: &std::collections::BTreeMap<u32, Game>,
     settings: &ProductSettings,
     steam_executable: &Path,
+    now: u64,
 ) -> Result<Vec<Value>, String> {
     let program = steam_executable
         .to_str()
@@ -487,16 +501,38 @@ fn catalog_records(
                     .any(|segment| segment == "." || segment == "..")
         })
         .ok_or("Steam client path is not a valid absolute UTF-8 path")?;
+    let mut selected = games
+        .values()
+        .filter(|game| {
+            game.installed
+                && !settings
+                    .exclude_games
+                    .iter()
+                    .any(|exclusion| exclusion.matches(game.app_id, &game.name))
+                && is_importable(game, settings.include_tools)
+        })
+        .collect::<Vec<_>>();
+    if !settings.sync_all_installed {
+        selected.retain(|game| {
+            let Some(last_played) = game.last_played.filter(|timestamp| *timestamp > 0) else {
+                return false;
+            };
+            if last_played > now {
+                return false;
+            }
+            let max_age_days = u64::from(settings.recent_max_age_days);
+            max_age_days == 0 || now - last_played <= max_age_days * 24 * 60 * 60
+        });
+        selected.sort_by(|left, right| {
+            right
+                .last_played
+                .cmp(&left.last_played)
+                .then_with(|| left.app_id.cmp(&right.app_id))
+        });
+        selected.truncate(settings.recent_games as usize);
+    }
     let mut records = Vec::new();
-    for game in games.values() {
-        if !game.installed
-            || settings
-                .exclude_games
-                .iter()
-                .any(|exclusion| exclusion.matches(game.app_id, &game.name))
-        {
-            continue;
-        }
+    for game in selected {
         let stable_id = format!("steam:{}", game.app_id);
         if game.stable_id != stable_id {
             return Err("Steam discovery returned a noncanonical source ID".into());
@@ -544,6 +580,54 @@ fn catalog_records(
         records.push(record);
     }
     Ok(records)
+}
+
+fn is_importable(game: &Game, include_tools: bool) -> bool {
+    if include_tools {
+        return true;
+    }
+    let app_type = game
+        .app_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        app_type.as_str(),
+        "tool" | "config" | "dlc" | "driver" | "music" | "video"
+    ) {
+        return false;
+    }
+    const RUNTIME_APP_IDS: &[u32] = &[
+        228_980, 1_070_560, 1_391_110, 1_628_350, 1_824_220, 1_493_710, 4_183_110,
+    ];
+    if RUNTIME_APP_IDS.contains(&game.app_id) {
+        return false;
+    }
+    let name = game.name.to_lowercase();
+    !name.starts_with("proton ")
+        && !name.starts_with("steam linux runtime")
+        && name != "steamworks common redistributables"
+}
+
+fn catalog_source_error(provider: &Provider, settings: &ProductSettings) -> Option<String> {
+    if !settings.include_tools && !provider.appinfo_complete {
+        return Some(
+            "Steam appinfo metadata is missing or incomplete; catalog was left unchanged".into(),
+        );
+    }
+    if !settings.sync_all_installed && settings.recent_games > 0 && !provider.history_complete {
+        return Some(
+            "Steam local play history is missing or incomplete; catalog was left unchanged".into(),
+        );
+    }
+    None
+}
+
+fn unix_timestamp_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn chunk_records(records: Vec<Value>) -> Result<Vec<Vec<Value>>, String> {
@@ -612,6 +696,8 @@ mod tests {
             state_flags: if installed { 4 } else { 2 },
             installed,
             last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: Some(2_000_000_000),
         }
     }
 
@@ -625,6 +711,7 @@ mod tests {
         .into_iter()
         .collect();
         let settings = ProductSettings {
+            sync_all_installed: true,
             exclude_games: vec![Exclusion {
                 id: None,
                 name: Some("excluded by NAME".into()),
@@ -632,7 +719,7 @@ mod tests {
             ..ProductSettings::default()
         };
         let executable = std::env::current_exe().unwrap();
-        let records = catalog_records(&games, &settings, &executable).unwrap();
+        let records = catalog_records(&games, &settings, &executable, 2_000_000_000).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["source_id"], "steam:10");
         assert_eq!(records[0]["entry"]["name"], "Kept");
@@ -648,16 +735,160 @@ mod tests {
     }
 
     #[test]
+    fn recent_policy_filters_types_and_exclusions_before_age_and_count() {
+        let game_with_metadata =
+            |app_id: u32, name: &str, app_type: &str, last_played: Option<u64>| {
+                let mut game = game(app_id, name, true);
+                game.app_type = Some(app_type.into());
+                game.last_played = last_played;
+                game
+            };
+        let games = [
+            (
+                10,
+                game_with_metadata(10, "Newest game", "game", Some(999_000)),
+            ),
+            (20, game_with_metadata(20, "Tool", "tool", Some(999_900))),
+            (
+                30,
+                game_with_metadata(30, "Excluded game", "game", Some(999_800)),
+            ),
+            (
+                40,
+                game_with_metadata(40, "Second game", "game", Some(998_000)),
+            ),
+            (50, game_with_metadata(50, "Too old", "game", Some(800_000))),
+            (60, game_with_metadata(60, "No history", "game", None)),
+        ]
+        .into_iter()
+        .collect();
+        let settings = ProductSettings {
+            recent_games: 2,
+            recent_max_age_days: 1,
+            exclude_games: vec![Exclusion {
+                id: Some("30".into()),
+                name: None,
+            }],
+            ..ProductSettings::default()
+        };
+        let executable = std::env::current_exe().unwrap();
+        let records = catalog_records(&games, &settings, &executable, 1_000_000).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["source_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["steam:10", "steam:40"]
+        );
+    }
+
+    #[test]
+    fn including_tools_imports_them_only_when_explicitly_enabled() {
+        let mut tool = game(228_980, "Steamworks Common Redistributables", true);
+        tool.app_type = Some("tool".into());
+        let games = [(tool.app_id, tool)].into_iter().collect();
+        let executable = std::env::current_exe().unwrap();
+        assert!(
+            catalog_records(
+                &games,
+                &ProductSettings {
+                    sync_all_installed: true,
+                    ..ProductSettings::default()
+                },
+                &executable,
+                2_000_000_000,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            catalog_records(
+                &games,
+                &ProductSettings {
+                    include_tools: true,
+                    sync_all_installed: true,
+                    ..ProductSettings::default()
+                },
+                &executable,
+                2_000_000_000,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn catalog_cleanup_requires_metadata_for_each_active_selection_policy() {
+        let mut provider = Provider {
+            snapshot_complete: true,
+            ..Provider::default()
+        };
+        let recent = ProductSettings::default();
+        assert!(
+            catalog_source_error(&provider, &recent)
+                .unwrap()
+                .contains("appinfo")
+        );
+
+        provider.appinfo_complete = true;
+        assert!(
+            catalog_source_error(&provider, &recent)
+                .unwrap()
+                .contains("play history")
+        );
+
+        provider.history_complete = true;
+        assert!(catalog_source_error(&provider, &recent).is_none());
+        assert!(
+            catalog_source_error(
+                &Provider {
+                    snapshot_complete: true,
+                    ..Provider::default()
+                },
+                &ProductSettings {
+                    include_tools: true,
+                    sync_all_installed: true,
+                    ..recent
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn invalid_catalog_names_and_client_paths_fail_before_a_snapshot_is_started() {
         let games = [(10, game(10, &"x".repeat(161), true))]
             .into_iter()
             .collect();
         let executable = std::env::current_exe().unwrap();
-        assert!(catalog_records(&games, &ProductSettings::default(), &executable).is_err());
+        assert!(
+            catalog_records(
+                &games,
+                &ProductSettings {
+                    sync_all_installed: true,
+                    ..ProductSettings::default()
+                },
+                &executable,
+                2_000_000_000
+            )
+            .is_err()
+        );
 
         let games = [(10, game(10, "Valid name", true))].into_iter().collect();
         let long_executable = Path::new("/").join("x".repeat(2_049));
-        assert!(catalog_records(&games, &ProductSettings::default(), &long_executable).is_err());
+        assert!(
+            catalog_records(
+                &games,
+                &ProductSettings {
+                    sync_all_installed: true,
+                    ..ProductSettings::default()
+                },
+                &long_executable,
+                2_000_000_000
+            )
+            .is_err()
+        );
     }
 
     #[test]
