@@ -512,6 +512,9 @@ fn no_success_before_persistence_and_cancelled_commit_remains_durable() {
     pipeline
         .tick_at(100, |command| state.send(command))
         .unwrap();
+    pipeline
+        .tick_at(100, |command| state.send(command))
+        .unwrap();
     assert_eq!(state.writes, 1);
     assert!(state.output.is_none());
     state.cancelled = true;
@@ -1088,6 +1091,7 @@ fn successful_legacy_password_proof_upgrades_the_durable_verifier() {
         },
         "tokens": []
     }));
+    state.revision = 1;
 
     assert_eq!(
         state.request(
