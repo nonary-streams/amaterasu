@@ -245,6 +245,7 @@ impl StreamProfile {
 pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
+    configured_audio_sink: Option<String>,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
@@ -268,6 +269,7 @@ impl Controller {
         Ok(Self {
             config,
             configured_output_name: None,
+            configured_audio_sink: None,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
@@ -289,6 +291,10 @@ impl Controller {
     pub fn set_output_name_settings(&mut self, ready: bool, configured_output_name: Option<&str>) {
         self.output_settings_ready = ready;
         self.configured_output_name = configured_output_name.map(str::to_owned);
+    }
+
+    pub fn set_audio_sink_settings(&mut self, configured_audio_sink: Option<&str>) {
+        self.configured_audio_sink = configured_audio_sink.map(str::to_owned);
     }
 
     pub fn set_capture_mode(&mut self, configured_capture: CaptureMode) {
@@ -360,6 +366,11 @@ impl Controller {
             .filter(|output_name| !output_name.is_empty())
             .unwrap_or(&config.capture.output)
             .to_owned();
+        let audio_endpoint = self
+            .configured_audio_sink
+            .as_deref()
+            .unwrap_or(&config.capture.audio_endpoint)
+            .to_owned();
         let (capture_provider, constant_rate) = self
             .configured_capture
             .resolve(config.capture.capture_provider);
@@ -411,6 +422,7 @@ impl Controller {
             global_max_bitrate_kbps,
             global_minimum_fps_target,
             capture_output,
+            audio_endpoint,
             capture_provider,
             constant_rate,
             connection,

@@ -40,6 +40,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         output_name: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        audio_sink: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         stream_audio: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         capture: FieldUpdate<CaptureMode>,
@@ -168,6 +170,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.loaded(),
                 self.product_settings.configured_output_name(),
             );
+            router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
             router.set_global_stream_audio(self.product_settings.stream_audio());
             router.set_capture_mode(self.product_settings.configured_capture());
             router.set_global_video_max_batch_size_kb(
@@ -424,6 +427,7 @@ impl NvhttpModule {
                                 address_family,
                                 bind_address,
                                 output_name,
+                                audio_sink,
                                 stream_audio,
                                 capture,
                                 video_max_batch_size_kb,
@@ -451,6 +455,7 @@ impl NvhttpModule {
                                     address_family,
                                     bind_address,
                                     output_name,
+                                    audio_sink,
                                     stream_audio,
                                     capture,
                                     video_max_batch_size_kb,
@@ -592,6 +597,7 @@ mod tests {
             address_family: omitted_family,
             bind_address: omitted_bind,
             output_name: omitted_output,
+            audio_sink: omitted_sink,
             stream_audio: omitted_audio,
             capture: omitted_capture,
             video_max_batch_size_kb: omitted_batch_size,
@@ -608,6 +614,7 @@ mod tests {
         assert_eq!(omitted_family, FieldUpdate::Omitted);
         assert_eq!(omitted_bind, FieldUpdate::Omitted);
         assert_eq!(omitted_output, FieldUpdate::Omitted);
+        assert_eq!(omitted_sink, FieldUpdate::Omitted);
         assert_eq!(omitted_audio, FieldUpdate::Omitted);
         assert_eq!(omitted_capture, FieldUpdate::Omitted);
         assert_eq!(omitted_batch_size, FieldUpdate::Omitted);
@@ -618,6 +625,7 @@ mod tests {
             address_family: reset_family,
             bind_address: blank_bind,
             output_name: reset_output,
+            audio_sink: reset_sink,
             stream_audio: null_audio,
             capture: null_capture,
             video_max_batch_size_kb: null_batch_size,
@@ -626,7 +634,7 @@ mod tests {
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":null,"bind_address":"","output_name":null,"stream_audio":null,"capture":null,
+            "address_family":null,"bind_address":"","output_name":null,"audio_sink":null,"stream_audio":null,"capture":null,
             "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null
         }))
         .unwrap()
@@ -636,6 +644,7 @@ mod tests {
         assert_eq!(reset_family, FieldUpdate::Null);
         assert_eq!(blank_bind, FieldUpdate::Value(String::new()));
         assert_eq!(reset_output, FieldUpdate::Null);
+        assert_eq!(reset_sink, FieldUpdate::Null);
         assert_eq!(null_audio, FieldUpdate::Null);
         assert_eq!(null_capture, FieldUpdate::Null);
         assert_eq!(null_batch_size, FieldUpdate::Null);
@@ -646,6 +655,7 @@ mod tests {
             address_family: family,
             bind_address: address,
             output_name,
+            audio_sink,
             stream_audio,
             capture,
             video_max_batch_size_kb,
@@ -654,7 +664,7 @@ mod tests {
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false,"capture":"wgcc",
+            "address_family":"both","bind_address":"::1","output_name":"stable-display-id","audio_sink":"render.selected","stream_audio":false,"capture":"wgcc",
             "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5
         }))
         .unwrap()
@@ -664,6 +674,7 @@ mod tests {
         assert_eq!(family, FieldUpdate::Value(settings::AddressFamily::Both));
         assert_eq!(address, FieldUpdate::Value("::1".into()));
         assert_eq!(output_name, FieldUpdate::Value("stable-display-id".into()));
+        assert_eq!(audio_sink, FieldUpdate::Value("render.selected".into()));
         assert_eq!(stream_audio, FieldUpdate::Value(false));
         assert_eq!(capture, FieldUpdate::Value(CaptureMode::Wgcc));
         assert_eq!(video_max_batch_size_kb, FieldUpdate::Value(32));

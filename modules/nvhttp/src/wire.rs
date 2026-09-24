@@ -156,6 +156,10 @@ impl Router {
             .set_output_name_settings(ready, configured_output_name);
     }
 
+    pub fn set_audio_sink_settings(&mut self, configured_audio_sink: Option<&str>) {
+        self.launches.set_audio_sink_settings(configured_audio_sink);
+    }
+
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.launches.set_global_stream_audio(stream_audio);
     }

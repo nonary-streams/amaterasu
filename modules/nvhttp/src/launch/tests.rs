@@ -167,6 +167,64 @@ fn selected_or_default_output_is_snapshotted_into_rtsp_open() {
 }
 
 #[test]
+fn selected_or_bootstrap_audio_sink_is_snapshotted_into_rtsp_capture_open() {
+    for (configured, expected) in [
+        (Some("endpoint.selected"), "endpoint.selected"),
+        (None, "default"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_audio_sink_settings(configured);
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        controller.set_audio_sink_settings(Some("endpoint.changed"));
+
+        let mut broker = Broker::default();
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["capture"]["audio_endpoint"], expected);
+    }
+}
+
+#[test]
+fn unavailable_selected_audio_sink_fails_without_opening_bootstrap_sink() {
+    let now = Instant::now();
+    let selected = "endpoint.unavailable";
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_audio_sink_settings(Some(selected));
+    let mut broker = Broker {
+        unavailable_audio_endpoint: Some(selected.into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    let opened_endpoints: Vec<_> = broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                payload["capture"]["audio_endpoint"].as_str()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened_endpoints, [selected]);
+}
+
+#[test]
 fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
     let now = Instant::now();
     let selected = "unavailable-display-id";
@@ -210,6 +268,7 @@ struct Broker {
     fail_rtsp_settlement: bool,
     fail_application_settlement: bool,
     unavailable_output: Option<String>,
+    unavailable_audio_endpoint: Option<String>,
     unsettled_rtsp: BTreeSet<u64>,
     unsettled_application: BTreeSet<u64>,
     rtsp_closed: bool,
@@ -235,6 +294,7 @@ impl Default for Broker {
             fail_rtsp_settlement: false,
             fail_application_settlement: false,
             unavailable_output: None,
+            unavailable_audio_endpoint: None,
             unsettled_rtsp: BTreeSet::new(),
             unsettled_application: BTreeSet::new(),
             rtsp_closed: false,
@@ -304,6 +364,16 @@ impl Broker {
                 .unavailable_output
                 .as_deref()
                 .is_some_and(|output| action == "open" && payload["capture"]["output"] == output)
+        {
+            return json!({"ok":false,"code":"not_found"});
+        }
+        if service == "amaterasu.rtsp/1"
+            && self
+                .unavailable_audio_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| {
+                    action == "open" && payload["capture"]["audio_endpoint"] == endpoint
+                })
         {
             return json!({"ok":false,"code":"not_found"});
         }

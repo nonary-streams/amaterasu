@@ -160,7 +160,7 @@ impl Controller {
                     "constant_rate":record.constant_rate,
                     "output":record.capture_output,
                     "encoder":config.capture.encoder,
-                    "audio_endpoint":config.capture.audio_endpoint,
+                    "audio_endpoint":record.audio_endpoint,
                 });
                 (
                     RTSP_SERVICE,

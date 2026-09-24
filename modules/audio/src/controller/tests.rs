@@ -34,6 +34,9 @@ impl Backend for FakeBackend {
 
     fn open(&self, endpoint: &str) -> AudioResult<Opened> {
         self.observed.opens.lock().unwrap().push(endpoint.into());
+        if endpoint != "render.explicit" {
+            return Err("endpoint_not_found");
+        }
         Ok(Opened {
             endpoint: endpoint.into(),
             format: Format::new(48_000, 2, PCM_F32).unwrap(),
@@ -141,6 +144,21 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_and_never_selects_a_defaul
         Some("stream_closed")
     );
     assert_eq!(*observed.opens.lock().unwrap(), ["render.explicit"]);
+}
+
+#[test]
+fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
+    let (mut controller, observed) = controller(true);
+    let result = controller.handle(
+        "alice",
+        Operation::Open {
+            endpoint: "render.missing".into(),
+            operation_id: Some("missing-endpoint".into()),
+        },
+    );
+
+    assert_eq!(result.err(), Some("endpoint_not_found"));
+    assert_eq!(*observed.opens.lock().unwrap(), ["render.missing"]);
 }
 
 #[test]
