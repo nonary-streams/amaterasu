@@ -263,6 +263,7 @@ pub struct Controller {
     global_video_max_batch_size_kb: u8,
     global_max_bitrate_kbps: Option<u32>,
     global_minimum_fps_target: f64,
+    global_wgc_pacing_smoothing: bool,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -287,6 +288,7 @@ impl Controller {
             global_video_max_batch_size_kb: 64,
             global_max_bitrate_kbps: None,
             global_minimum_fps_target: 20.0,
+            global_wgc_pacing_smoothing: true,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -331,6 +333,10 @@ impl Controller {
         self.global_minimum_fps_target = target;
     }
 
+    pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
+        self.global_wgc_pacing_smoothing = enabled;
+    }
+
     pub fn busy(&self) -> bool {
         self.records.values().any(|record| !record.state.terminal())
     }
@@ -371,6 +377,7 @@ impl Controller {
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
         let global_minimum_fps_target = self.global_minimum_fps_target;
+        let global_wgc_pacing_smoothing = self.global_wgc_pacing_smoothing;
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -433,6 +440,7 @@ impl Controller {
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
             global_minimum_fps_target,
+            global_wgc_pacing_smoothing,
             capture_output,
             audio_endpoint,
             bootstrap_audio_endpoint,

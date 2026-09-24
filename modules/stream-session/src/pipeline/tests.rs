@@ -167,6 +167,40 @@ fn constant_rate_mode_reaches_video_open_and_uses_a_distinct_capture_lease() {
 }
 
 #[test]
+fn wgc_pacing_smoothing_snapshot_reaches_video_open() {
+    let mut enabled_host = Harness::new();
+    let id = enabled_host.response(1, prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut enabled = start(id);
+    enabled["configuration"]["capture_provider"] = json!("wgc");
+    assert_eq!(enabled_host.response(2, enabled)["state"], "active");
+    let enabled_open = enabled_host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("enabled WGC video open");
+    assert_eq!(enabled_open.payload["wgc_pacing_smoothing"], true);
+
+    let mut disabled_host = Harness::new();
+    let id = disabled_host.response(1, prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut disabled = start(id);
+    disabled["configuration"]["capture_provider"] = json!("wgc");
+    disabled["configuration"]["wgc_pacing_smoothing"] = json!(false);
+    assert_eq!(disabled_host.response(2, disabled)["state"], "active");
+    let disabled_open = disabled_host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .expect("disabled WGC video open");
+    assert_eq!(disabled_open.payload["wgc_pacing_smoothing"], false);
+}
+
+#[test]
 fn disabled_audio_skips_encoder_capture_and_audio_lease_but_keeps_video_plane() {
     let mut host = Harness::new();
     let mut request = prepare();

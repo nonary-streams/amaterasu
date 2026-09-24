@@ -174,6 +174,7 @@ impl Controller {
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
                         "minimum_fps_target": record.global_minimum_fps_target,
+                        "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "capture": capture,
                         "profile": {
                             "width": record.request.width,

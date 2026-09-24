@@ -276,6 +276,8 @@ pub struct StartConfig {
     pub constant_rate: bool,
     #[serde(default = "default_minimum_fps_target")]
     pub minimum_fps_target: f64,
+    #[serde(default = "default_wgc_pacing_smoothing")]
+    pub wgc_pacing_smoothing: bool,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,
@@ -302,6 +304,10 @@ impl StartConfig {
 
 fn default_minimum_fps_target() -> f64 {
     20.0
+}
+
+fn default_wgc_pacing_smoothing() -> bool {
+    true
 }
 
 fn valid_minimum_fps_target(value: f64) -> bool {
@@ -407,6 +413,7 @@ mod tests {
         assert!(without_audio.validate(true).is_err());
         assert!(matches!(start.capture_provider, CaptureProvider::Dxgi));
         assert_eq!(start.minimum_fps_target, 20.0);
+        assert!(start.wgc_pacing_smoothing);
         assert_eq!(start.configuration.max_reference_frames, 0);
         assert!(
             serde_json::to_value(&start.configuration).unwrap()["max_reference_frames"].is_null()
@@ -437,6 +444,18 @@ mod tests {
             let parsed: StartConfig = serde_json::from_value(request).unwrap();
             assert_eq!(parsed.validate(true), Err("invalid_minimum_fps_target"));
         }
+    }
+
+    #[test]
+    fn wgc_pacing_smoothing_defaults_on_and_preserves_explicit_disable() {
+        let defaulted: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert!(defaulted.wgc_pacing_smoothing);
+
+        let mut selected = start_json();
+        selected["wgc_pacing_smoothing"] = json!(false);
+        let selected: StartConfig = serde_json::from_value(selected).unwrap();
+        assert!(!selected.wgc_pacing_smoothing);
+        assert!(selected.validate(true).is_ok());
     }
 
     #[test]

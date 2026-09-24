@@ -19,7 +19,8 @@ const VIDEO_BATCH_SETTINGS_VERSION: u64 = 7;
 const MAX_BITRATE_SETTINGS_VERSION: u64 = 8;
 const MINIMUM_FPS_SETTINGS_VERSION: u64 = 9;
 const AUDIO_SINK_SETTINGS_VERSION: u64 = 10;
-const SETTINGS_VERSION: u64 = AUDIO_SINK_SETTINGS_VERSION;
+const WGC_PACING_SMOOTHING_SETTINGS_VERSION: u64 = 11;
+const SETTINGS_VERSION: u64 = WGC_PACING_SMOOTHING_SETTINGS_VERSION;
 const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
@@ -41,6 +42,7 @@ pub enum AdminAction {
         video_max_batch_size_kb: FieldUpdate<u8>,
         max_bitrate: FieldUpdate<i32>,
         minimum_fps_target: FieldUpdate<f64>,
+        wgc_pacing_smoothing: FieldUpdate<bool>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -114,6 +116,7 @@ enum Purpose {
         video_max_batch_size_kb: Option<u8>,
         max_bitrate: Option<i32>,
         minimum_fps_target: Option<f64>,
+        wgc_pacing_smoothing: Option<bool>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -149,6 +152,7 @@ struct ProductDocument {
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
+    wgc_pacing_smoothing: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -159,6 +163,7 @@ struct ProductStreamingSettings {
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
+    wgc_pacing_smoothing: Option<bool>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -180,6 +185,7 @@ pub struct ProductSettings {
     configured_video_max_batch_size_kb: Option<u8>,
     configured_max_bitrate: Option<i32>,
     configured_minimum_fps_target: Option<f64>,
+    configured_wgc_pacing_smoothing: Option<bool>,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -274,6 +280,7 @@ impl ProductSettings {
             configured_video_max_batch_size_kb: None,
             configured_max_bitrate: None,
             configured_minimum_fps_target: None,
+            configured_wgc_pacing_smoothing: None,
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -358,6 +365,14 @@ impl ProductSettings {
     pub fn effective_minimum_fps_target(&self) -> f64 {
         self.configured_minimum_fps_target
             .unwrap_or(DEFAULT_MINIMUM_FPS_TARGET)
+    }
+
+    pub fn configured_wgc_pacing_smoothing(&self) -> Option<bool> {
+        self.configured_wgc_pacing_smoothing
+    }
+
+    pub fn effective_wgc_pacing_smoothing(&self) -> bool {
+        self.configured_wgc_pacing_smoothing.unwrap_or(true)
     }
 
     pub fn stream_audio(&self) -> bool {
@@ -844,6 +859,7 @@ impl ProductSettings {
                 video_max_batch_size_kb,
                 max_bitrate,
                 minimum_fps_target,
+                wgc_pacing_smoothing,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -929,6 +945,8 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let wgc_pacing_smoothing =
+                    apply_field_update(wgc_pacing_smoothing, self.configured_wgc_pacing_smoothing);
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -994,6 +1012,7 @@ impl ProductSettings {
                             video_max_batch_size_kb,
                             max_bitrate,
                             minimum_fps_target,
+                            wgc_pacing_smoothing,
                         },
                     ),
                     Some(request.request),
@@ -1009,6 +1028,7 @@ impl ProductSettings {
                         video_max_batch_size_kb,
                         max_bitrate,
                         minimum_fps_target,
+                        wgc_pacing_smoothing,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -1126,6 +1146,7 @@ impl ProductSettings {
                 video_max_batch_size_kb,
                 max_bitrate,
                 minimum_fps_target,
+                wgc_pacing_smoothing,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
@@ -1141,6 +1162,7 @@ impl ProductSettings {
                         video_max_batch_size_kb,
                         max_bitrate,
                         minimum_fps_target,
+                        wgc_pacing_smoothing,
                     };
                     match update_result(&payload, &expected) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
@@ -1419,6 +1441,7 @@ impl ProductSettings {
         self.configured_video_max_batch_size_kb = document.video_max_batch_size_kb;
         self.configured_max_bitrate = document.max_bitrate;
         self.configured_minimum_fps_target = document.minimum_fps_target;
+        self.configured_wgc_pacing_smoothing = document.wgc_pacing_smoothing;
         self.loaded = true;
     }
 
@@ -1444,6 +1467,8 @@ impl ProductSettings {
             "effective_max_bitrate_kbps":self.effective_max_bitrate_kbps(),
             "configured_minimum_fps_target":self.configured_minimum_fps_target(),
             "effective_minimum_fps_target":self.effective_minimum_fps_target(),
+            "configured_wgc_pacing_smoothing":self.configured_wgc_pacing_smoothing(),
+            "effective_wgc_pacing_smoothing":self.effective_wgc_pacing_smoothing(),
             "stream_audio":self.stream_audio,
             "effective_output_name":self.effective_output_name(),
             "capture_provider":self.capture_provider(),
@@ -1518,6 +1543,7 @@ fn product_update_payload(
             "video_max_batch_size_kb":streaming.video_max_batch_size_kb,
             "max_bitrate":streaming.max_bitrate,
             "minimum_fps_target":streaming.minimum_fps_target,
+            "wgc_pacing_smoothing":streaming.wgc_pacing_smoothing,
         },
     })
 }
@@ -1568,6 +1594,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             video_max_batch_size_kb: None,
             max_bitrate: None,
             minimum_fps_target: None,
+            wgc_pacing_smoothing: None,
         });
     }
 
@@ -1587,6 +1614,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | MAX_BITRATE_SETTINGS_VERSION
             | MINIMUM_FPS_SETTINGS_VERSION
             | AUDIO_SINK_SETTINGS_VERSION
+            | WGC_PACING_SMOOTHING_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -1604,6 +1632,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         MAX_BITRATE_SETTINGS_VERSION => 9,
         MINIMUM_FPS_SETTINGS_VERSION => 10,
         AUDIO_SINK_SETTINGS_VERSION => 11,
+        WGC_PACING_SMOOTHING_SETTINGS_VERSION => 12,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1619,6 +1648,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= MAX_BITRATE_SETTINGS_VERSION && !values.contains_key("max_bitrate"))
         || (version >= MINIMUM_FPS_SETTINGS_VERSION && !values.contains_key("minimum_fps_target"))
         || (version >= AUDIO_SINK_SETTINGS_VERSION && !values.contains_key("audio_sink"))
+        || (version >= WGC_PACING_SMOOTHING_SETTINGS_VERSION
+            && !values.contains_key("wgc_pacing_smoothing"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1740,6 +1771,15 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         None
     };
+    let wgc_pacing_smoothing = if version >= WGC_PACING_SMOOTHING_SETTINGS_VERSION {
+        match values.get("wgc_pacing_smoothing") {
+            Some(Value::Null) => None,
+            Some(Value::Bool(value)) => Some(*value),
+            _ => return Err(invalid_state("persisted wgc_pacing_smoothing is invalid")),
+        }
+    } else {
+        None
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -1753,6 +1793,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         video_max_batch_size_kb,
         max_bitrate,
         minimum_fps_target,
+        wgc_pacing_smoothing,
     })
 }
 
@@ -1768,6 +1809,7 @@ struct UpdateExpectation<'a> {
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
+    wgc_pacing_smoothing: Option<bool>,
 }
 
 fn update_result(
@@ -1779,7 +1821,7 @@ fn update_result(
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v10 audio sink settings",
+            "product_update did not confirm the v11 WGC pacing settings",
         ));
     }
     let document = parse_document(payload)?;
@@ -1794,6 +1836,7 @@ fn update_result(
         || document.video_max_batch_size_kb != expected.video_max_batch_size_kb
         || document.max_bitrate != expected.max_bitrate
         || document.minimum_fps_target != expected.minimum_fps_target
+        || document.wgc_pacing_smoothing != expected.wgc_pacing_smoothing
         || expected.revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -2424,6 +2467,7 @@ mod tests {
                 "max_bitrate":null,"minimum_fps_target":20.0}
         });
         let parsed = parse_document(&document).unwrap();
+        assert_eq!(parsed.wgc_pacing_smoothing, None);
         let mut first_start =
             ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
         first_start.apply_document(parsed);
@@ -2443,6 +2487,8 @@ mod tests {
         restarted.apply_document(parse_document(&document).unwrap());
         assert_eq!(restarted.configured_audio_sink(), Some(selected));
         assert_eq!(restarted.effective_audio_sink(), selected);
+        assert_eq!(restarted.configured_wgc_pacing_smoothing(), None);
+        assert!(restarted.effective_wgc_pacing_smoothing());
 
         for invalid_sink in [json!("render\ninvalid"), json!("é".repeat(2049)), json!(7)] {
             let mut invalid = document.clone();
@@ -2461,6 +2507,141 @@ mod tests {
             parse_document(&missing).unwrap_err().code,
             "invalid_state_response"
         );
+    }
+
+    #[test]
+    fn v11_wgc_pacing_smoothing_migrates_v10_default_and_persists_bool_or_reset() {
+        let legacy_v10 = json!({
+            "ok":true,"found":true,"version":10,"revision":9,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"audio_sink":null,
+                "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                "max_bitrate":null,"minimum_fps_target":20.0}
+        });
+        let mut migrated = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        migrated.apply_document(parse_document(&legacy_v10).unwrap());
+        assert_eq!(migrated.configured_wgc_pacing_smoothing(), None);
+        assert!(migrated.effective_wgc_pacing_smoothing());
+
+        for (raw, effective) in [
+            (json!(true), true),
+            (json!(false), false),
+            (Value::Null, true),
+        ] {
+            let document = json!({
+                "ok":true,"found":true,"version":11,"revision":10,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,
+                    "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                    "max_bitrate":null,"minimum_fps_target":20.0,
+                    "wgc_pacing_smoothing":raw}
+            });
+            let parsed = parse_document(&document).unwrap();
+            let configured = raw.as_bool();
+            assert_eq!(parsed.wgc_pacing_smoothing, configured);
+
+            let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+            product.apply_document(parsed);
+            assert_eq!(product.configured_wgc_pacing_smoothing(), configured);
+            assert_eq!(product.effective_wgc_pacing_smoothing(), effective);
+            assert_eq!(
+                product.settings_payload()["configured_wgc_pacing_smoothing"],
+                raw
+            );
+            assert_eq!(
+                product.settings_payload()["effective_wgc_pacing_smoothing"],
+                effective
+            );
+        }
+
+        for invalid in [
+            json!({"ok":true,"found":true,"version":11,"revision":10,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,
+                    "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                    "max_bitrate":null,"minimum_fps_target":20.0}}),
+            json!({"ok":true,"found":true,"version":11,"revision":10,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,
+                    "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                    "max_bitrate":null,"minimum_fps_target":20.0,
+                    "wgc_pacing_smoothing":"true"}}),
+        ] {
+            assert_eq!(
+                parse_document(&invalid).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+    }
+
+    #[test]
+    fn wgc_pacing_smoothing_admin_update_preserves_selects_and_resets() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":11,"revision":5,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"audio_sink":null,
+                    "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                    "max_bitrate":null,"minimum_fps_target":20.0,
+                    "wgc_pacing_smoothing":true}
+            }))
+            .unwrap(),
+        );
+
+        for (request, revision, update, expected) in [
+            (41, 5, FieldUpdate::Omitted, Some(true)),
+            (42, 6, FieldUpdate::Value(false), Some(false)),
+            (43, 7, FieldUpdate::Null, None),
+        ] {
+            product
+                .enqueue(
+                    request,
+                    5_000,
+                    AdminAction::Update {
+                        hostname: "Host".into(),
+                        port: 47_989,
+                        address_family: FieldUpdate::Omitted,
+                        bind_address: FieldUpdate::Omitted,
+                        output_name: FieldUpdate::Omitted,
+                        audio_sink: FieldUpdate::Omitted,
+                        stream_audio: FieldUpdate::Omitted,
+                        capture: FieldUpdate::Omitted,
+                        video_max_batch_size_kb: FieldUpdate::Omitted,
+                        max_bitrate: FieldUpdate::Omitted,
+                        minimum_fps_target: FieldUpdate::Omitted,
+                        wgc_pacing_smoothing: update,
+                        expected_revision: revision,
+                        require_listener_apply: false,
+                    },
+                )
+                .unwrap();
+            product.start_next();
+            let pending = product.pending.take().expect("product update request");
+            let expected_raw = expected.map_or(Value::Null, |value| json!(value));
+            assert_eq!(pending.payload["version"], 11);
+            assert_eq!(
+                pending.payload["values"]["wgc_pacing_smoothing"],
+                expected_raw
+            );
+
+            product.finish_call(
+                pending.purpose,
+                CallOutcome::Payload(json!({
+                    "ok":true,"found":true,"version":11,"revision":revision + 1,
+                    "values":{"hostname":"Host","port":47989,"address_family":null,
+                        "bind_address":null,"output_name":null,"audio_sink":null,
+                        "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
+                        "max_bitrate":null,"minimum_fps_target":20.0,
+                        "wgc_pacing_smoothing":expected_raw}
+                })),
+            );
+            assert_eq!(product.configured_wgc_pacing_smoothing(), expected);
+            assert_eq!(
+                product.effective_wgc_pacing_smoothing(),
+                expected.unwrap_or(true)
+            );
+        }
     }
 
     #[test]
@@ -2519,6 +2700,7 @@ mod tests {
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
+                    wgc_pacing_smoothing: FieldUpdate::Omitted,
                     expected_revision: 8,
                     require_listener_apply: false,
                 },
@@ -2526,16 +2708,16 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 10);
+        assert_eq!(pending.payload["version"], 11);
         assert_eq!(pending.payload["values"]["audio_sink"], "render.selected");
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":10,"revision":9,
+                "ok":true,"found":true,"version":11,"revision":9,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":"render.selected",
                     "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
-                    "max_bitrate":null,"minimum_fps_target":20.0}
+                    "max_bitrate":null,"minimum_fps_target":20.0,"wgc_pacing_smoothing":null}
             })),
         );
 
@@ -2580,6 +2762,7 @@ mod tests {
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: FieldUpdate::Omitted,
                         minimum_fps_target: update,
+                        wgc_pacing_smoothing: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -2587,7 +2770,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 10);
+            assert_eq!(pending.payload["version"], 11);
             assert_eq!(
                 pending.payload["values"]["minimum_fps_target"],
                 expected_raw
@@ -2600,12 +2783,12 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":10,"revision":reply_revision,
+                    "ok":true,"found":true,"version":11,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"audio_sink":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":32,"max_bitrate":null,
-                        "minimum_fps_target":persisted_value}
+                        "minimum_fps_target":persisted_value,"wgc_pacing_smoothing":null}
                 })),
             );
         }
@@ -2652,6 +2835,7 @@ mod tests {
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: update,
                         minimum_fps_target: FieldUpdate::Omitted,
+                        wgc_pacing_smoothing: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -2659,18 +2843,18 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 10);
+            assert_eq!(pending.payload["version"], 11);
             assert_eq!(
                 pending.payload["values"]["max_bitrate"],
                 expected.map_or(Value::Null, |value| json!(value))
             );
 
             let response = json!({
-                "ok":true,"found":true,"version":10,"revision":revision + 1,
+                "ok":true,"found":true,"version":11,"revision":revision + 1,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":null,
                     "stream_audio":true,"capture":"auto",
-                    "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null}
+                    "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
             });
             product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
             assert_eq!(product.configured_max_bitrate(), expected);
@@ -2809,8 +2993,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":10,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+            "ok":true,"found":true,"version":11,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -2828,6 +3012,7 @@ mod tests {
             video_max_batch_size_kb: None,
             max_bitrate: None,
             minimum_fps_target: None,
+            wgc_pacing_smoothing: None,
         };
         assert_eq!(update_result(&success, &expected).unwrap().revision, 4);
         assert_eq!(
@@ -2871,8 +3056,8 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":10,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+            "ok":true,"found":true,"version":11,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
         });
         assert_eq!(
             update_result(
@@ -2890,8 +3075,8 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":10,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+            "ok":true,"found":true,"version":11,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
         });
         assert_eq!(
             update_result(
@@ -2965,6 +3150,8 @@ mod tests {
             "effective_max_bitrate_kbps":null,
             "configured_minimum_fps_target":null,
             "effective_minimum_fps_target":20.0,
+            "configured_wgc_pacing_smoothing":null,
+            "effective_wgc_pacing_smoothing":true,
             "stream_audio":true,
             "effective_output_name":null,
                 "capture_provider":null,
@@ -3051,15 +3238,16 @@ mod tests {
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
                 minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":10,
+                "version":11,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
             })),
         );
 
@@ -3110,12 +3298,13 @@ mod tests {
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
                 minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":10,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+                "ok":true,"found":true,"version":11,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
             })),
         );
 
@@ -3282,12 +3471,13 @@ mod tests {
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
                 minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":10,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+                "ok":true,"found":true,"version":11,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
             })),
         );
 
@@ -3328,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_product_update_payload_keeps_nullable_values_exact() {
+    fn v11_product_update_payload_keeps_nullable_values_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -3345,9 +3535,10 @@ mod tests {
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
                 minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
             },
         );
-        assert_eq!(reset["version"], 10);
+        assert_eq!(reset["version"], 11);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
@@ -3355,6 +3546,7 @@ mod tests {
         assert_eq!(reset["values"]["max_bitrate"], Value::Null);
         assert_eq!(reset["values"]["minimum_fps_target"], Value::Null);
         assert_eq!(reset["values"]["audio_sink"], Value::Null);
+        assert_eq!(reset["values"]["wgc_pacing_smoothing"], Value::Null);
 
         let explicit_blank = product_update_payload(
             8,
@@ -3372,6 +3564,7 @@ mod tests {
                 video_max_batch_size_kb: Some(32),
                 max_bitrate: Some(15_000),
                 minimum_fps_target: None,
+                wgc_pacing_smoothing: Some(false),
             },
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
@@ -3383,6 +3576,7 @@ mod tests {
         assert_eq!(explicit_blank["values"]["max_bitrate"], 15_000);
         assert_eq!(explicit_blank["values"]["minimum_fps_target"], Value::Null);
         assert_eq!(explicit_blank["values"]["audio_sink"], Value::Null);
+        assert_eq!(explicit_blank["values"]["wgc_pacing_smoothing"], false);
     }
 
     #[test]
@@ -3448,6 +3642,7 @@ mod tests {
                         video_max_batch_size_kb: update,
                         max_bitrate: FieldUpdate::Omitted,
                         minimum_fps_target: FieldUpdate::Omitted,
+                        wgc_pacing_smoothing: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -3455,7 +3650,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 10);
+            assert_eq!(pending.payload["version"], 11);
             assert_eq!(
                 pending.payload["values"]["video_max_batch_size_kb"],
                 expected_raw
@@ -3468,12 +3663,12 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":10,"revision":reply_revision,
+                    "ok":true,"found":true,"version":11,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"audio_sink":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":persisted_value,"max_bitrate":null,
-                        "minimum_fps_target":null}
+                    "minimum_fps_target":null,"wgc_pacing_smoothing":null}
                 })),
             );
         }
@@ -3514,6 +3709,7 @@ mod tests {
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
+                    wgc_pacing_smoothing: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -3521,7 +3717,7 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 10);
+        assert_eq!(payload["version"], 11);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
         assert_eq!(payload["values"]["capture"], "auto");
@@ -3551,6 +3747,7 @@ mod tests {
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
+                    wgc_pacing_smoothing: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -3591,6 +3788,7 @@ mod tests {
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
                     minimum_fps_target: FieldUpdate::Omitted,
+                    wgc_pacing_smoothing: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: false,
                 },
@@ -3598,17 +3796,17 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 10);
+        assert_eq!(pending.payload["version"], 11);
         assert_eq!(pending.payload["values"]["capture"], "wgcc");
 
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":10,"revision":5,
+                "ok":true,"found":true,"version":11,"revision":5,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":null,
                     "stream_audio":true,"capture":"wgcc",
-                    "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
+                    "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null}
             })),
         );
         assert_eq!(product.configured_capture(), CaptureMode::Wgcc);

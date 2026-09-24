@@ -399,6 +399,8 @@ pub struct Open {
     pub stream_audio: bool,
     #[serde(default = "default_minimum_fps_target")]
     pub minimum_fps_target: f64,
+    #[serde(default = "default_wgc_pacing_smoothing")]
+    pub wgc_pacing_smoothing: bool,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -508,6 +510,7 @@ impl Open {
                 "capture_provider": self.capture.capture_provider,
                 "constant_rate": self.capture.constant_rate,
                 "minimum_fps_target": self.minimum_fps_target,
+                "wgc_pacing_smoothing": self.wgc_pacing_smoothing,
                 "output": self.capture.output,
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
@@ -529,6 +532,10 @@ fn default_stream_audio() -> bool {
 
 fn default_minimum_fps_target() -> f64 {
     20.0
+}
+
+fn default_wgc_pacing_smoothing() -> bool {
+    true
 }
 
 fn valid_minimum_fps_target(value: f64) -> bool {
@@ -858,6 +865,18 @@ mod tests {
         assert_eq!(
             request.validate_capture(),
             Err("invalid_minimum_fps_target")
+        );
+    }
+
+    #[test]
+    fn wgc_pacing_smoothing_defaults_on_and_reaches_stream_session_start() {
+        let mut request = open();
+        assert!(request.wgc_pacing_smoothing);
+        request.wgc_pacing_smoothing = false;
+        assert!(request.validate(false).is_ok());
+        assert_eq!(
+            request.arm(51)["configuration"]["wgc_pacing_smoothing"],
+            false
         );
     }
 

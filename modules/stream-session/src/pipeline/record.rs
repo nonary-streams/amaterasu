@@ -279,7 +279,8 @@ impl Record {
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");
                 json!({"action":"open","capture_provider":start.capture_provider,"output":start.output,
-                    "constant_rate":start.constant_rate,"minimum_fps_target":start.minimum_fps_target,"encoder":start.encoder,
+                    "constant_rate":start.constant_rate,"minimum_fps_target":start.minimum_fps_target,
+                    "wgc_pacing_smoothing":start.wgc_pacing_smoothing,"encoder":start.encoder,
                     "configuration":start.configuration,"packet_boundaries":true})
             }
             Resource::AudioCapture => {

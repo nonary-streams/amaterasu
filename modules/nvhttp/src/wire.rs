@@ -177,6 +177,10 @@ impl Router {
         self.launches.set_global_minimum_fps_target(target);
     }
 
+    pub fn set_global_wgc_pacing_smoothing(&mut self, enabled: bool) {
+        self.launches.set_global_wgc_pacing_smoothing(enabled);
+    }
+
     pub fn set_capture_mode(&mut self, capture: crate::launch::CaptureMode) {
         self.launches.set_capture_mode(capture);
     }

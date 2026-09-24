@@ -51,6 +51,8 @@ enum Operation {
         max_bitrate: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         minimum_fps_target: FieldUpdate<f64>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        wgc_pacing_smoothing: FieldUpdate<bool>,
         expected_revision: u64,
     },
 }
@@ -179,6 +181,9 @@ impl ManagedModule for NvhttpModule {
             router.set_global_max_bitrate_kbps(self.product_settings.effective_max_bitrate_kbps());
             router.set_global_minimum_fps_target(
                 self.product_settings.effective_minimum_fps_target(),
+            );
+            router.set_global_wgc_pacing_smoothing(
+                self.product_settings.effective_wgc_pacing_smoothing(),
             );
         }
         if self.product_settings.loaded() {
@@ -433,6 +438,7 @@ impl NvhttpModule {
                                 video_max_batch_size_kb,
                                 max_bitrate,
                                 minimum_fps_target,
+                                wgc_pacing_smoothing,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -461,6 +467,7 @@ impl NvhttpModule {
                                     video_max_batch_size_kb,
                                     max_bitrate,
                                     minimum_fps_target,
+                                    wgc_pacing_smoothing,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -603,6 +610,7 @@ mod tests {
             video_max_batch_size_kb: omitted_batch_size,
             max_bitrate: omitted_max_bitrate,
             minimum_fps_target: omitted_minimum_fps,
+            wgc_pacing_smoothing: omitted_wgc_pacing,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -620,6 +628,7 @@ mod tests {
         assert_eq!(omitted_batch_size, FieldUpdate::Omitted);
         assert_eq!(omitted_max_bitrate, FieldUpdate::Omitted);
         assert_eq!(omitted_minimum_fps, FieldUpdate::Omitted);
+        assert_eq!(omitted_wgc_pacing, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -631,11 +640,12 @@ mod tests {
             video_max_batch_size_kb: null_batch_size,
             max_bitrate: null_max_bitrate,
             minimum_fps_target: null_minimum_fps,
+            wgc_pacing_smoothing: null_wgc_pacing,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"audio_sink":null,"stream_audio":null,"capture":null,
-            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null
+            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null
         }))
         .unwrap()
         else {
@@ -650,6 +660,7 @@ mod tests {
         assert_eq!(null_batch_size, FieldUpdate::Null);
         assert_eq!(null_max_bitrate, FieldUpdate::Null);
         assert_eq!(null_minimum_fps, FieldUpdate::Null);
+        assert_eq!(null_wgc_pacing, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -661,11 +672,12 @@ mod tests {
             video_max_batch_size_kb,
             max_bitrate,
             minimum_fps_target,
+            wgc_pacing_smoothing,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","audio_sink":"render.selected","stream_audio":false,"capture":"wgcc",
-            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5
+            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false
         }))
         .unwrap()
         else {
@@ -680,6 +692,7 @@ mod tests {
         assert_eq!(video_max_batch_size_kb, FieldUpdate::Value(32));
         assert_eq!(max_bitrate, FieldUpdate::Value(-15_000));
         assert_eq!(minimum_fps_target, FieldUpdate::Value(23.5));
+        assert_eq!(wgc_pacing_smoothing, FieldUpdate::Value(false));
 
         assert!(
             serde_json::from_value::<Operation>(json!({
