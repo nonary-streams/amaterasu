@@ -33,8 +33,9 @@ Workers should report concrete changed files, test commands and results, and
 unimplemented behavior. Sol integrates only when the ownership boundary is clear
 and the option's observable effect is tested. The current increment establishes
 the inventory and settings foundation, host and application lifecycle controls,
-session renewal, network port behavior, and Steam provider reconciliation. It
-does not pass the final parity gate.
+session renewal, network policy, Steam and Playnite provider slices, a live
+input policy, and one certificate-bound streaming override. It does not pass
+the final parity gate.
 
 Each worker commits its owned implementation after rustfmt, meaningful tests,
 and Clippy. Use the repository's Nonary Git identity and include these exact
@@ -56,12 +57,30 @@ The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
 IPv4 and IPv6 listeners can coexist where the startup policy requests both.
 `global:port` remains pending until listener moves, startup recovery, and
 platform behavior are verified as one configuration contract. Durable live
-updates of `address_family` and `bind_address` are in progress; those IDs
-remain pending until every public listener follows their effective policy
-without weakening the loopback control plane.
+updates of `address_family` and `bind_address` now cover NVHTTP and RTSP on
+Windows. Those IDs remain pending until every public listener and supported
+platform follows the effective policy without weakening the loopback control
+plane.
 
 Per-application process lifecycle fields now preserve omitted values and apply
-explicit values at launch. The shared `config-overrides` map and named-client
-overrides remain pending: launch has no authenticated TLS client identity or
-trusted client profile lookup yet. A request-supplied client ID cannot provide
-that authority.
+explicit values at launch. `fec_percentage` now resolves from the global
+stream profile through a sparse app override and a certificate-matched paired
+client record. The management editor updates that sparse FEC value through
+the paired certificate record. The other shared override keys and their
+runtime consumers remain pending. Request-supplied client IDs are not used as
+authority.
+
+Keyboard and mouse settings now persist and gate native input events; disabling
+a category releases its held keys or buttons and reports pending cleanup when
+the operating system rejects a release. Scancode choice, high-resolution
+scrolling, controller/gamepad behavior, and platform-specific input effects
+remain pending.
+
+Playnite now imports only complete, bounded extension snapshots through its
+own provider and leaves stale catalog entries intact. Its management editor,
+Playnite-ID launch support, targeted stale cleanup, focus behavior, fullscreen
+entry, and extension management remain pending. Lutris now imports complete
+current-user Linux library snapshots with exclusions and optional Steam
+deduplication. Cross-session discovery, generic-launch eligibility after
+disabling the provider, and selective cleanup when stale removal is disabled
+remain pending.
