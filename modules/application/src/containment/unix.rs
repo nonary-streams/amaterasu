@@ -48,7 +48,7 @@ impl ContainedChild {
         }
         // SAFETY: si_code and si_status are initialized for the reported child.
         Ok(Some(
-            unsafe { info.si_code() } == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+            siginfo_code(&info) == libc::CLD_EXITED && siginfo_status(&info) == 0,
         ))
     }
 
@@ -195,7 +195,7 @@ fn macos_group_is_dead(group: u32) -> io::Result<bool> {
     }
 
     Ok(super::macos_members_are_dead(
-        &members[..size as usize],
+        members[..size as usize].iter().copied(),
         |pid| {
             // SAFETY: zero is valid initialization and proc_pidinfo receives the
             // matching buffer size/flavor. This is inspection only, never PID signaling.
@@ -216,4 +216,26 @@ fn macos_group_is_dead(group: u32) -> io::Result<bool> {
                 .then_some(info.pbi_status == libc::SZOMB)
         },
     ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn siginfo_code(info: &libc::siginfo_t) -> i32 {
+    info.si_code
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn siginfo_code(info: &libc::siginfo_t) -> i32 {
+    // SAFETY: callers only inspect siginfo_t after waitid initialized its result.
+    unsafe { info.si_code() }
+}
+
+#[cfg(target_os = "macos")]
+fn siginfo_status(info: &libc::siginfo_t) -> i32 {
+    info.si_status
+}
+
+#[cfg(not(target_os = "macos"))]
+fn siginfo_status(info: &libc::siginfo_t) -> i32 {
+    // SAFETY: callers only inspect siginfo_t after waitid initialized its result.
+    unsafe { info.si_status() }
 }
