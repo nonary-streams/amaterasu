@@ -23,7 +23,7 @@ Each coverage ID is assigned once. Application fields stay with applications; al
 
 ### luna-01
 
-Write ownership: `modules/configuration/`, `modules/authentication/`, `modules/state/`, `crates/runtime/`, `crates/host/`, `crates/package/`, `crates/storage/`, `crates/identity/`, `crates/module-sdk/`, `crates/contracts/`, `crates/abi/`, `sdk/`, `root manifests and lockfiles`, `CI`, `scripts`.
+Write ownership: `modules/configuration/`, `modules/host-configuration/`, `modules/authentication/`, `modules/state/`, `crates/runtime/`, `crates/host/`, `crates/package/`, `crates/storage/`, `crates/identity/`, `crates/module-sdk/`, `crates/contracts/`, `crates/abi/`, `sdk/`, `root manifests and lockfiles`, `CI`, `scripts`.
 
 | Stable ID | Status |
 | --- | --- |
@@ -62,7 +62,7 @@ Write ownership: `modules/nvhttp/`, `modules/pairing/`, `modules/rtsp/`, `module
 
 ### luna-03
 
-Write ownership: `modules/video/`, `modules/encode/`, `modules/capture-dxgi/`, `modules/capture-wgc/`, `modules/display/`, `modules/virtual-display/`, `crates/media/`, `crates/windows-capture-geometry/`.
+Write ownership: `modules/video/`, `modules/encode/`, `modules/capture-dxgi/`, `modules/capture-wgc/`, `modules/display/`, `modules/virtual-display/`, `modules/frame-limiter/`, `crates/media/`, `crates/windows-capture-geometry/`.
 
 | Stable ID | Status |
 | --- | --- |
@@ -282,7 +282,7 @@ Write ownership: `modules/catalog/`, `modules/application/`, `modules/launch/`, 
 
 ### luna-06
 
-Write ownership: `modules/management/`, `frontend/`, `modules/diagnostics/`, `modules/session-history/`.
+Write ownership: `modules/management/`, `frontend/`, `modules/diagnostics/`, `modules/session-history/`, `modules/updater/`, `modules/system-tray/`, `modules/host-metrics/`.
 
 | Stable ID | Status |
 | --- | --- |
@@ -307,7 +307,17 @@ Write ownership: `modules/management/`, `frontend/`, `modules/diagnostics/`, `mo
 
 ## Dependencies and version reservations
 
-No cross-lane dependency requests or schema reservations have been accepted yet. The coordinator records each request and its acknowledgment in `coordination.json` and this file, then relays it through the relevant inboxes.
+Coordinator decisions and dependency acknowledgments are tracked here and in the run inbox/outbox.
+
+| Request | Ownership / contract | Status |
+| --- | --- | --- |
+| `luna-02-stream-overrides-01` | `luna-02` owns global stream-value resolution and nvhttp persistence; `luna-05` owns catalog/launch persistence; `luna-06` owns signed management routes and frontend controls. Preserve absent/null versus explicit zero; per-client values are keyed by paired certificate identity and take precedence over per-application, global, then reference defaults. | Relayed to all three owners; implementation and schema acknowledgments pending. |
+| `luna-03-frame-limiter-path-001` | `luna-03` owns `modules/frame-limiter/**`; `luna-02` is the only writer for nvhttp persistence and launch projection. | Path ownership assigned. Interface and launch contract pending. |
+| Product-settings migration | Reserve nvhttp v17 once for the combined v16-to-v17 parity batch, with `luna-02` as sole writer. Include the frame-limiter global fields supplied by `luna-03`; do not create a second v17 migration. | Coordinator reservation issued; lane acknowledgment pending. |
+| Host settings provider | `luna-01` owns `modules/host-configuration/**`, `amaterasu.host-configuration/1`, and its revisioned v1 product document for host paths/identity plus `log_path` and `min_log_level`. `file_state` and `vibeshine_file_state` select contained legacy import files and do not replace live Amaterasu state storage. `luna-02` consumes read-only identity/import values; `luna-06` owns the signed editor and diagnostics behavior. | Coordinator decision relayed; provider API/readiness and consumer acknowledgments pending. |
+| Session TTL and browser session parity | `luna-01` owns auth persistence and configured TTL behavior; `luna-06` owns management cookie and frontend behavior. Keep management loopback-only and retain Secure, HttpOnly, SameSite and Origin protections. | Dependency relayed; route, browser-origin and restart evidence pending. |
+| DS4 Back mapping | `luna-04` owns the input policy and reserves `amaterasu.input` settings v9; `luna-02` owns stream launch projection, `luna-05` owns sparse catalog overrides, and `luna-06` owns management/frontend changes. Explicit `false` is preserved; only selected DS4 profiles change. | Input v9 and behavior approved; exact consumer acknowledgments pending. |
+| Updater, tray and host metrics | `luna-06` owns `modules/updater/**`, `modules/system-tray/**`, and `modules/host-metrics/**`; `luna-01` owns host startup integration in `crates/host/**`; `luna-02` owns stream-session metric emission. | Path ownership assigned; module contracts and lifecycle integration pending. |
 
 ## Merge queue
 
