@@ -695,7 +695,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
         (
             "amaterasu.authentication".into(),
             json!({
-                "administrator_principals": ["amaterasu.console"],
+                "administrator_principals": ["amaterasu.console", "amaterasu.management"],
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [

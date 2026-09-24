@@ -240,6 +240,11 @@ fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_relo
     ] {
         let settings = &policy.settings["amaterasu.authentication"];
         assert!(
+            settings["administrator_principals"]
+                .as_array()
+                .is_some_and(|principals| principals.contains(&json!("amaterasu.management")))
+        );
+        assert!(
             policy.principals[AUTHENTICATION.id]
                 .call
                 .contains("amaterasu.configuration/1")
