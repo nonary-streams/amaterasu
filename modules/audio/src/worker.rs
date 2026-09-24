@@ -19,6 +19,12 @@ pub const QUEUE_PACKETS: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+struct RecoveryPolicy {
+    expected_endpoint: String,
+    expected_format: Format,
+    retry_delay: Duration,
+}
+
 pub trait Source: Send {
     fn read(&mut self) -> AudioResult<Option<Packet>>;
     fn health(&self) -> Health;
@@ -143,12 +149,14 @@ impl Worker {
                         platform::Capture::reopen(&recovery_config)
                             .map(|capture| Box::new(capture) as Box<dyn CaptureDevice>)
                     },
-                    endpoint,
-                    format,
                     &sender,
                     &thread_health,
                     &thread_stop,
-                    RECOVERY_RETRY_DELAY,
+                    RecoveryPolicy {
+                        expected_endpoint: endpoint,
+                        expected_format: format,
+                        retry_delay: RECOVERY_RETRY_DELAY,
+                    },
                 );
             })
             .map_err(|_| "audio_worker_failed")?;
@@ -230,12 +238,10 @@ fn set_recovering(health: &Mutex<Health>, recovering: bool) {
 fn run_capture_loop<F>(
     mut capture: Box<dyn CaptureDevice>,
     mut reopen: F,
-    expected_endpoint: String,
-    expected_format: Format,
     sender: &SyncSender<Packet>,
     health: &Mutex<Health>,
     stop: &AtomicBool,
-    retry_delay: Duration,
+    recovery_policy: RecoveryPolicy,
 ) where
     F: FnMut() -> AudioResult<Box<dyn CaptureDevice>>,
 {
@@ -263,16 +269,16 @@ fn run_capture_loop<F>(
                 continuity.begin_recovery();
                 drop(capture);
                 loop {
-                    if !wait_for_retry(stop, retry_delay) {
+                    if !wait_for_retry(stop, recovery_policy.retry_delay) {
                         return;
                     }
                     match reopen() {
                         Ok(reopened) => {
-                            if reopened.endpoint() != expected_endpoint {
+                            if reopened.endpoint() != recovery_policy.expected_endpoint {
                                 fail(health, "audio_endpoint_changed");
                                 return;
                             }
-                            if reopened.format() != expected_format {
+                            if reopened.format() != recovery_policy.expected_format {
                                 fail(health, "audio_format_changed");
                                 return;
                             }
@@ -432,12 +438,14 @@ mod tests {
                         Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
                             as Box<dyn CaptureDevice>)
                     },
-                    "render.fixed".into(),
-                    format,
                     &sender,
                     &health,
                     &stop,
-                    Duration::ZERO,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        retry_delay: Duration::ZERO,
+                    },
                 );
             }
         });
@@ -478,12 +486,14 @@ mod tests {
                         attempts.fetch_add(1, Ordering::SeqCst);
                         Err("endpoint_not_found")
                     },
-                    "render.fixed".into(),
-                    format,
                     &sender,
                     &health,
                     &stop,
-                    Duration::from_secs(30),
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        retry_delay: Duration::from_secs(30),
+                    },
                 );
             }
         });
@@ -510,12 +520,14 @@ mod tests {
         run_capture_loop(
             Box::new(initial),
             || Ok(Box::new(FakeCapture::new(incompatible, [])) as Box<dyn CaptureDevice>),
-            "render.fixed".into(),
-            format,
             &sender,
             &health,
             &stop,
-            Duration::ZERO,
+            RecoveryPolicy {
+                expected_endpoint: "render.fixed".into(),
+                expected_format: format,
+                retry_delay: Duration::ZERO,
+            },
         );
         let health = health.lock().unwrap();
         assert_eq!(health.failure, Some("audio_format_changed"));
