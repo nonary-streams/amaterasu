@@ -34,7 +34,8 @@ The action defers while a ticket is live or an accepted TCP connection remains,
 and reports active only after the replacement RTSP listener binds and all three
 UDP addresses pass a simultaneous bind check. UDP sockets themselves belong to
 per-session stream owners, so the check does not reserve ports between streams.
-Pending updates keep new opens on the previous active base until retry succeeds.
+Pending updates keep new opens on the currently bound listener's base until retry
+succeeds.
 This does not alter NVHTTP's HTTP/HTTPS listener or weaken its loopback policy.
 
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,

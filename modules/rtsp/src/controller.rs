@@ -44,6 +44,7 @@ struct PendingNetwork {
 pub struct Controller {
     settings: Settings,
     network_base_port: Option<u16>,
+    listener_base_port: Option<u16>,
     active_network_base_port: Option<u16>,
     network_error: Option<&'static str>,
     network_retry_at: u64,
@@ -70,6 +71,7 @@ impl Controller {
         Ok(Self {
             settings,
             network_base_port,
+            listener_base_port: network_base_port,
             active_network_base_port: None,
             network_error: None,
             network_retry_at: 0,
@@ -153,7 +155,7 @@ impl Controller {
 
     pub(super) fn media_binds_for_open(&self) -> Option<crate::model::MediaBinds> {
         self.active_network_base_port
-            .or(self.network_base_port)
+            .or(self.listener_base_port)
             .and_then(|port| self.settings.media_binds(port).ok())
     }
 
@@ -195,6 +197,7 @@ impl Controller {
 
         self.settings.probe_media_binds(base_port)?;
         if self.local == Some(bind) {
+            self.listener_base_port = Some(base_port);
             self.active_network_base_port = Some(base_port);
             self.network_error = None;
             return Ok(true);
@@ -204,6 +207,7 @@ impl Controller {
         self.transport = Some(replacement);
         self.local = Some(local);
         self.settings.bind = local;
+        self.listener_base_port = Some(base_port);
         self.active_network_base_port = Some(base_port);
         self.network_error = None;
         Ok(true)

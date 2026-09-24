@@ -74,9 +74,10 @@ Updating the base port prepares both NVHTTP replacement listeners before releasi
 either current listener, retains accepted connections, and updates `/serverinfo`
 to advertise the new bound ports. RTSP changes wait until all live RTSP tickets
 are terminal and accepted RTSP TCP connections have closed. While that change is
-pending, new RTSP opens keep using the active base port. The RTSP module checks that
-all three UDP addresses can bind together before acknowledging application, then
-passes those addresses to `stream-session` for each later stream. Per-session UDP
+pending, new RTSP opens keep using the base of the currently bound RTSP listener.
+Before acknowledging application, the RTSP module checks that all three UDP
+addresses can bind together, then passes those addresses to `stream-session` for
+each later stream. Per-session UDP
 sockets are created by the stream owner and are not reserved while idle, so an
 external process can still claim a port after preflight.
 

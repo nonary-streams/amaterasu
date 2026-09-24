@@ -267,6 +267,42 @@ fn network_port_updates_rebind_rtsp_and_defer_until_the_stream_is_idle() {
 }
 
 #[test]
+fn failed_startup_rebind_keeps_media_binds_aligned_with_the_bootstrap_listener() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let old_port = free_base_port();
+    let mut desired_port = free_base_port();
+    while desired_port == old_port {
+        desired_port = free_base_port();
+    }
+    let settings = Settings {
+        enabled: true,
+        bind: SocketAddr::from(([127, 0, 0, 1], old_port + 21)),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("bootstrap listener binds");
+    assert_eq!(controller.local.unwrap().port(), old_port + 21);
+    assert_eq!(controller.active_network_base_port, None);
+
+    let _occupied_video_port =
+        UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], desired_port + 9)))
+            .expect("reserve desired video UDP port");
+    let pending = controller
+        .configure_network_port(desired_port, 0)
+        .expect("desired base port is persisted for reconciliation");
+    assert_eq!(pending["active"], false);
+    assert_eq!(pending["error"], "udp_bind_failed");
+    assert_eq!(controller.local.unwrap().port(), old_port + 21);
+
+    let binds = controller
+        .media_binds_for_open()
+        .expect("bootstrap listener has its own base port");
+    assert_eq!(binds.video.port(), old_port + 9);
+    assert_eq!(binds.control.port(), old_port + 10);
+    assert_eq!(binds.audio.port(), old_port + 11);
+    assert_ne!(binds.video.port(), desired_port + 9);
+}
+
+#[test]
 fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_state() {
     let _guard = NETWORK_TEST_LOCK.lock().unwrap();
     let settings = Settings {
