@@ -28,10 +28,17 @@ The coordinator runs as `gpt-6-luna` with reasoning effort `max`. It prepares
 the integration worktree and six lane worktrees described below, then launches
 all six `codex exec` processes before waiting for any one to finish. Each lead
 uses `gpt-6-luna` with `model_reasoning_effort="max"`; its implementation workers
-use `gpt-6-luna` with `xhigh`. Lead prompts must explicitly authorize worker
-delegation and specify those settings. When the worker tool requires a fresh or partial
-context fork to override model/effort, use that mode and supply the full task
-contract rather than inheriting the lead's Max effort accidentally.
+use `gpt-6-luna` with `xhigh`. Set `agents.enabled=true`,
+`agents.default_subagent_model="gpt-6-luna"`,
+`agents.default_subagent_reasoning_effort="xhigh"`, and a bounded
+`agents.max_concurrent_threads_per_session` for every lead process. Lead prompts
+must explicitly authorize worker delegation and ask Codex to verify a child
+actually starts at XHigh before assigning writes. Each lead assigns child agents
+exclusive, disjoint files in its own lane worktree, reviews their changes, and
+owns the lane commit. Native subagents share their lead's checkout; do not assume
+they have a separate working directory or branch. If the client later provides
+isolated worker worktrees, keep the same file ownership and merge each worker
+back into its owning lane before submission.
 
 Use one external run directory, for example
 `D:\sources\worktrees\amaterasu-config-runs\<run-id>`, outside every Git
@@ -160,11 +167,12 @@ entry starts `pending`; ownership is not evidence of implementation.
    dependency requests, schema reservations, review assignments, candidate
    SHAs, and last validated integration SHA there. Other leads send structured
    requests; they never edit this central file from their own branches.
-4. Every lead and worker receives an explicit absolute working directory and
-   checks `git rev-parse --show-toplevel` and `git branch --show-current` before
-   edits or commits. Never switch another lane's checkout or run a Git mutation
-   there. A nested worker gets a separate branch/worktree and a narrower,
-   disjoint path assignment; its lead merges it locally before submission.
+4. Every lead receives an explicit absolute working directory and checks
+   `git rev-parse --show-toplevel` and `git branch --show-current` before edits
+   or commits. Never switch another lane's checkout or run a Git mutation there.
+   A lead gives each nested worker a narrower, disjoint path assignment within
+   its lane worktree. Never let two agents edit the same path concurrently; the
+   lane lead integrates and reviews worker edits before committing.
 5. Keep build outputs, frontend dependencies, test state roots, logs, sockets,
    and service ports isolated by lane. Give each build-enabled lane a distinct
    `CARGO_TARGET_DIR`. Do not share mutable target directories or native device
@@ -214,7 +222,9 @@ same next document version or overwrite a neighbor's migration.
    paths to the owning leads. They coordinate a correction in their own lane,
    rerun affected checks, and resubmit for review. Never choose one side blindly
    for settings schemas, migrations, authorization, or override precedence.
-4. Validate the combined tree before creating the integration commit. Run
+4. Lightweight worktrees are non-buildable under the worktree policy. First
+   trial-merge the candidate into the clean source checkout, which is reserved
+   for integration validation and final promotion. Run
    `cargo fmt --all --check`, `cargo test --workspace --locked`, and
    `cargo clippy --workspace --all-targets --locked -- -D warnings`, plus
    `python scripts/inventory_configuration.py --check`. Run relevant signed
@@ -222,12 +232,15 @@ same next document version or overwrite a neighbor's migration.
    Meet the platform gates in CI and the native qualification requirements of
    the changed settings. On failure, abort the trial merge, retain the logs,
    and return the failure to its owner. Keep the last validated integration
-   SHA as the common base until a candidate passes.
-5. Commit a passing merge with the attribution below and publish its SHA to all
-   leads through the coordination ledger. Idle/ready leads merge that SHA into
-   their clean lane branches before starting dependent work; busy leads finish
-   their bounded slice first. Resubmit and revalidate any candidate changed by
-   synchronization. Do not rebase or force-update another lead's branch.
+   SHA as the common base until a candidate passes. Abort the trial merge on
+   failure and return the evidence to its owner. Commit each passing merge with
+   the attribution below on the source integration checkout, then fast-forward
+   the integration worktree to that commit.
+5. Publish the accepted SHA to all leads through the coordination ledger.
+   Idle/ready leads merge that SHA into their clean lane branches before starting
+   dependent work; busy leads finish their bounded slice first. Resubmit and
+   revalidate any candidate changed by synchronization. Do not rebase or
+   force-update another lead's branch.
 6. Only the coordinator updates the shared coverage ledger and consolidated progress
    narrative after independent review confirms all evidence. Keep local and
    platform validation distinct; a test that was not run cannot close a gate.
