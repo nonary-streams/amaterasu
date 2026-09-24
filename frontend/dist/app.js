@@ -1479,10 +1479,12 @@ var Amaterasu;
                 const refreshTtl = Amaterasu.input("remember_me_refresh_token_ttl_seconds", String(settings.values.remember_me_refresh_token_ttl_seconds), "number");
                 for (const control of [sessionTtl, refreshTtl]) {
                     control.required = true;
-                    control.min = "1";
                     control.max = String(maxConfiguredAuthTtlSeconds);
-                    control.step = "1";
                 }
+                sessionTtl.min = "60";
+                sessionTtl.step = "60";
+                refreshTtl.min = "3600";
+                refreshTtl.step = "3600";
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save authentication settings");
                 save.type = "submit";

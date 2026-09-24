@@ -587,10 +587,12 @@ namespace Amaterasu {
         );
         for (const control of [sessionTtl, refreshTtl]) {
           control.required = true;
-          control.min = "1";
           control.max = String(maxConfiguredAuthTtlSeconds);
-          control.step = "1";
         }
+        sessionTtl.min = "60";
+        sessionTtl.step = "60";
+        refreshTtl.min = "3600";
+        refreshTtl.step = "3600";
         const status = el("div");
         const save = el("button", "button primary", "Save authentication settings");
         save.type = "submit";
