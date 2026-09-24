@@ -59,6 +59,7 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         "focus_attempts":9,
         "focus_timeout_secs":45,
         "focus_exit_on_first":true,
+        "fullscreen_entry_enabled":true,
         "expected_revision":3
     }))
     .unwrap();
@@ -67,6 +68,7 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         focus_attempts,
         focus_timeout_secs,
         focus_exit_on_first,
+        fullscreen_entry_enabled,
         ..
     } = action
     else {
@@ -75,6 +77,7 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     assert_eq!(focus_attempts, Some(9));
     assert_eq!(focus_timeout_secs, Some(45));
     assert_eq!(focus_exit_on_first, Some(true));
+    assert_eq!(fullscreen_entry_enabled, Some(true));
 
     let legacy_update: Action = serde_json::from_value(json!({
         "action":"settings_update",
@@ -87,6 +90,7 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         focus_attempts,
         focus_timeout_secs,
         focus_exit_on_first,
+        fullscreen_entry_enabled,
         ..
     } = legacy_update
     else {
@@ -96,6 +100,7 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     assert_eq!(focus_attempts, None);
     assert_eq!(focus_timeout_secs, None);
     assert_eq!(focus_exit_on_first, None);
+    assert_eq!(fullscreen_entry_enabled, None);
 
     assert!(
         serde_json::from_value::<Action>(json!({
@@ -114,6 +119,35 @@ fn status_and_refresh_accept_no_owner_selector() {
     assert!(!status.is_settings());
     let refresh: Action = serde_json::from_value(json!({"action":"refresh"})).unwrap();
     assert!(!refresh.is_settings());
+}
+
+#[test]
+fn fullscreen_ticket_actions_are_launch_only_and_reject_owner_selectors() {
+    let start: Action = serde_json::from_value(json!({
+        "action":"fullscreen_start",
+        "operation_id":"fullscreen-operation"
+    }))
+    .unwrap();
+    assert!(start.is_fullscreen_launch());
+    assert!(!start.is_settings());
+    assert!(launch_caller_is_authorized(LAUNCH_CALLER));
+    assert!(!launch_caller_is_authorized(MANAGEMENT_CALLER));
+
+    let status: Action = serde_json::from_value(json!({
+        "action":"fullscreen_status",
+        "ticket":"ab".repeat(24)
+    }))
+    .unwrap();
+    assert!(status.is_fullscreen_launch());
+
+    assert!(
+        serde_json::from_value::<Action>(json!({
+            "action":"fullscreen_start",
+            "operation_id":"fullscreen-operation",
+            "executable":"C:\\Temp\\attacker.exe"
+        }))
+        .is_err()
+    );
 }
 
 #[test]

@@ -4,6 +4,8 @@ mod configuration;
 mod connector;
 mod discovery;
 mod focus;
+mod fullscreen;
+mod installation;
 mod launch;
 mod settings;
 mod snapshot;
@@ -48,6 +50,8 @@ enum Action {
         #[serde(default)]
         focus_exit_on_first: Option<bool>,
         #[serde(default)]
+        fullscreen_entry_enabled: Option<bool>,
+        #[serde(default)]
         recent_games: Option<u32>,
         #[serde(default)]
         recent_max_age_days: Option<u32>,
@@ -82,6 +86,23 @@ enum Action {
         game_id: String,
         exit_timeout_seconds: u64,
     },
+    FullscreenStart {
+        operation_id: String,
+    },
+    FullscreenLookup {
+        operation_id: String,
+    },
+    FullscreenStatus {
+        ticket: String,
+    },
+    FullscreenStop {
+        ticket: String,
+        exit_timeout_seconds: u64,
+    },
+    FullscreenRecoverStop {
+        operation_id: String,
+        exit_timeout_seconds: u64,
+    },
 }
 
 impl Action {
@@ -97,6 +118,17 @@ impl Action {
                 | Self::LaunchStatus { .. }
                 | Self::LaunchStop { .. }
                 | Self::LaunchRecoverStop { .. }
+        )
+    }
+
+    fn is_fullscreen_launch(&self) -> bool {
+        matches!(
+            self,
+            Self::FullscreenStart { .. }
+                | Self::FullscreenLookup { .. }
+                | Self::FullscreenStatus { .. }
+                | Self::FullscreenStop { .. }
+                | Self::FullscreenRecoverStop { .. }
         )
     }
 }
@@ -152,6 +184,7 @@ struct PlayniteModule {
     last_discovery: discovery::Discovery,
     eligible_launch_ids: std::collections::BTreeSet<String>,
     launches: launch::Launches,
+    fullscreen_launches: fullscreen::FullscreenSessions,
     next_discovery: Instant,
 }
 
@@ -173,6 +206,7 @@ impl ManagedModule for PlayniteModule {
             last_discovery: discovery::Discovery::default(),
             eligible_launch_ids: std::collections::BTreeSet::new(),
             launches: launch::Launches::default(),
+            fullscreen_launches: fullscreen::FullscreenSessions::default(),
             next_discovery: Instant::now(),
         })
     }
@@ -183,6 +217,8 @@ impl ManagedModule for PlayniteModule {
         self.observe_settings();
         self.launches.advance();
         self.refresh_discovery();
+        self.fullscreen_launches
+            .advance(Instant::now(), &self.last_discovery.processes);
         self.poll_snapshot();
         self.start_automatic_snapshot();
         self.catalog
@@ -307,6 +343,9 @@ impl PlayniteModule {
         if action.is_launch() && !launch_caller_is_authorized(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
         }
+        if action.is_fullscreen_launch() && !launch_caller_is_authorized(caller) {
+            return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+        }
         if action.is_settings() && self.configuration.busy() {
             let code = if self.configuration.ready() {
                 "settings_busy"
@@ -378,6 +417,66 @@ impl PlayniteModule {
                 );
                 self.complete(id, response)
             }
+            Action::FullscreenStart { operation_id } => {
+                if !cfg!(windows) {
+                    return self.complete(id, launch::not_started_error("unsupported_platform"));
+                }
+                if !self.configuration.ready() {
+                    return self.complete(id, launch::not_started_error("settings_loading"));
+                }
+                if !self.configuration.settings().enabled {
+                    return self.complete(id, launch::not_started_error("playnite_disabled"));
+                }
+                if !self.configuration.settings().fullscreen_entry_enabled {
+                    return self
+                        .complete(id, launch::not_started_error("fullscreen_entry_disabled"));
+                }
+                self.refresh_discovery_for_stop();
+                let installation = installation::Installation::discover_associated();
+                let response = self.fullscreen_launches.start(
+                    &operation_id,
+                    installation,
+                    &self.last_discovery.processes,
+                    focus::FocusPolicy {
+                        attempts: self.configuration.settings().focus_attempts,
+                        timeout_secs: self.configuration.settings().focus_timeout_secs,
+                        exit_on_first: self.configuration.settings().focus_exit_on_first,
+                    },
+                );
+                self.complete(id, response)
+            }
+            Action::FullscreenLookup { operation_id } => {
+                let response = self.fullscreen_launches.lookup(&operation_id);
+                self.complete(id, response)
+            }
+            Action::FullscreenStatus { ticket } => {
+                let response = self.fullscreen_launches.status(&ticket);
+                self.complete(id, response)
+            }
+            Action::FullscreenStop {
+                ticket,
+                exit_timeout_seconds,
+            } => {
+                self.refresh_discovery_for_stop();
+                let response = self.fullscreen_launches.stop(
+                    &ticket,
+                    exit_timeout_seconds,
+                    &self.last_discovery.processes,
+                );
+                self.complete(id, response)
+            }
+            Action::FullscreenRecoverStop {
+                operation_id,
+                exit_timeout_seconds,
+            } => {
+                self.refresh_discovery_for_stop();
+                let response = self.fullscreen_launches.recover_stop(
+                    &operation_id,
+                    exit_timeout_seconds,
+                    &self.last_discovery.processes,
+                );
+                self.complete(id, response)
+            }
             Action::SettingsGet {} => {
                 if !self.configuration.ready() {
                     self.complete(id, json!({"ok":false,"code":"settings_loading"}))
@@ -395,6 +494,7 @@ impl PlayniteModule {
                 focus_attempts,
                 focus_timeout_secs,
                 focus_exit_on_first,
+                fullscreen_entry_enabled,
                 recent_games,
                 recent_max_age_days,
                 sync_categories,
@@ -418,6 +518,8 @@ impl PlayniteModule {
                     focus_attempts: focus_attempts.unwrap_or(current.focus_attempts),
                     focus_timeout_secs: focus_timeout_secs.unwrap_or(current.focus_timeout_secs),
                     focus_exit_on_first: focus_exit_on_first.unwrap_or(current.focus_exit_on_first),
+                    fullscreen_entry_enabled: fullscreen_entry_enabled
+                        .unwrap_or(current.fullscreen_entry_enabled),
                     recent_games: recent_games.unwrap_or(current.recent_games),
                     recent_max_age_days: recent_max_age_days.unwrap_or(current.recent_max_age_days),
                     sync_categories: sync_categories
@@ -469,12 +571,15 @@ impl PlayniteModule {
             "settings_ready":self.configuration.ready(),
             "enabled":self.configuration.settings().enabled,
             "auto_sync":self.configuration.settings().auto_sync,
+            "fullscreen_entry_enabled":self.configuration.settings().fullscreen_entry_enabled,
+            "fullscreen_supported":cfg!(windows),
             "playnite_running":self.last_discovery.running,
             "playnite_paths":self.last_discovery.executable_paths,
             "snapshot_pending":self.snapshot_worker.busy(),
             "snapshot_game_count":self.last_snapshot_games,
             "launchable_game_count":self.eligible_launch_ids.len(),
             "active_provider_launches":self.launches.active_count(),
+            "active_fullscreen_sessions":self.fullscreen_launches.active_count(),
             "catalog_sync":self.catalog.status(),
             "last_error":self.last_error,
             "revision":self.configuration.revision()

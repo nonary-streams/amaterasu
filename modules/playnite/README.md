@@ -31,10 +31,28 @@ is committed only after the provider completes that snapshot, and catalog CAS
 plus unchanged-entry checks preserve manual edits.
 
 The typed GUID launch route uses the bounded extension connection and ticket
-protocol, but full reference focus and fullscreen launch behavior and the
-remaining extension synchronization features are still pending. Playnite
-selection and age settings have Amaterasu-specific bounds, so this does not
-claim every reference input edge is identical.
+protocol. Fullscreen entry is a separate Windows-only launch action, authorized
+only to `amaterasu.launch`; management can read or update the persisted
+`fullscreen_entry_enabled` setting. It defaults to false, is preserved by older
+settings updates that omit it, and must be enabled before the launch action is
+accepted. Discovery resolves the current `playnite://` executable association,
+requires an existing canonical DesktopApp/FullscreenApp pair in one install
+directory, and never accepts a path from the request. A Desktop-only install is
+rejected before process creation, avoiding an untrackable session. Start returns
+a random ticket and state; lookup is keyed by operation ID, and status/stop are
+ticket-bound. Stop posts a bounded close request and waits for the exact
+FullscreenApp process to exit. Session tickets are held in memory, so they do
+not survive a Playnite module restart; recovery never stops a process based only
+on broad discovery after its ticket has been lost. A startup timeout or an
+unexpected empty process scan leaves the ticket occupying the single-session
+slot; only a correlated stop that confirms the launcher and FullscreenApp have
+exited releases it.
+
+This does not yet create the synthetic catalog entry or implement the helper's
+active-game watchdog, return-to-fullscreen behavior, relaunch after game exit,
+or full extension focus/cleanup behavior. Playnite selection and age settings
+have Amaterasu-specific bounds, so this does not claim every reference input
+edge is identical.
 
 Focus settings default to 3 confirmed focus attempts, a 15-second timeout, and
 `focus_exit_on_first=false`. Zero attempts or zero timeout disables focus;

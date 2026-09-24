@@ -28,6 +28,8 @@ pub struct ProductSettings {
     pub focus_timeout_secs: u32,
     #[serde(default)]
     pub focus_exit_on_first: bool,
+    #[serde(default)]
+    pub fullscreen_entry_enabled: bool,
     #[serde(default = "default_recent_games")]
     pub recent_games: u32,
     #[serde(default = "default_recent_max_age_days")]
@@ -92,6 +94,7 @@ impl Default for ProductSettings {
             focus_attempts: default_focus_attempts(),
             focus_timeout_secs: default_focus_timeout_secs(),
             focus_exit_on_first: false,
+            fullscreen_entry_enabled: false,
             recent_games: default_recent_games(),
             recent_max_age_days: default_recent_max_age_days(),
             sync_categories: Vec::new(),
@@ -229,6 +232,7 @@ mod tests {
         assert_eq!(settings.focus_attempts, 3);
         assert_eq!(settings.focus_timeout_secs, 15);
         assert!(!settings.focus_exit_on_first);
+        assert!(!settings.fullscreen_entry_enabled);
     }
 
     #[test]
@@ -271,6 +275,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("focus_exit_on_first");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("fullscreen_entry_enabled");
         assert!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":true,"version":1,"revision":6,
@@ -291,6 +299,7 @@ mod tests {
         assert_eq!(old_settings.focus_attempts, 3);
         assert_eq!(old_settings.focus_timeout_secs, 15);
         assert!(!old_settings.focus_exit_on_first);
+        assert!(!old_settings.fullscreen_entry_enabled);
         assert_eq!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":false,"version":null,"revision":0,"values":{}
