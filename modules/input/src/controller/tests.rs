@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::{Axis, Button, DevicePolicy, Key};
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 #[derive(Default)]
@@ -16,6 +17,9 @@ struct FakeBackend {
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
     back_button_timeout_ms: i32,
+    fail_controller_disable: bool,
+    controller_disable_calls: usize,
+    active_controller_slots: BTreeSet<u16>,
 }
 impl Backend for FakeBackend {
     fn name(&self) -> &'static str {
@@ -49,6 +53,15 @@ impl Backend for FakeBackend {
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.trace.borrow_mut().push(event.clone());
+        if let Event::Controller { active_mask, .. } = event {
+            self.active_controller_slots
+                .retain(|slot| active_mask & (1 << slot) != 0);
+            for slot in 0..16 {
+                if active_mask & (1 << slot) != 0 {
+                    self.active_controller_slots.insert(slot);
+                }
+            }
+        }
         if matches!(event, Event::Controller { .. })
             && std::mem::take(&mut self.fail_controller_input)
         {
@@ -69,6 +82,17 @@ impl Backend for FakeBackend {
     }
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.back_button_timeout_ms = timeout_ms;
+    }
+    fn disable_controller_input(&mut self) -> InputResult<()> {
+        self.controller_disable_calls += 1;
+        if std::mem::take(&mut self.fail_controller_disable) {
+            return Err(InputError::new(
+                "release_failed",
+                "test virtual controller removal failure",
+            ));
+        }
+        self.active_controller_slots.clear();
+        Ok(())
     }
     fn stop(&mut self) -> InputResult<()> {
         self.stops += 1;
@@ -361,6 +385,179 @@ fn unavailable_gamepad_keeps_the_input_lease_for_other_events_and_cleanup() {
     let accepted = batch(&mut controller, &token, vec![key(30, KeyState::Down)]);
     assert_eq!(accepted["ok"], true);
     assert!(controller.lease.is_some());
+}
+
+#[test]
+fn controller_policy_live_disables_slots_without_stopping_keyboard_or_mouse() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    assert_eq!(
+        batch(&mut controller, &token, vec![controller_event()])["ok"],
+        true
+    );
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
+
+    assert!(controller.set_controller_enabled(false, now).is_ok());
+    assert!(!controller.controller_enabled());
+    assert!(controller.backend.active_controller_slots.is_empty());
+    assert_eq!(controller.backend.controller_disable_calls, 1);
+
+    let result = batch(
+        &mut controller,
+        &token,
+        vec![
+            controller_event(),
+            key(31, KeyState::Down),
+            key(31, KeyState::Up),
+            Event::Relative { dx: 2, dy: 3 },
+        ],
+    );
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["accepted"], 4);
+    assert_eq!(result["suppressed"], 1);
+    assert!(controller.backend.active_controller_slots.is_empty());
+
+    assert!(
+        controller
+            .backend
+            .trace
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, Event::Relative { dx: 2, dy: 3 }))
+    );
+    assert_eq!(
+        controller
+            .backend
+            .trace
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, Event::Controller { .. }))
+            .count(),
+        1,
+    );
+
+    controller
+        .set_controller_enabled(true, Instant::now())
+        .unwrap();
+    assert!(controller.backend.active_controller_slots.is_empty());
+    assert_eq!(
+        batch(&mut controller, &token, vec![controller_event()])["ok"],
+        true
+    );
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
+    controller.handle(
+        "owner",
+        Operation::Release { lease: token },
+        Instant::now(),
+        &mut || Ok(()),
+    );
+}
+
+#[test]
+fn failed_controller_slot_removal_retries_without_blocking_keyboard_or_mouse() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            fail_controller_disable: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    controller.set_key_repeat_policy(10, 50.0);
+    let token = acquire(&mut controller, now);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![controller_event(), key(30, KeyState::Down)],
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
+
+    assert!(controller.set_controller_enabled(false, now).is_err());
+    assert!(controller.cleanup_required());
+    assert!(controller.lease.is_some());
+    let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(status["controller_enabled"], false);
+    assert_eq!(status["controller_cleanup_required"], true);
+    assert_eq!(status["lease"]["cleanup_required"], false);
+
+    let response = batch(
+        &mut controller,
+        &token,
+        vec![
+            controller_event(),
+            key(31, KeyState::Down),
+            Event::Relative { dx: -1, dy: 4 },
+        ],
+    );
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["accepted"], 3);
+    assert_eq!(response["suppressed"], 1);
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
+
+    controller.expire(Instant::now() + Duration::from_millis(11));
+    assert!(
+        controller
+            .backend
+            .trace
+            .borrow()
+            .iter()
+            .any(|event| matches!(
+                event,
+                Event::Key {
+                    key: Key::WindowsScan { code: 31, .. },
+                    state: KeyState::Repeat
+                }
+            ))
+    );
+    assert_eq!(
+        batch(&mut controller, &token, vec![key(31, KeyState::Up)])["ok"],
+        true
+    );
+
+    controller.expire(Instant::now() + Duration::from_millis(101));
+    assert!(!controller.cleanup_required());
+    assert!(controller.backend.active_controller_slots.is_empty());
+    assert_eq!(controller.backend.controller_disable_calls, 2);
+    assert_eq!(
+        batch(&mut controller, &token, vec![controller_event()])["suppressed"],
+        1
+    );
+
+    controller
+        .set_controller_enabled(true, Instant::now())
+        .unwrap();
+    assert!(controller.backend.active_controller_slots.is_empty());
+    assert_eq!(
+        batch(&mut controller, &token, vec![controller_event()])["ok"],
+        true
+    );
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
 }
 
 #[test]

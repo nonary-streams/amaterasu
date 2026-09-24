@@ -55,6 +55,8 @@ enum SettingsOperation {
         keyboard: bool,
         mouse: bool,
         #[serde(default)]
+        controller: Option<bool>,
+        #[serde(default)]
         high_resolution_scrolling: Option<bool>,
         #[serde(default)]
         always_send_scancodes: Option<bool>,
@@ -211,6 +213,7 @@ impl InputModule {
                 Ok(SettingsOperation::SettingsUpdate {
                     keyboard,
                     mouse,
+                    controller,
                     high_resolution_scrolling,
                     always_send_scancodes,
                     key_rightalt_to_key_win,
@@ -230,6 +233,7 @@ impl InputModule {
                     let desired = self.product_settings.merge_update(InputPolicyUpdate {
                         keyboard,
                         mouse,
+                        controller,
                         high_resolution_scrolling,
                         always_send_scancodes,
                         key_rightalt_to_key_win,
@@ -404,6 +408,7 @@ mod tests {
                 key_repeat_frequency: None,
                 back_button_timeout: None,
                 gamepad: None,
+                controller: None,
                 ..
             }
         ));
@@ -419,6 +424,7 @@ mod tests {
             "key_repeat_frequency":30.5,
             "back_button_timeout":-1,
             "gamepad":"auto",
+            "controller":false,
             "expected_revision":4,
         }))
         .unwrap();
@@ -432,6 +438,7 @@ mod tests {
                 key_repeat_frequency: Some(30.5),
                 back_button_timeout: Some(-1),
                 gamepad: Some(gamepad_profile::GamepadProfile::Auto),
+                controller: Some(false),
                 ..
             }
         ));

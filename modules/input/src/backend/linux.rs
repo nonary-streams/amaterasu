@@ -525,6 +525,10 @@ impl Backend for LinuxBackend {
     fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
         self.profile = profile;
     }
+
+    fn disable_controller_input(&mut self) -> InputResult<()> {
+        self.gamepads.stop()
+    }
 }
 
 fn profile_uses_uinput_backend(profile: GamepadProfile) -> bool {

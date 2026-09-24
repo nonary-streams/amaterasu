@@ -7,7 +7,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 7;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 8;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
@@ -20,6 +20,8 @@ pub struct InputPolicy {
     pub keyboard: bool,
     #[serde(default = "default_enabled")]
     pub mouse: bool,
+    #[serde(default = "default_enabled")]
+    pub controller: bool,
     #[serde(default = "default_enabled")]
     pub high_resolution_scrolling: bool,
     #[serde(default = "default_enabled")]
@@ -40,6 +42,7 @@ pub struct InputPolicy {
 pub struct InputPolicyUpdate {
     pub keyboard: bool,
     pub mouse: bool,
+    pub controller: Option<bool>,
     pub high_resolution_scrolling: Option<bool>,
     pub always_send_scancodes: Option<bool>,
     pub key_rightalt_to_key_win: Option<bool>,
@@ -65,6 +68,7 @@ impl InputPolicy {
         json!({
             "keyboard":self.keyboard,
             "mouse":self.mouse,
+            "controller":self.controller,
             "high_resolution_scrolling":self.high_resolution_scrolling,
             "always_send_scancodes":self.always_send_scancodes,
             "key_rightalt_to_key_win":self.key_rightalt_to_key_win,
@@ -112,6 +116,7 @@ impl Default for InputPolicy {
         Self {
             keyboard: true,
             mouse: true,
+            controller: true,
             high_resolution_scrolling: true,
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
@@ -200,6 +205,7 @@ impl ProductSettings {
         InputPolicy {
             keyboard: update.keyboard,
             mouse: update.mouse,
+            controller: update.controller.unwrap_or(self.policy.controller),
             high_resolution_scrolling: update
                 .high_resolution_scrolling
                 .unwrap_or(self.policy.high_resolution_scrolling),
@@ -478,6 +484,8 @@ impl ProductSettings {
                         controller.set_back_button_timeout_ms(policy.back_button_timeout);
                         controller.set_gamepad_profile(policy.gamepad);
                         let _ = controller
+                            .set_controller_enabled(policy.controller, std::time::Instant::now());
+                        let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
                     Err(_) => self.retry_startup_load(30),
@@ -549,9 +557,14 @@ impl ProductSettings {
                         );
                         controller.set_back_button_timeout_ms(actual.back_button_timeout);
                         controller.set_gamepad_profile(actual.gamepad);
-                        let cleanup = controller
+                        let now = std::time::Instant::now();
+                        let controller_cleanup = controller
+                            .set_controller_enabled(actual.controller, now)
+                            .is_err();
+                        let device_cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
+                        let cleanup = controller_cleanup || device_cleanup;
                         complete(
                             send,
                             management_request,
@@ -590,9 +603,14 @@ impl ProductSettings {
         controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
         controller.set_back_button_timeout_ms(policy.back_button_timeout);
         controller.set_gamepad_profile(policy.gamepad);
-        let cleanup = controller
-            .set_device_policy(policy.device_policy(), std::time::Instant::now())
+        let now = std::time::Instant::now();
+        let controller_cleanup = controller
+            .set_controller_enabled(policy.controller, now)
             .is_err();
+        let device_cleanup = controller
+            .set_device_policy(policy.device_policy(), now)
+            .is_err();
+        let cleanup = controller_cleanup || device_cleanup;
         let response = if cleanup {
             json!({
                 "ok":false,
@@ -612,6 +630,7 @@ impl ProductSettings {
     fn response<B: Backend>(&self, controller: &Controller<B>, persisted: bool) -> Value {
         let cleanup_required = controller.cleanup_required();
         let applied = controller.device_policy() == self.policy.device_policy()
+            && controller.controller_enabled() == self.policy.controller
             && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
             && controller.always_send_scancodes() == self.policy.always_send_scancodes
             && controller.key_rightalt_to_key_win() == self.policy.key_rightalt_to_key_win
@@ -694,7 +713,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=7)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=8)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -740,6 +759,19 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                     key.as_str(),
                     "keyboard"
                         | "mouse"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
+                ),
+                8 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "controller"
                         | "high_resolution_scrolling"
                         | "always_send_scancodes"
                         | "key_rightalt_to_key_win"

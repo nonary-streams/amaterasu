@@ -34,6 +34,11 @@ pub trait Backend {
     }
     fn set_back_button_timeout(&mut self, _timeout_ms: i32) {}
     fn set_gamepad_profile(&mut self, _profile: GamepadProfile) {}
+    /// Releases and removes owned virtual controller slots without stopping
+    /// keyboard or pointer injection for the current lease.
+    fn disable_controller_input(&mut self) -> InputResult<()> {
+        Ok(())
+    }
     fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]

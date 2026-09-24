@@ -62,6 +62,8 @@ pub struct Controller<B: Backend> {
     key_repeat_frequency_hz: f64,
     back_button_timeout_ms: i32,
     gamepad_profile: GamepadProfile,
+    controller_enabled: bool,
+    controller_cleanup_pending: bool,
     repeating_key: Option<RepeatingKey>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
@@ -84,6 +86,8 @@ impl<B: Backend> Controller<B> {
             key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
             gamepad_profile: GamepadProfile::Auto,
+            controller_enabled: true,
+            controller_cleanup_pending: false,
             repeating_key: None,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
@@ -141,11 +145,22 @@ impl<B: Backend> Controller<B> {
             let _ = self.finish_lease(now, reason);
             return;
         }
-        if self.lease.is_some() && !self.cleanup_required() && self.backend.advance(now).is_err() {
+        if self.controller_cleanup_pending && now >= self.retry_at {
+            let _ = self.retry_controller_cleanup(now);
+        }
+        let lease_cleanup_required = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.cleanup_required);
+        if self.lease.is_some()
+            && !lease_cleanup_required
+            && !self.controller_cleanup_pending
+            && self.backend.advance(now).is_err()
+        {
             let _ = self.finish_lease(now, "failed");
             return;
         }
-        if self.lease.is_some() && !self.cleanup_required() && self.repeat_if_due(now).is_err() {
+        if self.lease.is_some() && !lease_cleanup_required && self.repeat_if_due(now).is_err() {
             let _ = self.finish_lease(now, "failed");
         }
     }
@@ -215,6 +230,38 @@ impl<B: Backend> Controller<B> {
         self.backend.set_gamepad_profile(profile);
     }
 
+    pub fn controller_enabled(&self) -> bool {
+        self.controller_enabled
+    }
+
+    /// Updates the live controller gate before trying to remove virtual slots.
+    /// A failed removal is retried without disabling keyboard or pointer input.
+    pub fn set_controller_enabled(&mut self, enabled: bool, now: Instant) -> InputResult<()> {
+        self.controller_enabled = enabled;
+        if enabled && !self.controller_cleanup_pending {
+            return Ok(());
+        }
+        self.controller_cleanup_pending = true;
+        self.retry_controller_cleanup(now)
+    }
+
+    fn retry_controller_cleanup(&mut self, now: Instant) -> InputResult<()> {
+        match self.backend.disable_controller_input() {
+            Ok(()) => {
+                self.controller_cleanup_pending = false;
+                if self.lease.is_none() {
+                    self.retry_at = now;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.controller_cleanup_pending = true;
+                self.retry_at = now + Duration::from_millis(100);
+                Err(InputError::new("release_failed", error.message))
+            }
+        }
+    }
+
     fn reset_scroll_remainders(&mut self) {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
@@ -267,9 +314,11 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn cleanup_required(&self) -> bool {
-        self.lease
-            .as_ref()
-            .is_some_and(|lease| lease.cleanup_required)
+        self.controller_cleanup_pending
+            || self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.cleanup_required)
     }
     pub fn cancel_owner(&mut self, caller: &str) {
         if self
@@ -330,6 +379,12 @@ impl<B: Backend> Controller<B> {
             return Err(InputError::new(
                 "unsupported_platform",
                 "no native input backend for this platform",
+            ));
+        }
+        if self.controller_cleanup_pending {
+            return Err(InputError::new(
+                "cleanup_required",
+                "virtual controller cleanup must complete before acquiring a lease",
             ));
         }
         if self.lease.is_some() {
@@ -476,7 +531,7 @@ impl<B: Backend> Controller<B> {
                         "input lease expired during batch",
                     ));
                 }
-                if event.enabled_by(policy) {
+                if self.event_enabled(event, policy) {
                     self.inject_batch_event(event)
                         .and_then(|()| self.update_repeat_after_event(event, Instant::now()))
                 } else {
@@ -517,7 +572,7 @@ impl<B: Backend> Controller<B> {
         let mut key_encoding = self.lease.as_ref().and_then(|lease| lease.key_encoding);
         for event in events {
             event.validate()?;
-            if !event.enabled_by(self.device_policy) {
+            if !self.event_enabled(event, self.device_policy) {
                 continue;
             }
             self.backend.validate(event)?;
@@ -643,6 +698,12 @@ impl<B: Backend> Controller<B> {
             crate::model::Axis::Vertical => self.vertical_scroll_remainder = next_remainder,
         }
         Ok(())
+    }
+
+    fn event_enabled(&self, event: &Event, policy: DevicePolicy) -> bool {
+        event.enabled_by(policy)
+            && (!matches!(event, Event::Controller { .. })
+                || (self.controller_enabled && !self.controller_cleanup_pending))
     }
 
     fn update_repeat_after_event(&mut self, event: &Event, now: Instant) -> InputResult<()> {
@@ -782,6 +843,7 @@ impl<B: Backend> Controller<B> {
             self.retry_at = now + Duration::from_millis(100);
             return Err(InputError::new("release_failed", error.message));
         }
+        self.controller_cleanup_pending = false;
         self.backend
             .set_back_button_timeout(self.back_button_timeout_ms);
         let Some(lease) = self.lease.take() else {
@@ -826,7 +888,7 @@ impl<B: Backend> Controller<B> {
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

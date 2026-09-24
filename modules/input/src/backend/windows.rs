@@ -197,6 +197,10 @@ impl Backend for WindowsBackend {
         self.gamepads.set_profile(profile);
     }
 
+    fn disable_controller_input(&mut self) -> InputResult<()> {
+        self.gamepads.disable()
+    }
+
     fn stop(&mut self) -> InputResult<()> {
         self.gamepads.stop()?;
         self.held_key_plans.clear();

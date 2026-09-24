@@ -58,6 +58,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     key_repeat_frequency: 0,
     back_button_timeout: -1,
     gamepad: "auto",
+    controller: true,
   });
   assert.deepEqual(
     ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25, 2147483647)),
@@ -71,6 +72,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       key_repeat_frequency: 31.25,
       back_button_timeout: 2147483647,
       gamepad: "auto",
+      controller: true,
     },
   );
   assert.equal(
@@ -82,6 +84,12 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     ordinary(parsePolicy(true, true, true, true, false, 0, 0, 0)).back_button_timeout,
     0,
   );
+  assert.equal(
+    ordinary(parsePolicy(true, true, true, true, false, 500, 24.9, -1, "auto", ["auto"], false))
+      .controller,
+    false,
+  );
+  assert.throws(() => parsePolicy(true, true, true, true, false, 500, 24.9, -1, "auto", ["auto"], "false"));
   for (const values of [
     ["false", true, true, true, true, 500, 24.9],
     [true, true, "false", true, true, 500, 24.9],
@@ -146,6 +154,8 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
       effective_gamepad_profile: null,
       gamepad_unavailable_reason: "ViGEm profile is not implemented",
       controller_input: false,
+      controller_enabled: true,
+      controller_cleanup_required: false,
       lease: {},
     }),
     /recognized but unavailable.*not implemented/,
@@ -157,9 +167,24 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
       effective_gamepad_profile: null,
       gamepad_unavailable_reason: null,
       controller_input: false,
+      controller_enabled: true,
+      controller_cleanup_required: false,
       lease: null,
     }),
     /availability is checked when a stream starts/,
+  );
+  assert.match(
+    describe("auto", {
+      gamepad: "auto",
+      supported_profiles: ["auto", "x360"],
+      effective_gamepad_profile: null,
+      gamepad_unavailable_reason: null,
+      controller_input: false,
+      controller_enabled: false,
+      controller_cleanup_required: true,
+      lease: {},
+    }),
+    /disabled; virtual gamepad removal is retrying.*keyboard and mouse input remain available/i,
   );
 });
 

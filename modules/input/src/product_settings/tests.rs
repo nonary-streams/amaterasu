@@ -81,7 +81,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto"})
+        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto"})
     );
     assert_eq!(revision, 0);
 }
@@ -252,6 +252,38 @@ fn product_v7_persists_typed_platform_profile_and_rejects_unknown_choice() {
 }
 
 #[test]
+fn product_v7_migrates_controller_policy_to_enabled() {
+    let (policy, revision) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":7,
+        "revision":21,
+        "values":{"keyboard":false,"mouse":true,"gamepad":"auto"},
+    }))
+    .unwrap();
+    assert_eq!(revision, 21);
+    assert!(!policy.keyboard);
+    assert!(policy.mouse);
+    assert!(policy.controller);
+}
+
+#[test]
+fn product_v8_preserves_an_explicitly_disabled_controller_policy() {
+    let (policy, revision) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":8,
+        "revision":22,
+        "values":{"keyboard":true,"mouse":false,"controller":false},
+    }))
+    .unwrap();
+    assert_eq!(revision, 22);
+    assert!(policy.keyboard);
+    assert!(!policy.mouse);
+    assert!(!policy.controller);
+}
+
+#[test]
 fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
     let (disabled, _) = read_document(&json!({
         "ok":true,
@@ -279,7 +311,7 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":8,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":9,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -295,6 +327,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
         json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":1.5}}),
         json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"back_button_timeout":"100"}}),
         json!({"ok":true,"found":true,"version":6,"revision":1,"values":{"keyboard":true,"mouse":true,"gamepad":"auto"}}),
+        json!({"ok":true,"found":true,"version":8,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":"true"}}),
         json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_delay":-1}}),
         json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true,"key_repeat_frequency":-0.1}}),
         json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true}}),
@@ -305,7 +338,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v7_document() {
+fn update_requires_current_revision_and_sends_whole_v8_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -366,8 +399,8 @@ fn update_requires_current_revision_and_sends_whole_v7_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":7,
-            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto"},
+            "version":8,
+            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto"},
         })
     );
 }
@@ -384,6 +417,7 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     settings.policy.key_repeat_delay = 230;
     settings.policy.key_repeat_frequency = 40.0;
     settings.policy.gamepad = selected_supported_profile();
+    settings.policy.controller = false;
     let legacy_desired = settings.merge_update(InputPolicyUpdate {
         keyboard: false,
         mouse: true,
@@ -393,16 +427,17 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     assert!(!legacy_desired.always_send_scancodes);
     assert!(legacy_desired.key_rightalt_to_key_win);
     assert_eq!(legacy_desired.gamepad, selected_supported_profile());
+    assert!(!legacy_desired.controller);
     settings
         .begin_update(90, 9, legacy_desired, 10_000)
         .unwrap();
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 7);
+    assert_eq!(payload["version"], 8);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str()})
+        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str()})
     );
     assert!(
         !settings
@@ -465,6 +500,16 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
             .gamepad,
         GamepadProfile::Auto
     );
+    assert!(
+        !settings
+            .merge_update(InputPolicyUpdate {
+                keyboard: true,
+                mouse: true,
+                controller: None,
+                ..InputPolicyUpdate::default()
+            })
+            .controller
+    );
 }
 
 fn selected_supported_profile() -> GamepadProfile {
@@ -490,6 +535,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     let policy = InputPolicy {
         keyboard: true,
         mouse: true,
+        controller: false,
         high_resolution_scrolling: false,
         always_send_scancodes: false,
         key_rightalt_to_key_win: true,
@@ -514,6 +560,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert!(controller.key_rightalt_to_key_win());
     assert_eq!(controller.back_button_timeout_ms(), 1_250);
     assert_eq!(controller.gamepad_profile(), selected_supported_profile());
+    assert!(!controller.controller_enabled());
     assert_eq!(settings.get_response(&controller)["applied"], true);
     assert_eq!(
         settings.get_response(&controller)["values"]["high_resolution_scrolling"],

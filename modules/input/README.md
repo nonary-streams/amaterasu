@@ -1,4 +1,4 @@
-# Keyboard and mouse input module
+# Keyboard, mouse, and controller input module
 
 `amaterasu-input` provides `amaterasu.input/1` as an independently loadable native
 `cdylib` and an `rlib`. The provider needs a service grant; callers need a call
@@ -20,21 +20,22 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 7 stores `keyboard`, `mouse`,
+after startup. Version 8 stores `keyboard`, `mouse`, `controller`,
 `high_resolution_scrolling`, `always_send_scancodes`, and
 `key_rightalt_to_key_win`, `key_repeat_delay`, and
 `key_repeat_frequency`, `back_button_timeout`, and the global `gamepad` profile;
-an absent document enables keyboard, mouse,
+an absent document enables keyboard, mouse, and controller input,
 high-resolution scrolling, and scancode mode, leaves right-Alt mapping disabled,
 uses a 500 ms initial key-repeat delay at 24.9 Hz, and disables the Back timeout
-with `-1`, and selects `auto` for gamepads. Versions 1 through 6 migrate in
+with `-1`, and selects `auto` for gamepads. Versions 1 through 7 migrate in
 memory with `auto` for the profile and their prior defaults. Versions 1 through 5
 migrate in memory with the new repeat defaults. Version 1 documents migrate in
 memory with high-resolution
 scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
 Version 2 documents preserve all three saved values and default scancode mode to
 enabled. Version 3 preserves all four earlier values and defaults right-Alt
-mapping to disabled. The next update writes the complete v7 document. Delay is
+mapping to disabled. Versions 1 through 7 default controller input to enabled.
+The next update writes the complete v8 document. Delay is
 an integer from 0 through 2,147,483,647 milliseconds; zero disables repeat.
 Frequency is a finite nonnegative decimal in Hz. Zero keeps Vibeshine's 24.9 Hz
 default. Back timeout is a signed 32-bit millisecond value; any negative value
@@ -49,19 +50,24 @@ Administrators use the fixed management routes `/v1/input/settings_get` and
 `expected_revision`, and may contain `high_resolution_scrolling`,
 `always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
 newer fields preserve their current durable values. The update may also include
-`key_repeat_delay`, `key_repeat_frequency`, `back_button_timeout`, and `gamepad`.
+`key_repeat_delay`, `key_repeat_frequency`, `back_button_timeout`, `gamepad`, and
+the optional `controller` boolean. An omitted controller field preserves its
+durable value for older clients. The signed `/v1/input/status` read route reports
+controller policy separately from backend capability. Controller policy is
+currently global; app and paired-client controller overrides remain
+unimplemented.
 Windows recognizes `auto`, `x360`, `ds4`, `vhf`, `vhf_xbox`, `vhf_xbox_one`,
 `vhf_ds4`, `vhf_ds5`, and `vhf_switch`. Linux recognizes `auto`, `xone`, `ds4`,
 `ds5`, and `switch`. These names follow Vibeshine's pinned option lists at
 `457237db7e57f9c4be21c35bb07e28d1c100eb7d`. Unsupported-but-recognized profiles
 remain valid settings so deployments can retain an intended choice; a lease
 reports them unavailable, rejects controller snapshots, and never silently
-selects another profile. The next update writes the complete v7 document.
+selects another profile. The next update writes the complete v8 document.
 Product settings actions accept only the exact runtime caller
 `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","expected_revision":4}
+{"keyboard":false,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -80,10 +86,16 @@ be polled. Settings reads do not block on the startup fetch; they return
 `settings_unavailable` until the stored document has loaded rather than presenting
 bootstrap defaults as persisted settings.
 
-The live global policy includes `keyboard`, `mouse`,
+The live global policy includes `keyboard`, `mouse`, `controller`,
 `high_resolution_scrolling`, `always_send_scancodes`,
 `key_rightalt_to_key_win`, `key_repeat_delay`,
-`key_repeat_frequency`, `back_button_timeout`, and `gamepad`. When high-resolution
+`key_repeat_frequency`, `back_button_timeout`, and `gamepad`. Setting
+`controller:false` suppresses controller snapshots and removes active owned
+virtual gamepad slots while leaving keyboard and mouse delivery available. If
+slot removal fails, controller snapshots remain suppressed and slot cleanup is
+retried at 100 ms intervals; it does not block keyboard or mouse input. Re-enabling
+controller input does not restore old slot state: a new controller snapshot must
+arrive first. When high-resolution
 scrolling is disabled, the input controller accumulates signed wheel units
 separately per axis and emits legacy 120-unit detents. Fractional remainders are
 discarded on mode changes, mouse disable, and lease end. The default preserves

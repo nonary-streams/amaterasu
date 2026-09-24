@@ -246,6 +246,7 @@ namespace Amaterasu {
       key_repeat_frequency: number;
       back_button_timeout: number;
       gamepad: string;
+      controller: boolean;
     };
   }
   export interface InputRuntimeStatus {
@@ -255,6 +256,8 @@ namespace Amaterasu {
     effective_gamepad_profile: string | null;
     gamepad_unavailable_reason: string | null;
     controller_input: boolean;
+    controller_enabled: boolean;
+    controller_cleanup_required: boolean;
     lease: Record<string, unknown> | null;
   }
   export interface HistorySettingsReply {

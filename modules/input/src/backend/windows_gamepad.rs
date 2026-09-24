@@ -386,6 +386,10 @@ impl WindowsGamepads {
         self.profile = profile;
     }
 
+    pub(super) fn disable(&mut self) -> InputResult<()> {
+        self.slots.stop()
+    }
+
     pub(super) fn validate(&self, event: &Event) -> InputResult<()> {
         if matches!(event, Event::Controller { .. }) && !self.supported() {
             return Err(InputError::new(

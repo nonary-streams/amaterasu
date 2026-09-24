@@ -64,6 +64,7 @@ namespace Amaterasu {
     backButtonTimeout: number = -1,
     gamepadProfile: string = "auto",
     selectableGamepadProfiles: readonly string[] = ["auto"],
+    controllerEnabled: boolean = true,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
@@ -81,7 +82,8 @@ namespace Amaterasu {
       backButtonTimeout > maxInputBackButtonTimeoutMs ||
       typeof gamepadProfile !== "string" ||
       !Array.isArray(selectableGamepadProfiles) ||
-      !selectableGamepadProfiles.includes(gamepadProfile)
+      !selectableGamepadProfiles.includes(gamepadProfile) ||
+      typeof controllerEnabled !== "boolean"
     )
       throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
     return {
@@ -94,6 +96,7 @@ namespace Amaterasu {
       key_repeat_frequency: keyRepeatFrequency,
       back_button_timeout: backButtonTimeout,
       gamepad: gamepadProfile,
+      controller: controllerEnabled,
     };
   }
 
@@ -136,6 +139,10 @@ namespace Amaterasu {
   ): string {
     if (!status || !Array.isArray(status.supported_profiles))
       return "Current gamepad backend status is unavailable.";
+    if (!status.controller_enabled)
+      return status.controller_cleanup_required
+        ? "Controller input is disabled; virtual gamepad removal is retrying. Keyboard and mouse input remain available."
+        : "Controller input is disabled by policy. Keyboard and mouse input remain available.";
     const isSupported = status.supported_profiles.includes(selectedProfile);
     if (!isSupported) {
       const reason =
@@ -1589,6 +1596,8 @@ namespace Amaterasu {
         keyboard.checked = settings.values.keyboard;
         const mouse = input("input_mouse", "", "checkbox");
         mouse.checked = settings.values.mouse;
+        const controller = input("input_controller", "", "checkbox");
+        controller.checked = settings.values.controller;
         const highResolutionScrolling = input(
           "input_high_resolution_scrolling",
           "",
@@ -1646,10 +1655,11 @@ namespace Amaterasu {
         }
         gamepadProfile.value = settings.values.gamepad;
         const selectedGamepadUnavailable =
-          !runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
-          (runtimeStatus.lease !== null &&
-            runtimeStatus.gamepad === settings.values.gamepad &&
-            !runtimeStatus.controller_input);
+          settings.values.controller &&
+          (!runtimeStatus.supported_profiles.includes(settings.values.gamepad) ||
+            (runtimeStatus.lease !== null &&
+              runtimeStatus.gamepad === settings.values.gamepad &&
+              !runtimeStatus.controller_input));
         const gamepadStatus = el(
           "p",
           selectedGamepadUnavailable ? "error" : "muted",
@@ -1673,6 +1683,11 @@ namespace Amaterasu {
             "Mouse input",
             mouse,
             "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons.",
+          ),
+          field(
+            "Controller input",
+            controller,
+            "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue.",
           ),
           field(
             "High-resolution scrolling",
@@ -1731,6 +1746,7 @@ namespace Amaterasu {
                     backButtonTimeout.valueAsNumber,
                     gamepadProfile.value,
                     gamepadProfileChoices.map((choice) => choice.value),
+                    controller.checked,
                   ),
                   expected_revision: settings.revision,
                 },
