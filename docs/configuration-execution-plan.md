@@ -198,10 +198,14 @@ ID, friendly name, description, then adapter name. The backend tries the
 reference format candidates against the current default render bit depth and
 captures the selected device as 48 kHz float PCM. Stream-session and Opus
 remain stereo-only even though the backend can select 5.1/7.1 layouts.
-The reference's default Steam virtual-endpoint fallback when host audio is
-disabled or the regular endpoint is empty is absent, as is hardware and
-cross-platform qualification. `global:virtual_sink` and its scoped overrides
-remain pending.
+Windows AudioCapture now selects an available Steam stereo endpoint when host
+audio is disabled or the ordinary default endpoint is missing, falling back to
+the ordinary endpoint if Steam is unavailable. A Moonlight
+`localAudioPlayMode` value of 0 or 1 reaches AudioCapture through the RTSP and
+stream-session snapshot; omission defaults to 0. The `/resume` endpoint is
+still unsupported. Hardware and cross-platform qualification, multichannel
+streaming, and complete resume behavior remain pending for
+`global:virtual_sink` and its scoped overrides.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
 Global preparation now persists as a bounded structured list in NVHTTP product
@@ -303,10 +307,12 @@ repeat now applies configurable delay and frequency, including zero-delay
 disable and legacy document migration, with a signed editor. Vibeshine also
 accepts all seven keyboard, mouse, scrolling, scan-code, Right Alt, and repeat
 settings as per-application and per-client overrides, with client values taking
-precedence over application values. Amaterasu currently exposes only a global
-input policy. Scroll remainder handling across policy changes, per-client repeat
-timing, and the `keybindings` precedence over the Right Alt alias differ as
-well. These seven IDs remain pending.
+precedence over application values. Amaterasu now resolves scoped `keyboard`
+and `mouse` values at input lease acquisition, preserving explicit false.
+Scrolling, scan-code, Right Alt, repeat, and the other pinned advanced input
+overrides are not yet scoped. Scroll remainder handling across policy changes,
+per-client repeat timing, and the `keybindings` precedence over the Right Alt
+alias differ as well. These seven IDs remain pending.
 
 ### Controller and gamepad implementation sequence
 
@@ -328,10 +334,11 @@ the bus at lease start; keyboard and mouse remain usable if the driver or
 client DLL is absent. No DLL or driver is bundled. macOS reports native
 injection as unsupported. Linux still needs runtime device and permission
 qualification, and the reference controller profile choices are incomplete.
-Sparse application and certificate-bound client timeout overrides
-now resolve client, then application, then durable global policy at input lease
-acquisition. The lease snapshots its effective value, so later global edits
-apply to later leases.
+Sparse application and certificate-bound client overrides for Back timeout,
+controller, gamepad, keyboard, and mouse now resolve client, then application,
+then durable global policy at input lease acquisition. The exclusive lease
+snapshots its effective values, so later global edits apply to later leases;
+sequential owner/profile restoration is covered by tests.
 The input product document v7 now persists a platform-specific `gamepad`
 choice. Versions 1 through 6 migrate to `auto`. Leases snapshot the requested
 and effective profile; status reports backend-supported choices and an
@@ -345,9 +352,8 @@ Input product document v8 also persists the default-enabled `controller`
 switch. Disabling it suppresses controller snapshots while leaving keyboard
 and mouse input active; existing virtual slots are removed immediately, with
 failed removal retained for retry. The signed editor and status expose the
-policy and pending cleanup. Vibeshine also permits this key as an application
-and paired-client override, which Amaterasu has not yet resolved into a lease.
-Native device qualification remains pending.
+policy and pending cleanup. Its application and paired-client overrides now
+reach the input lease. Native device qualification remains pending.
 
 The live path follows this order; steps 1, 2, and 4 plus initial Linux and
 Windows backends in step 3 are implemented:
