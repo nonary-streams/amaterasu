@@ -84,6 +84,10 @@ and fails when the selected ID is unavailable. The editor lists discoverable
 outputs and retains a saved ID even when discovery is unavailable. Automatic
 uses the bootstrap output. Output selection on other supported platforms and
 the complete capture-provider selection policy still need verification.
+The WGC backend now supports an explicit constant-rate mode that reuses the
+last owned frame on an idle read with monotonic frame metadata. It leaves
+event-driven WGC as the default; global `capture = wgcc` routing into this
+mode is still pending.
 
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when
