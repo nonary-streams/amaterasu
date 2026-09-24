@@ -2,6 +2,12 @@ use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub type ControlResult<T> = Result<T, &'static str>;
+pub const DEFAULT_PING_TIMEOUT_MS: i64 = 10_000;
+pub const MAX_PING_TIMEOUT_MS: i64 = i32::MAX as i64;
+
+fn default_ping_timeout_ms() -> i64 {
+    DEFAULT_PING_TIMEOUT_MS
+}
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,6 +41,8 @@ pub struct Open {
     pub local_bind: Option<SocketAddr>,
     pub connect_data: u32,
     pub key_hex: String,
+    #[serde(default = "default_ping_timeout_ms")]
+    pub ping_timeout_ms: i64,
     #[serde(default)]
     pub operation_id: Option<String>,
 }
@@ -47,6 +55,7 @@ impl Open {
         if !allow_remote && !self.peer_ip.is_loopback() {
             return Err("remote_disabled");
         }
+        validate_ping_timeout_ms(self.ping_timeout_ms)?;
         if let Some(local) = self.local_bind
             && (local.is_ipv4() != self.peer_ip.is_ipv4()
                 || local.ip().is_multicast()
@@ -83,6 +92,13 @@ impl Open {
             SocketAddr::new(address, 0)
         })
     }
+}
+
+pub fn validate_ping_timeout_ms(value: i64) -> ControlResult<u64> {
+    if !(0..=MAX_PING_TIMEOUT_MS).contains(&value) {
+        return Err("invalid_ping_timeout");
+    }
+    Ok(value as u64)
 }
 
 fn valid_peer(peer: IpAddr) -> bool {

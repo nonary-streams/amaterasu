@@ -111,6 +111,7 @@ fn exact_lane_pings_freeze_source_ports_and_rebinding_cannot_redirect_media() {
             video: VIDEO_TOKEN,
             audio: AUDIO_TOKEN,
         },
+        Duration::from_secs(10),
     )
     .unwrap();
     let (video_local, audio_local) = delivery.addresses().unwrap();
@@ -181,6 +182,7 @@ fn expired_discovery_rejects_already_queued_valid_pings() {
             video: VIDEO_TOKEN,
             audio: AUDIO_TOKEN,
         },
+        Duration::from_secs(10),
     )
     .unwrap();
     let (video_local, audio_local) = delivery.addresses().unwrap();
@@ -208,6 +210,7 @@ fn valid_payload_from_a_different_ip_is_ignored() {
             video: VIDEO_TOKEN,
             audio: AUDIO_TOKEN,
         },
+        Duration::from_secs(10),
     )
     .unwrap();
     let (video_local, _) = delivery.addresses().unwrap();
@@ -233,6 +236,7 @@ fn receive_work_per_tick_is_bounded() {
             video: VIDEO_TOKEN,
             audio: AUDIO_TOKEN,
         },
+        Duration::from_secs(10),
     )
     .unwrap();
     let (video_local, _) = delivery.addresses().unwrap();

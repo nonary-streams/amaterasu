@@ -9,7 +9,10 @@ use amaterasu_gamestream::{
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 pub struct Stream {
     pub owner: String,
@@ -18,6 +21,7 @@ pub struct Stream {
     pub video_batch_size_fallback: bool,
     pub audio_settings: AudioSettings,
     pub stream_audio: bool,
+    pub ping_timeout_ms: u64,
     pub video_local: SocketAddr,
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
@@ -37,6 +41,7 @@ pub struct Stream {
 
 impl Stream {
     pub fn open(owner: &str, request: &Open) -> TransportResult<Self> {
+        let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
         let (video, audio) = packetizers(request)?;
         let (video_sealer, audio_sealer) = ciphers(request)?;
         let mut delivery = match (&request.discovery, request.video_port, request.audio_port) {
@@ -45,6 +50,7 @@ impl Stream {
                 request.local(false),
                 request.peer_ip,
                 discovery.tokens()?,
+                Duration::from_millis(ping_timeout_ms),
             ),
             (None, Some(video_port), Some(audio_port)) if video_port != 0 && audio_port != 0 => {
                 Delivery::bind(
@@ -67,6 +73,7 @@ impl Stream {
             video_batch_size_fallback: request.video.batch_size_fallback(),
             audio_settings: request.audio,
             stream_audio: request.stream_audio,
+            ping_timeout_ms,
             video_local,
             audio_local,
             delivery,

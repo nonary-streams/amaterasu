@@ -1,6 +1,6 @@
 mod socket;
 
-use crate::model::{ControlResult, Open};
+use crate::model::{ControlResult, Open, validate_ping_timeout_ms};
 use amaterasu_gamestream::{
     crypto::{ControlOpener, ControlOrdering, ControlProfile, ControlSealer, Direction},
     enet::peer::{Config, Delivery, Event, Peer, PeerError, State},
@@ -15,8 +15,6 @@ use std::{
 
 const MAX_MESSAGES: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-const AUTHENTICATION_TIMEOUT_MS: u64 = 5000;
-const AUTHENTICATED_IDLE_MS: u64 = 15000;
 
 struct Received {
     kind: u16,
@@ -40,6 +38,7 @@ pub struct Stream {
     incoming: VecDeque<Received>,
     incoming_bytes: usize,
     opened: u64,
+    ping_timeout_ms: u64,
     authenticated_at: Option<u64>,
     failure: Option<&'static str>,
     sent_messages: u64,
@@ -51,10 +50,14 @@ pub struct Stream {
 
 impl Stream {
     pub fn open(owner: &str, request: &Open, key: &[u8; 16], now: u64) -> ControlResult<Self> {
+        let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
+        let defaults = Config::default();
         let peer = Peer::new(
             Config {
                 expected_connect_data: request.connect_data,
-                ..Config::default()
+                handshake_timeout_ms: ping_timeout_ms.max(defaults.retransmit_ms),
+                idle_timeout_ms: ping_timeout_ms.max(defaults.ping_interval_ms),
+                ..defaults
             },
             now,
         )
@@ -89,6 +92,7 @@ impl Stream {
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             opened: now,
+            ping_timeout_ms,
             authenticated_at: None,
             failure: None,
             sent_messages: 0,
@@ -108,6 +112,7 @@ impl Stream {
             "peer": self.remote,
             "state": self.state(),
             "authenticated": self.failure.is_none() && self.authenticated_at.is_some() && self.peer.state() == State::Connected,
+            "ping_timeout_ms": self.ping_timeout_ms,
             "failure": self.failure,
             "queued_messages": self.incoming.len(),
             "queued_bytes": self.incoming_bytes,
@@ -150,16 +155,26 @@ impl Stream {
         }
         self.collect_messages(now);
         self.flush_socket();
-        let deadline = match self.authenticated_at {
-            Some(last) => last.saturating_add(AUTHENTICATED_IDLE_MS),
-            None => self.opened.saturating_add(AUTHENTICATION_TIMEOUT_MS),
-        };
-        if now >= deadline {
-            self.fail(if self.authenticated_at.is_some() {
-                "authenticated_peer_idle"
-            } else {
-                "authentication_timeout"
-            });
+        self.check_timeout(now);
+    }
+
+    fn check_timeout(&mut self, now: u64) {
+        if now >= self.timeout_deadline() {
+            self.fail(self.timeout_failure());
+        }
+    }
+
+    fn timeout_deadline(&self) -> u64 {
+        self.authenticated_at
+            .unwrap_or(self.opened)
+            .saturating_add(self.ping_timeout_ms)
+    }
+
+    fn timeout_failure(&self) -> &'static str {
+        if self.authenticated_at.is_some() {
+            "authenticated_peer_idle"
+        } else {
+            "authentication_timeout"
         }
     }
 
@@ -182,7 +197,11 @@ impl Stream {
                     return;
                 }
                 Event::TimedOut => {
-                    self.fail("peer_timeout");
+                    self.fail(if now >= self.timeout_deadline() {
+                        self.timeout_failure()
+                    } else {
+                        "peer_timeout"
+                    });
                     return;
                 }
             }

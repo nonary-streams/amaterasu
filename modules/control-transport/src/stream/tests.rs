@@ -8,6 +8,7 @@ fn stream() -> Stream {
         local_bind: None,
         connect_data: 7,
         key_hex: "35".repeat(16),
+        ping_timeout_ms: 10_000,
         operation_id: None,
     };
     Stream::open("owner", &request, &[0x35; 16], 0).unwrap()
@@ -79,13 +80,60 @@ fn oversized_or_unauthenticated_udp_does_not_extend_the_admission_deadline() {
         .unwrap();
     receiver.peek_from(&mut [0; 8000]).unwrap();
     receiver.set_nonblocking(true).unwrap();
-    stream.tick(4999);
+    stream.tick(9999);
     assert_eq!(stream.failure, None);
     assert!(stream.rejected_datagrams > 0);
-    stream.tick(5000);
-    assert!(stream.failure.is_some());
+    stream.tick(10_000);
+    assert_eq!(stream.failure, Some("authentication_timeout"));
     assert!(stream.socket.is_none());
     assert!(UdpSocket::bind(address).is_ok());
+}
+
+fn stream_with_ping_timeout(ping_timeout_ms: i64) -> Stream {
+    let request = Open {
+        peer_ip: "127.0.0.1".parse().unwrap(),
+        peer_port: None,
+        local_bind: None,
+        connect_data: 7,
+        key_hex: "35".repeat(16),
+        ping_timeout_ms,
+        operation_id: None,
+    };
+    Stream::open("owner", &request, &[0x35; 16], 0).unwrap()
+}
+
+#[test]
+fn configured_ping_timeout_applies_to_authentication_and_authenticated_idle() {
+    let mut awaiting_authentication = stream_with_ping_timeout(250);
+    awaiting_authentication.tick(249);
+    assert_eq!(awaiting_authentication.failure, None);
+    awaiting_authentication.tick(250);
+    assert_eq!(
+        awaiting_authentication.failure,
+        Some("authentication_timeout")
+    );
+
+    let mut authenticated = stream_with_ping_timeout(250);
+    authenticated.accept_control(
+        2,
+        Delivery::Reliable,
+        &client().seal(3, b"keyboard").unwrap(),
+        400,
+    );
+    authenticated.check_timeout(649);
+    assert_eq!(authenticated.failure, None);
+    authenticated.check_timeout(650);
+    assert_eq!(authenticated.failure, Some("authenticated_peer_idle"));
+}
+
+#[test]
+fn zero_ping_timeout_expires_immediately_and_default_is_ten_seconds() {
+    let mut immediate = stream_with_ping_timeout(0);
+    immediate.tick(0);
+    assert_eq!(immediate.failure, Some("authentication_timeout"));
+    let default_stream = stream();
+    assert_eq!(default_stream.ping_timeout_ms, 10_000);
+    assert_eq!(default_stream.metadata(7)["ping_timeout_ms"], 10_000);
 }
 
 #[derive(Default)]

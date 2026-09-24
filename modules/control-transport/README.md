@@ -23,6 +23,7 @@ allowlist entry. Open accepts these strict fields:
 | `local_bind` | Optional local socket address; defaults to loopback port zero for local peers, otherwise an unspecified address of the same family |
 | `connect_data` | Expected 32-bit ENet connection data supplied during session negotiation |
 | `key_hex` | Fresh 128-bit launch key encoded as 32 hexadecimal characters |
+| `ping_timeout_ms` | Optional timeout in milliseconds, 0–2147483647; defaults to 10000 |
 | `operation_id` | Optional caller-scoped idempotency name, 1–128 bytes without control characters |
 
 Non-loopback peers/binds require `allow_remote`. Unspecified, multicast,
@@ -36,8 +37,9 @@ CONNECT pins that endpoint for the connection; other endpoints cannot move it.
 The state remains `awaiting_authentication` until a control message authenticates
 with the launch key. Native sends are withheld until that proof arrives. A bad
 tag or replay delivers no plaintext and does not extend the authenticated idle
-clock. The initial authentication deadline is five seconds; after authentication,
-fifteen seconds without fresh authenticated control traffic fails the stream.
+clock. `ping_timeout_ms` sets both the initial authentication deadline and the
+idle limit after authentication; the default is ten seconds. The selected value
+is returned in stream metadata.
 
 The trusted coordinator must derive the peer and key from authenticated session
 negotiation and apply revocation/teardown. Native modules are trusted code;
@@ -46,9 +48,10 @@ API grants are not a sandbox against arbitrary native sockets or memory access.
 ## Lifetime and controls
 
 `open` returns `ok`, `stream`, `local`, `peer_ip`, `peer`, `state`,
-`authenticated`, `failure`, queue sizes and message/datagram counters. Keys and
-connection data are not returned. States distinguish listening, connecting,
-waiting for authentication, active operation and terminal failure.
+`authenticated`, `ping_timeout_ms`, `failure`, queue sizes and message/datagram
+counters. Keys and connection data are not returned. States distinguish
+listening, connecting, waiting for authentication, active operation and terminal
+failure.
 
 `lookup {operation_id}` returns the live owned stream's metadata.
 `status {stream?:u64}` returns `{ok,enabled,streams:[...]}` scoped to the immediate

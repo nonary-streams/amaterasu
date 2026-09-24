@@ -46,6 +46,7 @@ The action and all fields are strict. Open fields:
 | `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}` |
 | `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
 | `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
+| `ping_timeout_ms` | Optional discovery timeout in milliseconds, 0–2147483647; defaults to 10000 |
 | `encryption` | Optional `{key_hex:32 hexadecimal characters,key_id:u32,video:bool,audio:bool,permit_legacy_audio_iv_wrap:false}` |
 | `operation_id` | Optional caller-scoped idempotency key, 1–128 bytes without control characters |
 
@@ -89,11 +90,12 @@ Each lane ignores malformed datagrams, the other lane's payload, and source IPs
 other than `peer_ip`. Its first matching payload freezes that lane's source
 port by connecting the socket. Later packets cannot rebind it. The payload is
 bearer evidence supplied by the authenticated session; it is not cryptographic
-sender authentication.
+sender authentication. `ping_timeout_ms` bounds discovery, including at zero;
+the selected value is returned in open, lookup, and status metadata.
 
 Open replies contain `ok`, `stream`, `peer_ip`, `stream_audio`, `peer_discovery`, `ready`, destination ports,
 `video_local`/`audio_local`, the effective `video`/`audio` configuration,
-`video_batch_size_fallback`, `video_encrypted`,
+`video_batch_size_fallback`, `ping_timeout_ms`, `video_encrypted`,
 `audio_encrypted`, and `permit_legacy_audio_iv_wrap`. Keys/key IDs are not returned.
 Discovery destination ports are null until the corresponding lane freezes, then
 report the learned source port. Payloads are never returned.

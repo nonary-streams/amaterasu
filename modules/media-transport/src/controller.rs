@@ -261,6 +261,7 @@ fn metadata(id: u64, stream: &Stream) -> Value {
         "video_batch_size_fallback":stream.video_batch_size_fallback,
         "audio":stream.audio_settings,
         "stream_audio":stream.stream_audio,
+        "ping_timeout_ms":stream.ping_timeout_ms,
         "video_encrypted":video_encrypted,
         "audio_encrypted":audio_encrypted,
         "permit_legacy_audio_iv_wrap":stream.permit_legacy_audio_iv_wrap

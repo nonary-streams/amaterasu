@@ -28,6 +28,7 @@ pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> 
             ssrc: 0,
         },
         stream_audio: true,
+        ping_timeout_ms: 10_000,
         encryption: encrypted.then(|| Encryption {
             key_hex: "000102030405060708090a0b0c0d0e0f".into(),
             key_id: 9,
@@ -228,6 +229,25 @@ fn invalid_media_changes_no_queued_bytes_or_sequence_and_eos_closes_only_its_med
         unsafe { stream.submit_audio(&audio_packet(&[0x94, 1, 2, 3], 0)) },
         STATUS_OK
     );
+}
+
+#[test]
+fn ping_timeout_defaults_to_ten_seconds_and_sets_the_discovery_deadline() {
+    let (video, audio) = receivers();
+    let mut request = request(&video, &audio, false);
+    assert_eq!(request.ping_timeout_ms, 10_000);
+    request.video_port = None;
+    request.audio_port = None;
+    request.discovery = Some(Box::new(Discovery {
+        video_ping_payload: "video_token-1234".into(),
+        audio_ping_payload: "audio_token-1234".into(),
+    }));
+    request.ping_timeout_ms = 0;
+
+    let mut stream = Stream::open("owner", &request).unwrap();
+    assert_eq!(stream.ping_timeout_ms, 0);
+    stream.delivery.tick();
+    assert_eq!(stream.delivery.failure, Some("udp_discovery_timeout"));
 }
 
 #[test]

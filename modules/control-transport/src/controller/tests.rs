@@ -33,6 +33,22 @@ fn defaults_and_principal_policy_reject_before_allocating() {
 }
 
 #[test]
+fn ping_timeout_defaults_and_accepts_only_the_signed_integer_range() {
+    let mut request = request();
+    assert_eq!(request.ping_timeout_ms, 10_000);
+    assert!(request.validate(false).is_ok());
+
+    for value in [0, i32::MAX as i64] {
+        request.ping_timeout_ms = value;
+        assert!(request.validate(false).is_ok());
+    }
+    for value in [-1, i32::MAX as i64 + 1] {
+        request.ping_timeout_ms = value;
+        assert_eq!(request.validate(false), Err("invalid_ping_timeout"));
+    }
+}
+
+#[test]
 fn replay_is_owned_and_closed_identifiers_never_allocate_again() {
     let mut controller = configured();
     let reply = controller.open("alice", request()).unwrap();

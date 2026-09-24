@@ -7,6 +7,12 @@ pub const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub const SENDS_PER_STREAM: usize = 16;
 pub const SENDS_PER_TICK: usize = 64;
 pub const DISCOVERY_TOKEN_BYTES: usize = 16;
+pub const DEFAULT_PING_TIMEOUT_MS: i64 = 10_000;
+pub const MAX_PING_TIMEOUT_MS: i64 = i32::MAX as i64;
+
+fn default_ping_timeout_ms() -> i64 {
+    DEFAULT_PING_TIMEOUT_MS
+}
 
 fn yes() -> bool {
     true
@@ -184,6 +190,8 @@ pub struct Open {
     pub audio: AudioSettings,
     #[serde(default = "yes")]
     pub stream_audio: bool,
+    #[serde(default = "default_ping_timeout_ms")]
+    pub ping_timeout_ms: i64,
     #[serde(default)]
     pub encryption: Option<Encryption>,
     #[serde(default)]
@@ -192,6 +200,7 @@ pub struct Open {
 
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> TransportResult<()> {
+        validate_ping_timeout_ms(self.ping_timeout_ms)?;
         if self.peer_ip.is_unspecified()
             || self.peer_ip.is_multicast()
             || matches!(self.peer_ip, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some())
@@ -281,6 +290,13 @@ impl Open {
             )
         })
     }
+}
+
+pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {
+    if !(0..=MAX_PING_TIMEOUT_MS).contains(&value) {
+        return Err("invalid_ping_timeout");
+    }
+    Ok(value as u64)
 }
 
 #[derive(Deserialize)]

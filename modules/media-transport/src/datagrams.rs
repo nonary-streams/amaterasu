@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const RECEIVES_PER_LANE: usize = 16;
 const SS_PING_BYTES: usize = DISCOVERY_TOKEN_BYTES + size_of::<u32>();
 const MAX_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
@@ -129,6 +128,7 @@ impl Delivery {
             Lane::fixed(video_local, video_peer)?,
             Lane::fixed(audio_local, audio_peer)?,
             None,
+            None,
         ))
     }
 
@@ -137,16 +137,25 @@ impl Delivery {
         audio_local: SocketAddr,
         peer_ip: IpAddr,
         tokens: DiscoveryTokens,
+        timeout: Duration,
     ) -> io::Result<Self> {
         Ok(Self::new(
             Lane::discovering(video_local, tokens.video)?,
             Lane::discovering(audio_local, tokens.audio)?,
             Some(peer_ip),
+            Some(timeout),
         ))
     }
 
-    fn new(video: Lane, audio: Lane, discovery_peer_ip: Option<IpAddr>) -> Self {
-        let discovery_deadline = discovery_peer_ip.map(|_| Instant::now() + DISCOVERY_DEADLINE);
+    fn new(
+        video: Lane,
+        audio: Lane,
+        discovery_peer_ip: Option<IpAddr>,
+        discovery_timeout: Option<Duration>,
+    ) -> Self {
+        let discovery_deadline = discovery_peer_ip
+            .zip(discovery_timeout)
+            .map(|(_, timeout)| Instant::now() + timeout);
         Self {
             video,
             audio,

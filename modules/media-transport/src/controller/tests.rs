@@ -61,6 +61,28 @@ fn disabled_authorization_destination_and_lookup_are_fail_closed() {
 }
 
 #[test]
+fn ping_timeout_defaults_to_ten_seconds_and_validates_the_signed_integer_range() {
+    let mut request: Open = serde_json::from_value(json!({
+        "peer_ip": "127.0.0.1",
+        "video_port": 49001,
+        "audio_port": 49002,
+        "audio": {"packet_ms": 10, "channels": 2, "wire_payload_bytes": 4}
+    }))
+    .unwrap();
+    assert_eq!(request.ping_timeout_ms, 10_000);
+    assert!(request.validate(false).is_ok());
+
+    for value in [0, i32::MAX as i64] {
+        request.ping_timeout_ms = value;
+        assert!(request.validate(false).is_ok());
+    }
+    for value in [-1, i32::MAX as i64 + 1] {
+        request.ping_timeout_ms = value;
+        assert_eq!(request.validate(false), Err("invalid_ping_timeout"));
+    }
+}
+
+#[test]
 fn ownership_retry_key_history_secret_redaction_and_close_do_not_recreate_cipher_state() {
     let (video, audio) = receivers();
     let mut request = request(&video, &audio, true);
