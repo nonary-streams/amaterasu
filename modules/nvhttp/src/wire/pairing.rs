@@ -425,6 +425,7 @@ impl Router {
                     certificate_id.into(),
                     config_overrides.fec_percentage,
                     config_overrides.stream_audio,
+                    config_overrides.audio_sink,
                 ) {
                     Ok(peer) => peer,
                     Err(_) => {

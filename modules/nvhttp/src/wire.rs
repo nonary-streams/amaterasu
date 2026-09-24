@@ -528,6 +528,7 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
 struct ClientConfigOverrides {
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
+    audio_sink: Option<String>,
 }
 
 #[cfg(test)]

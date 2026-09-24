@@ -48,6 +48,7 @@ pub struct PeerIdentity {
     certificate_id: Option<String>,
     client_fec_percentage: Option<u8>,
     client_stream_audio: Option<bool>,
+    client_audio_sink: Option<String>,
 }
 
 impl PeerIdentity {
@@ -65,6 +66,7 @@ impl PeerIdentity {
             certificate_id: None,
             client_fec_percentage: None,
             client_stream_audio: None,
+            client_audio_sink: None,
         })
     }
 
@@ -74,11 +76,15 @@ impl PeerIdentity {
         certificate_id: String,
         fec_percentage: Option<u8>,
         stream_audio: Option<bool>,
+        audio_sink: Option<String>,
     ) -> Result<Self, &'static str> {
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
             || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
             || fec_percentage == Some(0)
+            || audio_sink
+                .as_deref()
+                .is_some_and(|value| !valid_audio_sink_override(value))
         {
             return Err("invalid_paired_identity");
         }
@@ -86,6 +92,7 @@ impl PeerIdentity {
         self.certificate_id = Some(certificate_id.to_ascii_lowercase());
         self.client_fec_percentage = fec_percentage;
         self.client_stream_audio = stream_audio;
+        self.client_audio_sink = audio_sink;
         Ok(self)
     }
 
@@ -109,6 +116,10 @@ fn valid_client_id(value: &str) -> bool {
 
 fn valid_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn valid_audio_sink_override(value: &str) -> bool {
+    value.len() <= 4096 && !value.chars().any(char::is_control)
 }
 
 fn fingerprint(certificate: &[u8]) -> String {
@@ -371,6 +382,7 @@ impl Controller {
             .as_deref()
             .unwrap_or(&config.capture.audio_endpoint)
             .to_owned();
+        let bootstrap_audio_endpoint = config.capture.audio_endpoint.clone();
         let (capture_provider, constant_rate) = self
             .configured_capture
             .resolve(config.capture.capture_provider);
@@ -423,6 +435,7 @@ impl Controller {
             global_minimum_fps_target,
             capture_output,
             audio_endpoint,
+            bootstrap_audio_endpoint,
             capture_provider,
             constant_rate,
             connection,

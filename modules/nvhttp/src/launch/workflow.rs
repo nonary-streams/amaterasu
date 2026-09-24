@@ -260,6 +260,21 @@ impl Controller {
                                     .client_stream_audio
                                     .or(application_overrides.stream_audio)
                                     .unwrap_or(record.global_stream_audio);
+                                record.audio_endpoint = record
+                                    .peer
+                                    .client_audio_sink
+                                    .as_deref()
+                                    .or(application_overrides.audio_sink.as_deref())
+                                    .map_or_else(
+                                        || record.audio_endpoint.clone(),
+                                        |audio_sink| {
+                                            if audio_sink.is_empty() {
+                                                record.bootstrap_audio_endpoint.clone()
+                                            } else {
+                                                audio_sink.to_owned()
+                                            }
+                                        },
+                                    );
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -593,6 +608,7 @@ fn application_response<'a>(
 struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
+    audio_sink: Option<String>,
 }
 
 fn application_config_overrides(
@@ -608,7 +624,12 @@ fn application_config_overrides(
             serde_json::from_value(value.clone()).map_err(|_| "invalid_application_response")?
         }
     };
-    if config_overrides.fec_percentage == Some(0) {
+    if config_overrides.fec_percentage == Some(0)
+        || config_overrides
+            .audio_sink
+            .as_deref()
+            .is_some_and(|value| !super::valid_audio_sink_override(value))
+    {
         return Err("invalid_application_response");
     }
     Ok(config_overrides)

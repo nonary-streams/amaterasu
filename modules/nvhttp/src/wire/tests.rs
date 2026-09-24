@@ -55,7 +55,11 @@ impl Broker {
                             "paired": 1,
                             "certificate_id": hex(&Sha256::digest(certificate_der)),
                             "client_id": "certificate-bound-client",
-                            "config_overrides": {"fec_percentage": 49, "stream_audio": false}
+                            "config_overrides": {
+                                "fec_percentage": 49,
+                                "stream_audio": false,
+                                "audio_sink": "endpoint.client"
+                            }
                         })
                     }
                     (PAIRING_SERVICE, "begin") => {
@@ -86,7 +90,11 @@ impl Broker {
                             "state": "active",
                             "failure": null,
                             "cleanup_error": null,
-                            "config_overrides": {"fec_percentage": 37, "stream_audio": true}
+                            "config_overrides": {
+                                "fec_percentage": 37,
+                                "stream_audio": true,
+                                "audio_sink": "endpoint.app"
+                            }
                         }
                     }),
                     ("amaterasu.rtsp/1", "open") => json!({
@@ -295,6 +303,9 @@ fn public_launch_requires_paired_tls_before_parsing_private_fields() {
 #[test]
 fn launch_identity_and_client_override_come_from_the_authenticated_certificate() {
     let mut router = streaming_router();
+    router
+        .launches
+        .set_audio_sink_settings(Some("endpoint.global"));
     let mut broker = Broker::default();
     let now = Instant::now();
     let target = concat!(
@@ -345,6 +356,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     // and global value (20). The query's forged uniqueid has no effect.
     assert_eq!(rtsp_open["profile"]["fec_percentage"], 49);
     assert_eq!(rtsp_open["stream_audio"], false);
+    assert_eq!(rtsp_open["capture"]["audio_endpoint"], "endpoint.client");
 }
 
 #[test]

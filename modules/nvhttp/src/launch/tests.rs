@@ -43,6 +43,19 @@ fn peer_with_overrides(
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
 ) -> PeerIdentity {
+    peer_with_settings(marker, fec_percentage, stream_audio, None)
+}
+
+fn peer_with_audio_sink(marker: u8, audio_sink: Option<&str>) -> PeerIdentity {
+    peer_with_settings(marker, None, None, audio_sink.map(str::to_owned))
+}
+
+fn peer_with_settings(
+    marker: u8,
+    fec_percentage: Option<u8>,
+    stream_audio: Option<bool>,
+    audio_sink: Option<String>,
+) -> PeerIdentity {
     let certificate = vec![marker; 32];
     let certificate_id = fingerprint(&certificate);
     PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate)
@@ -52,6 +65,7 @@ fn peer_with_overrides(
             certificate_id,
             fec_percentage,
             stream_audio,
+            audio_sink,
         )
         .unwrap()
 }
@@ -79,7 +93,21 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
     let certificate = vec![7; 32];
     let peer = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone()).unwrap();
     assert_eq!(
-        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None, None)
+        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None, None, None)
+            .err()
+            .unwrap(),
+        "invalid_paired_identity"
+    );
+    assert_eq!(
+        PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+            .unwrap()
+            .with_paired_identity(
+                "moonlight-id".into(),
+                fingerprint(&certificate),
+                None,
+                None,
+                Some("bad\nendpoint".into()),
+            )
             .err()
             .unwrap(),
         "invalid_paired_identity"
@@ -91,6 +119,7 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
             fingerprint(&certificate),
             Some(37),
             Some(false),
+            None,
         )
         .unwrap();
     assert_eq!(paired.paired_client_id(), Some("moonlight-id"));
@@ -225,6 +254,111 @@ fn unavailable_selected_audio_sink_fails_without_opening_bootstrap_sink() {
 }
 
 #[test]
+fn audio_sink_overrides_preserve_empty_values_and_apply_client_app_global_precedence() {
+    for (app, client, expected) in [
+        (None, None, "endpoint.global"),
+        (Some("endpoint.app"), None, "endpoint.app"),
+        (
+            Some("endpoint.app"),
+            Some("endpoint.client"),
+            "endpoint.client",
+        ),
+        (Some(""), None, "default"),
+        (Some("endpoint.app"), Some(""), "default"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_audio_sink_settings(Some("endpoint.global"));
+        let mut broker = Broker {
+            application_audio_sink: app.map(str::to_owned),
+            ..Broker::default()
+        };
+        assert!(
+            controller
+                .launch(10, request(1), peer_with_audio_sink(1, client), now)
+                .is_none()
+        );
+
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(opened_audio_endpoint(&broker), expected);
+    }
+}
+
+#[test]
+fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
+    let now = Instant::now();
+    let selected = "endpoint.unavailable";
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_audio_sink_settings(Some("endpoint.global"));
+    let mut broker = Broker {
+        application_audio_sink: Some(selected.into()),
+        unavailable_audio_endpoint: Some(selected.into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    assert_eq!(opened_audio_endpoints(&broker), [selected]);
+}
+
+#[test]
+fn invalid_application_audio_sink_is_rejected_before_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_audio_sink: Some("invalid\nendpoint".into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    assert!(opened_audio_endpoints(&broker).is_empty());
+}
+
+#[test]
+fn client_audio_sink_override_does_not_leak_to_another_client() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_audio_sink_settings(Some("endpoint.global"));
+    let first_peer = peer_with_audio_sink(1, Some("endpoint.client-one"));
+    let second_peer = peer_with_audio_sink(2, None);
+    let mut broker = Broker::default();
+
+    assert!(
+        controller
+            .launch(10, request(1), first_peer.clone(), now)
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 10);
+    assert_eq!(reply.status, 200);
+    assert_eq!(opened_audio_endpoint(&broker), "endpoint.client-one");
+    controller.reply_delivered(connection, now);
+
+    assert!(controller.cancel(11, &first_peer, now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 11);
+    assert_eq!(reply.status, 200);
+
+    assert!(
+        controller
+            .launch(12, request(2), second_peer, now)
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 12);
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        opened_audio_endpoints(&broker),
+        ["endpoint.client-one", "endpoint.global"]
+    );
+}
+
+#[test]
 fn unavailable_selected_output_fails_without_opening_bootstrap_output() {
     let now = Instant::now();
     let selected = "unavailable-display-id";
@@ -276,6 +410,7 @@ struct Broker {
     application_unhealthy: bool,
     application_fec_percentage: Option<u8>,
     application_stream_audio: Option<bool>,
+    application_audio_sink: Option<String>,
 }
 
 impl Default for Broker {
@@ -302,6 +437,7 @@ impl Default for Broker {
             application_unhealthy: false,
             application_fec_percentage: None,
             application_stream_audio: None,
+            application_audio_sink: None,
         }
     }
 }
@@ -411,7 +547,9 @@ impl Broker {
                     Value::Null
                 },
             });
-            if self.application_fec_percentage.is_some() || self.application_stream_audio.is_some()
+            if self.application_fec_percentage.is_some()
+                || self.application_stream_audio.is_some()
+                || self.application_audio_sink.is_some()
             {
                 let mut config_overrides = json!({});
                 if let Some(fec_percentage) = self.application_fec_percentage {
@@ -419,6 +557,9 @@ impl Broker {
                 }
                 if let Some(stream_audio) = self.application_stream_audio {
                     config_overrides["stream_audio"] = json!(stream_audio);
+                }
+                if let Some(audio_sink) = &self.application_audio_sink {
+                    config_overrides["audio_sink"] = json!(audio_sink);
                 }
                 launch["config_overrides"] = config_overrides;
             }
@@ -494,6 +635,36 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
     );
     controller.reply_delivered(connection, now);
     assert_eq!(controller.current_game(&peer(1)), 1);
+}
+
+fn opened_audio_endpoint(broker: &Broker) -> &str {
+    broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                payload["capture"]["audio_endpoint"].as_str()
+            }
+            _ => None,
+        })
+        .expect("RTSP open request includes audio endpoint")
+}
+
+fn opened_audio_endpoints(broker: &Broker) -> Vec<&str> {
+    broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => {
+                payload["capture"]["audio_endpoint"].as_str()
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
