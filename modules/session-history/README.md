@@ -8,8 +8,18 @@ package's private state directory. Production falls back to the current user's
 application data directory under `Amaterasu/session-history/history.db`.
 Configured database paths must be absolute file paths.
 
-Initial settings default to `enabled: true`, `ttl_days: 0`, and
-`db_size_limit_mb: 0`.
+The product settings default to `enabled: true`, `ttl_days: 0`, and
+`db_size_limit_mb: 0`. They are stored as version 1 settings in
+`amaterasu.configuration/1`, with its product revision used for compare-and-swap
+updates.
+
+At startup, an existing central product document is authoritative. If none
+exists, the module imports values from a previous SQLite `history_settings`
+row, or initializes the defaults, using a revision 0 compare-and-swap. The old
+row is removed only after the central document is confirmed. If configuration
+cannot be loaded, the history service remains available for reads and lifecycle
+calls, while new recording remains disabled and settings requests wait for
+configuration.
 
 ## RPC
 
@@ -44,9 +54,7 @@ configured size limit cannot yet be met. A size of zero disables its policy.
 ## Integration status
 
 The management HTTP routes and frontend editor expose these settings and the
-history list, detail, active, status, and delete operations. This first storage
-slice still stores the three revisioned settings alongside the history
-database. They are not yet synchronized with the central
-`amaterasu.configuration/1` service, and stream-session lifecycle hooks remain
-a separate integration step. The three configuration coverage IDs must stay
-pending until both integrations are complete.
+history list, detail, active, status, and delete operations. The module now
+loads and updates policy through the central configuration service. Stream
+session lifecycle and metric integration remain separate work. Keep the three
+configuration coverage IDs pending until those integrations are complete.

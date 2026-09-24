@@ -74,11 +74,11 @@ const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.session-history",
     library: "amaterasu_session_history",
     provides: &["amaterasu.session-history/1"],
-    calls: &[],
+    calls: &["amaterasu.configuration/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
 };
 
 const CONFIGURATION: ComponentDefinition = ComponentDefinition {

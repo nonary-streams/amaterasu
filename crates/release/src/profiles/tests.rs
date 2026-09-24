@@ -143,6 +143,25 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
 }
 
 #[test]
+fn session_history_loads_its_policy_from_central_configuration() {
+    assert!(SESSION_HISTORY.calls.contains(&"amaterasu.configuration/1"));
+    assert!(SESSION_HISTORY.dependencies.contains(&CONFIGURATION.id));
+    for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
+        let components = profile.components();
+        assert!(
+            components
+                .iter()
+                .any(|component| component.id == SESSION_HISTORY.id)
+        );
+        assert!(
+            components
+                .iter()
+                .any(|component| component.id == CONFIGURATION.id)
+        );
+    }
+}
+
+#[test]
 fn development_policy_keeps_stream_session_disabled_and_console_non_native() {
     let root = std::env::temp_dir().join(format!(
         "amaterasu-release-stream-profile-{}",

@@ -237,6 +237,7 @@ pub struct PruneReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoryStatus {
     pub available: bool,
+    pub configuration_ready: bool,
     pub enabled: bool,
     pub effective_enabled: bool,
     pub degraded: bool,

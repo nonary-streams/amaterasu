@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SECONDS_PER_DAY: i64 = 86_400;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 
@@ -16,7 +16,6 @@ const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 pub enum HistoryError {
     Invalid(&'static str),
     Database,
-    RevisionConflict(u64),
     NotFound,
     ActiveSession,
 }
@@ -39,7 +38,7 @@ impl From<rusqlite::Error> for HistoryError {
 pub struct HistoryStore {
     connection: Connection,
     settings: HistorySettings,
-    settings_revision: u64,
+    configuration_ready: bool,
     effective_enabled: bool,
     active_streams: BTreeSet<String>,
     failed_operations: u64,
@@ -64,11 +63,10 @@ impl HistoryStore {
              PRAGMA foreign_keys = ON;",
         )?;
         apply_schema(&connection)?;
-        let (settings, settings_revision) = read_settings(&connection)?;
         let mut store = Self {
-            effective_enabled: settings.enabled,
-            settings,
-            settings_revision,
+            settings: HistorySettings::default(),
+            configuration_ready: false,
+            effective_enabled: false,
             connection,
             active_streams: BTreeSet::new(),
             failed_operations: 0,
@@ -79,58 +77,62 @@ impl HistoryStore {
         Ok(store)
     }
 
-    pub fn settings(&self) -> (&HistorySettings, u64, bool) {
-        (
-            &self.settings,
-            self.settings_revision,
-            self.effective_enabled,
-        )
+    pub fn settings(&self) -> (&HistorySettings, bool) {
+        (&self.settings, self.effective_enabled)
     }
 
-    pub fn set_settings(
+    /// Returns the previous SQLite-owned policy so startup can import it into
+    /// the central product document before deleting the obsolete table.
+    pub fn legacy_settings(&self) -> Result<Option<HistorySettings>, HistoryError> {
+        if !table_exists(&self.connection, "history_settings")? {
+            return Ok(None);
+        }
+        let legacy = self
+            .connection
+            .query_row(
+                "SELECT enabled, ttl_days, db_size_limit_mb
+                 FROM history_settings WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(HistorySettings {
+                        enabled: row.get(0)?,
+                        ttl_days: row.get(1)?,
+                        db_size_limit_mb: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(settings) = &legacy {
+            settings.validate().map_err(HistoryError::Invalid)?;
+        }
+        Ok(legacy)
+    }
+
+    /// Marks the policy loaded from `amaterasu.configuration/1` as active.
+    /// The revision is owned by the configuration service, not SQLite.
+    pub fn apply_configuration(
         &mut self,
         settings: HistorySettings,
-        expected_revision: u64,
         now_unix: i64,
-    ) -> Result<u64, HistoryError> {
+    ) -> Result<(), HistoryError> {
         settings.validate().map_err(HistoryError::Invalid)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actual_revision: i64 = transaction.query_row(
-            "SELECT revision FROM history_settings WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        if u64::try_from(actual_revision).ok() != Some(expected_revision) {
-            return Err(HistoryError::RevisionConflict(
-                u64::try_from(actual_revision).unwrap_or(0),
-            ));
-        }
-        let next_revision = expected_revision
-            .checked_add(1)
-            .filter(|revision| *revision <= i64::MAX as u64)
-            .ok_or(HistoryError::Invalid("settings revision is exhausted"))?;
-        transaction.execute(
-            "UPDATE history_settings
-             SET enabled = ?1, ttl_days = ?2, db_size_limit_mb = ?3, revision = ?4
-             WHERE singleton = 1",
-            params![
-                settings.enabled,
-                settings.ttl_days,
-                settings.db_size_limit_mb,
-                next_revision as i64
-            ],
-        )?;
-        transaction.commit()?;
-
         self.settings = settings;
-        self.settings_revision = next_revision;
+        self.configuration_ready = true;
         if self.active_streams.is_empty() {
             self.effective_enabled = self.settings.enabled;
         }
         self.prune_best_effort(now_unix);
-        Ok(self.settings_revision)
+        Ok(())
+    }
+
+    /// Removes the v1 local policy only after the central document is known
+    /// durable. Keeping this separate makes failed imports restart-safe.
+    pub fn discard_legacy_settings(&mut self) -> Result<(), HistoryError> {
+        if table_exists(&self.connection, "history_settings")? {
+            self.connection
+                .execute_batch("DROP TABLE history_settings")?;
+        }
+        Ok(())
     }
 
     pub fn begin_session(
@@ -424,9 +426,12 @@ impl HistoryStore {
     pub fn status(&self) -> Result<HistoryStatus, HistoryError> {
         Ok(HistoryStatus {
             available: true,
+            configuration_ready: self.configuration_ready,
             enabled: self.settings.enabled,
             effective_enabled: self.effective_enabled,
-            degraded: self.failed_operations > 0 || self.last_prune.size_limit_unmet,
+            degraded: !self.configuration_ready
+                || self.failed_operations > 0
+                || self.last_prune.size_limit_unmet,
             failed_operations: self.failed_operations,
             active_streams: self.active_streams.len(),
             sessions: table_count(&self.connection, "sessions")?,
@@ -481,14 +486,7 @@ fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
         return Err(HistoryError::Database);
     }
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS history_settings (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-            ttl_days INTEGER NOT NULL CHECK (ttl_days >= 0),
-            db_size_limit_mb INTEGER NOT NULL CHECK (db_size_limit_mb >= 0),
-            revision INTEGER NOT NULL CHECK (revision >= 1)
-         );
-         CREATE TABLE IF NOT EXISTS sessions (
+        "CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY NOT NULL,
             protocol TEXT NOT NULL,
             client_name TEXT NOT NULL,
@@ -528,32 +526,18 @@ fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
          CREATE INDEX IF NOT EXISTS idx_events_session_time
          ON events (session_id, recorded_at_unix, id);",
     )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO history_settings
-         (singleton, enabled, ttl_days, db_size_limit_mb, revision)
-         VALUES (1, 1, 0, 0, 1)",
-        [],
-    )?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
-fn read_settings(connection: &Connection) -> Result<(HistorySettings, u64), HistoryError> {
-    let (enabled, ttl_days, db_size_limit_mb, revision): (bool, i32, i32, i64) = connection
-        .query_row(
-            "SELECT enabled, ttl_days, db_size_limit_mb, revision
-             FROM history_settings WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-    let settings = HistorySettings {
-        enabled,
-        ttl_days,
-        db_size_limit_mb,
-    };
-    settings.validate().map_err(HistoryError::Invalid)?;
-    let revision = u64::try_from(revision).map_err(|_| HistoryError::Database)?;
-    Ok((settings, revision))
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, HistoryError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )?)
 }
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -764,6 +748,10 @@ mod tests {
         }
     }
 
+    fn configure(store: &mut HistoryStore, settings: HistorySettings, now_unix: i64) {
+        store.apply_configuration(settings, now_unix).unwrap();
+    }
+
     #[test]
     fn defaults_and_nonnegative_ranges_match_the_global_contract() {
         assert_eq!(
@@ -802,12 +790,12 @@ mod tests {
     }
 
     #[test]
-    fn session_samples_events_and_settings_survive_database_reopen() {
+    fn session_samples_events_survive_reopen_with_central_policy() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         {
             let mut store = HistoryStore::open(&path, 100).unwrap();
-            assert_eq!(store.settings().1, 1);
+            configure(&mut store, HistorySettings::default(), 100);
             assert!(store.begin_session(&metadata("session-1"), 100).unwrap());
             assert!(
                 store
@@ -829,27 +817,22 @@ mod tests {
                     .unwrap()
             );
             assert!(store.end_session("session-1", 110).unwrap());
-            assert_eq!(
-                store
-                    .set_settings(
-                        HistorySettings {
-                            enabled: true,
-                            ttl_days: 12,
-                            db_size_limit_mb: 8,
-                        },
-                        1,
-                        111,
-                    )
-                    .unwrap(),
-                2
-            );
         }
 
-        let store = HistoryStore::open(&path, 120).unwrap();
-        let (settings, revision, effective_enabled) = store.settings();
+        let mut store = HistoryStore::open(&path, 120).unwrap();
+        assert!(!store.status().unwrap().configuration_ready);
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: true,
+                ttl_days: 12,
+                db_size_limit_mb: 8,
+            },
+            120,
+        );
+        let (settings, effective_enabled) = store.settings();
         assert_eq!(settings.ttl_days, 12);
         assert_eq!(settings.db_size_limit_mb, 8);
-        assert_eq!(revision, 2);
         assert!(effective_enabled);
         assert_eq!(store.list_sessions(25, 0).unwrap().len(), 1);
         let detail = store.session_detail("session-1").unwrap();
@@ -861,15 +844,88 @@ mod tests {
     }
 
     #[test]
+    fn v1_settings_remain_available_until_the_central_document_is_confirmed() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        amaterasu_storage::create_private_directory(path.parent().unwrap()).unwrap();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE history_settings (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                        ttl_days INTEGER NOT NULL CHECK (ttl_days >= 0),
+                        db_size_limit_mb INTEGER NOT NULL CHECK (db_size_limit_mb >= 0),
+                        revision INTEGER NOT NULL CHECK (revision >= 1)
+                     );
+                     INSERT INTO history_settings
+                     (singleton, enabled, ttl_days, db_size_limit_mb, revision)
+                     VALUES (1, 0, 9, 17, 4);
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+        }
+
+        let mut store = HistoryStore::open(&path, 200).unwrap();
+        assert_eq!(
+            store.legacy_settings().unwrap(),
+            Some(HistorySettings {
+                enabled: false,
+                ttl_days: 9,
+                db_size_limit_mb: 17,
+            })
+        );
+        assert!(table_exists(&store.connection, "history_settings").unwrap());
+
+        let central = HistorySettings {
+            enabled: false,
+            ttl_days: 9,
+            db_size_limit_mb: 17,
+        };
+        store.apply_configuration(central, 200).unwrap();
+        store.discard_legacy_settings().unwrap();
+        assert!(!table_exists(&store.connection, "history_settings").unwrap());
+        assert!(store.status().unwrap().configuration_ready);
+    }
+
+    #[test]
+    fn streaming_before_configuration_load_does_not_create_a_history_record() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+
+        assert!(
+            !store
+                .begin_session(&metadata("config-pending"), 100)
+                .unwrap()
+        );
+        let pending = store.status().unwrap();
+        assert!(!pending.configuration_ready);
+        assert!(!pending.effective_enabled);
+        assert!(pending.degraded);
+        assert_eq!(pending.sessions, 0);
+
+        store
+            .apply_configuration(HistorySettings::default(), 101)
+            .unwrap();
+        assert!(!store.status().unwrap().effective_enabled);
+        assert!(!store.end_session("config-pending", 110).unwrap());
+        assert!(store.status().unwrap().effective_enabled);
+        assert_eq!(store.list_sessions(25, 0).unwrap().len(), 0);
+    }
+
+    #[test]
     fn reopening_marks_unclosed_sessions_as_interrupted() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         {
             let mut store = HistoryStore::open(&path, 100).unwrap();
+            configure(&mut store, HistorySettings::default(), 100);
             store.begin_session(&metadata("interrupted"), 90).unwrap();
         }
 
-        let store = HistoryStore::open(&path, 150).unwrap();
+        let mut store = HistoryStore::open(&path, 150).unwrap();
+        configure(&mut store, HistorySettings::default(), 150);
         let detail = store.session_detail("interrupted").unwrap();
         assert_eq!(detail.session.ended_at_unix, Some(150));
         assert_eq!(detail.session.duration_seconds, Some(60));
@@ -886,6 +942,7 @@ mod tests {
     fn failed_begin_rolls_back_and_does_not_leave_an_active_stream() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
         store
             .connection
             .execute_batch(
@@ -907,6 +964,7 @@ mod tests {
     fn failed_end_keeps_the_active_stream_tracked_for_retry() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
         store.begin_session(&metadata("retry-end"), 100).unwrap();
         store
             .connection
@@ -935,23 +993,19 @@ mod tests {
     fn enabled_changes_wait_until_the_last_active_session_ends() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
-        store
-            .set_settings(
-                HistorySettings {
-                    enabled: false,
-                    ..HistorySettings::default()
-                },
-                1,
-                100,
-            )
-            .unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            100,
+        );
         assert!(!store.begin_session(&metadata("unrecorded"), 110).unwrap());
-        store
-            .set_settings(HistorySettings::default(), 2, 120)
-            .unwrap();
-        assert!(!store.settings().2);
+        configure(&mut store, HistorySettings::default(), 120);
+        assert!(!store.settings().1);
         assert!(!store.end_session("unrecorded", 130).unwrap());
-        assert!(store.settings().2);
+        assert!(store.settings().1);
         assert!(store.list_sessions(25, 0).unwrap().is_empty());
     }
 
@@ -959,17 +1013,15 @@ mod tests {
     fn age_pruning_removes_expired_ended_sessions_and_preserves_active_sessions() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 200_000).unwrap();
-        store
-            .set_settings(
-                HistorySettings {
-                    enabled: true,
-                    ttl_days: 1,
-                    db_size_limit_mb: 0,
-                },
-                1,
-                200_000,
-            )
-            .unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: true,
+                ttl_days: 1,
+                db_size_limit_mb: 0,
+            },
+            200_000,
+        );
         store.begin_session(&metadata("expired"), 100).unwrap();
         store.begin_session(&metadata("recent"), 190_000).unwrap();
         store.begin_session(&metadata("active"), 100).unwrap();
@@ -996,6 +1048,15 @@ mod tests {
     fn size_pruning_removes_oldest_ended_sessions_without_deleting_active_records() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: true,
+                ttl_days: 0,
+                db_size_limit_mb: 1,
+            },
+            100,
+        );
         store.begin_session(&metadata("oldest"), 10).unwrap();
         for index in 0..150 {
             store
@@ -1012,18 +1073,7 @@ mod tests {
         store.end_session("newer", 500).unwrap();
         store.begin_session(&metadata("still-active"), 600).unwrap();
 
-        let report = store
-            .set_settings(
-                HistorySettings {
-                    enabled: true,
-                    ttl_days: 0,
-                    db_size_limit_mb: 1,
-                },
-                1,
-                601,
-            )
-            .map(|_| store.status().unwrap().last_prune)
-            .unwrap();
+        let report = store.status().unwrap().last_prune;
         let sessions = store.list_sessions(25, 0).unwrap();
         assert!(report.sessions_deleted >= 1);
         assert!(
@@ -1050,6 +1100,7 @@ mod tests {
     fn active_sessions_cannot_be_deleted_and_child_rows_cascade_for_ended_sessions() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 10).unwrap();
+        configure(&mut store, HistorySettings::default(), 10);
         store.begin_session(&metadata("active"), 10).unwrap();
         assert!(matches!(
             store.delete_session("active"),
@@ -1070,6 +1121,7 @@ mod tests {
     fn detail_reads_are_bounded_and_report_truncation() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 10).unwrap();
+        configure(&mut store, HistorySettings::default(), 10);
         store.begin_session(&metadata("bounded"), 10).unwrap();
         for index in 0..40 {
             store

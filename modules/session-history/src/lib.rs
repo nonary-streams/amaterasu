@@ -1,11 +1,14 @@
 //! Durable session history storage and RPC service.
 mod model;
+mod product_settings;
 mod store;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::{HistorySettings, Operation};
+use product_settings::{ProductSettings, UpdateCompletion};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{HistoryError, HistoryStore};
@@ -13,6 +16,7 @@ use store::{HistoryError, HistoryStore};
 const SERVICE: &str = "amaterasu.session-history/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
 const STREAM_SESSION_CALLER: &str = "amaterasu.stream-session";
+const MAX_DEFERRED_SETTINGS_REQUESTS: usize = 32;
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -23,20 +27,50 @@ struct ModuleSettings {
 struct SessionHistoryModule {
     runtime: RuntimeClient,
     store: Option<HistoryStore>,
+    product_settings: ProductSettings,
+    applied_revision: Option<u64>,
+    legacy_cleanup_pending: bool,
+    legacy_cleanup_retry_ticks: u8,
+    deferred_settings: VecDeque<(u64, Operation)>,
 }
 
 impl ManagedModule for SessionHistoryModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
         // Storage failure leaves the RPC available so management can report it and
         // streaming can continue with history degraded.
-        let store = module_settings(&runtime)
+        let mut store = module_settings(&runtime)
             .and_then(database_path_from_settings)
             .ok()
             .and_then(|path| HistoryStore::open(&path, unix_time_seconds()).ok());
+        let mut legacy_read_failed = false;
+        let migration_candidate = match store.as_ref() {
+            Some(store) => match store.legacy_settings() {
+                Ok(settings) => Some(settings.unwrap_or_default()),
+                Err(_) => {
+                    legacy_read_failed = true;
+                    None
+                }
+            },
+            // Without readable storage, a prior local policy cannot be ruled
+            // out. Wait for an existing central document instead of writing a
+            // default over an uninspected migration source.
+            None => None,
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self { runtime, store })
+        if legacy_read_failed && let Some(store) = store.as_mut() {
+            store.record_failure();
+        }
+        Ok(Self {
+            runtime,
+            store,
+            product_settings: ProductSettings::new(migration_candidate),
+            applied_revision: None,
+            legacy_cleanup_pending: false,
+            legacy_cleanup_retry_ticks: 0,
+            deferred_settings: VecDeque::new(),
+        })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -47,66 +81,212 @@ impl ManagedModule for SessionHistoryModule {
                 payload,
                 ..
             } => {
-                let response = self.handle(&caller, payload);
-                match self.runtime.send(Command::Complete {
-                    request: id,
-                    payload: response,
-                })? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
-                        Ok(())
+                match serde_json::from_value::<Operation>(payload) {
+                    Ok(operation) if is_authorized(&caller, &operation) => {
+                        self.accept_request(id, operation)?;
                     }
-                    response => Err(format!(
-                        "unexpected session-history completion response: {response:?}"
-                    )),
+                    Ok(_) => self.complete(
+                        id,
+                        failure(
+                            "permission_denied",
+                            "caller is not authorized for this history operation",
+                        ),
+                    )?,
+                    Err(_) => self.complete(
+                        id,
+                        failure(
+                            "invalid_request",
+                            "request does not match the history schema",
+                        ),
+                    )?,
                 }
+                Ok(())
             }
             Response::Pending => Ok(()),
             response => Err(format!(
                 "unexpected session-history poll response: {response:?}"
             )),
-        }
+        }?;
+
+        let runtime = &mut self.runtime;
+        self.product_settings
+            .advance(&mut |command| runtime.send(command))?;
+        self.apply_configuration_if_changed();
+        self.cleanup_legacy_settings();
+        self.complete_settings_updates()?;
+        self.drain_deferred_settings()?;
+        Ok(())
     }
 }
 
 impl SessionHistoryModule {
-    fn handle(&mut self, caller: &str, payload: Value) -> Value {
-        let operation: Operation = match serde_json::from_value(payload) {
-            Ok(operation) => operation,
-            Err(_) => {
-                return failure(
-                    "invalid_request",
-                    "request does not match the history schema",
+    fn accept_request(&mut self, id: u64, operation: Operation) -> ModuleResult<()> {
+        if matches!(
+            operation,
+            Operation::SettingsGet {} | Operation::SettingsUpdate { .. }
+        ) && (!self.product_settings.is_ready() || self.product_settings.busy())
+        {
+            if self.deferred_settings.len() >= MAX_DEFERRED_SETTINGS_REQUESTS {
+                return self.complete(
+                    id,
+                    failure(
+                        "settings_busy",
+                        "too many history settings requests are queued",
+                    ),
                 );
             }
-        };
+            self.deferred_settings.push_back((id, operation));
+            return Ok(());
+        }
 
-        if !is_authorized(caller, &operation) {
-            return failure(
-                "permission_denied",
-                "caller is not authorized for this history operation",
-            );
+        self.handle_operation(id, operation)
+    }
+
+    fn handle_operation(&mut self, id: u64, operation: Operation) -> ModuleResult<()> {
+        match operation {
+            Operation::SettingsGet {} => {
+                let (settings, revision) = self.product_settings.settings();
+                let effective_enabled = self.store.as_ref().is_some_and(|store| store.settings().1);
+                self.complete(
+                    id,
+                    json!({
+                        "ok": true,
+                        "settings": settings,
+                        "revision": revision,
+                        "effective_enabled": effective_enabled,
+                    }),
+                )
+            }
+            Operation::SettingsUpdate {
+                settings,
+                expected_revision,
+            } => match self
+                .product_settings
+                .begin_update(id, expected_revision, settings)
+            {
+                Ok(()) => Ok(()),
+                Err(response) => self.complete(id, response),
+            },
+            operation => {
+                let Some(store) = self.store.as_mut() else {
+                    if matches!(operation, Operation::HistoryStatus {}) {
+                        return self.complete(id, unavailable_status());
+                    }
+                    return self.complete(
+                        id,
+                        failure(
+                            "storage_unavailable",
+                            "session history storage is unavailable",
+                        ),
+                    );
+                };
+                let response = match execute(store, operation, unix_time_seconds()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if error.is_database() {
+                            store.record_failure();
+                        }
+                        error_response(error)
+                    }
+                };
+                self.complete(id, response)
+            }
+        }
+    }
+
+    fn apply_configuration_if_changed(&mut self) {
+        if !self.product_settings.is_ready() {
+            return;
+        }
+        let (settings, revision) = self.product_settings.settings();
+        if self.applied_revision == Some(revision) {
+            return;
+        }
+        if let Some(store) = self.store.as_mut() {
+            match store.apply_configuration(settings.clone(), unix_time_seconds()) {
+                Ok(()) => {
+                    self.applied_revision = Some(revision);
+                    self.legacy_cleanup_pending = true;
+                }
+                Err(_) => store.record_failure(),
+            }
+        } else {
+            self.applied_revision = Some(revision);
+        }
+    }
+
+    fn cleanup_legacy_settings(&mut self) {
+        if !self.legacy_cleanup_pending || self.applied_revision.is_none() {
+            return;
+        }
+        if self.legacy_cleanup_retry_ticks > 0 {
+            self.legacy_cleanup_retry_ticks -= 1;
+            return;
         }
         let Some(store) = self.store.as_mut() else {
-            if matches!(&operation, Operation::HistoryStatus {}) {
-                return unavailable_status();
-            }
-            return failure(
-                "storage_unavailable",
-                "session history storage is unavailable",
-            );
+            self.legacy_cleanup_pending = false;
+            return;
         };
-
-        match execute(store, operation, unix_time_seconds()) {
-            Ok(value) => value,
-            Err(error) => {
-                if error.is_database() {
-                    store.record_failure();
-                }
-                error_response(error)
+        match store.discard_legacy_settings() {
+            Ok(()) => self.legacy_cleanup_pending = false,
+            Err(_) => {
+                store.record_failure();
+                self.legacy_cleanup_retry_ticks = 30;
             }
+        }
+    }
+
+    fn complete_settings_updates(&mut self) -> ModuleResult<()> {
+        while let Some(completion) = self.product_settings.take_completion() {
+            match completion {
+                UpdateCompletion::Applied {
+                    request,
+                    settings,
+                    revision,
+                } => {
+                    let effective_enabled =
+                        self.store.as_ref().is_some_and(|store| store.settings().1);
+                    self.complete(
+                        request,
+                        json!({
+                            "ok": true,
+                            "settings": settings,
+                            "revision": revision,
+                            "effective_enabled": effective_enabled,
+                        }),
+                    )?;
+                }
+                UpdateCompletion::Failed { request, response } => {
+                    self.complete(request, response)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_deferred_settings(&mut self) -> ModuleResult<()> {
+        if !self.product_settings.is_ready() || self.product_settings.busy() {
+            return Ok(());
+        }
+        while let Some((id, operation)) = self.deferred_settings.pop_front() {
+            let is_update = matches!(operation, Operation::SettingsUpdate { .. });
+            self.handle_operation(id, operation)?;
+            if is_update && self.product_settings.busy() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, request: u64, payload: Value) -> ModuleResult<()> {
+        match self.runtime.send(Command::Complete { request, payload })? {
+            Response::Ok => Ok(()),
+            Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
+                Ok(())
+            }
+            response => Err(format!(
+                "unexpected session-history completion response: {response:?}"
+            )),
         }
     }
 }
@@ -127,28 +307,9 @@ fn execute(
     now_unix: i64,
 ) -> Result<Value, HistoryError> {
     match operation {
-        Operation::SettingsGet {} => {
-            let (settings, revision, effective_enabled) = store.settings();
-            Ok(json!({
-                "ok": true,
-                "settings": settings,
-                "revision": revision,
-                "effective_enabled": effective_enabled,
-            }))
-        }
-        Operation::SettingsUpdate {
-            settings,
-            expected_revision,
-        } => {
-            let revision = store.set_settings(settings, expected_revision, now_unix)?;
-            let (settings, _, effective_enabled) = store.settings();
-            Ok(json!({
-                "ok": true,
-                "settings": settings,
-                "revision": revision,
-                "effective_enabled": effective_enabled,
-            }))
-        }
+        Operation::SettingsGet {} | Operation::SettingsUpdate { .. } => Err(HistoryError::Invalid(
+            "history settings are handled by the configuration client",
+        )),
         Operation::SessionBegin {
             metadata,
             started_at_unix,
@@ -198,12 +359,6 @@ fn error_response(error: HistoryError) -> Value {
     match error {
         HistoryError::Invalid(message) => failure("invalid_request", message),
         HistoryError::Database => failure("storage_error", "history storage operation failed"),
-        HistoryError::RevisionConflict(revision) => json!({
-            "ok": false,
-            "code": "revision_conflict",
-            "message": "history settings changed since the supplied revision",
-            "revision": revision,
-        }),
         HistoryError::NotFound => failure("not_found", "session history record was not found"),
         HistoryError::ActiveSession => {
             failure("active_session", "active history records cannot be deleted")
@@ -220,6 +375,7 @@ fn unavailable_status() -> Value {
         "ok": true,
         "status": {
             "available": false,
+            "configuration_ready": false,
             "enabled": HistorySettings::default().enabled,
             "effective_enabled": false,
             "degraded": true,
