@@ -12,6 +12,12 @@ use std::path::Path;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 
+pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "native path cannot be represented as Unicode".to_owned())
+}
+
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
@@ -40,16 +46,17 @@ impl LoadedComponents {
             .find(|component| component.runtime)
             .ok_or("package has no runtime")?;
         let state_root = validated_state_root(state_root)?;
+        let state_root_string = path_to_unicode_string(&state_root)?;
         let mut runtime_config = package.runtime_config.clone();
         runtime_config.host_context.schema = 1;
-        runtime_config.host_context.state_root = Some(state_root.to_string_lossy().into_owned());
+        runtime_config.host_context.state_root = Some(state_root_string.clone());
         if package
             .manifest
             .components
             .iter()
             .any(|component| component.id == HOST_CONFIGURATION_COMPONENT)
         {
-            inject_host_configuration_root(&mut runtime_config, &state_root)?;
+            inject_host_configuration_root(&mut runtime_config, &state_root_string)?;
         }
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
@@ -95,6 +102,7 @@ impl LoadedComponents {
 /// boundary. This prevents a module package from redirecting durable state
 /// through a relative path or a reparse point.
 fn validated_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
+    let path_string = path_to_unicode_string(path)?;
     if !path.is_absolute() {
         return Err("runtime state root must be absolute".into());
     }
@@ -103,7 +111,8 @@ fn validated_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
         return Err("runtime state root is not a real directory".into());
     }
     let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-    if !same_path(&canonical, path) {
+    let canonical_string = path_to_unicode_string(&canonical)?;
+    if !same_path(&canonical_string, &path_string) {
         return Err("runtime state root contains a reparse point".into());
     }
     Ok(canonical)
@@ -114,7 +123,7 @@ fn validated_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
 /// verification instead of trusting it to choose a filesystem location.
 fn inject_host_configuration_root(
     runtime_config: &mut amaterasu_contracts::RuntimeConfig,
-    state_root: &Path,
+    state_root: &str,
 ) -> PackageResult<()> {
     let settings = runtime_config
         .settings
@@ -123,25 +132,20 @@ fn inject_host_configuration_root(
     let settings = settings
         .as_object_mut()
         .ok_or("host configuration component settings must be an object")?;
-    settings.insert(
-        "host_state_root".into(),
-        json!(state_root.to_string_lossy().into_owned()),
-    );
+    settings.insert("host_state_root".into(), json!(state_root));
     Ok(())
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+fn same_path(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
-        let left = left.to_string_lossy();
-        let right = right.to_string_lossy();
         left.strip_prefix(r"\\?\")
-            .unwrap_or(&left)
+            .unwrap_or(left)
             .replace('/', "\\")
             .eq_ignore_ascii_case(
                 &right
                     .strip_prefix(r"\\?\")
-                    .unwrap_or(&right)
+                    .unwrap_or(right)
                     .replace('/', "\\"),
             )
     }
@@ -309,10 +313,9 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::inject_host_configuration_root;
+    use super::{inject_host_configuration_root, path_to_unicode_string};
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
-    use std::path::Path;
 
     #[test]
     fn host_configuration_root_overrides_signed_component_settings() {
@@ -322,7 +325,7 @@ mod tests {
             json!({"host_state_root":"package-controlled","retained":true}),
         );
 
-        inject_host_configuration_root(&mut runtime_config, Path::new(r"C:\state\user")).unwrap();
+        inject_host_configuration_root(&mut runtime_config, r"C:\state\user").unwrap();
 
         assert_eq!(
             runtime_config.settings[super::HOST_CONFIGURATION_COMPONENT],
@@ -341,9 +344,30 @@ mod tests {
             json!("package-controlled"),
         );
 
-        assert!(
-            inject_host_configuration_root(&mut runtime_config, Path::new(r"C:\state\user"))
-                .is_err()
+        assert!(inject_host_configuration_root(&mut runtime_config, r"C:\state\user").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_to_unicode_string_rejects_non_unicode_unix_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/state/\xff"));
+        assert_eq!(
+            path_to_unicode_string(path),
+            Err("native path cannot be represented as Unicode".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_to_unicode_string_rejects_non_unicode_windows_paths() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[0xD800]));
+        assert_eq!(
+            path_to_unicode_string(&path),
+            Err("native path cannot be represented as Unicode".into())
         );
     }
 }

@@ -52,7 +52,7 @@ pub(crate) struct HostLoggingConfig {
 }
 
 impl HostLoggingConfig {
-    pub(crate) fn from_global(global: Option<&Value>, state_root: &Path) -> Self {
+    pub(crate) fn from_global(global: Option<&Value>, state_root: &Path) -> Result<Self, String> {
         let default_level = default_minimum_level(env!("CARGO_PKG_VERSION"));
         let minimum_level = global
             .and_then(|settings| settings.get("min_log_level"))
@@ -70,11 +70,13 @@ impl HostLoggingConfig {
             .map(Path::new)
             .unwrap_or(default_log_path);
 
-        Self {
+        let state_root = crate::loading::path_to_unicode_string(state_root)?;
+
+        Ok(Self {
             minimum_level,
             log_path: log_path.to_string_lossy().into_owned(),
-            state_root: state_root.to_string_lossy().into_owned(),
-        }
+            state_root,
+        })
     }
 
     /// Injects trusted host configuration after package verification. Global
@@ -171,7 +173,7 @@ mod tests {
             "log_path": r"logs\amaterasu.log",
             "sunshine_name": "ignored here"
         });
-        let config = HostLoggingConfig::from_global(Some(&global), state_root);
+        let config = HostLoggingConfig::from_global(Some(&global), state_root).unwrap();
         assert_eq!(config.minimum_level, MinimumLogLevel::Warning);
         assert_eq!(config.log_path, r"logs\amaterasu.log");
 
@@ -198,9 +200,34 @@ mod tests {
         let state_root = Path::new(r"C:\private\state");
         for invalid in ["", "../outside.log", "folder\u{0}name.log"] {
             let config =
-                HostLoggingConfig::from_global(Some(&json!({"log_path":invalid})), state_root);
+                HostLoggingConfig::from_global(Some(&json!({"log_path":invalid})), state_root)
+                    .unwrap();
             assert_eq!(config.log_path, "amaterasu.log");
             assert_eq!(config.minimum_level, MinimumLogLevel::Info);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_settings_reject_non_unicode_state_roots() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let state_root = Path::new(std::ffi::OsStr::from_bytes(b"/state/\xff"));
+        assert_eq!(
+            HostLoggingConfig::from_global(None, state_root).unwrap_err(),
+            "native path cannot be represented as Unicode"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_settings_reject_non_unicode_state_roots() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let state_root = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[0xD800]));
+        assert_eq!(
+            HostLoggingConfig::from_global(None, &state_root).unwrap_err(),
+            "native path cannot be represented as Unicode"
+        );
     }
 }

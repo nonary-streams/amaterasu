@@ -141,7 +141,7 @@ fn load_components(
     let logging = crate::logging_config::HostLoggingConfig::from_global(
         bootstrap.policy.settings.get("global"),
         state_root,
-    );
+    )?;
     logging.inject(&mut package.runtime_config)?;
 
     let mut loaded = |index| progress(StartupProgress::Component(index));
