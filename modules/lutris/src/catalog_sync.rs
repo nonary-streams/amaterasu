@@ -1254,7 +1254,10 @@ mod tests {
         let batch = transaction.payload();
         assert_eq!(batch["action"], "provider_snapshot_batch");
         assert_eq!(batch["entries"][0]["source_id"], "1");
-        assert_eq!(batch["selection_remove_source_ids"], json!(["2", "99"]));
+        let selection_removals = batch["selection_remove_source_ids"].as_array().unwrap();
+        assert_eq!(selection_removals.len(), 2);
+        assert!(selection_removals.contains(&json!("2")));
+        assert!(selection_removals.contains(&json!("99")));
     }
 
     #[test]
