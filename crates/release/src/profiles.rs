@@ -645,7 +645,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     policy.settings = BTreeMap::from([
         (
             "amaterasu.rtsp".into(),
-            json!({"enabled":false,"allow_remote":false,"allowed_principals":[]}),
+            json!({"enabled":false,"allow_remote":false,"address_family":"ipv4","bind_address":"","allowed_principals":[]}),
         ),
         (
             "amaterasu.stream-session".into(),
@@ -684,7 +684,10 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({"administrator_principals": ["amaterasu.console", "amaterasu.management"], "transport_principals": ["amaterasu.nvhttp"]}),
         ),
         ("amaterasu.display".into(), json!({"allow_mutation": false})),
-        ("amaterasu.nvhttp".into(), json!({"enabled": false})),
+        (
+            "amaterasu.nvhttp".into(),
+            json!({"enabled": false, "address_family":"ipv4", "bind_address":""}),
+        ),
         (
             "amaterasu.state".into(),
             json!({"data_directory": state_directory}),
@@ -743,6 +746,8 @@ pub fn installer_policy(
                 "enabled": true,
                 "http_bind": "127.0.0.1:47989",
                 "https_bind": "127.0.0.1:47984",
+                "address_family": "ipv4",
+                "bind_address": "",
                 "allow_remote": false,
             }),
         ),
@@ -801,7 +806,7 @@ pub fn installer_policy(
         ),
         (
             "amaterasu.rtsp".into(),
-            json!({"enabled": false, "allow_remote": false, "allowed_principals": []}),
+            json!({"enabled": false, "allow_remote": false, "address_family":"ipv4", "bind_address":"", "allowed_principals": []}),
         ),
     ]);
     policy

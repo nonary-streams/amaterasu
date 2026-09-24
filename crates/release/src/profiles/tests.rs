@@ -143,10 +143,14 @@ fn development_policy_keeps_stream_session_disabled_and_console_non_native() {
     assert_eq!(policy.settings[INPUT_PROBE.id]["enabled"], false);
     let http_settings = &policy.settings[NVHTTP.id];
     assert_eq!(http_settings["enabled"], false);
+    assert_eq!(http_settings["address_family"], "ipv4");
+    assert_eq!(http_settings["bind_address"], "");
     assert!(http_settings.get("streaming").is_none());
     let settings = &policy.settings[RTSP.id];
     assert_eq!(settings["enabled"], false);
     assert_eq!(settings["allow_remote"], false);
+    assert_eq!(settings["address_family"], "ipv4");
+    assert_eq!(settings["bind_address"], "");
     assert_eq!(settings["allowed_principals"], json!([]));
     assert!(
         policy.principals["amaterasu.console"]
@@ -184,7 +188,12 @@ fn installer_policy_enables_only_the_loopback_control_plane() {
     assert_eq!(nvhttp["http_bind"], "127.0.0.1:47989");
     assert_eq!(nvhttp["https_bind"], "127.0.0.1:47984");
     assert_eq!(nvhttp["allow_remote"], false);
+    assert_eq!(nvhttp["address_family"], "ipv4");
+    assert_eq!(nvhttp["bind_address"], "");
     assert!(nvhttp.get("streaming").is_none());
+    let rtsp = &policy.settings[RTSP.id];
+    assert_eq!(rtsp["address_family"], "ipv4");
+    assert_eq!(rtsp["bind_address"], "");
     assert_eq!(
         policy.settings["amaterasu.pairing"]["transport_principals"],
         json!(["amaterasu.nvhttp"])
