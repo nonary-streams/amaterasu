@@ -5,9 +5,12 @@ use amaterasu_abi::{
 };
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
+use serde_json::json;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
+
+const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
@@ -40,6 +43,14 @@ impl LoadedComponents {
         let mut runtime_config = package.runtime_config.clone();
         runtime_config.host_context.schema = 1;
         runtime_config.host_context.state_root = Some(state_root.to_string_lossy().into_owned());
+        if package
+            .manifest
+            .components
+            .iter()
+            .any(|component| component.id == HOST_CONFIGURATION_COMPONENT)
+        {
+            inject_host_configuration_root(&mut runtime_config, &state_root)?;
+        }
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
@@ -96,6 +107,27 @@ fn validated_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
         return Err("runtime state root contains a reparse point".into());
     }
     Ok(canonical)
+}
+
+/// Only the host may select this root. A package's component settings are
+/// signed configuration data, so overwrite any supplied value after package
+/// verification instead of trusting it to choose a filesystem location.
+fn inject_host_configuration_root(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    state_root: &Path,
+) -> PackageResult<()> {
+    let settings = runtime_config
+        .settings
+        .entry(HOST_CONFIGURATION_COMPONENT.into())
+        .or_insert_with(|| json!({}));
+    let settings = settings
+        .as_object_mut()
+        .ok_or("host configuration component settings must be an object")?;
+    settings.insert(
+        "host_state_root".into(),
+        json!(state_root.to_string_lossy().into_owned()),
+    );
+    Ok(())
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -273,4 +305,45 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
         return Err(format!("{operation} failed with ABI status {status}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inject_host_configuration_root;
+    use amaterasu_contracts::RuntimeConfig;
+    use serde_json::json;
+    use std::path::Path;
+
+    #[test]
+    fn host_configuration_root_overrides_signed_component_settings() {
+        let mut runtime_config = RuntimeConfig::default();
+        runtime_config.settings.insert(
+            super::HOST_CONFIGURATION_COMPONENT.into(),
+            json!({"host_state_root":"package-controlled","retained":true}),
+        );
+
+        inject_host_configuration_root(&mut runtime_config, Path::new(r"C:\state\user")).unwrap();
+
+        assert_eq!(
+            runtime_config.settings[super::HOST_CONFIGURATION_COMPONENT],
+            json!({
+                "host_state_root":r"C:\state\user",
+                "retained":true
+            })
+        );
+    }
+
+    #[test]
+    fn host_configuration_root_rejects_non_object_component_settings() {
+        let mut runtime_config = RuntimeConfig::default();
+        runtime_config.settings.insert(
+            super::HOST_CONFIGURATION_COMPONENT.into(),
+            json!("package-controlled"),
+        );
+
+        assert!(
+            inject_host_configuration_root(&mut runtime_config, Path::new(r"C:\state\user"))
+                .is_err()
+        );
+    }
 }

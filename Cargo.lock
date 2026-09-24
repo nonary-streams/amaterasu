@@ -205,6 +205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-host-configuration"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-identity"
 version = "0.1.0"
 dependencies = [
