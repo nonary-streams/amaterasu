@@ -97,6 +97,8 @@ namespace Amaterasu {
     effective_max_bitrate_kbps: number | null;
     configured_minimum_fps_target: number | null;
     effective_minimum_fps_target: number;
+    configured_ping_timeout_ms: number | null;
+    effective_ping_timeout_ms: number;
     configured_audio_sink: string | null;
     configured_external_ip: string | null;
     effective_audio_sink: string;

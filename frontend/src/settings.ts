@@ -192,6 +192,16 @@ namespace Amaterasu {
     return target;
   }
 
+  export function parsePingTimeout(value: string): number {
+    if (value.trim() === "") return -1;
+    if (!/^(0|[1-9][0-9]*)$/.test(value))
+      throw new Error("Ping timeout must be a whole number from 0 to 2147483647 milliseconds, or blank to reset.");
+    const timeout = Number(value);
+    if (!Number.isSafeInteger(timeout) || timeout > 2_147_483_647)
+      throw new Error("Ping timeout must be a whole number from 0 to 2147483647 milliseconds, or blank to reset.");
+    return timeout;
+  }
+
   export function parseAudioSinkSelection(value: string): string | null {
     if (value === "") return null;
     if (new TextEncoder().encode(value).length > 4096 || /[\u0000-\u001f\u007f-\u009f]/.test(value))
@@ -1642,6 +1652,17 @@ namespace Amaterasu {
         minimumFpsTarget.max = "1000";
         minimumFpsTarget.step = "any";
         minimumFpsTarget.placeholder = "Default (20)";
+        const pingTimeout = input(
+          "ping_timeout_ms",
+          settings.configured_ping_timeout_ms === null
+            ? ""
+            : String(settings.configured_ping_timeout_ms),
+          "number",
+        );
+        pingTimeout.min = "0";
+        pingTimeout.max = "2147483647";
+        pingTimeout.step = "1";
+        pingTimeout.placeholder = "Default (10000)";
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1697,6 +1718,11 @@ namespace Amaterasu {
             minimumFpsTarget,
             `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`,
           ),
+          field(
+            "Stream ping timeout (ms)",
+            pingTimeout,
+            `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`,
+          ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           ...(audioDiscoveryIssue ? [el("p", "muted", audioDiscoveryIssue)] : []),
           el(
@@ -1727,6 +1753,7 @@ namespace Amaterasu {
               video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
               max_bitrate: parseMaxBitrate(maxBitrate.value),
               minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
+              ping_timeout_ms: parsePingTimeout(pingTimeout.value),
               audio_sink: parseAudioSinkSelection(audioSink.value),
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),

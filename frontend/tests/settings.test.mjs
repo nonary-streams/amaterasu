@@ -270,6 +270,17 @@ test("minimum frame rate editor preserves default, zero, and fractional targets"
     assert.throws(() => parse(invalid));
 });
 
+test("global ping timeout editor maps blank to reset and validates bounded milliseconds", () => {
+  const parse = context.Amaterasu.parsePingTimeout;
+  assert.equal(parse(""), -1);
+  assert.equal(parse("  "), -1);
+  assert.equal(parse("0"), 0);
+  assert.equal(parse("10000"), 10000);
+  assert.equal(parse("2147483647"), 2147483647);
+  for (const invalid of ["-1", "+1", "01", "1.5", "2147483648", "Infinity", "10 ms"])
+    assert.throws(() => parse(invalid));
+});
+
 test("audio sink editor preserves exact IDs and sparse automatic selection", () => {
   const parse = context.Amaterasu.parseAudioSinkSelection;
   assert.equal(parse(""), null);
