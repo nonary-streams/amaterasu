@@ -18,6 +18,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: actions/checkout@v7
+        if: runner.os == 'Linux'
+        with:
+          repository: Nonary/vibeshine
+          ref: 457237db7e57f9c4be21c35bb07e28d1c100eb7d
+          path: reference/vibeshine
+          persist-credentials: false
+      - name: Configuration inventory coverage
+        if: runner.os == 'Linux'
+        env:
+          AMATERASU_VIBESHINE_REFERENCE: reference/vibeshine
+        run: python scripts/inventory_configuration.py --check
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
