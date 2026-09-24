@@ -34,11 +34,22 @@ use `gpt-6-luna` with `xhigh`. Set `agents.enabled=true`,
 `agents.max_concurrent_threads_per_session` for every lead process. Lead prompts
 must explicitly authorize worker delegation and ask Codex to verify a child
 actually starts at XHigh before assigning writes. Each lead assigns child agents
-exclusive, disjoint files in its own lane worktree, reviews their changes, and
-owns the lane commit. Native subagents share their lead's checkout; do not assume
-they have a separate working directory or branch. If the client later provides
-isolated worker worktrees, keep the same file ownership and merge each worker
-back into its owning lane before submission.
+exclusive, disjoint files within its lane and tells every worker to commit its
+finished slice. Workers stage only their assigned paths, run checks allowed by
+the lightweight-worktree policy, and report the commit SHA, changed paths,
+checks, and remaining gaps. Each worker commit includes the required plan
+attribution below and its actual model attribution.
+
+Prefer an isolated lightweight worktree and branch for independent or
+overlap-prone worker slices. The Luna Max lead reviews each child diff and
+commit, then merges the child branch into its lane branch with `--no-ff` after
+checking ownership and a clean worker worktree. Native subagents may share the
+lead's checkout; do not assume they have a separate directory or branch. When a
+child shares the lane branch, serialize Git operations, require exact-path
+staging, and review its commit on that branch; there is no separate child branch
+to merge. In both cases, the Luna Max lead owns the lane handoff and submits its
+lane branch to the coordinator. No worker merges directly into another lane or
+the coordinator's integration branch.
 
 Use one external run directory, for example
 `D:\sources\worktrees\amaterasu-config-runs\<run-id>`, outside every Git
@@ -209,7 +220,8 @@ same next document version or overwrite a neighbor's migration.
 
 ## Merge queue and review
 
-1. Each lead submits a small committed slice with its base integration SHA,
+1. Each lead first reviews and integrates its workers' committed slices, then
+   submits a small committed lane slice with its base integration SHA,
    exact candidate SHA, stable IDs/scopes, changed paths, dependencies, test
    commands/results, platform evidence, and remaining gaps in its handoff file.
    Run rustfmt, meaningful tests, and strict Clippy before submission. An editor
