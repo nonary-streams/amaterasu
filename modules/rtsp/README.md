@@ -23,7 +23,7 @@ Capture contains `capture_provider` (`dxgi` or `wgc`), `output`, `encoder` and
 reference-frame limit, video packet/FEC settings, Opus packet duration/bitrate and
 encryption policy. Unknown fields are rejected; network data cannot override these
 authorized settings.
-The ticket peer and explicit listener must use the same address family; an
+The ticket peer and selected listener must use the same address family; an
 unreachable ticket is rejected before media allocation.
 
 NVHTTP is the only caller allowed to use the private `network_configure {port}`
@@ -37,6 +37,21 @@ per-session stream owners, so the check does not reserve ports between streams.
 Pending updates keep new opens on the currently bound listener's base until retry
 succeeds.
 This does not alter NVHTTP's HTTP/HTTPS listener or weaken its loopback policy.
+
+Startup settings accept `address_family` (`ipv4` or `both`) and `bind_address`
+(an IP address or empty string). An explicit address replaces the RTSP listener IP
+and supplies the same-family video, control and audio UDP bind addresses while
+preserving configured ports. If either key is omitted, the legacy `bind` address
+remains in effect. An explicit empty address keeps the legacy loopback address when
+`allow_remote` is false, and selects the family wildcard when remote access is
+enabled. For wildcard listeners, RTSP selects a concrete local route for each peer
+and uses it in the returned URL and that stream's UDP binds.
+
+The library currently binds one TCP family at a time. With an explicit address,
+`both` permits either address family. An empty remote-enabled `both` bind selects
+IPv6; it does not install a second IPv4 listener or guarantee platform dual-stack
+acceptance. IPv4 and IPv6 listeners therefore cannot both accept tickets at once;
+full `both` parity remains pending.
 
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,
 downstream `stream_state`, and fixed failure/cleanup codes. `playing` means PLAY

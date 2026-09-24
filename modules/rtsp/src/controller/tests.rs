@@ -3,11 +3,12 @@ use amaterasu_gamestream::rtsp::Method;
 use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
 use std::{
     ffi::c_void,
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
 };
 
 static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+const TEST_BASE_PORT: u16 = 47_989;
 
 #[derive(Default)]
 struct Endpoint {
@@ -202,6 +203,62 @@ fn cleanup_status_polling_preserves_one_deadline() {
     assert!(record.uncertain.is_some());
 }
 
+#[test]
+fn configured_ipv6_listener_and_media_binds_use_the_selected_family() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true,
+        "address_family": "both",
+        "bind_address": "::1",
+        "bind": "[::1]:0"
+    }))
+    .unwrap();
+    let controller = Controller::new(settings).expect("IPv6 RTSP listener");
+    let local = controller.local.expect("bound RTSP listener");
+    assert_eq!(local.ip(), "::1".parse::<IpAddr>().unwrap());
+    assert!(TcpStream::connect(local).is_ok());
+
+    let binds = controller
+        .settings
+        .media_binds(TEST_BASE_PORT)
+        .expect("IPv6 media listeners");
+    assert_eq!(binds.video.ip(), local.ip());
+    assert_eq!(binds.control.ip(), local.ip());
+    assert_eq!(binds.audio.ip(), local.ip());
+}
+
+#[test]
+fn wildcard_listener_advertises_the_peer_route_and_uses_it_for_udp_binds() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled": true,
+        "allow_remote": true,
+        "address_family": "ipv4",
+        "bind_address": "",
+        "bind": "127.0.0.1:0"
+    }))
+    .unwrap();
+    let controller = Controller::new(settings).expect("wildcard RTSP listener");
+    let listener = controller.local.expect("bound RTSP listener");
+    assert!(listener.ip().is_unspecified());
+
+    let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let advertised = controller
+        .advertised_local_for_peer(peer)
+        .expect("route to loopback peer");
+    assert_eq!(advertised.ip(), peer);
+    assert_eq!(advertised.port(), listener.port());
+    let binds = controller
+        .settings
+        .media_binds_on(TEST_BASE_PORT, advertised.ip())
+        .expect("per-stream UDP binds");
+    assert_eq!(binds.video.ip(), peer);
+    assert_eq!(binds.control.ip(), peer);
+    assert_eq!(binds.audio.ip(), peer);
+    assert_eq!(
+        controller.advertised_local_for_peer(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        Err("peer_family_mismatch")
+    );
+}
+
 fn free_base_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener");
     let port = listener.local_addr().unwrap().port();
@@ -239,7 +296,9 @@ fn network_port_updates_rebind_rtsp_and_defer_until_the_stream_is_idle() {
     assert_eq!(pending["udp_binds_preflighted"], false);
     assert_eq!(pending["active_base_port"], old_port);
     assert_eq!(controller.local, Some(old_local));
-    let deferred_binds = controller.media_binds_for_open().unwrap();
+    let deferred_binds = controller
+        .media_binds_for_open(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .unwrap();
     assert_eq!(deferred_binds.video.port(), old_port + 9);
     assert_eq!(deferred_binds.control.port(), old_port + 10);
     assert_eq!(deferred_binds.audio.port(), old_port + 11);
@@ -255,7 +314,9 @@ fn network_port_updates_rebind_rtsp_and_defer_until_the_stream_is_idle() {
         controller.network_error
     );
     assert_eq!(controller.active_network_base_port, Some(port));
-    let applied_binds = controller.media_binds_for_open().unwrap();
+    let applied_binds = controller
+        .media_binds_for_open(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .unwrap();
     assert_eq!(applied_binds.video.port(), port + 9);
     assert_eq!(applied_binds.control.port(), port + 10);
     assert_eq!(applied_binds.audio.port(), port + 11);
@@ -294,7 +355,7 @@ fn failed_startup_rebind_keeps_media_binds_aligned_with_the_bootstrap_listener()
     assert_eq!(controller.local.unwrap().port(), old_port + 21);
 
     let binds = controller
-        .media_binds_for_open()
+        .media_binds_for_open(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .expect("bootstrap listener has its own base port");
     assert_eq!(binds.video.port(), old_port + 9);
     assert_eq!(binds.control.port(), old_port + 10);

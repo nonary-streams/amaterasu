@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
 };
 
 const PREPARE_BUDGET_MS: u64 = 5_000;
@@ -62,7 +62,7 @@ impl Controller {
         settings.validate()?;
         let network_base_port = settings.default_base_port();
         let (transport, local) = if settings.enabled {
-            let transport = Transport::bind(settings.bind, settings.allow_remote)?;
+            let transport = Transport::bind(settings.resolved_bind()?, settings.allow_remote)?;
             let local = transport.local_addr()?;
             (Some(transport), Some(local))
         } else {
@@ -153,10 +153,40 @@ impl Controller {
         Ok(self.network_status(applied.is_ok_and(|applied| applied)))
     }
 
-    pub(super) fn media_binds_for_open(&self) -> Option<crate::model::MediaBinds> {
+    pub(super) fn media_binds_for_open(
+        &self,
+        local_address: IpAddr,
+    ) -> Option<crate::model::MediaBinds> {
         self.active_network_base_port
             .or(self.listener_base_port)
-            .and_then(|port| self.settings.media_binds(port).ok())
+            .and_then(|port| self.settings.media_binds_on(port, local_address).ok())
+    }
+
+    pub(super) fn advertised_local_for_peer(
+        &self,
+        peer: IpAddr,
+    ) -> Result<SocketAddr, &'static str> {
+        let listener = self.local.ok_or("listener_unavailable")?;
+        if listener.ip().is_ipv4() != peer.is_ipv4() {
+            return Err("peer_family_mismatch");
+        }
+        if !listener.ip().is_unspecified() {
+            return Ok(listener);
+        }
+
+        // UDP connect performs route selection without sending a datagram. The
+        // resulting local endpoint is advertised and reused for this stream's
+        // per-session UDP listeners instead of returning an unusable wildcard.
+        let route = UdpSocket::bind(SocketAddr::new(listener.ip(), 0))
+            .map_err(|_| "route_selection_failed")?;
+        route
+            .connect(SocketAddr::new(peer, 9))
+            .map_err(|_| "route_selection_failed")?;
+        let source = route.local_addr().map_err(|_| "route_selection_failed")?;
+        if source.ip().is_unspecified() {
+            return Err("route_selection_failed");
+        }
+        Ok(SocketAddr::new(source.ip(), listener.port()))
     }
 
     fn reconcile_network_port(&mut self, now: u64) {

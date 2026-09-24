@@ -92,9 +92,17 @@ stored base and repeats reconciliation. The settings response includes
 The live settings response includes the configured port, derived https_port, and
 active_http_port/active_https_port values. A legacy version 1 hostname-only product
 document remains readable and uses the component's configured HTTP port; the next
-update writes a version 2 document containing both hostname and port. This NVHTTP
-slice keeps its configured bind IPs unchanged and loopback restrictions intact. It
-does not yet apply the global `address_family` or `bind_address` settings.
+update writes a version 2 document containing both hostname and port.
+
+NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
+(an IP address or empty string). An explicit address replaces the IP for both HTTP
+listeners while preserving their configured ports. If either key is omitted, the
+legacy `http_bind` and `https_bind` addresses remain in effect. With explicit
+`bind_address:""`, remote access disabled keeps the legacy loopback addresses;
+remote access enabled binds the family wildcard. `allow_remote` remains the gate
+for non-loopback listeners. Each service currently owns one listener per protocol,
+so `both` chooses one family from the explicit address, or IPv6 for an empty
+remote-enabled bind; it does not yet create simultaneous IPv4 and IPv6 listeners.
 
 Public streaming is a separate startup opt-in. Omitting `streaming` disables it.
 The complete settings object has no executable, arguments, environment, or catalog

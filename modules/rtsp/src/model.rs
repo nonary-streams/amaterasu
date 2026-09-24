@@ -3,7 +3,7 @@ use amaterasu_gamestream::{
     sdp::{Announce, ColorMode, ControlProtocol},
 };
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 const DEFAULT_BASE_PORT: u16 = 47_989;
 const MIN_BASE_PORT: u16 = 1_029;
@@ -13,12 +13,22 @@ const VIDEO_OFFSET: u16 = 9;
 const CONTROL_OFFSET: u16 = 10;
 const AUDIO_OFFSET: u16 = 11;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressFamily {
+    #[default]
+    Ipv4,
+    Both,
+}
+
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
     pub allow_remote: bool,
     pub bind: SocketAddr,
+    pub address_family: Option<AddressFamily>,
+    pub bind_address: Option<String>,
     pub allowed_principals: Vec<String>,
 }
 impl Default for Settings {
@@ -27,6 +37,8 @@ impl Default for Settings {
             enabled: false,
             allow_remote: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_BASE_PORT + RTSP_SETUP_OFFSET)),
+            address_family: None,
+            bind_address: None,
             allowed_principals: Vec::new(),
         }
     }
@@ -38,12 +50,55 @@ impl Settings {
         {
             return Err("invalid_settings");
         }
-        if invalid_bind_address(self.bind.ip())
-            || (!self.allow_remote && !self.bind.ip().is_loopback())
+        self.resolved_bind()?;
+        Ok(())
+    }
+
+    pub fn resolved_bind(&self) -> Result<SocketAddr, &'static str> {
+        Ok(SocketAddr::new(self.resolved_bind_ip()?, self.bind.port()))
+    }
+
+    fn resolved_bind_ip(&self) -> Result<IpAddr, &'static str> {
+        let family = self.resolved_address_family();
+        let ip = match self.bind_address.as_deref() {
+            None => self.bind.ip(),
+            Some(configured) if configured.trim().is_empty() => {
+                if self.allow_remote {
+                    family.wildcard()
+                } else {
+                    self.bind.ip()
+                }
+            }
+            Some(configured) => configured
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| "invalid_bind")?,
+        };
+        if !family.supports(ip) {
+            return Err("address_family_mismatch");
+        }
+        if invalid_configured_bind(ip)
+            || (self.bind_address.is_none() && invalid_bind_address(ip))
+            || (!self.allow_remote && !ip.is_loopback())
         {
             return Err("invalid_bind");
         }
-        Ok(())
+        Ok(ip)
+    }
+
+    fn resolved_address_family(&self) -> AddressFamily {
+        self.address_family.unwrap_or_else(|| {
+            let ip = self
+                .bind_address
+                .as_deref()
+                .and_then(|address| address.trim().parse::<IpAddr>().ok())
+                .unwrap_or_else(|| self.bind.ip());
+            if ip.is_ipv4() {
+                AddressFamily::Ipv4
+            } else {
+                AddressFamily::Both
+            }
+        })
     }
 
     pub fn default_base_port(&self) -> Option<u16> {
@@ -59,14 +114,30 @@ impl Settings {
     pub fn rtsp_bind_for_base(&self, base_port: u16) -> Result<SocketAddr, &'static str> {
         validate_base_port(base_port)?;
         Ok(SocketAddr::new(
-            self.bind.ip(),
+            self.resolved_bind_ip()?,
             base_port + RTSP_SETUP_OFFSET,
         ))
     }
 
     pub fn media_binds(&self, base_port: u16) -> Result<MediaBinds, &'static str> {
+        self.media_binds_on(base_port, self.resolved_bind_ip()?)
+    }
+
+    pub fn media_binds_on(
+        &self,
+        base_port: u16,
+        local_address: IpAddr,
+    ) -> Result<MediaBinds, &'static str> {
         validate_base_port(base_port)?;
-        let address = self.bind.ip();
+        let configured_address = self.resolved_bind_ip()?;
+        let address = if configured_address.is_unspecified() {
+            local_address
+        } else {
+            configured_address
+        };
+        if address.is_ipv4() != configured_address.is_ipv4() {
+            return Err("address_family_mismatch");
+        }
         Ok(MediaBinds {
             video: SocketAddr::new(address, base_port + VIDEO_OFFSET),
             control: SocketAddr::new(address, base_port + CONTROL_OFFSET),
@@ -85,6 +156,25 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+impl AddressFamily {
+    fn supports(self, address: IpAddr) -> bool {
+        matches!(self, Self::Both) || address.is_ipv4()
+    }
+
+    fn wildcard(self) -> IpAddr {
+        match self {
+            Self::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Self::Both => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        }
+    }
+}
+
+fn invalid_configured_bind(address: IpAddr) -> bool {
+    address.is_multicast()
+        || address == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || matches!(address, IpAddr::V6(address) if address.to_ipv4_mapped().is_some())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,6 +550,8 @@ mod tests {
         assert!(!settings.enabled);
         assert!(!settings.allow_remote);
         assert_eq!(settings.bind, "127.0.0.1:48010".parse().unwrap());
+        assert!(settings.address_family.is_none());
+        assert!(settings.bind_address.is_none());
         assert!(settings.allowed_principals.is_empty());
         assert_eq!(settings.validate(), Ok(()));
 
@@ -502,6 +594,67 @@ mod tests {
             assert_eq!(settings.media_binds(invalid), Err("invalid_port"));
             assert_eq!(settings.rtsp_bind_for_base(invalid), Err("invalid_port"));
         }
+    }
+
+    #[test]
+    fn configured_family_and_address_drive_rtsp_and_all_udp_listener_addresses() {
+        let settings: Settings = serde_json::from_value(json!({
+            "address_family": "both",
+            "bind_address": " ::1 ",
+            "bind": "127.0.0.1:48010"
+        }))
+        .unwrap();
+        assert_eq!(settings.validate(), Ok(()));
+        assert_eq!(
+            settings.resolved_bind().unwrap(),
+            "[::1]:48010".parse().unwrap()
+        );
+        assert_eq!(
+            settings.rtsp_bind_for_base(DEFAULT_BASE_PORT).unwrap(),
+            "[::1]:48010".parse().unwrap()
+        );
+        assert_eq!(
+            settings.media_binds(DEFAULT_BASE_PORT).unwrap(),
+            MediaBinds {
+                video: "[::1]:47998".parse().unwrap(),
+                control: "[::1]:47999".parse().unwrap(),
+                audio: "[::1]:48000".parse().unwrap(),
+            }
+        );
+
+        let mismatch: Settings = serde_json::from_value(json!({
+            "address_family": "ipv4",
+            "bind_address": "::1"
+        }))
+        .unwrap();
+        assert_eq!(mismatch.validate(), Err("address_family_mismatch"));
+
+        let malformed: Settings = serde_json::from_value(json!({
+            "address_family": "both",
+            "bind_address": "rtsp.example"
+        }))
+        .unwrap();
+        assert_eq!(malformed.validate(), Err("invalid_bind"));
+    }
+
+    #[test]
+    fn explicit_empty_bind_address_uses_family_wildcard_only_when_remote_is_enabled() {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled": true,
+            "allow_remote": true,
+            "address_family": "both",
+            "bind_address": "",
+            "bind": "127.0.0.1:48010"
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.resolved_bind().unwrap(),
+            "[::]:48010".parse().unwrap()
+        );
+        assert_eq!(
+            settings.media_binds(DEFAULT_BASE_PORT).unwrap().video,
+            "[::]:47998".parse().unwrap()
+        );
     }
 
     #[test]

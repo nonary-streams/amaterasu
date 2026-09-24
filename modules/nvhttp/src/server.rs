@@ -50,8 +50,10 @@ pub struct Server {
 
 impl Server {
     pub fn bind(settings: &Settings) -> Result<Self, String> {
-        let http = bind_listener(settings.http_bind, "HTTP")?;
-        let https = bind_listener(settings.https_bind, "HTTPS")?;
+        let http_address = settings.resolved_http_bind().map_err(str::to_owned)?;
+        let https_address = settings.resolved_https_bind().map_err(str::to_owned)?;
+        let http = bind_listener(http_address, "HTTP")?;
+        let https = bind_listener(https_address, "HTTPS")?;
         Ok(Self {
             http,
             https,
@@ -634,6 +636,27 @@ mod tests {
         assert!(response.ends_with(b"hello"));
         assert!(delivered);
         assert_eq!(server.connections(), 0);
+    }
+
+    #[test]
+    fn configured_ipv6_bind_address_is_used_by_both_live_listeners() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "address_family": "both",
+            "bind_address": "::1",
+            "http_bind": "127.0.0.1:0",
+            "https_bind": "127.0.0.1:0"
+        }))
+        .unwrap();
+        settings.validate().unwrap();
+
+        let server = Server::bind(&settings).expect("bind IPv6 HTTP pair");
+        assert_eq!(server.http_address().ip(), "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            server.https_address().ip(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert!(TcpStream::connect(server.http_address()).is_ok());
     }
 
     #[test]

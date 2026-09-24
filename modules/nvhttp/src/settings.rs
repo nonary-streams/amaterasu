@@ -1,6 +1,6 @@
 use crate::launch::StreamingConfig;
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const FALLBACK_HOSTNAME: &str = "Amaterasu";
 const HOSTNAME_BUFFER_LENGTH: usize = 256;
@@ -9,12 +9,22 @@ pub const MIN_PORT: u16 = 1_029;
 pub const MAX_PORT: u16 = 65_514;
 pub const HTTPS_PORT_OFFSET: u16 = 5;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressFamily {
+    #[default]
+    Ipv4,
+    Both,
+}
+
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
     pub http_bind: SocketAddr,
     pub https_bind: SocketAddr,
+    pub address_family: Option<AddressFamily>,
+    pub bind_address: Option<String>,
     pub allow_remote: bool,
     pub hostname: String,
     pub streaming: Option<StreamingConfig>,
@@ -26,6 +36,8 @@ impl Default for Settings {
             enabled: false,
             http_bind: SocketAddr::from(([127, 0, 0, 1], 47989)),
             https_bind: SocketAddr::from(([127, 0, 0, 1], 47984)),
+            address_family: None,
+            bind_address: None,
             allow_remote: false,
             hostname: default_hostname(),
             streaming: None,
@@ -35,14 +47,11 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.allow_remote
-            && (!self.http_bind.ip().is_loopback() || !self.https_bind.ip().is_loopback())
-        {
-            return Err("remote_binding_requires_allow_remote");
-        }
+        let http_bind = self.resolved_http_bind()?;
+        let https_bind = self.resolved_https_bind()?;
         validate_configured_hostname(&self.hostname)?;
         validate_hostname(&effective_hostname(&self.hostname))?;
-        if self.http_bind == self.https_bind && self.http_bind.port() != 0 {
+        if http_bind == https_bind && http_bind.port() != 0 {
             return Err("listener_addresses_conflict");
         }
         if let Some(streaming) = &self.streaming {
@@ -50,6 +59,77 @@ impl Settings {
         }
         Ok(())
     }
+
+    pub fn resolved_http_bind(&self) -> Result<SocketAddr, &'static str> {
+        self.resolve_bind(self.http_bind)
+    }
+
+    pub fn resolved_https_bind(&self) -> Result<SocketAddr, &'static str> {
+        self.resolve_bind(self.https_bind)
+    }
+
+    fn resolve_bind(&self, legacy: SocketAddr) -> Result<SocketAddr, &'static str> {
+        let family = self.resolved_address_family(legacy.ip());
+        let ip = match self.bind_address.as_deref() {
+            None => legacy.ip(),
+            Some(address) if address.trim().is_empty() => {
+                if self.allow_remote {
+                    family.wildcard()
+                } else {
+                    legacy.ip()
+                }
+            }
+            Some(address) => address
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| "invalid_bind_address")?,
+        };
+        if !family.supports(ip) {
+            return Err("address_family_mismatch");
+        }
+        if invalid_configured_bind(ip) || (!self.allow_remote && !ip.is_loopback()) {
+            return Err(if !self.allow_remote && !ip.is_loopback() {
+                "remote_binding_requires_allow_remote"
+            } else {
+                "invalid_bind_address"
+            });
+        }
+        Ok(SocketAddr::new(ip, legacy.port()))
+    }
+
+    fn resolved_address_family(&self, legacy_ip: IpAddr) -> AddressFamily {
+        self.address_family.unwrap_or_else(|| {
+            let ip = self
+                .bind_address
+                .as_deref()
+                .and_then(|address| address.trim().parse::<IpAddr>().ok())
+                .unwrap_or(legacy_ip);
+            if ip.is_ipv4() {
+                AddressFamily::Ipv4
+            } else {
+                AddressFamily::Both
+            }
+        })
+    }
+}
+
+impl AddressFamily {
+    fn supports(self, address: IpAddr) -> bool {
+        matches!(self, Self::Both) || address.is_ipv4()
+    }
+
+    fn wildcard(self) -> IpAddr {
+        match self {
+            Self::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            Self::Both => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        }
+    }
+}
+
+fn invalid_configured_bind(address: IpAddr) -> bool {
+    address.is_multicast()
+        || address == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || matches!(address, IpAddr::V6(address) if address.to_ipv4_mapped().is_some())
 }
 
 /// Returns the configured hostname, or the machine hostname when the setting is blank.
@@ -160,11 +240,86 @@ mod tests {
         assert!(!settings.enabled);
         settings.validate().unwrap();
         assert_eq!(settings.hostname, default_hostname());
+        assert!(settings.address_family.is_none());
+        assert!(settings.bind_address.is_none());
+        assert_eq!(
+            settings.resolved_http_bind().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
         let mut settings: Settings =
             serde_json::from_str(r#"{"http_bind":"0.0.0.0:47989"}"#).unwrap();
         assert!(settings.validate().is_err());
         settings.allow_remote = true;
         settings.validate().unwrap();
+        assert_eq!(
+            settings.resolved_http_bind().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn bind_address_and_family_resolve_and_validate_without_weakening_remote_opt_in() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "address_family": "both",
+            "bind_address": " ::1 ",
+            "http_bind": "127.0.0.1:47989",
+            "https_bind": "127.0.0.1:47984"
+        }))
+        .unwrap();
+        settings.validate().unwrap();
+        assert_eq!(
+            settings.resolved_http_bind().unwrap(),
+            "[::1]:47989".parse().unwrap()
+        );
+        assert_eq!(
+            settings.resolved_https_bind().unwrap(),
+            "[::1]:47984".parse().unwrap()
+        );
+
+        let mismatch: Settings = serde_json::from_value(serde_json::json!({
+            "address_family": "ipv4",
+            "bind_address": "::1"
+        }))
+        .unwrap();
+        assert_eq!(mismatch.validate(), Err("address_family_mismatch"));
+
+        let remote: Settings = serde_json::from_value(serde_json::json!({
+            "bind_address": "192.0.2.10"
+        }))
+        .unwrap();
+        assert_eq!(
+            remote.validate(),
+            Err("remote_binding_requires_allow_remote")
+        );
+
+        let malformed: Settings = serde_json::from_value(serde_json::json!({
+            "bind_address": "stream.example"
+        }))
+        .unwrap();
+        assert_eq!(malformed.validate(), Err("invalid_bind_address"));
+
+        let collapsed: Settings = serde_json::from_value(serde_json::json!({
+            "allow_remote": true,
+            "bind_address": "192.0.2.10",
+            "http_bind": "127.0.0.1:49000",
+            "https_bind": "192.0.2.11:49000"
+        }))
+        .unwrap();
+        assert_eq!(collapsed.validate(), Err("listener_addresses_conflict"));
+    }
+
+    #[test]
+    fn both_family_empty_bind_uses_ipv6_wildcard_when_remote_access_is_enabled() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "address_family": "both",
+            "bind_address": "",
+            "allow_remote": true
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.resolved_http_bind().unwrap().ip(),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
     }
 
     #[test]

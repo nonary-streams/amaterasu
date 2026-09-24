@@ -211,6 +211,7 @@ fn settings(enabled: bool, allowed_principals: &[&str]) -> Settings {
             .iter()
             .map(|principal| (*principal).into())
             .collect(),
+        ..Settings::default()
     }
 }
 

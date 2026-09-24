@@ -85,7 +85,10 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
-        if config.peer_ip.is_ipv4() != self.settings.bind.is_ipv4() {
+        if self
+            .local
+            .is_some_and(|address| config.peer_ip.is_ipv4() != address.is_ipv4())
+        {
             rpc::complete(runtime, request, error("peer_family_mismatch"));
             return;
         }
@@ -119,7 +122,13 @@ impl Controller {
                 return;
             }
         };
-        let local = self.local.expect("enabled transport");
+        let local = match self.advertised_local_for_peer(config.peer_ip) {
+            Ok(local) => local,
+            Err(code) => {
+                rpc::complete(runtime, request, error(code));
+                return;
+            }
+        };
         let url = format!("rtspenc://{local}/launch-{ticket:016x}");
         let expires = now.saturating_add(remaining.min(PREPARE_BUDGET_MS));
         let record = Record {
@@ -144,7 +153,7 @@ impl Controller {
             revoke_after: None,
             cleanup_confirmed: false,
         };
-        let media_binds = self.media_binds_for_open();
+        let media_binds = self.media_binds_for_open(local.ip());
         let payload = record.config.prepare_with_media_binds(
             &record.operation(),
             record.udp_discovery.as_ref(),
