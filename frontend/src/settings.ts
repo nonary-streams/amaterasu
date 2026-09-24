@@ -20,6 +20,75 @@ namespace Amaterasu {
     };
   }
 
+  function safeNvhttpBindFamily(value: string): "ipv4" | "ipv6" | null {
+    if (value === "") return null;
+    const octets = value.split(".");
+    if (octets.length === 4) {
+      const parsed = octets.map((octet) => Number(octet));
+      if (
+        octets.every((octet, index) => {
+          const number = parsed[index];
+          return (
+            number !== undefined &&
+            /^(0|[1-9][0-9]{0,2})$/.test(octet) &&
+            number <= 255 &&
+            String(number) === octet
+          );
+        })
+      ) {
+        const firstOctet = parsed[0];
+        if (firstOctet !== undefined && firstOctet >= 224 && firstOctet <= 239)
+          throw new Error("NVHTTP bind address must not be multicast or broadcast.");
+        if (value === "255.255.255.255")
+          throw new Error("NVHTTP bind address must not be multicast or broadcast.");
+        return "ipv4";
+      }
+    }
+    if (!value.includes(":") || /[%\[\]\s]/.test(value)) return null;
+    try {
+      const hostname = new URL(`http://[${value}]/`).hostname.toLowerCase();
+      if (!hostname.startsWith("[") || !hostname.endsWith("]")) return null;
+      if (hostname.startsWith("[ff") || hostname.startsWith("[::ffff:"))
+        throw new Error("NVHTTP bind address must not be multicast or IPv4-mapped IPv6.");
+      return "ipv6";
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("NVHTTP bind address"))
+        throw error;
+      return null;
+    }
+  }
+
+  export function parseNvhttpNetworkOverrides(
+    addressFamilySelection: string,
+    useStartupBindAddress: boolean,
+    bindAddress: string,
+  ): {
+    address_family: "ipv4" | "both" | null;
+    bind_address: string | null;
+  } {
+    const addressFamily =
+      addressFamilySelection === "startup"
+        ? null
+        : addressFamilySelection === "ipv4" || addressFamilySelection === "both"
+          ? addressFamilySelection
+          : (() => {
+              throw new Error("Choose IPv4, both address families, or startup policy.");
+            })();
+    let configuredBindAddress: string | null = null;
+    if (!useStartupBindAddress) {
+      const bindFamily = safeNvhttpBindFamily(bindAddress);
+      if (bindAddress !== "" && bindFamily === null)
+        throw new Error("Enter a valid IPv4 or IPv6 address literal, or leave it blank.");
+      if (addressFamily === "ipv4" && bindFamily === "ipv6")
+        throw new Error("An IPv6 bind address requires both address families.");
+      configuredBindAddress = bindAddress;
+    }
+    return {
+      address_family: addressFamily,
+      bind_address: configuredBindAddress,
+    };
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -368,6 +437,33 @@ namespace Amaterasu {
         port.min = "1029";
         port.max = "65514";
         port.step = "1";
+        const addressFamily = el("select");
+        addressFamily.name = "address_family";
+        const familyOptions: Array<[string, string]> = [
+          ["startup", `Use startup policy (effective: ${settings.address_family})`],
+          ["ipv4", "IPv4 only"],
+          ["both", "IPv4 and IPv6"],
+        ];
+        for (const [value, label] of familyOptions) {
+          const option = el("option", "", label);
+          option.value = value;
+          addressFamily.append(option);
+        }
+        addressFamily.value = settings.configured_address_family ?? "startup";
+        const useStartupBindAddress = input(
+          "use_startup_bind_address",
+          "",
+          "checkbox",
+        );
+        useStartupBindAddress.checked = settings.configured_bind_address === null;
+        const bindAddress = input(
+          "bind_address",
+          settings.configured_bind_address ?? "",
+        );
+        bindAddress.disabled = useStartupBindAddress.checked;
+        useStartupBindAddress.addEventListener("change", () => {
+          bindAddress.disabled = useStartupBindAddress.checked;
+        });
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -375,6 +471,26 @@ namespace Amaterasu {
         form.append(
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
           field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
+          field(
+            "Address family",
+            addressFamily,
+            "Choose IPv4 only, both families, or retain the startup policy.",
+          ),
+          field(
+            "Use startup bind address",
+            useStartupBindAddress,
+            `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`,
+          ),
+          field(
+            "Bind address override",
+            bindAddress,
+            "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
+          ),
+          el(
+            "p",
+            "muted",
+            `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`,
+          ),
           el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`),
           ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
           status,
@@ -383,9 +499,15 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
+            const network = parseNvhttpNetworkOverrides(
+              addressFamily.value,
+              useStartupBindAddress.checked,
+              bindAddress.value,
+            );
             await context.api.post("nvhttp/settings_update", {
               hostname: hostname.value,
               port: port.valueAsNumber,
+              ...network,
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");

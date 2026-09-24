@@ -189,11 +189,21 @@ def test_auth_and_crud(console, api):
     assert status == 200 and host_settings["hostname"] == "Amaterasu-test", host_settings
     assert host_settings["active_http_port"] == host_settings["port"], host_settings
     assert host_settings["active_https_port"] == host_settings["port"] - 5, host_settings
+    assert host_settings["address_family"] == "ipv4", host_settings
+    assert host_settings["bind_address"] == "127.0.0.1", host_settings
+    assert host_settings["configured_address_family"] is None, host_settings
+    assert host_settings["configured_bind_address"] is None, host_settings
+    assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
+    assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
+    assert host_settings["rtsp_addresses"] == [f"127.0.0.1:{host_settings['port'] + 21}"], host_settings
     status, default_host, _ = api.post("/v1/nvhttp/settings_update", {
         "hostname": "", "port": host_settings["port"],
+        "address_family": None, "bind_address": None,
         "expected_revision": host_settings["revision"],
     }, administrator)
     assert status == 200 and default_host["configured_hostname"] == "" and default_host["hostname"], default_host
+    assert default_host["configured_address_family"] is None, default_host
+    assert default_host["configured_bind_address"] is None, default_host
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
         connection.request("GET", "/serverinfo")
@@ -201,12 +211,23 @@ def test_auth_and_crud(console, api):
     finally:
         connection.close()
     assert default_info.findtext("hostname") == default_host["hostname"], ET.tostring(default_info)
-    status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
-        "hostname": "Living Room & Games",
-        "port": default_host["port"],
+    status, explicit_blank_host, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "", "port": default_host["port"],
+        "address_family": "ipv4", "bind_address": "",
         "expected_revision": default_host["revision"],
     }, administrator)
+    assert status == 200 and explicit_blank_host["ok"], explicit_blank_host
+    assert explicit_blank_host["configured_address_family"] == "ipv4", explicit_blank_host
+    assert explicit_blank_host["configured_bind_address"] == "", explicit_blank_host
+    assert explicit_blank_host["bind_address"] == "127.0.0.1", explicit_blank_host
+    status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games",
+        "port": explicit_blank_host["port"],
+        "expected_revision": explicit_blank_host["revision"],
+    }, administrator)
     assert status == 200 and renamed_host["hostname"] == "Living Room & Games", renamed_host
+    assert renamed_host["configured_address_family"] == "ipv4", renamed_host
+    assert renamed_host["configured_bind_address"] == "", renamed_host
     status, conflict, _ = api.post("/v1/nvhttp/settings_update", {
         "hostname": "Stale", "port": renamed_host["port"],
         "expected_revision": host_settings["revision"],
@@ -385,6 +406,10 @@ def main():
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
+            assert host_settings["address_family"] == "ipv4", host_settings
+            assert host_settings["configured_address_family"] == "ipv4", host_settings
+            assert host_settings["configured_bind_address"] == "", host_settings
+            reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
             assert status == 200 and steam_settings["values"] == steam_values, steam_settings
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
@@ -397,6 +422,16 @@ def main():
             revoked = console.request("amaterasu.authentication/1", {"action": "revoke_token", "token_id": token["token_id"]})
             assert revoked["ok"], revoked
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 403
+            status, reset_host, _ = api.post("/v1/nvhttp/settings_update", {
+                "hostname": "Living Room & Games", "port": moved_port,
+                "address_family": None, "bind_address": None,
+                "expected_revision": reset_revision,
+            }, relogged["bearer"])
+            assert status == 200 and reset_host["ok"], reset_host
+            assert reset_host["configured_address_family"] is None, reset_host
+            assert reset_host["configured_bind_address"] is None, reset_host
+            assert reset_host["address_family"] == "ipv4", reset_host
+            assert reset_host["bind_address"] == "127.0.0.1", reset_host
             console.eof()
         finally:
             console.close()

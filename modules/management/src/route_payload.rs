@@ -3,6 +3,7 @@
 use crate::routes::Route;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr};
 
 type Object = Map<String, Value>;
 const INVALID: &str = "unexpected or malformed route fields";
@@ -198,7 +199,11 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
         "settings_update" => {
-            fields(object, &["hostname", "port", "expected_revision"], &[])?;
+            fields(
+                object,
+                &["hostname", "port", "expected_revision"],
+                &["address_family", "bind_address"],
+            )?;
             let hostname = text(object, "hostname")?;
             let port = object.get("port").and_then(Value::as_u64);
             if hostname.len() > 128
@@ -211,9 +216,44 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
+            if let Some(address_family) = object.get("address_family") {
+                match address_family {
+                    Value::Null => {}
+                    Value::String(value) if matches!(value.as_str(), "ipv4" | "both") => {}
+                    _ => return Err(INVALID),
+                }
+            }
+            if let Some(bind_address) = object.get("bind_address") {
+                match bind_address {
+                    Value::Null => {}
+                    Value::String(value) if value.is_empty() => {}
+                    Value::String(value) => {
+                        let address = safe_bind_address(value).ok_or(INVALID)?;
+                        if object.get("address_family").and_then(Value::as_str) == Some("ipv4")
+                            && !address.is_ipv4()
+                        {
+                            return Err(INVALID);
+                        }
+                    }
+                    _ => return Err(INVALID),
+                }
+            }
             Ok(())
         }
         _ => Err(INVALID),
+    }
+}
+
+fn safe_bind_address(value: &str) -> Option<IpAddr> {
+    let address = value.parse::<IpAddr>().ok()?;
+    match address {
+        IpAddr::V4(address) if !address.is_multicast() && address != Ipv4Addr::BROADCAST => {
+            Some(IpAddr::V4(address))
+        }
+        IpAddr::V6(address) if !address.is_multicast() && address.to_ipv4_mapped().is_none() => {
+            Some(IpAddr::V6(address))
+        }
+        _ => None,
     }
 }
 

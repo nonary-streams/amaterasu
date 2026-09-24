@@ -55,6 +55,13 @@ namespace Amaterasu {
     configured_hostname: string;
     port: number;
     https_port: number;
+    address_family: "ipv4" | "both";
+    bind_address: string;
+    configured_address_family: "ipv4" | "both" | null;
+    configured_bind_address: string | null;
+    http_addresses: string[] | null;
+    https_addresses: string[] | null;
+    rtsp_addresses: string[] | null;
     active_http_port: number | null;
     active_https_port: number | null;
     listener_error: string | null;

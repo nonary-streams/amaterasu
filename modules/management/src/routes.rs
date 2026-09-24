@@ -509,6 +509,31 @@ mod tests {
             .unwrap()["action"],
             "settings_update"
         );
+        let network_override = serde_json::json!({
+            "hostname":"Living Room",
+            "port":47989,
+            "address_family":"both",
+            "bind_address":"::1",
+            "expected_revision":1
+        });
+        let parsed_override =
+            payload(update, &serde_json::to_vec(&network_override).unwrap()).unwrap();
+        assert_eq!(parsed_override["address_family"], "both");
+        assert_eq!(parsed_override["bind_address"], "::1");
+        let reset = payload(
+            update,
+            br#"{"hostname":"Living Room","port":47989,"address_family":null,"bind_address":null,"expected_revision":2}"#,
+        )
+        .unwrap();
+        assert!(reset["address_family"].is_null());
+        assert!(reset["bind_address"].is_null());
+        let explicit_empty = payload(
+            update,
+            br#"{"hostname":"Living Room","port":47989,"address_family":"ipv4","bind_address":"","expected_revision":2}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit_empty["address_family"], "ipv4");
+        assert_eq!(explicit_empty["bind_address"], "");
         for rejected in [
             br#"{"hostname":"Living Room","port":47989}"#.as_slice(),
             br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"owner":"other"}"#,
@@ -517,6 +542,18 @@ mod tests {
             br#"{"hostname":"Living Room","port":1028,"expected_revision":0}"#,
             br#"{"hostname":"Living Room","port":65515,"expected_revision":0}"#,
             br#"{"hostname":"Living Room","port":47989.5,"expected_revision":0}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"address_family":"ipv6"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"address_family":1}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":false}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"localhost"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":" "}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"127.0.0.1/24"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"127.0.0.1:4"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"address_family":"ipv4","bind_address":"::1"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"224.0.0.1"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"255.255.255.255"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"ff02::1"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"bind_address":"::ffff:127.0.0.1"}"#,
         ] {
             assert!(payload(update, rejected).is_err());
         }

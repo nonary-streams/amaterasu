@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
-const context = vm.createContext({ TextEncoder });
+const context = vm.createContext({ TextEncoder, URL });
 vm.runInContext(
   ts.transpile(readFileSync("src/settings.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
@@ -34,6 +34,45 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
     [60, 0x8000_0000],
   ]) {
     assert.throws(() => parseAuth(session, refresh));
+  }
+});
+
+test("NVHTTP network settings preserve startup null and explicit blank overrides", () => {
+  const parse = context.Amaterasu.parseNvhttpNetworkOverrides;
+  assert.deepEqual(ordinary(parse("startup", true, "")), {
+    address_family: null,
+    bind_address: null,
+  });
+  assert.deepEqual(ordinary(parse("ipv4", false, "")), {
+    address_family: "ipv4",
+    bind_address: "",
+  });
+  assert.deepEqual(ordinary(parse("both", false, "::1")), {
+    address_family: "both",
+    bind_address: "::1",
+  });
+  assert.deepEqual(ordinary(parse("both", false, "192.168.1.20")), {
+    address_family: "both",
+    bind_address: "192.168.1.20",
+  });
+  assert.deepEqual(ordinary(parse("startup", false, "::1")), {
+    address_family: null,
+    bind_address: "::1",
+  });
+  for (const [family, useStartup, bind] of [
+    ["ipv6", false, "127.0.0.1"],
+    ["ipv4", false, "::1"],
+    ["both", false, "localhost"],
+    ["both", false, " "],
+    ["both", false, "127.0.0.1/24"],
+    ["both", false, "127.0.0.1:47989"],
+    ["both", false, "224.0.0.1"],
+    ["both", false, "255.255.255.255"],
+    ["both", false, "ff02::1"],
+    ["both", false, "::ffff:127.0.0.1"],
+    ["both", false, " ::1"],
+  ]) {
+    assert.throws(() => parse(family, useStartup, bind));
   }
 });
 
