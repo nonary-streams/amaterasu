@@ -33,7 +33,9 @@ browser API calls.
 
 ## Implemented workflows
 
-- Administrator username/password login or existing scoped API token sign-in.
+- Administrator username/password login with an optional remembered session, or
+  existing scoped API token sign-in. Administrator sessions silently rotate their
+  access and refresh pair as needed for requests while the tab remains open.
   First-run instructions explain that initial credentials must be created through
   the trusted local console. There is no browser password bootstrap.
 - Overview shows actual responses from catalog, sessions, applications, and Steam.
@@ -70,17 +72,24 @@ checked locally and the server authenticates every subsequent request.
 
 Bearer tokens exist only in the API client's memory. There is no localStorage,
 sessionStorage, IndexedDB, cookie auth, credential logging, URL token, or persistent
-login cache. Reload, sign-out and page departure clear the token; restoring from
-browser back/forward cache returns to login. Sign-out clears the browser session
-only: this API currently does not expose session revocation, so the authentication
-service retains it until expiration or trusted-console revocation.
+login cache. Reload and page departure clear the tokens; restoring from browser
+back/forward cache returns to login. Sign-out immediately clears the browser
+session and sends a best-effort revocation using the refresh token. If the page is
+reloaded or closed before revocation completes, the server session remains valid
+until its absolute refresh expiry or trusted-administrator revocation. Signing out
+with an API token does not revoke that token.
+
+Remember me selects the configured longer refresh lifetime. It does not persist
+authentication across a page reload or browser restart. The backend currently
+keeps sessions only in module memory, so a module restart also requires login.
 
 Requests use POST JSON, Authorization Bearer, omitted cookies, no-store caching,
-and a 12-second browser timeout. Mutations are never automatically retried;
-ambiguous timeout messages instruct refresh/reconciliation. Server validation,
-Origin policy and scopes remain authoritative. All dynamic content is inserted
-with DOM text nodes/property setters, never HTML strings or inline event handlers.
-The bundle works without inline scripts or styles.
+and a 12-second browser timeout. An explicit unauthorized response may cause one
+retry after management verifies a rotated session; timeouts and transport failures
+never retry mutations. Ambiguous timeout messages instruct refresh/reconciliation.
+Server validation, Origin policy and scopes remain authoritative. All dynamic
+content is inserted with DOM text nodes/property setters, never HTML strings or
+inline event handlers. The bundle works without inline scripts or styles.
 
 The UI uses semantic forms, labels, headings, tables, native confirmation dialogs,
 keyboard-visible focus, status/alert regions, a skip link, and responsive navigation.
@@ -97,6 +106,6 @@ These are not represented as working controls. Native module and HTTP protocol
 limitations are documented by their respective READMEs.
 
 Tests exercise literal argument handling, invalid form values, safe numeric
-editing, non-exact page counts, bearer transport/clearing and domain conflict
-handling without retries. Browser visual and end-to-end checks run against the
-real signed frontend and management host.
+editing, non-exact page counts, bearer transport/clearing, single-flight refresh,
+token rotation, logout revocation and domain conflict handling. Browser visual and
+end-to-end checks run against the real signed frontend and management host.

@@ -42,6 +42,13 @@ namespace Amaterasu {
           'meta[name="amaterasu-api-base"]',
         )?.content ?? "",
       );
+      this.api.onAuthenticationLost = () => {
+        if (this.signedIn) {
+          clearTimeout(this.notificationTimer);
+          document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+          this.loginScreen();
+        }
+      };
       window.addEventListener("hashchange", () => {
         if (this.signedIn) this.renderPage(this.currentPage());
       });
@@ -105,6 +112,12 @@ namespace Amaterasu {
       const password = input("password", "", "password");
       password.autocomplete = "current-password";
       password.required = true;
+      const rememberMe = input("remember_me", "", "checkbox");
+      const rememberField = field(
+        "Remember this tab",
+        rememberMe,
+        "Use the longer refresh lifetime; tokens still stay in memory.",
+      );
       const token = input("token", "", "password");
       token.autocomplete = "off";
       token.spellcheck = false;
@@ -135,7 +148,9 @@ namespace Amaterasu {
           password.required = !tokenMode;
           token.required = tokenMode;
           password.value = "";
+          rememberMe.checked = false;
           token.value = "";
+          rememberField.hidden = tokenMode;
           status.replaceChildren();
           toggle.textContent = tokenMode
             ? "Use username and password"
@@ -148,6 +163,7 @@ namespace Amaterasu {
         "form",
         "",
         credentials,
+        rememberField,
         tokenField,
         status,
         submit,
@@ -158,7 +174,12 @@ namespace Amaterasu {
         if (!form.reportValidity()) return;
         void runAction(submit, status, async () => {
           if (tokenMode) this.api.useToken(token.value.trim());
-          else await this.api.login(username.value.trim(), password.value);
+          else
+            await this.api.login(
+              username.value.trim(),
+              password.value,
+              rememberMe.checked,
+            );
           password.value = "";
           token.value = "";
           this.shell();
@@ -256,7 +277,7 @@ namespace Amaterasu {
       const logout = button(
         "Sign out",
         () => {
-          this.api.clear();
+          void this.api.logout();
           clearTimeout(this.notificationTimer);
           document
             .querySelectorAll("dialog")
