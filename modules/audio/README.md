@@ -42,12 +42,17 @@ ID, friendly name, device description, or adapter name, in that priority order.
 Matching is exact and case-sensitive. The virtual selector never falls back to
 the regular endpoint or the default endpoint when it is unavailable. `channels`
 selects stereo (2), 5.1 (6), or 7.1 (8); when omitted in virtual mode it defaults
-to stereo. For 5.1, the backend tries back-speaker and side-speaker masks. It
-sets the selected endpoint's engine format to 48 kHz float32 or signed PCM16 and
-fails with `virtual_sink_format_unavailable` if Windows rejects every candidate.
-The engine format change belongs to the selected endpoint and is not restored
-when capture closes. Capture-only routing is invalid for virtual selection;
-virtual opens use the normal shared default-role lease and cleanup.
+to stereo. The backend reads the current Console render mix's valid bit depth
+(using 32 bits if it cannot query the mix) and tries only matching virtual
+formats in Vibeshine's order. Stereo tries signed 24-in-32, signed 24, signed
+16, float32, then signed 32. 5.1 and 7.1 try float32, signed 32, signed
+24-in-32, signed 24, then signed 16; 5.1 tests back-speaker and side-speaker
+masks for each format. Unsupported preferred depths or Windows rejecting every
+candidate return `virtual_sink_format_unavailable`. Loopback capture requests
+48 kHz float32 and uses WASAPI shared-mode PCM conversion for the configured
+layout, while the selected endpoint's engine format change persists after
+capture closes. Capture-only routing is invalid for virtual selection; virtual
+opens use the normal shared default-role lease and cleanup.
 
 Set `capture_sink_without_routing:true` on an open to capture the selected
 endpoint without changing any render default role. The product resolver should

@@ -8,6 +8,44 @@ pub struct ChannelLayout {
     pub masks: &'static [u32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VirtualSampleFormat {
+    Float32,
+    Signed32,
+    Signed24In32,
+    Signed24,
+    Signed16,
+}
+
+impl VirtualSampleFormat {
+    pub const fn container_bits(self) -> u16 {
+        match self {
+            Self::Signed24 => 24,
+            Self::Signed16 => 16,
+            Self::Float32 | Self::Signed32 | Self::Signed24In32 => 32,
+        }
+    }
+
+    pub const fn valid_bits(self) -> u16 {
+        match self {
+            Self::Signed24 => 24,
+            Self::Signed16 => 16,
+            Self::Float32 | Self::Signed32 => 32,
+            Self::Signed24In32 => 24,
+        }
+    }
+
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::Float32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtualFormatCandidate {
+    pub sample_format: VirtualSampleFormat,
+    pub channel_mask: u32,
+}
+
 const STEREO_MASKS: &[u32] = &[0x0003];
 const SURROUND_51_MASKS: &[u32] = &[0x003f, 0x060f];
 const SURROUND_71_MASKS: &[u32] = &[0x063f];
@@ -20,6 +58,42 @@ pub fn channel_layout(channels: u32) -> AudioResult<ChannelLayout> {
         _ => return Err("unsupported_channel_layout"),
     };
     Ok(ChannelLayout { channels, masks })
+}
+
+/// Builds candidate order from Vibeshine's channel-specific preferred formats.
+pub fn format_candidates(channels: u32) -> AudioResult<Vec<VirtualFormatCandidate>> {
+    use VirtualSampleFormat::{Float32 as F32, Signed16 as S16, Signed24 as S24};
+    use VirtualSampleFormat::{Signed24In32 as S24In32, Signed32 as S32};
+
+    let (formats, layout) = match channels {
+        2 => (&[S24In32, S24, S16, F32, S32][..], channel_layout(2)?),
+        6 => (&[F32, S32, S24In32, S24, S16][..], channel_layout(6)?),
+        8 => (&[F32, S32, S24In32, S24, S16][..], channel_layout(8)?),
+        _ => return Err("unsupported_channel_layout"),
+    };
+
+    Ok(formats
+        .iter()
+        .flat_map(|sample_format| {
+            layout
+                .masks
+                .iter()
+                .map(|channel_mask| VirtualFormatCandidate {
+                    sample_format: *sample_format,
+                    channel_mask: *channel_mask,
+                })
+        })
+        .collect())
+}
+
+pub fn preferred_format_candidates(
+    channels: u32,
+    preferred_valid_bits: u16,
+) -> AudioResult<Vec<VirtualFormatCandidate>> {
+    Ok(format_candidates(channels)?
+        .into_iter()
+        .filter(|candidate| candidate.sample_format.valid_bits() == preferred_valid_bits)
+        .collect())
 }
 
 /// Matches the configured text against the endpoint fields in Vibeshine's
@@ -143,5 +217,82 @@ mod tests {
         assert_eq!(channel_layout(6).unwrap().masks, &[0x003f, 0x060f]);
         assert_eq!(channel_layout(8).unwrap().masks, &[0x063f]);
         assert_eq!(channel_layout(4).unwrap_err(), "unsupported_channel_layout");
+    }
+
+    #[test]
+    fn stereo_candidates_preserve_spatial_audio_preference_order_and_valid_depth() {
+        let candidates = format_candidates(2).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.sample_format)
+                .collect::<Vec<_>>(),
+            [
+                VirtualSampleFormat::Signed24In32,
+                VirtualSampleFormat::Signed24,
+                VirtualSampleFormat::Signed16,
+                VirtualSampleFormat::Float32,
+                VirtualSampleFormat::Signed32,
+            ]
+        );
+        assert_eq!(
+            preferred_format_candidates(2, 24)
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate.sample_format)
+                .collect::<Vec<_>>(),
+            [
+                VirtualSampleFormat::Signed24In32,
+                VirtualSampleFormat::Signed24
+            ]
+        );
+        assert_eq!(
+            preferred_format_candidates(2, 32)
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate.sample_format)
+                .collect::<Vec<_>>(),
+            [VirtualSampleFormat::Float32, VirtualSampleFormat::Signed32]
+        );
+    }
+
+    #[test]
+    fn surround_candidates_keep_each_sample_preference_and_mask_fallback_order() {
+        let candidates = format_candidates(6).unwrap();
+        assert_eq!(
+            candidates,
+            [
+                (VirtualSampleFormat::Float32, 0x003f),
+                (VirtualSampleFormat::Float32, 0x060f),
+                (VirtualSampleFormat::Signed32, 0x003f),
+                (VirtualSampleFormat::Signed32, 0x060f),
+                (VirtualSampleFormat::Signed24In32, 0x003f),
+                (VirtualSampleFormat::Signed24In32, 0x060f),
+                (VirtualSampleFormat::Signed24, 0x003f),
+                (VirtualSampleFormat::Signed24, 0x060f),
+                (VirtualSampleFormat::Signed16, 0x003f),
+                (VirtualSampleFormat::Signed16, 0x060f),
+            ]
+            .map(|(sample_format, channel_mask)| VirtualFormatCandidate {
+                sample_format,
+                channel_mask,
+            })
+        );
+        assert_eq!(
+            format_candidates(8).unwrap(),
+            [
+                VirtualSampleFormat::Float32,
+                VirtualSampleFormat::Signed32,
+                VirtualSampleFormat::Signed24In32,
+                VirtualSampleFormat::Signed24,
+                VirtualSampleFormat::Signed16,
+            ]
+            .map(|sample_format| VirtualFormatCandidate {
+                sample_format,
+                channel_mask: 0x063f,
+            })
+        );
+        assert_eq!(preferred_format_candidates(6, 24).unwrap().len(), 4);
+        assert!(preferred_format_candidates(6, 20).unwrap().is_empty());
     }
 }

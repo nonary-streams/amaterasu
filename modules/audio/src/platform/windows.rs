@@ -5,7 +5,10 @@ use crate::{
     route_policy::{
         AcquirePlan, DefaultEndpoints, DefaultRole, ReleasePlan, RoleAssignment, RoutePolicy,
     },
-    virtual_sink::{ChannelLayout, channel_layout, select_endpoint},
+    virtual_sink::{
+        ChannelLayout, VirtualFormatCandidate, VirtualSampleFormat, channel_layout,
+        preferred_format_candidates, select_endpoint,
+    },
 };
 use amaterasu_media::{
     AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32, PCM_I16,
@@ -106,26 +109,20 @@ impl PolicyConfig {
         format: &mut WAVEFORMATEXTENSIBLE,
     ) -> AudioResult<()> {
         let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
-        let mut default_format = WAVEFORMATEX {
-            wFormatTag: 0,
-            nChannels: 0,
-            nSamplesPerSec: 0,
-            nAvgBytesPerSec: 0,
-            nBlockAlign: 0,
-            wBitsPerSample: 0,
-            cbSize: 0,
-        };
+        let mut default_format = WAVEFORMATEXTENSIBLE::default();
         // SAFETY: the vtable slot is SetDeviceFormat, the fourth IPolicyConfig
-        // method after IUnknown. The UTF-16 ID and both format structures stay
-        // live for the synchronous COM call. This undocumented ABI is isolated
-        // here and invoked only for an explicitly selected virtual sink.
+        // method after IUnknown. The UTF-16 ID and both extensible format
+        // structures stay live for the synchronous COM call; the zeroed
+        // default-format buffer has the full extension size expected by the
+        // ABI. This undocumented call is isolated here and used only for an
+        // explicitly selected virtual sink.
         unsafe {
             let vtable = &**(self.0 as *mut *const PolicyConfigVtable);
             (vtable.set_device_format)(
                 self.0,
                 PCWSTR(wide.as_ptr()),
                 (&mut format.Format) as *mut WAVEFORMATEX,
-                &mut default_format,
+                &mut default_format.Format,
             )
             .ok()
             .map_err(|_| "virtual_sink_format_unavailable")
@@ -465,6 +462,60 @@ impl Drop for MixFormat {
 }
 
 impl MixFormat {
+    fn valid_bits(&self) -> Option<u16> {
+        if self.0.is_null() {
+            return None;
+        }
+        // SAFETY: GetMixFormat owns a live WAVEFORMATEX plus any declared
+        // WAVEFORMATEXTENSIBLE bytes until this wrapper is dropped.
+        unsafe {
+            let base = self.0.read_unaligned();
+            let valid_bits = if base.wFormatTag == 0xfffe && base.cbSize >= 22 {
+                self.0
+                    .cast::<WAVEFORMATEXTENSIBLE>()
+                    .read_unaligned()
+                    .Samples
+                    .wValidBitsPerSample
+            } else {
+                base.wBitsPerSample
+            };
+            Some(if valid_bits == 0 {
+                base.wBitsPerSample
+            } else {
+                valid_bits
+            })
+        }
+    }
+
+    fn channel_layout(&self) -> AudioResult<(u32, u32)> {
+        if self.0.is_null() {
+            return Err("unsupported_channel_layout");
+        }
+        // SAFETY: GetMixFormat owns a live WAVEFORMATEX plus any declared
+        // WAVEFORMATEXTENSIBLE bytes until this wrapper is dropped. Copy packed
+        // structures by value rather than forming potentially unaligned refs.
+        unsafe {
+            let base = self.0.read_unaligned();
+            let channels = u32::from(base.nChannels);
+            let mask = if base.wFormatTag == 0xfffe && base.cbSize >= 22 {
+                self.0
+                    .cast::<WAVEFORMATEXTENSIBLE>()
+                    .read_unaligned()
+                    .dwChannelMask
+            } else {
+                match channels {
+                    1 => 0x0004,
+                    2 => 0x0003,
+                    _ => 0,
+                }
+            };
+            if mask == 0 || mask.count_ones() != channels {
+                return Err("unsupported_channel_layout");
+            }
+            Ok((channels, mask))
+        }
+    }
+
     fn describe(&self) -> AudioResult<Format> {
         if self.0.is_null() {
             return Err("unsupported_format");
@@ -520,8 +571,9 @@ impl MixFormat {
     }
 }
 
-fn virtual_waveformat(channels: u32, channel_mask: u32, code: u32) -> WAVEFORMATEXTENSIBLE {
-    let bits_per_sample = if code == PCM_F32 { 32 } else { 16 };
+fn virtual_waveformat(candidate: VirtualFormatCandidate, channels: u32) -> WAVEFORMATEXTENSIBLE {
+    let sample_format = candidate.sample_format;
+    let bits_per_sample = sample_format.container_bits();
     let block_align = (channels * u32::from(bits_per_sample) / 8) as u16;
     WAVEFORMATEXTENSIBLE {
         Format: WAVEFORMATEX {
@@ -534,10 +586,10 @@ fn virtual_waveformat(channels: u32, channel_mask: u32, code: u32) -> WAVEFORMAT
             cbSize: 22,
         },
         Samples: WAVEFORMATEXTENSIBLE_0 {
-            wValidBitsPerSample: bits_per_sample,
+            wValidBitsPerSample: sample_format.valid_bits(),
         },
-        dwChannelMask: channel_mask,
-        SubFormat: if code == PCM_F32 {
+        dwChannelMask: candidate.channel_mask,
+        SubFormat: if sample_format.is_float() {
             KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
         } else {
             KSDATAFORMAT_SUBTYPE_PCM
@@ -545,21 +597,46 @@ fn virtual_waveformat(channels: u32, channel_mask: u32, code: u32) -> WAVEFORMAT
     }
 }
 
-fn set_virtual_device_layout(endpoint: &str, layout: ChannelLayout) -> AudioResult<()> {
-    let policy = PolicyConfig::new()?;
-    for code in [PCM_F32, PCM_I16] {
-        for mask in layout.masks {
-            let mut format = virtual_waveformat(layout.channels, *mask, code);
-            if policy.set_device_format(endpoint, &mut format).is_ok() {
-                return Ok(());
-            }
+fn default_render_valid_bits(enumerator: &IMMDeviceEnumerator) -> u16 {
+    // SAFETY: endpoint activation and GetMixFormat are read-only COM calls in
+    // the worker's live apartment. MixFormat frees the returned allocation.
+    unsafe {
+        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return 32;
+        };
+        let Ok(client) = device.Activate::<IAudioClient>(CLSCTX_ALL, None) else {
+            return 32;
+        };
+        let Ok(format) = client.GetMixFormat() else {
+            return 32;
+        };
+        MixFormat(format).valid_bits().unwrap_or(32)
+    }
+}
+
+fn set_virtual_device_layout(
+    endpoint: &str,
+    layout: ChannelLayout,
+    preferred_valid_bits: u16,
+) -> AudioResult<VirtualFormatCandidate> {
+    let policy = PolicyConfig::new().map_err(|_| "virtual_sink_format_unavailable")?;
+    let candidates = preferred_format_candidates(layout.channels, preferred_valid_bits)?;
+    for candidate in candidates {
+        let mut format = virtual_waveformat(candidate, layout.channels);
+        if policy.set_device_format(endpoint, &mut format).is_ok() {
+            return Ok(candidate);
         }
     }
     Err("virtual_sink_format_unavailable")
 }
 
-fn validate_virtual_mix(format: Format, layout: ChannelLayout) -> AudioResult<()> {
-    if format.channels != layout.channels || !layout.masks.contains(&format.channel_mask) {
+fn validate_virtual_mix(
+    mix: &MixFormat,
+    layout: ChannelLayout,
+    candidate: VirtualFormatCandidate,
+) -> AudioResult<()> {
+    let (channels, channel_mask) = mix.channel_layout()?;
+    if channels != layout.channels || channel_mask != candidate.channel_mask {
         return Err("unsupported_channel_layout");
     }
     Ok(())
@@ -590,6 +667,7 @@ impl Capture {
         if virtual_sink.is_some() && capture_sink_without_routing {
             return Err("invalid_open_policy");
         }
+        let preferred_valid_bits = desired_layout.map(|_| default_render_valid_bits(&enumerator));
         // SAFETY: activation and capture interface references never leave this
         // apartment. The mix-format allocation stays live through Initialize.
         unsafe {
@@ -616,24 +694,52 @@ impl Capture {
             let endpoint = identifier(&device)?;
             let route_lease =
                 RouteLease::acquire(&enumerator, &endpoint, capture_sink_without_routing)?;
-            if let Some(layout) = desired_layout {
-                set_virtual_device_layout(&endpoint, layout)?;
-            }
+            let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
+                (Some(layout), Some(valid_bits)) => {
+                    Some(set_virtual_device_layout(&endpoint, layout, valid_bits)?)
+                }
+                _ => None,
+            };
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|_| "audio_activation_failed")?;
             let mix = MixFormat(client.GetMixFormat().map_err(|_| "unsupported_format")?);
-            let format = mix.describe()?;
-            if let Some(layout) = desired_layout {
-                validate_virtual_mix(format, layout)?;
-            }
+            let mut capture_format = match (desired_layout, selected_virtual_format) {
+                (Some(layout), Some(candidate)) => {
+                    validate_virtual_mix(&mix, layout, candidate)?;
+                    let mut format = Format::new(48_000, layout.channels, PCM_F32)?;
+                    format.channel_mask = candidate.channel_mask;
+                    let waveformat = virtual_waveformat(
+                        VirtualFormatCandidate {
+                            sample_format: VirtualSampleFormat::Float32,
+                            channel_mask: candidate.channel_mask,
+                        },
+                        layout.channels,
+                    );
+                    Some((format, waveformat))
+                }
+                (None, None) => None,
+                _ => return Err("virtual_sink_format_unavailable"),
+            };
+            let format = match &capture_format {
+                Some((format, _)) => *format,
+                None => mix.describe()?,
+            };
+            let mut stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
+            let format_pointer = if let Some((_, waveformat)) = capture_format.as_mut() {
+                stream_flags |=
+                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+                &mut waveformat.Format as *mut WAVEFORMATEX
+            } else {
+                mix.0
+            };
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
+                    stream_flags,
                     1_000_000,
                     0,
-                    mix.0,
+                    format_pointer,
                     None,
                 )
                 .map_err(|_| "audio_initialize_failed")?;
@@ -783,6 +889,72 @@ mod tests {
         let changed =
             std::mem::ManuallyDrop::new(MixFormat((&mut mix as *mut WAVEFORMATEXTENSIBLE).cast()));
         assert_eq!(changed.describe().unwrap_err(), "unsupported_format");
+    }
+
+    #[test]
+    fn mix_format_preference_reads_extensible_valid_bits_for_default_depth_selection() {
+        let mut default_mix = virtual_waveformat(
+            VirtualFormatCandidate {
+                sample_format: VirtualSampleFormat::Signed24In32,
+                channel_mask: 0x0003,
+            },
+            2,
+        );
+        let descriptor = std::mem::ManuallyDrop::new(MixFormat(
+            (&mut default_mix as *mut WAVEFORMATEXTENSIBLE).cast(),
+        ));
+        let preferred_bits = descriptor.valid_bits().unwrap();
+        assert_eq!(preferred_bits, 24);
+        assert_eq!(
+            preferred_format_candidates(2, preferred_bits)
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate.sample_format)
+                .collect::<Vec<_>>(),
+            [
+                VirtualSampleFormat::Signed24In32,
+                VirtualSampleFormat::Signed24
+            ]
+        );
+    }
+
+    #[test]
+    fn virtual_waveformats_keep_container_depth_subtype_and_valid_bits_distinct() {
+        for (sample_format, expected_container_bits, expected_valid_bits, expect_float) in [
+            (VirtualSampleFormat::Float32, 32, 32, true),
+            (VirtualSampleFormat::Signed32, 32, 32, false),
+            (VirtualSampleFormat::Signed24In32, 32, 24, false),
+            (VirtualSampleFormat::Signed24, 24, 24, false),
+            (VirtualSampleFormat::Signed16, 16, 16, false),
+        ] {
+            let waveformat = virtual_waveformat(
+                VirtualFormatCandidate {
+                    sample_format,
+                    channel_mask: 0x003f,
+                },
+                6,
+            );
+            let container_bits = waveformat.Format.wBitsPerSample;
+            let valid_bits = unsafe { waveformat.Samples.wValidBitsPerSample };
+            let sample_rate = waveformat.Format.nSamplesPerSec;
+            let block_align = waveformat.Format.nBlockAlign;
+            let average_bytes_per_second = waveformat.Format.nAvgBytesPerSec;
+            let sub_format = waveformat.SubFormat;
+
+            assert_eq!(container_bits, expected_container_bits);
+            assert_eq!(valid_bits, expected_valid_bits);
+            assert_eq!(sample_rate, 48_000);
+            assert_eq!(block_align, 6 * expected_container_bits / 8);
+            assert_eq!(average_bytes_per_second, 48_000 * u32::from(block_align));
+            assert_eq!(
+                sub_format,
+                if expect_float {
+                    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                } else {
+                    KSDATAFORMAT_SUBTYPE_PCM
+                }
+            );
+        }
     }
 
     fn defaults() -> Vec<Option<String>> {
