@@ -1,0 +1,218 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product Id="{C86B8AA3-EB7F-4DA8-A28F-8872C1D283AF}" Language="1033" Manufacturer="Amaterasu Project" Name="Amaterasu" UpgradeCode="{51B3E91F-BB86-4EF3-9A9D-AED8610C8E47}" Version="0.1.1">
+        <Package Comments="This installer database contains the logic and data required to install Amaterasu." Compressed="yes" Description="Amaterasu development host and migration tools" InstallerVersion="500" Languages="1033" Manufacturer="Amaterasu Project" Platform="x64" />
+        <CustomAction Id="SetLegacyProgramFiles" Property="LEGACY_PROGRAM_FILES" Value="[ProgramFiles64Folder]" />
+        <CustomAction Id="SetRequireNoPredecessor" Property="RequireNoPredecessor" Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; require-no-predecessor" HideTarget="yes" />
+        <CustomAction Id="RequireNoPredecessor" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetImportLegacyConfiguration" Property="ImportLegacyConfiguration" Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; import --destination &quot;[AMATERASU_DATA].&quot; --runtime &quot;[AMATERASU_DATA]runtime&quot; --program-files &quot;[LEGACY_PROGRAM_FILES].&quot;" HideTarget="yes" />
+        <CustomAction Id="ImportLegacyConfiguration" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetProvisionInstallerRuntime" Property="ProvisionInstallerRuntime" Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; install-installer &quot;[INSTALLFOLDER]tools\bootstrap-template.json&quot; &quot;[INSTALLFOLDER]tools\package&quot; &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="ProvisionInstallerRuntime" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetRollbackProvisionInstallerRuntime" Property="RollbackProvisionInstallerRuntime" Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; unprovision-if-created &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="RollbackProvisionInstallerRuntime" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetFinalizeInstallerProvision" Property="FinalizeInstallerProvision" Value="&quot;[INSTALLFOLDER]tools\amaterasu-release.exe&quot; finalize-installer-provision &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="FinalizeInstallerProvision" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetVerifyAmaterasuServiceReady" Property="VerifyAmaterasuServiceReady" Value="&quot;[INSTALLFOLDER]amaterasu.exe&quot; service-ready &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="VerifyAmaterasuServiceReady" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetRollbackPredecessorHandoff" Property="RollbackPredecessorHandoff" Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; rollback-predecessor-handoff --runtime &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="RollbackPredecessorHandoff" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetHandoffPredecessor" Property="HandoffPredecessor" Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; handoff-predecessor --runtime &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="HandoffPredecessor" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <CustomAction Id="SetFinalizePredecessorHandoff" Property="FinalizePredecessorHandoff" Value="&quot;[INSTALLFOLDER]tools\amaterasu-migration.exe&quot; finalize-predecessor-handoff --runtime &quot;[AMATERASU_DATA]runtime&quot;" HideTarget="yes" />
+        <CustomAction Id="FinalizePredecessorHandoff" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" HideTarget="yes" />
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder">
+                <Directory Id="INSTALLFOLDER" Name="Amaterasu" ShortName="wxxyoswf">
+                    <Component Id="HostExecutable" Guid="{28D7CB2D-9804-53DB-9757-6FA41063AD8C}" Win64="yes">
+                        <File Id="HostExe" Name="amaterasu.exe" KeyPath="yes" ShortName="njzwxaaj.exe" DiskId="1" Source="target\installer\review-extract\File\HostExe" />
+                        <ServiceControl Id="AmaterasuServiceControl" Name="Amaterasu" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+                        <ServiceInstall Id="AmaterasuServiceInstall" Name="Amaterasu" DisplayName="Amaterasu Service" Type="ownProcess" Start="auto" ErrorControl="normal" Arguments="service &quot;[AMATERASU_DATA]runtime&quot;" />
+                    </Component>
+                    <Directory Id="MIGRATIONTOOLS" Name="tools">
+                        <Component Id="cmpF00DF31AB61D12A30533B1507977F3CD" Guid="{DF52156E-E4F8-589A-9F5F-222BCBB4CFA9}" Win64="yes">
+                            <File Id="fil84190E8100CE9F4E4A69D0C6536F2865" Name="bootstrap-template.json" KeyPath="yes" ShortName="hwiapw3c.jso" DiskId="1" Source="target\installer\review-extract\File\fil84190E8100CE9F4E4A69D0C6536F2865" />
+                        </Component>
+                        <Component Id="MigrationTool" Guid="{A77B6ECC-9938-56E6-8989-7CBB726E6B25}" Win64="yes">
+                            <File Id="MigrationToolExe" Name="amaterasu-migration.exe" KeyPath="yes" ShortName="eouhtsel.exe" DiskId="1" Source="target\installer\review-extract\File\MigrationToolExe" />
+                        </Component>
+                        <Component Id="PairingImportTool" Guid="{DF45B089-F7F1-5EA3-9C59-6FB2A692EF85}" Win64="yes">
+                            <File Id="PairingImportExe" Name="amaterasu-pairing-import.exe" KeyPath="yes" ShortName="shxne-vq.exe" DiskId="1" Source="target\installer\review-extract\File\PairingImportExe" />
+                        </Component>
+                        <Component Id="AuthenticationImportTool" Guid="{2E0BCD3B-3CBC-58F5-A351-D35D31E0D0F5}" Win64="yes">
+                            <File Id="AuthenticationImportExe" Name="amaterasu-authentication-import.exe" KeyPath="yes" ShortName="y_gkuqox.exe" DiskId="1" Source="target\installer\review-extract\File\AuthenticationImportExe" />
+                        </Component>
+                        <Component Id="ReleaseTool" Guid="{4C629EE1-0F93-55C3-8002-C7B3266D0417}" Win64="yes">
+                            <File Id="ReleaseToolExe" Name="amaterasu-release.exe" KeyPath="yes" ShortName="n2ge-1pk.exe" DiskId="1" Source="target\installer\review-extract\File\ReleaseToolExe" />
+                        </Component>
+                        <Directory Id="dirA81499546CFDA272192DA9E7D5686C65" Name="package">
+                            <Component Id="cmp7319CF73A9B09866B669166BAFA5E7A8" Guid="{3A8B98A4-2027-5919-852A-A2521C591BF7}" Win64="yes">
+                                <File Id="fil530B6A97DDBBC30B6C9BCAD53C879D24" Name="amaterasu_application.dll" KeyPath="yes" ShortName="yhqhi94v.dll" DiskId="1" Source="target\installer\review-extract\File\fil530B6A97DDBBC30B6C9BCAD53C879D24" />
+                            </Component>
+                            <Component Id="cmpE7193959732C01BBC74359FB2C74028D" Guid="{652A42EF-D38A-54BF-AF3E-4EA161A2B743}" Win64="yes">
+                                <File Id="fil86529576FDA8907128688C838446CF1E" Name="amaterasu_audio.dll" KeyPath="yes" ShortName="diij-j3v.dll" DiskId="1" Source="target\installer\review-extract\File\fil86529576FDA8907128688C838446CF1E" />
+                            </Component>
+                            <Component Id="cmp96899E9599F865D8C5A3FFFF6F393B79" Guid="{62619535-18A6-581D-A177-11F8E3120E16}" Win64="yes">
+                                <File Id="filBFD30CAA117FFBCC55A9569826B74A5B" Name="amaterasu_audio_encode.dll" KeyPath="yes" ShortName="zsviucpu.dll" DiskId="1" Source="target\installer\review-extract\File\filBFD30CAA117FFBCC55A9569826B74A5B" />
+                            </Component>
+                            <Component Id="cmpAFD8816BDA35096773B071898B8567BF" Guid="{F84FB162-2148-50BF-B9A2-111314D23689}" Win64="yes">
+                                <File Id="fil481F2FC1DDC793CA49285C8DC8F3A66C" Name="amaterasu_authentication.dll" KeyPath="yes" ShortName="rcni_zuf.dll" DiskId="1" Source="target\installer\review-extract\File\fil481F2FC1DDC793CA49285C8DC8F3A66C" />
+                            </Component>
+                            <Component Id="cmp03A8618E03CE87A5A794C931668F69A9" Guid="{8190A5BC-34F0-55D2-BE31-C36D2FE1D66F}" Win64="yes">
+                                <File Id="fil980AFBF4FAA7A2B10A38A6B0CE71ED82" Name="amaterasu_capture_dxgi.dll" KeyPath="yes" ShortName="bqeajxzq.dll" DiskId="1" Source="target\installer\review-extract\File\fil980AFBF4FAA7A2B10A38A6B0CE71ED82" />
+                            </Component>
+                            <Component Id="cmpC75D9552EFF3E400ACC74042888C5386" Guid="{AA5700D0-EDCE-555A-BDAC-F175BC9576B5}" Win64="yes">
+                                <File Id="filE618E6CEA71A257C320A28B3859AE26D" Name="amaterasu_capture_wgc.dll" KeyPath="yes" ShortName="22hfdsyi.dll" DiskId="1" Source="target\installer\review-extract\File\filE618E6CEA71A257C320A28B3859AE26D" />
+                            </Component>
+                            <Component Id="cmp30A3B6A11753A341A8DB1A5DA104620D" Guid="{DB95DEFE-20F3-538E-B9F6-7AE1796C0DFE}" Win64="yes">
+                                <File Id="fil9DF6082F3B16E0954D9E0CA6E3528919" Name="amaterasu_catalog.dll" KeyPath="yes" ShortName="ypcxrz03.dll" DiskId="1" Source="target\installer\review-extract\File\fil9DF6082F3B16E0954D9E0CA6E3528919" />
+                            </Component>
+                            <Component Id="cmp7B852FB75E218E0E26ACA57C2FC735B4" Guid="{C9CC0DE9-0326-5AC7-8697-9C23550EA1FA}" Win64="yes">
+                                <File Id="fil68CD5D6CEC11E7D85966231F7292194F" Name="amaterasu_configuration.dll" KeyPath="yes" ShortName="xmrouhh4.dll" DiskId="1" Source="target\installer\review-extract\File\fil68CD5D6CEC11E7D85966231F7292194F" />
+                            </Component>
+                            <Component Id="cmp1795752DF91770DD48C89EE54ADC6F28" Guid="{95C63BBA-958B-557E-BC60-3A844E3C9F19}" Win64="yes">
+                                <File Id="fil6823AA04169755F8E87A756B923691D3" Name="amaterasu_control_transport.dll" KeyPath="yes" ShortName="-yq91iqe.dll" DiskId="1" Source="target\installer\review-extract\File\fil6823AA04169755F8E87A756B923691D3" />
+                            </Component>
+                            <Component Id="cmpF97D703582F9F2C3F56A2C2867D3F197" Guid="{EB0E1F89-430D-594C-859F-088438A2B64A}" Win64="yes">
+                                <File Id="fil71012DDFF227A17459289C56335A9886" Name="amaterasu_diagnostics.dll" KeyPath="yes" ShortName="fwzkpbab.dll" DiskId="1" Source="target\installer\review-extract\File\fil71012DDFF227A17459289C56335A9886" />
+                            </Component>
+                            <Component Id="cmp8CE1BF17F4B499530119905A5F187690" Guid="{04FAAACD-E75F-5FEF-91D7-8C5065C9C3F8}" Win64="yes">
+                                <File Id="fil98365DF7A68E01AB7448A56C2AA04C08" Name="amaterasu_display.dll" KeyPath="yes" ShortName="fsktsukn.dll" DiskId="1" Source="target\installer\review-extract\File\fil98365DF7A68E01AB7448A56C2AA04C08" />
+                            </Component>
+                            <Component Id="cmp5BA10BEA3FC07C731C367DE1DEC5BFAA" Guid="{A659C2EB-C5E1-5E48-9B01-95C62D5F5CF9}" Win64="yes">
+                                <File Id="filC67985F3413B2677E394B6A8495EEDE5" Name="amaterasu_encode.dll" KeyPath="yes" ShortName="0_lnbmo5.dll" DiskId="1" Source="target\installer\review-extract\File\filC67985F3413B2677E394B6A8495EEDE5" />
+                            </Component>
+                            <Component Id="cmp7C4E58194DFBFD8B6BEEDF74534D1F2B" Guid="{B12276B2-9039-5491-BB30-664D49833D97}" Win64="yes">
+                                <File Id="fil8D0EFC81AF20217129BFBF093FA3DC80" Name="amaterasu_input.dll" KeyPath="yes" ShortName="3g7a7xlv.dll" DiskId="1" Source="target\installer\review-extract\File\fil8D0EFC81AF20217129BFBF093FA3DC80" />
+                            </Component>
+                            <Component Id="cmpB01EAA11CCC3D8408F43A51A21A44DEA" Guid="{FF504691-70CF-5BA8-A484-1F328A654E95}" Win64="yes">
+                                <File Id="fil6DA04E5650E0D081C4C61F7F457F6946" Name="amaterasu_launch.dll" KeyPath="yes" ShortName="luhtb5pf.dll" DiskId="1" Source="target\installer\review-extract\File\fil6DA04E5650E0D081C4C61F7F457F6946" />
+                            </Component>
+                            <Component Id="cmpB15B658A5887DA11552AD76CC485E986" Guid="{311F6CF5-B27E-58EF-A969-4C70D9E82A65}" Win64="yes">
+                                <File Id="fil96D18EF020FD3EBC3D42E4856FF4AB78" Name="amaterasu_management.dll" KeyPath="yes" ShortName="edx8dfpw.dll" DiskId="1" Source="target\installer\review-extract\File\fil96D18EF020FD3EBC3D42E4856FF4AB78" />
+                            </Component>
+                            <Component Id="cmp2C240D5B0DC2D9ECAB558BE036739964" Guid="{4701EA09-AFF4-57BA-82CC-CD18DB675BA9}" Win64="yes">
+                                <File Id="fil7022FAB08EF2DBA147820681A5E425F1" Name="amaterasu_media_transport.dll" KeyPath="yes" ShortName="sjc_gqjj.dll" DiskId="1" Source="target\installer\review-extract\File\fil7022FAB08EF2DBA147820681A5E425F1" />
+                            </Component>
+                            <Component Id="cmp02885DFFAB9D911D8FDE5632A35FB295" Guid="{E5E0E058-167C-50B2-9A6B-A001B4CFF38A}" Win64="yes">
+                                <File Id="filCB25E1494013B07E09A346778DE79EE3" Name="amaterasu_nvhttp.dll" KeyPath="yes" ShortName="7dk9fsxa.dll" DiskId="1" Source="target\installer\review-extract\File\filCB25E1494013B07E09A346778DE79EE3" />
+                            </Component>
+                            <Component Id="cmpC5438AC86BA0FD40709B16963CF9E404" Guid="{5D7719DC-1E3F-54C3-9CED-7AB27022CCA9}" Win64="yes">
+                                <File Id="filFB2A1FA61E0D1B62E56DE6AC438F8745" Name="amaterasu_pairing.dll" KeyPath="yes" ShortName="mxyu3pn-.dll" DiskId="1" Source="target\installer\review-extract\File\filFB2A1FA61E0D1B62E56DE6AC438F8745" />
+                            </Component>
+                            <Component Id="cmpF8512F9721C151E98F7899209B04CA75" Guid="{EE9C5D9C-6F72-5B87-83EE-A8586EA5730B}" Win64="yes">
+                                <File Id="fil9A084D0F38874B3205E8A01DFC17A032" Name="amaterasu_rtsp.dll" KeyPath="yes" ShortName="yb2ztoho.dll" DiskId="1" Source="target\installer\review-extract\File\fil9A084D0F38874B3205E8A01DFC17A032" />
+                            </Component>
+                            <Component Id="cmpC213FC947F2B46C5322E701DFA1DD129" Guid="{8A833BD1-E7FB-5A0C-84A9-6DAE033BA74E}" Win64="yes">
+                                <File Id="filB16DBAE2347E3F39F2CC36A18F6DFB67" Name="amaterasu_runtime.dll" KeyPath="yes" ShortName="nqyctmeq.dll" DiskId="1" Source="target\installer\review-extract\File\filB16DBAE2347E3F39F2CC36A18F6DFB67" />
+                            </Component>
+                            <Component Id="cmp017BEAD36059FD2804F994916162950E" Guid="{B985D4BC-29DB-54ED-9E95-8E9F630AC0FD}" Win64="yes">
+                                <File Id="fil62887C1574198BCAE753A3B06C64B37B" Name="amaterasu_session.dll" KeyPath="yes" ShortName="ql3zdjll.dll" DiskId="1" Source="target\installer\review-extract\File\fil62887C1574198BCAE753A3B06C64B37B" />
+                            </Component>
+                            <Component Id="cmpE8040AF683B1CBC6E2A5064250F8B14B" Guid="{66C459B4-6812-5674-ABA7-86A8B232E23C}" Win64="yes">
+                                <File Id="fil560D2D73660E642BB300C057AD7551C4" Name="amaterasu_state.dll" KeyPath="yes" ShortName="oyzj0hef.dll" DiskId="1" Source="target\installer\review-extract\File\fil560D2D73660E642BB300C057AD7551C4" />
+                            </Component>
+                            <Component Id="cmpB049F22F9F03D35132E50B307DF568A2" Guid="{CA5054B3-A4C9-5FB1-B1C7-A3C3E5BB9579}" Win64="yes">
+                                <File Id="fil31E27BF00C143E0A8030989C409D148D" Name="amaterasu_steam.dll" KeyPath="yes" ShortName="hc1pflcu.dll" DiskId="1" Source="target\installer\review-extract\File\fil31E27BF00C143E0A8030989C409D148D" />
+                            </Component>
+                            <Component Id="cmpBCBB6EB559084583608C32B060323E61" Guid="{06B8A4BB-8769-5578-8D62-53090D5E6F22}" Win64="yes">
+                                <File Id="fil40BA5CC0E9AB9FE6DDB372944ECF6C8A" Name="amaterasu_stream_session.dll" KeyPath="yes" ShortName="dv7968fz.dll" DiskId="1" Source="target\installer\review-extract\File\fil40BA5CC0E9AB9FE6DDB372944ECF6C8A" />
+                            </Component>
+                            <Component Id="cmp93E724F95AD6168C165FEDDDB7FC42BB" Guid="{841CC246-5704-571F-A863-90E7D7141DC7}" Win64="yes">
+                                <File Id="fil73B97B12FE1FAF536EF95EF44C6DCDAD" Name="amaterasu_video.dll" KeyPath="yes" ShortName="2rbnfb_n.dll" DiskId="1" Source="target\installer\review-extract\File\fil73B97B12FE1FAF536EF95EF44C6DCDAD" />
+                            </Component>
+                            <Component Id="cmpA41863203398DDB6E43FD1E9D2AE7876" Guid="{DBD33404-C337-5EE9-90A0-6F3311CBD06F}" Win64="yes">
+                                <File Id="fil88997060EF877921A278594CC6415987" Name="amaterasu_virtual_display.dll" KeyPath="yes" ShortName="to9l9hl1.dll" DiskId="1" Source="target\installer\review-extract\File\fil88997060EF877921A278594CC6415987" />
+                            </Component>
+                            <Component Id="cmp929437CF082837AC320DF4476D471234" Guid="{601B5AF8-8FC0-59B2-9117-853AADFD7DF0}" Win64="yes">
+                                <File Id="filF7AB7E054D9E7AF16E1AF68572E11A74" Name="manifest.json" KeyPath="yes" ShortName="nbedlbhp.jso" DiskId="1" Source="target\installer\review-extract\File\filF7AB7E054D9E7AF16E1AF68572E11A74" />
+                            </Component>
+                            <Component Id="cmpC6A2B01996A015AACDFE909871EF55BB" Guid="{EA5510D8-58F8-5B73-931B-87F15B7E2912}" Win64="yes">
+                                <File Id="fil6E18031E59191CDDB685EDB4D88314F7" Name="manifest.sig" KeyPath="yes" DiskId="1" Source="target\installer\review-extract\File\fil6E18031E59191CDDB685EDB4D88314F7" />
+                            </Component>
+                        </Directory>
+                    </Directory>
+                </Directory>
+            </Directory>
+            <Directory Id="CommonAppDataFolder">
+                <Directory Id="AMATERASU_DATA" Name="Amaterasu" ShortName="kfe7_xac">
+                    <Component Id="DataDirectory" Guid="{0E4B54F3-8120-5E77-B18E-844B32CF4946}" Win64="yes">
+                        <RegistryValue Id="reg402D71ACD2E8814C000E05B29539D557" Root="HKLM" Key="Software\Amaterasu" Name="DataDirectory" Value="[AMATERASU_DATA]" Type="string" KeyPath="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+        <Feature Id="ProductFeature" Level="1" Title="Amaterasu">
+            <ComponentRef Id="cmpF00DF31AB61D12A30533B1507977F3CD" />
+            <ComponentRef Id="cmp7319CF73A9B09866B669166BAFA5E7A8" />
+            <ComponentRef Id="cmpE7193959732C01BBC74359FB2C74028D" />
+            <ComponentRef Id="cmp96899E9599F865D8C5A3FFFF6F393B79" />
+            <ComponentRef Id="cmpAFD8816BDA35096773B071898B8567BF" />
+            <ComponentRef Id="cmp03A8618E03CE87A5A794C931668F69A9" />
+            <ComponentRef Id="cmpC75D9552EFF3E400ACC74042888C5386" />
+            <ComponentRef Id="cmp30A3B6A11753A341A8DB1A5DA104620D" />
+            <ComponentRef Id="cmp7B852FB75E218E0E26ACA57C2FC735B4" />
+            <ComponentRef Id="cmp1795752DF91770DD48C89EE54ADC6F28" />
+            <ComponentRef Id="cmpF97D703582F9F2C3F56A2C2867D3F197" />
+            <ComponentRef Id="cmp8CE1BF17F4B499530119905A5F187690" />
+            <ComponentRef Id="cmp5BA10BEA3FC07C731C367DE1DEC5BFAA" />
+            <ComponentRef Id="cmp7C4E58194DFBFD8B6BEEDF74534D1F2B" />
+            <ComponentRef Id="cmpB01EAA11CCC3D8408F43A51A21A44DEA" />
+            <ComponentRef Id="cmpB15B658A5887DA11552AD76CC485E986" />
+            <ComponentRef Id="cmp2C240D5B0DC2D9ECAB558BE036739964" />
+            <ComponentRef Id="cmp02885DFFAB9D911D8FDE5632A35FB295" />
+            <ComponentRef Id="cmpC5438AC86BA0FD40709B16963CF9E404" />
+            <ComponentRef Id="cmpF8512F9721C151E98F7899209B04CA75" />
+            <ComponentRef Id="cmpC213FC947F2B46C5322E701DFA1DD129" />
+            <ComponentRef Id="cmp017BEAD36059FD2804F994916162950E" />
+            <ComponentRef Id="cmpE8040AF683B1CBC6E2A5064250F8B14B" />
+            <ComponentRef Id="cmpB049F22F9F03D35132E50B307DF568A2" />
+            <ComponentRef Id="cmpBCBB6EB559084583608C32B060323E61" />
+            <ComponentRef Id="cmp93E724F95AD6168C165FEDDDB7FC42BB" />
+            <ComponentRef Id="cmpA41863203398DDB6E43FD1E9D2AE7876" />
+            <ComponentRef Id="cmp929437CF082837AC320DF4476D471234" />
+            <ComponentRef Id="cmpC6A2B01996A015AACDFE909871EF55BB" />
+            <ComponentRef Id="MigrationTool" />
+            <ComponentRef Id="PairingImportTool" />
+            <ComponentRef Id="AuthenticationImportTool" />
+            <ComponentRef Id="ReleaseTool" />
+            <ComponentRef Id="HostExecutable" />
+            <ComponentRef Id="DataDirectory" />
+        </Feature>
+        <MajorUpgrade DowngradeErrorMessage="A newer version of Amaterasu is already installed." Schedule="afterInstallFinalize" />
+        <Media Id="1" Cabinet="cab1.cab" EmbedCab="yes" />
+        <Property Id="ALLUSERS" Value="1" />
+        <Property Id="AMATERASU_BUNDLE_COORDINATED" Secure="yes" />
+        <Property Id="VIBEPOLO_UPGRADE_DETECTED" Secure="yes" />
+        <Property Id="VIBESHINE_UPGRADE_DETECTED" Secure="yes" />
+        <Property Id="WIX_DOWNGRADE_DETECTED" Secure="yes" />
+        <Property Id="WIX_UPGRADE_DETECTED" Secure="yes" />
+        <Upgrade Id="{C2C36624-2D9C-4AFD-9C79-6B7861AE4A0D}">
+            <UpgradeVersion Minimum="0.0.0" Property="VIBESHINE_UPGRADE_DETECTED" OnlyDetect="yes" IncludeMinimum="yes" />
+        </Upgrade>
+        <Upgrade Id="{E3FA501A-85F8-4187-85A7-D6E6BDC7EDA1}">
+            <UpgradeVersion Minimum="0.0.0" Property="VIBEPOLO_UPGRADE_DETECTED" OnlyDetect="yes" IncludeMinimum="yes" />
+        </Upgrade>
+        <InstallExecuteSequence>
+            <Custom Action="SetLegacyProgramFiles" After="InstallFiles">NOT Installed AND NOT REMOVE AND NOT LEGACY_PROGRAM_FILES</Custom>
+            <Custom Action="SetRequireNoPredecessor" After="SetLegacyProgramFiles">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="RequireNoPredecessor" After="SetRequireNoPredecessor">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="SetProvisionInstallerRuntime" After="RequireNoPredecessor">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="SetRollbackProvisionInstallerRuntime" After="SetProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="RollbackProvisionInstallerRuntime" After="SetRollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="ProvisionInstallerRuntime" After="RollbackProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="SetImportLegacyConfiguration" After="ProvisionInstallerRuntime">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="ImportLegacyConfiguration" After="SetImportLegacyConfiguration">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="SetRollbackPredecessorHandoff" After="ImportLegacyConfiguration">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="RollbackPredecessorHandoff" After="SetRollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="SetHandoffPredecessor" After="RollbackPredecessorHandoff">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="HandoffPredecessor" Before="StartServices">NOT Installed AND NOT REMOVE AND AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="SetVerifyAmaterasuServiceReady" After="StartServices">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="VerifyAmaterasuServiceReady" After="SetVerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE</Custom>
+            <Custom Action="SetFinalizePredecessorHandoff" After="VerifyAmaterasuServiceReady">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="FinalizePredecessorHandoff" After="SetFinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="SetFinalizeInstallerProvision" After="FinalizePredecessorHandoff">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+            <Custom Action="FinalizeInstallerProvision" After="SetFinalizeInstallerProvision">NOT Installed AND NOT REMOVE AND NOT AMATERASU_BUNDLE_COORDINATED</Custom>
+        </InstallExecuteSequence>
+    </Product>
+</Wix>
