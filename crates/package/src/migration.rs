@@ -828,8 +828,11 @@ fn collect_configured_sensitive_files(
                     "predecessor configuration has an unsafe configured identity path".into(),
                 );
             }
-            let configured_path = root.join(relative);
-            let canonical = configured_path.canonicalize().map_err(io_error)?;
+            let resolved_relative = resolved_existing_relative_path(root, relative)?;
+            let canonical = root
+                .join(resolved_relative)
+                .canonicalize()
+                .map_err(io_error)?;
             if !canonical.starts_with(&canonical_root) {
                 return Err(
                     "predecessor configuration has an escaping configured identity path".into(),
@@ -1176,7 +1179,7 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     {
