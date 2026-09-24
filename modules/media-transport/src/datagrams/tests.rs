@@ -62,6 +62,8 @@ fn reservation_bounds_and_per_stream_send_budget_are_enforced() {
 fn configured_video_batch_size_changes_the_per_frame_send_allowance() {
     for (batch_size_kb, expected_sends) in [(16, 16), (32, 32), (64, 64)] {
         let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let local = "127.0.0.1:0".parse().unwrap();
         let address = peer.local_addr().unwrap();
         let mut delivery = Delivery::bind(local, local, address, address).unwrap();
@@ -72,8 +74,131 @@ fn configured_video_batch_size_changes_the_per_frame_send_allowance() {
 
         assert_eq!(sent, expected_sends);
         assert_eq!(delivery.sent_datagrams, expected_sends as u64);
+        assert_ne!(delivery.video_batch_support, VideoBatchSupport::Unknown);
         assert_eq!(delivery.queued(), 72 - expected_sends);
+        for _ in 0..expected_sends {
+            let mut received = [0; 1024];
+            assert_eq!(peer.recv(&mut received).unwrap(), received.len());
+            assert_eq!(received, [0; 1024]);
+        }
     }
+}
+
+#[test]
+fn video_grouping_requires_equal_payload_sizes_and_the_same_frame() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 2], vec![4; 4]]);
+    delivery.push_video(2, vec![vec![5; 4]]);
+
+    assert_eq!(delivery.video_group_len(Some(1), 4, 64), 2);
+    assert_eq!(delivery.video_group_payload(2, 4), [1, 1, 1, 1, 2, 2, 2, 2]);
+}
+
+#[test]
+fn unavailable_segmentation_falls_back_to_individual_ordered_sends() {
+    let peer = sender();
+    let local = "127.0.0.1:0".parse().unwrap();
+    let address = peer.local_addr().unwrap();
+    let mut delivery = Delivery::bind(local, local, address, address).unwrap();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let mut batch_attempts = 0;
+
+    let sent = delivery.tick_with_batch_sender(64, |_, _, _| {
+        batch_attempts += 1;
+        Err(BatchError::Unsupported)
+    });
+
+    assert_eq!(batch_attempts, 1);
+    assert_eq!(sent, 3);
+    assert_eq!(delivery.video_batch_support, VideoBatchSupport::Unavailable);
+    for expected in [1, 2, 3] {
+        let mut bytes = [0; 8];
+        let length = peer.recv(&mut bytes).unwrap();
+        assert_eq!(&bytes[..length], &[expected; 4]);
+    }
+    assert_eq!(delivery.queued(), 0);
+}
+
+#[test]
+fn transient_batch_send_failure_retains_the_entire_confirmed_ordered_group() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let queued_bytes = delivery.queued_bytes();
+
+    let sent = delivery.tick_with_batch_sender(64, |_, _, _| Err(BatchError::Retry));
+
+    assert_eq!(sent, 0);
+    assert_eq!(delivery.queued(), 3);
+    assert_eq!(delivery.queued_bytes(), queued_bytes);
+    assert_eq!(delivery.sent_datagrams, 0);
+    assert_eq!(delivery.failure, None);
+}
+
+#[test]
+fn batch_dequeues_only_after_full_byte_count_is_confirmed() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let mut submitted = Vec::new();
+
+    let sent = delivery.tick_with_batch_sender(64, |_, payload, segment_size| {
+        assert_eq!(segment_size, 4);
+        submitted.extend_from_slice(payload);
+        Ok(payload.len())
+    });
+
+    assert_eq!(sent, 3);
+    assert_eq!(
+        submitted,
+        [1; 4]
+            .into_iter()
+            .chain([2; 4])
+            .chain([3; 4])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(delivery.queued(), 0);
+    assert_eq!(delivery.sent_datagrams, 3);
+}
+
+#[test]
+fn partial_batch_send_result_fails_without_counting_any_datagrams_as_sent() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let queued_bytes = delivery.queued_bytes();
+
+    let sent =
+        delivery.tick_with_batch_sender(64, |_, payload, _| Ok(payload.len().saturating_sub(1)));
+
+    assert_eq!(sent, 0);
+    assert_eq!(delivery.failure, Some("udp_send_failed"));
+    assert_eq!(delivery.sent_datagrams, 0);
+    assert_eq!(delivery.discarded_datagrams, 3);
+    assert_eq!(delivery.queued(), 0);
+    assert_eq!(delivery.bytes, 0);
+    assert!(queued_bytes > 0);
+}
+
+#[test]
+#[cfg(windows)]
+fn accepted_batch_with_failed_option_reset_is_counted_once_then_fails_stream() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4], vec![4; 4]]);
+    let mut batch_attempts = 0;
+
+    let sent = delivery.tick_with_batch_sender(3, |_, payload, _| {
+        batch_attempts += 1;
+        if batch_attempts == 1 {
+            Err(BatchError::SentThenFailed(payload.len()))
+        } else {
+            Ok(payload.len())
+        }
+    });
+
+    assert_eq!(sent, 3);
+    assert_eq!(batch_attempts, 1);
+    assert_eq!(delivery.sent_datagrams, 3);
+    assert_eq!(delivery.discarded_datagrams, 1);
+    assert_eq!(delivery.failure, Some("udp_send_failed"));
+    assert_eq!(delivery.queued(), 0);
 }
 
 #[test]

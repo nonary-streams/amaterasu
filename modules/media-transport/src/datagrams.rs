@@ -1,12 +1,14 @@
 use crate::model::{
     DISCOVERY_TOKEN_BYTES, DiscoveryTokens, MAX_DATAGRAMS, MAX_QUEUE_BYTES, SENDS_PER_STREAM,
 };
+mod udp_batch;
 use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
+use udp_batch::{BatchError, BatchSender};
 
 const RECEIVES_PER_LANE: usize = 16;
 const SS_PING_BYTES: usize = DISCOVERY_TOKEN_BYTES + size_of::<u32>();
@@ -26,8 +28,16 @@ struct Datagram {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoBatchSupport {
+    Unknown,
+    Available,
+    Unavailable,
+}
+
 struct Lane {
     socket: UdpSocket,
+    batch_sender: BatchSender,
     peer: Option<SocketAddr>,
     ping_payload: Option<[u8; DISCOVERY_TOKEN_BYTES]>,
     receive_buffer: Option<Box<[u8]>>,
@@ -38,6 +48,7 @@ impl Lane {
         let socket = bound_socket(local)?;
         socket.connect(peer)?;
         Ok(Self {
+            batch_sender: BatchSender::new(&socket),
             socket,
             peer: Some(peer),
             ping_payload: None,
@@ -49,8 +60,10 @@ impl Lane {
         local: SocketAddr,
         ping_payload: [u8; DISCOVERY_TOKEN_BYTES],
     ) -> io::Result<Self> {
+        let socket = bound_socket(local)?;
         Ok(Self {
-            socket: bound_socket(local)?,
+            batch_sender: BatchSender::new(&socket),
+            socket,
             peer: None,
             ping_payload: Some(ping_payload),
             // A full-size buffer makes oversized UDP payloads malformed on all
@@ -111,6 +124,7 @@ pub struct Delivery {
     queue: VecDeque<Datagram>,
     bytes: usize,
     video_max_batch_size_kb: u8,
+    video_batch_support: VideoBatchSupport,
     last_progress: Instant,
     pub sent_datagrams: u64,
     pub discarded_datagrams: u64,
@@ -164,6 +178,7 @@ impl Delivery {
             queue: VecDeque::new(),
             bytes: 0,
             video_max_batch_size_kb: 64,
+            video_batch_support: VideoBatchSupport::Unknown,
             last_progress: Instant::now(),
             sent_datagrams: 0,
             discarded_datagrams: 0,
@@ -252,6 +267,15 @@ impl Delivery {
     }
 
     pub fn tick_with_limit(&mut self, send_limit: usize) -> usize {
+        self.tick_with_batch_sender(send_limit, |lane, payload, segment_size| {
+            lane.batch_sender.send(&lane.socket, payload, segment_size)
+        })
+    }
+
+    fn tick_with_batch_sender<F>(&mut self, send_limit: usize, mut send_batch: F) -> usize
+    where
+        F: FnMut(&Lane, &[u8], usize) -> Result<usize, BatchError>,
+    {
         if self.failure.is_some() {
             return 0;
         }
@@ -268,7 +292,8 @@ impl Delivery {
         let mut sent = 0;
         let mut audio_sent = 0;
         let mut active_video_batch: Option<(Option<u32>, usize, usize)> = None;
-        while sent < send_limit.min(MAX_VIDEO_BATCH_PACKETS) {
+        let send_limit = send_limit.min(MAX_VIDEO_BATCH_PACKETS);
+        while sent < send_limit {
             let Some(packet) = self.queue.front() else {
                 break;
             };
@@ -284,6 +309,49 @@ impl Delivery {
                     .is_some_and(|(_, batch_limit, batch_sent)| batch_sent >= batch_limit)
                 {
                     break;
+                }
+                let (_, batch_limit, batch_sent) = active_video_batch.unwrap();
+                let remaining_frame_packets = batch_limit - batch_sent;
+                let remaining_tick_packets = send_limit - sent;
+                if self.video_batch_support != VideoBatchSupport::Unavailable
+                    && packet_bytes > 0
+                    && remaining_frame_packets > 1
+                    && remaining_tick_packets > 1
+                {
+                    let group_limit = remaining_frame_packets.min(remaining_tick_packets);
+                    let group_count = self.video_group_len(video_frame, packet_bytes, group_limit);
+                    if group_count > 1 {
+                        let payload = self.video_group_payload(group_count, packet_bytes);
+                        match send_batch(&self.video, &payload, packet_bytes) {
+                            Ok(bytes) => {
+                                if !self.record_batch_send(group_count, payload.len(), Ok(bytes)) {
+                                    break;
+                                }
+                                self.video_batch_support = VideoBatchSupport::Available;
+                                sent += group_count;
+                                if let Some((_, _, batch_sent)) = &mut active_video_batch {
+                                    *batch_sent += group_count;
+                                }
+                                continue;
+                            }
+                            Err(BatchError::Unsupported) => {
+                                self.video_batch_support = VideoBatchSupport::Unavailable;
+                            }
+                            Err(BatchError::Retry) => break,
+                            #[cfg(windows)]
+                            Err(BatchError::SentThenFailed(bytes)) => {
+                                if self.record_batch_send(group_count, payload.len(), Ok(bytes)) {
+                                    sent += group_count;
+                                    self.fail("udp_send_failed");
+                                }
+                                break;
+                            }
+                            Err(BatchError::Failed(_error)) => {
+                                self.fail("udp_send_failed");
+                                break;
+                            }
+                        }
+                    }
                 }
             } else {
                 active_video_batch = None;
@@ -309,6 +377,26 @@ impl Delivery {
             }
         }
         sent
+    }
+
+    fn video_group_len(&self, frame: Option<u32>, packet_bytes: usize, limit: usize) -> usize {
+        self.queue
+            .iter()
+            .take(limit)
+            .take_while(|packet| {
+                matches!(packet.medium, Medium::Video)
+                    && packet.video_frame == frame
+                    && packet.bytes.len() == packet_bytes
+            })
+            .count()
+    }
+
+    fn video_group_payload(&self, count: usize, packet_bytes: usize) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(count * packet_bytes);
+        for packet in self.queue.iter().take(count) {
+            payload.extend_from_slice(&packet.bytes);
+        }
+        payload
     }
 
     fn video_batch_packet_limit(&self, packet_bytes: usize) -> usize {
@@ -347,6 +435,40 @@ impl Delivery {
             {
                 self.bytes -= self.queue.pop_front().unwrap().bytes.len();
                 self.sent_datagrams = self.sent_datagrams.saturating_add(1);
+                self.last_progress = Instant::now();
+                true
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                false
+            }
+            _ => {
+                self.fail("udp_send_failed");
+                false
+            }
+        }
+    }
+
+    fn record_batch_send(
+        &mut self,
+        count: usize,
+        expected_bytes: usize,
+        result: io::Result<usize>,
+    ) -> bool {
+        match result {
+            Ok(bytes) if bytes == expected_bytes => {
+                for _ in 0..count {
+                    let Some(packet) = self.queue.pop_front() else {
+                        self.fail("udp_send_failed");
+                        return false;
+                    };
+                    self.bytes -= packet.bytes.len();
+                }
+                self.sent_datagrams = self.sent_datagrams.saturating_add(count as u64);
                 self.last_progress = Instant::now();
                 true
             }

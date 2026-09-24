@@ -164,8 +164,18 @@ progress fail the stream visibly and discard its remaining queue. Crypto
 failure also fails and discards the queue; consumed nonces are never rewound.
 UDP send success is only kernel admission: delivery loss, decoding failure,
 congestion control, retransmission and peer acknowledgements are not measured.
-This is a software send allowance using individual `UdpSocket::send` calls, not
-OS UDP segmentation offload. Windows USO and Linux GSO batching remain pending.
+The allowance also bounds OS segmentation batches. On Linux, equal-size
+consecutive datagrams from one video frame use `UDP_SEGMENT`; on Windows, they
+temporarily set the `IPPROTO_UDP` `UDP_SEND_MSG_SIZE` socket option for that
+send, then restore it to zero. The final shorter payload is sent separately.
+The transport treats an unsupported OS, kernel, socket provider, or network
+device as a capability miss and falls back to individual `UdpSocket::send`
+calls for the rest of that stream. Microsoft documents the option starting with
+Windows 10 version 2004; older versions fall back. Other platforms use
+individual sends. The Linux kernel may segment in software when the NIC cannot
+offload the operation, so this does not promise hardware acceleration. Live
+qualification across supported kernels, Windows versions, socket providers,
+and NIC drivers remains pending.
 Discovery reads at most 16 datagrams per lane per tick. Five seconds from open
 without both lanes fails with `udp_discovery_timeout`; queued pings cannot revive
 an expired stream.
