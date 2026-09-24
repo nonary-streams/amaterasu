@@ -102,8 +102,14 @@ var Amaterasu;
     Amaterasu.ApiError = ApiError;
     class Api {
         bearer = "";
+        refreshToken = "";
+        accessExpiresAt = 0;
+        authGeneration = 0;
+        tokenGeneration = 0;
+        refreshInFlight = null;
         requests = new Set();
         base;
+        onAuthenticationLost = null;
         subject = "";
         scopes = null;
         constructor(base) {
@@ -116,23 +122,44 @@ var Amaterasu;
                 throw new Error("The API address must be an HTTP(S) origin.");
             this.base = url.origin;
         }
-        async login(username, password) {
-            const reply = await this.post("auth/login", { username, password }, false);
-            this.bearer = reply.bearer;
-            this.subject = reply.subject;
-            this.scopes = reply.scopes;
+        async login(username, password, rememberMe = false) {
+            const generation = this.authGeneration;
+            const reply = await this.post("auth/login", { username, password, remember_me: rememberMe }, false);
+            this.installSession(reply, generation, true);
         }
         useToken(token) {
             if (!/^ama_[a-f0-9]{64}$/.test(token))
                 throw new Error("Enter an Amaterasu token beginning with ama_ followed by 64 hexadecimal characters.");
+            this.clear();
             this.bearer = token;
             this.subject = "API token";
             this.scopes = null;
+            this.tokenGeneration += 1;
+        }
+        async logout() {
+            const payload = this.refreshToken
+                ? { refresh_token: this.refreshToken }
+                : this.bearer
+                    ? { bearer: this.bearer }
+                    : null;
+            this.clear();
+            if (payload) {
+                try {
+                    await this.post("auth/logout", payload, false);
+                }
+                catch {
+                }
+            }
         }
         clear() {
+            this.authGeneration += 1;
+            this.tokenGeneration += 1;
             this.bearer = "";
+            this.refreshToken = "";
+            this.accessExpiresAt = 0;
             this.subject = "";
             this.scopes = null;
+            this.refreshInFlight = null;
             for (const request of this.requests)
                 request.abort();
             this.requests.clear();
@@ -141,6 +168,91 @@ var Amaterasu;
             return this.scopes === null || this.scopes.includes(scope);
         }
         async post(route, payload = {}, protectedRoute = true) {
+            if (protectedRoute && !this.bearer)
+                throw new ApiError("Sign in to continue.", "unauthorized", 401);
+            if (protectedRoute &&
+                this.refreshToken &&
+                this.accessExpiresAt - Date.now() / 1000 <= 60) {
+                await this.refreshOrClear();
+            }
+            const bearerUsed = this.bearer;
+            const authGeneration = this.authGeneration;
+            const tokenGeneration = this.tokenGeneration;
+            try {
+                return await this.send(route, payload, protectedRoute, bearerUsed);
+            }
+            catch (error) {
+                if (!protectedRoute ||
+                    !(error instanceof ApiError) ||
+                    error.code !== "unauthorized" ||
+                    !this.refreshToken ||
+                    authGeneration !== this.authGeneration) {
+                    throw error;
+                }
+                if (tokenGeneration === this.tokenGeneration)
+                    await this.refreshOrClear();
+                return this.send(route, payload, true, this.bearer);
+            }
+        }
+        async refreshOrClear() {
+            try {
+                await this.refreshSession();
+            }
+            catch (error) {
+                if (this.refreshToken) {
+                    this.clear();
+                    this.onAuthenticationLost?.();
+                }
+                throw error;
+            }
+        }
+        async refreshSession() {
+            if (this.refreshInFlight)
+                return this.refreshInFlight;
+            if (!this.refreshToken)
+                throw new ApiError("Sign in again to continue.", "unauthorized", 401);
+            const generation = this.authGeneration;
+            const token = this.refreshToken;
+            const pending = (async () => {
+                const reply = await this.send("auth/refresh", { refresh_token: token }, false, "");
+                if (generation !== this.authGeneration || token !== this.refreshToken)
+                    throw new Error("The sign-in session was cleared.");
+                this.installSession(reply, generation, false);
+            })();
+            this.refreshInFlight = pending;
+            try {
+                await pending;
+            }
+            finally {
+                if (this.refreshInFlight === pending)
+                    this.refreshInFlight = null;
+            }
+        }
+        installSession(reply, generation, newSession) {
+            if (generation !== this.authGeneration)
+                throw new Error("The sign-in attempt was cancelled.");
+            if (!/^ama_[a-f0-9]{64}$/.test(reply.bearer) ||
+                !/^ama_[a-f0-9]{64}$/.test(reply.refresh_token) ||
+                typeof reply.subject !== "string" ||
+                !Array.isArray(reply.scopes) ||
+                !reply.scopes.every((scope) => typeof scope === "string") ||
+                !Number.isSafeInteger(reply.expires_at) ||
+                !Number.isSafeInteger(reply.refresh_expires_at) ||
+                reply.expires_at <= 0 ||
+                reply.refresh_expires_at < reply.expires_at ||
+                typeof reply.remember_me !== "boolean") {
+                throw new ApiError("The host returned an invalid authentication response.", "invalid_response", 502);
+            }
+            this.bearer = reply.bearer;
+            this.refreshToken = reply.refresh_token;
+            this.accessExpiresAt = reply.expires_at;
+            this.subject = reply.subject;
+            this.scopes = reply.scopes;
+            this.tokenGeneration += 1;
+            if (newSession)
+                this.authGeneration += 1;
+        }
+        async send(route, payload, protectedRoute, bearer) {
             const controller = new AbortController();
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
@@ -149,7 +261,7 @@ var Amaterasu;
                     "Content-Type": "application/json",
                 };
                 if (protectedRoute)
-                    headers.Authorization = `Bearer ${this.bearer}`;
+                    headers.Authorization = `Bearer ${bearer}`;
                 const response = await fetch(`${this.base}/v1/${route}`, {
                     method: "POST",
                     headers,
@@ -486,15 +598,217 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
+    function parseAuthTokenLifetimes(sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
+        if (!Number.isSafeInteger(sessionTokenTtlSeconds) ||
+            sessionTokenTtlSeconds < 1 ||
+            sessionTokenTtlSeconds > maxConfiguredAuthTtlSeconds ||
+            !Number.isSafeInteger(rememberMeRefreshTokenTtlSeconds) ||
+            rememberMeRefreshTokenTtlSeconds < 1 ||
+            rememberMeRefreshTokenTtlSeconds > maxConfiguredAuthTtlSeconds)
+            throw new Error("Authentication lifetimes must be whole seconds from 1 to 2147483647.");
+        return {
+            session_token_ttl_seconds: sessionTokenTtlSeconds,
+            remember_me_refresh_token_ttl_seconds: rememberMeRefreshTokenTtlSeconds,
+        };
+    }
+    Amaterasu.parseAuthTokenLifetimes = parseAuthTokenLifetimes;
+    function safeNvhttpBindFamily(value) {
+        if (value === "")
+            return null;
+        const octets = value.split(".");
+        if (octets.length === 4) {
+            const parsed = octets.map((octet) => Number(octet));
+            if (octets.every((octet, index) => {
+                const number = parsed[index];
+                return (number !== undefined &&
+                    /^(0|[1-9][0-9]{0,2})$/.test(octet) &&
+                    number <= 255 &&
+                    String(number) === octet);
+            })) {
+                const firstOctet = parsed[0];
+                if (firstOctet !== undefined && firstOctet >= 224 && firstOctet <= 239)
+                    throw new Error("NVHTTP bind address must not be multicast or broadcast.");
+                if (value === "255.255.255.255")
+                    throw new Error("NVHTTP bind address must not be multicast or broadcast.");
+                return "ipv4";
+            }
+        }
+        if (!value.includes(":") || /[%\[\]\s]/.test(value))
+            return null;
+        try {
+            const hostname = new URL(`http://[${value}]/`).hostname.toLowerCase();
+            if (!hostname.startsWith("[") || !hostname.endsWith("]"))
+                return null;
+            if (hostname.startsWith("[ff") || hostname.startsWith("[::ffff:"))
+                throw new Error("NVHTTP bind address must not be multicast or IPv4-mapped IPv6.");
+            return "ipv6";
+        }
+        catch (error) {
+            if (error instanceof Error && error.message.startsWith("NVHTTP bind address"))
+                throw error;
+            return null;
+        }
+    }
+    function parseNvhttpNetworkOverrides(addressFamilySelection, useStartupBindAddress, bindAddress) {
+        const addressFamily = addressFamilySelection === "startup"
+            ? null
+            : addressFamilySelection === "ipv4" || addressFamilySelection === "both"
+                ? addressFamilySelection
+                : (() => {
+                    throw new Error("Choose IPv4, both address families, or startup policy.");
+                })();
+        let configuredBindAddress = null;
+        if (!useStartupBindAddress) {
+            const bindFamily = safeNvhttpBindFamily(bindAddress);
+            if (bindAddress !== "" && bindFamily === null)
+                throw new Error("Enter a valid IPv4 or IPv6 address literal, or leave it blank.");
+            if (addressFamily === "ipv4" && bindFamily === "ipv6")
+                throw new Error("An IPv6 bind address requires both address families.");
+            configuredBindAddress = bindAddress;
+        }
+        return {
+            address_family: addressFamily,
+            bind_address: configuredBindAddress,
+        };
+    }
+    Amaterasu.parseNvhttpNetworkOverrides = parseNvhttpNetworkOverrides;
+    function parseSteamExclusions(value) {
+        let parsed;
+        try {
+            parsed = JSON.parse(value);
+        }
+        catch {
+            throw new Error("Excluded games must be valid JSON.");
+        }
+        if (!Array.isArray(parsed) || parsed.length > 256)
+            throw new Error("Excluded games must be a JSON array with at most 256 entries.");
+        const ids = new Set();
+        const names = new Set();
+        for (const item of parsed) {
+            if (typeof item !== "object" || item === null || Array.isArray(item))
+                throw new Error("Each excluded game must be an object.");
+            const exclusion = item;
+            if (Object.keys(exclusion).some((key) => key !== "id" && key !== "name"))
+                throw new Error("Excluded games may only contain id and name fields.");
+            const id = exclusion.id;
+            const name = exclusion.name;
+            if (id === undefined && name === undefined)
+                throw new Error("Each excluded game needs an app ID or name.");
+            if (id !== undefined) {
+                if (typeof id !== "string" ||
+                    !/^[1-9][0-9]*$/.test(id) ||
+                    !Number.isSafeInteger(Number(id)) ||
+                    Number(id) > 0xffff_ffff ||
+                    String(Number(id)) !== id)
+                    throw new Error("Steam app IDs must be canonical nonzero decimal strings.");
+                if (ids.has(id))
+                    throw new Error("Excluded Steam app IDs must be unique.");
+                ids.add(id);
+            }
+            if (name !== undefined) {
+                if (typeof name !== "string" ||
+                    name.trim().length === 0 ||
+                    new TextEncoder().encode(name).length > 512 ||
+                    /[\u0000-\u001f\u007f-\u009f]/.test(name))
+                    throw new Error("Exclusion names must contain 1–512 printable UTF-8 bytes.");
+                if (id === undefined) {
+                    const normalized = name.toLowerCase();
+                    if (names.has(normalized))
+                        throw new Error("Name-only exclusions must be unique, ignoring case.");
+                    names.add(normalized);
+                }
+            }
+        }
+        return parsed;
+    }
+    Amaterasu.parseSteamExclusions = parseSteamExclusions;
+    function parseSteamImportSettings(includeTools, syncAllInstalled, autosyncRemoveUninstalled, recentGames, recentMaxAgeDays) {
+        if (typeof includeTools !== "boolean" ||
+            typeof syncAllInstalled !== "boolean" ||
+            typeof autosyncRemoveUninstalled !== "boolean" ||
+            !Number.isSafeInteger(recentGames) ||
+            recentGames < 0 ||
+            recentGames > 10_000 ||
+            !Number.isSafeInteger(recentMaxAgeDays) ||
+            recentMaxAgeDays < 0 ||
+            recentMaxAgeDays > 36_500)
+            throw new Error("Steam import values are outside their supported ranges.");
+        return {
+            include_tools: includeTools,
+            sync_all_installed: syncAllInstalled,
+            autosync_remove_uninstalled: autosyncRemoveUninstalled,
+            recent_games: recentGames,
+            recent_max_age_days: recentMaxAgeDays,
+        };
+    }
+    Amaterasu.parseSteamImportSettings = parseSteamImportSettings;
+    function steamStatusDescription(status) {
+        if (status.settings_ready === false)
+            return "Provider settings are still loading; runtime state is not confirmed yet.";
+        if (typeof status.enabled !== "boolean")
+            return "The provider did not report whether Steam discovery is enabled.";
+        if (!status.enabled)
+            return "Steam discovery is disabled; no scan is running.";
+        const scanState = status.scanning
+            ? "scan in progress"
+            : status.complete
+                ? "last scan complete"
+                : "no complete scan is available";
+        const warningCount = `${status.warning_count} ${status.warning_count === 1 ? "warning" : "warnings"}`;
+        return `Steam discovery enabled · ${scanState} · ${status.game_count} games · ${warningCount}.`;
+    }
+    Amaterasu.steamStatusDescription = steamStatusDescription;
     function renderSettings(context) {
         const area = Amaterasu.el("div");
+        const authArea = Amaterasu.el("div");
         const hostArea = Amaterasu.el("div");
         const steamArea = Amaterasu.el("div");
         context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
             void load();
+            void loadAuth();
             void loadHost();
             void loadSteam();
-        })), area, hostArea, steamArea);
+        })), area, authArea, hostArea, steamArea);
+        async function loadAuth() {
+            authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
+            try {
+                const settings = await context.api.post("auth/settings");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const sessionTtl = Amaterasu.input("session_token_ttl_seconds", String(settings.values.session_token_ttl_seconds), "number");
+                const refreshTtl = Amaterasu.input("remember_me_refresh_token_ttl_seconds", String(settings.values.remember_me_refresh_token_ttl_seconds), "number");
+                for (const control of [sessionTtl, refreshTtl]) {
+                    control.required = true;
+                    control.min = "1";
+                    control.max = String(maxConfiguredAuthTtlSeconds);
+                    control.step = "1";
+                }
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save authentication settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Administrator session lifetime (seconds)", sessionTtl, "Access sessions default to 7200 seconds. Existing sessions keep their issued expiry; new logins and refreshes use this value."), Amaterasu.field("Remembered device lifetime (seconds)", refreshTtl, "Remember-me refresh tokens default to 604800 seconds. Non-remembered refresh tokens remain fixed at 86400 seconds."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        const values = parseAuthTokenLifetimes(sessionTtl.valueAsNumber, refreshTtl.valueAsNumber);
+                        await context.api.post("auth/settings_update", {
+                            ...values,
+                            expected_revision: settings.revision,
+                        });
+                        context.notify("Authentication lifetimes saved.");
+                        await loadAuth();
+                    });
+                });
+                authArea.replaceChildren(Amaterasu.panel("Authentication session lifetimes", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    authArea.replaceChildren(Amaterasu.errorPanel(error, loadAuth));
+            }
+        }
         async function loadSteam() {
             steamArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Steam settings…"));
             try {
@@ -504,16 +818,44 @@ var Amaterasu;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("steam_enabled", "", "checkbox");
                 enabled.checked = settings.values.enabled;
+                const autoSync = Amaterasu.input("steam_auto_sync", "", "checkbox");
+                autoSync.checked = settings.values.auto_sync;
+                const includeTools = Amaterasu.input("steam_include_tools", "", "checkbox");
+                includeTools.checked = settings.values.include_tools;
+                const syncAllInstalled = Amaterasu.input("steam_sync_all_installed", "", "checkbox");
+                syncAllInstalled.checked = settings.values.sync_all_installed;
+                const autosyncRemoveUninstalled = Amaterasu.input("steam_autosync_remove_uninstalled", "", "checkbox");
+                autosyncRemoveUninstalled.checked =
+                    settings.values.autosync_remove_uninstalled;
+                const recentGames = Amaterasu.input("steam_recent_games", String(settings.values.recent_games), "number");
+                recentGames.required = true;
+                recentGames.min = "0";
+                recentGames.max = "10000";
+                recentGames.step = "1";
+                const recentMaxAgeDays = Amaterasu.input("steam_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                recentMaxAgeDays.required = true;
+                recentMaxAgeDays.min = "0";
+                recentMaxAgeDays.max = "36500";
+                recentMaxAgeDays.step = "1";
+                const exclusions = Amaterasu.el("textarea");
+                exclusions.name = "steam_exclude_games";
+                exclusions.rows = 10;
+                exclusions.spellcheck = false;
+                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
                 const status = Amaterasu.el("div");
+                const runtimeStatus = Amaterasu.el("p", "muted", "Loading current provider status…");
                 const save = Amaterasu.el("button", "button primary", "Save Steam settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Catalog synchronization and Steam launch support are not available yet."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
                         await context.api.post("steam/settings_update", {
                             enabled: enabled.checked,
+                            auto_sync: autoSync.checked,
+                            exclude_games: parseSteamExclusions(exclusions.value),
+                            ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
                             expected_revision: settings.revision,
                         });
                         context.notify("Steam discovery setting saved.");
@@ -521,10 +863,27 @@ var Amaterasu;
                     });
                 });
                 steamArea.replaceChildren(Amaterasu.panel("Steam", form));
+                void loadSteamRuntimeStatus(runtimeStatus, context);
             }
             catch (error) {
                 if (context.content.isConnected)
                     steamArea.replaceChildren(Amaterasu.errorPanel(error, loadSteam));
+            }
+        }
+        async function loadSteamRuntimeStatus(target, context) {
+            try {
+                const status = await context.api.post("steam/status");
+                if (!target.isConnected)
+                    return;
+                target.textContent = steamStatusDescription(status);
+            }
+            catch (error) {
+                if (!target.isConnected)
+                    return;
+                target.textContent =
+                    error instanceof Amaterasu.ApiError && error.code === "forbidden"
+                        ? "Runtime status requires steam.read; settings remain available with configuration access."
+                        : "Current provider status is unavailable; settings remain editable.";
             }
         }
         async function loadHost() {
@@ -541,17 +900,39 @@ var Amaterasu;
                 port.min = "1029";
                 port.max = "65514";
                 port.step = "1";
+                const addressFamily = Amaterasu.el("select");
+                addressFamily.name = "address_family";
+                const familyOptions = [
+                    ["startup", `Use startup policy (effective: ${settings.address_family})`],
+                    ["ipv4", "IPv4 only"],
+                    ["both", "IPv4 and IPv6"],
+                ];
+                for (const [value, label] of familyOptions) {
+                    const option = Amaterasu.el("option", "", label);
+                    option.value = value;
+                    addressFamily.append(option);
+                }
+                addressFamily.value = settings.configured_address_family ?? "startup";
+                const useStartupBindAddress = Amaterasu.input("use_startup_bind_address", "", "checkbox");
+                useStartupBindAddress.checked = settings.configured_bind_address === null;
+                const bindAddress = Amaterasu.input("bind_address", settings.configured_bind_address ?? "");
+                bindAddress.disabled = useStartupBindAddress.checked;
+                useStartupBindAddress.addEventListener("change", () => {
+                    bindAddress.disabled = useStartupBindAddress.checked;
+                });
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
+                        const network = parseNvhttpNetworkOverrides(addressFamily.value, useStartupBindAddress.checked, bindAddress.value);
                         await context.api.post("nvhttp/settings_update", {
                             hostname: hostname.value,
                             port: port.valueAsNumber,
+                            ...network,
                             expected_revision: settings.revision,
                         });
                         context.notify("Host settings saved.");
@@ -658,6 +1039,7 @@ var Amaterasu;
             }
         }
         void load();
+        void loadAuth();
         void loadHost();
         void loadSteam();
     }
@@ -1005,6 +1387,13 @@ var Amaterasu;
                 main?.scrollIntoView();
             });
             this.api = new Amaterasu.Api(document.querySelector('meta[name="amaterasu-api-base"]')?.content ?? "");
+            this.api.onAuthenticationLost = () => {
+                if (this.signedIn) {
+                    clearTimeout(this.notificationTimer);
+                    document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+                    this.loginScreen();
+                }
+            };
             window.addEventListener("hashchange", () => {
                 if (this.signedIn)
                     this.renderPage(this.currentPage());
@@ -1042,6 +1431,8 @@ var Amaterasu;
             const password = Amaterasu.input("password", "", "password");
             password.autocomplete = "current-password";
             password.required = true;
+            const rememberMe = Amaterasu.input("remember_me", "", "checkbox");
+            const rememberField = Amaterasu.field("Remember this tab", rememberMe, "Use the longer refresh lifetime; tokens still stay in memory.");
             const token = Amaterasu.input("token", "", "password");
             token.autocomplete = "off";
             token.spellcheck = false;
@@ -1061,14 +1452,16 @@ var Amaterasu;
                 password.required = !tokenMode;
                 token.required = tokenMode;
                 password.value = "";
+                rememberMe.checked = false;
                 token.value = "";
+                rememberField.hidden = tokenMode;
                 status.replaceChildren();
                 toggle.textContent = tokenMode
                     ? "Use username and password"
                     : "Use an API token instead";
                 (tokenMode ? token : username).focus();
             }, "link-button");
-            const form = Amaterasu.el("form", "", credentials, tokenField, status, submit, toggle);
+            const form = Amaterasu.el("form", "", credentials, rememberField, tokenField, status, submit, toggle);
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
                 if (!form.reportValidity())
@@ -1077,7 +1470,7 @@ var Amaterasu;
                     if (tokenMode)
                         this.api.useToken(token.value.trim());
                     else
-                        await this.api.login(username.value.trim(), password.value);
+                        await this.api.login(username.value.trim(), password.value, rememberMe.checked);
                     password.value = "";
                     token.value = "";
                     this.shell();
@@ -1120,7 +1513,7 @@ var Amaterasu;
             menu.setAttribute("aria-label", "Toggle navigation");
             menu.setAttribute("aria-expanded", "false");
             const logout = Amaterasu.button("Sign out", () => {
-                this.api.clear();
+                void this.api.logout();
                 clearTimeout(this.notificationTimer);
                 document
                     .querySelectorAll("dialog")

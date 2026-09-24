@@ -36,14 +36,32 @@ the inventory and settings foundation, host and application lifecycle controls,
 session renewal, network port behavior, and Steam provider reconciliation. It
 does not pass the final parity gate.
 
-Steam catalog reconciliation now owns explicit game exclusions, while
-`steam_include_tools` and `steam_recent_games` still need app type and
-play-history data. Vibeshine applies them to import and launch eligibility.
-Filtering the raw discovery feed would change that behavior. The Steam IDs
-remain pending until the whole reference behavior is verified.
+Each worker commits its owned implementation after rustfmt, meaningful tests,
+and Clippy. Use the repository's Nonary Git identity and include these exact
+lines in every plan commit, including integration commits:
+
+```text
+Orchestrated By: GPT-6 Sol High
+Planned By: GPT-6 Astra High
+```
+
+Steam catalog reconciliation now owns explicit exclusions, app type selection,
+recent-play selection, and the policy for retaining stale entries in all-game
+sync. It reads local app metadata and play history before changing the catalog;
+an incomplete scan leaves the prior catalog intact. Artwork, richer reference
+metadata, and platform-specific discovery and launch behavior still need
+verification. The Steam IDs remain pending until those effects are covered.
 
 The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
+IPv4 and IPv6 listeners can coexist where the startup policy requests both.
 `global:port` remains pending until listener moves, startup recovery, and
-platform behavior are verified as one configuration contract. `address_family`
-and `bind_address` remain pending until every public listener follows their
-policy without weakening the loopback control plane.
+platform behavior are verified as one configuration contract. Durable live
+updates of `address_family` and `bind_address` are in progress; those IDs
+remain pending until every public listener follows their effective policy
+without weakening the loopback control plane.
+
+Per-application process lifecycle fields now preserve omitted values and apply
+explicit values at launch. The shared `config-overrides` map and named-client
+overrides remain pending: launch has no authenticated TLS client identity or
+trusted client profile lookup yet. A request-supplied client ID cannot provide
+that authority.
