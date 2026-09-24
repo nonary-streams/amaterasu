@@ -239,6 +239,15 @@ fn credential_persistence_wrong_password_and_frontend_role_boundary() {
             "frontend",
             json!({"action":"verify","bearer":bearer,"required_scopes":[]}),
             7300
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":bearer,"required_scopes":[]}),
+            7301
         )["code"],
         "unauthorized"
     );
@@ -557,8 +566,8 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
             "frontend",
             json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
             220,
-        )["code"],
-        "unauthorized"
+        )["ok"],
+        true,
     );
 
     let rotated = state.request(
@@ -594,8 +603,8 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
             "frontend",
             json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":[]}),
             340,
-        )["code"],
-        "unauthorized"
+        )["ok"],
+        true,
     );
 
     // Refresh remains usable after access expiry, but the new access token is
@@ -621,8 +630,43 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
         state.request(
             &mut pipeline,
             "frontend",
-            json!({"action":"refresh","refresh_token":rotated_again["refresh_token"]}),
+            json!({"action":"verify","bearer":rotated_again["bearer"],"required_scopes":[]}),
             500,
+        )["ok"],
+        true
+    );
+    let rotated_at_expiry = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"refresh","refresh_token":rotated_again["refresh_token"]}),
+        500,
+    );
+    assert_eq!(rotated_at_expiry["expires_at"], 500);
+    assert_eq!(rotated_at_expiry["refresh_expires_at"], 500);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"verify","bearer":rotated_at_expiry["bearer"],"required_scopes":[]}),
+            500,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"verify","bearer":rotated_at_expiry["bearer"],"required_scopes":[]}),
+            501,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"refresh","refresh_token":rotated_at_expiry["refresh_token"]}),
+            501,
         )["code"],
         "unauthorized"
     );
