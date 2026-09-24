@@ -412,7 +412,7 @@ impl Transaction {
             }
             if self.remove_selection
                 && !self.sync_all_installed
-                && marker.source_flags & SOURCE_INSTALLED != 0
+                && marker.source_flags == SOURCE_INSTALLED
                 && !self.selected_source_ids.contains(&normalized_source_id)
             {
                 selection.push(marker.source_id.clone());
@@ -1184,6 +1184,53 @@ mod tests {
             transaction.selection_remove_source_id_batches.concat(),
             vec![previous_id]
         );
+    }
+
+    #[test]
+    fn disabling_sync_all_retains_unselected_rows_with_combined_source_flags() {
+        let selected_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let previous_id = "b1c2d3e4-1234-5678-9abc-0123456789ab";
+        let now = crate::snapshot::parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap();
+        let snapshot = Snapshot {
+            games: vec![Game {
+                last_played: "2026-09-23T00:00:00Z".into(),
+                ..game(selected_id, "Current recent", "")
+            }],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let inventory = vec![
+            inventory_entry(
+                selected_id,
+                Some(now - SECONDS_PER_DAY),
+                crate::snapshot::SOURCE_RECENT,
+                true,
+            ),
+            inventory_entry(
+                previous_id,
+                Some(now - SECONDS_PER_DAY),
+                SOURCE_INSTALLED | crate::snapshot::SOURCE_RECENT,
+                true,
+            ),
+        ];
+
+        let mut sync = CatalogSync::default();
+        sync.start(
+            &snapshot,
+            &ProductSettings {
+                recent_games: 1,
+                sync_all_installed: false,
+                autosync_require_replacement: true,
+                ..ProductSettings::default()
+            },
+            4,
+            now,
+        )
+        .unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        finish_inventory(transaction, inventory, 5);
+
+        assert!(transaction.selection_remove_source_id_batches.is_empty());
     }
 
     #[test]
