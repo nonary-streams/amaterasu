@@ -1351,6 +1351,40 @@ mod tests {
     }
 
     #[test]
+    fn paired_exclusions_match_by_id_or_name_during_catalog_selection() {
+        let games = [
+            (10, game(10, "Excluded by ID", true)),
+            (20, game(20, "Excluded by name", true)),
+            (30, game(30, "Kept", true)),
+        ]
+        .into_iter()
+        .collect();
+        let settings = ProductSettings {
+            sync_all_installed: true,
+            exclude_games: vec![Exclusion {
+                id: Some("10".into()),
+                name: Some("EXCLUDED BY NAME".into()),
+            }],
+            ..ProductSettings::default()
+        };
+        let records = catalog_records(
+            &games,
+            &settings,
+            &std::env::current_exe().unwrap(),
+            2_000_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["source_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["steam:30"]
+        );
+    }
+
+    #[test]
     fn including_tools_imports_them_only_when_explicitly_enabled() {
         let mut tool = game(228_980, "Steamworks Common Redistributables", true);
         tool.app_type = Some("tool".into());

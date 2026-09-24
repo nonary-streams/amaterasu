@@ -35,12 +35,12 @@ impl Exclusion {
     }
 
     pub fn matches(&self, app_id: u32, game_name: &str) -> bool {
-        if let Some(id) = &self.id {
-            return id == &app_id.to_string();
-        }
-        self.name
+        let id_matches = self.id.as_ref().is_some_and(|id| id == &app_id.to_string());
+        let name_matches = self
+            .name
             .as_deref()
-            .is_some_and(|name| name.to_lowercase() == game_name.to_lowercase())
+            .is_some_and(|name| name.eq_ignore_ascii_case(game_name));
+        id_matches || name_matches
     }
 }
 
@@ -307,13 +307,19 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_are_bounded_validated_and_match_by_id_or_name_fallback() {
+    fn exclusions_are_bounded_validated_and_match_by_id_or_name() {
         let by_id = Exclusion {
             id: Some("730".into()),
             name: Some("Renamed display label".into()),
         };
         assert!(by_id.matches(730, "Counter-Strike 2"));
-        assert!(!by_id.matches(731, "Renamed display label"));
+        assert!(by_id.matches(731, "Renamed display label"));
+        assert!(!by_id.matches(731, "Another game"));
+        let non_ascii_name = Exclusion {
+            id: None,
+            name: Some("K".into()),
+        };
+        assert!(!non_ascii_name.matches(731, "k"));
         let by_name = Exclusion {
             id: None,
             name: Some("Example Game".into()),

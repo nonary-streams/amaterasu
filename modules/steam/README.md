@@ -50,8 +50,10 @@ field to preserve its persisted value.
 
 Exclusions are bounded to 256 records of the form
 `{"id":"730","name":"Counter-Strike 2"}`; either a canonical decimal Steam
-app ID or printable name is required. When an ID is provided, matching uses
-the ID; a name-only exclusion matches exact names without case sensitivity.
+app ID or printable name is required. An exclusion matches when its supplied
+ID equals the app ID or its supplied name matches the current game name exactly
+with ASCII case-insensitive comparison. When both are supplied, either match
+excludes the game.
 
 With `auto_sync` enabled, Steam starts discovery when settings are applied.
 After each completed scan and its catalog attempt finish, it schedules the next
