@@ -37,6 +37,8 @@ enum Action {
         recent_games: Option<u32>,
         #[serde(default)]
         recent_max_age_days: Option<u32>,
+        #[serde(default)]
+        autosync_remove_uninstalled: Option<bool>,
         expected_revision: u64,
     },
     List {
@@ -147,6 +149,7 @@ impl Provider {
                 sync_all_installed,
                 recent_games,
                 recent_max_age_days,
+                autosync_remove_uninstalled,
                 expected_revision,
             } => ActionResult::SettingsUpdate {
                 settings: ProductSettingsPatch {
@@ -157,6 +160,7 @@ impl Provider {
                     sync_all_installed,
                     recent_games,
                     recent_max_age_days,
+                    autosync_remove_uninstalled,
                 },
                 expected_revision,
             },
@@ -230,6 +234,7 @@ struct ProductSettingsPatch {
     sync_all_installed: Option<bool>,
     recent_games: Option<u32>,
     recent_max_age_days: Option<u32>,
+    autosync_remove_uninstalled: Option<bool>,
 }
 
 impl ProductSettingsPatch {
@@ -248,6 +253,9 @@ impl ProductSettingsPatch {
             recent_max_age_days: self
                 .recent_max_age_days
                 .unwrap_or(current.recent_max_age_days),
+            autosync_remove_uninstalled: self
+                .autosync_remove_uninstalled
+                .unwrap_or(current.autosync_remove_uninstalled),
         }
     }
 }

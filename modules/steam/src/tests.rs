@@ -26,6 +26,7 @@ fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
         sync_all_installed: false,
         recent_games: 6,
         recent_max_age_days: 14,
+        autosync_remove_uninstalled: false,
         ..ProductSettings::default()
     };
     let Action::SettingsUpdate {
@@ -36,6 +37,7 @@ fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
         sync_all_installed,
         recent_games,
         recent_max_age_days,
+        autosync_remove_uninstalled,
         ..
     } = serde_json::from_value(json!({
         "action":"settings_update",
@@ -56,6 +58,7 @@ fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
         sync_all_installed,
         recent_games,
         recent_max_age_days,
+        autosync_remove_uninstalled,
     }
     .apply(&current);
     assert!(!updated.enabled);
@@ -63,6 +66,7 @@ fn legacy_management_settings_updates_preserve_recent_and_tool_policy() {
     assert!(updated.include_tools);
     assert_eq!(updated.recent_games, 6);
     assert_eq!(updated.recent_max_age_days, 14);
+    assert!(!updated.autosync_remove_uninstalled);
 }
 
 #[test]

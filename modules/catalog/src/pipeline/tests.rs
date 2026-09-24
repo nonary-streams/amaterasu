@@ -194,6 +194,26 @@ fn snapshot_finish(
     next_sequence: u64,
     complete: bool,
 ) -> Value {
+    snapshot_finish_policy(
+        sync_id,
+        generation,
+        source_revision,
+        expected_revision,
+        next_sequence,
+        complete,
+        true,
+    )
+}
+
+fn snapshot_finish_policy(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    expected_revision: u64,
+    next_sequence: u64,
+    complete: bool,
+    remove_stale: bool,
+) -> Value {
     json!({
         "action":"provider_snapshot_finish",
         "sync_id":sync_id,
@@ -202,7 +222,50 @@ fn snapshot_finish(
         "expected_revision":expected_revision,
         "next_sequence":next_sequence,
         "complete":complete,
+        "remove_stale":remove_stale,
     })
+}
+
+#[test]
+fn old_provider_snapshot_state_defaults_to_removal_enabled() {
+    let mut value = serde_json::to_value(SnapshotState::initial()).unwrap();
+    value.as_object_mut().unwrap().remove("finish_remove_stale");
+    let restored: SnapshotState = serde_json::from_value(value).unwrap();
+    assert!(restored.finish_remove_stale);
+}
+
+#[test]
+fn snapshot_finish_policy_is_boolean_and_defaults_to_legacy_removal() {
+    let mut request = json!({
+        "action":"provider_snapshot_finish",
+        "sync_id":"scan-1",
+        "generation":1,
+        "source_revision":1,
+        "expected_revision":0,
+        "next_sequence":0,
+        "complete":true
+    });
+    let operation: Operation = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(
+        operation,
+        Operation::ProviderSnapshotFinish {
+            remove_stale: true,
+            ..
+        }
+    ));
+
+    request["remove_stale"] = json!(false);
+    let operation: Operation = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(
+        operation,
+        Operation::ProviderSnapshotFinish {
+            remove_stale: false,
+            ..
+        }
+    ));
+
+    request["remove_stale"] = json!("false");
+    assert!(serde_json::from_value::<Operation>(request).is_err());
 }
 
 #[test]
@@ -968,6 +1031,231 @@ fn provider_snapshot_detaches_manual_edits_and_preserves_them_on_later_cleanup()
         "management",
     );
     assert_eq!(third["generation"], 3);
+    assert_eq!(cleaned["ok"], true);
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["name"],
+        "Hand edited"
+    );
+    assert!(
+        !backend
+            .entries
+            .contains_key("~provider.entry:steam:steam:10")
+    );
+}
+
+#[test]
+fn finish_policy_retains_then_cleans_only_unchanged_provider_entries_and_replays_stably() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let first = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-1", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    let imported = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "scan-1",
+            first["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![("steam:10", entry("Managed"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(imported["revision"], 1);
+    let first_finished = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-1", 1, 1, 1, 1, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(first_finished["remove_stale"], true);
+
+    let second = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-2", 2),
+        "steam",
+        "management",
+        "management",
+    );
+    let retained_finish = snapshot_finish_policy(
+        "scan-2",
+        second["generation"].as_u64().unwrap(),
+        2,
+        1,
+        0,
+        true,
+        false,
+    );
+    backend.lose_commit_ack_once = true;
+    let ambiguous = backend.run_for(
+        &mut pipeline,
+        retained_finish.clone(),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(ambiguous["error"]["code"], "deadline_exceeded");
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+    assert!(
+        backend
+            .entries
+            .contains_key("~provider.entry:steam:steam:10")
+    );
+
+    let mut restarted_pipeline = steam_importer();
+    let replay = backend.run_for(
+        &mut restarted_pipeline,
+        retained_finish,
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(replay["ok"], true);
+    assert_eq!(replay["remove_stale"], false);
+    let flipped_replay = backend.run_for(
+        &mut restarted_pipeline,
+        snapshot_finish_policy("scan-2", 2, 2, 1, 0, true, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(flipped_replay["error"]["code"], "snapshot_conflict");
+
+    let third = backend.run_for(
+        &mut restarted_pipeline,
+        snapshot_begin("scan-3", 3),
+        "steam",
+        "management",
+        "management",
+    );
+    let cleaned = backend.run_for(
+        &mut restarted_pipeline,
+        snapshot_finish_policy(
+            "scan-3",
+            third["generation"].as_u64().unwrap(),
+            3,
+            1,
+            0,
+            true,
+            true,
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(cleaned["ok"], true);
+    assert_eq!(cleaned["remove_stale"], true);
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+    assert!(
+        !backend
+            .entries
+            .contains_key("~provider.entry:steam:steam:10")
+    );
+}
+
+#[test]
+fn retained_manually_edited_entry_loses_marker_but_survives_later_cleanup() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-1", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "scan-1",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![("steam:10", entry("Managed"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-1", 1, 1, 1, 1, true),
+        "steam",
+        "management",
+        "management",
+    );
+    backend.run_for(
+        &mut pipeline,
+        json!({"action":"update","id":"app-0000000000000001","expected_revision":1,"entry":entry("Hand edited")} ),
+        "management",
+        "management",
+        "management",
+    );
+
+    let second = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-2", 2),
+        "steam",
+        "management",
+        "management",
+    );
+    let retained = backend.run_for(
+        &mut pipeline,
+        snapshot_finish_policy(
+            "scan-2",
+            second["generation"].as_u64().unwrap(),
+            2,
+            2,
+            0,
+            true,
+            false,
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(retained["ok"], true);
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["name"],
+        "Hand edited"
+    );
+    assert!(
+        backend
+            .entries
+            .contains_key("~provider.entry:steam:steam:10")
+    );
+
+    let third = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-3", 3),
+        "steam",
+        "management",
+        "management",
+    );
+    let cleaned = backend.run_for(
+        &mut pipeline,
+        snapshot_finish_policy(
+            "scan-3",
+            third["generation"].as_u64().unwrap(),
+            3,
+            2,
+            0,
+            true,
+            true,
+        ),
+        "steam",
+        "management",
+        "management",
+    );
     assert_eq!(cleaned["ok"], true);
     assert_eq!(
         backend.entries["app-0000000000000001"]["name"],

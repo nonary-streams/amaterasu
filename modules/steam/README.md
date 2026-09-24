@@ -37,14 +37,16 @@ Steam requests continue to be served during those retries.
 The version 1 product document also contains `auto_sync` (`false`),
 `exclude_games` (`[]`), `include_tools` (`false`), `sync_all_installed`
 (`false`), `recent_games` (`10`), and `recent_max_age_days` (`30`). The provider
-accepts settings updates with `{enabled,auto_sync,exclude_games,include_tools,
-sync_all_installed,recent_games,recent_max_age_days,expected_revision}`. The
+`autosync_remove_uninstalled` defaults to `true` and accepts settings updates
+with `{enabled,auto_sync,exclude_games,include_tools,
+sync_all_installed,recent_games,recent_max_age_days,
+autosync_remove_uninstalled,expected_revision}`. The
 new fields default when reading older version 1 documents. Older management
 updates that omit them preserve their current values. `recent_games` is bounded
 to 10000 and `recent_max_age_days` to 36500; either can be zero, with zero games
 selecting none and zero days disabling the age limit. The management HTTP
-projection/editor still needs to expose the new fields before users can change
-them through those routes.
+projection/editor exposes these settings; updates may omit the new
+field to preserve its persisted value.
 
 Exclusions are bounded to 256 records of the form
 `{"id":"730","name":"Counter-Strike 2"}`; either a canonical decimal Steam
@@ -80,19 +82,23 @@ management catalog and accepts no caller-supplied owner selector.
 
 The snapshot protocol writes bounded batches and declares completion only after
 a successful full scan. Catalog ownership markers preserve manually changed or
-deleted entries, and stale Steam-managed entries are removed only by a complete
-scan. A scan with no configured roots, any discovery warning, or no resolved
-Steam client leaves the catalog unchanged. If settings or discovery revision
+deleted entries. A scan with no configured roots, any discovery warning, or no
+resolved Steam client leaves the catalog unchanged. If settings or discovery revision
 changes during an import, Steam stops before submitting another step; a catalog
 finish already in flight may still complete, after which a later complete scan
 reconciles current settings. Status and list requests continue during catalog
 retries.
 
-This still does not provide complete Vibeshine Steam sync parity. Catalog
-finish always removes stale Steam-owned entries after a successful full
-snapshot, so `steam_autosync_remove_uninstalled=false` is not configurable.
-Artwork and richer catalog metadata are also unavailable. The settings HTTP
-projection/editor follow-up is pending for the new tool/recent fields.
+`autosync_remove_uninstalled` defaults to `true`. In `sync_all_installed` mode,
+`false` retains older Steam-owned catalog entries that are absent from a
+successful scan; a later complete scan with removal enabled can clean them up.
+Recent mode always removes entries that fall outside its current selection,
+regardless of this setting. Cleanup is fixed to the authenticated importer's own
+provider markers, runs only after a complete scan, and preserves detached manual
+edits.
+
+This still does not provide complete Vibeshine Steam sync parity. Artwork and
+richer catalog metadata are unavailable.
 Unlike Vibeshine's legacy host config parser, the product API rejects negative
 counts and ages as malformed unsigned values instead of clamping them to zero.
 

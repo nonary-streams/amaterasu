@@ -265,21 +265,25 @@ out-of-order sequences return `sequence_conflict`. State collection compare-and-
 set also detects edits by ordinary catalog clients; reload/retry after a
 `revision_conflict`.
 
-Finish only after the provider has completed its full source scan:
+Finish only after the provider has completed its full source scan. `remove_stale`
+is an optional boolean that defaults to `true` for existing clients:
 
 ```json
-{"action":"provider_snapshot_finish","sync_id":"steam-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true}
+{"action":"provider_snapshot_finish","sync_id":"steam-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true,"remove_stale":true}
 ```
 
-Success returns `ok`, `revision`, `generation`, `complete:true`, and
-`cleanup_pending:false`. An incomplete scan is rejected and does not remove
-anything. The catalog removes stale provider-managed entries only after this
-explicit complete finish. Cleanup is committed in bounded chunks and can be
-reconciled by repeating the same finish after an ambiguous timeout. Entries
-changed or deleted by a user are detached from provider ownership and are never
-silently overwritten or removed. Begin retries with the same `sync_id` resume
-that generation; a new or restarted source scan must use a fresh ID so partial
-data from the old generation cannot be mistaken for a complete snapshot.
+Success returns `ok`, `revision`, `generation`, `complete:true`,
+`cleanup_pending:false`, and the resolved `remove_stale` policy. An incomplete
+scan is rejected and never removes anything. When `remove_stale` is false, old
+provider markers and entries are retained for a later complete scan; the
+authenticated importer cannot select another provider's markers. The chosen
+policy is persisted with the finished generation, so retries after an ambiguous
+timeout must repeat the same choice. Removal is committed in bounded chunks and
+can be reconciled by repeating that finish. Entries changed or deleted by a
+user are detached from provider ownership and are never silently overwritten or
+removed. Begin retries with the same `sync_id` resume that generation; a new or
+restarted source scan must use a fresh ID so partial data from the old
+generation cannot be mistaken for a complete snapshot.
 
 The catalog API provides durable snapshot mechanics, not source discovery or
 product policy. Providers remain responsible for validating their domain data,

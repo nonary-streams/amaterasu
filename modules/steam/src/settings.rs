@@ -60,6 +60,8 @@ pub struct ProductSettings {
     pub recent_games: u32,
     #[serde(default = "default_recent_max_age_days")]
     pub recent_max_age_days: u32,
+    #[serde(default = "default_autosync_remove_uninstalled")]
+    pub autosync_remove_uninstalled: bool,
 }
 
 pub(super) fn default_recent_games() -> u32 {
@@ -68,6 +70,10 @@ pub(super) fn default_recent_games() -> u32 {
 
 pub(super) fn default_recent_max_age_days() -> u32 {
     30
+}
+
+pub(super) fn default_autosync_remove_uninstalled() -> bool {
+    true
 }
 
 #[allow(clippy::derivable_impls)] // The default follows Vibeshine's Linux policy.
@@ -81,6 +87,7 @@ impl Default for ProductSettings {
             sync_all_installed: false,
             recent_games: default_recent_games(),
             recent_max_age_days: default_recent_max_age_days(),
+            autosync_remove_uninstalled: default_autosync_remove_uninstalled(),
         }
     }
 }
@@ -218,6 +225,7 @@ mod tests {
         let settings = ProductSettings::default();
         assert_eq!(settings.enabled, cfg!(target_os = "linux"));
         assert!(!settings.auto_sync);
+        assert!(settings.autosync_remove_uninstalled);
         assert!(settings.exclude_games.is_empty());
         assert_eq!(
             settings.product_update_payload(0),
@@ -225,7 +233,7 @@ mod tests {
                 "action":"product_update",
                 "expected_revision":0,
                 "version":1,
-                "values":{"enabled":cfg!(target_os = "linux"),"auto_sync":false,"exclude_games":[],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30}
+                "values":{"enabled":cfg!(target_os = "linux"),"auto_sync":false,"exclude_games":[],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30,"autosync_remove_uninstalled":true}
             })
         );
     }
@@ -239,6 +247,17 @@ mod tests {
             .unwrap(),
             (ProductSettings::default(), 0)
         );
+        let (older_settings, _) = ProductSettings::from_product_document(&json!({
+            "ok":true,"found":true,"version":1,"revision":4,
+            "values":{"enabled":true,"sync_all_installed":true,"autosync_remove_uninstalled":false}
+        }))
+        .unwrap();
+        assert!(!older_settings.autosync_remove_uninstalled);
+        let (legacy_settings, _) = ProductSettings::from_product_document(&json!({
+            "ok":true,"found":true,"version":1,"revision":4,"values":{"enabled":true}
+        }))
+        .unwrap();
+        assert!(legacy_settings.autosync_remove_uninstalled);
         assert_eq!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":true,"version":1,"revision":4,"values":{"enabled":true}
@@ -258,6 +277,7 @@ mod tests {
             json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"enabled":true}}),
             json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"enabled":true,"other":1}}),
             json!({"ok":true,"found":true,"version":1,"revision":1,"values":{}}),
+            json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"enabled":true,"autosync_remove_uninstalled":"false"}}),
             json!({"ok":true,"found":false,"version":null,"revision":1,"values":{}}),
             json!({"ok":true,"found":false,"version":1,"revision":0,"values":{}}),
             json!({"ok":true,"found":false,"version":null,"revision":0,"values":{"enabled":true}}),
@@ -282,7 +302,7 @@ mod tests {
                 ..ProductSettings::default()
             }
             .management_response(8),
-            json!({"ok":true,"revision":8,"values":{"enabled":true,"auto_sync":true,"exclude_games":[{"id":"730","name":"Counter-Strike 2"}],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30}})
+            json!({"ok":true,"revision":8,"values":{"enabled":true,"auto_sync":true,"exclude_games":[{"id":"730","name":"Counter-Strike 2"}],"include_tools":false,"sync_all_installed":false,"recent_games":10,"recent_max_age_days":30,"autosync_remove_uninstalled":true}})
         );
     }
 

@@ -33,6 +33,7 @@ struct Transaction {
     sync_id: String,
     source_revision: u64,
     settings_epoch: u64,
+    remove_stale: bool,
     entries: Vec<Vec<Value>>,
     generation: Option<u64>,
     revision: Option<u64>,
@@ -83,6 +84,7 @@ impl Transaction {
                 "expected_revision":self.revision.expect("begin provides revision"),
                 "next_sequence":self.next_sequence,
                 "complete":true,
+                "remove_stale":self.remove_stale,
             }),
         }
     }
@@ -178,6 +180,8 @@ impl Transaction {
                     || revision < self.revision.unwrap_or(u64::MAX)
                     || payload.get("complete").and_then(Value::as_bool) != Some(true)
                     || payload.get("cleanup_pending").and_then(Value::as_bool) != Some(false)
+                    || payload.get("remove_stale").and_then(Value::as_bool)
+                        != Some(self.remove_stale)
                 {
                     return Err("catalog finish response is inconsistent".into());
                 }
@@ -336,6 +340,7 @@ impl CatalogSync {
             sync_id: new_sync_id(provider.revision),
             source_revision: provider.revision,
             settings_epoch: self.settings_epoch,
+            remove_stale: should_remove_stale(settings),
             entries: batches,
             generation: None,
             revision: None,
@@ -623,6 +628,10 @@ fn catalog_source_error(provider: &Provider, settings: &ProductSettings) -> Opti
     None
 }
 
+fn should_remove_stale(settings: &ProductSettings) -> bool {
+    !settings.sync_all_installed || settings.autosync_remove_uninstalled
+}
+
 fn unix_timestamp_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -857,6 +866,46 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_policy_forces_removal_in_recent_mode_and_respects_sync_all_setting() {
+        assert!(should_remove_stale(&ProductSettings::default()));
+        assert!(should_remove_stale(&ProductSettings {
+            sync_all_installed: false,
+            autosync_remove_uninstalled: false,
+            ..ProductSettings::default()
+        }));
+        assert!(should_remove_stale(&ProductSettings {
+            sync_all_installed: true,
+            autosync_remove_uninstalled: true,
+            ..ProductSettings::default()
+        }));
+        assert!(!should_remove_stale(&ProductSettings {
+            sync_all_installed: true,
+            autosync_remove_uninstalled: false,
+            ..ProductSettings::default()
+        }));
+
+        let transaction = Transaction {
+            sync_id: "test-sync".into(),
+            source_revision: 4,
+            settings_epoch: 1,
+            remove_stale: false,
+            entries: Vec::new(),
+            generation: Some(2),
+            revision: Some(8),
+            next_sequence: 0,
+            batch_index: 0,
+            conflict_restarts: 0,
+            stage: Stage::Finish,
+            call: CallState::Submit,
+            retry_attempt: 0,
+            delay_ticks: 0,
+            cancel_after_call: false,
+        };
+        let request = transaction.payload();
+        assert_eq!(request["remove_stale"], false);
+    }
+
+    #[test]
     fn invalid_catalog_names_and_client_paths_fail_before_a_snapshot_is_started() {
         let games = [(10, game(10, &"x".repeat(161), true))]
             .into_iter()
@@ -923,6 +972,7 @@ mod tests {
             sync_id: "sync".into(),
             source_revision: 1,
             settings_epoch: 1,
+            remove_stale: true,
             entries: Vec::new(),
             generation: None,
             revision: None,
@@ -938,7 +988,7 @@ mod tests {
         assert!(!transaction.advance_success(&malformed).unwrap());
         assert_eq!(transaction.stage, Stage::Finish);
         let incomplete_finish = json!({
-            "ok":true,"revision":1,"generation":2,"complete":true,"cleanup_pending":true
+            "ok":true,"revision":1,"generation":2,"complete":true,"cleanup_pending":true,"remove_stale":true
         });
         assert!(transaction.advance_success(&incomplete_finish).is_err());
     }
@@ -953,6 +1003,7 @@ mod tests {
             sync_id: "sync".into(),
             source_revision: 1,
             settings_epoch: 1,
+            remove_stale: true,
             entries: Vec::new(),
             generation: None,
             revision: None,

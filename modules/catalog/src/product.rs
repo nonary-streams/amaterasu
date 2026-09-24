@@ -33,6 +33,8 @@ pub(crate) struct SnapshotState {
     pub(crate) finished: bool,
     pub(crate) cleanup_pending: bool,
     pub(crate) finish_expected_revision: Option<u64>,
+    #[serde(default = "default_remove_stale")]
+    pub(crate) finish_remove_stale: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -57,6 +59,7 @@ impl SnapshotState {
             finished: false,
             cleanup_pending: false,
             finish_expected_revision: None,
+            finish_remove_stale: true,
         }
     }
 
@@ -78,6 +81,10 @@ impl SnapshotState {
             })
             && (self.next_sequence == 0 || self.last_batch.is_some())
     }
+}
+
+fn default_remove_stale() -> bool {
+    true
 }
 
 pub(crate) fn state_key(caller: &str) -> String {

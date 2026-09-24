@@ -61,7 +61,13 @@ pub enum Operation {
         expected_revision: u64,
         next_sequence: u64,
         complete: bool,
+        #[serde(default = "default_remove_stale")]
+        remove_stale: bool,
     },
+}
+
+fn default_remove_stale() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize)]

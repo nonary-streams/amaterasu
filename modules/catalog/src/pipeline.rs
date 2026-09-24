@@ -99,6 +99,7 @@ struct ProviderFinish {
     expected_revision: u64,
     next_sequence: u64,
     source_complete: bool,
+    remove_stale: bool,
 }
 struct Scan {
     export: bool,
@@ -453,6 +454,7 @@ impl Pipeline {
                 expected_revision,
                 next_sequence,
                 complete: source_complete,
+                remove_stale,
             } => self.finish_snapshot(
                 context,
                 session,
@@ -463,6 +465,7 @@ impl Pipeline {
                     expected_revision,
                     next_sequence,
                     source_complete,
+                    remove_stale,
                 },
                 send,
             ),
@@ -532,6 +535,7 @@ impl Pipeline {
             finished: false,
             cleanup_pending: false,
             finish_expected_revision: None,
+            finish_remove_stale: true,
         };
         let key = state_key(&session.caller);
         if is_new_state {
@@ -695,6 +699,7 @@ impl Pipeline {
         session.state.finished = false;
         session.state.cleanup_pending = false;
         session.state.finish_expected_revision = None;
+        session.state.finish_remove_stale = true;
         session.state.last_batch = Some(CommittedBatch {
             sequence,
             expected_revision,
@@ -736,6 +741,7 @@ impl Pipeline {
             expected_revision,
             next_sequence,
             source_complete,
+            remove_stale,
         } = finish;
         if !source_complete {
             return complete(
@@ -760,7 +766,9 @@ impl Pipeline {
             );
         }
         if session.state.finished {
-            if session.state.finish_expected_revision != Some(expected_revision) {
+            if session.state.finish_expected_revision != Some(expected_revision)
+                || session.state.finish_remove_stale != remove_stale
+            {
                 return complete(
                     send,
                     context.request_id,
@@ -771,7 +779,7 @@ impl Pipeline {
                 return complete(
                     send,
                     context.request_id,
-                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false}),
+                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale}),
                 );
             }
         } else {
@@ -784,13 +792,18 @@ impl Pipeline {
             }
             session.state.finished = true;
             session.state.finish_expected_revision = Some(expected_revision);
+            session.state.finish_remove_stale = remove_stale;
         }
-        let mut stale: Vec<Marker> = session
-            .markers
-            .values()
-            .filter(|marker| marker.caller == session.caller && marker.generation < generation)
-            .cloned()
-            .collect();
+        let mut stale: Vec<Marker> = if remove_stale {
+            session
+                .markers
+                .values()
+                .filter(|marker| marker.caller == session.caller && marker.generation < generation)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         stale.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         session.state.cleanup_pending = !stale.is_empty();
         self.commit_provider_cleanup(context, session, stale, send)
@@ -838,7 +851,7 @@ impl Pipeline {
             "value":session.state.clone(),
         }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty()});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale});
         self.submit(
             context,
             payload,
