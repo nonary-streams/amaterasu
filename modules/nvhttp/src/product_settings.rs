@@ -14,7 +14,8 @@ const PORT_SETTINGS_VERSION: u64 = 2;
 const NETWORK_SETTINGS_VERSION: u64 = 3;
 const OUTPUT_SETTINGS_VERSION: u64 = 4;
 const STREAM_AUDIO_SETTINGS_VERSION: u64 = 5;
-const SETTINGS_VERSION: u64 = 6;
+const CAPTURE_SETTINGS_VERSION: u64 = 6;
+const SETTINGS_VERSION: u64 = 7;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +32,7 @@ pub enum AdminAction {
         output_name: FieldUpdate<String>,
         stream_audio: FieldUpdate<bool>,
         capture: FieldUpdate<CaptureMode>,
+        video_max_batch_size_kb: FieldUpdate<u8>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -100,6 +102,7 @@ enum Purpose {
         output_name: Option<String>,
         stream_audio: bool,
         capture: CaptureMode,
+        video_max_batch_size_kb: Option<u8>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -131,6 +134,7 @@ struct ProductDocument {
     output_name: Option<String>,
     stream_audio: bool,
     capture: CaptureMode,
+    video_max_batch_size_kb: Option<u8>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -148,6 +152,7 @@ pub struct ProductSettings {
     configured_bind_address: Option<String>,
     configured_output_name: Option<String>,
     configured_capture: CaptureMode,
+    configured_video_max_batch_size_kb: Option<u8>,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -238,6 +243,7 @@ impl ProductSettings {
             configured_bind_address: None,
             configured_output_name: None,
             configured_capture: CaptureMode::Auto,
+            configured_video_max_batch_size_kb: None,
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -275,6 +281,21 @@ impl ProductSettings {
 
     pub fn configured_capture(&self) -> CaptureMode {
         self.configured_capture
+    }
+
+    pub fn configured_video_max_batch_size_kb(&self) -> Option<u8> {
+        self.configured_video_max_batch_size_kb
+    }
+
+    pub fn effective_video_max_batch_size_kb(&self) -> u8 {
+        self.configured_video_max_batch_size_kb
+            .map(effective_video_max_batch_size_kb)
+            .unwrap_or(64)
+    }
+
+    pub fn video_batch_size_fallback(&self) -> bool {
+        self.configured_video_max_batch_size_kb
+            .is_some_and(video_batch_size_fallback)
     }
 
     pub fn stream_audio(&self) -> bool {
@@ -757,6 +778,7 @@ impl ProductSettings {
                 output_name,
                 stream_audio,
                 capture,
+                video_max_batch_size_kb,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -798,6 +820,22 @@ impl ProductSettings {
                     }
                 };
                 let capture = apply_capture_update(capture, self.configured_capture);
+                let video_max_batch_size_kb = match apply_video_max_batch_size_update(
+                    video_max_batch_size_kb,
+                    self.configured_video_max_batch_size_kb,
+                ) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(
+                                "invalid_video_max_batch_size_kb",
+                                "video_max_batch_size_kb must be an integer from 0 to 64 or null",
+                            ),
+                        );
+                        return;
+                    }
+                };
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -858,6 +896,7 @@ impl ProductSettings {
                         output_name.as_deref(),
                         stream_audio,
                         capture,
+                        video_max_batch_size_kb,
                     ),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
@@ -868,6 +907,7 @@ impl ProductSettings {
                         output_name,
                         stream_audio,
                         capture,
+                        video_max_batch_size_kb,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -981,19 +1021,21 @@ impl ProductSettings {
                 output_name,
                 stream_audio,
                 capture,
+                video_max_batch_size_kb,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
                 CallOutcome::Payload(payload) => {
-                    match update_result(
-                        &payload,
-                        expected_revision,
-                        &hostname,
-                        &target,
-                        output_name.as_deref(),
+                    let expected = UpdateExpectation {
+                        revision: expected_revision,
+                        hostname: &hostname,
+                        target: &target,
+                        output_name: output_name.as_deref(),
                         stream_audio,
                         capture,
-                    ) {
+                        video_max_batch_size_kb,
+                    };
+                    match update_result(&payload, &expected) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
                             let previous_http_target = self.http_target();
                             let previous_rtsp_target = self.rtsp_target();
@@ -1209,6 +1251,14 @@ impl ProductSettings {
         {
             return Err(invalid_state("persisted output name is invalid"));
         }
+        if document
+            .video_max_batch_size_kb
+            .is_some_and(|value| value > 64)
+        {
+            return Err(invalid_state(
+                "persisted video_max_batch_size_kb is outside 0..=64",
+            ));
+        }
         let mut validation_settings = self.bootstrap_settings.clone();
         let port = document.port.unwrap_or(self.bootstrap_port);
         validation_settings.http_bind.set_port(port);
@@ -1243,6 +1293,7 @@ impl ProductSettings {
         self.configured_output_name = document.output_name;
         self.stream_audio = document.stream_audio;
         self.configured_capture = document.capture;
+        self.configured_video_max_batch_size_kb = document.video_max_batch_size_kb;
         self.loaded = true;
     }
 
@@ -1259,6 +1310,9 @@ impl ProductSettings {
             "configured_bind_address":self.configured_bind_address,
             "configured_output_name":self.configured_output_name,
             "configured_capture":self.configured_capture.as_str(),
+            "configured_video_max_batch_size_kb":self.configured_video_max_batch_size_kb(),
+            "effective_video_max_batch_size_kb":self.effective_video_max_batch_size_kb(),
+            "video_batch_size_fallback":self.video_batch_size_fallback(),
             "stream_audio":self.stream_audio,
             "effective_output_name":self.effective_output_name(),
             "capture_provider":self.capture_provider(),
@@ -1317,6 +1371,7 @@ fn product_update_payload(
     output_name: Option<&str>,
     stream_audio: bool,
     capture: CaptureMode,
+    video_max_batch_size_kb: Option<u8>,
 ) -> Value {
     json!({
         "action":"product_update",
@@ -1330,6 +1385,7 @@ fn product_update_payload(
             "output_name":output_name,
             "stream_audio":stream_audio,
             "capture":capture,
+            "video_max_batch_size_kb":video_max_batch_size_kb,
         },
     })
 }
@@ -1376,6 +1432,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             output_name: None,
             stream_audio: true,
             capture: CaptureMode::Auto,
+            video_max_batch_size_kb: None,
         });
     }
 
@@ -1390,6 +1447,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | NETWORK_SETTINGS_VERSION
             | OUTPUT_SETTINGS_VERSION
             | STREAM_AUDIO_SETTINGS_VERSION
+            | CAPTURE_SETTINGS_VERSION
             | SETTINGS_VERSION
     ) || revision == 0
     {
@@ -1403,7 +1461,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         NETWORK_SETTINGS_VERSION => 4,
         OUTPUT_SETTINGS_VERSION => 5,
         STREAM_AUDIO_SETTINGS_VERSION => 6,
-        SETTINGS_VERSION => 7,
+        CAPTURE_SETTINGS_VERSION => 7,
+        SETTINGS_VERSION => 8,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1413,7 +1472,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             && (!values.contains_key("address_family") || !values.contains_key("bind_address")))
         || (version >= OUTPUT_SETTINGS_VERSION && !values.contains_key("output_name"))
         || (version >= STREAM_AUDIO_SETTINGS_VERSION && !values.contains_key("stream_audio"))
-        || (version == SETTINGS_VERSION && !values.contains_key("capture"))
+        || (version >= CAPTURE_SETTINGS_VERSION && !values.contains_key("capture"))
+        || (version == SETTINGS_VERSION && !values.contains_key("video_max_batch_size_kb"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1468,7 +1528,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         true
     };
-    let capture = if version == SETTINGS_VERSION {
+    let capture = if version >= CAPTURE_SETTINGS_VERSION {
         serde_json::from_value::<CaptureMode>(
             values
                 .get("capture")
@@ -1479,6 +1539,24 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         CaptureMode::Auto
     };
+    let video_max_batch_size_kb = if version >= SETTINGS_VERSION {
+        match values.get("video_max_batch_size_kb") {
+            Some(Value::Null) => None,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| *value <= 64)
+                .map(Some)
+                .ok_or_else(|| invalid_state("persisted video_max_batch_size_kb is invalid"))?,
+            None => {
+                return Err(invalid_state(
+                    "persisted video_max_batch_size_kb is missing",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -1488,35 +1566,43 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         output_name,
         stream_audio,
         capture,
+        video_max_batch_size_kb,
     })
+}
+
+#[derive(Clone, Copy)]
+struct UpdateExpectation<'a> {
+    revision: u64,
+    hostname: &'a str,
+    target: &'a NetworkTarget,
+    output_name: Option<&'a str>,
+    stream_audio: bool,
+    capture: CaptureMode,
+    video_max_batch_size_kb: Option<u8>,
 }
 
 fn update_result(
     payload: &Value,
-    expected_revision: u64,
-    hostname: &str,
-    target: &NetworkTarget,
-    output_name: Option<&str>,
-    stream_audio: bool,
-    capture: CaptureMode,
+    expected: &UpdateExpectation<'_>,
 ) -> Result<ProductDocument, SettingFailure> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v6 capture settings",
+            "product_update did not confirm the v7 video batch settings",
         ));
     }
     let document = parse_document(payload)?;
-    if document.hostname.as_deref() != Some(hostname)
-        || document.port != Some(target.port)
-        || document.address_family != target.address_family
-        || document.bind_address != target.bind_address
-        || document.output_name.as_deref() != output_name
-        || document.stream_audio != stream_audio
-        || document.capture != capture
-        || expected_revision.checked_add(1) != Some(document.revision)
+    if document.hostname.as_deref() != Some(expected.hostname)
+        || document.port != Some(expected.target.port)
+        || document.address_family != expected.target.address_family
+        || document.bind_address != expected.target.bind_address
+        || document.output_name.as_deref() != expected.output_name
+        || document.stream_audio != expected.stream_audio
+        || document.capture != expected.capture
+        || document.video_max_batch_size_kb != expected.video_max_batch_size_kb
+        || expected.revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
             "product_update response does not match the requested write",
@@ -1564,6 +1650,29 @@ fn apply_capture_update(update: FieldUpdate<CaptureMode>, current: CaptureMode) 
         FieldUpdate::Null => CaptureMode::Auto,
         FieldUpdate::Value(value) => value,
     }
+}
+
+fn apply_video_max_batch_size_update(
+    update: FieldUpdate<u8>,
+    current: Option<u8>,
+) -> Result<Option<u8>, ()> {
+    match update {
+        FieldUpdate::Omitted => Ok(current),
+        FieldUpdate::Null => Ok(None),
+        FieldUpdate::Value(value) if value <= 64 => Ok(Some(value)),
+        FieldUpdate::Value(_) => Err(()),
+    }
+}
+
+fn effective_video_max_batch_size_kb(value: u8) -> u8 {
+    match value {
+        16 | 32 | 64 => value,
+        _ => 64,
+    }
+}
+
+fn video_batch_size_fallback(value: u8) -> bool {
+    value != 0 && !matches!(value, 16 | 32 | 64)
 }
 
 fn apply_field_update<T>(update: FieldUpdate<T>, current: Option<T>) -> Option<T> {
@@ -1844,6 +1953,66 @@ mod tests {
     }
 
     #[test]
+    fn v7_video_batch_size_migrates_defaults_and_survives_restart() {
+        let v6 = parse_document(&json!({
+            "ok":true,"found":true,"version":6,"revision":2,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+        }))
+        .unwrap();
+        assert_eq!(v6.video_max_batch_size_kb, None);
+
+        let selected_document = json!({
+            "ok":true,"found":true,"version":7,"revision":3,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                "video_max_batch_size_kb":17}
+        });
+        let mut first_start = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        first_start.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(first_start.configured_video_max_batch_size_kb(), Some(17));
+        assert_eq!(first_start.effective_video_max_batch_size_kb(), 64);
+        assert!(first_start.video_batch_size_fallback());
+        assert_eq!(
+            first_start.settings_payload()["configured_video_max_batch_size_kb"],
+            17
+        );
+        assert_eq!(
+            first_start.settings_payload()["effective_video_max_batch_size_kb"],
+            64
+        );
+        assert_eq!(
+            first_start.settings_payload()["video_batch_size_fallback"],
+            true
+        );
+
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&selected_document).unwrap());
+        assert_eq!(restarted.configured_video_max_batch_size_kb(), Some(17));
+        assert_eq!(restarted.effective_video_max_batch_size_kb(), 64);
+        assert!(restarted.video_batch_size_fallback());
+
+        for invalid in [
+            json!({"ok":true,"found":true,"version":7,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":65}}),
+            json!({"ok":true,"found":true,"version":7,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":-1}}),
+            json!({"ok":true,"found":true,"version":7,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}}),
+        ] {
+            assert_eq!(
+                parse_document(&invalid).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+    }
+
+    #[test]
     fn capture_selection_survives_restart_and_reports_the_resolved_provider() {
         let mut bootstrap = bootstrap_with_capture_output("bootstrap-display-id");
         bootstrap
@@ -1965,37 +2134,31 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":6,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+            "ok":true,"found":true,"version":7,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
         });
         let target = NetworkTarget {
             port: 48_000,
             address_family: None,
             bind_address: None,
         };
+        let expected = UpdateExpectation {
+            revision: 3,
+            hostname: "New Host",
+            target: &target,
+            output_name: None,
+            stream_audio: true,
+            capture: CaptureMode::Auto,
+            video_max_batch_size_kb: None,
+        };
+        assert_eq!(update_result(&success, &expected).unwrap().revision, 4);
         assert_eq!(
             update_result(
                 &success,
-                3,
-                "New Host",
-                &target,
-                None,
-                true,
-                CaptureMode::Auto
-            )
-            .unwrap()
-            .revision,
-            4
-        );
-        assert_eq!(
-            update_result(
-                &success,
-                2,
-                "New Host",
-                &target,
-                None,
-                true,
-                CaptureMode::Auto
+                &UpdateExpectation {
+                    revision: 2,
+                    ..expected
+                }
             )
             .unwrap_err()
             .code,
@@ -2004,12 +2167,10 @@ mod tests {
         assert_eq!(
             update_result(
                 &success,
-                3,
-                "Other Host",
-                &target,
-                None,
-                true,
-                CaptureMode::Auto
+                &UpdateExpectation {
+                    hostname: "Other Host",
+                    ..expected
+                }
             )
             .unwrap_err()
             .code,
@@ -2018,15 +2179,13 @@ mod tests {
         assert_eq!(
             update_result(
                 &success,
-                3,
-                "New Host",
-                &NetworkTarget {
-                    port: 48_001,
-                    ..target.clone()
-                },
-                None,
-                true,
-                CaptureMode::Auto,
+                &UpdateExpectation {
+                    target: &NetworkTarget {
+                        port: 48_001,
+                        ..target.clone()
+                    },
+                    ..expected
+                }
             )
             .unwrap_err()
             .code,
@@ -2034,18 +2193,17 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":6,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+            "ok":true,"found":true,"version":7,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
         });
         assert_eq!(
             update_result(
                 &reset_to_machine_name,
-                4,
-                "",
-                &target,
-                None,
-                true,
-                CaptureMode::Auto
+                &UpdateExpectation {
+                    revision: 4,
+                    hostname: "",
+                    ..expected
+                }
             )
             .unwrap()
             .hostname
@@ -2054,18 +2212,17 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":6,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true,"capture":"auto"}
+            "ok":true,"found":true,"version":7,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
         });
         assert_eq!(
             update_result(
                 &selected,
-                8,
-                "New Host",
-                &target,
-                Some("selected-display-id"),
-                true,
-                CaptureMode::Auto,
+                &UpdateExpectation {
+                    revision: 8,
+                    output_name: Some("selected-display-id"),
+                    ..expected
+                }
             )
             .unwrap()
             .output_name
@@ -2075,12 +2232,10 @@ mod tests {
         assert_eq!(
             update_result(
                 &selected,
-                8,
-                "New Host",
-                &target,
-                None,
-                true,
-                CaptureMode::Auto
+                &UpdateExpectation {
+                    revision: 8,
+                    ..expected
+                }
             )
             .unwrap_err()
             .code,
@@ -2123,6 +2278,9 @@ mod tests {
             "configured_bind_address":null,
             "configured_output_name":null,
             "configured_capture":"auto",
+            "configured_video_max_batch_size_kb":null,
+            "effective_video_max_batch_size_kb":64,
+            "video_batch_size_fallback":false,
             "stream_audio":true,
             "effective_output_name":null,
                 "capture_provider":null,
@@ -2205,15 +2363,16 @@ mod tests {
                 output_name: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
+                video_max_batch_size_kb: None,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":6,
+                "version":7,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
             })),
         );
 
@@ -2260,12 +2419,13 @@ mod tests {
                 output_name: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
+                video_max_batch_size_kb: None,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":6,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+                "ok":true,"found":true,"version":7,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
             })),
         );
 
@@ -2428,12 +2588,13 @@ mod tests {
                 output_name: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
+                video_max_batch_size_kb: None,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":6,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto"}
+                "ok":true,"found":true,"version":7,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null}
             })),
         );
 
@@ -2474,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_product_update_payload_keeps_nulls_and_capture_mode_exact() {
+    fn v7_product_update_payload_keeps_nullable_values_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -2486,8 +2647,9 @@ mod tests {
             None,
             false,
             CaptureMode::Auto,
+            None,
         );
-        assert_eq!(reset["version"], 6);
+        assert_eq!(reset["version"], 7);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
@@ -2504,12 +2666,14 @@ mod tests {
             Some("stable-display-id"),
             true,
             CaptureMode::Wgcc,
+            Some(32),
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
         assert_eq!(explicit_blank["values"]["bind_address"], "");
         assert_eq!(explicit_blank["values"]["output_name"], "stable-display-id");
         assert_eq!(explicit_blank["values"]["stream_audio"], true);
         assert_eq!(explicit_blank["values"]["capture"], "wgcc");
+        assert_eq!(explicit_blank["values"]["video_max_batch_size_kb"], 32);
     }
 
     #[test]
@@ -2543,6 +2707,73 @@ mod tests {
     }
 
     #[test]
+    fn video_batch_update_omission_preserves_and_null_resets_to_default() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":7,"revision":3,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32}
+            }))
+            .unwrap(),
+        );
+
+        for (request, revision, update, expected_raw, reply_revision) in [
+            (20, 3, FieldUpdate::Omitted, json!(32), 4),
+            (21, 4, FieldUpdate::Null, Value::Null, 5),
+        ] {
+            product
+                .enqueue(
+                    request,
+                    5_000,
+                    AdminAction::Update {
+                        hostname: "Host".into(),
+                        port: 47_989,
+                        address_family: FieldUpdate::Omitted,
+                        bind_address: FieldUpdate::Omitted,
+                        output_name: FieldUpdate::Omitted,
+                        stream_audio: FieldUpdate::Omitted,
+                        capture: FieldUpdate::Omitted,
+                        video_max_batch_size_kb: update,
+                        expected_revision: revision,
+                        require_listener_apply: false,
+                    },
+                )
+                .unwrap();
+            product.start_next();
+            let pending = product.pending.take().expect("product update request");
+            assert_eq!(pending.payload["version"], 7);
+            assert_eq!(
+                pending.payload["values"]["video_max_batch_size_kb"],
+                expected_raw
+            );
+            let persisted_value = if expected_raw.is_null() {
+                Value::Null
+            } else {
+                expected_raw.clone()
+            };
+            product.finish_call(
+                pending.purpose,
+                CallOutcome::Payload(json!({
+                    "ok":true,"found":true,"version":7,"revision":reply_revision,
+                    "values":{"hostname":"Host","port":47989,"address_family":null,
+                        "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                        "video_max_batch_size_kb":persisted_value}
+                })),
+            );
+        }
+
+        assert_eq!(product.configured_video_max_batch_size_kb(), None);
+        assert_eq!(product.effective_video_max_batch_size_kb(), 64);
+        assert!(!product.video_batch_size_fallback());
+        assert_eq!(
+            product.settings_payload()["configured_video_max_batch_size_kb"],
+            Value::Null
+        );
+    }
+
+    #[test]
     fn stream_audio_admin_update_writes_v6_and_rejects_null() {
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         product.apply_document(
@@ -2565,6 +2796,7 @@ mod tests {
                     output_name: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
+                    video_max_batch_size_kb: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -2572,7 +2804,7 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 6);
+        assert_eq!(payload["version"], 7);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
         assert_eq!(payload["values"]["capture"], "auto");
@@ -2598,6 +2830,7 @@ mod tests {
                     output_name: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Null,
                     capture: FieldUpdate::Omitted,
+                    video_max_batch_size_kb: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -2634,6 +2867,7 @@ mod tests {
                     output_name: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Value(CaptureMode::Wgcc),
+                    video_max_batch_size_kb: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: false,
                 },
@@ -2641,15 +2875,16 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 6);
+        assert_eq!(pending.payload["version"], 7);
         assert_eq!(pending.payload["values"]["capture"], "wgcc");
 
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":6,"revision":5,
+                "ok":true,"found":true,"version":7,"revision":5,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
-                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"wgcc"}
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"wgcc",
+                    "video_max_batch_size_kb":null}
             })),
         );
         assert_eq!(product.configured_capture(), CaptureMode::Wgcc);

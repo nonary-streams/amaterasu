@@ -83,6 +83,52 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
 }
 
 #[test]
+fn selected_video_batch_limit_reaches_media_transport_open() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video"] = json!({"max_batch_size_kb":32});
+
+    let prepared = host.response(1, request);
+
+    assert_eq!(prepared["state"], "prepared");
+    let media_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service())
+        .expect("media transport open request");
+    assert_eq!(media_open.payload["video"]["max_batch_size_kb"], 32);
+}
+
+#[test]
+fn media_readback_accepts_normalized_batch_values_and_checks_fallback_metadata() {
+    for (configured, effective, fallback) in [(0, 64, false), (17, 64, true)] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["video"] = json!({"max_batch_size_kb":configured});
+
+        let prepared = host.response(1, request);
+
+        assert_eq!(prepared["state"], "prepared");
+        assert_eq!(prepared["media_ready"], true);
+        let media_open = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == Resource::Media.service())
+            .expect("media transport open request");
+        assert_eq!(media_open.payload["video"]["max_batch_size_kb"], configured);
+        let record = host
+            .pipeline
+            .records
+            .get(&prepared["session"].as_u64().unwrap())
+            .expect("prepared session record");
+        assert_eq!(record.config.video.effective().max_batch_size_kb, effective);
+        assert_eq!(record.config.video.batch_size_fallback(), fallback);
+    }
+}
+
+#[test]
 fn constant_rate_mode_reaches_video_open_and_uses_a_distinct_capture_lease() {
     let mut constant_host = Harness::new();
     let prepared = constant_host.response(1, prepare());

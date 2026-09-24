@@ -279,6 +279,7 @@ pub struct Profile {
     pub max_reference_frames: u32,
     pub packet_size: usize,
     pub fec_percentage: u8,
+    pub video_max_batch_size_kb: u8,
     pub min_parity_shards: u8,
     pub max_fec_blocks: u8,
     pub packet_ms: u32,
@@ -297,6 +298,7 @@ impl Default for Profile {
             max_reference_frames: 1,
             packet_size: 1024,
             fec_percentage: 20,
+            video_max_batch_size_kb: 64,
             min_parity_shards: 2,
             max_fec_blocks: 1,
             packet_ms: 10,
@@ -308,6 +310,13 @@ impl Default for Profile {
     }
 }
 impl Profile {
+    pub fn effective_video_max_batch_size_kb(&self) -> u8 {
+        match self.video_max_batch_size_kb {
+            16 | 32 | 64 => self.video_max_batch_size_kb,
+            _ => 64,
+        }
+    }
+
     pub fn matches(&self, announce: &Announce) -> bool {
         self.matches_video(announce)
             && self.matches_audio(announce)
@@ -350,6 +359,7 @@ impl Profile {
             || !(1..=120).contains(&self.fps)
             || !(100..=100000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 1
+            || self.video_max_batch_size_kb > 64
             || !matches!(self.packet_ms, 5 | 10)
             || !(6000..=256000).contains(&self.audio_bitrate)
         {
@@ -458,6 +468,7 @@ impl Open {
                 "fec_percentage": self.profile.fec_percentage,
                 "min_parity_shards": self.profile.min_parity_shards,
                 "max_fec_blocks": self.profile.max_fec_blocks,
+                "max_batch_size_kb": self.profile.effective_video_max_batch_size_kb(),
             },
             "audio": {
                 "packet_ms": self.profile.packet_ms,
@@ -805,6 +816,20 @@ mod tests {
         assert!(payload.get("audio_port").is_none());
         assert_eq!(payload["video_bind"], "127.0.0.1:47998");
         assert_eq!(payload["audio_bind"], "127.0.0.1:48000");
+    }
+
+    #[test]
+    fn configured_video_batch_size_reaches_stream_session_as_effective_video_setting() {
+        for (requested, effective) in [(0, 64), (16, 16), (32, 32), (64, 64), (17, 64)] {
+            let mut request = open();
+            request.profile.video_max_batch_size_kb = requested;
+            let payload = request.prepare("operation", None);
+            assert_eq!(payload["video"]["max_batch_size_kb"], effective);
+        }
+
+        let mut invalid = open();
+        invalid.profile.video_max_batch_size_kb = 65;
+        assert_eq!(invalid.validate(false), Err("invalid_profile"));
     }
 
     #[test]

@@ -182,6 +182,7 @@ impl Controller {
                             "max_reference_frames": config.profile.max_reference_frames,
                             "packet_size": config.profile.packet_size,
                             "fec_percentage": record.effective_fec_percentage,
+                            "video_max_batch_size_kb": record.global_video_max_batch_size_kb,
                             "min_parity_shards": config.profile.min_parity_shards,
                             "max_fec_blocks": config.profile.max_fec_blocks,
                             "packet_ms": config.profile.packet_ms,

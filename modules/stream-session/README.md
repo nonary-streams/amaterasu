@@ -151,3 +151,8 @@ validation before capture allocation. Video does not activate unless the encoder
 confirms the selected constraint. On Windows the encoder uses Microsoft's
 [`CODECAPI_AVEncVideoMaxNumRefFrame`](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avencvideomaxnumrefframe)
 property. Hardware and emitted-bitstream qualification remain outstanding.
+
+The nested video configuration also carries `max_batch_size_kb` (default 64,
+range 0..=64) to the media transport. Values 0 and unsupported in-range values
+normalize to an effective 64; 16, 32, and 64 select the software per-frame send
+allowance. This does not enable Windows USO or Linux GSO segmentation offload.

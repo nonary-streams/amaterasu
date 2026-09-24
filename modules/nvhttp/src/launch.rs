@@ -248,6 +248,7 @@ pub struct Controller {
     configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
+    global_video_max_batch_size_kb: u8,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -268,6 +269,7 @@ impl Controller {
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
+            global_video_max_batch_size_kb: 64,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -291,6 +293,13 @@ impl Controller {
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.global_stream_audio = stream_audio;
+    }
+
+    pub fn set_global_video_max_batch_size_kb(&mut self, value: u8) {
+        self.global_video_max_batch_size_kb = match value {
+            16 | 32 | 64 => value,
+            _ => 64,
+        };
     }
 
     pub fn busy(&self) -> bool {
@@ -321,6 +330,7 @@ impl Controller {
         }
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
+        let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -374,6 +384,7 @@ impl Controller {
             connect_data,
             global_fec_percentage,
             global_stream_audio,
+            global_video_max_batch_size_kb,
             capture_output,
             capture_provider,
             constant_rate,

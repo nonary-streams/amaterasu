@@ -160,6 +160,11 @@ impl Router {
         self.launches.set_global_stream_audio(stream_audio);
     }
 
+    pub fn set_global_video_max_batch_size_kb(&mut self, max_batch_size_kb: u8) {
+        self.launches
+            .set_global_video_max_batch_size_kb(max_batch_size_kb);
+    }
+
     pub fn set_capture_mode(&mut self, capture: crate::launch::CaptureMode) {
         self.launches.set_capture_mode(capture);
     }

@@ -454,10 +454,14 @@ impl Broker {
             }
             "amaterasu.media-transport/1" => {
                 let request = &allocation.request;
+                let video: crate::model::VideoWire =
+                    serde_json::from_value(request["video"].clone())
+                        .expect("video configuration in media open request");
                 let mut metadata = json!({"ok":true,"stream":id,"peer_ip":request["peer_ip"],
                     "video_port":request["video_port"],"audio_port":request["audio_port"],
                     "video_local":"127.0.0.1:50001","audio_local":"127.0.0.1:50002",
-                    "video":request["video"],"audio":request["audio"],
+                    "video":video.effective(),"video_batch_size_fallback":video.batch_size_fallback(),
+                    "audio":request["audio"],
                     "stream_audio":request["stream_audio"],
                     "video_encrypted":request["encryption"]["video"],
                     "audio_encrypted":request["encryption"]["audio"],

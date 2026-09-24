@@ -49,6 +49,11 @@ pub struct VideoWire {
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
     pub max_fec_blocks: u8,
+    #[serde(default = "default_video_max_batch_size_kb")]
+    pub max_batch_size_kb: u8,
+}
+fn default_video_max_batch_size_kb() -> u8 {
+    64
 }
 impl Default for VideoWire {
     fn default() -> Self {
@@ -57,7 +62,22 @@ impl Default for VideoWire {
             fec_percentage: 20,
             min_parity_shards: 2,
             max_fec_blocks: 1,
+            max_batch_size_kb: default_video_max_batch_size_kb(),
         }
+    }
+}
+impl VideoWire {
+    pub fn effective(&self) -> Self {
+        let mut effective = self.clone();
+        effective.max_batch_size_kb = match self.max_batch_size_kb {
+            16 | 32 | 64 => self.max_batch_size_kb,
+            _ => 64,
+        };
+        effective
+    }
+
+    pub fn batch_size_fallback(&self) -> bool {
+        self.max_batch_size_kb != 0 && !matches!(self.max_batch_size_kb, 16 | 32 | 64)
     }
 }
 
@@ -199,6 +219,9 @@ impl AudioWire {
 
 impl VideoWire {
     fn validate(&self) -> Result<(), &'static str> {
+        if self.max_batch_size_kb > 64 {
+            return Err("invalid_video_configuration");
+        }
         amaterasu_gamestream::video::VideoPacketizer::new(
             amaterasu_gamestream::video::VideoConfig {
                 packet_size: self.packet_size,
@@ -380,6 +403,24 @@ mod tests {
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
             1
         );
+    }
+
+    #[test]
+    fn video_batch_size_defaults_and_rejects_values_above_the_reference_range() {
+        let legacy = prepare();
+        assert_eq!(legacy.video.max_batch_size_kb, 64);
+        assert!(legacy.validate(false).is_ok());
+
+        let mut selected = prepare_json();
+        selected["video"] = json!({"max_batch_size_kb":32});
+        let selected: PrepareConfig = serde_json::from_value(selected).unwrap();
+        assert_eq!(selected.video.max_batch_size_kb, 32);
+        assert!(selected.validate(false).is_ok());
+
+        let mut invalid = prepare_json();
+        invalid["video"] = json!({"max_batch_size_kb":65});
+        let invalid: PrepareConfig = serde_json::from_value(invalid).unwrap();
+        assert_eq!(invalid.validate(false), Err("invalid_video_configuration"));
     }
 
     #[test]

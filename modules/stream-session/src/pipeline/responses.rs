@@ -75,12 +75,18 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
         (!expected_discovery).then_some(false),
     )?;
     let ready = response_bool(payload, "ready", (!expected_discovery).then_some(true))?;
+    let batch_size_fallback = response_bool(
+        payload,
+        "video_batch_size_fallback",
+        (!config.video.batch_size_fallback()).then_some(false),
+    )?;
     let video_port = optional_port(&payload["video_port"])?;
     let audio_port = optional_port(&payload["audio_port"])?;
     if payload["peer_ip"] != json!(config.peer_ip)
         || payload["stream_audio"] != config.stream_audio
         || peer_discovery != expected_discovery
-        || payload["video"] != json!(config.video)
+        || payload["video"] != json!(config.video.effective())
+        || batch_size_fallback != config.video.batch_size_fallback()
         || payload["audio"]["packet_ms"] != config.audio.packet_ms
         || payload["audio"]["channels"] != 2
         || payload["audio"]["wire_payload_bytes"] != record.wire_audio_bytes

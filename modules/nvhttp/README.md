@@ -90,10 +90,10 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. Product document versions 1 through 6
+active_http_port/active_https_port values. Product document versions 1 through 7
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
-address policy, v4 adds the global capture output, v5 adds audio enablement, and v6
-adds the global capture mode.
+address policy, v4 adds the global capture output, v5 adds audio enablement, v6
+adds the global capture mode, and v7 adds the global video batch allowance.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -187,6 +187,22 @@ automatic WGC choice can depend on virtual-display and game context; Amaterasu d
 not yet model that policy. Per-client and per-application capture overrides are
 also not implemented. A direct RTSP open remains explicit about its provider and
 constant-rate flag.
+
+## Global video batch allowance
+
+Product settings v7 accepts nullable `video_max_batch_size_kb` values from 0
+through 64. Omission preserves the configured value and `null` resets it to the
+default. Settings reads return `configured_video_max_batch_size_kb`,
+`effective_video_max_batch_size_kb`, and `video_batch_size_fallback`. Zero selects
+the automatic 64 KiB default. Effective values 16, 32, and 64 pass through; other
+accepted in-range values are preserved in storage, use 64 at runtime, and set the
+fallback indicator.
+
+NVHTTP snapshots the effective value for each launch and forwards it through RTSP
+and stream-session to the media transport. It changes the per-frame software send
+allowance while preserving the aggregate 64-send fairness bound. Platform UDP
+segmentation offload (USO/GSO) is not implemented yet, so this is not full transport
+batching parity.
 
 ## Wire routes
 

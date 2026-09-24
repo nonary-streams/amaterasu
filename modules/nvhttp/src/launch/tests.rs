@@ -499,6 +499,32 @@ fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
 }
 
 #[test]
+fn global_video_batch_size_reaches_rtsp_open_and_is_snapshotted_at_admission() {
+    for (configured, later_value) in [(16, 32), (32, 64), (64, 16)] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_video_max_batch_size_kb(configured);
+        let mut broker = Broker::default();
+
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        controller.set_global_video_max_batch_size_kb(later_value);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["profile"]["video_max_batch_size_kb"], configured);
+    }
+}
+
+#[test]
 fn global_capture_modes_reach_rtsp_open_and_are_snapshotted_at_admission() {
     for (mode, bootstrap_provider, expected_provider, expected_constant_rate) in [
         (

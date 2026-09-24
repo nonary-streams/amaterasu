@@ -25,6 +25,9 @@ per-open selection. The profile supplies dimensions, frame rate, bitrate in kbps
 reference-frame limit, video packet/FEC settings, Opus packet duration/bitrate and
 encryption policy. Unknown fields are rejected; network data cannot override these
 authorized settings.
+NVHTTP also supplies `profile.video_max_batch_size_kb` for each launch; direct
+RTSP opens default it to 64. The effective 16/32/64 value is copied to the nested
+`video.max_batch_size_kb` stream-session setting.
 The ticket peer and selected listener must use the same address family; an
 unreachable ticket is rejected before media allocation.
 
