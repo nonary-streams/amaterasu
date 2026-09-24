@@ -19,6 +19,19 @@ For example, on a Unix host:
 {"action":"list","offset":0,"limit":16}
 ```
 
+Launch policy also accepts `auto_detach` (default `true`), `wait_all` (default
+`true`), `exit_timeout_seconds` (default 10, maximum 300), and an ordered
+`detached` list of up to 16 command strings. `wait_all` keeps the app active while
+any process in its contained group remains after the root exits. `auto_detach`
+keeps a successful root that exits within five seconds as a status-driven app,
+after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
+Detached command strings use platform argv quoting, run best-effort before the
+primary executable, and are not attached to its process group or termination
+lifecycle. They inherit the app's explicit environment and working directory.
+They do not support shell expansion, per-command environment overrides, output
+redirection, or elevation; a detached-command spawn failure does not fail the
+main launch.
+
 Launch may also contain up to eight ordered preparation steps:
 
 ```json
@@ -49,8 +62,9 @@ Use an absolute native executable path appropriate to the host. `args` and
 `environment` default to empty; `cwd` defaults to the host working directory.
 The environment is cleared before applying the supplied map; host secrets and
 PATH are not inherited. Supply any platform/application-required variables
-explicitly. Stdin, stdout, and stderr are null handles. There is no command-string
-splitting, implicit shell, output capture, elevation, or executable allowlist.
+explicitly. Stdin, stdout, and stderr are null handles. Main executables and
+preparation commands use structured argv with no command-string splitting or
+implicit shell. There is no output capture, elevation, or executable allowlist.
 `.bat` and `.cmd` executable extensions are rejected case-insensitively on every
 platform because Windows may otherwise invoke a shell implicitly. A trusted
 caller can explicitly choose an interpreter and pass arguments to it. Arguments
@@ -87,9 +101,10 @@ terminate another caller's processes.
 An `operation_id` is unique per caller during the module lifetime. Retrying the
 same launch specification returns the original process's current state, including
 a retained failure or exit, without spawning again. Changing its executable,
-argument array, environment map, cwd, or preparation steps yields
-`operation_conflict`. Defaulted empty args/environment/preparation and absent/null
-cwd are normalized before comparison; paths are not canonicalized. Retries never
+argument array, environment map, cwd, detached commands, or preparation steps
+yields `operation_conflict`. Defaulted empty args/environment/preparation/detached
+list, policy defaults, and absent/null cwd are normalized before comparison;
+paths are not canonicalized. Retries never
 rerun completed preparation or undo, and repeated termination of a terminal
 record is inert. Terminal and cleanup-failed records are retained and cannot be
 deleted, so capacity exhaustion cannot silently evict idempotency records. Use a
@@ -103,6 +118,10 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 - Records: 128 total and 32 per caller, including failed and exited launches.
 - Operation ID: 1–128 ASCII graphic bytes (no spaces or controls).
 - Executable and optional cwd: absolute paths, 1–1,024 bytes, no NUL.
+- `exit_timeout_seconds`: integer from 0 through 300; `wait_all` and
+  `auto_detach` are booleans.
+- `detached`: up to 16 command strings, each at most 2,048 printable bytes, with
+  up to 64 parsed arguments and 8,192 argument bytes combined.
 - Args: at most 64, each at most 1,024 bytes, 8,192 bytes combined, no NUL.
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
@@ -119,11 +138,16 @@ Errors use `{"ok":false,"code":"..."}`. Codes are `invalid_caller`,
 `process_not_found`. OS spawning errors create retained `launch_failed` records.
 
 On Unix, each launch creates a new process group before exec. Termination sends
-SIGTERM to the group, allows 200 ms for cooperative cleanup, then sends SIGKILL.
-The root is deliberately left unreaped (`waitid(WNOWAIT)`) until the final group
-signal, so its PID/PGID cannot be recycled into an unrelated group. Natural root
-exit starts the same cleanup on the next poll; launcher handoff is not supported.
-The record remains `running` during this brief cleanup and reports the root's
+SIGTERM to the group and waits up to `exit_timeout_seconds` for cooperative
+cleanup before sending SIGKILL. A zero timeout skips SIGTERM. Natural root exit
+with `wait_all: true` remains running while a non-zombie group member exists;
+with `wait_all: false`, the remaining group receives the same graceful-then-force
+cleanup. Linux and macOS inspect group members while excluding the deliberately
+unreaped root and other zombies. The root is deliberately left unreaped
+(`waitid(WNOWAIT)`) until the final group signal, so its PID/PGID cannot be
+recycled into an unrelated group. Natural root exit starts cleanup on the next
+poll when the group is done or `wait_all` is disabled. The record remains
+`running` during graceful cleanup and reports the root's
 exit status afterward. The host must preserve exclusive wait ownership: it must
 not reap these children elsewhere, ignore SIGCHLD, or enable SA_NOCLDWAIT.
 A wait ownership error stops group signaling. Processes that deliberately leave
@@ -136,10 +160,13 @@ before their primary thread is resumed. The job forbids breakaway and has
 KILL_ON_JOB_CLOSE; descendants remain owned even after root exit. Failure to
 assign or resume fails the launch closed. The standard library still constructs
 the command line and environment; Toolhelp locates the suspended primary thread.
-Windows has no universal graceful-stop primitive for arbitrary native GUI and
-console programs, so after the 200 ms interval the job is forcibly terminated;
-application-specific cooperative stop and console-event delivery remain parity
-work. Job handles, never reopened numeric PIDs, are used for termination. Shutdown
+`wait_all` uses job accounting, so a root exit with active descendants remains
+running until the job becomes empty. Graceful shutdown enumerates top-level
+windows in the job and asynchronously sends `WM_CLOSE`; when no window accepts
+that request, the job is force-terminated immediately. Otherwise the job is
+forcibly terminated when `exit_timeout_seconds` elapses if processes remain.
+Console-event delivery and app-specific shutdown remain unsupported. Job handles,
+never reopened numeric PIDs, are used for termination. Shutdown
 also waits for job accounting to report zero active processes before releasing
 ownership; timeout retains the job for retry.
 
@@ -148,8 +175,8 @@ for a running preparation/undo command. They perform at most a bounded spawn,
 observation, or containment action and retain child ownership between ticks.
 Containment errors and the bounded reap deadline become `cleanup_failed` instead
 of discarding the child; an explicit terminate retries. Manager shutdown requests
-all stops and advances owed undo against one shared 200 ms grace plus a 2-second
-reap deadline. If a long lifecycle command outlasts that deadline, shutdown
+all stops and advances owed undo against one shared deadline based on the longest
+configured application exit timeout plus a 2-second reap deadline. If a long lifecycle command outlasts that deadline, shutdown
 returns an error while the live manager still retains ownership for retry. Drop
 first attempts normal cleanup, then cancels remaining lifecycle commands and
 makes a final bounded containment attempt. Drop cannot report failure, and
@@ -164,8 +191,9 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Its detached launchers, desktop pseudo-apps, URI launch, output logging, and
-launcher-specific behavior are unimplemented parity work.
+Detached launchers are a bounded argv-only subset: environment expansion,
+output handling, and elevation remain parity gaps. Desktop pseudo-apps, URI
+launch, and launcher-specific behavior also remain unimplemented.
 In particular, this module's omitted cwd inherits the host cwd rather than using
 the executable directory.
 

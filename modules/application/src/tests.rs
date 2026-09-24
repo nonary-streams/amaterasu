@@ -20,19 +20,31 @@ fn status(manager: &mut ProcessManager, caller: &str, id: u64) -> Value {
 #[test]
 #[ignore = "subprocess entry point invoked by process lifecycle tests"]
 fn controlled_child() {
-    match std::env::var("AMATERASU_TEST_CHILD").as_deref() {
-        Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
-        Ok("exit") => {
+    let mode = if std::env::args().any(|argument| argument == "--detached-child") {
+        "detached-marker".into()
+    } else {
+        std::env::var("AMATERASU_TEST_CHILD").unwrap_or_default()
+    };
+    match mode.as_str() {
+        "sleep" => std::thread::sleep(Duration::from_secs(30)),
+        "exit" => {
             if let Ok(marker) = std::env::var("AMATERASU_TEST_MARKER") {
                 std::fs::write(marker, b"exit").unwrap();
             }
         }
-        Ok("exit-failure") => std::process::exit(7),
-        Ok("tree") | Ok("tree_exit") | Ok("branch") | Ok("leaf") => tree_child(),
-        Ok("trace") | Ok("trace_fail") | Ok("trace_sleep") | Ok("trace_fail_once") => trace_child(),
+        "exit-failure" => std::process::exit(7),
+        "detached-marker" => {
+            std::thread::sleep(Duration::from_millis(100));
+            let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
+            std::fs::write(marker, b"detached").unwrap();
+        }
+        "tree" | "tree_exit" | "branch" | "leaf" => tree_child(),
+        "trace" | "trace_fail" | "trace_sleep" | "trace_fail_once" => trace_child(),
         #[cfg(unix)]
-        Ok("graceful") => graceful_child(),
-        Ok("cwd") => {
+        "graceful" => graceful_child(),
+        #[cfg(windows)]
+        "window-graceful" => window_graceful_child(),
+        "cwd" => {
             let actual = std::env::current_dir().unwrap().canonicalize().unwrap();
             let expected = std::path::PathBuf::from(std::env::var("AMATERASU_TEST_CWD").unwrap())
                 .canonicalize()
@@ -221,6 +233,250 @@ fn auto_detach_does_not_retain_a_failed_launcher() {
     let exited = wait_for_state(&mut manager, "alice", id, "exited");
     assert_eq!(exited["process"]["success"], false);
     manager.shutdown().unwrap();
+}
+
+fn detached_command_for_current_test() -> String {
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    let executable = format!("\"{executable}\"");
+    #[cfg(not(windows))]
+    let executable = format!("'{}'", executable.replace('\'', "'\\''"));
+    format!("{executable} --exact tests::controlled_child --ignored -- --detached-child")
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn graceful_window_procedure(
+    window: windows_sys::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DestroyWindow, PostQuitMessage, WM_CLOSE, WM_DESTROY,
+    };
+
+    match message {
+        WM_CLOSE => {
+            if let (Ok(marker), Ok(ready)) = (
+                std::env::var("AMATERASU_TEST_MARKER"),
+                std::env::var("AMATERASU_TEST_READY"),
+            ) {
+                let _ = std::fs::write(marker, b"closed");
+                let _ = std::fs::write(ready, b"closed");
+            }
+            // SAFETY: the window is the live HWND delivered by its message loop.
+            unsafe { DestroyWindow(window) };
+            0
+        }
+        WM_DESTROY => {
+            // SAFETY: posting quit from the window's owning thread ends its loop.
+            unsafe { PostQuitMessage(0) };
+            0
+        }
+        _ => {
+            // SAFETY: unhandled messages retain the system default window behavior.
+            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn window_graceful_child() {
+    use std::ptr;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CW_USEDEFAULT, CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW,
+        TranslateMessage, UnregisterClassW, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    };
+
+    let class_name = "AmaterasuGracefulTestWindow\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    assert!(!instance.is_null());
+    let window_class = WNDCLASSW {
+        lpfnWndProc: Some(graceful_window_procedure),
+        hInstance: instance,
+        lpszClassName: class_name.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: the class and callback remain alive until the message loop exits.
+    assert_ne!(unsafe { RegisterClassW(&window_class) }, 0);
+    // SAFETY: class name is NUL terminated, instance is valid, and no parent or
+    // creation data is needed for this isolated test window.
+    let window = unsafe {
+        CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            100,
+            100,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        )
+    };
+    assert!(!window.is_null());
+    let ready = std::env::var("AMATERASU_TEST_READY").unwrap();
+    std::fs::write(ready, b"ready").unwrap();
+
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: `message` is writable and this thread owns the window queue.
+        let status = unsafe { GetMessageW(&mut message, ptr::null_mut(), 0, 0) };
+        assert!(status >= 0);
+        if status == 0 {
+            break;
+        }
+        // SAFETY: `message` was populated by GetMessageW above.
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    // SAFETY: all windows of this class were destroyed before the queue quit.
+    unsafe { UnregisterClassW(class_name.as_ptr(), instance) };
+}
+
+#[test]
+fn detached_commands_outlive_the_primary_application_and_are_reaped() {
+    let directory = test_directory("detached-commands");
+    let marker = directory.join("detached-finished");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("detached-commands", "sleep");
+    request["detached"] = json!([detached_command_for_current_test()]);
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+
+    let started = manager.handle("alice", request);
+    assert_eq!(started["process"]["state"], "running", "{started}");
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let stopped = manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    assert_eq!(stopped["process"]["state"], "stopping", "{stopped}");
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", id, "cancelled")["process"]["state"],
+        "cancelled"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "detached command was killed with its app"
+        );
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    manager.reap_exited().unwrap();
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wait_all_keeps_the_app_running_for_live_process_group_members() {
+    let directory = test_directory("wait-all");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("wait-all", "tree_exit");
+    request["environment"]["AMATERASU_TEST_TREE"] = json!(directory);
+    request["wait_all"] = json!(true);
+    request["exit_timeout_seconds"] = json!(0);
+    request["auto_detach"] = json!(false);
+
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !directory.join("leaf").exists() {
+        assert!(Instant::now() < deadline, "process group did not start");
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    manager.reap_exited().unwrap();
+    let retained = status(&mut manager, "alice", id);
+    assert_eq!(retained["process"]["state"], "running", "{retained}");
+
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", id, "cancelled")["process"]["state"],
+        "cancelled"
+    );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn per_app_exit_timeout_controls_the_graceful_process_group_window() {
+    let directory = test_directory("exit-timeout");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("exit-timeout", "tree");
+    request["environment"]["AMATERASU_TEST_TREE"] = json!(directory);
+    request["wait_all"] = json!(false);
+    request["exit_timeout_seconds"] = json!(1);
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !directory.join("leaf").exists() {
+        assert!(Instant::now() < deadline, "process group did not start");
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let termination_started = Instant::now();
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    std::thread::sleep(Duration::from_millis(100));
+    manager.reap_exited().unwrap();
+    assert_eq!(
+        status(&mut manager, "alice", id)["process"]["state"],
+        "stopping"
+    );
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", id, "cancelled")["process"]["state"],
+        "cancelled"
+    );
+    assert!(termination_started.elapsed() >= Duration::from_secs(1));
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn per_app_exit_timeout_requests_wm_close_before_terminating_the_job() {
+    let directory = test_directory("windows-exit-timeout");
+    let ready = directory.join("window-ready");
+    let marker = directory.join("window-closed");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("windows-exit-timeout", "window-graceful");
+    request["environment"]["AMATERASU_TEST_READY"] = json!(ready);
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["exit_timeout_seconds"] = json!(5);
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "window child did not become ready"
+        );
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let stopping = manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    assert_eq!(stopping["process"]["state"], "stopping", "{stopping}");
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", id, "cancelled")["process"]["state"],
+        "cancelled"
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), b"closed");
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -640,6 +896,10 @@ fn termination_and_natural_root_exit_stop_children_and_grandchildren() {
         let mut manager = ProcessManager::default();
         let mut request = launch(mode, mode);
         request["environment"]["AMATERASU_TEST_TREE"] = json!(directory);
+        request["exit_timeout_seconds"] = json!(0);
+        if mode == "tree_exit" {
+            request["wait_all"] = json!(false);
+        }
         let launched = manager.handle("alice", request);
         assert_eq!(launched["process"]["state"], "running", "{launched}");
         let id = launched["process"]["process_id"].as_u64().unwrap();

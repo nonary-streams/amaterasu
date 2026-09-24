@@ -240,7 +240,7 @@ impl CommandTask {
         }
         if self.stop_requested_at.is_none() {
             match self.child.request_stop() {
-                Ok(()) => self.stop_requested_at = Some(now),
+                Ok(_) => self.stop_requested_at = Some(now),
                 Err(error) => {
                     return CommandPoll::Blocked(CommandFailure::containment(&error));
                 }

@@ -1,11 +1,17 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, SendNotifyMessageW, WM_CLOSE,
+};
 
 pub(crate) struct ContainedChild {
     child: Child,
@@ -74,10 +80,48 @@ impl ContainedChild {
     pub fn successful_exit(&mut self) -> io::Result<Option<bool>> {
         Ok(self.child.try_wait()?.map(|status| status.success()))
     }
-    // Windows has no universal graceful termination primitive for arbitrary GUI
-    // and console programs. Retain a grace interval, then terminate the owned job.
-    pub fn request_stop(&mut self) -> io::Result<()> {
-        Ok(())
+    pub fn group_running(&self) -> io::Result<bool> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the owned job remains live and the writable buffer and size
+        // match JobObjectBasicAccountingInformation.
+        if unsafe {
+            QueryInformationJobObject(
+                self.job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(accounting.ActiveProcesses != 0)
+    }
+
+    // Windows has no universal graceful-stop primitive for console processes.
+    // Ask every top-level window in the job to close, matching the sibling's
+    // GUI shutdown behavior; callers force the owned job if none accepts it.
+    pub fn request_stop(&mut self) -> io::Result<bool> {
+        let Ok(process_ids) = process_ids_in_job(self.job.as_raw_handle()) else {
+            return Ok(false);
+        };
+        if process_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut context = CloseWindowsContext {
+            process_ids: process_ids.into_iter().collect(),
+            requested_exit: false,
+        };
+        // SAFETY: EnumWindows calls the callback synchronously while `context`
+        // remains alive and exclusively borrowed for the duration of the call.
+        unsafe {
+            EnumWindows(
+                Some(request_group_window),
+                (&mut context as *mut CloseWindowsContext) as LPARAM,
+            );
+        }
+        Ok(context.requested_exit)
     }
     pub fn force_stop(&mut self) -> io::Result<()> {
         if !self.group_finished {
@@ -114,6 +158,92 @@ impl ContainedChild {
         }
         self.child.try_wait()
     }
+}
+
+const MAX_JOB_PROCESS_IDS: usize = 65_536;
+
+fn process_ids_in_job(job: HANDLE) -> io::Result<Vec<u32>> {
+    let header_size = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+    let max_bytes = header_size + (MAX_JOB_PROCESS_IDS - 1) * std::mem::size_of::<usize>();
+    let mut storage = vec![0usize; header_size.div_ceil(std::mem::size_of::<usize>())];
+
+    loop {
+        let buffer_size = storage.len() * std::mem::size_of::<usize>();
+        let mut required_size = 0u32;
+        // SAFETY: Vec<usize> provides aligned writable storage whose length is
+        // passed exactly; the job handle is privately owned by this child.
+        let succeeded = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                storage.as_mut_ptr().cast(),
+                buffer_size as u32,
+                &mut required_size,
+            )
+        };
+        if succeeded != 0 {
+            // SAFETY: a successful query initialized the two counts and each
+            // process ID within the supplied, aligned buffer.
+            let list = unsafe { &*(storage.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+            let capacity = (buffer_size
+                - std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList))
+                / std::mem::size_of::<usize>();
+            let count = list.NumberOfProcessIdsInList as usize;
+            if count > capacity {
+                return Err(io::Error::other("job returned an invalid process count"));
+            }
+            // SAFETY: `count` was checked against the process-ID capacity above.
+            let process_ids =
+                unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), count) };
+            return process_ids
+                .iter()
+                .map(|process_id| {
+                    u32::try_from(*process_id)
+                        .map_err(|_| io::Error::other("job returned an invalid process ID"))
+                })
+                .collect();
+        }
+
+        // SAFETY: GetLastError reads the thread-local error from the failed
+        // QueryInformationJobObject call above.
+        if unsafe { GetLastError() } != ERROR_MORE_DATA {
+            return Err(io::Error::last_os_error());
+        }
+        let required_size = (required_size as usize).max(buffer_size.saturating_mul(2));
+        if required_size > max_bytes {
+            return Err(io::Error::other("job process list exceeds its bound"));
+        }
+        storage.resize(required_size.div_ceil(std::mem::size_of::<usize>()), 0);
+    }
+}
+
+struct CloseWindowsContext {
+    process_ids: BTreeSet<u32>,
+    requested_exit: bool,
+}
+
+unsafe extern "system" fn request_group_window(
+    window: windows_sys::Win32::Foundation::HWND,
+    parameter: LPARAM,
+) -> windows_sys::core::BOOL {
+    if parameter == 0 {
+        return 1;
+    }
+    // SAFETY: `parameter` points to the live context borrowed by EnumWindows.
+    let context = unsafe { &mut *(parameter as *mut CloseWindowsContext) };
+    let mut process_id = 0u32;
+    // SAFETY: the HWND was supplied by EnumWindows and `process_id` is writable.
+    if unsafe { GetWindowThreadProcessId(window, &mut process_id) } == 0
+        || !context.process_ids.contains(&process_id)
+    {
+        return 1;
+    }
+    // SAFETY: the window handle is valid for the duration of this enumeration;
+    // SendNotifyMessageW posts WM_CLOSE asynchronously to the owning UI thread.
+    if unsafe { SendNotifyMessageW(window, WM_CLOSE, 0, 0) } != 0 {
+        context.requested_exit = true;
+    }
+    1
 }
 
 fn resume_primary_thread(child: &Child) -> io::Result<()> {

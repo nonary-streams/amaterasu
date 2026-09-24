@@ -140,6 +140,9 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
             arguments: vec!["--literal=$HOME".into()],
             working_directory: None,
             auto_detach: true,
+            wait_all: true,
+            exit_timeout_seconds: 10,
+            detached: Vec::new(),
             preparation: Vec::new(),
         };
         game.validate().unwrap();
@@ -228,6 +231,91 @@ fn auto_detach_can_be_disabled_and_persists_across_reload() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn application_lifecycle_policy_defaults_aliases_and_persists() {
+    let defaults: Entry = serde_json::from_value(json!({
+        "name": "Default lifecycle policy",
+        "launch": {"kind": "executable", "program": "/games/example/game"}
+    }))
+    .unwrap();
+    defaults.validate().unwrap();
+    let encoded_defaults = serde_json::to_value(defaults).unwrap();
+    assert_eq!(encoded_defaults["launch"]["wait_all"], true);
+    assert_eq!(encoded_defaults["launch"]["exit_timeout_seconds"], 10);
+    assert!(encoded_defaults["launch"].get("detached").is_none());
+
+    let entry: Entry = serde_json::from_value(json!({
+        "name": "Configured lifecycle policy",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/example/game",
+            "wait-all": false,
+            "exit-timeout": 0,
+            "detached": ["/games/example/overlay --quiet", "/games/example/metrics"]
+        }
+    }))
+    .unwrap();
+    entry.validate().unwrap();
+
+    let Change::Write { document, .. } = apply(
+        Operation::Create {
+            entry,
+            expected_revision: 0,
+        },
+        None,
+    )
+    .unwrap() else {
+        panic!("creating a catalog entry must persist it");
+    };
+    let persisted = serde_json::to_value(document).unwrap();
+    let reloaded: Document = serde_json::from_value(persisted).unwrap();
+    let reloaded = serde_json::to_value(reloaded.entries.values().next().unwrap()).unwrap();
+    assert_eq!(reloaded["launch"]["wait_all"], false);
+    assert_eq!(reloaded["launch"]["exit_timeout_seconds"], 0);
+    assert_eq!(
+        reloaded["launch"]["detached"],
+        json!(["/games/example/overlay --quiet", "/games/example/metrics"])
+    );
+    assert!(reloaded["launch"].get("wait-all").is_none());
+    assert!(reloaded["launch"].get("exit-timeout").is_none());
+}
+
+#[test]
+fn application_lifecycle_policy_rejects_ambiguous_or_unbounded_values() {
+    for launch in [
+        json!({
+            "kind": "executable",
+            "program": "/games/example/game",
+            "wait-all": false,
+            "wait_all": true
+        }),
+        json!({
+            "kind": "executable",
+            "program": "/games/example/game",
+            "exit-timeout": 10,
+            "exit_timeout_seconds": 20
+        }),
+        json!({
+            "kind": "executable",
+            "program": "/games/example/game",
+            "exit-timeout": 301
+        }),
+        json!({
+            "kind": "executable",
+            "program": "/games/example/game",
+            "detached": [""]
+        }),
+    ] {
+        assert!(
+            serde_json::from_value::<Entry>(json!({
+                "name": "Invalid lifecycle policy",
+                "launch": launch
+            }))
+            .map_or(true, |entry| entry.validate().is_err())
+        );
+    }
 }
 
 #[test]

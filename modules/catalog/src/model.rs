@@ -34,6 +34,12 @@ pub enum Launch {
         working_directory: Option<String>,
         #[serde(default = "default_auto_detach", alias = "auto-detach")]
         auto_detach: bool,
+        #[serde(default = "default_wait_all", alias = "wait-all")]
+        wait_all: bool,
+        #[serde(default = "default_exit_timeout_seconds", alias = "exit-timeout")]
+        exit_timeout_seconds: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        detached: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preparation: Vec<PreparationStep>,
     },
@@ -52,6 +58,18 @@ where
 fn default_auto_detach() -> bool {
     true
 }
+
+fn default_wait_all() -> bool {
+    true
+}
+
+fn default_exit_timeout_seconds() -> u64 {
+    10
+}
+
+const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
+const MAX_DETACHED_COMMANDS: usize = 16;
+const MAX_DETACHED_COMMAND_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +117,9 @@ impl Entry {
                 arguments,
                 working_directory,
                 auto_detach: _,
+                wait_all: _,
+                exit_timeout_seconds,
+                detached,
                 preparation,
             } => {
                 validate_path(program)?;
@@ -107,6 +128,16 @@ impl Entry {
                 }
                 if let Some(directory) = working_directory {
                     validate_path(directory)?;
+                }
+                if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                    || detached.len() > MAX_DETACHED_COMMANDS
+                    || detached.iter().any(|command| {
+                        command.is_empty()
+                            || command.len() > MAX_DETACHED_COMMAND_BYTES
+                            || command.chars().any(char::is_control)
+                    })
+                {
+                    return Err("invalid per-application process policy");
                 }
                 validate_preparation(preparation)?;
             }

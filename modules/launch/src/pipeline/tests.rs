@@ -44,6 +44,9 @@ struct Harness {
     catalog_preparation: Option<Value>,
     catalog_working_directory: Option<String>,
     catalog_auto_detach: Option<bool>,
+    catalog_wait_all: Option<bool>,
+    catalog_exit_timeout_seconds: Option<u64>,
+    catalog_detached: Option<Vec<String>>,
     application_preparing_statuses: usize,
     preparation_terminal: Option<&'static str>,
     application_stopping_statuses: usize,
@@ -75,6 +78,9 @@ impl Harness {
             catalog_preparation: None,
             catalog_working_directory: None,
             catalog_auto_detach: None,
+            catalog_wait_all: None,
+            catalog_exit_timeout_seconds: None,
+            catalog_detached: None,
             application_preparing_statuses: 0,
             preparation_terminal: None,
             application_stopping_statuses: 0,
@@ -320,6 +326,16 @@ impl Harness {
                         if let Some(auto_detach) = self.catalog_auto_detach {
                             reply["entry"]["launch"]["auto_detach"] = json!(auto_detach);
                         }
+                        if let Some(wait_all) = self.catalog_wait_all {
+                            reply["entry"]["launch"]["wait_all"] = json!(wait_all);
+                        }
+                        if let Some(exit_timeout_seconds) = self.catalog_exit_timeout_seconds {
+                            reply["entry"]["launch"]["exit_timeout_seconds"] =
+                                json!(exit_timeout_seconds);
+                        }
+                        if let Some(detached) = &self.catalog_detached {
+                            reply["entry"]["launch"]["detached"] = json!(detached);
+                        }
                         if action == "resolve_exported_launch" {
                             reply["catalog_owner"] = json!("management");
                         }
@@ -462,6 +478,9 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
     assert_eq!(application[0]["action"], "launch");
     assert_eq!(application[0]["cwd"], json!(command.parent().unwrap()));
     assert_eq!(application[0]["auto_detach"], true);
+    assert_eq!(application[0]["wait_all"], true);
+    assert_eq!(application[0]["exit_timeout_seconds"], 10);
+    assert_eq!(application[0]["detached"], json!([]));
     assert_eq!(
         application[0]["preparation"],
         json!([{
@@ -518,6 +537,32 @@ fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
         .expect("launch workflow sends an application launch request");
     assert_eq!(application_launch["cwd"], working_directory);
     assert_eq!(application_launch["auto_detach"], false);
+}
+
+#[test]
+fn persisted_process_lifecycle_policy_reaches_application_launch() {
+    let mut harness = Harness::new();
+    harness.catalog_wait_all = Some(false);
+    harness.catalog_exit_timeout_seconds = Some(0);
+    harness.catalog_detached = Some(vec!["/opt/tools/overlay --launch".into()]);
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", launch("process-policy"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("launch workflow sends an application launch request");
+    assert_eq!(application_launch["wait_all"], false);
+    assert_eq!(application_launch["exit_timeout_seconds"], 0);
+    assert_eq!(
+        application_launch["detached"],
+        json!(["/opt/tools/overlay --launch"])
+    );
 }
 
 #[test]

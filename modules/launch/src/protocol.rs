@@ -73,6 +73,12 @@ pub enum CatalogLaunch {
         working_directory: Option<String>,
         #[serde(default = "default_auto_detach", alias = "auto-detach")]
         auto_detach: bool,
+        #[serde(default = "default_wait_all", alias = "wait-all")]
+        wait_all: bool,
+        #[serde(default = "default_exit_timeout_seconds", alias = "exit-timeout")]
+        exit_timeout_seconds: u64,
+        #[serde(default)]
+        detached: Vec<String>,
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
@@ -111,12 +117,27 @@ fn default_auto_detach() -> bool {
     true
 }
 
+fn default_wait_all() -> bool {
+    true
+}
+
+fn default_exit_timeout_seconds() -> u64 {
+    10
+}
+
+const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
+const MAX_DETACHED_COMMANDS: usize = 16;
+const MAX_DETACHED_COMMAND_BYTES: usize = 2048;
+
 #[derive(Clone, Debug)]
 pub struct Executable {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
     pub auto_detach: bool,
+    pub wait_all: bool,
+    pub exit_timeout_seconds: u64,
+    pub detached: Vec<String>,
     pub preparation: Vec<PreparationStep>,
 }
 impl Executable {
@@ -129,11 +150,21 @@ impl Executable {
                 arguments,
                 working_directory,
                 auto_detach,
+                wait_all,
+                exit_timeout_seconds,
+                detached,
                 mut preparation,
             } => {
                 let working_directory = working_directory.filter(|directory| !directory.is_empty());
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
+                    || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
+                    || detached.len() > MAX_DETACHED_COMMANDS
+                    || detached.iter().any(|command| {
+                        command.is_empty()
+                            || command.len() > MAX_DETACHED_COMMAND_BYTES
+                            || command.chars().any(char::is_control)
+                    })
                     || working_directory
                         .as_deref()
                         .is_some_and(|cwd| !valid_native_path(cwd))
@@ -156,6 +187,9 @@ impl Executable {
                     arguments,
                     working_directory: resolved_working_directory,
                     auto_detach,
+                    wait_all,
+                    exit_timeout_seconds,
+                    detached,
                     preparation,
                 })
             }

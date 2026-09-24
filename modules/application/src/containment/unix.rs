@@ -52,14 +52,14 @@ impl ContainedChild {
         ))
     }
 
-    fn signal(&mut self, signal: i32) -> io::Result<()> {
+    fn signal(&mut self, signal: i32) -> io::Result<bool> {
         // Validate ownership before every group signal, including retries. ECHILD
         // stops signaling if an embedding host has violated exclusive wait ownership.
         self.exited()?;
         // SAFETY: our unreaped leader reserves this positive PID. A negative PID
         // addresses only its group. No signal is sent after reaping the leader.
         if unsafe { libc::kill(-(self.id() as i32), signal) } == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let error = io::Error::last_os_error();
 
@@ -68,25 +68,53 @@ impl ContainedChild {
             && self.exited()?
             && macos_group_is_dead(self.id())?
         {
-            return Ok(());
+            return Ok(false);
         }
         if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
+            Ok(false)
         } else {
             Err(error)
         }
     }
 
-    pub fn request_stop(&mut self) -> io::Result<()> {
+    pub fn request_stop(&mut self) -> io::Result<bool> {
         self.signal(libc::SIGTERM)
     }
 
     pub fn force_stop(&mut self) -> io::Result<()> {
         if !self.group_finished {
-            self.signal(libc::SIGKILL)?;
+            let _ = self.signal(libc::SIGKILL)?;
             self.group_finished = true;
         }
         Ok(())
+    }
+
+    pub fn group_running(&self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            return linux_group_has_live_members(self.id());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return Ok(!macos_group_is_dead(self.id())?);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // Other Unix targets retain conservative process-group probing.
+            // The pinned product's supported Linux and macOS paths use member
+            // enumeration so the deliberately unreaped leader is not mistaken
+            // for a live descendant.
+            let result = unsafe { libc::kill(-(self.id() as i32), 0) };
+            if result == 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
     }
 
     pub fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -96,6 +124,55 @@ impl ContainedChild {
         }
         self.child.try_wait()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_group_has_live_members(group_id: u32) -> io::Result<bool> {
+    const MAX_PROCESS_SCAN: usize = 131_072;
+
+    let processes = std::fs::read_dir("/proc")?;
+    for (index, entry) in processes.enumerate() {
+        if index >= MAX_PROCESS_SCAN {
+            return Err(io::Error::other("procfs process scan exceeded its bound"));
+        }
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // An unreadable process could be a live group member. Keep the
+            // stream alive until the configured timeout forces group cleanup.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if linux_stat_is_live_group_member(&stat, group_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stat_is_live_group_member(stat: &str, group_id: u32) -> bool {
+    let Some(command_end) = stat.rfind(')') else {
+        return false;
+    };
+    let mut fields = stat[command_end + 1..].split_whitespace();
+    let Some(state) = fields.next() else {
+        return false;
+    };
+    let _parent_process = fields.next();
+    let Some(process_group) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+        return false;
+    };
+    process_group == group_id && !matches!(state, "Z" | "X")
 }
 
 #[cfg(target_os = "macos")]

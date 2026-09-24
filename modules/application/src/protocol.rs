@@ -1,3 +1,4 @@
+use crate::commands::DetachedCommand;
 use crate::lifecycle::PreparationStep;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +17,12 @@ pub(crate) enum Action {
         cwd: Option<String>,
         #[serde(default = "default_auto_detach")]
         auto_detach: bool,
+        #[serde(default = "default_wait_all")]
+        wait_all: bool,
+        #[serde(default = "default_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+        #[serde(default)]
+        detached: Vec<String>,
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
@@ -44,6 +51,16 @@ fn default_auto_detach() -> bool {
     true
 }
 
+fn default_wait_all() -> bool {
+    true
+}
+
+fn default_exit_timeout_seconds() -> u64 {
+    10
+}
+
+pub(crate) const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LaunchSpec {
     pub executable: String,
@@ -51,6 +68,9 @@ pub(crate) struct LaunchSpec {
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
     pub auto_detach: bool,
+    pub wait_all: bool,
+    pub exit_timeout_seconds: u64,
+    pub detached: Vec<DetachedCommand>,
     pub preparation: Vec<PreparationStep>,
 }
 
@@ -61,6 +81,9 @@ impl LaunchSpec {
             || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err("operation_id must be 1 to 128 printable ASCII bytes without spaces");
+        }
+        if self.exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+            return Err("exit timeout exceeds bounds");
         }
         if !valid_path(&self.executable) || self.cwd.as_deref().is_some_and(|cwd| !valid_path(cwd))
         {

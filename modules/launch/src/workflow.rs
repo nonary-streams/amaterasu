@@ -95,7 +95,7 @@ impl Workflow {
                 let executable = record.executable.as_ref().ok_or("invalid_workflow")?;
                 (
                     APPLICATION,
-                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"environment":environment,"preparation":executable.preparation}),
+                    json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
             Step::Activate => (

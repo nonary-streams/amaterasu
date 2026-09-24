@@ -38,6 +38,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "shlex",
  "windows-sys 0.61.2",
 ]
 

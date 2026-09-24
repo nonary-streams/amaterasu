@@ -1,4 +1,5 @@
 //! Application process-tree ownership for trusted administrative callers.
+mod commands;
 mod containment;
 mod lifecycle;
 mod processes;

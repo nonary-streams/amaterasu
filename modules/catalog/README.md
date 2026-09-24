@@ -72,6 +72,16 @@ mutations require `expected_revision`, referring to the **whole caller catalog**
 Each successful mutation advances it once. Missing IDs return `not_found`.
 Delete returns `ok`, `revision`, `id`, `deleted:true`.
 
+Executable launch metadata defaults `auto_detach` and `wait_all` to `true`,
+`exit_timeout_seconds` to 10, and `detached` to an empty ordered list. The
+accepted aliases `auto-detach`, `wait-all`, and `exit-timeout` are serialized
+back using their canonical underscore names. `exit_timeout_seconds` is limited
+to 300; `detached` accepts up to 16 nonempty command strings of 2048 bytes each.
+Detached strings are parsed by the application module at launch time, so catalog
+validation checks their bounds and control characters while launch validation
+checks command syntax. These fields configure the application process manager;
+catalog persistence alone does not establish behavior parity on each platform.
+
 List and search return `ok`, `revision`, `entries:[{"id":...,"entry":...}]`, and
 `next_cursor` (null when finished). Pass the entire returned cursor as `cursor`
 on the next request, preserving the search query. Cursors contain revision,

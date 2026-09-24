@@ -1,13 +1,15 @@
+use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
 use crate::lifecycle::ApplicationLifecycle;
-use crate::protocol::{Action, LaunchSpec, ProcessState, TerminalOutcome};
+use crate::protocol::{
+    Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, ProcessState, TerminalOutcome,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const TERMINATION_GRACE: Duration = Duration::from_millis(200);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -67,6 +69,8 @@ struct ProcessRecord {
     application_started_at: Option<Instant>,
     #[serde(skip)]
     auto_detached: bool,
+    #[serde(skip)]
+    detached_children: Vec<std::process::Child>,
 }
 
 impl ProcessRecord {
@@ -85,6 +89,7 @@ impl ProcessRecord {
             completion: None,
             application_started_at: None,
             auto_detached: false,
+            detached_children: Vec::new(),
         };
         if record.lifecycle.is_none() {
             record.spawn_application();
@@ -93,6 +98,8 @@ impl ProcessRecord {
     }
 
     fn spawn_application(&mut self) {
+        self.spawn_detached_commands();
+
         let mut command = Command::new(&self.spec.executable);
         command
             .args(&self.spec.args)
@@ -117,6 +124,38 @@ impl ProcessRecord {
         }
     }
 
+    fn spawn_detached_commands(&mut self) {
+        for detached in &self.spec.detached {
+            let mut command = Command::new(&detached.executable);
+            command
+                .args(&detached.args)
+                .env_clear()
+                .envs(&self.spec.environment)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(cwd) = &self.spec.cwd {
+                command.current_dir(cwd);
+            } else if let Some(cwd) = std::path::Path::new(&detached.executable)
+                .parent()
+                .filter(|directory| !directory.as_os_str().is_empty())
+            {
+                command.current_dir(cwd);
+            }
+
+            // The source treats these as best-effort launchers. Their spawn
+            // failure must not prevent the primary application from starting.
+            if let Ok(child) = command.spawn() {
+                self.detached_children.push(child);
+            }
+        }
+    }
+
+    fn reap_detached_commands(&mut self) {
+        self.detached_children
+            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+    }
+
     fn complete_or_clean(&mut self, completion: Completion) {
         if let Some(lifecycle) = &mut self.lifecycle {
             self.completion = Some(completion);
@@ -134,8 +173,19 @@ impl ProcessRecord {
         now: Instant,
     ) -> Result<(), &'static str> {
         let child = self.child.as_mut().ok_or("process_wait_failed")?;
-        child.request_stop().map_err(|_| "process_kill_failed")?;
-        self.stop_deadline = Some(now + TERMINATION_GRACE);
+        let exit_timeout = Duration::from_secs(self.spec.exit_timeout_seconds);
+        let should_wait = if exit_timeout.is_zero() {
+            false
+        } else {
+            child.request_stop().map_err(|_| "process_kill_failed")?
+        };
+        let group_running = child.group_running().unwrap_or(true);
+        let grace = if should_wait && group_running {
+            exit_timeout
+        } else {
+            Duration::ZERO
+        };
+        self.stop_deadline = Some(now + grace);
         self.completion = Some(completion);
         self.state = ProcessState::Stopping;
         Ok(())
@@ -150,6 +200,22 @@ impl ProcessRecord {
         match observation {
             Ok(None) => {}
             Ok(Some(success)) => {
+                if self.spec.wait_all {
+                    match self
+                        .child
+                        .as_mut()
+                        .expect("running process has child")
+                        .group_running()
+                    {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(_) => {
+                            self.completion = Some(Completion::ExitedPending);
+                            self.mark_cleanup_failed();
+                            return;
+                        }
+                    }
+                }
                 let exited_quickly = self.application_started_at.is_some_and(|started_at| {
                     now.saturating_duration_since(started_at) < Duration::from_secs(5)
                 });
@@ -176,10 +242,10 @@ impl ProcessRecord {
 
     fn advance_main_stop(&mut self, now: Instant) {
         let deadline = self.stop_deadline.expect("stopping process has deadline");
-        if now < deadline {
+        let child = self.child.as_mut().expect("stopping process has child");
+        if now < deadline && child.group_running().unwrap_or(true) {
             return;
         }
-        let child = self.child.as_mut().expect("stopping process has child");
         if child.force_stop().is_err() {
             self.mark_cleanup_failed();
             return;
@@ -266,6 +332,7 @@ impl ProcessRecord {
 
     fn advance(&mut self) -> Result<(), &'static str> {
         let now = Instant::now();
+        self.reap_detached_commands();
         match self.state {
             ProcessState::Preparing => self.advance_preparation(now),
             ProcessState::Running if !self.auto_detached => self.observe_running(now),
@@ -391,14 +458,21 @@ impl ProcessManager {
                 environment,
                 cwd,
                 auto_detach,
+                wait_all,
+                exit_timeout_seconds,
+                detached,
                 preparation,
             } => {
+                let detached = parse_detached_commands(detached).map_err(|_| "invalid_launch")?;
                 let spec = LaunchSpec {
                     executable,
                     args,
                     environment,
                     cwd,
                     auto_detach,
+                    wait_all,
+                    exit_timeout_seconds,
+                    detached,
                     preparation,
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
@@ -501,7 +575,7 @@ impl ProcessManager {
     /// Stop every owned child against one shared deadline. Active preparation is
     /// cancelled, owed undo is allowed to finish, and cleanup failures stay retryable.
     pub fn shutdown(&mut self) -> Result<(), &'static str> {
-        let deadline = Instant::now() + TERMINATION_GRACE + REAP_TIMEOUT;
+        let deadline = Instant::now() + self.shutdown_budget();
         let mut failure = None;
         loop {
             for record in self.records.values_mut() {
@@ -538,7 +612,7 @@ impl ProcessManager {
     /// shared deadline, then make a final bounded attempt to settle every owned
     /// child before the manager itself is dropped.
     fn force_settle_owned_children(&mut self) {
-        let deadline = Instant::now() + TERMINATION_GRACE + REAP_TIMEOUT;
+        let deadline = Instant::now() + self.shutdown_budget();
         loop {
             for record in self.records.values_mut() {
                 let _ = record.prepare_shutdown();
@@ -555,6 +629,17 @@ impl ProcessManager {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn shutdown_budget(&self) -> Duration {
+        let longest_grace = self
+            .records
+            .values()
+            .map(|record| record.spec.exit_timeout_seconds)
+            .max()
+            .unwrap_or_default()
+            .min(MAX_EXIT_TIMEOUT_SECONDS);
+        Duration::from_secs(longest_grace) + REAP_TIMEOUT
     }
 }
 
