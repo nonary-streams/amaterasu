@@ -273,7 +273,7 @@ pub fn select_game_sources(
     installed.sort_by(|left, right| right.last_played.cmp(&left.last_played));
 
     let included_categories = lower_set(&settings.sync_categories);
-    let excluded_categories = lower_set(&settings.exclude_categories);
+    let excluded_categories = ascii_lower_set(&settings.exclude_categories);
     let included_plugins = lower_set(&settings.sync_plugins);
     let excluded_plugins = lower_set(&settings.exclude_plugins);
     let excluded_games = lower_set(&settings.exclude_games);
@@ -362,7 +362,14 @@ fn is_excluded(
         || game
             .categories
             .iter()
-            .any(|category| excluded_categories.contains(&category.to_lowercase()))
+            .any(|category| excluded_categories.contains(&category.to_ascii_lowercase()))
+}
+
+fn ascii_lower_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
 }
 
 fn lower_set(values: &[String]) -> BTreeSet<String> {
@@ -627,11 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn category_plugin_and_game_exclusions_are_case_insensitive() {
+    fn category_exclusions_use_ascii_case_insensitive_matching() {
         let snapshot = Snapshot {
             games: vec![
                 game("one", &["ARCADE"], "plugin", ""),
                 game("two", &["Strategy"], "other", ""),
+                game("three", &["K"], "other", ""),
             ],
             categories: Vec::new(),
             plugins: Vec::new(),
@@ -639,11 +647,19 @@ mod tests {
         let settings = ProductSettings {
             recent_games: 0,
             sync_all_installed: true,
-            exclude_categories: vec!["arcade".into()],
+            exclude_categories: vec!["arcade".into(), "k".into()],
             exclude_games: vec!["TWO".into()],
             ..ProductSettings::default()
         };
-        assert!(select_games(&snapshot, &settings, 0).is_empty());
+        let selected = select_games(&snapshot, &settings, 0);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three"]
+        );
     }
 
     #[test]

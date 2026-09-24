@@ -6,6 +6,14 @@ persisted by `amaterasu.configuration`; older documents without
 `autosync_remove_uninstalled` load with its host default of `true`, and a
 settings update that omits the optional field preserves its stored value.
 
+`exclude_categories` compares category names after ASCII lowercase, so matching
+is case-insensitive for ASCII letters while non-ASCII characters remain distinct
+(for example, the Kelvin sign `K` does not match ASCII `k`). This follows the
+pinned reference's byte-oriented lowercase behavior under its default C locale.
+The reference uses locale-sensitive `std::tolower`, so behavior under a
+non-default C locale remains unqualified; no Playnite runtime qualification was
+run.
+
 `auto_sync` controls membership reconciliation. When it is enabled together with
 `autosync_remove_uninstalled`, the provider sends tombstones only for explicit
 Playnite records whose `installed` value is `false`. The catalog applies those
