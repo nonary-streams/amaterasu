@@ -100,6 +100,9 @@ impl<D: Driver> Manager<D> {
                 if !self.settings.enabled {
                     return failure("disabled");
                 }
+                if !self.settings.dd_use_sunshine_virtual_display_driver {
+                    return failure("unsupported_driver");
+                }
                 if !self.driver.supported() {
                     return failure("unsupported_platform");
                 }
@@ -130,8 +133,30 @@ impl<D: Driver> Manager<D> {
             })
             .map(|(_, monitor)| monitor.response()["monitor"].clone())
             .collect();
-        json!({"ok":true,"enabled":self.settings.enabled,"supported_platform":self.driver.supported(),
-            "driver":"sunshine","monitors":monitors,"readiness":"monitor_identity_published_not_capture_ready"})
+        let driver = if self.settings.dd_use_sunshine_virtual_display_driver {
+            "sunshine"
+        } else {
+            "unsupported"
+        };
+        let activation_state = if self.settings.dd_activate_virtual_display {
+            "unsupported"
+        } else {
+            "not_requested"
+        };
+        let activation_error = self
+            .settings
+            .dd_activate_virtual_display
+            .then_some("unsupported_activation");
+        json!({"ok":true,
+            "enabled":self.settings.enabled,
+            "dd_activate_virtual_display":self.settings.dd_activate_virtual_display,
+            "dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver,
+            "supported_platform":self.driver.supported(),
+            "driver":driver,
+            "activation_supported":false,
+            "activation_state":activation_state,
+            "activation_error":activation_error,
+            "monitors":monitors,"readiness":"monitor_identity_published_not_capture_ready"})
     }
 
     fn create(&mut self, caller: &str, specification: Specification) -> Value {

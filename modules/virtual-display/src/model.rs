@@ -2,10 +2,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    pub dd_activate_virtual_display: bool,
+    pub dd_use_sunshine_virtual_display_driver: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dd_activate_virtual_display: false,
+            dd_use_sunshine_virtual_display_driver: true,
+        }
+    }
 }
 
 #[derive(Deserialize)]

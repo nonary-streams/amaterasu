@@ -3,8 +3,19 @@
 `amaterasu_virtual_display` is an independently built native library providing
 `amaterasu.virtual-display/1`. It implements the Sunshine Windows virtual display
 control protocol with temporary owned leases. It does not install or modify a
-driver. Settings default to `{"enabled":false}`; disabled startup never enumerates
-or opens devices. Non-Windows create returns `unsupported_platform` when enabled.
+driver. Settings default to
+`{"enabled":false,"dd_activate_virtual_display":false,"dd_use_sunshine_virtual_display_driver":true}`.
+`enabled` remains the module's service gate and is independent of the stable
+configuration setting names. When it is false, create returns `disabled` without
+touching the driver. When the module is enabled, create may manage a temporary
+monitor regardless of `dd_activate_virtual_display`. That setting requests
+stream-time topology activation; this service does not implement that behavior.
+An explicit create only creates a temporary monitor and cannot activate it or make
+it the only active display. Status reports the unsupported activation request.
+If `dd_use_sunshine_virtual_display_driver` is false, create returns
+`unsupported_driver`; this service has no alternative driver and does not silently
+select Sunshine. Non-Windows create returns `unsupported_platform` when the module
+is enabled and the Sunshine driver is selected.
 
 The provider needs only its service registration grant; clients need its call
 grant. There are no state, filesystem, or subprocess service dependencies.
@@ -42,7 +53,11 @@ the native effect. Changing its specification returns `identity_conflict` until
 removed. A SHA-256 derivation of caller and UUID yields the stable requested driver
 ID; a fresh random lease/capability is used for each new lifecycle. Neither secret
 is exposed. Missing remove is idempotent. A remove of another caller's UUID never
-removes that caller's monitor. Status is a bounded snapshot, not persistent history.
+removes that caller's monitor. Status is a bounded snapshot, not persistent history;
+it reports the module gate and both canonical setting names, marks activation as
+unsupported through `activation_supported`, `activation_state`, and
+`activation_error`, and identifies the driver as `unsupported` when the Sunshine
+driver is not selected.
 
 ## Protocol provenance and safety
 
@@ -102,8 +117,12 @@ retention/cleanup policy, persistent monitor manifests, adapter selection, HDR/I
 DPI controls, and the incompatible SudoVDA protocol are not supported. There is no
 automatic session/launch coordination or Linux DRM virtual display backend yet.
 
-Tests exercise disabled behavior, caller isolation, stable identity/idempotency,
-readiness/feeding, ambiguous creation, bounded exact cleanup, departure confirmation,
-and malformed protocol lengths/counts/UTF-16. Run `cargo test -p
+Tests exercise setting defaults and separation, activation diagnostics and driver
+selection, caller isolation, stable identity/idempotency, readiness/feeding,
+ambiguous creation, bounded exact cleanup, departure confirmation, and malformed protocol
+lengths/counts/UTF-16. Persistent global configuration projection and per-client
+behavior remain pending; the defaults and module settings payload do not provide
+that configuration plumbing. The `dd_activate_virtual_display` stream-time
+topology behavior also remains pending. Run `cargo test -p
 amaterasu-virtual-display` and cross-check with `cargo check -p
 amaterasu-virtual-display --target x86_64-pc-windows-msvc`.

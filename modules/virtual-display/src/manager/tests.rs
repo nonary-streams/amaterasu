@@ -58,12 +58,15 @@ impl Driver for Fake {
         Ok(())
     }
 }
-fn setup(enabled: bool) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
+fn setup_with(settings: Settings) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
     let calls = Rc::new(RefCell::new(Calls::default()));
-    (
-        Manager::new(Settings { enabled }, Fake(calls.clone())),
-        calls,
-    )
+    (Manager::new(settings, Fake(calls.clone())), calls)
+}
+fn setup(enabled: bool) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
+    setup_with(Settings {
+        enabled,
+        ..Settings::default()
+    })
 }
 fn create() -> Operation {
     Operation::Create {
@@ -88,6 +91,82 @@ fn disabled_never_touches_driver() {
     drop(manager);
     assert!(calls.borrow().creates.is_empty());
     assert!(calls.borrow().removes.is_empty());
+}
+
+#[test]
+fn driver_selection_rejects_sunshine_driver_without_native_effects() {
+    let (mut manager, calls) = setup_with(Settings {
+        enabled: true,
+        dd_activate_virtual_display: false,
+        dd_use_sunshine_virtual_display_driver: false,
+    });
+
+    assert_eq!(
+        manager.handle("alice", create())["code"],
+        "unsupported_driver"
+    );
+    let status = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(status["dd_activate_virtual_display"], false);
+    assert_eq!(status["dd_use_sunshine_virtual_display_driver"], false);
+    assert_eq!(status["driver"], "unsupported");
+    assert_eq!(status["activation_state"], "not_requested");
+    assert!(status["activation_error"].is_null());
+    assert!(calls.borrow().creates.is_empty());
+}
+
+#[test]
+fn requested_activation_does_not_change_explicit_create_and_status_reports_gap() {
+    let (mut manager, calls) = setup_with(Settings {
+        enabled: true,
+        dd_activate_virtual_display: true,
+        ..Settings::default()
+    });
+
+    let response = manager.handle("alice", create());
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["monitor"]["state"], "creating");
+    assert!(response["monitor"]["ready"].is_null());
+    assert_eq!(calls.borrow().creates.len(), 1);
+
+    let status = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["dd_activate_virtual_display"], true);
+    assert_eq!(status["activation_supported"], false);
+    assert_eq!(status["activation_state"], "unsupported");
+    assert_eq!(status["activation_error"], "unsupported_activation");
+}
+
+#[test]
+fn activation_not_requested_keeps_temporary_create_available() {
+    let (mut manager, calls) = setup(true);
+
+    assert_eq!(manager.handle("alice", create())["ok"], true);
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
+fn settings_default_to_reference_values_and_accept_stable_names() {
+    let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
+    assert!(!defaults.enabled);
+    assert!(!defaults.dd_activate_virtual_display);
+    assert!(defaults.dd_use_sunshine_virtual_display_driver);
+
+    let configured = serde_json::from_value::<Settings>(json!({
+        "enabled": true,
+        "dd_activate_virtual_display": true,
+        "dd_use_sunshine_virtual_display_driver": false
+    }))
+    .unwrap();
+    assert!(configured.enabled);
+    assert!(configured.dd_activate_virtual_display);
+    assert!(!configured.dd_use_sunshine_virtual_display_driver);
+}
+
+#[test]
+fn module_enabled_setting_is_independent_of_display_activation() {
+    let settings = serde_json::from_value::<Settings>(json!({"enabled": true})).unwrap();
+    assert!(settings.enabled);
+    assert!(!settings.dd_activate_virtual_display);
 }
 #[test]
 fn identity_is_idempotent_and_owned_by_caller() {
