@@ -17,7 +17,9 @@ const STREAM_AUDIO_SETTINGS_VERSION: u64 = 5;
 const CAPTURE_SETTINGS_VERSION: u64 = 6;
 const VIDEO_BATCH_SETTINGS_VERSION: u64 = 7;
 const MAX_BITRATE_SETTINGS_VERSION: u64 = 8;
-const SETTINGS_VERSION: u64 = MAX_BITRATE_SETTINGS_VERSION;
+const MINIMUM_FPS_SETTINGS_VERSION: u64 = 9;
+const SETTINGS_VERSION: u64 = MINIMUM_FPS_SETTINGS_VERSION;
+const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
 const MAX_QUEUED_ADMIN_REQUESTS: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +38,7 @@ pub enum AdminAction {
         capture: FieldUpdate<CaptureMode>,
         video_max_batch_size_kb: FieldUpdate<u8>,
         max_bitrate: FieldUpdate<i32>,
+        minimum_fps_target: FieldUpdate<f64>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -107,6 +110,7 @@ enum Purpose {
         capture: CaptureMode,
         video_max_batch_size_kb: Option<u8>,
         max_bitrate: Option<i32>,
+        minimum_fps_target: Option<f64>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -140,6 +144,7 @@ struct ProductDocument {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    minimum_fps_target: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -148,6 +153,7 @@ struct ProductStreamingSettings {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    minimum_fps_target: Option<f64>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -167,6 +173,7 @@ pub struct ProductSettings {
     configured_capture: CaptureMode,
     configured_video_max_batch_size_kb: Option<u8>,
     configured_max_bitrate: Option<i32>,
+    configured_minimum_fps_target: Option<f64>,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -259,6 +266,7 @@ impl ProductSettings {
             configured_capture: CaptureMode::Auto,
             configured_video_max_batch_size_kb: None,
             configured_max_bitrate: None,
+            configured_minimum_fps_target: None,
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -321,6 +329,15 @@ impl ProductSettings {
         self.configured_max_bitrate
             .filter(|value| *value > 0)
             .map(|value| value as u32)
+    }
+
+    pub fn configured_minimum_fps_target(&self) -> Option<f64> {
+        self.configured_minimum_fps_target
+    }
+
+    pub fn effective_minimum_fps_target(&self) -> f64 {
+        self.configured_minimum_fps_target
+            .unwrap_or(DEFAULT_MINIMUM_FPS_TARGET)
     }
 
     pub fn stream_audio(&self) -> bool {
@@ -805,6 +822,7 @@ impl ProductSettings {
                 capture,
                 video_max_batch_size_kb,
                 max_bitrate,
+                minimum_fps_target,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -863,6 +881,22 @@ impl ProductSettings {
                     }
                 };
                 let max_bitrate = apply_field_update(max_bitrate, self.configured_max_bitrate);
+                let minimum_fps_target = match apply_minimum_fps_update(
+                    minimum_fps_target,
+                    self.configured_minimum_fps_target,
+                ) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(
+                                "invalid_minimum_fps_target",
+                                "minimum_fps_target must be a finite number from 0 to 1000 or null",
+                            ),
+                        );
+                        return;
+                    }
+                };
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -926,6 +960,7 @@ impl ProductSettings {
                             capture,
                             video_max_batch_size_kb,
                             max_bitrate,
+                            minimum_fps_target,
                         },
                     ),
                     Some(request.request),
@@ -939,6 +974,7 @@ impl ProductSettings {
                         capture,
                         video_max_batch_size_kb,
                         max_bitrate,
+                        minimum_fps_target,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -1054,6 +1090,7 @@ impl ProductSettings {
                 capture,
                 video_max_batch_size_kb,
                 max_bitrate,
+                minimum_fps_target,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
@@ -1067,6 +1104,7 @@ impl ProductSettings {
                         capture,
                         video_max_batch_size_kb,
                         max_bitrate,
+                        minimum_fps_target,
                     };
                     match update_result(&payload, &expected) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
@@ -1292,6 +1330,14 @@ impl ProductSettings {
                 "persisted video_max_batch_size_kb is outside 0..=64",
             ));
         }
+        if document
+            .minimum_fps_target
+            .is_some_and(|value| !valid_minimum_fps_target(value))
+        {
+            return Err(invalid_state(
+                "persisted minimum_fps_target is outside 0..=1000",
+            ));
+        }
         let mut validation_settings = self.bootstrap_settings.clone();
         let port = document.port.unwrap_or(self.bootstrap_port);
         validation_settings.http_bind.set_port(port);
@@ -1328,6 +1374,7 @@ impl ProductSettings {
         self.configured_capture = document.capture;
         self.configured_video_max_batch_size_kb = document.video_max_batch_size_kb;
         self.configured_max_bitrate = document.max_bitrate;
+        self.configured_minimum_fps_target = document.minimum_fps_target;
         self.loaded = true;
     }
 
@@ -1349,6 +1396,8 @@ impl ProductSettings {
             "video_batch_size_fallback":self.video_batch_size_fallback(),
             "configured_max_bitrate":self.configured_max_bitrate(),
             "effective_max_bitrate_kbps":self.effective_max_bitrate_kbps(),
+            "configured_minimum_fps_target":self.configured_minimum_fps_target(),
+            "effective_minimum_fps_target":self.effective_minimum_fps_target(),
             "stream_audio":self.stream_audio,
             "effective_output_name":self.effective_output_name(),
             "capture_provider":self.capture_provider(),
@@ -1421,6 +1470,7 @@ fn product_update_payload(
             "capture":streaming.capture,
             "video_max_batch_size_kb":streaming.video_max_batch_size_kb,
             "max_bitrate":streaming.max_bitrate,
+            "minimum_fps_target":streaming.minimum_fps_target,
         },
     })
 }
@@ -1469,6 +1519,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             capture: CaptureMode::Auto,
             video_max_batch_size_kb: None,
             max_bitrate: None,
+            minimum_fps_target: None,
         });
     }
 
@@ -1486,6 +1537,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | CAPTURE_SETTINGS_VERSION
             | VIDEO_BATCH_SETTINGS_VERSION
             | MAX_BITRATE_SETTINGS_VERSION
+            | MINIMUM_FPS_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -1501,6 +1553,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         CAPTURE_SETTINGS_VERSION => 7,
         VIDEO_BATCH_SETTINGS_VERSION => 8,
         MAX_BITRATE_SETTINGS_VERSION => 9,
+        MINIMUM_FPS_SETTINGS_VERSION => 10,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1514,6 +1567,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= VIDEO_BATCH_SETTINGS_VERSION
             && !values.contains_key("video_max_batch_size_kb"))
         || (version >= MAX_BITRATE_SETTINGS_VERSION && !values.contains_key("max_bitrate"))
+        || (version >= MINIMUM_FPS_SETTINGS_VERSION && !values.contains_key("minimum_fps_target"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1612,6 +1666,19 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         None
     };
+    let minimum_fps_target = if version >= MINIMUM_FPS_SETTINGS_VERSION {
+        match values.get("minimum_fps_target") {
+            Some(Value::Null) => None,
+            Some(value) => value
+                .as_f64()
+                .filter(|value| valid_minimum_fps_target(*value))
+                .map(Some)
+                .ok_or_else(|| invalid_state("persisted minimum_fps_target is invalid"))?,
+            None => return Err(invalid_state("persisted minimum_fps_target is missing")),
+        }
+    } else {
+        None
+    };
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -1623,6 +1690,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         capture,
         video_max_batch_size_kb,
         max_bitrate,
+        minimum_fps_target,
     })
 }
 
@@ -1636,6 +1704,7 @@ struct UpdateExpectation<'a> {
     capture: CaptureMode,
     video_max_batch_size_kb: Option<u8>,
     max_bitrate: Option<i32>,
+    minimum_fps_target: Option<f64>,
 }
 
 fn update_result(
@@ -1647,7 +1716,7 @@ fn update_result(
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
         return Err(invalid_state(
-            "product_update did not confirm the v8 maximum bitrate settings",
+            "product_update did not confirm the v9 minimum FPS settings",
         ));
     }
     let document = parse_document(payload)?;
@@ -1660,6 +1729,7 @@ fn update_result(
         || document.capture != expected.capture
         || document.video_max_batch_size_kb != expected.video_max_batch_size_kb
         || document.max_bitrate != expected.max_bitrate
+        || document.minimum_fps_target != expected.minimum_fps_target
         || expected.revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -1667,6 +1737,22 @@ fn update_result(
         ));
     }
     Ok(document)
+}
+
+fn valid_minimum_fps_target(value: f64) -> bool {
+    value.is_finite() && (0.0..=1000.0).contains(&value)
+}
+
+fn apply_minimum_fps_update(
+    update: FieldUpdate<f64>,
+    current: Option<f64>,
+) -> Result<Option<f64>, ()> {
+    match update {
+        FieldUpdate::Omitted => Ok(current),
+        FieldUpdate::Null => Ok(None),
+        FieldUpdate::Value(value) if valid_minimum_fps_target(value) => Ok(Some(value)),
+        FieldUpdate::Value(_) => Err(()),
+    }
 }
 
 fn normalize_output_name(value: &str) -> Result<Option<String>, ()> {
@@ -2152,6 +2238,147 @@ mod tests {
     }
 
     #[test]
+    fn v9_minimum_fps_target_migrates_defaults_and_survives_restart() {
+        let legacy = parse_document(&json!({
+            "ok":true,"found":true,"version":8,"revision":3,
+            "values":{"hostname":"Host","port":47989,"address_family":null,
+                "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                "video_max_batch_size_kb":32,"max_bitrate":null}
+        }))
+        .unwrap();
+        assert_eq!(legacy.minimum_fps_target, None);
+        let mut migrated = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        migrated.apply_document(legacy);
+        assert_eq!(migrated.configured_minimum_fps_target(), None);
+        assert_eq!(migrated.effective_minimum_fps_target(), 20.0);
+
+        for target in [0.0, 23.5, 1000.0] {
+            let document = json!({
+                "ok":true,"found":true,"version":9,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null,
+                    "minimum_fps_target":target}
+            });
+            let parsed = parse_document(&document).unwrap();
+            assert_eq!(parsed.minimum_fps_target, Some(target));
+
+            let mut first_start = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+            first_start.apply_document(parsed);
+            assert_eq!(first_start.configured_minimum_fps_target(), Some(target));
+            assert_eq!(first_start.effective_minimum_fps_target(), target);
+            assert_eq!(
+                first_start.settings_payload()["configured_minimum_fps_target"],
+                target
+            );
+            assert_eq!(
+                first_start.settings_payload()["effective_minimum_fps_target"],
+                target
+            );
+
+            let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+            restarted.apply_document(parse_document(&document).unwrap());
+            assert_eq!(restarted.configured_minimum_fps_target(), Some(target));
+            assert_eq!(restarted.effective_minimum_fps_target(), target);
+        }
+
+        for invalid in [
+            json!({"ok":true,"found":true,"version":9,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null,"minimum_fps_target":-0.1}}),
+            json!({"ok":true,"found":true,"version":9,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null,"minimum_fps_target":1000.1}}),
+            json!({"ok":true,"found":true,"version":9,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null,"minimum_fps_target":"30"}}),
+            json!({"ok":true,"found":true,"version":9,"revision":1,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null}}),
+        ] {
+            assert_eq!(
+                parse_document(&invalid).unwrap_err().code,
+                "invalid_state_response"
+            );
+        }
+        assert!(!valid_minimum_fps_target(f64::NAN));
+        assert!(!valid_minimum_fps_target(f64::INFINITY));
+    }
+
+    #[test]
+    fn minimum_fps_updates_preserve_omission_and_null_resets_to_default() {
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":9,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                    "video_max_batch_size_kb":32,"max_bitrate":null,"minimum_fps_target":23.5}
+            }))
+            .unwrap(),
+        );
+
+        for (request, revision, update, reply_revision, expected_raw) in [
+            (31, 4, FieldUpdate::Omitted, 5, json!(23.5)),
+            (32, 5, FieldUpdate::Null, 6, Value::Null),
+        ] {
+            product
+                .enqueue(
+                    request,
+                    5_000,
+                    AdminAction::Update {
+                        hostname: "Host".into(),
+                        port: 47_989,
+                        address_family: FieldUpdate::Omitted,
+                        bind_address: FieldUpdate::Omitted,
+                        output_name: FieldUpdate::Omitted,
+                        stream_audio: FieldUpdate::Omitted,
+                        capture: FieldUpdate::Omitted,
+                        video_max_batch_size_kb: FieldUpdate::Omitted,
+                        max_bitrate: FieldUpdate::Omitted,
+                        minimum_fps_target: update,
+                        expected_revision: revision,
+                        require_listener_apply: false,
+                    },
+                )
+                .unwrap();
+            product.start_next();
+            let pending = product.pending.take().expect("product update request");
+            assert_eq!(pending.payload["version"], 9);
+            assert_eq!(
+                pending.payload["values"]["minimum_fps_target"],
+                expected_raw
+            );
+            let persisted_value = if expected_raw.is_null() {
+                Value::Null
+            } else {
+                expected_raw.clone()
+            };
+            product.finish_call(
+                pending.purpose,
+                CallOutcome::Payload(json!({
+                    "ok":true,"found":true,"version":9,"revision":reply_revision,
+                    "values":{"hostname":"Host","port":47989,"address_family":null,
+                        "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
+                        "video_max_batch_size_kb":32,"max_bitrate":null,
+                        "minimum_fps_target":persisted_value}
+                })),
+            );
+        }
+
+        assert_eq!(product.configured_minimum_fps_target(), None);
+        assert_eq!(product.effective_minimum_fps_target(), 20.0);
+        assert_eq!(
+            product.settings_payload()["configured_minimum_fps_target"],
+            Value::Null
+        );
+    }
+
+    #[test]
     fn max_bitrate_updates_preserve_omission_and_support_signed_value_and_null_reset() {
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         product.apply_document(
@@ -2183,6 +2410,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: FieldUpdate::Omitted,
                         max_bitrate: update,
+                        minimum_fps_target: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -2190,17 +2418,17 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 8);
+            assert_eq!(pending.payload["version"], 9);
             assert_eq!(
                 pending.payload["values"]["max_bitrate"],
                 expected.map_or(Value::Null, |value| json!(value))
             );
 
             let response = json!({
-                "ok":true,"found":true,"version":8,"revision":revision + 1,
+                "ok":true,"found":true,"version":9,"revision":revision + 1,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
-                    "video_max_batch_size_kb":32,"max_bitrate":expected}
+                    "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null}
             });
             product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
             assert_eq!(product.configured_max_bitrate(), expected);
@@ -2339,8 +2567,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":8,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+            "ok":true,"found":true,"version":9,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -2356,6 +2584,7 @@ mod tests {
             capture: CaptureMode::Auto,
             video_max_batch_size_kb: None,
             max_bitrate: None,
+            minimum_fps_target: None,
         };
         assert_eq!(update_result(&success, &expected).unwrap().revision, 4);
         assert_eq!(
@@ -2399,8 +2628,8 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":8,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+            "ok":true,"found":true,"version":9,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
         });
         assert_eq!(
             update_result(
@@ -2418,8 +2647,8 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":8,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+            "ok":true,"found":true,"version":9,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
         });
         assert_eq!(
             update_result(
@@ -2489,6 +2718,8 @@ mod tests {
             "video_batch_size_fallback":false,
             "configured_max_bitrate":null,
             "effective_max_bitrate_kbps":null,
+            "configured_minimum_fps_target":null,
+            "effective_minimum_fps_target":20.0,
             "stream_audio":true,
             "effective_output_name":null,
                 "capture_provider":null,
@@ -2573,15 +2804,16 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                minimum_fps_target: None,
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":8,
+                "version":9,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
             })),
         );
 
@@ -2630,12 +2862,13 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                minimum_fps_target: None,
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":8,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+                "ok":true,"found":true,"version":9,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
             })),
         );
 
@@ -2800,12 +3033,13 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                minimum_fps_target: None,
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":8,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null}
+                "ok":true,"found":true,"version":9,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
             })),
         );
 
@@ -2846,7 +3080,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_product_update_payload_keeps_nullable_values_exact() {
+    fn v9_product_update_payload_keeps_nullable_values_exact() {
         let reset = product_update_payload(
             7,
             "Host",
@@ -2861,14 +3095,16 @@ mod tests {
                 capture: CaptureMode::Auto,
                 video_max_batch_size_kb: None,
                 max_bitrate: None,
+                minimum_fps_target: None,
             },
         );
-        assert_eq!(reset["version"], 8);
+        assert_eq!(reset["version"], 9);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
         assert_eq!(reset["values"]["bind_address"], Value::Null);
         assert_eq!(reset["values"]["max_bitrate"], Value::Null);
+        assert_eq!(reset["values"]["minimum_fps_target"], Value::Null);
 
         let explicit_blank = product_update_payload(
             8,
@@ -2884,6 +3120,7 @@ mod tests {
                 capture: CaptureMode::Wgcc,
                 video_max_batch_size_kb: Some(32),
                 max_bitrate: Some(15_000),
+                minimum_fps_target: None,
             },
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
@@ -2893,6 +3130,7 @@ mod tests {
         assert_eq!(explicit_blank["values"]["capture"], "wgcc");
         assert_eq!(explicit_blank["values"]["video_max_batch_size_kb"], 32);
         assert_eq!(explicit_blank["values"]["max_bitrate"], 15_000);
+        assert_eq!(explicit_blank["values"]["minimum_fps_target"], Value::Null);
     }
 
     #[test]
@@ -2956,6 +3194,7 @@ mod tests {
                         capture: FieldUpdate::Omitted,
                         video_max_batch_size_kb: update,
                         max_bitrate: FieldUpdate::Omitted,
+                        minimum_fps_target: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -2963,7 +3202,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 8);
+            assert_eq!(pending.payload["version"], 9);
             assert_eq!(
                 pending.payload["values"]["video_max_batch_size_kb"],
                 expected_raw
@@ -2976,10 +3215,11 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":8,"revision":reply_revision,
+                    "ok":true,"found":true,"version":9,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"stream_audio":true,"capture":"auto",
-                        "video_max_batch_size_kb":persisted_value,"max_bitrate":null}
+                        "video_max_batch_size_kb":persisted_value,"max_bitrate":null,
+                        "minimum_fps_target":null}
                 })),
             );
         }
@@ -3018,6 +3258,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    minimum_fps_target: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -3025,7 +3266,7 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 8);
+        assert_eq!(payload["version"], 9);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
         assert_eq!(payload["values"]["capture"], "auto");
@@ -3053,6 +3294,7 @@ mod tests {
                     capture: FieldUpdate::Omitted,
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    minimum_fps_target: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -3091,6 +3333,7 @@ mod tests {
                     capture: FieldUpdate::Value(CaptureMode::Wgcc),
                     video_max_batch_size_kb: FieldUpdate::Omitted,
                     max_bitrate: FieldUpdate::Omitted,
+                    minimum_fps_target: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: false,
                 },
@@ -3098,16 +3341,16 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 8);
+        assert_eq!(pending.payload["version"], 9);
         assert_eq!(pending.payload["values"]["capture"], "wgcc");
 
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":8,"revision":5,
+                "ok":true,"found":true,"version":9,"revision":5,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"stream_audio":true,"capture":"wgcc",
-                    "video_max_batch_size_kb":null,"max_bitrate":null}
+                    "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null}
             })),
         );
         assert_eq!(product.configured_capture(), CaptureMode::Wgcc);

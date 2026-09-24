@@ -173,6 +173,7 @@ impl Controller {
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
+                        "minimum_fps_target": record.global_minimum_fps_target,
                         "capture": capture,
                         "profile": {
                             "width": record.request.width,

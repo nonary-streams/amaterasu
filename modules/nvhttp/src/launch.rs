@@ -250,6 +250,7 @@ pub struct Controller {
     global_stream_audio: bool,
     global_video_max_batch_size_kb: u8,
     global_max_bitrate_kbps: Option<u32>,
+    global_minimum_fps_target: f64,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -272,6 +273,7 @@ impl Controller {
             global_stream_audio: true,
             global_video_max_batch_size_kb: 64,
             global_max_bitrate_kbps: None,
+            global_minimum_fps_target: 20.0,
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -306,6 +308,10 @@ impl Controller {
 
     pub fn set_global_max_bitrate_kbps(&mut self, value: Option<u32>) {
         self.global_max_bitrate_kbps = value;
+    }
+
+    pub fn set_global_minimum_fps_target(&mut self, target: f64) {
+        self.global_minimum_fps_target = target;
     }
 
     pub fn busy(&self) -> bool {
@@ -347,6 +353,7 @@ impl Controller {
         let global_stream_audio = self.global_stream_audio;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
+        let global_minimum_fps_target = self.global_minimum_fps_target;
         let capture_output = self
             .configured_output_name
             .as_deref()
@@ -402,6 +409,7 @@ impl Controller {
             global_stream_audio,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
+            global_minimum_fps_target,
             capture_output,
             capture_provider,
             constant_rate,

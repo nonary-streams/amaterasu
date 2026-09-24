@@ -555,6 +555,30 @@ fn global_max_bitrate_caps_rtsp_profile_and_is_snapshotted_at_admission() {
 }
 
 #[test]
+fn global_minimum_fps_target_reaches_rtsp_open_and_is_snapshotted_at_admission() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_minimum_fps_target(23.5);
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    controller.set_global_minimum_fps_target(60.0);
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let rtsp_open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("RTSP open request");
+    assert_eq!(rtsp_open["minimum_fps_target"], 23.5);
+}
+
+#[test]
 fn maximum_bitrate_below_encoder_minimum_fails_before_launch_work() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

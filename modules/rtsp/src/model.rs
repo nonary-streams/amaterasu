@@ -381,7 +381,7 @@ impl Profile {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
@@ -397,6 +397,8 @@ pub struct Open {
     pub connect_data: u32,
     #[serde(default = "default_stream_audio")]
     pub stream_audio: bool,
+    #[serde(default = "default_minimum_fps_target")]
+    pub minimum_fps_target: f64,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -433,6 +435,9 @@ impl Open {
     }
 
     fn validate_capture(&self) -> Result<(), &'static str> {
+        if !valid_minimum_fps_target(self.minimum_fps_target) {
+            return Err("invalid_minimum_fps_target");
+        }
         if self.capture.constant_rate && self.capture.capture_provider != CaptureProvider::Wgc {
             return Err("constant_rate_requires_wgc");
         }
@@ -502,6 +507,7 @@ impl Open {
             "configuration": {
                 "capture_provider": self.capture.capture_provider,
                 "constant_rate": self.capture.constant_rate,
+                "minimum_fps_target": self.minimum_fps_target,
                 "output": self.capture.output,
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
@@ -519,6 +525,14 @@ impl Open {
 
 fn default_stream_audio() -> bool {
     true
+}
+
+fn default_minimum_fps_target() -> f64 {
+    20.0
+}
+
+fn valid_minimum_fps_target(value: f64) -> bool {
+    value.is_finite() && (0.0..=1000.0).contains(&value)
 }
 
 #[derive(Deserialize)]
@@ -830,6 +844,21 @@ mod tests {
         let mut invalid = open();
         invalid.profile.video_max_batch_size_kb = 65;
         assert_eq!(invalid.validate(false), Err("invalid_profile"));
+    }
+
+    #[test]
+    fn minimum_fps_target_reaches_stream_session_start_and_defaults_to_source_value() {
+        let mut request = open();
+        assert_eq!(request.minimum_fps_target, 20.0);
+        request.minimum_fps_target = 23.5;
+        assert!(request.validate(false).is_ok());
+        assert_eq!(request.arm(51)["configuration"]["minimum_fps_target"], 23.5);
+
+        request.minimum_fps_target = 1000.1;
+        assert_eq!(
+            request.validate_capture(),
+            Err("invalid_minimum_fps_target")
+        );
     }
 
     #[test]

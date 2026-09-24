@@ -47,6 +47,8 @@ enum Operation {
         video_max_batch_size_kb: FieldUpdate<u8>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         max_bitrate: FieldUpdate<i32>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        minimum_fps_target: FieldUpdate<f64>,
         expected_revision: u64,
     },
 }
@@ -172,6 +174,9 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.effective_video_max_batch_size_kb(),
             );
             router.set_global_max_bitrate_kbps(self.product_settings.effective_max_bitrate_kbps());
+            router.set_global_minimum_fps_target(
+                self.product_settings.effective_minimum_fps_target(),
+            );
         }
         if self.product_settings.loaded() {
             self.network_settings.tick(
@@ -423,6 +428,7 @@ impl NvhttpModule {
                                 capture,
                                 video_max_batch_size_kb,
                                 max_bitrate,
+                                minimum_fps_target,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -449,6 +455,7 @@ impl NvhttpModule {
                                     capture,
                                     video_max_batch_size_kb,
                                     max_bitrate,
+                                    minimum_fps_target,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -589,6 +596,7 @@ mod tests {
             capture: omitted_capture,
             video_max_batch_size_kb: omitted_batch_size,
             max_bitrate: omitted_max_bitrate,
+            minimum_fps_target: omitted_minimum_fps,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -604,6 +612,7 @@ mod tests {
         assert_eq!(omitted_capture, FieldUpdate::Omitted);
         assert_eq!(omitted_batch_size, FieldUpdate::Omitted);
         assert_eq!(omitted_max_bitrate, FieldUpdate::Omitted);
+        assert_eq!(omitted_minimum_fps, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -613,11 +622,12 @@ mod tests {
             capture: null_capture,
             video_max_batch_size_kb: null_batch_size,
             max_bitrate: null_max_bitrate,
+            minimum_fps_target: null_minimum_fps,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"stream_audio":null,"capture":null,
-            "video_max_batch_size_kb":null,"max_bitrate":null
+            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null
         }))
         .unwrap()
         else {
@@ -630,6 +640,7 @@ mod tests {
         assert_eq!(null_capture, FieldUpdate::Null);
         assert_eq!(null_batch_size, FieldUpdate::Null);
         assert_eq!(null_max_bitrate, FieldUpdate::Null);
+        assert_eq!(null_minimum_fps, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -639,11 +650,12 @@ mod tests {
             capture,
             video_max_batch_size_kb,
             max_bitrate,
+            minimum_fps_target,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","stream_audio":false,"capture":"wgcc",
-            "video_max_batch_size_kb":32,"max_bitrate":-15000
+            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5
         }))
         .unwrap()
         else {
@@ -656,6 +668,7 @@ mod tests {
         assert_eq!(capture, FieldUpdate::Value(CaptureMode::Wgcc));
         assert_eq!(video_max_batch_size_kb, FieldUpdate::Value(32));
         assert_eq!(max_bitrate, FieldUpdate::Value(-15_000));
+        assert_eq!(minimum_fps_target, FieldUpdate::Value(23.5));
 
         assert!(
             serde_json::from_value::<Operation>(json!({

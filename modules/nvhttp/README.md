@@ -90,11 +90,11 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. Product document versions 1 through 8
+active_http_port/active_https_port values. Product document versions 1 through 9
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
 address policy, v4 adds the global capture output, v5 adds audio enablement, v6
 adds the global capture mode, v7 adds the global video batch allowance, and v8
-adds the global maximum bitrate.
+adds the global maximum bitrate. V9 adds the nullable global minimum FPS target.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -226,9 +226,33 @@ the configured-profile cap. This slice applies only at launch; Amaterasu has no 
 
 Vibeshine's live `/bitrate` consumer applies a 500,000 kbps ceiling. That runtime
 path and ceiling are not implemented here; the current Amaterasu startup profile
-has a lower 100,000 kbps maximum. `minimum_fps_target` also remains pending: the
-reference initializer uses 20 while its documentation says 0, and its capture
-wait/duplicate-frame behavior needs a separate pacing design before implementation.
+has a lower 100,000 kbps maximum.
+
+## Minimum FPS target
+
+Product document v9 stores nullable `minimum_fps_target`. Settings updates accept
+finite numbers from 0 through 1000: omission preserves the stored value and
+`null` clears it. Reads expose the raw nullable value as
+`configured_minimum_fps_target` and its launch value as
+`effective_minimum_fps_target`. Documents v1 through v8 migrate with no stored
+value and the runtime default of 20 FPS.
+
+NVHTTP snapshots the effective target for each launch and forwards it through
+RTSP and stream-session to Video. Positive values request an idle repeat cadence;
+zero uses the negotiated capture FPS. Newly captured frames still submit
+immediately. Video keeps a bounded owned copy of the last accepted frame and
+attempts at most one repeat per module tick when idle. Fresh accepted captures
+take precedence over a repeat in the same tick, and output timestamps/sequences
+advance only when the encoder accepts the frame. Host tick cadence and encoder
+backpressure can reduce the achieved rate; targets above capture FPS are allowed
+but do not create a timer or catch-up burst.
+
+The pinned Vibeshine initializer and runtime use 20 FPS by default, while its
+documentation says zero means half the client FPS. Its runtime resolves zero to
+the negotiated FPS, so this implementation follows source behavior and records
+that documentation mismatch. This slice implements startup/session handoff and
+Video's idle repeats; it does not change the negotiated capture FPS or claim a
+real-time scheduler.
 
 ## Wire routes
 
