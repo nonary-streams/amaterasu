@@ -283,6 +283,8 @@ pub struct StartConfig {
     pub minimum_fps_target: f64,
     #[serde(default = "default_wgc_pacing_smoothing")]
     pub wgc_pacing_smoothing: bool,
+    #[serde(default)]
+    pub capture_sink_without_routing: bool,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,
@@ -413,6 +415,11 @@ mod tests {
         assert_eq!((config.audio.packet_ms, config.audio.bitrate), (10, 128000));
         let start: StartConfig = serde_json::from_value(start_json()).unwrap();
         assert!(start.validate(true).is_ok());
+        assert!(!start.capture_sink_without_routing);
+        let mut capture_only = start_json();
+        capture_only["capture_sink_without_routing"] = json!(true);
+        let capture_only: StartConfig = serde_json::from_value(capture_only).unwrap();
+        assert!(capture_only.capture_sink_without_routing);
         let without_audio: StartConfig = serde_json::from_value(json!({
             "output":"display-1","encoder":0,"audio_endpoint":"",
             "configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}

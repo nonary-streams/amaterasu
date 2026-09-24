@@ -403,6 +403,8 @@ pub struct Open {
     pub minimum_fps_target: f64,
     #[serde(default = "default_wgc_pacing_smoothing")]
     pub wgc_pacing_smoothing: bool,
+    #[serde(default)]
+    pub capture_sink_without_routing: bool,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -520,6 +522,7 @@ impl Open {
                 "output": self.capture.output,
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
+                "capture_sink_without_routing": self.capture_sink_without_routing,
                 "configuration": {
                     "width": self.profile.width,
                     "height": self.profile.height,
@@ -1173,6 +1176,25 @@ mod tests {
         assert_eq!(video["fps"], 60);
         assert_eq!(video["bitrate"], 16_000_000);
         assert_eq!(video["max_reference_frames"], 0);
+    }
+
+    #[test]
+    fn arm_forwards_capture_only_mode_and_legacy_open_defaults_to_routing() {
+        let legacy = open();
+        assert!(!legacy.capture_sink_without_routing);
+        assert_eq!(
+            legacy.arm(40)["configuration"]["capture_sink_without_routing"],
+            false
+        );
+
+        let mut value = open_json();
+        value["capture_sink_without_routing"] = json!(true);
+        let selected: Open = serde_json::from_value(value).unwrap();
+        assert!(selected.validate(false).is_ok());
+        assert_eq!(
+            selected.arm(41)["configuration"]["capture_sink_without_routing"],
+            true
+        );
     }
 
     #[test]

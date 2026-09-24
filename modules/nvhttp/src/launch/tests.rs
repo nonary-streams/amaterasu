@@ -50,6 +50,25 @@ fn peer_with_audio_sink(marker: u8, audio_sink: Option<&str>) -> PeerIdentity {
     peer_with_settings(marker, None, None, audio_sink.map(str::to_owned))
 }
 
+fn peer_with_capture_options(
+    marker: u8,
+    audio_sink: Option<&str>,
+    audio_sink_capture_only: Option<bool>,
+) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            None,
+            None,
+            audio_sink.map(str::to_owned),
+            audio_sink_capture_only,
+        )
+        .unwrap()
+}
+
 fn peer_with_settings(
     marker: u8,
     fec_percentage: Option<u8>,
@@ -66,6 +85,7 @@ fn peer_with_settings(
             fec_percentage,
             stream_audio,
             audio_sink,
+            None,
         )
         .unwrap()
 }
@@ -93,9 +113,16 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
     let certificate = vec![7; 32];
     let peer = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone()).unwrap();
     assert_eq!(
-        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None, None, None)
-            .err()
-            .unwrap(),
+        peer.with_paired_identity(
+            "moonlight-id".into(),
+            "00".repeat(32),
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap(),
         "invalid_paired_identity"
     );
     assert_eq!(
@@ -107,6 +134,7 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
                 None,
                 None,
                 Some("bad\nendpoint".into()),
+                None,
             )
             .err()
             .unwrap(),
@@ -119,6 +147,7 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
             fingerprint(&certificate),
             Some(37),
             Some(false),
+            None,
             None,
         )
         .unwrap();
@@ -285,6 +314,116 @@ fn audio_sink_overrides_preserve_empty_values_and_apply_client_app_global_preced
 }
 
 #[test]
+fn audio_sink_capture_only_requires_an_explicit_resolved_sink_and_uses_client_app_global_precedence()
+ {
+    let cases = [
+        (true, None, None, None, None, None, false, "default"),
+        (
+            true,
+            Some("endpoint.global"),
+            None,
+            None,
+            None,
+            None,
+            true,
+            "endpoint.global",
+        ),
+        (
+            true,
+            Some("endpoint.global"),
+            Some(false),
+            None,
+            None,
+            None,
+            false,
+            "endpoint.global",
+        ),
+        (
+            true,
+            Some("endpoint.global"),
+            Some(true),
+            Some(false),
+            None,
+            None,
+            false,
+            "endpoint.global",
+        ),
+        (
+            false,
+            None,
+            Some(true),
+            None,
+            Some("endpoint.app"),
+            None,
+            true,
+            "endpoint.app",
+        ),
+        (
+            true,
+            Some("endpoint.global"),
+            Some(false),
+            Some(true),
+            Some("endpoint.app"),
+            Some("endpoint.client"),
+            true,
+            "endpoint.client",
+        ),
+        (
+            true,
+            Some("endpoint.global"),
+            None,
+            None,
+            Some(""),
+            None,
+            false,
+            "default",
+        ),
+    ];
+
+    for (
+        index,
+        (
+            global_enabled,
+            global_sink,
+            app_enabled,
+            client_enabled,
+            app_sink,
+            client_sink,
+            expected,
+            endpoint,
+        ),
+    ) in cases.into_iter().enumerate()
+    {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_audio_sink_settings(global_sink);
+        controller.set_audio_sink_capture_only(global_enabled);
+        let peer = peer_with_capture_options(index as u8 + 20, client_sink, client_enabled);
+        let mut broker = Broker {
+            application_audio_sink: app_sink.map(str::to_owned),
+            application_audio_sink_capture_only: app_enabled,
+            ..Broker::default()
+        };
+
+        assert!(controller.launch(10, request(1), peer, now).is_none());
+        controller.set_audio_sink_capture_only(!global_enabled);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["capture_sink_without_routing"], expected);
+        assert_eq!(rtsp_open["capture"]["audio_endpoint"], endpoint);
+    }
+}
+
+#[test]
 fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
     let now = Instant::now();
     let selected = "endpoint.unavailable";
@@ -411,6 +550,7 @@ struct Broker {
     application_fec_percentage: Option<u8>,
     application_stream_audio: Option<bool>,
     application_audio_sink: Option<String>,
+    application_audio_sink_capture_only: Option<bool>,
 }
 
 impl Default for Broker {
@@ -438,6 +578,7 @@ impl Default for Broker {
             application_fec_percentage: None,
             application_stream_audio: None,
             application_audio_sink: None,
+            application_audio_sink_capture_only: None,
         }
     }
 }
@@ -550,6 +691,7 @@ impl Broker {
             if self.application_fec_percentage.is_some()
                 || self.application_stream_audio.is_some()
                 || self.application_audio_sink.is_some()
+                || self.application_audio_sink_capture_only.is_some()
             {
                 let mut config_overrides = json!({});
                 if let Some(fec_percentage) = self.application_fec_percentage {
@@ -560,6 +702,9 @@ impl Broker {
                 }
                 if let Some(audio_sink) = &self.application_audio_sink {
                     config_overrides["audio_sink"] = json!(audio_sink);
+                }
+                if let Some(capture_only) = self.application_audio_sink_capture_only {
+                    config_overrides["audio_sink_capture_only"] = json!(capture_only);
                 }
                 launch["config_overrides"] = config_overrides;
             }

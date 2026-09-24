@@ -292,7 +292,9 @@ impl Record {
                     "configuration":start.configuration,"packet_boundaries":true})
             }
             Resource::AudioCapture => {
-                json!({"action":"open","endpoint":self.start.as_ref().expect("validated start workflow").audio_endpoint})
+                let start = self.start.as_ref().expect("validated start workflow");
+                json!({"action":"open","endpoint":start.audio_endpoint,
+                    "capture_sink_without_routing":start.capture_sink_without_routing})
             }
         };
         payload["operation_id"] = json!(self.operation(resource));

@@ -1,7 +1,7 @@
 use super::{
-    CLEANUP_DEADLINE, Controller, Send, app_id,
+    AudioSinkCaptureOnlyOverrides, CLEANUP_DEADLINE, Controller, Send, app_id,
     call::{Call, Outcome},
-    key_hex, private_error,
+    capture_sink_without_routing, key_hex, private_error,
     record::{Record, Stage, State},
     success_reply,
 };
@@ -173,6 +173,7 @@ impl Controller {
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
+                        "capture_sink_without_routing": record.capture_sink_without_routing,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
@@ -262,21 +263,32 @@ impl Controller {
                                     .client_stream_audio
                                     .or(application_overrides.stream_audio)
                                     .unwrap_or(record.global_stream_audio);
-                                record.audio_endpoint = record
+                                let scoped_audio_sink = record
                                     .peer
                                     .client_audio_sink
                                     .as_deref()
-                                    .or(application_overrides.audio_sink.as_deref())
-                                    .map_or_else(
-                                        || record.audio_endpoint.clone(),
-                                        |audio_sink| {
-                                            if audio_sink.is_empty() {
-                                                record.bootstrap_audio_endpoint.clone()
-                                            } else {
-                                                audio_sink.to_owned()
-                                            }
-                                        },
-                                    );
+                                    .or(application_overrides.audio_sink.as_deref());
+                                let resolved_configured_audio_sink = match scoped_audio_sink {
+                                    Some("") => None,
+                                    Some(audio_sink) => Some(audio_sink.to_owned()),
+                                    None => record.global_configured_audio_sink.clone(),
+                                };
+                                record.audio_endpoint = resolved_configured_audio_sink
+                                    .as_deref()
+                                    .unwrap_or(&record.bootstrap_audio_endpoint)
+                                    .to_owned();
+                                // The endpoint has now been resolved using global, application,
+                                // then client precedence. Amaterasu has no virtual-sink setting.
+                                record.capture_sink_without_routing = capture_sink_without_routing(
+                                    record.global_audio_sink_capture_only,
+                                    AudioSinkCaptureOnlyOverrides {
+                                        application: application_overrides.audio_sink_capture_only,
+                                        client: record.peer.client_audio_sink_capture_only,
+                                    },
+                                    resolved_configured_audio_sink.as_deref(),
+                                    &record.audio_endpoint,
+                                    None,
+                                );
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -611,6 +623,7 @@ struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
+    audio_sink_capture_only: Option<bool>,
 }
 
 fn application_config_overrides(

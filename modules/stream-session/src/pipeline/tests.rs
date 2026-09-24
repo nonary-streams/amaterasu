@@ -103,6 +103,26 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
 }
 
 #[test]
+fn capture_only_snapshot_reaches_audio_capture_open() {
+    let mut host = Harness::new();
+    let prepared = host.response(1, prepare());
+    let id = prepared["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["capture_sink_without_routing"] = json!(true);
+
+    assert_eq!(host.response(2, request)["state"], "active");
+    let audio_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .expect("audio capture open");
+    assert_eq!(audio_open.payload["capture_sink_without_routing"], true);
+}
+
+#[test]
 fn selected_video_batch_limit_reaches_media_transport_open() {
     let mut host = Harness::new();
     let mut request = prepare();

@@ -90,11 +90,13 @@ stored base and repeats reconciliation. The settings response includes
 `active_rtsp_port` and `rtsp_listener_error` alongside the active HTTP ports.
 
 The live settings response includes the configured port, derived https_port, and
-active_http_port/active_https_port values. Product document versions 1 through 9
+active_http_port/active_https_port values. Product document versions 1 through 14
 remain readable: v1 stores the hostname, v2 adds the port, v3 adds the listener
 address policy, v4 adds the global capture output, v5 adds audio enablement, v6
-adds the global capture mode, v7 adds the global video batch allowance, and v8
-adds the global maximum bitrate. V9 adds the nullable global minimum FPS target.
+adds the global capture mode, v7 adds the global video batch allowance, v8 adds
+the global maximum bitrate, v9 adds the nullable global minimum FPS target, v10
+adds the global audio sink, v11 adds WGC pacing smoothing, v12 adds the external
+IP, v13 adds the ping timeout, and v14 adds audio sink capture-only policy.
 
 NVHTTP startup also accepts `address_family` (`ipv4` or `both`) and `bind_address`
 (an IP address or empty string). An explicit address replaces the IP for both HTTP
@@ -188,6 +190,29 @@ automatic WGC choice can depend on virtual-display and game context; Amaterasu d
 not yet model that policy. Per-client and per-application capture overrides are
 also not implemented. A direct RTSP open remains explicit about its provider and
 constant-rate flag.
+
+## Audio sink capture-only mode
+
+Product document v14 stores `audio_sink_capture_only`, defaulting to `false` for
+documents v1 through v13. NVHTTP's settings read returns the boolean. An omitted
+update preserves it; an explicit `true` or `false` is written with the expected
+product revision, while `null` is rejected. The management adapter can expose the
+field as `GET /v1/nvhttp/settings` and `POST /v1/nvhttp/settings_update`.
+
+Each stream snapshots this policy after resolving its audio endpoint. Endpoint
+selection uses global, application, then paired-client precedence; the capture-only
+boolean uses global, application, then certificate-verified client precedence, so
+an explicit `false` override disables a global or application `true`. The policy
+is forwarded through RTSP and stream-session to AudioCapture's
+`capture_sink_without_routing` open field. It is enabled only when the winning
+policy is true and the resolved configured sink is nonempty and matches the
+selected endpoint. An empty scoped sink selects the bootstrap endpoint and does
+not enable capture-only routing.
+
+Amaterasu does not currently model `virtual_sink`, so it cannot apply Vibeshine's
+virtual-sink exclusion. The management HTTP route and editor still need to expose
+the setting and sparse app/client override controls before the complete product
+configuration surface is available.
 
 ## Global video batch allowance
 

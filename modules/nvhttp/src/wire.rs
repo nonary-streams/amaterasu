@@ -160,6 +160,10 @@ impl Router {
         self.launches.set_audio_sink_settings(configured_audio_sink);
     }
 
+    pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
+        self.launches.set_audio_sink_capture_only(enabled);
+    }
+
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.launches.set_global_stream_audio(stream_audio);
     }
@@ -537,6 +541,7 @@ struct ClientConfigOverrides {
     fec_percentage: Option<u8>,
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
+    audio_sink_capture_only: Option<bool>,
 }
 
 #[cfg(test)]

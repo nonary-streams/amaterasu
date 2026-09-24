@@ -49,6 +49,7 @@ pub struct PeerIdentity {
     client_fec_percentage: Option<u8>,
     client_stream_audio: Option<bool>,
     client_audio_sink: Option<String>,
+    client_audio_sink_capture_only: Option<bool>,
 }
 
 impl PeerIdentity {
@@ -67,6 +68,7 @@ impl PeerIdentity {
             client_fec_percentage: None,
             client_stream_audio: None,
             client_audio_sink: None,
+            client_audio_sink_capture_only: None,
         })
     }
 
@@ -77,6 +79,7 @@ impl PeerIdentity {
         fec_percentage: Option<u8>,
         stream_audio: Option<bool>,
         audio_sink: Option<String>,
+        audio_sink_capture_only: Option<bool>,
     ) -> Result<Self, &'static str> {
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
@@ -93,6 +96,7 @@ impl PeerIdentity {
         self.client_fec_percentage = fec_percentage;
         self.client_stream_audio = stream_audio;
         self.client_audio_sink = audio_sink;
+        self.client_audio_sink_capture_only = audio_sink_capture_only;
         Ok(self)
     }
 
@@ -120,6 +124,30 @@ fn valid_fingerprint(value: &str) -> bool {
 
 pub(crate) fn valid_audio_sink_override(value: &str) -> bool {
     value.len() <= 4096 && !value.chars().any(char::is_control)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AudioSinkCaptureOnlyOverrides {
+    pub application: Option<bool>,
+    pub client: Option<bool>,
+}
+
+pub(crate) fn capture_sink_without_routing(
+    global_enabled: bool,
+    overrides: AudioSinkCaptureOnlyOverrides,
+    resolved_configured_audio_sink: Option<&str>,
+    selected_audio_sink: &str,
+    virtual_sink: Option<&str>,
+) -> bool {
+    let enabled = overrides
+        .client
+        .or(overrides.application)
+        .unwrap_or(global_enabled);
+    enabled
+        && resolved_configured_audio_sink.is_some_and(|configured_sink| {
+            !configured_sink.is_empty() && configured_sink == selected_audio_sink
+        })
+        && virtual_sink.is_none_or(str::is_empty)
 }
 
 fn fingerprint(certificate: &[u8]) -> String {
@@ -257,6 +285,7 @@ pub struct Controller {
     config: Option<StreamingConfig>,
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
+    global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
@@ -283,6 +312,7 @@ impl Controller {
             config,
             configured_output_name: None,
             configured_audio_sink: None,
+            global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
@@ -310,6 +340,10 @@ impl Controller {
 
     pub fn set_audio_sink_settings(&mut self, configured_audio_sink: Option<&str>) {
         self.configured_audio_sink = configured_audio_sink.map(str::to_owned);
+    }
+
+    pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
+        self.global_audio_sink_capture_only = enabled;
     }
 
     pub fn set_capture_mode(&mut self, configured_capture: CaptureMode) {
@@ -380,6 +414,7 @@ impl Controller {
         }
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
+        let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
@@ -444,6 +479,8 @@ impl Controller {
             connect_data,
             global_fec_percentage,
             global_stream_audio,
+            global_audio_sink_capture_only,
+            self.configured_audio_sink.clone(),
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,

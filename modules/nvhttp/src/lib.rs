@@ -42,6 +42,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        audio_sink_capture_only: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         external_ip: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         stream_audio: FieldUpdate<bool>,
@@ -177,6 +179,7 @@ impl ManagedModule for NvhttpModule {
                 self.product_settings.configured_output_name(),
             );
             router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
+            router.set_audio_sink_capture_only(self.product_settings.audio_sink_capture_only());
             router.set_global_stream_audio(self.product_settings.stream_audio());
             router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
             router.set_capture_mode(self.product_settings.configured_capture());
@@ -438,6 +441,7 @@ impl NvhttpModule {
                                 bind_address,
                                 output_name,
                                 audio_sink,
+                                audio_sink_capture_only,
                                 external_ip,
                                 stream_audio,
                                 capture,
@@ -469,6 +473,7 @@ impl NvhttpModule {
                                     bind_address,
                                     output_name,
                                     audio_sink,
+                                    audio_sink_capture_only,
                                     external_ip,
                                     stream_audio,
                                     capture,
@@ -716,5 +721,50 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn audio_sink_capture_only_update_keeps_omitted_null_and_explicit_false_distinct() {
+        let omitted: Operation = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,
+            "expected_revision":2
+        }))
+        .unwrap();
+        let Operation::SettingsUpdate {
+            audio_sink_capture_only,
+            ..
+        } = omitted
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(audio_sink_capture_only, FieldUpdate::Omitted);
+
+        let reset: Operation = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,
+            "expected_revision":2,"audio_sink_capture_only":null
+        }))
+        .unwrap();
+        let Operation::SettingsUpdate {
+            audio_sink_capture_only,
+            ..
+        } = reset
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(audio_sink_capture_only, FieldUpdate::Null);
+
+        let explicit_false: Operation = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,
+            "expected_revision":2,"audio_sink_capture_only":false
+        }))
+        .unwrap();
+        let Operation::SettingsUpdate {
+            audio_sink_capture_only,
+            ..
+        } = explicit_false
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(audio_sink_capture_only, FieldUpdate::Value(false));
     }
 }

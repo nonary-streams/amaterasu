@@ -426,6 +426,7 @@ impl Router {
                     config_overrides.fec_percentage,
                     config_overrides.stream_audio,
                     config_overrides.audio_sink,
+                    config_overrides.audio_sink_capture_only,
                 ) {
                     Ok(peer) => peer,
                     Err(_) => {
