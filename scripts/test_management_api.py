@@ -131,6 +131,79 @@ def test_auth_and_crud(console, api):
     assert status == 200 and logged_in["ok"], logged_in
     assert headers["Access-Control-Allow-Origin"] == ORIGIN
     administrator = logged_in["bearer"]
+    imported_clients = []
+    for client_name, certificate_name in [
+        ("Duplicate ID client one", "client-cert.pem"),
+        ("Duplicate ID client two", "host-cert.pem"),
+    ]:
+        imported = console.request("amaterasu.pairing/1", {
+            "action": "import_client",
+            "client_id": "duplicate-client-id",
+            "name": client_name,
+            "certificate_pem": (PAIRING_FIXTURES / certificate_name).read_text(),
+        })
+        assert imported["ok"], imported
+        imported_clients.append(client_name)
+    status, paired_clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and paired_clients["ok"], paired_clients
+    duplicates = [
+        client for client in paired_clients["clients"]
+        if client["client_id"] == "duplicate-client-id"
+    ]
+    assert len(duplicates) == 2, paired_clients
+    first_client = next(client for client in duplicates if client["name"] == imported_clients[0])
+    second_client = next(client for client in duplicates if client["name"] == imported_clients[1])
+    status, forged_owner, _ = api.post(
+        "/v1/pairing/update_client_config_overrides",
+        {
+            "certificate_id": first_client["certificate_id"],
+            "client_id": second_client["client_id"],
+            "expected_revision": paired_clients["revision"],
+            "config_overrides": {"fec_percentage": 41},
+        },
+        administrator,
+    )
+    assert status == 400 and not forged_owner["ok"], forged_owner
+    status, fec_update, _ = api.post(
+        "/v1/pairing/update_client_config_overrides",
+        {
+            "certificate_id": first_client["certificate_id"],
+            "expected_revision": paired_clients["revision"],
+            "config_overrides": {"fec_percentage": 47},
+        },
+        administrator,
+    )
+    assert status == 200 and fec_update["ok"], fec_update
+    status, paired_after_update, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and paired_after_update["ok"], paired_after_update
+    first_after_update = next(
+        client for client in paired_after_update["clients"]
+        if client["certificate_id"] == first_client["certificate_id"]
+    )
+    second_after_update = next(
+        client for client in paired_after_update["clients"]
+        if client["certificate_id"] == second_client["certificate_id"]
+    )
+    assert first_after_update.get("config_overrides", {}).get("fec_percentage") == 47, first_after_update
+    assert second_after_update.get("config_overrides", {}).get("fec_percentage") is None, second_after_update
+    status, stale_fec_update, _ = api.post(
+        "/v1/pairing/update_client_config_overrides",
+        {
+            "certificate_id": first_client["certificate_id"],
+            "expected_revision": paired_clients["revision"],
+            "config_overrides": {"fec_percentage": 61},
+        },
+        administrator,
+    )
+    assert status == 200 and not stale_fec_update["ok"], stale_fec_update
+    assert stale_fec_update["code"] == "revision_conflict", stale_fec_update
+    status, paired_after_conflict, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and paired_after_conflict["ok"], paired_after_conflict
+    persisted_client = next(
+        client for client in paired_after_conflict["clients"]
+        if client["certificate_id"] == first_client["certificate_id"]
+    )
+    assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
     status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
     assert status == 200 and auth_settings["ok"], auth_settings
     assert auth_settings["values"] == {
@@ -352,6 +425,17 @@ def test_auth_and_crud(console, api):
     assert token["ok"], token
     status, result, _ = api.post("/v1/catalog/list", token=token["bearer"])
     assert status == 200 and result["ok"], result
+    assert api.post("/v1/pairing/list_clients", token=token["bearer"])[0] == 403
+    status, result, _ = api.post(
+        "/v1/pairing/update_client_config_overrides",
+        {
+            "certificate_id": first_client["certificate_id"],
+            "expected_revision": paired_after_conflict["revision"],
+            "config_overrides": {"fec_percentage": 53},
+        },
+        token["bearer"],
+    )
+    assert status == 403 and not result["ok"], result
     status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": deleted["revision"]}, token["bearer"])
     assert status == 403 and not result["ok"], result
     assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
@@ -361,7 +445,17 @@ def test_auth_and_crud(console, api):
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
     assert api.post("/v1/runtime/request", {"service": "amaterasu.state/1"}, administrator)[0] == 404
-    return token, administrator, moved_port, steam_values, auth_values, saved_auth_settings["revision"], input_values, input_saved["revision"]
+    return (
+        token,
+        administrator,
+        moved_port,
+        steam_values,
+        auth_values,
+        saved_auth_settings["revision"],
+        input_values,
+        input_saved["revision"],
+        first_client["certificate_id"],
+    )
 
 
 def test_http_framing(api):
@@ -405,7 +499,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -434,6 +528,13 @@ def main():
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
             assert status == 200 and steam_settings["values"] == steam_values, steam_settings
+            status, paired_clients, _ = api.post("/v1/pairing/list_clients", token=relogged["bearer"])
+            assert status == 200 and paired_clients["ok"], paired_clients
+            persisted_client = next(
+                client for client in paired_clients["clients"]
+                if client["certificate_id"] == fec_client_id
+            )
+            assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -458,7 +559,9 @@ def main():
         finally:
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog CRUD, token persistence/revocation,")
-    print("Moonlight hostname/port live rebind and Steam settings CAS, discovery and restart persistence,")
+    print("Moonlight hostname/port live rebind, certificate-bound FEC override CAS and restart persistence,")
+    print("duplicate client-ID isolation and pairing admin scope enforcement,")
+    print("Steam settings CAS, discovery and restart persistence,")
     print("session restart invalidation,")
     print("input keyboard/mouse CAS policy persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 

@@ -29,6 +29,19 @@ namespace Amaterasu {
     return { keyboard, mouse };
   }
 
+  export function parseClientFecOverride(value: string): {
+    fec_percentage: number | null;
+  } {
+    const trimmed = value.trim();
+    if (trimmed === "") return { fec_percentage: null };
+    if (!/^(?:[1-9][0-9]{0,2})$/.test(trimmed))
+      throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
+    const percentage = Number(trimmed);
+    if (percentage > 255)
+      throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
+    return { fec_percentage: percentage };
+  }
+
   export function inputPolicyStatusDescription(
     settings: InputPolicySettings,
   ): string {
@@ -220,6 +233,7 @@ namespace Amaterasu {
     const hostArea = el("div");
     const steamArea = el("div");
     const inputArea = el("div");
+    const pairingArea = el("div");
     context.content.append(
       sectionHeading(
         "Settings",
@@ -230,6 +244,7 @@ namespace Amaterasu {
           void loadHost();
           void loadSteam();
           void loadInput();
+          void loadPairing();
         }),
       ),
       area,
@@ -237,6 +252,7 @@ namespace Amaterasu {
       hostArea,
       steamArea,
       inputArea,
+      pairingArea,
     );
     async function loadAuth(): Promise<void> {
       authArea.replaceChildren(el("p", "muted", "Loading authentication lifetimes…"));
@@ -426,6 +442,78 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           steamArea.replaceChildren(errorPanel(error, loadSteam));
+      }
+    }
+    async function loadPairing(): Promise<void> {
+      pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
+      try {
+        const settings = await context.api.post<PairingClients>("pairing/list_clients");
+        if (!context.content.isConnected) return;
+        if (settings.clients.length === 0) {
+          pairingArea.replaceChildren(
+            panel(
+              "Paired client overrides",
+              empty("No paired clients", "Pair a Moonlight client before setting client-specific streaming values."),
+              badge(`Revision ${settings.revision}`),
+            ),
+          );
+          return;
+        }
+        const rows = settings.clients.map((client) => {
+          const fec = input(
+            `fec_${client.certificate_id}`,
+            String(client.config_overrides?.fec_percentage ?? ""),
+            "number",
+          );
+          fec.min = "1";
+          fec.max = "255";
+          fec.step = "1";
+          fec.placeholder = "Inherit";
+          fec.setAttribute("aria-label", `FEC percentage override for ${client.name}`);
+          const status = el("div");
+          const save = button(
+            "Save",
+            () => runAction(save, status, async () => {
+              try {
+                await context.api.post("pairing/update_client_config_overrides", {
+                  certificate_id: client.certificate_id,
+                  expected_revision: settings.revision,
+                  config_overrides: parseClientFecOverride(fec.value),
+                });
+                context.notify(`Streaming override saved for ${client.name}.`);
+                await loadPairing();
+              } catch (error) {
+                if (error instanceof ApiError && error.code === "revision_conflict") {
+                  context.notify("Paired clients changed elsewhere. The list has been refreshed; review and save again.");
+                  await loadPairing();
+                  return;
+                }
+                throw error;
+              }
+            }),
+            "primary",
+          );
+          save.disabled = !context.api.allows("pairing.admin");
+          const identity = el(
+            "div",
+            "",
+            el("strong", "", client.name),
+            el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
+          );
+          return [identity, fec, el("div", "", save, status)];
+        });
+        const tableView = table(["Paired client", "FEC percentage", ""], rows);
+        pairingArea.replaceChildren(
+          panel(
+            "Paired client overrides",
+            el("p", "muted", "Blank inherits the application and host value. Each save uses the current pairing revision."),
+            tableView,
+            el("div", "actions", badge(`Revision ${settings.revision}`)),
+          ),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          pairingArea.replaceChildren(errorPanel(error, loadPairing));
       }
     }
     async function loadInput(): Promise<void> {
@@ -722,5 +810,6 @@ namespace Amaterasu {
     void loadHost();
     void loadSteam();
     void loadInput();
+    void loadPairing();
   }
 }

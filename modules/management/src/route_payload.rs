@@ -171,35 +171,6 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
     }
 }
 
-#[cfg(test)]
-mod input_tests {
-    use super::*;
-
-    #[test]
-    fn input_policy_route_fields_are_exact_and_typed() {
-        let route = Route {
-            service: "amaterasu.input/1",
-            action: "settings_update",
-            scope: Some("configuration.write"),
-            requires_empty_body: false,
-        };
-        for object in [
-            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0}),
-            serde_json::json!({"keyboard":false,"mouse":true,"expected_revision":u64::MAX}),
-        ] {
-            assert!(validate(route, object.as_object().unwrap()).is_ok());
-        }
-        for object in [
-            serde_json::json!({"keyboard":1,"mouse":true,"expected_revision":0}),
-            serde_json::json!({"keyboard":true,"mouse":"false","expected_revision":0}),
-            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":-1}),
-            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0,"owner":"other"}),
-        ] {
-            assert!(validate(route, object.as_object().unwrap()).is_err());
-        }
-    }
-}
-
 fn steam_exclusions(value: &Value) -> Result<(), &'static str> {
     let exclusions = value.as_array().ok_or(INVALID)?;
     if exclusions.len() > 256 {
@@ -342,6 +313,37 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(object, &["certificate_id"], &[])?;
             let id = text(object, "certificate_id")?;
             if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "update_client_config_overrides" => {
+            fields(
+                object,
+                &["certificate_id", "expected_revision", "config_overrides"],
+                &[],
+            )?;
+            let certificate_id = text(object, "certificate_id")?;
+            if certificate_id.len() != 64
+                || !certificate_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            let config_overrides = object
+                .get("config_overrides")
+                .and_then(Value::as_object)
+                .ok_or(INVALID)?;
+            fields(config_overrides, &[], &["fec_percentage"])?;
+            if let Some(percentage) = config_overrides.get("fec_percentage")
+                && !percentage.is_null()
+                && !percentage
+                    .as_u64()
+                    .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
+            {
                 return Err(INVALID);
             }
             Ok(())
@@ -505,5 +507,34 @@ fn launch(action: &str, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Err(INVALID),
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn input_policy_route_fields_are_exact_and_typed() {
+        let route = Route {
+            service: "amaterasu.input/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for object in [
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0}),
+            serde_json::json!({"keyboard":false,"mouse":true,"expected_revision":u64::MAX}),
+        ] {
+            assert!(validate(route, object.as_object().unwrap()).is_ok());
+        }
+        for object in [
+            serde_json::json!({"keyboard":1,"mouse":true,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":"false","expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":-1}),
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0,"owner":"other"}),
+        ] {
+            assert!(validate(route, object.as_object().unwrap()).is_err());
+        }
     }
 }

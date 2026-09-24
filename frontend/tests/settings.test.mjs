@@ -57,6 +57,16 @@ test("input policy editor preserves booleans and reports pending cleanup honestl
   assert.match(describe(settings), /policy is active/);
 });
 
+test("client FEC override editor preserves sparse inherit and validates bounded integers", () => {
+  const parseFec = context.Amaterasu.parseClientFecOverride;
+  assert.deepEqual(ordinary(parseFec("")), { fec_percentage: null });
+  assert.deepEqual(ordinary(parseFec("  ")), { fec_percentage: null });
+  assert.deepEqual(ordinary(parseFec("1")), { fec_percentage: 1 });
+  assert.deepEqual(ordinary(parseFec("255")), { fec_percentage: 255 });
+  for (const value of ["0", "256", "1.5", "1e2", "01", "-1", "abc"])
+    assert.throws(() => parseFec(value));
+});
+
 test("NVHTTP network settings preserve startup null and explicit blank overrides", () => {
   const parse = context.Amaterasu.parseNvhttpNetworkOverrides;
   assert.deepEqual(ordinary(parse("startup", true, "")), {

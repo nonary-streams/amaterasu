@@ -202,6 +202,7 @@ fn pairing_action(action: &str) -> Option<&'static str> {
         "list_clients" => Some("list_clients"),
         "approve_pin" => Some("approve_pin"),
         "unpair" => Some("unpair"),
+        "update_client_config_overrides" => Some("update_client_config_overrides"),
         _ => None,
     }
 }
@@ -317,6 +318,7 @@ mod tests {
             "list_clients",
             "approve_pin",
             "unpair",
+            "update_client_config_overrides",
         ] {
             let route = resolve(&format!("/v1/pairing/{action}")).unwrap();
             assert_eq!(route.service, "amaterasu.pairing/1");
@@ -353,6 +355,31 @@ mod tests {
             )
             .is_err()
         );
+        let update = resolve("/v1/pairing/update_client_config_overrides").unwrap();
+        assert!(payload(
+            update,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":37}}"#,
+        ).is_ok());
+        assert!(payload(
+            update,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":null}}"#,
+        ).is_ok());
+        assert!(payload(
+            update,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{}}"#,
+        ).is_ok());
+        for body in [
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"client_id":"forged","config_overrides":{"fec_percentage":37}}"#.as_slice(),
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":0}}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":256}}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":"37"}}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":{"fec_percentage":37,"unknown":true}}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"config_overrides":null}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":-1,"config_overrides":{"fec_percentage":37}}"#,
+            br#"{"certificate_id":"not-a-fingerprint","expected_revision":7,"config_overrides":{"fec_percentage":37}}"#,
+        ] {
+            assert!(payload(update, body).is_err());
+        }
     }
 
     #[test]

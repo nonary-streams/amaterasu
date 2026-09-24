@@ -90,6 +90,20 @@ namespace Amaterasu {
       remember_me_refresh_token_ttl_seconds: number;
     };
   }
+  export interface PairingClient {
+    certificate_id: string;
+    client_id: string;
+    name: string;
+    paired_at: number;
+    config_overrides?: {
+      fec_percentage?: number;
+    };
+  }
+  export interface PairingClients {
+    ok: boolean;
+    revision: number;
+    clients: PairingClient[];
+  }
   export interface InputPolicySettings {
     ok: boolean;
     persisted: boolean;
