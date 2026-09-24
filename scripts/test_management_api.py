@@ -1089,6 +1089,37 @@ def test_http_framing(api):
     assert api.post("/v1/auth/login", extra={"Host": "evil.invalid"})[0] == 400
 
 
+def test_history_settings(api, administrator, reader):
+    assert api.post("/v1/history/settings_get")[0] == 401
+    assert api.post("/v1/history/settings_get", token=reader)[0] == 403
+    status, initial, _ = api.post("/v1/history/settings_get", token=administrator)
+    assert status == 200 and initial["ok"], initial
+    assert initial["settings"] == {
+        "enabled": True, "ttl_days": 0, "db_size_limit_mb": 0,
+    }, initial
+    status, updated, _ = api.post("/v1/history/settings_update", {
+        "settings": {"enabled": True, "ttl_days": 7, "db_size_limit_mb": 16},
+        "expected_revision": initial["revision"],
+    }, administrator)
+    assert status == 200 and updated["ok"], updated
+    assert updated["revision"] == initial["revision"] + 1, updated
+    assert updated["settings"]["ttl_days"] == 7, updated
+    assert updated["settings"]["db_size_limit_mb"] == 16, updated
+    assert api.post("/v1/history/settings_update", {
+        "settings": {"enabled": True, "ttl_days": 8, "db_size_limit_mb": 16},
+        "expected_revision": initial["revision"],
+    }, administrator)[1]["code"] == "revision_conflict"
+    assert api.post("/v1/history/settings_update", {
+        "settings": {"enabled": True, "ttl_days": -1, "db_size_limit_mb": 0},
+        "expected_revision": updated["revision"],
+    }, administrator)[0] == 400
+    status, listed, _ = api.post("/v1/history/list_sessions", {"limit": 25}, administrator)
+    assert status == 200 and listed == {"ok": True, "sessions": []}, listed
+    status, history_status, _ = api.post("/v1/history/history_status", token=administrator)
+    assert status == 200 and history_status["status"]["available"], history_status
+    return updated["settings"], updated["revision"]
+
+
 def main():
     run(CARGO, "build", "--workspace", "--offline")
     with tempfile.TemporaryDirectory(prefix="amaterasu-management-") as temporary:
@@ -1122,6 +1153,7 @@ def main():
         try:
             api = Api(console)
             token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision, catalog_id, catalog_revision, catalog_entry, playnite_override_id, playnite_override_value = test_auth_and_crud(console, api)
+            history_values, history_revision = test_history_settings(api, session, token["bearer"])
             test_http_framing(api)
             console.eof()
         finally:
@@ -1141,6 +1173,9 @@ def main():
             status, input_settings, _ = api.post("/v1/input/settings_get", token=relogged["bearer"])
             assert status == 200 and input_settings["values"] == input_values, input_settings
             assert input_settings["revision"] == input_revision and input_settings["applied"], input_settings
+            status, history_settings, _ = api.post("/v1/history/settings_get", token=relogged["bearer"])
+            assert status == 200 and history_settings["settings"] == history_values, history_settings
+            assert history_settings["revision"] == history_revision, history_settings
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
@@ -1255,6 +1290,7 @@ def main():
     print("Steam settings CAS, discovery, authorized artwork retrieval and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
+    print("session history authorization, settings CAS, status, and restart persistence,")
     print("session restart invalidation,")
     print("input policy CAS, Right Alt and repeat settings, legacy field omission and restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
