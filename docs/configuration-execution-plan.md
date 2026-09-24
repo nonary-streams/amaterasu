@@ -58,6 +58,15 @@ change retention policy and read it after restart. Runtime stream metrics and
 remaining Vibeshine history semantics still require implementation and
 qualification, so the history IDs remain pending.
 
+Host bootstrap now parses global `min_log_level` and `log_path` and passes a
+typed policy into diagnostics. Accepted diagnostic records above the selected
+level reach a bounded per-session disk log; relative paths stay beneath the
+private state root. A signed host test checks level filtering and configured
+file output. These IDs remain pending because other host and native-library
+logs do not use this sink, updates require a worker restart, and prerelease
+defaults currently follow the host crate version rather than the product
+release channel.
+
 Legacy migration now follows configured `file_state` and
 `vibeshine_file_state` auxiliary paths when they resolve to contained regular
 files. Missing auxiliary leaves are skipped after their existing ancestors are
@@ -264,8 +273,10 @@ the timer on release or slot teardown. Failed native updates retain a retry
 state. Windows `SendInput` does not create a virtual controller, and macOS
 reports native injection as unsupported. Linux still needs runtime device and
 permission qualification, the reference controller profile choices are
-incomplete, and scoped application/client timeout resolution is still being
-integrated.
+incomplete. Sparse application and certificate-bound client timeout overrides
+now resolve client, then application, then durable global policy at input lease
+acquisition. The lease snapshots its effective value, so later global edits
+apply to later leases.
 Persisting either setting or displaying an editor control alone would not
 complete gamepad parity.
 
