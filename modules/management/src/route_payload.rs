@@ -11,6 +11,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         return fields(object, &[], &[]);
     }
     match route.service {
+        "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
         "amaterasu.launch/1" => launch(route.action, object),
@@ -18,6 +19,52 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.steam/1" => steam(route.action, object),
         _ => Ok(()),
     }
+}
+
+fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "login" => {
+            fields(object, &["username", "password"], &["remember_me"])?;
+            text(object, "username")?;
+            text(object, "password")?;
+            if object
+                .get("remember_me")
+                .is_some_and(|value| value.as_bool().is_none())
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "refresh" => {
+            fields(object, &["refresh_token"], &[])?;
+            authentication_token(text(object, "refresh_token")?)
+        }
+        "logout" => {
+            fields(object, &[], &["bearer", "refresh_token"])?;
+            match (object.get("bearer"), object.get("refresh_token")) {
+                (Some(bearer), None) => authentication_token(bearer.as_str().ok_or(INVALID)?),
+                (None, Some(refresh_token)) => {
+                    authentication_token(refresh_token.as_str().ok_or(INVALID)?)
+                }
+                _ => Err(INVALID),
+            }
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn authentication_token(value: &str) -> Result<(), &'static str> {
+    let Some(digest) = value.strip_prefix("ama_") else {
+        return Err(INVALID);
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn steam(action: &str, object: &Object) -> Result<(), &'static str> {

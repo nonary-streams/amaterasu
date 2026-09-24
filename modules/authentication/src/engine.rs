@@ -12,11 +12,15 @@ pub enum Change {
     },
 }
 
+#[derive(Clone)]
 struct Session {
     credential_digest: String,
     subject: String,
     scopes: BTreeSet<String>,
     expires_at: u64,
+    refresh_expires_at: u64,
+    refresh_token_digest: String,
+    remember_me: bool,
 }
 
 #[derive(Default)]
@@ -28,6 +32,7 @@ struct Attempts {
 pub struct Engine {
     settings: Settings,
     sessions: BTreeMap<String, Session>,
+    refresh_index: BTreeMap<String, String>,
     attempts: BTreeMap<String, Attempts>,
     global_attempts: Attempts,
     latest_time: u64,
@@ -38,6 +43,7 @@ impl Engine {
         Self {
             settings,
             sessions: BTreeMap::new(),
+            refresh_index: BTreeMap::new(),
             attempts: BTreeMap::new(),
             global_attempts: Attempts::default(),
             latest_time: 0,
@@ -48,7 +54,9 @@ impl Engine {
         // Never extend a session inside this instance when wall time rolls back.
         self.latest_time = self.latest_time.max(now);
         self.sessions
-            .retain(|_, session| session.expires_at > self.latest_time);
+            .retain(|_, session| session.refresh_expires_at > self.latest_time);
+        self.refresh_index
+            .retain(|_, session_id| self.sessions.contains_key(session_id));
         self.latest_time
     }
 
@@ -114,6 +122,8 @@ impl Engine {
         // that committed even when cancellation hid its write acknowledgment.
         self.sessions
             .retain(|_, session| Some(&session.credential_digest) == credential_digest.as_ref());
+        self.refresh_index
+            .retain(|_, session_id| self.sessions.contains_key(session_id));
         match operation {
             Operation::Status {} => Ok(Change::Read(json!({
                 "ok": true,
@@ -123,18 +133,31 @@ impl Engine {
             Operation::ChangePassword { password } => Self::change_password(document, password),
             Operation::ListSessions { offset, limit } => self.list_sessions(offset, limit),
             Operation::RevokeSession { session_id } => {
-                self.sessions.remove(&session_id);
+                self.remove_session(&session_id);
                 Ok(Change::Read(json!({"ok":true})))
             }
-            Operation::Login { username, password } => {
-                self.login(document, username, password, now)
-            }
+            Operation::Login {
+                username,
+                password,
+                remember_me,
+            } => self.login(document, username, password, remember_me, now),
+            Operation::Refresh { refresh_token } => self.refresh(refresh_token, now),
             Operation::Verify {
                 bearer,
                 required_scopes,
             } => self.verify(&document, bearer, required_scopes, now),
-            Operation::Logout { bearer } => {
-                self.sessions.remove(&crypto::token_digest(&bearer));
+            Operation::Logout {
+                bearer,
+                refresh_token,
+            } => {
+                if let Some(bearer) = bearer {
+                    self.remove_session(&crypto::token_digest(&bearer));
+                } else if let Some(refresh_token) = refresh_token {
+                    let refresh_digest = crypto::token_digest(&refresh_token);
+                    if let Some(session_id) = self.refresh_index.get(&refresh_digest).cloned() {
+                        self.remove_session(&session_id);
+                    }
+                }
                 Ok(Change::Read(json!({"ok":true})))
             }
             Operation::IssueToken {
@@ -178,7 +201,7 @@ impl Engine {
     }
 
     fn list_sessions(&self, offset: usize, limit: usize) -> Result<Change, &'static str> {
-        let sessions: Vec<_> = self.sessions.iter().skip(offset).take(limit).map(|(session_id, session)| json!({"session_id":session_id,"subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at})).collect();
+        let sessions: Vec<_> = self.sessions.iter().skip(offset).take(limit).map(|(session_id, session)| json!({"session_id":session_id,"subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at,"refresh_expires_at":session.refresh_expires_at,"remember_me":session.remember_me})).collect();
         let next_offset = offset
             .checked_add(sessions.len())
             .filter(|&next| next < self.sessions.len());
@@ -192,6 +215,7 @@ impl Engine {
         mut document: Document,
         username: String,
         password: String,
+        remember_me: bool,
         now: u64,
     ) -> Result<Change, &'static str> {
         let credential = document.credential.as_ref().ok_or("unauthorized")?;
@@ -213,9 +237,20 @@ impl Engine {
             return Err("session_limit");
         }
         let (bearer, digest) = crypto::issue_bearer()?;
-        let expires_at = now.checked_add(SESSION_SECONDS).ok_or("clock_failure")?;
+        let (refresh_token, refresh_digest) = crypto::issue_bearer()?;
+        let refresh_ttl = if remember_me {
+            self.settings.remember_me_refresh_token_ttl_seconds
+        } else {
+            DEFAULT_REFRESH_TOKEN_TTL_SECONDS
+        }
+        .max(self.settings.session_token_ttl_seconds);
+        let refresh_expires_at = now.checked_add(refresh_ttl).ok_or("clock_failure")?;
+        let expires_at = now
+            .checked_add(self.settings.session_token_ttl_seconds)
+            .ok_or("clock_failure")?
+            .min(refresh_expires_at);
         let scopes = self.settings.allowed_scopes.clone();
-        let response = json!({"ok":true,"bearer":bearer,"kind":"administrator_session","subject":username,"scopes":scopes,"expires_at":expires_at});
+        let response = json!({"ok":true,"bearer":bearer,"refresh_token":refresh_token,"kind":"administrator_session","subject":username,"scopes":scopes,"expires_at":expires_at,"refresh_expires_at":refresh_expires_at,"remember_me":remember_me});
         let upgraded = credential.legacy_salt.is_some();
         if upgraded {
             let credential = document
@@ -230,14 +265,18 @@ impl Engine {
             .as_ref()
             .expect("credential checked above");
         self.sessions.insert(
-            digest,
+            digest.clone(),
             Session {
                 credential_digest: crypto::token_digest(&credential.password_hash),
                 subject: username,
                 scopes,
                 expires_at,
+                refresh_expires_at,
+                refresh_token_digest: refresh_digest.clone(),
+                remember_me,
             },
         );
+        self.refresh_index.insert(refresh_digest, digest);
         if upgraded {
             document.validate().map_err(|_| "resource_limit")?;
             Ok(Change::Write {
@@ -254,6 +293,58 @@ impl Engine {
         }
     }
 
+    fn refresh(&mut self, refresh_token: String, now: u64) -> Result<Change, &'static str> {
+        let refresh_digest = crypto::token_digest(&refresh_token);
+        let session_id = self
+            .refresh_index
+            .get(&refresh_digest)
+            .cloned()
+            .ok_or("unauthorized")?;
+        let Some(mut session) = self.sessions.get(&session_id).cloned() else {
+            self.refresh_index.remove(&refresh_digest);
+            return Err("unauthorized");
+        };
+        if session.refresh_token_digest != refresh_digest || session.refresh_expires_at <= now {
+            self.remove_session(&session_id);
+            return Err("unauthorized");
+        }
+
+        // Mint the replacement pair before consuming the old refresh token. A
+        // randomness or clock failure therefore leaves the current session usable.
+        let (bearer, new_session_id) = crypto::issue_bearer()?;
+        let (new_refresh_token, new_refresh_digest) = crypto::issue_bearer()?;
+        let expires_at = now
+            .checked_add(self.settings.session_token_ttl_seconds)
+            .ok_or("clock_failure")?
+            .min(session.refresh_expires_at);
+        session.expires_at = expires_at;
+        session.refresh_token_digest = new_refresh_digest.clone();
+
+        self.remove_session(&session_id);
+        self.sessions
+            .insert(new_session_id.clone(), session.clone());
+        self.refresh_index
+            .insert(new_refresh_digest, new_session_id);
+
+        Ok(Change::Read(json!({
+            "ok": true,
+            "bearer": bearer,
+            "refresh_token": new_refresh_token,
+            "kind": "administrator_session",
+            "subject": session.subject,
+            "scopes": session.scopes,
+            "expires_at": session.expires_at,
+            "refresh_expires_at": session.refresh_expires_at,
+            "remember_me": session.remember_me
+        })))
+    }
+
+    fn remove_session(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            self.refresh_index.remove(&session.refresh_token_digest);
+        }
+    }
+
     fn verify(
         &self,
         document: &Document,
@@ -263,6 +354,9 @@ impl Engine {
     ) -> Result<Change, &'static str> {
         let digest = crypto::token_digest(&bearer);
         if let Some(session) = self.sessions.get(&digest) {
+            if session.expires_at <= now {
+                return Err("unauthorized");
+            }
             self.authorize_scopes(&session.scopes, &required_scopes)?;
             return Ok(Change::Read(
                 json!({"ok":true,"kind":"administrator_session","subject":session.subject,"scopes":session.scopes,"expires_at":session.expires_at}),
@@ -327,6 +421,7 @@ impl Engine {
 
     pub fn clear_sessions(&mut self) {
         self.sessions.clear();
+        self.refresh_index.clear();
     }
 
     fn authorize_scopes(

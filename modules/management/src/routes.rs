@@ -13,6 +13,8 @@ pub fn resolve(path: &str) -> Option<Route> {
     let (domain, action) = path.strip_prefix("/v1/")?.split_once('/')?;
     let (service, action, scope) = match (domain, action) {
         ("auth", "login") => ("amaterasu.authentication/1", "login", None),
+        ("auth", "refresh") => ("amaterasu.authentication/1", "refresh", None),
+        ("auth", "logout") => ("amaterasu.authentication/1", "logout", None),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -387,6 +389,66 @@ mod tests {
         assert!(payload(route, br#"{"action":"get"}"#).is_err());
         assert!(resolve("/v1/auth/issue_token").is_none());
         assert!(resolve("/v1/state/set").is_none());
+    }
+
+    #[test]
+    fn authentication_routes_only_expose_login_refresh_and_pair_logout() {
+        let login = resolve("/v1/auth/login").unwrap();
+        assert_eq!(login.service, "amaterasu.authentication/1");
+        assert_eq!(login.action, "login");
+        assert_eq!(login.scope, None);
+        assert!(
+            payload(
+                login,
+                br#"{"username":"admin","password":"correct horse battery staple"}"#
+            )
+            .is_ok()
+        );
+        assert!(payload(
+            login,
+            br#"{"username":"admin","password":"correct horse battery staple","remember_me":true}"#
+        )
+        .is_ok());
+        assert!(payload(
+            login,
+            br#"{"username":"admin","password":"correct horse battery staple","caller":"console"}"#
+        )
+        .is_err());
+
+        let token = format!("ama_{}", "a".repeat(64));
+        let refresh = resolve("/v1/auth/refresh").unwrap();
+        assert_eq!(refresh.scope, None);
+        assert_eq!(refresh.action, "refresh");
+        assert!(
+            payload(
+                refresh,
+                &serde_json::to_vec(&serde_json::json!({"refresh_token":token.clone()})).unwrap()
+            )
+            .is_ok()
+        );
+        assert!(payload(refresh, br#"{"refresh_token":"malformed"}"#).is_err());
+        assert!(resolve("/v1/auth/issue_token").is_none());
+
+        let logout = resolve("/v1/auth/logout").unwrap();
+        assert_eq!(logout.scope, None);
+        assert!(
+            payload(
+                logout,
+                &serde_json::to_vec(&serde_json::json!({"refresh_token":token.clone()})).unwrap()
+            )
+            .is_ok()
+        );
+        assert!(payload(logout, br#"{}"#).is_err());
+        assert!(
+            payload(
+                logout,
+                &serde_json::to_vec(
+                    &serde_json::json!({"bearer":token.clone(),"refresh_token":token})
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

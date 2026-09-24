@@ -4,14 +4,30 @@ use std::collections::BTreeSet;
 
 pub const MAX_TOKENS: usize = 32;
 pub const MAX_SCOPES: usize = 64;
-pub const SESSION_SECONDS: u64 = 900;
+pub const DEFAULT_SESSION_TOKEN_TTL_SECONDS: u64 = 7200;
+pub const DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS: u64 = 604800;
+pub const DEFAULT_REFRESH_TOKEN_TTL_SECONDS: u64 = 86400;
+pub const MAX_CONFIGURED_TTL_SECONDS: u64 = i32::MAX as u64;
 pub const MAX_TOKEN_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub allowed_scopes: BTreeSet<String>,
+    pub session_token_ttl_seconds: u64,
+    pub remember_me_refresh_token_ttl_seconds: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            administrator_principals: BTreeSet::new(),
+            allowed_scopes: BTreeSet::new(),
+            session_token_ttl_seconds: DEFAULT_SESSION_TOKEN_TTL_SECONDS,
+            remember_me_refresh_token_ttl_seconds: DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS,
+        }
+    }
 }
 
 impl Settings {
@@ -26,6 +42,9 @@ impl Settings {
                 .allowed_scopes
                 .iter()
                 .any(|value| !identifier(value, 64))
+            || !(1..=MAX_CONFIGURED_TTL_SECONDS).contains(&self.session_token_ttl_seconds)
+            || !(1..=MAX_CONFIGURED_TTL_SECONDS)
+                .contains(&self.remember_me_refresh_token_ttl_seconds)
         {
             return Err("invalid authentication settings");
         }
@@ -58,13 +77,21 @@ pub enum Operation {
     Login {
         username: String,
         password: String,
+        #[serde(default)]
+        remember_me: bool,
+    },
+    Refresh {
+        refresh_token: String,
     },
     Verify {
         bearer: String,
         required_scopes: BTreeSet<String>,
     },
     Logout {
-        bearer: String,
+        #[serde(default)]
+        bearer: Option<String>,
+        #[serde(default)]
+        refresh_token: Option<String>,
     },
     IssueToken {
         scopes: BTreeSet<String>,
@@ -86,14 +113,21 @@ impl Operation {
             Self::ChangePassword { password } => (12..=256).contains(&password.len()),
             Self::ListSessions { limit, .. } => (1..=4).contains(limit),
             Self::RevokeSession { session_id } => valid_digest(session_id),
-            Self::Login { username, password } => {
-                identifier(username, 64) && (1..=256).contains(&password.len())
-            }
+            Self::Login {
+                username, password, ..
+            } => identifier(username, 64) && (1..=256).contains(&password.len()),
+            Self::Refresh { refresh_token } => valid_bearer(refresh_token),
             Self::Verify {
                 bearer,
                 required_scopes,
             } => valid_bearer(bearer) && valid_scopes(required_scopes),
-            Self::Logout { bearer } => valid_bearer(bearer),
+            Self::Logout {
+                bearer,
+                refresh_token,
+            } => match (bearer.as_deref(), refresh_token.as_deref()) {
+                (Some(token), None) | (None, Some(token)) => valid_bearer(token),
+                _ => false,
+            },
             Self::IssueToken {
                 scopes,
                 ttl_seconds,
@@ -223,6 +257,64 @@ fn session_page_limit() -> usize {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+
+    #[test]
+    fn authentication_ttl_defaults_and_bounds_are_explicit() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.session_token_ttl_seconds, 7200);
+        assert_eq!(defaults.remember_me_refresh_token_ttl_seconds, 604800);
+        defaults.validate().unwrap();
+
+        let custom: Settings = serde_json::from_value(json!({
+            "session_token_ttl_seconds": 30,
+            "remember_me_refresh_token_ttl_seconds": 60
+        }))
+        .unwrap();
+        custom.validate().unwrap();
+
+        for invalid in [
+            json!({"session_token_ttl_seconds": 0}),
+            json!({"session_token_ttl_seconds": i32::MAX as u64 + 1}),
+            json!({"remember_me_refresh_token_ttl_seconds": 0}),
+            json!({"remember_me_refresh_token_ttl_seconds": i32::MAX as u64 + 1}),
+        ] {
+            let mut settings = defaults.clone();
+            if let Some(value) = invalid.get("session_token_ttl_seconds") {
+                settings.session_token_ttl_seconds = value.as_u64().unwrap();
+            }
+            if let Some(value) = invalid.get("remember_me_refresh_token_ttl_seconds") {
+                settings.remember_me_refresh_token_ttl_seconds = value.as_u64().unwrap();
+            }
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn login_and_logout_payloads_remain_backward_compatible_and_unambiguous() {
+        let old_login: Operation = serde_json::from_value(json!({
+            "action": "login",
+            "username": "admin",
+            "password": "correct horse battery staple"
+        }))
+        .unwrap();
+        assert!(old_login.validate().is_ok());
+
+        let token = format!("ama_{}", "a".repeat(64));
+        for payload in [
+            json!({"action":"logout","bearer":token.clone()}),
+            json!({"action":"logout","refresh_token":token.clone()}),
+        ] {
+            let logout: Operation = serde_json::from_value(payload).unwrap();
+            assert!(logout.validate().is_ok());
+        }
+        for payload in [
+            json!({"action":"logout"}),
+            json!({"action":"logout","bearer":token.clone(),"refresh_token":token}),
+        ] {
+            let logout: Operation = serde_json::from_value(payload).unwrap();
+            assert!(logout.validate().is_err());
+        }
+    }
 
     #[test]
     fn scope_capacity_supports_new_domains_but_remains_bounded() {

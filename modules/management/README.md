@@ -33,13 +33,22 @@ All business routes are POST and accept `Content-Type: application/json` with an
 object body. The route supplies `action`; including `action` in the body is an
 error. Remaining body fields are the target module's documented action arguments.
 
-`POST /v1/auth/login` accepts `{"username":"...","password":"..."}` and delegates
-to `amaterasu.authentication/1`. Successful login returns the auth library's JSON,
-including its bearer. Every protected route requires
+`POST /v1/auth/login` accepts `{"username":"...","password":"..."}` with an
+optional boolean `remember_me` and delegates to `amaterasu.authentication/1`.
+`POST /v1/auth/refresh` accepts a `refresh_token` body field and rotates the access
+and refresh pair. `POST /v1/auth/logout` accepts exactly one of `bearer` or
+`refresh_token` and revokes the pair. These three endpoints require no access
+header because login and refresh establish the credential; the refresh secret is
+validated by the authentication module. Successful login returns the auth
+library's JSON, including both token secrets. Every other protected route requires
 `Authorization: Bearer ama_<opaque token>`; cookies, query parameters and body
 fields do not provide authentication. Before each business request, the module
 calls auth `verify` with `bearer` and `required_scopes:[scope]`, requires an explicit
 successful result containing the exact scope, then dispatches the action.
+
+Frontend code keeps both secrets only in tab memory and renews access through the
+refresh endpoint. Reloading the page loses the tokens and requires login again;
+the remember-me setting controls refresh lifetime, not browser-storage persistence.
 
 | Route prefix | Actions | Required scope |
 | --- | --- | --- |

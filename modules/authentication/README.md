@@ -7,14 +7,18 @@ TLS, cookies, CSRF protection, public network policy, and frontend identity are
 separate responsibilities. Native code is trusted; runtime grants are not a
 native-code sandbox.
 
-Startup settings (both arrays default empty, denying administrator operations):
+Startup settings (administrator and scope arrays default empty, denying
+administrator operations):
 
 ```json
-{"administrator_principals":["amaterasu.console"],"allowed_scopes":["catalog.read","catalog.write"]}
+{"administrator_principals":["amaterasu.console"],"allowed_scopes":["catalog.read","catalog.write"],"session_token_ttl_seconds":7200,"remember_me_refresh_token_ttl_seconds":604800}
 ```
 
 The administrator list is restricted to 16 runtime principals. Scope names are
-exact strings, maximum 16 names of 64 bytes. There are no wildcard or implied
+exact strings, maximum 64 names of 64 bytes. Access-session lifetime defaults to
+7,200 seconds and remembered refresh lifetime defaults to 604,800 seconds. Both
+settings accept integers from 1 through 2,147,483,647 seconds. Non-remembered
+refresh lifetime is fixed at 86,400 seconds. There are no wildcard or implied
 scopes. Deployments choose the vocabulary together with consumers. The module
 needs a `provide` grant for authentication and a `call` grant for
 `amaterasu.state/1`. Consumers need authentication call permission. State requests
@@ -27,12 +31,13 @@ The following strict JSON actions are supported:
 
 ```json
 {"action":"setup","username":"admin","password":"a long administrator password"}
-{"action":"login","username":"admin","password":"a long administrator password"}
+{"action":"login","username":"admin","password":"a long administrator password","remember_me":true}
+{"action":"refresh","refresh_token":"ama_<64 lowercase hex digits>"}
 {"action":"change_password","password":"a new long administrator password"}
 {"action":"list_sessions","offset":0,"limit":4}
 {"action":"revoke_session","session_id":"<64 lowercase hex digest digits>"}
 {"action":"verify","bearer":"ama_<64 lowercase hex digits>","required_scopes":["catalog.read"]}
-{"action":"logout","bearer":"ama_<64 lowercase hex digits>"}
+{"action":"logout","refresh_token":"ama_<64 lowercase hex digits>"}
 {"action":"issue_token","scopes":["catalog.read"],"ttl_seconds":3600}
 {"action":"list_tokens"}
 {"action":"revoke_token","token_id":"<64 lowercase hex digest digits>"}
@@ -73,16 +78,29 @@ credential. Passwords and verifier values are never printed. The installer must
 call `validate` before takeover and call `seed` only on the copied
 `DATA_ROOT/legacy-imports/PRODUCT` source.
 
-Successful login returns `ok`, `bearer`, `kind:"administrator_session"`, `subject`
-(the administrator username), `scopes`, and `expires_at` (Unix seconds). Sessions
-receive the configured scope set, last 900 seconds, and are held only in memory
-under their SHA-256 digest. There are at most 128 active sessions. Logout removes
-a session, is idempotent, and does not revoke API tokens. Module restart invalidates
-sessions. Verify returns the same identity/scope/expiry metadata without the
-bearer, with kind `administrator_session` or `api_token`; a token's subject is its
-issuing runtime principal. All required scopes must match. Removing a configured
-scope denies any session/token that still grants it, including otherwise valid
-requests for a smaller subset.
+Successful login returns `ok`, access `bearer`, `refresh_token`,
+`kind:"administrator_session"`, `subject` (the administrator username), `scopes`,
+`expires_at`, `refresh_expires_at`, and `remember_me`. Access lifetime uses
+`session_token_ttl_seconds`. A non-remembered refresh token lasts 86,400 seconds;
+a remembered refresh token uses `remember_me_refresh_token_ttl_seconds`. Refresh
+rotates both tokens and never extends the original absolute refresh expiry. Access
+tokens can expire earlier and be renewed while their refresh token remains valid.
+The refresh token is accepted only by `refresh` and `logout`; either a refresh
+token or access bearer can revoke its entire session pair. Logout is idempotent
+and does not revoke API tokens. Session metadata listings include access and
+refresh expiration plus the remember-me flag, but never either secret.
+
+Sessions and refresh-token digests are held only in memory. Module restart and
+browser reload lose active authentication; login is then required again. Browser
+clients should keep both secrets in tab memory rather than durable browser storage.
+The packaged runtime profile supplies default TTL settings, but this module has no
+administrator-facing live settings editor. These limitations mean the complete
+remember-me persistence and operator-editable TTL behavior is not yet implemented.
+There are at most 128 active sessions. Verify returns identity/scope/expiry
+metadata without the bearer, with kind `administrator_session` or `api_token`; a
+token's subject is its issuing runtime principal. All required scopes must match.
+Removing a configured scope denies any session/token that still grants it,
+including otherwise valid requests for a smaller subset.
 
 Token issuance returns `ok`, the one-time `bearer`, its `token_id`, `scopes`, and
 `expires_at`. The ID is the SHA-256 bearer digest and may be used for revocation;

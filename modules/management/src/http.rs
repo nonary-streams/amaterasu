@@ -363,6 +363,37 @@ mod tests {
     }
 
     #[test]
+    fn auth_refresh_and_logout_require_body_secrets_without_access_headers() {
+        let token = format!("ama_{}", "a".repeat(64));
+        for (path, body) in [
+            (
+                "/v1/auth/login",
+                r#"{"username":"admin","password":"correct horse battery staple"}"#.to_owned(),
+            ),
+            (
+                "/v1/auth/refresh",
+                serde_json::json!({"refresh_token":token.clone()}).to_string(),
+            ),
+            (
+                "/v1/auth/logout",
+                serde_json::json!({"refresh_token":token.clone()}).to_string(),
+            ),
+        ] {
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let parsed = parse(request.as_bytes(), HOST, &[]).unwrap().unwrap();
+            assert!(parsed.bearer.is_none());
+            assert_eq!(parsed.payload["action"], path.rsplit('/').next().unwrap());
+            assert!(matches!(
+                parsed.target,
+                RequestTarget::Api(Route { scope: None, .. })
+            ));
+        }
+    }
+
+    #[test]
     fn static_gets_are_bodyless_public_targets_not_api_commands() {
         for path in ["/", "/app.js", "/styles.css", "/web/0123456789/app.js"] {
             let bytes = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
