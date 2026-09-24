@@ -335,6 +335,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-playnite"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "amaterasu-release"
 version = "0.1.0"
 dependencies = [

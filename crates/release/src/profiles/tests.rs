@@ -266,9 +266,12 @@ fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_relo
 }
 
 #[test]
-fn steam_imports_have_a_fixed_catalog_owner_and_narrow_service_grant() {
+fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
     assert!(STEAM.calls.contains(&"amaterasu.catalog/1"));
     assert!(STEAM.dependencies.contains(&CATALOG.id));
+    assert!(PLAYNITE.calls.contains(&"amaterasu.catalog/1"));
+    assert!(PLAYNITE.calls.contains(&"amaterasu.configuration/1"));
+    assert!(PLAYNITE.dependencies.contains(&CATALOG.id));
 
     let root = std::env::temp_dir().join(format!(
         "amaterasu-steam-import-profile-{}",
@@ -283,12 +286,30 @@ fn steam_imports_have_a_fixed_catalog_owner_and_narrow_service_grant() {
     for policy in [development, installer] {
         assert_eq!(
             policy.settings[CATALOG.id]["import_principals"],
-            json!({"amaterasu.steam": "amaterasu.management"})
+            json!({
+                "amaterasu.steam": "amaterasu.management",
+                "amaterasu.playnite": "amaterasu.management"
+            })
         );
         assert!(
             policy.principals[STEAM.id]
                 .call
                 .contains("amaterasu.catalog/1")
+        );
+        assert!(
+            policy.principals[PLAYNITE.id]
+                .call
+                .contains("amaterasu.catalog/1")
+        );
+        assert!(
+            policy.principals[PLAYNITE.id]
+                .call
+                .contains("amaterasu.configuration/1")
+        );
+        assert!(
+            policy.principals[MANAGEMENT.id]
+                .call
+                .contains("amaterasu.playnite/1")
         );
     }
 }

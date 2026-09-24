@@ -134,6 +134,17 @@ const STEAM: ComponentDefinition = ComponentDefinition {
     ],
 };
 
+const PLAYNITE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.playnite",
+    library: "amaterasu_playnite",
+    provides: &["amaterasu.playnite/1"],
+    calls: &["amaterasu.catalog/1", "amaterasu.configuration/1"],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.catalog", "amaterasu.configuration"],
+};
+
 const AUTHENTICATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.authentication",
     library: "amaterasu_authentication",
@@ -491,6 +502,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session/1",
         "amaterasu.application/1",
         "amaterasu.steam/1",
+        "amaterasu.playnite/1",
         "amaterasu.diagnostics/1",
         "amaterasu.pairing/1",
         "amaterasu.display/1",
@@ -520,6 +532,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session",
         "amaterasu.application",
         "amaterasu.steam",
+        "amaterasu.playnite",
         "amaterasu.diagnostics",
         "amaterasu.pairing",
         "amaterasu.display",
@@ -577,6 +590,7 @@ impl PackageProfile {
                 APPLICATION,
                 DIAGNOSTICS,
                 STEAM,
+                PLAYNITE,
                 AUTHENTICATION,
                 MANAGEMENT,
                 PAIRING,
@@ -674,7 +688,10 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
-                "import_principals": {"amaterasu.steam": "amaterasu.management"},
+                "import_principals": {
+                    "amaterasu.steam": "amaterasu.management",
+                    "amaterasu.playnite": "amaterasu.management",
+                },
             }),
         ),
         ("amaterasu.input".into(), json!({"allow_injection": false})),
@@ -756,7 +773,10 @@ pub fn installer_policy(
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
-                "import_principals": {"amaterasu.steam": "amaterasu.management"},
+                "import_principals": {
+                    "amaterasu.steam": "amaterasu.management",
+                    "amaterasu.playnite": "amaterasu.management",
+                },
             }),
         ),
         (

@@ -1,0 +1,673 @@
+use crate::settings::ProductSettings;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const MAX_GAMES: usize = 50_000;
+pub const MAX_CATEGORIES: usize = 4_096;
+pub const MAX_PLUGINS: usize = 4_096;
+pub const MAX_LINE_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Game {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default, rename = "workingDir")]
+    pub working_directory: String,
+    #[serde(default, rename = "installDir")]
+    pub install_directory: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default, rename = "pluginId")]
+    pub plugin_id: String,
+    #[serde(default, rename = "pluginName")]
+    pub plugin_name: String,
+    #[serde(default, rename = "lastPlayed")]
+    pub last_played: String,
+    #[serde(default)]
+    pub installed: Option<bool>,
+    #[serde(default, rename = "isInstalled")]
+    pub is_installed: Option<bool>,
+}
+
+impl Game {
+    pub fn is_installed(&self) -> Option<bool> {
+        match (self.installed, self.is_installed) {
+            (Some(installed), Some(is_installed)) => Some(installed || is_installed),
+            (Some(installed), None) => Some(installed),
+            (None, Some(is_installed)) => Some(is_installed),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Category {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Plugin {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Snapshot {
+    pub games: Vec<Game>,
+    pub categories: Vec<Category>,
+    pub plugins: Vec<Plugin>,
+}
+
+#[derive(Default)]
+pub struct SnapshotAssembler {
+    current: Option<IncompleteSnapshot>,
+}
+
+#[derive(Default)]
+struct IncompleteSnapshot {
+    games: Vec<Game>,
+    ids: BTreeSet<String>,
+    categories: Option<Vec<Category>>,
+    plugins: Option<Vec<Plugin>>,
+    invalid: bool,
+}
+
+impl SnapshotAssembler {
+    /// Consumes one newline-delimited extension message. A snapshot is exposed
+    /// only when both lookup lists and the declared game count are complete.
+    pub fn receive_line(&mut self, line: &[u8]) -> Option<Result<Snapshot, &'static str>> {
+        if line.is_empty() || line.len() > MAX_LINE_BYTES {
+            if let Some(current) = &mut self.current {
+                current.invalid = true;
+            }
+            return None;
+        }
+        let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+            if let Some(current) = &mut self.current {
+                current.invalid = true;
+            }
+            return None;
+        };
+        let Some(kind) = message.get("type").and_then(serde_json::Value::as_str) else {
+            if let Some(current) = &mut self.current {
+                current.invalid = true;
+            }
+            return None;
+        };
+        match kind {
+            "snapshotStart" => {
+                self.current = Some(IncompleteSnapshot::default());
+                None
+            }
+            "plugins" => self.receive_plugins(message.get("payload")),
+            "categories" => self.receive_categories(message.get("payload")),
+            "games" => self.receive_games(message.get("payload")),
+            "snapshotComplete" => self.finish(message.get("games")),
+            "status" | "commandResult" | "hello" => None,
+            _ => {
+                if let Some(current) = &mut self.current {
+                    current.invalid = true;
+                }
+                None
+            }
+        }
+    }
+
+    fn receive_plugins(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Option<Result<Snapshot, &'static str>> {
+        let Some(current) = &mut self.current else {
+            return None;
+        };
+        let Some(plugins) =
+            payload.and_then(|payload| serde_json::from_value::<Vec<Plugin>>(payload.clone()).ok())
+        else {
+            current.invalid = true;
+            return None;
+        };
+        if plugins.len() > MAX_PLUGINS
+            || plugins.iter().any(|plugin| {
+                (plugin.id.is_empty() && plugin.name.is_empty())
+                    || plugin.id.len() > 512
+                    || plugin.name.len() > 512
+                    || plugin.id.chars().any(char::is_control)
+                    || plugin.name.chars().any(char::is_control)
+            })
+            || current.plugins.replace(plugins).is_some()
+        {
+            current.invalid = true;
+        }
+        None
+    }
+
+    fn receive_categories(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Option<Result<Snapshot, &'static str>> {
+        let Some(current) = &mut self.current else {
+            return None;
+        };
+        let Some(categories) = payload
+            .and_then(|payload| serde_json::from_value::<Vec<Category>>(payload.clone()).ok())
+        else {
+            current.invalid = true;
+            return None;
+        };
+        if categories.len() > MAX_CATEGORIES
+            || categories.iter().any(|category| {
+                (category.id.is_empty() && category.name.is_empty())
+                    || category.id.len() > 512
+                    || category.name.len() > 512
+                    || category.id.chars().any(char::is_control)
+                    || category.name.chars().any(char::is_control)
+            })
+            || current.categories.replace(categories).is_some()
+        {
+            current.invalid = true;
+        }
+        None
+    }
+
+    fn receive_games(
+        &mut self,
+        payload: Option<&serde_json::Value>,
+    ) -> Option<Result<Snapshot, &'static str>> {
+        let Some(current) = &mut self.current else {
+            return None;
+        };
+        let Some(games) =
+            payload.and_then(|payload| serde_json::from_value::<Vec<Game>>(payload.clone()).ok())
+        else {
+            current.invalid = true;
+            return None;
+        };
+        if current.games.len().saturating_add(games.len()) > MAX_GAMES {
+            current.invalid = true;
+            return None;
+        }
+        for game in games {
+            let id = game.id.to_lowercase();
+            if game.id.trim().is_empty()
+                || game.id.len() > 512
+                || game.id.chars().any(char::is_control)
+                || game.name.len() > 1_024
+                || game.name.chars().any(char::is_control)
+                || game.is_installed().is_none()
+                || game.categories.len() > MAX_CATEGORIES
+                || game
+                    .categories
+                    .iter()
+                    .any(|category| category.len() > 512 || category.chars().any(char::is_control))
+                || !current.ids.insert(id)
+            {
+                current.invalid = true;
+                continue;
+            }
+            current.games.push(game);
+        }
+        None
+    }
+
+    fn finish(
+        &mut self,
+        declared_count: Option<&serde_json::Value>,
+    ) -> Option<Result<Snapshot, &'static str>> {
+        let current = self.current.take()?;
+        let Some(expected_count) = declared_count.and_then(serde_json::Value::as_u64) else {
+            return Some(Err("snapshot completion omitted a valid game count"));
+        };
+        if current.invalid
+            || current.games.len() as u64 != expected_count
+            || current.categories.is_none()
+            || current.plugins.is_none()
+        {
+            return Some(Err("Playnite snapshot was incomplete or malformed"));
+        }
+        Some(Ok(Snapshot {
+            games: current.games,
+            categories: current.categories.unwrap_or_default(),
+            plugins: current.plugins.unwrap_or_default(),
+        }))
+    }
+}
+
+pub fn select_games(snapshot: &Snapshot, settings: &ProductSettings, now_unix: i64) -> Vec<Game> {
+    let mut installed: Vec<&Game> = snapshot
+        .games
+        .iter()
+        .filter(|game| game.is_installed() == Some(true))
+        .collect();
+    installed.sort_by(|left, right| right.last_played.cmp(&left.last_played));
+
+    let included_categories = lower_set(&settings.sync_categories);
+    let excluded_categories = lower_set(&settings.exclude_categories);
+    let included_plugins = lower_set(&settings.sync_plugins);
+    let excluded_plugins = lower_set(&settings.exclude_plugins);
+    let excluded_games = lower_set(&settings.exclude_games);
+    let mut selected = BTreeMap::<String, &Game>::new();
+
+    if settings.recent_games > 0 {
+        let cutoff = i64::from(settings.recent_max_age_days)
+            .checked_mul(86_400)
+            .and_then(|age| now_unix.checked_sub(age));
+        let mut recent_count = 0;
+        for game in &installed {
+            if is_excluded(
+                game,
+                &excluded_games,
+                &excluded_categories,
+                &excluded_plugins,
+            ) {
+                continue;
+            }
+            if settings.recent_max_age_days > 0
+                && !parse_iso8601_unix(&game.last_played)
+                    .zip(cutoff)
+                    .is_some_and(|(last_played, cutoff)| last_played >= cutoff)
+            {
+                continue;
+            }
+            selected.insert(game.id.to_lowercase(), game);
+            recent_count += 1;
+            if recent_count == settings.recent_games as usize {
+                break;
+            }
+        }
+    }
+
+    for game in &installed {
+        if is_excluded(
+            game,
+            &excluded_games,
+            &excluded_categories,
+            &excluded_plugins,
+        ) {
+            continue;
+        }
+        if settings.sync_all_installed
+            || game
+                .categories
+                .iter()
+                .any(|category| included_categories.contains(&category.to_lowercase()))
+            || included_plugins.contains(&game.plugin_id.to_lowercase())
+        {
+            selected.insert(game.id.to_lowercase(), game);
+        }
+    }
+
+    selected.into_values().cloned().collect()
+}
+
+fn is_excluded(
+    game: &Game,
+    excluded_games: &BTreeSet<String>,
+    excluded_categories: &BTreeSet<String>,
+    excluded_plugins: &BTreeSet<String>,
+) -> bool {
+    excluded_games.contains(&game.id.to_lowercase())
+        || excluded_plugins.contains(&game.plugin_id.to_lowercase())
+        || game
+            .categories
+            .iter()
+            .any(|category| excluded_categories.contains(&category.to_lowercase()))
+}
+
+fn lower_set(values: &[String]) -> BTreeSet<String> {
+    values.iter().map(|value| value.to_lowercase()).collect()
+}
+
+pub fn parse_iso8601_unix(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 19
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let year = parse_decimal(&bytes[0..4])? as i64;
+    let month = parse_decimal(&bytes[5..7])? as i64;
+    let day = parse_decimal(&bytes[8..10])? as i64;
+    let hour = parse_decimal(&bytes[11..13])? as i64;
+    let minute = parse_decimal(&bytes[14..16])? as i64;
+    let second = parse_decimal(&bytes[17..19])? as i64;
+    if !(1..=12).contains(&month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+    let mut position = 19;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == start {
+            return None;
+        }
+    }
+    let mut offset_seconds = 0_i64;
+    match bytes.get(position) {
+        None => {}
+        Some(b'Z' | b'z') if position + 1 == bytes.len() => {}
+        Some(sign @ (b'+' | b'-')) => {
+            if bytes.len() != position + 6 || bytes.get(position + 3) != Some(&b':') {
+                return None;
+            }
+            let hours = parse_decimal(&bytes[position + 1..position + 3])? as i64;
+            let minutes = parse_decimal(&bytes[position + 4..position + 6])? as i64;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let direction = if *sign == b'+' { 1 } else { -1 };
+            offset_seconds = direction * (hours * 3_600 + minutes * 60);
+        }
+        _ => return None,
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?
+        .checked_sub(offset_seconds)
+}
+
+fn parse_decimal(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        value.checked_mul(10)?.checked_add(u32::from(*byte - b'0'))
+    })
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || value.starts_with("\\\\")
+}
+
+pub fn executable_launch(game: &Game) -> Option<serde_json::Value> {
+    if game.name.trim().is_empty() || !is_windows_absolute_path(&game.exe) {
+        return None;
+    }
+    let arguments = parse_windows_arguments(&game.args)?;
+    let working_directory = if !game.working_directory.is_empty() {
+        game.working_directory.as_str()
+    } else if !game.install_directory.is_empty() {
+        game.install_directory.as_str()
+    } else {
+        ""
+    };
+    if !working_directory.is_empty() && !is_windows_absolute_path(working_directory) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind":"executable",
+        "program":game.exe,
+        "arguments":arguments,
+        "working_directory":if working_directory.is_empty() { None } else { Some(working_directory) },
+    }))
+}
+
+/// Splits the Windows CRT command-line argument string without invoking a shell.
+fn parse_windows_arguments(value: &str) -> Option<Vec<String>> {
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+    if value.len() > 8_192 || value.contains('\0') {
+        return None;
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let mut arguments = Vec::new();
+    let mut position = 0;
+    while position < chars.len() {
+        while chars
+            .get(position)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            position += 1;
+        }
+        if position == chars.len() {
+            break;
+        }
+        let mut argument = String::new();
+        let mut quoted = false;
+        while position < chars.len() {
+            let mut backslashes = 0;
+            while chars.get(position) == Some(&'\\') {
+                backslashes += 1;
+                position += 1;
+            }
+            if chars.get(position) == Some(&'"') {
+                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 1 {
+                    argument.push('"');
+                    position += 1;
+                } else if quoted && chars.get(position + 1) == Some(&'"') {
+                    argument.push('"');
+                    position += 2;
+                } else {
+                    quoted = !quoted;
+                    position += 1;
+                }
+                continue;
+            }
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            if position == chars.len() || (!quoted && chars[position].is_whitespace()) {
+                break;
+            }
+            argument.push(chars[position]);
+            position += 1;
+        }
+        if quoted {
+            return None;
+        }
+        arguments.push(argument);
+        if arguments.len() > 32 || arguments.iter().map(String::len).sum::<usize>() > 8_192 {
+            return None;
+        }
+    }
+    Some(arguments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn game(id: &str, categories: &[&str], plugin: &str, last_played: &str) -> Game {
+        Game {
+            id: id.into(),
+            name: format!("Game {id}"),
+            exe: format!(r"C:\Games\{id}\game.exe"),
+            args: String::new(),
+            working_directory: String::new(),
+            install_directory: format!(r"C:\Games\{id}"),
+            categories: categories.iter().map(|value| (*value).into()).collect(),
+            plugin_id: plugin.into(),
+            plugin_name: String::new(),
+            last_played: last_played.into(),
+            installed: Some(true),
+            is_installed: None,
+        }
+    }
+
+    #[test]
+    fn only_a_bracketed_count_matched_snapshot_is_published() {
+        let mut assembler = SnapshotAssembler::default();
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"snapshotStart"}"#);
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"categories","payload":[]}"#);
+        assembler.receive_line(
+            br#"{"type":"games","payload":[{"id":"a","name":"A","installed":true}]}"#,
+        );
+        let Some(Ok(snapshot)) =
+            assembler.receive_line(br#"{"type":"snapshotComplete","games":1}"#)
+        else {
+            panic!("complete source snapshot should be published");
+        };
+        assert_eq!(snapshot.games.len(), 1);
+
+        assembler.receive_line(br#"{"type":"snapshotStart"}"#);
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"categories","payload":[]}"#);
+        assert_eq!(
+            assembler.receive_line(br#"{"type":"snapshotComplete","games":2}"#),
+            Some(Err("Playnite snapshot was incomplete or malformed"))
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_games_poison_the_whole_snapshot() {
+        let mut assembler = SnapshotAssembler::default();
+        assembler.receive_line(br#"{"type":"snapshotStart"}"#);
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"categories","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"games","payload":[{"id":"a","name":"A"}]}"#);
+        assert!(matches!(
+            assembler.receive_line(br#"{"type":"snapshotComplete","games":1}"#),
+            Some(Err(_))
+        ));
+
+        assembler.receive_line(br#"{"type":"snapshotStart"}"#);
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"categories","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"games","payload":[{"id":"a","name":"A","installed":true},{"id":"A","name":"A copy","installed":true}]}"#);
+        assert!(matches!(
+            assembler.receive_line(br#"{"type":"snapshotComplete","games":2}"#),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn full_scan_filters_union_and_recent_age_match_product_policy() {
+        let snapshot = Snapshot {
+            games: vec![
+                game("recent", &[], "p1", "2026-09-20T00:00:00Z"),
+                game("category", &["Arcade"], "p2", "2025-01-01T00:00:00Z"),
+                game("plugin", &[], "P3", ""),
+                Game {
+                    installed: Some(false),
+                    ..game("uninstalled", &["Arcade"], "p1", "2026-09-21T00:00:00Z")
+                },
+                game("excluded", &["Arcade"], "p1", "2026-09-21T00:00:00Z"),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 10,
+            recent_max_age_days: 30,
+            sync_categories: vec!["arcade".into()],
+            sync_plugins: vec!["p3".into()],
+            exclude_games: vec!["EXCLUDED".into()],
+            ..ProductSettings::default()
+        };
+        let selected = select_games(
+            &snapshot,
+            &settings,
+            parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap(),
+        );
+        let ids: BTreeSet<_> = selected.iter().map(|game| game.id.as_str()).collect();
+        assert_eq!(ids, BTreeSet::from(["category", "plugin", "recent"]));
+    }
+
+    #[test]
+    fn category_plugin_and_game_exclusions_are_case_insensitive() {
+        let snapshot = Snapshot {
+            games: vec![
+                game("one", &["ARCADE"], "plugin", ""),
+                game("two", &["Strategy"], "other", ""),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_categories: vec!["arcade".into()],
+            exclude_games: vec!["TWO".into()],
+            ..ProductSettings::default()
+        };
+        assert!(select_games(&snapshot, &settings, 0).is_empty());
+    }
+
+    #[test]
+    fn extension_arguments_use_windows_quoting_and_reject_unmatched_quotes() {
+        assert_eq!(
+            parse_windows_arguments(r#"--profile "space dir" "quote\"inside""#),
+            Some(vec![
+                "--profile".into(),
+                "space dir".into(),
+                "quote\"inside".into()
+            ])
+        );
+        assert_eq!(parse_windows_arguments("\"unfinished"), None);
+        assert_eq!(
+            executable_launch(&Game {
+                exe: "playnite://game/id".into(),
+                ..game("uri", &[], "", "")
+            }),
+            None
+        );
+        let launch = executable_launch(&Game {
+            args: r#""quoted value" --quiet"#.into(),
+            ..game("valid", &[], "", "")
+        })
+        .unwrap();
+        assert_eq!(launch["arguments"], json!(["quoted value", "--quiet"]));
+        assert_eq!(launch["working_directory"], r"C:\Games\valid");
+    }
+
+    #[test]
+    fn iso8601_parser_validates_offsets_and_calendar_dates() {
+        assert_eq!(
+            parse_iso8601_unix("2026-09-24T02:30:00+02:30"),
+            parse_iso8601_unix("2026-09-24T00:00:00Z")
+        );
+        assert!(parse_iso8601_unix("2024-02-29T00:00:00Z").is_some());
+        assert_eq!(parse_iso8601_unix("2023-02-29T00:00:00Z"), None);
+        assert_eq!(parse_iso8601_unix("2026-20-24T00:00:00Z"), None);
+    }
+}
