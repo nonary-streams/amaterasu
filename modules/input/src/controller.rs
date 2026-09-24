@@ -1,7 +1,7 @@
 use crate::backend::Backend;
 use crate::model::{
-    Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS, MAX_PRESSED, Operation,
-    Pressed, lease_duration, validate_operation_id,
+    DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS, MAX_PRESSED,
+    Operation, Pressed, lease_duration, validate_operation_id,
 };
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +33,7 @@ struct TerminalAcquire {
 pub struct Controller<B: Backend> {
     backend: B,
     enabled: bool,
+    device_policy: DevicePolicy,
     lease: Option<Lease>,
     // Preserve press order so cleanup releases chords in reverse order.
     pressed: Vec<Pressed>,
@@ -44,6 +45,7 @@ impl<B: Backend> Controller<B> {
         Self {
             backend,
             enabled,
+            device_policy: DevicePolicy::default(),
             lease: None,
             pressed: Vec::new(),
             retry_at: Instant::now(),
@@ -89,6 +91,56 @@ impl<B: Backend> Controller<B> {
                 .unwrap_or("expired");
             let _ = self.finish_lease(now, reason);
         }
+    }
+
+    pub fn device_policy(&self) -> DevicePolicy {
+        self.device_policy
+    }
+
+    /// Switches policy gates before attempting native cleanup. Requests later
+    /// in the module queue therefore cannot inject disabled categories even if
+    /// releasing an already-held input needs a retry.
+    pub fn set_device_policy(&mut self, policy: DevicePolicy, now: Instant) -> InputResult<()> {
+        self.device_policy = policy;
+        let mut failure = None;
+        for index in (0..self.pressed.len()).rev() {
+            let pressed = &self.pressed[index];
+            let should_release = match pressed {
+                Pressed::Key(_) => !policy.keyboard,
+                Pressed::Button(_) => !policy.mouse,
+            };
+            if !should_release {
+                continue;
+            }
+            match self.backend.inject(&pressed.release_event()) {
+                Ok(()) => {
+                    self.pressed.remove(index);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = failure {
+            if let Some(lease) = &mut self.lease {
+                lease.cleanup_required = true;
+                lease.termination_reason.get_or_insert("policy_changed");
+            }
+            self.retry_at = now + Duration::from_millis(100);
+            return Err(InputError::new("release_failed", error.message));
+        }
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.cleanup_required)
+        {
+            self.finish_lease(now, "policy_changed")?;
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_required(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.cleanup_required)
     }
     pub fn cancel_owner(&mut self, caller: &str) {
         if self
@@ -256,6 +308,8 @@ impl<B: Backend> Controller<B> {
         {
             return self.failure(error);
         }
+        let policy = self.device_policy;
+        let mut suppressed = 0;
         for (accepted, event) in events.iter().enumerate() {
             let result = guard().and_then(|()| {
                 if self
@@ -268,7 +322,12 @@ impl<B: Backend> Controller<B> {
                         "input lease expired during batch",
                     ));
                 }
-                self.inject(event)
+                if event.enabled_by(policy) {
+                    self.inject(event)
+                } else {
+                    suppressed += 1;
+                    Ok(())
+                }
             });
             if let Err(error) = result {
                 let _ = self.finish_lease(Instant::now(), "failed");
@@ -278,7 +337,7 @@ impl<B: Backend> Controller<B> {
                 return reply;
             }
         }
-        json!({"ok":true,"accepted":events.len(),"lease":token})
+        json!({"ok":true,"accepted":events.len(),"suppressed":suppressed,"lease":token})
     }
     fn validate_batch(&self, events: &[Event]) -> InputResult<()> {
         if events.is_empty() || events.len() > MAX_EVENTS {
@@ -291,6 +350,9 @@ impl<B: Backend> Controller<B> {
         let mut key_encoding = self.lease.as_ref().and_then(|lease| lease.key_encoding);
         for event in events {
             event.validate()?;
+            if !event.enabled_by(self.device_policy) {
+                continue;
+            }
             self.backend.validate(event)?;
             if let Event::Key { key, .. } = event {
                 let event_encoding = key.encoding();
@@ -403,7 +465,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

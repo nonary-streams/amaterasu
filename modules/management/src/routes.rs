@@ -102,6 +102,16 @@ pub fn resolve(path: &str) -> Option<Route> {
             "settings_update",
             Some("configuration.write"),
         ),
+        ("input", "settings_get") => (
+            "amaterasu.input/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("input", "settings_update") => (
+            "amaterasu.input/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "counters") => (
             "amaterasu.diagnostics/1",
@@ -640,5 +650,41 @@ mod tests {
                 "accepted malformed Steam settings payload: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn input_settings_routes_pin_domain_scopes_and_bounded_payloads() {
+        let get = resolve("/v1/input/settings_get").unwrap();
+        assert_eq!(get.service, "amaterasu.input/1");
+        assert_eq!(get.scope, Some("configuration.read"));
+        assert_eq!(payload(get, br#"{}"#).unwrap()["action"], "settings_get");
+        for rejected in [
+            br#"{"owner":"amaterasu.other"}"#.as_slice(),
+            br#"{"action":"status"}"#,
+        ] {
+            assert!(payload(get, rejected).is_err());
+        }
+
+        let update = resolve("/v1/input/settings_update").unwrap();
+        assert_eq!(update.service, "amaterasu.input/1");
+        assert_eq!(update.scope, Some("configuration.write"));
+        let valid = payload(
+            update,
+            br#"{"keyboard":false,"mouse":true,"expected_revision":7}"#,
+        )
+        .unwrap();
+        assert_eq!(valid["action"], "settings_update");
+        assert_eq!(valid["keyboard"], false);
+        assert_eq!(valid["expected_revision"], 7);
+        for rejected in [
+            br#"{"keyboard":false,"mouse":true}"#.as_slice(),
+            br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":"true","expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":true,"expected_revision":-1}"#,
+            br#"{"keyboard":false,"mouse":true,"expected_revision":0,"owner":"other"}"#,
+        ] {
+            assert!(payload(update, rejected).is_err());
+        }
+        assert!(resolve("/v1/input/status").is_none());
     }
 }

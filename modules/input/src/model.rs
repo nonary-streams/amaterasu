@@ -3,6 +3,22 @@ use serde_json::{Value, json};
 
 pub const MAX_EVENTS: usize = 64;
 pub const MAX_PRESSED: usize = 128;
+pub const MAX_QUEUED_REQUESTS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevicePolicy {
+    pub keyboard: bool,
+    pub mouse: bool,
+}
+
+impl Default for DevicePolicy {
+    fn default() -> Self {
+        Self {
+            keyboard: true,
+            mouse: true,
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
@@ -100,6 +116,16 @@ pub enum Event {
     Scroll { axis: Axis, steps: i32 },
 }
 impl Event {
+    pub fn enabled_by(&self, policy: DevicePolicy) -> bool {
+        match self {
+            Self::Key { .. } => policy.keyboard,
+            Self::Button { .. }
+            | Self::Relative { .. }
+            | Self::Absolute { .. }
+            | Self::Scroll { .. } => policy.mouse,
+        }
+    }
+
     pub fn validate(&self) -> InputResult<()> {
         match self {
             Self::Key {

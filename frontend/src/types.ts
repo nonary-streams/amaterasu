@@ -90,6 +90,17 @@ namespace Amaterasu {
       remember_me_refresh_token_ttl_seconds: number;
     };
   }
+  export interface InputPolicySettings {
+    ok: boolean;
+    persisted: boolean;
+    applied: boolean;
+    cleanup_required: boolean;
+    revision: number;
+    values: {
+      keyboard: boolean;
+      mouse: boolean;
+    };
+  }
   export interface Session {
     id: number;
     key: string;

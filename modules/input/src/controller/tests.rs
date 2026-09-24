@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{Button, Key};
+use crate::model::{Button, DevicePolicy, Key};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -553,4 +553,97 @@ fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() 
         "invalid_sequence"
     );
     assert!(controller.pressed.is_empty());
+}
+
+#[test]
+fn disabled_categories_are_accepted_without_native_injection() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let token = acquire(&mut controller, Instant::now());
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: false,
+                mouse: true,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+    let response = batch(
+        &mut controller,
+        &token,
+        vec![
+            key(30, KeyState::Down),
+            key(30, KeyState::Up),
+            Event::Relative { dx: 1, dy: 2 },
+        ],
+    );
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["accepted"], 3);
+    assert_eq!(response["suppressed"], 2);
+    assert_eq!(
+        *controller.backend.trace.borrow(),
+        [Event::Relative { dx: 1, dy: 2 }]
+    );
+}
+
+#[test]
+fn disabling_a_category_releases_held_inputs_and_gates_before_cleanup_retry() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    batch(
+        &mut controller,
+        &token,
+        vec![
+            key(30, KeyState::Down),
+            Event::Button {
+                button: Button::Left,
+                pressed: true,
+            },
+        ],
+    );
+
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: false,
+                mouse: true,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(controller.pressed, [Pressed::Button(Button::Left)]);
+    assert_eq!(controller.device_policy().keyboard, false);
+    assert_eq!(
+        batch(&mut controller, &token, vec![key(30, KeyState::Down)])["suppressed"],
+        1
+    );
+
+    controller.backend.fail_release = true;
+    let failure = controller.set_device_policy(
+        DevicePolicy {
+            keyboard: true,
+            mouse: false,
+        },
+        now,
+    );
+    assert_eq!(failure.unwrap_err().code, "release_failed");
+    assert_eq!(controller.device_policy().mouse, false);
+    assert!(controller.cleanup_required());
+    assert_eq!(controller.pressed, [Pressed::Button(Button::Left)]);
+
+    controller.backend.fail_release = false;
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: true,
+                mouse: false,
+            },
+            now,
+        )
+        .unwrap();
+    controller.expire(now + Duration::from_millis(101));
+    assert!(controller.pressed.is_empty());
+    assert!(controller.lease.is_none());
 }

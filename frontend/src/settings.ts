@@ -20,6 +20,25 @@ namespace Amaterasu {
     };
   }
 
+  export function parseInputPolicy(
+    keyboard: boolean,
+    mouse: boolean,
+  ): InputPolicySettings["values"] {
+    if (typeof keyboard !== "boolean" || typeof mouse !== "boolean")
+      throw new Error("Keyboard and mouse policy values must be enabled or disabled.");
+    return { keyboard, mouse };
+  }
+
+  export function inputPolicyStatusDescription(
+    settings: InputPolicySettings,
+  ): string {
+    if (!settings.persisted)
+      return "The saved input policy has not been confirmed yet.";
+    if (!settings.applied || settings.cleanup_required)
+      return "The saved policy is active for new events, but cleanup of held native input is still pending.";
+    return "The saved keyboard and mouse policy is active.";
+  }
+
   function safeNvhttpBindFamily(value: string): "ipv4" | "ipv6" | null {
     if (value === "") return null;
     const octets = value.split(".");
@@ -200,6 +219,7 @@ namespace Amaterasu {
     const authArea = el("div");
     const hostArea = el("div");
     const steamArea = el("div");
+    const inputArea = el("div");
     context.content.append(
       sectionHeading(
         "Settings",
@@ -209,12 +229,14 @@ namespace Amaterasu {
           void loadAuth();
           void loadHost();
           void loadSteam();
+          void loadInput();
         }),
       ),
       area,
       authArea,
       hostArea,
       steamArea,
+      inputArea,
     );
     async function loadAuth(): Promise<void> {
       authArea.replaceChildren(el("p", "muted", "Loading authentication lifetimes…"));
@@ -404,6 +426,72 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           steamArea.replaceChildren(errorPanel(error, loadSteam));
+      }
+    }
+    async function loadInput(): Promise<void> {
+      inputArea.replaceChildren(el("p", "muted", "Loading input policy…"));
+      try {
+        const settings = await context.api.post<InputPolicySettings>(
+          "input/settings_get",
+        );
+        if (!context.content.isConnected) return;
+        const form = el("form", "settings-form");
+        const keyboard = input("input_keyboard", "", "checkbox");
+        keyboard.checked = settings.values.keyboard;
+        const mouse = input("input_mouse", "", "checkbox");
+        mouse.checked = settings.values.mouse;
+        const status = el(
+          "p",
+          settings.applied ? "muted" : "error",
+          inputPolicyStatusDescription(settings),
+        );
+        const save = el("button", "button primary", "Save input policy");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        form.append(
+          field(
+            "Keyboard input",
+            keyboard,
+            "Disabling keyboard input suppresses key events and releases held keys immediately.",
+          ),
+          field(
+            "Mouse input",
+            mouse,
+            "Disabling mouse input suppresses pointer, button, and scroll events and releases held buttons.",
+          ),
+          status,
+          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void runAction(save, status, async () => {
+            try {
+              const updated = await context.api.post<InputPolicySettings>(
+                "input/settings_update",
+                {
+                  ...parseInputPolicy(keyboard.checked, mouse.checked),
+                  expected_revision: settings.revision,
+                },
+              );
+              context.notify(
+                updated.applied
+                  ? "Input policy saved and applied."
+                  : "Input policy saved; native cleanup is pending.",
+              );
+            } catch (error) {
+              if (!(error instanceof ApiError) || error.code !== "cleanup_pending")
+                throw error;
+              context.notify(
+                "Input policy was saved, but releasing held native input is pending.",
+              );
+            }
+            await loadInput();
+          });
+        });
+        inputArea.replaceChildren(panel("Keyboard and mouse input", form));
+      } catch (error) {
+        if (context.content.isConnected)
+          inputArea.replaceChildren(errorPanel(error, loadInput));
       }
     }
     async function loadSteamRuntimeStatus(
@@ -633,5 +721,6 @@ namespace Amaterasu {
     void loadAuth();
     void loadHost();
     void loadSteam();
+    void loadInput();
   }
 }

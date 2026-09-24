@@ -19,6 +19,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.launch/1" => launch(route.action, object),
         "amaterasu.nvhttp/1" => nvhttp(route.action, object),
         "amaterasu.steam/1" => steam(route.action, object),
+        "amaterasu.input/1" => input(route.action, object),
         _ => Ok(()),
     }
 }
@@ -147,6 +148,55 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
             steam_exclusions(object.get("exclude_games").ok_or(INVALID)?)
         }
         _ => Ok(()),
+    }
+}
+
+fn input(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(object, &["keyboard", "mouse", "expected_revision"], &[])?;
+            if object.get("keyboard").and_then(Value::as_bool).is_none()
+                || object.get("mouse").and_then(Value::as_bool).is_none()
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn input_policy_route_fields_are_exact_and_typed() {
+        let route = Route {
+            service: "amaterasu.input/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for object in [
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0}),
+            serde_json::json!({"keyboard":false,"mouse":true,"expected_revision":u64::MAX}),
+        ] {
+            assert!(validate(route, object.as_object().unwrap()).is_ok());
+        }
+        for object in [
+            serde_json::json!({"keyboard":1,"mouse":true,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":"false","expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":-1}),
+            serde_json::json!({"keyboard":true,"mouse":false,"expected_revision":0,"owner":"other"}),
+        ] {
+            assert!(validate(route, object.as_object().unwrap()).is_err());
+        }
     }
 }
 

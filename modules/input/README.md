@@ -2,7 +2,7 @@
 
 `amaterasu-input` provides `amaterasu.input/1` as an independently loadable native
 `cdylib` and an `rlib`. The provider needs a service grant; callers need a call
-grant. There is no state-service dependency. Native modules are trusted code;
+grant. It uses `amaterasu.configuration/1` for durable product settings. Native modules are trusted code;
 API grants are not a native-code sandbox.
 
 Startup settings:
@@ -16,6 +16,45 @@ field. It must be an absolute, non-symlink character-device path and is opened
 only when an enabled acquire reaches its active-request check. No devices are
 created merely by loading the module. Windows ignores `uinput_path`. macOS and
 other platforms report unsupported native injection instead of simulated success.
+
+## Durable input policy
+
+The input module loads the caller-scoped product document `product/amaterasu.input`
+after startup. Version 1 stores `{ "keyboard": true, "mouse": true }`; an absent
+document uses those defaults. The module needs calls to configuration and state
+and dependencies on both services; the configuration service uses the caller's
+delegated authority for its durable state read. Management cannot select another
+product namespace.
+
+Administrators use the fixed management routes `/v1/input/settings_get` and
+`/v1/input/settings_update`, protected by `configuration.read` and
+`configuration.write`. An update body contains both boolean fields and
+`expected_revision`. Product settings actions accept only the exact runtime
+caller `amaterasu.management`.
+
+```json
+{"keyboard":false,"mouse":true,"expected_revision":4}
+```
+
+The policy gates event delivery after it is loaded. Disabled keys are suppressed;
+disabled pointer, button, and scroll events are suppressed. Suppressed events
+still count as accepted in successful batches so stream batch acknowledgements
+remain aligned with the submitted event count. Existing keys/buttons in a newly
+disabled category are released in reverse press order before the settings update
+is acknowledged. A failed native release leaves the new policy persisted and
+gated for new events, returns `ok:false` with `error.code:"cleanup_pending"`,
+`persisted:true`, `applied:false`, and `cleanup_required:true`, and retries
+cleanup. Settings reads report the durable values and whether cleanup is
+complete. Configuration calls run asynchronously; while a policy write is
+pending, later mutating input requests are held in a bounded FIFO queue. Status
+and lease lookup remain available, and unrelated runtime services continue to
+be polled. Settings reads do not block on the startup fetch; they return
+`settings_unavailable` until the stored document has loaded rather than presenting
+bootstrap defaults as persisted settings.
+
+This slice implements only `global:keyboard` and `global:mouse`. Scancode mode,
+high-resolution scrolling, controller, and gamepad parity remain pending because
+their Amaterasu event encodings/backends need matching runtime effects first.
 
 ## JSON API
 

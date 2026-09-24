@@ -37,6 +37,26 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
   }
 });
 
+test("input policy editor preserves booleans and reports pending cleanup honestly", () => {
+  const parsePolicy = context.Amaterasu.parseInputPolicy;
+  assert.deepEqual(ordinary(parsePolicy(false, true)), {
+    keyboard: false,
+    mouse: true,
+  });
+  assert.throws(() => parsePolicy("false", true));
+  const describe = context.Amaterasu.inputPolicyStatusDescription;
+  const settings = {
+    persisted: true,
+    applied: true,
+    cleanup_required: false,
+    revision: 4,
+    values: { keyboard: false, mouse: true },
+  };
+  assert.match(describe({ ...settings, persisted: false }), /not been confirmed/);
+  assert.match(describe({ ...settings, applied: false, cleanup_required: true }), /cleanup.*pending/);
+  assert.match(describe(settings), /policy is active/);
+});
+
 test("NVHTTP network settings preserve startup null and explicit blank overrides", () => {
   const parse = context.Amaterasu.parseNvhttpNetworkOverrides;
   assert.deepEqual(ordinary(parse("startup", true, "")), {

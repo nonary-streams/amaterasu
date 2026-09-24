@@ -260,6 +260,24 @@ def test_auth_and_crud(console, api):
     finally:
         connection.close()
     assert moved_info.findtext("hostname") == "Living Room & Games", ET.tostring(moved_info)
+    status, input_defaults, _ = api.post("/v1/input/settings_get", token=administrator)
+    assert status == 200 and input_defaults["values"] == {"keyboard": True, "mouse": True}, input_defaults
+    assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
+    input_values = {"keyboard": False, "mouse": True}
+    status, input_updated, _ = api.post("/v1/input/settings_update", {
+        **input_values, "expected_revision": input_defaults["revision"],
+    }, administrator)
+    assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
+    assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
+    status, input_conflict, _ = api.post("/v1/input/settings_update", {
+        "keyboard": True, "mouse": True, "expected_revision": input_defaults["revision"],
+    }, administrator)
+    assert status == 200 and input_conflict.get("error", {}).get("code") == "revision_conflict", input_conflict
+    assert api.post("/v1/input/settings_update", {
+        "keyboard": True, "mouse": True, "expected_revision": 1, "owner": "amaterasu.other",
+    }, administrator)[0] == 400
+    status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
+    assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
     assert status == 200 and steam_settings["ok"], steam_settings
     assert steam_settings["values"] == {
@@ -338,11 +356,12 @@ def test_auth_and_crud(console, api):
     assert status == 403 and not result["ok"], result
     assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/steam/settings", token=token["bearer"])[0] == 403
+    assert api.post("/v1/input/settings_get", token=token["bearer"])[0] == 403
     assert token["bearer"] not in json.dumps(result)
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
     assert api.post("/v1/runtime/request", {"service": "amaterasu.state/1"}, administrator)[0] == 404
-    return token, administrator, moved_port, steam_values, auth_values, saved_auth_settings["revision"]
+    return token, administrator, moved_port, steam_values, auth_values, saved_auth_settings["revision"], input_values, input_saved["revision"]
 
 
 def test_http_framing(api):
@@ -386,7 +405,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -403,6 +422,9 @@ def main():
             status, auth_settings, _ = api.post("/v1/auth/settings", token=relogged["bearer"])
             assert status == 200 and auth_settings["values"] == auth_values, auth_settings
             assert auth_settings["revision"] == auth_revision, auth_settings
+            status, input_settings, _ = api.post("/v1/input/settings_get", token=relogged["bearer"])
+            assert status == 200 and input_settings["values"] == input_values, input_settings
+            assert input_settings["revision"] == input_revision and input_settings["applied"], input_settings
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
@@ -438,7 +460,7 @@ def main():
     print("Passed: real HTTP login/authentication, route scopes, catalog CRUD, token persistence/revocation,")
     print("Moonlight hostname/port live rebind and Steam settings CAS, discovery and restart persistence,")
     print("session restart invalidation,")
-    print("strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input keyboard/mouse CAS policy persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":
