@@ -46,6 +46,16 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
 fn management_loads_after_its_nvhttp_settings_provider() {
     assert!(MANAGEMENT.calls.contains(&"amaterasu.nvhttp/1"));
     assert!(MANAGEMENT.dependencies.contains(&NVHTTP.id));
+    for service in [
+        "amaterasu.rtsp/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
+    ] {
+        assert!(
+            MANAGEMENT.calls.contains(&service),
+            "admin NVHTTP port updates must delegate {service}"
+        );
+    }
 }
 
 #[test]

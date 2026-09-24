@@ -502,6 +502,11 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
         "amaterasu.video/1",
         "amaterasu.nvhttp/1",
+        // NVHTTP applies base-port changes through RTSP, which preflights
+        // its media and control UDP listeners under the same admin request.
+        "amaterasu.rtsp/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
     ],
     publishes: &[],
     native_provides: &[],
