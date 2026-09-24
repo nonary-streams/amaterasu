@@ -61,6 +61,7 @@ impl Record {
     }
 
     pub fn capabilities(&self) -> Capabilities {
+        let effective_profile = self.config.effective_profile();
         Capabilities {
             transport: amaterasu_gamestream::sdp::TransportSupport {
                 stereo_audio: true,
@@ -73,12 +74,12 @@ impl Record {
                 fec: true,
             },
             color: amaterasu_gamestream::sdp::ColorMode::Bt709Limited,
-            max_width: self.config.profile.width,
-            max_height: self.config.profile.height,
-            max_fps: self.config.profile.fps,
-            max_bitrate_kbps: self.config.profile.bitrate_kbps,
-            require_video_encryption: self.config.profile.encrypt_video,
-            require_audio_encryption: self.config.profile.encrypt_audio,
+            max_width: effective_profile.width,
+            max_height: effective_profile.height,
+            max_fps: effective_profile.fps,
+            max_bitrate_kbps: effective_profile.bitrate_kbps,
+            require_video_encryption: effective_profile.encrypt_video,
+            require_audio_encryption: effective_profile.encrypt_audio,
         }
     }
 }

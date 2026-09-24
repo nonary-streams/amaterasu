@@ -73,7 +73,7 @@ impl Controller {
                 ticket: action_ticket,
                 action: Action::Announce(announce),
             }) => {
-                let success = record.config.profile.matches(&announce);
+                let success = record.config.effective_profile().matches(&announce);
                 self.finish_immediate_action(
                     &mut record,
                     connection,
