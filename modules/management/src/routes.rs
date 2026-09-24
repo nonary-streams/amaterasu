@@ -833,12 +833,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(right_alt_mapping["key_rightalt_to_key_win"], true);
+        let repeat_policy = payload(
+            update,
+            br#"{"keyboard":true,"mouse":true,"key_repeat_delay":0,"key_repeat_frequency":31.25,"expected_revision":11}"#,
+        )
+        .unwrap();
+        assert_eq!(repeat_policy["key_repeat_delay"], 0);
+        assert_eq!(repeat_policy["key_repeat_frequency"], 31.25);
         for rejected in [
             br#"{"keyboard":false,"mouse":true}"#.as_slice(),
             br#"{"keyboard":0,"mouse":true,"expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":"true","expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"high_resolution_scrolling":"true","expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"key_rightalt_to_key_win":"true","expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":true,"key_repeat_delay":2147483648,"expected_revision":0}"#,
+            br#"{"keyboard":false,"mouse":true,"key_repeat_frequency":-0.1,"expected_revision":0}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":-1}"#,
             br#"{"keyboard":false,"mouse":true,"expected_revision":0,"owner":"other"}"#,
         ] {

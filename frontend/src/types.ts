@@ -200,6 +200,8 @@ namespace Amaterasu {
       high_resolution_scrolling: boolean;
       always_send_scancodes: boolean;
       key_rightalt_to_key_win: boolean;
+      key_repeat_delay: number;
+      key_repeat_frequency: number;
     };
   }
   export interface Session {

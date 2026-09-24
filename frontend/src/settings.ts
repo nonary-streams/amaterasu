@@ -1,5 +1,6 @@
 namespace Amaterasu {
   const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
+  const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
 
   export function parseAuthTokenLifetimes(
     sessionTokenTtlSeconds: number,
@@ -26,21 +27,30 @@ namespace Amaterasu {
     highResolutionScrolling: boolean,
     alwaysSendScancodes: boolean,
     keyRightAltToKeyWin: boolean,
+    keyRepeatDelay: number,
+    keyRepeatFrequency: number,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
       typeof mouse !== "boolean" ||
       typeof highResolutionScrolling !== "boolean" ||
       typeof alwaysSendScancodes !== "boolean" ||
-      typeof keyRightAltToKeyWin !== "boolean"
+      typeof keyRightAltToKeyWin !== "boolean" ||
+      !Number.isSafeInteger(keyRepeatDelay) ||
+      keyRepeatDelay < 0 ||
+      keyRepeatDelay > maxInputKeyRepeatDelayMs ||
+      !Number.isFinite(keyRepeatFrequency) ||
+      keyRepeatFrequency < 0
     )
-      throw new Error("Input policy values must be enabled or disabled.");
+      throw new Error("Input policy values or key repeat settings are invalid.");
     return {
       keyboard,
       mouse,
       high_resolution_scrolling: highResolutionScrolling,
       always_send_scancodes: alwaysSendScancodes,
       key_rightalt_to_key_win: keyRightAltToKeyWin,
+      key_repeat_delay: keyRepeatDelay,
+      key_repeat_frequency: keyRepeatFrequency,
     };
   }
 
@@ -1122,6 +1132,23 @@ namespace Amaterasu {
           "checkbox",
         );
         keyRightAltToKeyWin.checked = settings.values.key_rightalt_to_key_win;
+        const keyRepeatDelay = input(
+          "input_key_repeat_delay",
+          String(settings.values.key_repeat_delay),
+          "number",
+        );
+        keyRepeatDelay.required = true;
+        keyRepeatDelay.min = "0";
+        keyRepeatDelay.max = String(maxInputKeyRepeatDelayMs);
+        keyRepeatDelay.step = "1";
+        const keyRepeatFrequency = input(
+          "input_key_repeat_frequency",
+          String(settings.values.key_repeat_frequency),
+          "number",
+        );
+        keyRepeatFrequency.required = true;
+        keyRepeatFrequency.min = "0";
+        keyRepeatFrequency.step = "any";
         const status = el(
           "p",
           settings.applied ? "muted" : "error",
@@ -1156,6 +1183,16 @@ namespace Amaterasu {
             keyRightAltToKeyWin,
             "Maps Moonlight Right Alt (VK_RMENU) to Left Windows (VK_LWIN) on Windows and Linux; a held key stays paired with its original release if this changes.",
           ),
+          field(
+            "Key repeat delay (milliseconds)",
+            keyRepeatDelay,
+            "Default is 500 milliseconds. Set to 0 to disable key repeat.",
+          ),
+          field(
+            "Key repeat frequency (Hz)",
+            keyRepeatFrequency,
+            "Default is 24.9 Hz. Set to 0 to use the 24.9 Hz default; decimal frequencies are supported.",
+          ),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -1172,6 +1209,8 @@ namespace Amaterasu {
                     highResolutionScrolling.checked,
                     alwaysSendScancodes.checked,
                     keyRightAltToKeyWin.checked,
+                    keyRepeatDelay.valueAsNumber,
+                    keyRepeatFrequency.valueAsNumber,
                   ),
                   expected_revision: settings.revision,
                 },

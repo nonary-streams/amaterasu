@@ -499,6 +499,8 @@ def test_auth_and_crud(console, api):
         )
     ), input_defaults
     assert input_defaults["values"]["key_rightalt_to_key_win"] is False, input_defaults
+    assert input_defaults["values"]["key_repeat_delay"] == 500, input_defaults
+    assert input_defaults["values"]["key_repeat_frequency"] == 24.9, input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
     input_policy_update = {
         "keyboard": False,
@@ -506,6 +508,8 @@ def test_auth_and_crud(console, api):
         "high_resolution_scrolling": False,
         "always_send_scancodes": False,
         "key_rightalt_to_key_win": True,
+        "key_repeat_delay": 275,
+        "key_repeat_frequency": 31.25,
     }
     input_values = {**input_defaults["values"], **input_policy_update}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
@@ -525,10 +529,33 @@ def test_auth_and_crud(console, api):
     assert api.post("/v1/input/settings_update", {
         "keyboard": True, "mouse": True, "expected_revision": 1, "owner": "amaterasu.other",
     }, administrator)[0] == 400
+    for invalid_repeat in [
+        {"key_repeat_delay": -1},
+        {"key_repeat_delay": 1.5},
+        {"key_repeat_delay": 2147483648},
+        {"key_repeat_frequency": -0.1},
+    ]:
+        invalid_status, _, _ = api.post("/v1/input/settings_update", {
+            "keyboard": input_values["keyboard"],
+            "mouse": input_values["mouse"],
+            **invalid_repeat,
+            "expected_revision": input_updated["revision"],
+        }, administrator)
+        assert invalid_status == 400, invalid_repeat
+    zero_repeat = {"key_repeat_delay": 0, "key_repeat_frequency": 0}
+    status, input_zero_repeat, _ = api.post("/v1/input/settings_update", {
+        "keyboard": input_values["keyboard"],
+        "mouse": input_values["mouse"],
+        **zero_repeat,
+        "expected_revision": input_updated["revision"],
+    }, administrator)
+    input_values = {**input_values, **zero_repeat}
+    assert status == 200 and input_zero_repeat["ok"] and input_zero_repeat["applied"], input_zero_repeat
+    assert input_zero_repeat["values"] == input_values and input_zero_repeat["revision"] == 2, input_zero_repeat
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
-    assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
-    # A v3 client knows the first four fields but omits the v4 Right Alt option.
-    # The update must preserve that value while changing the earlier controls.
+    assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 2, input_saved
+    # A v3 client omits the Right Alt and repeat fields; preserve them while it
+    # updates the older keyboard, mouse, scrolling and scancode settings.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
         "mouse": True,
@@ -538,7 +565,7 @@ def test_auth_and_crud(console, api):
     }, administrator)
     input_values = {**input_values, "keyboard": True, "mouse": True}
     assert status == 200 and input_legacy_updated["ok"] and input_legacy_updated["applied"], input_legacy_updated
-    assert input_legacy_updated["values"] == input_values and input_legacy_updated["revision"] == 2, input_legacy_updated
+    assert input_legacy_updated["values"] == input_values and input_legacy_updated["revision"] == 3, input_legacy_updated
     input_revision = input_legacy_updated["revision"]
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
     assert status == 200 and steam_settings["ok"], steam_settings
@@ -925,7 +952,7 @@ def main():
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy and restart persistence,")
     print("session restart invalidation,")
-    print("input policy CAS, Right Alt mapping, v3 field omission and restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input policy CAS, Right Alt and repeat settings, legacy field omission and restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

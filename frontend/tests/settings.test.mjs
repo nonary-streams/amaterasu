@@ -37,19 +37,43 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
   }
 });
 
-test("input policy editor preserves booleans and reports pending cleanup honestly", () => {
+test("input policy editor validates key repeat settings and reports cleanup honestly", () => {
   const parsePolicy = context.Amaterasu.parseInputPolicy;
-  assert.deepEqual(ordinary(parsePolicy(false, true, false, false, true)), {
+  assert.deepEqual(ordinary(parsePolicy(false, true, false, false, true, 0, 0)), {
     keyboard: false,
     mouse: true,
     high_resolution_scrolling: false,
     always_send_scancodes: false,
     key_rightalt_to_key_win: true,
+    key_repeat_delay: 0,
+    key_repeat_frequency: 0,
   });
-  assert.throws(() => parsePolicy("false", true, true, true, true));
-  assert.throws(() => parsePolicy(true, true, "false", true, true));
-  assert.throws(() => parsePolicy(true, true, true, "false", true));
-  assert.throws(() => parsePolicy(true, true, true, true, "false"));
+  assert.deepEqual(
+    ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25)),
+    {
+      keyboard: true,
+      mouse: true,
+      high_resolution_scrolling: true,
+      always_send_scancodes: true,
+      key_rightalt_to_key_win: false,
+      key_repeat_delay: 2147483647,
+      key_repeat_frequency: 31.25,
+    },
+  );
+  for (const values of [
+    ["false", true, true, true, true, 500, 24.9],
+    [true, true, "false", true, true, 500, 24.9],
+    [true, true, true, "false", true, 500, 24.9],
+    [true, true, true, true, "false", 500, 24.9],
+    [true, true, true, true, true, -1, 24.9],
+    [true, true, true, true, true, 1.5, 24.9],
+    [true, true, true, true, true, 2147483648, 24.9],
+    [true, true, true, true, true, 500, -0.1],
+    [true, true, true, true, true, 500, Number.NaN],
+    [true, true, true, true, true, 500, Number.POSITIVE_INFINITY],
+  ]) {
+    assert.throws(() => parsePolicy(...values));
+  }
   const describe = context.Amaterasu.inputPolicyStatusDescription;
   const settings = {
     persisted: true,
