@@ -147,3 +147,58 @@ fn sequence_exhaustion_does_not_evict_a_record() {
     assert_eq!(journal.callers["a"].records.len(), 1);
     assert_eq!(journal.callers["a"].dropped_total, 0);
 }
+
+#[test]
+fn configured_minimum_level_filters_file_output_but_keeps_caller_records() {
+    let state_root = std::env::temp_dir().join(format!(
+        "amaterasu-diagnostics-journal-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_root);
+    std::fs::create_dir_all(&state_root).unwrap();
+    let settings = super::super::logging::LoggingSettings::from_value(json!({
+        "min_log_level": 1,
+        "log_path": "diagnostics.log",
+        "state_root": state_root.to_string_lossy(),
+    }))
+    .unwrap();
+    let (mut journal, warning) = Journal::with_logging(settings);
+    assert_eq!(warning, None);
+    assert!(
+        journal.handle(
+            "alice",
+            json!({
+                "action":"record","level":"trace","target":"capture","message":"below threshold"
+            })
+        )["ok"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        journal.handle(
+            "alice",
+            json!({
+                "action":"record","level":"debug","target":"capture","message":"at threshold"
+            })
+        )["ok"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        journal.handle("alice", json!({"action":"query"}))["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(journal);
+    let log_directory = state_root.join("logs");
+    let logged = std::fs::read_dir(&log_directory)
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(logged.contains("at threshold"));
+    assert!(!logged.contains("below threshold"));
+    std::fs::remove_dir_all(state_root).unwrap();
+}

@@ -56,10 +56,37 @@ have a durable epoch. Payload replies fit the runtime's 16 KiB budget. Retries
 are not idempotent: a cancellation after dispatch can still leave an append or
 increment committed. Counter and record writes are separate operations.
 
-The library does not inspect environment variables, files, host logs, process
-state, credentials, or network traffic. It does not export to disk/network,
-redact caller strings, attach timestamps, aggregate across callers, capture
-crashes, implement tracing spans, or supply a diagnostics UI. Callers should
-submit only data intended for this journal. These are unimplemented parity
-features, not implied collection capabilities. Native modules remain trusted
-code; API grants are not a native-code sandbox.
+## Host log output
+
+The host reads `global.min_log_level` and `global.log_path` from its verified
+bootstrap policy once when each worker starts. `min_log_level` accepts
+`verbose`, `debug`, `info`, `warning`, `error`, `fatal`, and `none`, plus a
+numeric string beginning with `0` through `6`. Names are lowercase and exact;
+an unrecognized value keeps the default. The default is `debug` for a Cargo
+package version with a non-`stable` prerelease suffix, and `info` for stable
+versions. A `log_path` absent from configuration defaults to
+`<state_root>/amaterasu.log`. Relative custom paths resolve beneath the
+protected state root; parent traversal and symlink escapes are rejected.
+Absolute custom paths are allowed. A path that names an existing directory,
+or a path without an extension, selects a log directory. A file path selects a
+`logs` directory beside the configured file and uses the file stem as the
+session prefix.
+
+Each accepted diagnostic record is still kept in its caller's bounded journal.
+Records at or above the configured level are also written as JSON lines to the
+worker's shared session log. That file combines records from callers, so callers
+must not submit secrets or content they do not intend to make available to the
+host account. Log files roll at 2 MiB, retain up to four rolled files plus the
+active file per session, and startup prunes old sessions to keep at most 30
+session groups. If the disk sink cannot be opened or later fails, the volatile
+journal continues to work; disk logging remains unavailable until worker
+restart.
+
+This is a host diagnostics sink, not a capture of all host or native-library
+logs. Service supervisor messages on stderr and worker protocol lines on stdout
+remain outside this file sink. The settings are a worker-start snapshot and
+require restart to take effect; live `min_log_level` changes and changing the
+active file path without restart remain unimplemented. The library does not
+inspect process state, credentials, or network traffic, capture crashes,
+implement tracing spans, or supply a diagnostics UI. Native modules remain
+trusted code; API grants are not a native-code sandbox.

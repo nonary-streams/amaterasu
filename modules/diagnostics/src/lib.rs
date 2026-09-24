@@ -1,5 +1,6 @@
 //! Caller-scoped diagnostics with bounded, in-memory retention and no automatic collection.
 mod journal;
+mod logging;
 mod protocol;
 pub use journal::Journal;
 
@@ -14,13 +15,23 @@ pub struct DiagnosticsModule {
 
 impl ManagedModule for DiagnosticsModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("diagnostics settings request did not return a result".into());
+        };
+        let logging_settings = logging::LoggingSettings::from_value(
+            payload
+                .get("host_logging")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )?;
+        let (journal, logging_warning) = Journal::with_logging(logging_settings);
+        if let Some(warning) = logging_warning {
+            eprintln!("amaterasu diagnostics: file logging unavailable: {warning}");
+        }
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self {
-            runtime,
-            journal: Journal::default(),
-        })
+        Ok(Self { runtime, journal })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {

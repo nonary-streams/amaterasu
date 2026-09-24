@@ -24,7 +24,7 @@ pub(crate) enum Action {
     Counters {},
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Level {
     Trace,
@@ -34,7 +34,29 @@ pub(crate) enum Level {
     Error,
 }
 
-#[derive(Serialize)]
+impl Level {
+    pub(crate) fn numeric(self) -> u8 {
+        match self {
+            Self::Trace => 0,
+            Self::Debug => 1,
+            Self::Info => 2,
+            Self::Warn => 3,
+            Self::Error => 4,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub(crate) struct Record {
     pub sequence: u64,
     pub level: Level,

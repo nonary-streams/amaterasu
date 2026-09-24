@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod interactive_worker;
 mod loading;
+mod logging_config;
 mod protocol;
 mod service;
 #[cfg(windows)]

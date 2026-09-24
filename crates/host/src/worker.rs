@@ -115,7 +115,7 @@ fn load_components(
         return Err("production bootstrap cannot permit unsigned packages".into());
     }
     let directory = package_directory(root, digest)?;
-    let package = {
+    let mut package = {
         let mut verification_progress = |verified, total| {
             if verified == 0 {
                 progress(StartupProgress::Manifest(total))
@@ -137,6 +137,12 @@ fn load_components(
     if package.digest != digest {
         return Err("selected package identity does not match its manifest".into());
     }
+
+    let logging = crate::logging_config::HostLoggingConfig::from_global(
+        bootstrap.policy.settings.get("global"),
+        state_root,
+    );
+    logging.inject(&mut package.runtime_config)?;
 
     let mut loaded = |index| progress(StartupProgress::Component(index));
     if !bootstrap.development && !package.signed {
