@@ -1,6 +1,12 @@
 use super::*;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy)]
+struct CleanupPolicy {
+    remove_stale: bool,
+    remove_uninstalled: bool,
+}
+
 #[derive(Default)]
 struct Backend {
     revision: u64,
@@ -190,6 +196,26 @@ fn snapshot_batch(
     expected_revision: u64,
     items: Vec<(&str, Value)>,
 ) -> Value {
+    snapshot_batch_with_removals(
+        sync_id,
+        generation,
+        source_revision,
+        sequence,
+        expected_revision,
+        items,
+        Vec::new(),
+    )
+}
+
+fn snapshot_batch_with_removals(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    sequence: u64,
+    expected_revision: u64,
+    items: Vec<(&str, Value)>,
+    remove_source_ids: Vec<&str>,
+) -> Value {
     json!({
         "action":"provider_snapshot_batch",
         "sync_id":sync_id,
@@ -198,6 +224,7 @@ fn snapshot_batch(
         "sequence":sequence,
         "expected_revision":expected_revision,
         "entries":items.into_iter().map(|(source_id,entry)| json!({"source_id":source_id,"entry":entry})).collect::<Vec<_>>(),
+        "remove_source_ids":remove_source_ids,
     })
 }
 
@@ -229,6 +256,29 @@ fn snapshot_finish_policy(
     complete: bool,
     remove_stale: bool,
 ) -> Value {
+    snapshot_finish_with_policies(
+        sync_id,
+        generation,
+        source_revision,
+        expected_revision,
+        next_sequence,
+        complete,
+        CleanupPolicy {
+            remove_stale,
+            remove_uninstalled: false,
+        },
+    )
+}
+
+fn snapshot_finish_with_policies(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    expected_revision: u64,
+    next_sequence: u64,
+    complete: bool,
+    cleanup_policy: CleanupPolicy,
+) -> Value {
     json!({
         "action":"provider_snapshot_finish",
         "sync_id":sync_id,
@@ -237,7 +287,8 @@ fn snapshot_finish_policy(
         "expected_revision":expected_revision,
         "next_sequence":next_sequence,
         "complete":complete,
-        "remove_stale":remove_stale,
+        "remove_stale":cleanup_policy.remove_stale,
+        "remove_uninstalled":cleanup_policy.remove_uninstalled,
     })
 }
 
@@ -249,6 +300,24 @@ fn import_playnite_entry(
     expected_revision: u64,
     source_id: &str,
     name: &str,
+) -> Value {
+    import_playnite_entries(
+        backend,
+        pipeline,
+        sync_id,
+        source_revision,
+        expected_revision,
+        vec![(source_id, name)],
+    )
+}
+
+fn import_playnite_entries(
+    backend: &mut Backend,
+    pipeline: &mut Pipeline,
+    sync_id: &str,
+    source_revision: u64,
+    expected_revision: u64,
+    items: Vec<(&str, &str)>,
 ) -> Value {
     let begin = backend.run_for(
         pipeline,
@@ -267,7 +336,10 @@ fn import_playnite_entry(
             source_revision,
             0,
             expected_revision,
-            vec![(source_id, playnite_entry(name))],
+            items
+                .into_iter()
+                .map(|(source_id, name)| (source_id, playnite_entry(name)))
+                .collect(),
         ),
         "amaterasu.playnite",
         "management",
@@ -300,11 +372,29 @@ fn update_provider_overrides(id: &str, expected_revision: u64, fec_percentage: V
 }
 
 #[test]
-fn old_provider_snapshot_state_defaults_to_removal_enabled() {
+fn old_provider_snapshot_state_defaults_to_legacy_cleanup_policy() {
     let mut value = serde_json::to_value(SnapshotState::initial()).unwrap();
     value.as_object_mut().unwrap().remove("finish_remove_stale");
     let restored: SnapshotState = serde_json::from_value(value).unwrap();
     assert!(restored.finish_remove_stale);
+    assert!(!restored.finish_remove_uninstalled);
+}
+
+#[test]
+fn old_provider_markers_default_to_no_uninstalled_tombstone() {
+    let marker: Marker = serde_json::from_value(json!({
+        "version":1,
+        "caller":"amaterasu.playnite",
+        "source_id":"playnite:10",
+        "entry_id":"app-0000000000000001",
+        "generation":1,
+        "fingerprint":"a".repeat(64),
+        "detached":false
+    }))
+    .unwrap();
+
+    assert_eq!(marker.remove_generation, None);
+    assert!(marker.config_overrides.validate().is_ok());
 }
 
 #[test]
@@ -323,6 +413,7 @@ fn snapshot_finish_policy_is_boolean_and_defaults_to_legacy_removal() {
         operation,
         Operation::ProviderSnapshotFinish {
             remove_stale: true,
+            remove_uninstalled: false,
             ..
         }
     ));
@@ -333,6 +424,18 @@ fn snapshot_finish_policy_is_boolean_and_defaults_to_legacy_removal() {
         operation,
         Operation::ProviderSnapshotFinish {
             remove_stale: false,
+            remove_uninstalled: false,
+            ..
+        }
+    ));
+
+    request["remove_uninstalled"] = json!(true);
+    let operation: Operation = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(
+        operation,
+        Operation::ProviderSnapshotFinish {
+            remove_stale: false,
+            remove_uninstalled: true,
             ..
         }
     ));
@@ -1015,6 +1118,547 @@ fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complet
 }
 
 #[test]
+fn provider_uninstalled_tombstones_are_authorized_bounded_and_unique() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let imported = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let unauthorized = backend.run_for(
+        &mut pipeline,
+        snapshot_batch_with_removals(
+            "playnite-scan-1",
+            1,
+            1,
+            1,
+            1,
+            Vec::new(),
+            vec!["playnite:10"],
+        ),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(unauthorized["error"]["code"], "permission_denied");
+
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("playnite-scan-2", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    assert_eq!(generation, 2);
+
+    let overlap = backend.run_for(
+        &mut pipeline,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            vec![("playnite:10", playnite_entry("Imported"))],
+            vec!["playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(overlap["error"]["code"], "invalid_request");
+
+    let duplicates = backend.run_for(
+        &mut pipeline,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            vec!["playnite:10", "playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(duplicates["error"]["code"], "invalid_request");
+
+    let too_many = backend.run_for(
+        &mut pipeline,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            vec![
+                "playnite:a",
+                "playnite:b",
+                "playnite:c",
+                "playnite:d",
+                "playnite:e",
+                "playnite:f",
+                "playnite:g",
+                "playnite:h",
+                "playnite:i",
+            ],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(too_many["error"]["code"], "invalid_request");
+
+    let tombstone = backend.run_for(
+        &mut pipeline,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            vec!["playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(tombstone["ok"], true);
+
+    let cross_batch_duplicate = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "playnite-scan-2",
+            generation,
+            2,
+            1,
+            1,
+            vec![("playnite:10", playnite_entry("Duplicate"))],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(
+        cross_batch_duplicate["error"]["code"],
+        "duplicate_source_id"
+    );
+    assert_eq!(backend.entries["app-0000000000000001"]["name"], "Imported");
+}
+
+#[test]
+fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let imported = import_playnite_entries(
+        &mut backend,
+        &mut playnite,
+        "playnite-scan-1",
+        1,
+        0,
+        vec![
+            ("playnite:10", "Removed later"),
+            ("playnite:11", "Retained"),
+        ],
+    );
+    assert_eq!(imported["ok"], true);
+
+    let overrides = backend.run_for(
+        &mut playnite,
+        update_provider_overrides("app-0000000000000002", 1, json!(37)),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(overrides["ok"], true);
+
+    let mut steam = steam_importer();
+    let steam_begin = backend.run_for(
+        &mut steam,
+        snapshot_begin("steam-scan-1", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    let steam_batch = backend.run_for(
+        &mut steam,
+        snapshot_batch(
+            "steam-scan-1",
+            steam_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            2,
+            vec![("steam:42", entry("Steam entry"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(steam_batch["ok"], true);
+    let steam_finish = backend.run_for(
+        &mut steam,
+        snapshot_finish_with_policies(
+            "steam-scan-1",
+            steam_begin["generation"].as_u64().unwrap(),
+            1,
+            steam_batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: false,
+            },
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(steam_finish["ok"], true);
+
+    let mut manual = Pipeline::default();
+    let manual_entry = backend.run_for(
+        &mut manual,
+        json!({
+            "action":"create",
+            "expected_revision":3,
+            "entry":{"name":"Manual entry","launch":{"kind":"application","path":"/Applications/Manual.app"}}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual_entry["ok"], true);
+    assert_eq!(manual_entry["id"], "app-0000000000000004");
+
+    let generation_two = backend.run_for(
+        &mut playnite,
+        snapshot_begin("playnite-scan-2", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = generation_two["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            4,
+            vec![("playnite:11", playnite_entry("Retained after refresh"))],
+            vec!["playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true);
+    assert_eq!(batch["revision"], 5);
+
+    // Manual refreshes keep the explicit source fact in storage but do not
+    // apply the membership deletion policy when auto_sync is disabled.
+    let retained = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "playnite-scan-2",
+            generation,
+            2,
+            5,
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: false,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(retained["ok"], true);
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+    assert_eq!(
+        backend.entries["app-0000000000000002"]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(
+        backend.entries["app-0000000000000002"]["name"],
+        "Retained after refresh"
+    );
+
+    let generation_three = backend.run_for(
+        &mut playnite,
+        snapshot_begin("playnite-scan-3", 3),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = generation_three["generation"].as_u64().unwrap();
+    let tombstone = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_removals(
+            "playnite-scan-3",
+            generation,
+            3,
+            0,
+            5,
+            Vec::new(),
+            vec!["playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(tombstone["ok"], true);
+
+    let incomplete = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "playnite-scan-3",
+            generation,
+            3,
+            5,
+            1,
+            false,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: true,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(incomplete["error"]["code"], "incomplete_snapshot");
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+
+    let finish_with_removal = snapshot_finish_with_policies(
+        "playnite-scan-3",
+        generation,
+        3,
+        5,
+        1,
+        true,
+        CleanupPolicy {
+            remove_stale: false,
+            remove_uninstalled: true,
+        },
+    );
+    backend.lose_commit_ack_once = true;
+    let uncertain = backend.run_for(
+        &mut playnite,
+        finish_with_removal.clone(),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(uncertain["error"]["code"], "deadline_exceeded");
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+
+    let cleaned = backend.run_for(
+        &mut playnite,
+        finish_with_removal,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(cleaned["ok"], true);
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+    assert!(
+        !backend
+            .entries
+            .contains_key("~provider.entry:amaterasu.playnite:playnite:10")
+    );
+    assert!(backend.entries.contains_key("app-0000000000000002"));
+    assert!(backend.entries.contains_key("app-0000000000000003"));
+    assert!(backend.entries.contains_key("app-0000000000000004"));
+    assert_eq!(
+        backend.entries["app-0000000000000002"]["config_overrides"]["fec_percentage"],
+        37
+    );
+    assert_eq!(backend.metadata["provider_count"], 4);
+
+    let replay_with_changed_policy = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "playnite-scan-3",
+            generation,
+            3,
+            5,
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: false,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(
+        replay_with_changed_policy["error"]["code"],
+        "snapshot_conflict"
+    );
+}
+
+#[test]
+fn playnite_tombstone_cleanup_conflict_does_not_delete_an_entry() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let imported = import_playnite_entry(
+        &mut backend,
+        &mut playnite,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("playnite-scan-2", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let tombstone = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            vec!["playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(tombstone["ok"], true);
+
+    let concurrent = backend.run_for(
+        &mut Pipeline::default(),
+        json!({
+            "action":"create",
+            "expected_revision":1,
+            "entry":{"name":"Concurrent manual row","launch":{"kind":"application","path":"/Applications/Concurrent.app"}}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(concurrent["ok"], true);
+
+    let conflict = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "playnite-scan-2",
+            generation,
+            2,
+            1,
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: true,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(conflict["error"]["code"], "revision_conflict");
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+    assert!(backend.entries.contains_key("app-0000000000000002"));
+}
+
+#[test]
+fn empty_or_rejected_playnite_snapshot_has_no_cleanup_effect() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let imported = import_playnite_entry(
+        &mut backend,
+        &mut playnite,
+        "playnite-scan-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("playnite-scan-2", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let rejected_batch = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_removals(
+            "playnite-scan-2",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            vec!["playnite:10", "playnite:10"],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(rejected_batch["error"]["code"], "invalid_request");
+
+    let empty_complete = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "playnite-scan-2",
+            generation,
+            2,
+            1,
+            0,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: true,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(empty_complete["ok"], true);
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+    assert!(
+        backend
+            .entries
+            .contains_key("~provider.entry:amaterasu.playnite:playnite:10")
+    );
+}
+
+#[test]
 fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();
@@ -1387,6 +2031,7 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
         fingerprint: provider_entry_fingerprint("amaterasu.steam", &imported_entry),
         config_overrides: ConfigOverrides::default(),
         detached: false,
+        remove_generation: None,
     };
     let playnite_state = SnapshotState {
         version: 1,
@@ -1399,6 +2044,7 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
         cleanup_pending: false,
         finish_expected_revision: Some(1),
         finish_remove_stale: true,
+        finish_remove_uninstalled: false,
     };
     let mut backend = Backend {
         revision: 1,

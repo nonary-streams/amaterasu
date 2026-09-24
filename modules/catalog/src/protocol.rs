@@ -58,6 +58,8 @@ pub enum Operation {
         sequence: u64,
         expected_revision: u64,
         entries: Vec<ProviderEntry>,
+        #[serde(default)]
+        remove_source_ids: Vec<String>,
     },
     ProviderSnapshotFinish {
         sync_id: String,
@@ -68,6 +70,8 @@ pub enum Operation {
         complete: bool,
         #[serde(default = "default_remove_stale")]
         remove_stale: bool,
+        #[serde(default)]
+        remove_uninstalled: bool,
     },
 }
 

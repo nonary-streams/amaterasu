@@ -89,6 +89,7 @@ struct ProviderSession {
     entry_ids: BTreeSet<String>,
     fingerprints: BTreeMap<String, String>,
     markers: BTreeMap<String, Marker>,
+    seen_source_ids: BTreeSet<String>,
     state: SnapshotState,
 }
 
@@ -103,6 +104,7 @@ struct ProviderBatch {
     expected_revision: u64,
     fingerprint: String,
     entries: Vec<ProviderEntry>,
+    remove_source_ids: Vec<String>,
 }
 struct ProviderFinish {
     sync_id: String,
@@ -112,6 +114,7 @@ struct ProviderFinish {
     next_sequence: u64,
     source_complete: bool,
     remove_stale: bool,
+    remove_uninstalled: bool,
 }
 struct Scan {
     export: bool,
@@ -363,6 +366,16 @@ impl Pipeline {
         if !state.validate() {
             return complete(send, context.request_id, malformed());
         }
+        let seen_source_ids = scan
+            .markers
+            .values()
+            .filter(|marker| {
+                marker.caller == caller
+                    && (marker.generation == state.generation
+                        || marker.remove_generation == Some(state.generation))
+            })
+            .map(|marker| marker.source_id.clone())
+            .collect();
         let session = ProviderSession {
             caller,
             key: context.key.clone(),
@@ -373,6 +386,7 @@ impl Pipeline {
             entry_ids: scan.entry_ids,
             fingerprints: scan.fingerprints,
             markers: scan.markers,
+            seen_source_ids,
             state,
         };
         self.apply_provider_operation(context, scan.operation, session, send)
@@ -397,12 +411,26 @@ impl Pipeline {
                 sequence,
                 expected_revision,
                 entries,
+                remove_source_ids,
             } => {
-                let encoded = serde_json::to_vec(&entries).map_or(usize::MAX, |bytes| bytes.len());
+                let batch_payload = json!({
+                    "entries":&entries,
+                    "remove_source_ids":&remove_source_ids,
+                });
+                let encoded =
+                    serde_json::to_vec(&batch_payload).map_or(usize::MAX, |bytes| bytes.len());
+                let mut batch_source_ids = BTreeSet::new();
+                let unique_sources = entries
+                    .iter()
+                    .all(|entry| batch_source_ids.insert(entry.source_id.as_str()))
+                    && remove_source_ids
+                        .iter()
+                        .all(|source_id| batch_source_ids.insert(source_id.as_str()));
                 if !valid_sync_id(&sync_id)
-                    || entries.is_empty()
-                    || entries.len() > MAX_BATCH_ENTRIES
+                    || (entries.is_empty() && remove_source_ids.is_empty())
+                    || entries.len().saturating_add(remove_source_ids.len()) > MAX_BATCH_ENTRIES
                     || encoded > MAX_BATCH_BYTES
+                    || !unique_sources
                 {
                     return complete(
                         send,
@@ -410,7 +438,7 @@ impl Pipeline {
                         error("invalid_request", "provider batch exceeds its bounds"),
                     );
                 }
-                let batch_fingerprint = serde_json::to_vec(&entries)
+                let batch_fingerprint = serde_json::to_vec(&batch_payload)
                     .map(|bytes| fingerprint_bytes(&bytes))
                     .unwrap_or_default();
                 if !snapshot_matches(&session, &sync_id, generation, source_revision) {
@@ -467,6 +495,7 @@ impl Pipeline {
                         expected_revision,
                         fingerprint: batch_fingerprint,
                         entries,
+                        remove_source_ids,
                     },
                     send,
                 )
@@ -479,6 +508,7 @@ impl Pipeline {
                 next_sequence,
                 complete: source_complete,
                 remove_stale,
+                remove_uninstalled,
             } => self.finish_snapshot(
                 context,
                 session,
@@ -490,6 +520,7 @@ impl Pipeline {
                     next_sequence,
                     source_complete,
                     remove_stale,
+                    remove_uninstalled,
                 },
                 send,
             ),
@@ -807,7 +838,9 @@ impl Pipeline {
             cleanup_pending: false,
             finish_expected_revision: None,
             finish_remove_stale: true,
+            finish_remove_uninstalled: false,
         };
+        session.seen_source_ids.clear();
         let key = state_key(&session.caller);
         if is_new_state {
             session.provider_count = session.provider_count.saturating_add(1);
@@ -842,8 +875,28 @@ impl Pipeline {
             expected_revision,
             fingerprint: batch_fingerprint,
             entries,
+            remove_source_ids,
         } = batch;
         let mut source_ids = BTreeSet::new();
+        for source_id in entries
+            .iter()
+            .map(|entry| entry.source_id.as_str())
+            .chain(remove_source_ids.iter().map(String::as_str))
+        {
+            if !valid_source_id(source_id)
+                || session.seen_source_ids.contains(source_id)
+                || !source_ids.insert(source_id.to_owned())
+            {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "duplicate_source_id",
+                        "provider snapshot repeats a source ID within its generation",
+                    ),
+                );
+            }
+        }
         let mut edits = Vec::new();
         let mut entries_changed = false;
         for provider_entry in entries {
@@ -851,11 +904,7 @@ impl Pipeline {
             let mut entry = provider_entry.entry;
             let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
                 && session.caller != PLAYNITE_IMPORTER;
-            if !valid_source_id(&source_id)
-                || !source_ids.insert(source_id.clone())
-                || entry.validate().is_err()
-                || invalid_launch_owner
-            {
+            if entry.validate().is_err() || invalid_launch_owner {
                 return complete(
                     send,
                     context.request_id,
@@ -929,6 +978,7 @@ impl Pipeline {
                 fingerprint: desired_fingerprint.clone(),
                 config_overrides,
                 detached,
+                remove_generation: None,
             };
             if detached {
                 // A changed or deleted Entry has become user-owned. Keep it and
@@ -952,7 +1002,20 @@ impl Pipeline {
                 session.provider_count = session.provider_count.saturating_add(1);
             }
             session.markers.insert(key.clone(), marker.clone());
+            session.seen_source_ids.insert(source_id);
             edits.push(json!({"key":key,"value":marker_value(&marker)}));
+        }
+        for source_id in remove_source_ids {
+            let key = entry_key(&session.caller, &source_id);
+            if let Some(mut marker) = session.markers.get(&key).cloned() {
+                if !validate_marker(&marker, &session.caller, &source_id) {
+                    return complete(send, context.request_id, malformed());
+                }
+                marker.remove_generation = Some(session.state.generation);
+                session.markers.insert(key.clone(), marker.clone());
+                edits.push(json!({"key":key,"value":marker_value(&marker)}));
+            }
+            session.seen_source_ids.insert(source_id);
         }
         let new_revision = if entries_changed {
             let Some(revision) = session.document_revision.checked_add(1) else {
@@ -978,6 +1041,7 @@ impl Pipeline {
         session.state.cleanup_pending = false;
         session.state.finish_expected_revision = None;
         session.state.finish_remove_stale = true;
+        session.state.finish_remove_uninstalled = false;
         session.state.last_batch = Some(CommittedBatch {
             sequence,
             expected_revision,
@@ -1020,6 +1084,7 @@ impl Pipeline {
             next_sequence,
             source_complete,
             remove_stale,
+            remove_uninstalled,
         } = finish;
         if !source_complete {
             return complete(
@@ -1046,6 +1111,7 @@ impl Pipeline {
         if session.state.finished {
             if session.state.finish_expected_revision != Some(expected_revision)
                 || session.state.finish_remove_stale != remove_stale
+                || session.state.finish_remove_uninstalled != remove_uninstalled
             {
                 return complete(
                     send,
@@ -1057,7 +1123,7 @@ impl Pipeline {
                 return complete(
                     send,
                     context.request_id,
-                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale}),
+                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled}),
                 );
             }
         } else {
@@ -1071,18 +1137,20 @@ impl Pipeline {
             session.state.finished = true;
             session.state.finish_expected_revision = Some(expected_revision);
             session.state.finish_remove_stale = remove_stale;
+            session.state.finish_remove_uninstalled = remove_uninstalled;
         }
-        let mut stale: Vec<Marker> = if remove_stale {
-            session
-                .markers
-                .values()
-                .filter(|marker| marker.caller == session.caller && marker.generation < generation)
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        stale.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        let mut stale_by_key = BTreeMap::new();
+        for marker in session.markers.values().filter(|marker| {
+            marker.caller == session.caller
+                && ((remove_stale && marker.generation < generation)
+                    || (remove_uninstalled && marker.remove_generation == Some(generation)))
+        }) {
+            stale_by_key.insert(
+                entry_key(&session.caller, &marker.source_id),
+                marker.clone(),
+            );
+        }
+        let stale: Vec<Marker> = stale_by_key.into_values().collect();
         session.state.cleanup_pending = !stale.is_empty();
         self.commit_provider_cleanup(context, session, stale, send)
     }
@@ -1129,7 +1197,7 @@ impl Pipeline {
             "value":session.state.clone(),
         }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale,"remove_uninstalled":session.state.finish_remove_uninstalled});
         self.submit(
             context,
             payload,

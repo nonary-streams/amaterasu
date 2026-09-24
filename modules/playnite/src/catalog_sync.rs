@@ -34,6 +34,8 @@ struct Transaction {
     settings_epoch: u64,
     launchable_game_ids: std::collections::BTreeSet<String>,
     entries: Vec<Vec<Value>>,
+    remove_source_id_batches: Vec<Vec<String>>,
+    remove_uninstalled: bool,
     generation: Option<u64>,
     revision: Option<u64>,
     sequence: u64,
@@ -59,7 +61,8 @@ impl Transaction {
                 "source_revision":self.source_revision,
                 "sequence":self.sequence,
                 "expected_revision":self.revision.expect("begin provides revision"),
-                "entries":self.entries[self.batch_index]
+                "entries":self.entries.get(self.batch_index).cloned().unwrap_or_default(),
+                "remove_source_ids":self.remove_source_ids_for_batch()
             }),
             Stage::Finish => json!({
                 "action":"provider_snapshot_finish",
@@ -69,9 +72,24 @@ impl Transaction {
                 "expected_revision":self.revision.expect("begin provides revision"),
                 "next_sequence":self.sequence,
                 "complete":true,
-                "remove_stale":false
+                "remove_stale":false,
+                "remove_uninstalled":self.remove_uninstalled
             }),
         }
+    }
+
+    fn batch_count(&self) -> usize {
+        self.entries.len() + self.remove_source_id_batches.len()
+    }
+
+    fn remove_source_ids_for_batch(&self) -> Vec<String> {
+        let Some(index) = self.batch_index.checked_sub(self.entries.len()) else {
+            return Vec::new();
+        };
+        self.remove_source_id_batches
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn next_operation_id(&mut self) -> String {
@@ -134,7 +152,7 @@ impl Transaction {
                 }
                 self.generation = Some(generation);
                 self.revision = Some(revision);
-                self.stage = if self.entries.is_empty() {
+                self.stage = if self.batch_count() == 0 {
                     Stage::Finish
                 } else {
                     Stage::Batch
@@ -154,7 +172,7 @@ impl Transaction {
                 self.revision = Some(revision);
                 self.sequence = expected_next;
                 self.batch_index += 1;
-                self.stage = if self.batch_index == self.entries.len() {
+                self.stage = if self.batch_index == self.batch_count() {
                     Stage::Finish
                 } else {
                     Stage::Batch
@@ -166,6 +184,8 @@ impl Transaction {
                     || payload.get("complete").and_then(Value::as_bool) != Some(true)
                     || payload.get("cleanup_pending").and_then(Value::as_bool) != Some(false)
                     || payload.get("remove_stale").and_then(Value::as_bool) != Some(false)
+                    || payload.get("remove_uninstalled").and_then(Value::as_bool)
+                        != Some(self.remove_uninstalled)
                 {
                     return Err("catalog finish response was inconsistent".into());
                 }
@@ -202,6 +222,26 @@ impl CatalogSync {
         }
         let selected = select_games(snapshot, settings, now_unix);
         let (entries, skipped) = prepare_entries(&selected)?;
+        let remove_uninstalled = settings.auto_sync && settings.autosync_remove_uninstalled;
+        let remove_source_ids = if remove_uninstalled {
+            snapshot
+                .games
+                .iter()
+                .filter(|game| {
+                    game.is_installed() == Some(false)
+                        && crate::snapshot::valid_playnite_id(&game.id)
+                })
+                .map(|game| game.id.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let remove_source_id_batches = remove_source_ids
+            .chunks(MAX_BATCH_ENTRIES)
+            .map(<[String]>::to_vec)
+            .collect();
         let launchable_game_ids = entries
             .iter()
             .flatten()
@@ -219,6 +259,8 @@ impl CatalogSync {
             settings_epoch,
             launchable_game_ids,
             entries,
+            remove_source_id_batches,
+            remove_uninstalled,
             generation: None,
             revision: None,
             sequence: 0,
@@ -487,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_import_finish_never_deletes_prior_provider_entries() {
+    fn complete_import_finish_uses_targeted_uninstalled_cleanup_only() {
         let mut sync = CatalogSync::default();
         let snapshot = Snapshot {
             games: vec![game(
@@ -516,6 +558,92 @@ mod tests {
         transaction.revision = Some(2);
         assert_eq!(transaction.payload()["remove_stale"], false);
         assert_eq!(transaction.payload()["complete"], true);
+        assert_eq!(transaction.payload()["remove_uninstalled"], true);
+        assert!(transaction.remove_source_id_batches.is_empty());
+    }
+
+    #[test]
+    fn only_explicit_uninstalled_ids_become_bounded_tombstones() {
+        let installed_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let excluded_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let mut games = vec![
+            game(installed_id, "Installed", r"C:\Games\installed.exe"),
+            game(
+                excluded_id,
+                "Excluded but installed",
+                r"C:\Games\excluded.exe",
+            ),
+        ];
+        for index in 0..9 {
+            let id = format!("{index:08x}-1234-5678-9abc-0123456789ab");
+            let mut uninstalled = game(&id, "Uninstalled", "");
+            uninstalled.installed = Some(false);
+            games.push(uninstalled);
+        }
+        let mut invalid_uninstalled = game("not-a-guid", "Invalid ID", "");
+        invalid_uninstalled.installed = Some(false);
+        games.push(invalid_uninstalled);
+
+        let snapshot = Snapshot {
+            games,
+            categories: vec![],
+            plugins: vec![],
+        };
+        let settings = ProductSettings {
+            sync_all_installed: true,
+            exclude_games: vec![excluded_id.to_ascii_uppercase()],
+            ..ProductSettings::default()
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot, &settings, 1, 0).unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        assert!(transaction.remove_uninstalled);
+        assert_eq!(transaction.entries.len(), 1);
+        assert_eq!(transaction.remove_source_id_batches.len(), 2);
+        assert_eq!(
+            transaction.remove_source_id_batches[0].len(),
+            MAX_BATCH_ENTRIES
+        );
+        assert_eq!(transaction.remove_source_id_batches[1].len(), 1);
+
+        transaction.stage = Stage::Batch;
+        transaction.generation = Some(1);
+        transaction.revision = Some(0);
+        transaction.batch_index = 0;
+        let selected_batch = transaction.payload();
+        assert_eq!(selected_batch["entries"].as_array().unwrap().len(), 1);
+        assert!(
+            selected_batch["remove_source_ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        transaction.batch_index = transaction.entries.len();
+        let first_tombstone_batch = transaction.payload();
+        assert!(
+            first_tombstone_batch["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            first_tombstone_batch["remove_source_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_BATCH_ENTRIES
+        );
+
+        let mut manual_settings = settings;
+        manual_settings.auto_sync = false;
+        let mut manual_refresh = CatalogSync::default();
+        manual_refresh
+            .start(&snapshot, &manual_settings, 2, 0)
+            .unwrap();
+        let manual_transaction = manual_refresh.transaction.as_ref().unwrap();
+        assert!(!manual_transaction.remove_uninstalled);
+        assert!(manual_transaction.remove_source_id_batches.is_empty());
     }
 
     #[test]
@@ -550,7 +678,8 @@ mod tests {
                 "revision":3,
                 "complete":true,
                 "cleanup_pending":false,
-                "remove_stale":false
+                "remove_stale":false,
+                "remove_uninstalled":true
             }),
         );
         assert_eq!(

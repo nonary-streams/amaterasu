@@ -55,10 +55,26 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         "action":"settings_update",
         "enabled":true,
         "sync_all_installed":true,
+        "autosync_remove_uninstalled":false,
         "expected_revision":3
     }))
     .unwrap();
     assert!(action.is_settings());
+
+    let legacy_update: Action = serde_json::from_value(json!({
+        "action":"settings_update",
+        "enabled":true,
+        "expected_revision":3
+    }))
+    .unwrap();
+    let Action::SettingsUpdate {
+        autosync_remove_uninstalled,
+        ..
+    } = legacy_update
+    else {
+        panic!("expected settings update")
+    };
+    assert_eq!(autosync_remove_uninstalled, None);
 
     assert!(
         serde_json::from_value::<Action>(json!({

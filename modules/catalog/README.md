@@ -232,8 +232,8 @@ or migrates storage, including when reading a legacy document.
 
 Startup `import_principals` maps each trusted provider caller to one fixed catalog
 owner. It defaults to `{}` and has the same 16-entry principal validation as
-`export_principals`. For Steam, release policy maps
-`amaterasu.steam` to `amaterasu.management`. The importer identity comes from the
+`export_principals`. Release policy maps `amaterasu.steam` and
+`amaterasu.playnite` to `amaterasu.management`. The importer identity comes from the
 authenticated immediate caller of `Poll`; requests do not accept an owner or
 domain selector. The catalog stores provider ownership and sync state in separate
 reserved collection rows, not in user-editable `Entry` metadata.
@@ -248,8 +248,10 @@ Begin a source snapshot and retain the returned generation and catalog revision:
 {"ok":true,"revision":0,"generation":1,"next_sequence":0}
 ```
 
-Send batches with stable source IDs and validated catalog entries. Batches hold
-1–8 entries and at most 12,000 encoded bytes. `expected_revision` is the public
+Send batches with stable source IDs and validated catalog entries. Each batch
+contains 1–8 combined entries and removal IDs, at most 12,000 encoded bytes.
+Source IDs cannot repeat or overlap within a batch or across batches in one
+generation. `expected_revision` is the public
 catalog revision returned by the previous batch; `sequence` must equal
 `next_sequence`:
 
@@ -261,6 +263,13 @@ catalog revision returned by the previous batch; `sequence` must equal
 {"ok":true,"revision":1,"generation":1,"next_sequence":1}
 ```
 
+An importer may include `remove_source_ids` in a batch to record explicit
+provider facts that an owned item is uninstalled. These IDs are tombstones;
+they are not inferred from missing IDs or from an entry being filtered out of the
+selected catalog. A tombstone only matches a marker owned by the authenticated
+importer. Unknown IDs are ignored. Ordinary catalog management actions cannot
+write tombstones.
+
 The last committed batch can be retried after an ambiguous timeout. The replay
 must have the same sequence, expected revision and SHA-256 payload fingerprint;
 it returns the committed revision without applying the batch again. Earlier or
@@ -269,24 +278,35 @@ set also detects edits by ordinary catalog clients; reload/retry after a
 `revision_conflict`.
 
 Finish only after the provider has completed its full source scan. `remove_stale`
-is an optional boolean that defaults to `true` for existing clients:
+is an optional boolean that defaults to `true` for existing clients. The separate
+`remove_uninstalled` flag defaults to `false` and enables cleanup for explicit
+tombstones:
 
 ```json
-{"action":"provider_snapshot_finish","sync_id":"steam-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true,"remove_stale":true}
+{"action":"provider_snapshot_finish","sync_id":"playnite-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true,"remove_stale":false,"remove_uninstalled":true}
 ```
 
 Success returns `ok`, `revision`, `generation`, `complete:true`,
-`cleanup_pending:false`, and the resolved `remove_stale` policy. An incomplete
-scan is rejected and never removes anything. When `remove_stale` is false, old
-provider markers and entries are retained for a later complete scan; the
-authenticated importer cannot select another provider's markers. The chosen
-policy is persisted with the finished generation, so retries after an ambiguous
-timeout must repeat the same choice. Removal is committed in bounded chunks and
-can be reconciled by repeating that finish. Entries changed or deleted by a
-user are detached from provider ownership and are never silently overwritten or
-removed. Begin retries with the same `sync_id` resume that generation; a new or
-restarted source scan must use a fresh ID so partial data from the old
-generation cannot be mistaken for a complete snapshot.
+`cleanup_pending:false`, and both resolved cleanup policies. An incomplete scan
+is rejected and never removes anything. When `remove_stale` is false, old
+provider markers and entries are retained for a later complete scan. When
+`remove_uninstalled` is true, only markers explicitly tombstoned in this
+generation are eligible for cleanup. Cleanup removes an entry only if it remains
+unchanged and attached to this provider; a detached or edited entry is retained
+and its marker is cleared. Other providers' and manual entries are unaffected.
+Both choices are persisted with the finished generation, so retries after an
+ambiguous timeout must repeat the same choices. Removal is committed in bounded
+chunks and can be reconciled by repeating that finish. Begin retries with the
+same `sync_id` resume that generation; a new or restarted source scan must use a
+fresh ID so partial data from the old generation cannot be mistaken for a
+complete snapshot.
+
+Playnite uses explicit `installed:false` records as tombstones only when both
+`auto_sync` and `autosync_remove_uninstalled` are enabled. A manual refresh with
+`auto_sync` disabled does not apply membership cleanup. Selection exclusions and
+missing IDs do not imply uninstallation, and are never tombstoned by the
+provider. TTL cleanup and replacement of stale recent-mode selections are
+separate product policies and are not implemented by this catalog contract.
 
 The catalog API provides durable snapshot mechanics, not source discovery or
 product policy. Providers remain responsible for validating their domain data,

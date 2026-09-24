@@ -16,6 +16,8 @@ pub struct ProductSettings {
     pub auto_sync: bool,
     #[serde(default)]
     pub sync_all_installed: bool,
+    #[serde(default = "default_autosync_remove_uninstalled")]
+    pub autosync_remove_uninstalled: bool,
     #[serde(default = "default_recent_games")]
     pub recent_games: u32,
     #[serde(default = "default_recent_max_age_days")]
@@ -40,6 +42,10 @@ fn default_auto_sync() -> bool {
     true
 }
 
+fn default_autosync_remove_uninstalled() -> bool {
+    true
+}
+
 fn default_recent_games() -> u32 {
     10
 }
@@ -54,6 +60,7 @@ impl Default for ProductSettings {
             enabled: default_enabled(),
             auto_sync: default_auto_sync(),
             sync_all_installed: false,
+            autosync_remove_uninstalled: default_autosync_remove_uninstalled(),
             recent_games: default_recent_games(),
             recent_max_age_days: default_recent_max_age_days(),
             sync_categories: Vec::new(),
@@ -178,6 +185,7 @@ mod tests {
         assert_eq!(settings.enabled, cfg!(windows));
         assert!(settings.auto_sync);
         assert!(!settings.sync_all_installed);
+        assert!(settings.autosync_remove_uninstalled);
         assert_eq!(settings.recent_games, 10);
         assert_eq!(settings.recent_max_age_days, 30);
     }
@@ -196,6 +204,20 @@ mod tests {
         assert_eq!(
             ProductSettings::from_product_document(&payload),
             Ok((settings, 7))
+        );
+        let mut legacy_values = serde_json::to_value(ProductSettings::default()).unwrap();
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("autosync_remove_uninstalled");
+        assert!(
+            ProductSettings::from_product_document(&json!({
+                "ok":true,"found":true,"version":1,"revision":6,
+                "values":legacy_values
+            }))
+            .unwrap()
+            .0
+            .autosync_remove_uninstalled
         );
         assert_eq!(
             ProductSettings::from_product_document(&json!({

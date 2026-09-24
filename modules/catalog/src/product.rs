@@ -21,6 +21,8 @@ pub(crate) struct Marker {
     #[serde(default)]
     pub(crate) config_overrides: ConfigOverrides,
     pub(crate) detached: bool,
+    #[serde(default)]
+    pub(crate) remove_generation: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -37,6 +39,8 @@ pub(crate) struct SnapshotState {
     pub(crate) finish_expected_revision: Option<u64>,
     #[serde(default = "default_remove_stale")]
     pub(crate) finish_remove_stale: bool,
+    #[serde(default)]
+    pub(crate) finish_remove_uninstalled: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -62,6 +66,7 @@ impl SnapshotState {
             cleanup_pending: false,
             finish_expected_revision: None,
             finish_remove_stale: true,
+            finish_remove_uninstalled: false,
         }
     }
 
@@ -72,6 +77,7 @@ impl SnapshotState {
             && (!self.finished || self.generation != 0)
             && (!self.cleanup_pending || self.finished)
             && (self.finish_expected_revision.is_some() || !self.finished)
+            && (!self.finish_remove_uninstalled || self.finished)
             && self.last_batch.as_ref().is_none_or(|batch| {
                 batch.sequence.checked_add(1) == Some(batch.next_sequence)
                     && batch.next_sequence == self.next_sequence
@@ -115,6 +121,9 @@ pub(crate) fn validate_marker(marker: &Marker, caller: &str, source_id: &str) ->
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
         && marker.config_overrides.validate().is_ok()
+        && marker
+            .remove_generation
+            .is_none_or(|generation| generation > 0)
 }
 
 pub(crate) fn marker_value(marker: &Marker) -> Value {
