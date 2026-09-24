@@ -6,6 +6,7 @@ import http.client
 import json
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -334,14 +335,19 @@ def test_auth_and_crud(console, api):
         connection.close()
     assert moved_info.findtext("hostname") == "Living Room & Games", ET.tostring(moved_info)
     status, input_defaults, _ = api.post("/v1/input/settings_get", token=administrator)
-    assert status == 200 and input_defaults["values"] == {"keyboard": True, "mouse": True}, input_defaults
+    assert status == 200 and input_defaults["values"] == {
+        "keyboard": True,
+        "mouse": True,
+        "high_resolution_scrolling": True,
+    }, input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
     input_values = {"keyboard": False, "mouse": True}
+    input_persisted_values = {**input_values, "high_resolution_scrolling": True}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
         **input_values, "expected_revision": input_defaults["revision"],
     }, administrator)
     assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
-    assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
+    assert input_updated["values"] == input_persisted_values and input_updated["revision"] == 1, input_updated
     status, input_conflict, _ = api.post("/v1/input/settings_update", {
         "keyboard": True, "mouse": True, "expected_revision": input_defaults["revision"],
     }, administrator)
@@ -350,7 +356,7 @@ def test_auth_and_crud(console, api):
         "keyboard": True, "mouse": True, "expected_revision": 1, "owner": "amaterasu.other",
     }, administrator)[0] == 400
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
-    assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 1, input_saved
+    assert status == 200 and input_saved["values"] == input_persisted_values and input_saved["revision"] == 1, input_saved
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
     assert status == 200 and steam_settings["ok"], steam_settings
     assert steam_settings["values"] == {
@@ -421,10 +427,77 @@ def test_auth_and_crud(console, api):
         time.sleep(0.02)
     assert len(games["games"]) == 1 and games["games"][0]["stable_id"] == "steam:730", games
     assert games["games"][0]["installed"], games
+    deadline = time.monotonic() + 5
+    while True:
+        status, lutris_status, _ = api.post("/v1/lutris/status", token=administrator)
+        assert status == 200 and lutris_status["ok"], lutris_status
+        if lutris_status["settings_ready"]:
+            break
+        assert time.monotonic() < deadline, lutris_status
+        time.sleep(0.02)
+    status, lutris_defaults, _ = api.post("/v1/lutris/settings", token=administrator)
+    assert status == 200 and lutris_defaults["ok"], lutris_defaults
+    linux_runtime = sys.platform.startswith("linux")
+    assert lutris_status["platform_supported"] == linux_runtime, lutris_status
+    assert lutris_defaults["values"]["enabled"] == linux_runtime, lutris_defaults
+    lutris_values = {
+        "enabled": lutris_defaults["values"]["enabled"],
+        "auto_sync": False,
+        "autosync_remove_uninstalled": False,
+        "include_steam": False,
+        "exclude_games": [
+            {"id": "730", "name": "Old game name"},
+            {"name": "Excluded by name"},
+        ],
+    }
+    status, lutris_saved, _ = api.post(
+        "/v1/lutris/settings_update",
+        {**lutris_values, "expected_revision": lutris_defaults["revision"]},
+        administrator,
+    )
+    assert status == 200 and lutris_saved["ok"], lutris_saved
+    assert lutris_saved["values"] == lutris_values, lutris_saved
+    status, lutris_conflict, _ = api.post(
+        "/v1/lutris/settings_update",
+        {
+            **lutris_values,
+            "auto_sync": True,
+            "expected_revision": lutris_defaults["revision"],
+        },
+        administrator,
+    )
+    assert status == 200 and not lutris_conflict["ok"], lutris_conflict
+    assert lutris_conflict.get("error", {}).get("code") == "revision_conflict", lutris_conflict
+    status, lutris_readback, _ = api.post("/v1/lutris/settings", token=administrator)
+    assert status == 200 and lutris_readback["values"] == lutris_values, lutris_readback
+    lutris_revision = lutris_readback["revision"]
+    if not linux_runtime:
+        status, rejected_lutris_enable, _ = api.post(
+            "/v1/lutris/settings_update",
+            {**lutris_values, "enabled": True, "expected_revision": lutris_revision},
+            administrator,
+        )
+        assert status == 200 and not rejected_lutris_enable["ok"], rejected_lutris_enable
+        assert rejected_lutris_enable.get("error", {}).get("code") == "invalid_request", rejected_lutris_enable
+        status, lutris_readback, _ = api.post("/v1/lutris/settings", token=administrator)
+        assert status == 200 and lutris_readback["values"] == lutris_values, lutris_readback
+        status, rejected_refresh, _ = api.post("/v1/lutris/refresh", token=administrator)
+        assert status == 200 and not rejected_refresh["ok"], rejected_refresh
+        assert rejected_refresh["code"] == "lutris_disabled", rejected_refresh
+    lutris_revision = lutris_readback["revision"]
     token = console.request("amaterasu.authentication/1", {"action": "issue_token", "scopes": ["catalog.read"], "ttl_seconds": 3600})
     assert token["ok"], token
     status, result, _ = api.post("/v1/catalog/list", token=token["bearer"])
     assert status == 200 and result["ok"], result
+    assert api.post("/v1/lutris/settings", token=token["bearer"])[0] == 403
+    assert api.post("/v1/lutris/status", token=token["bearer"])[0] == 403
+    status, result, _ = api.post(
+        "/v1/lutris/settings_update",
+        {**lutris_values, "expected_revision": lutris_revision},
+        token["bearer"],
+    )
+    assert status == 403 and not result["ok"], result
+    assert api.post("/v1/lutris/refresh", token=token["bearer"])[0] == 403
     assert api.post("/v1/pairing/list_clients", token=token["bearer"])[0] == 403
     status, result, _ = api.post(
         "/v1/pairing/update_client_config_overrides",
@@ -452,9 +525,11 @@ def test_auth_and_crud(console, api):
         steam_values,
         auth_values,
         saved_auth_settings["revision"],
-        input_values,
+        input_persisted_values,
         input_saved["revision"],
         first_client["certificate_id"],
+        lutris_values,
+        lutris_revision,
     )
 
 
@@ -499,7 +574,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -535,6 +610,11 @@ def main():
                 if client["certificate_id"] == fec_client_id
             )
             assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
+            status, lutris_settings, _ = api.post("/v1/lutris/settings", token=relogged["bearer"])
+            assert status == 200 and lutris_settings["values"] == lutris_values, lutris_settings
+            assert lutris_settings["revision"] == lutris_revision, lutris_settings
+            status, lutris_status, _ = api.post("/v1/lutris/status", token=relogged["bearer"])
+            assert status == 200 and lutris_status["platform_supported"] == sys.platform.startswith("linux"), lutris_status
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -562,6 +642,7 @@ def main():
     print("Moonlight hostname/port live rebind, certificate-bound FEC override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery and restart persistence,")
+    print("Lutris settings CAS, platform policy and restart persistence,")
     print("session restart invalidation,")
     print("input keyboard/mouse CAS policy persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 

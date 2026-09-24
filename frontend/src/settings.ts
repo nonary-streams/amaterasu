@@ -176,6 +176,110 @@ namespace Amaterasu {
     return parsed as SteamExclusion[];
   }
 
+  export function parseLutrisExclusions(value: string): LutrisExclusion[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value) as unknown;
+    } catch {
+      throw new Error("Lutris exclusions must be valid JSON.");
+    }
+    if (!Array.isArray(parsed) || parsed.length > 256)
+      throw new Error("Lutris exclusions must be a JSON array with at most 256 entries.");
+
+    const identities = new Set<string>();
+    const validateId = (id: string): void => {
+      if (
+        id.length === 0 ||
+        new TextEncoder().encode(id).length > 512 ||
+        !/^[0-9]+$/.test(id) ||
+        BigInt(id) === 0n ||
+        BigInt(id) > 18_446_744_073_709_551_615n
+      )
+        throw new Error("Lutris exclusion IDs must be positive decimal integers.");
+    };
+    const validateName = (name: string): void => {
+      if (
+        name.trim().length === 0 ||
+        new TextEncoder().encode(name).length > 512 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(name)
+      )
+        throw new Error("Lutris exclusion names must be printable text of at most 512 UTF-8 bytes.");
+    };
+    const unique = (identity: string): void => {
+      if (identities.has(identity))
+        throw new Error("Lutris exclusion IDs and name-only entries must be unique.");
+      identities.add(identity);
+    };
+
+    for (const item of parsed) {
+      if (typeof item === "string") {
+        validateId(item);
+        unique(`id:${item}`);
+        continue;
+      }
+      if (typeof item !== "object" || item === null || Array.isArray(item))
+        throw new Error("Each Lutris exclusion must be an ID string or object.");
+      const exclusion = item as Record<string, unknown>;
+      if (Object.keys(exclusion).some((key) => key !== "id" && key !== "name"))
+        throw new Error("Lutris exclusions may only contain id and name fields.");
+      const id = exclusion.id;
+      const name = exclusion.name;
+      if (id === undefined && name === undefined)
+        throw new Error("Each Lutris exclusion needs an ID or name.");
+      if (id !== undefined && typeof id !== "string")
+        throw new Error("Lutris exclusion IDs must be strings.");
+      if (name !== undefined && typeof name !== "string")
+        throw new Error("Lutris exclusion names must be strings.");
+
+      if (typeof id === "string" && id !== "") {
+        validateId(id);
+        if (typeof name === "string" && name !== "") validateName(name);
+        unique(`id:${id}`);
+      } else if (typeof name === "string") {
+        validateName(name);
+        unique(`name:${name.toLowerCase()}`);
+      } else {
+        throw new Error("Each Lutris exclusion needs a positive ID or nonempty name.");
+      }
+    }
+
+    const maximumSettings = {
+      enabled: true,
+      auto_sync: true,
+      autosync_remove_uninstalled: true,
+      include_steam: true,
+      exclude_games: parsed,
+    };
+    const maximumUpdate = {
+      ...maximumSettings,
+      expected_revision: Number.MAX_SAFE_INTEGER,
+    };
+    const encoder = new TextEncoder();
+    if (
+      encoder.encode(JSON.stringify(maximumSettings)).length > 12_000 ||
+      encoder.encode(JSON.stringify(maximumUpdate)).length > 12_000
+    )
+      throw new Error("Lutris exclusions exceed the product settings or management request size limit.");
+    return parsed as LutrisExclusion[];
+  }
+
+  export function lutrisStatusDescription(status: LutrisStatus): string {
+    if (!status.settings_ready)
+      return "Lutris settings are still loading; discovery state is not confirmed.";
+    if (!status.platform_supported)
+      return "Lutris discovery is supported only on Linux and is inactive on this platform.";
+    if (!status.enabled)
+      return "Lutris discovery is disabled.";
+    if (!status.database_available)
+      return "The current user's Lutris game database is unavailable.";
+    if (!status.executable_available)
+      return "The Lutris executable was not found in the current user's PATH.";
+    if (status.last_error)
+      return `Lutris discovery is available · ${status.game_count} games · Last scan issue: ${status.last_error}`;
+    const pending = status.refresh_pending ? "A catalog scan is in progress." : "No catalog scan is pending.";
+    return `Lutris discovery is available · ${status.game_count} games · ${pending}`;
+  }
+
   export function parseSteamImportSettings(
     includeTools: boolean,
     syncAllInstalled: boolean,
@@ -232,6 +336,7 @@ namespace Amaterasu {
     const authArea = el("div");
     const hostArea = el("div");
     const steamArea = el("div");
+    const lutrisArea = el("div");
     const inputArea = el("div");
     const pairingArea = el("div");
     context.content.append(
@@ -243,6 +348,7 @@ namespace Amaterasu {
           void loadAuth();
           void loadHost();
           void loadSteam();
+          void loadLutris();
           void loadInput();
           void loadPairing();
         }),
@@ -251,6 +357,7 @@ namespace Amaterasu {
       authArea,
       hostArea,
       steamArea,
+      lutrisArea,
       inputArea,
       pairingArea,
     );
@@ -442,6 +549,150 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           steamArea.replaceChildren(errorPanel(error, loadSteam));
+      }
+    }
+    async function loadLutris(): Promise<void> {
+      lutrisArea.replaceChildren(el("p", "muted", "Loading Lutris settings…"));
+      try {
+        const [settings, runtime] = await Promise.all([
+          loadLutrisSettings(),
+          context.api.post<LutrisStatus>("lutris/status"),
+        ]);
+        if (!context.content.isConnected) return;
+        const form = el("form", "settings-form");
+        const enabled = input("lutris_enabled", "", "checkbox");
+        enabled.checked = settings.values.enabled;
+        enabled.disabled = !runtime.platform_supported;
+        const autoSync = input("lutris_auto_sync", "", "checkbox");
+        autoSync.checked = settings.values.auto_sync;
+        const removeUninstalled = input(
+          "lutris_autosync_remove_uninstalled",
+          "",
+          "checkbox",
+        );
+        removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+        const includeSteam = input("lutris_include_steam", "", "checkbox");
+        includeSteam.checked = settings.values.include_steam;
+        const exclusions = el("textarea");
+        exclusions.name = "lutris_exclude_games";
+        exclusions.rows = 8;
+        exclusions.maxLength = 12_000;
+        exclusions.spellcheck = false;
+        exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+        const runtimeStatus = el(
+          "p",
+          runtime.last_error ? "error" : "muted",
+          lutrisStatusDescription(runtime),
+        );
+        const saveStatus = el("div");
+        const refreshStatus = el("div");
+        const save = el("button", "button primary", "Save Lutris settings");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        const refresh = button(
+          "Refresh now",
+          () => runAction(refresh, refreshStatus, async () => {
+            const updated = await context.api.post<LutrisStatus>("lutris/refresh");
+            runtimeStatus.className = updated.last_error ? "error" : "muted";
+            runtimeStatus.textContent = lutrisStatusDescription(updated);
+            context.notify("Lutris refresh requested.");
+          }),
+        );
+        refresh.disabled =
+          !context.api.allows("configuration.write") ||
+          !runtime.platform_supported ||
+          !settings.values.enabled;
+        enabled.addEventListener("change", () => {
+          refresh.disabled =
+            !context.api.allows("configuration.write") ||
+            !runtime.platform_supported ||
+            !enabled.checked;
+        });
+        form.append(
+          field(
+            "Enable Lutris discovery",
+            enabled,
+            runtime.platform_supported
+              ? "Controls discovery for the current Linux user."
+              : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform.",
+          ),
+          field(
+            "Automatic synchronization",
+            autoSync,
+            "Scan the current user's installed Lutris games automatically.",
+          ),
+          field(
+            "Remove uninstalled games",
+            removeUninstalled,
+            "After a successful complete scan, remove Lutris-owned games that are no longer installed.",
+          ),
+          field(
+            "Include matching Steam games",
+            includeSteam,
+            "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs.",
+          ),
+          field(
+            "Excluded games (JSON)",
+            exclusions,
+            'Use a positive decimal ID string or an object with "id", "name", or both. ID takes precedence; name-only entries match without case sensitivity.',
+          ),
+          runtimeStatus,
+          saveStatus,
+          el("div", "actions", save, badge(`Revision ${settings.revision}`)),
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void runAction(save, saveStatus, async () => {
+            try {
+              await context.api.post("lutris/settings_update", {
+                enabled: enabled.checked,
+                auto_sync: autoSync.checked,
+                autosync_remove_uninstalled: removeUninstalled.checked,
+                include_steam: includeSteam.checked,
+                exclude_games: parseLutrisExclusions(exclusions.value),
+                expected_revision: settings.revision,
+              });
+              context.notify("Lutris settings saved.");
+              await loadLutris();
+            } catch (error) {
+              if (error instanceof ApiError && error.code === "revision_conflict") {
+                context.notify("Lutris settings changed elsewhere. The latest values have been reloaded.");
+                await loadLutris();
+                return;
+              }
+              throw error;
+            }
+          });
+        });
+        refreshStatus.className = "muted";
+        lutrisArea.replaceChildren(
+          panel(
+            "Lutris",
+            form,
+            el("div", "actions", refresh, refreshStatus),
+          ),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          lutrisArea.replaceChildren(errorPanel(error, loadLutris));
+      }
+    }
+    async function loadLutrisSettings(): Promise<LutrisSettings> {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await context.api.post<LutrisSettings>("lutris/settings");
+        } catch (error) {
+          if (
+            !(error instanceof ApiError) ||
+            !["settings_loading", "settings_busy"].includes(error.code) ||
+            attempt >= 7
+          ) {
+            throw error;
+          }
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, 50 * (attempt + 1));
+          });
+        }
       }
     }
     async function loadPairing(): Promise<void> {
@@ -809,6 +1060,7 @@ namespace Amaterasu {
     void loadAuth();
     void loadHost();
     void loadSteam();
+    void loadLutris();
     void loadInput();
     void loadPairing();
   }

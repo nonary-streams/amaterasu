@@ -114,6 +114,61 @@ test("Steam exclusions preserve valid ID and name objects without normalization"
   assert.deepEqual(ordinary(parse(JSON.stringify(exclusions))), exclusions);
 });
 
+test("Lutris exclusion editor preserves ID precedence and bounds entries", () => {
+  const parse = context.Amaterasu.parseLutrisExclusions;
+  const exclusions = ["0007", { id: "42", name: "Old title" }, { name: "Portal 2" }];
+  assert.deepEqual(ordinary(parse(JSON.stringify(exclusions))), exclusions);
+  assert.deepEqual(ordinary(parse("[]")), []);
+  for (const value of [
+    "not JSON",
+    "{}",
+    "null",
+    JSON.stringify([0]),
+    JSON.stringify(["0"]),
+    JSON.stringify(["18446744073709551616"]),
+    JSON.stringify([{}]),
+    JSON.stringify([{ id: "42", owner: "other" }]),
+    JSON.stringify([{ name: "  " }]),
+    JSON.stringify([{ name: "bad\nname" }]),
+    JSON.stringify([{ id: "42", name: "x".repeat(513) }]),
+    JSON.stringify(["42", { id: "42", name: "Duplicate ID" }]),
+    JSON.stringify([{ name: "Portal" }, { name: "portal" }]),
+    JSON.stringify(Array.from({ length: 257 }, (_, index) => String(index + 1))),
+    JSON.stringify(Array.from({ length: 24 }, (_, index) => ({
+      name: `${index}-${"x".repeat(500)}`,
+    }))),
+  ]) {
+    assert.throws(() => parse(value));
+  }
+});
+
+test("Lutris status identifies unsupported platforms and discovery blockers", () => {
+  const describe = context.Amaterasu.lutrisStatusDescription;
+  const base = {
+    ok: true,
+    settings_ready: true,
+    enabled: true,
+    auto_sync: true,
+    autosync_remove_uninstalled: true,
+    include_steam: false,
+    available: true,
+    platform_supported: true,
+    database_available: true,
+    executable_available: true,
+    settings_revision: 1,
+    game_count: 3,
+    refresh_pending: false,
+    last_error: null,
+  };
+  assert.match(describe({ ...base, settings_ready: false }), /still loading/);
+  assert.match(describe({ ...base, platform_supported: false }), /only on Linux/);
+  assert.match(describe({ ...base, enabled: false }), /disabled/);
+  assert.match(describe({ ...base, database_available: false }), /database is unavailable/);
+  assert.match(describe({ ...base, executable_available: false }), /executable was not found/);
+  assert.match(describe({ ...base, refresh_pending: true }), /3 games.*in progress/);
+  assert.match(describe({ ...base, last_error: "scan failed" }), /Last scan issue: scan failed/);
+});
+
 test("Steam import controls preserve booleans and bounded recent-game values", () => {
   const parseImport = context.Amaterasu.parseSteamImportSettings;
   assert.deepEqual(ordinary(parseImport(false, true, true, 10, 30)), {

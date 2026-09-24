@@ -19,6 +19,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.launch/1" => launch(route.action, object),
         "amaterasu.nvhttp/1" => nvhttp(route.action, object),
         "amaterasu.steam/1" => steam(route.action, object),
+        "amaterasu.lutris/1" => lutris(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
         _ => Ok(()),
     }
@@ -149,6 +150,114 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
         }
         _ => Ok(()),
     }
+}
+
+fn lutris(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" | "status" | "refresh" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(
+                object,
+                &["enabled", "expected_revision"],
+                &[
+                    "auto_sync",
+                    "autosync_remove_uninstalled",
+                    "include_steam",
+                    "exclude_games",
+                ],
+            )?;
+            if object.get("enabled").and_then(Value::as_bool).is_none()
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            for field in ["auto_sync", "autosync_remove_uninstalled", "include_steam"] {
+                if object
+                    .get(field)
+                    .is_some_and(|value| value.as_bool().is_none())
+                {
+                    return Err(INVALID);
+                }
+            }
+            if let Some(exclusions) = object.get("exclude_games") {
+                lutris_exclusions(exclusions)?;
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn lutris_exclusions(value: &Value) -> Result<(), &'static str> {
+    let exclusions = value.as_array().ok_or(INVALID)?;
+    if exclusions.len() > 256 {
+        return Err(INVALID);
+    }
+    let mut unique = BTreeSet::new();
+    for exclusion in exclusions {
+        let identity = if let Some(id) = exclusion.as_str() {
+            valid_lutris_id(id)?;
+            format!("id:{id}")
+        } else {
+            let object = exclusion.as_object().ok_or(INVALID)?;
+            fields(object, &[], &["id", "name"])?;
+            let id = object
+                .get("id")
+                .map(|value| value.as_str().ok_or(INVALID))
+                .transpose()?;
+            let name = object
+                .get("name")
+                .map(|value| value.as_str().ok_or(INVALID))
+                .transpose()?;
+            match (id, name) {
+                (Some(id), Some(name)) if !id.is_empty() => {
+                    valid_lutris_id(id)?;
+                    if !name.is_empty() {
+                        valid_lutris_name(name)?;
+                    }
+                    format!("id:{id}")
+                }
+                (Some(""), Some(name)) => {
+                    valid_lutris_name(name)?;
+                    format!("name:{}", name.to_lowercase())
+                }
+                (Some(id), None) if !id.is_empty() => {
+                    valid_lutris_id(id)?;
+                    format!("id:{id}")
+                }
+                (None, Some(name)) => {
+                    valid_lutris_name(name)?;
+                    format!("name:{}", name.to_lowercase())
+                }
+                _ => return Err(INVALID),
+            }
+        };
+        if !unique.insert(identity) {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
+}
+
+fn valid_lutris_id(value: &str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.parse::<u64>().map_or(true, |id| id == 0)
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn valid_lutris_name(value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn input(action: &str, object: &Object) -> Result<(), &'static str> {

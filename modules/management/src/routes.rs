@@ -102,6 +102,18 @@ pub fn resolve(path: &str) -> Option<Route> {
             "settings_update",
             Some("configuration.write"),
         ),
+        ("lutris", "settings") => (
+            "amaterasu.lutris/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("lutris", "settings_update") => (
+            "amaterasu.lutris/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
+        ("lutris", "status") => ("amaterasu.lutris/1", "status", Some("configuration.read")),
+        ("lutris", "refresh") => ("amaterasu.lutris/1", "refresh", Some("configuration.write")),
         ("input", "settings_get") => (
             "amaterasu.input/1",
             "settings_get",
@@ -675,6 +687,75 @@ mod tests {
             assert!(
                 payload(update, &serde_json::to_vec(&invalid).unwrap()).is_err(),
                 "accepted malformed Steam settings payload: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn lutris_routes_pin_the_provider_and_validate_settings_fields() {
+        for (path, action, scope) in [
+            ("/v1/lutris/settings", "settings_get", "configuration.read"),
+            (
+                "/v1/lutris/settings_update",
+                "settings_update",
+                "configuration.write",
+            ),
+            ("/v1/lutris/status", "status", "configuration.read"),
+            ("/v1/lutris/refresh", "refresh", "configuration.write"),
+        ] {
+            let route = resolve(path).unwrap();
+            assert_eq!(route.service, "amaterasu.lutris/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+        }
+        for path in [
+            "/v1/lutris/settings",
+            "/v1/lutris/status",
+            "/v1/lutris/refresh",
+        ] {
+            assert!(payload(resolve(path).unwrap(), br#"{}"#).is_ok());
+            assert!(payload(resolve(path).unwrap(), br#"{"owner":"other"}"#).is_err());
+        }
+
+        let update = resolve("/v1/lutris/settings_update").unwrap();
+        let valid = serde_json::json!({
+            "enabled":false,
+            "auto_sync":false,
+            "autosync_remove_uninstalled":true,
+            "include_steam":false,
+            "exclude_games":["730",{"id":"7","name":"Old title"},{"name":"Portal 2"}],
+            "expected_revision":8
+        });
+        let forwarded = payload(update, &serde_json::to_vec(&valid).unwrap()).unwrap();
+        assert_eq!(forwarded["action"], "settings_update");
+        assert_eq!(forwarded["exclude_games"][0], "730");
+        assert!(payload(update, br#"{"enabled":false,"expected_revision":0}"#).is_ok());
+
+        let mut invalid = vec![
+            serde_json::json!({"enabled":1,"expected_revision":0}),
+            serde_json::json!({"enabled":false,"expected_revision":-1}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"owner":"other"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"auto_sync":"false"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":"730"}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":["0"]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":["18446744073709551616"]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{"id":"1","name":"Title","owner":"other"}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{"name":"  "}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{"name":"bad\nname"}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{"name":"x".repeat(513)}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":["7",{"id":"7","name":"same ID"}]}),
+            serde_json::json!({"enabled":false,"expected_revision":0,"exclude_games":[{"name":"Portal"},{"name":"portal"}]}),
+        ];
+        invalid.push(serde_json::json!({
+            "enabled":false,
+            "expected_revision":0,
+            "exclude_games":(0..257).map(|_| serde_json::json!("7")).collect::<Vec<_>>()
+        }));
+        for value in invalid {
+            assert!(
+                payload(update, &serde_json::to_vec(&value).unwrap()).is_err(),
+                "accepted malformed Lutris settings payload: {value}"
             );
         }
     }

@@ -83,6 +83,38 @@ namespace Amaterasu {
     id?: string;
     name?: string;
   }
+  export type LutrisExclusion =
+    | string
+    | {
+        id?: string;
+        name?: string;
+      };
+  export interface LutrisSettings {
+    revision: number;
+    values: {
+      enabled: boolean;
+      auto_sync: boolean;
+      autosync_remove_uninstalled: boolean;
+      include_steam: boolean;
+      exclude_games: LutrisExclusion[];
+    };
+  }
+  export interface LutrisStatus {
+    ok: boolean;
+    settings_ready: boolean;
+    enabled: boolean;
+    auto_sync: boolean;
+    autosync_remove_uninstalled: boolean;
+    include_steam: boolean;
+    available: boolean;
+    platform_supported: boolean;
+    database_available: boolean;
+    executable_available: boolean;
+    settings_revision: number;
+    game_count: number;
+    refresh_pending: boolean;
+    last_error: string | null;
+  }
   export interface AuthTokenSettings {
     revision: number;
     values: {
