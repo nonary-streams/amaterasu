@@ -147,6 +147,84 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
 }
 
 #[test]
+fn snapshots_configured_primary_and_auxiliary_state_files_only_when_contained() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/primary_state.json # custom primary\nvibeshine_file_state = private/auxiliary_state.json\n",
+    );
+    write(&predecessor.join("private/primary_state.json"), b"primary");
+    write(
+        &predecessor.join("private/auxiliary_state.json"),
+        b"auxiliary",
+    );
+
+    let files = collect_configuration_files(&predecessor).unwrap().unwrap();
+    assert!(files.contains(&PathBuf::from("private/primary_state.json")));
+    assert!(files.contains(&PathBuf::from("private/auxiliary_state.json")));
+
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/primary_state.json\nvibeshine_file_state = private/not_created_yet.json\n",
+    );
+    let files = collect_configuration_files(&predecessor).unwrap().unwrap();
+    assert!(files.contains(&PathBuf::from("private/primary_state.json")));
+    assert!(!files.contains(&PathBuf::from("private/not_created_yet.json")));
+
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = ../outside_state.json\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+
+    let outside = fixture.path().join("outside_state.json");
+    write(&outside, b"outside");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        format!("file_state = {}\n", outside.display()).as_bytes(),
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/primary_state.json\n",
+    );
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = private/auxiliary_state.json\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_configured_state_symlinks_that_escape_the_predecessor_root() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let outside = fixture.path().join("outside_state.json");
+    write(&outside, b"outside");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = state_link.json\n",
+    );
+    symlink(&outside, predecessor.join("state_link.json")).unwrap();
+
+    assert!(collect_configuration_files(&predecessor).is_err());
+
+    let outside_directory = fixture.path().join("outside_directory");
+    std::fs::create_dir_all(&outside_directory).unwrap();
+    symlink(&outside_directory, predecessor.join("external")).unwrap();
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"vibeshine_file_state = external/not_created_yet.json\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[test]
 fn plan_maps_safe_settings_and_exact_executable_applications() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Vibeshine");

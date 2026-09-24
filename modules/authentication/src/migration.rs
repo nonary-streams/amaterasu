@@ -36,7 +36,22 @@ pub fn import_legacy_authentication(
     let mut documents = Vec::new();
     for path in candidates {
         let bytes = read_bounded(&path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?;
-        let legacy: LegacyCredential = serde_json::from_slice(&bytes)
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "legacy_authentication_invalid_credential")?;
+        if value
+            .pointer("/root/api_tokens")
+            .and_then(Value::as_array)
+            .is_some_and(|tokens| !tokens.is_empty())
+        {
+            return Err("legacy_authentication_tokens_unsupported");
+        }
+        if !["username", "password", "salt"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+        {
+            continue;
+        }
+        let legacy: LegacyCredential = serde_json::from_value(value)
             .map_err(|_| "legacy_authentication_invalid_credential")?;
         if legacy.api_tokens_present() {
             return Err("legacy_authentication_tokens_unsupported");
@@ -126,12 +141,20 @@ fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     }
     let mut files = Vec::new();
     for name in STATE_FILES {
-        let path = root.join(name);
-        if path
+        if root
+            .join(name)
             .try_exists()
             .map_err(|_| "legacy_authentication_layout")?
         {
-            files.push(regular_contained_file(root, Path::new(name))?);
+            let path = regular_contained_file(root, Path::new(name))?;
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    for path in configured_state_paths(root)? {
+        if !files.contains(&path) {
+            files.push(path);
         }
     }
     Ok(files)
@@ -145,18 +168,24 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
         "vibeshine.conf",
         "vibepollo.conf",
     ] {
-        let path = root.join(name);
-        if !path
+        let relative = Path::new(name);
+        if !root
+            .join(relative)
             .try_exists()
             .map_err(|_| "legacy_authentication_layout")?
         {
             continue;
         }
+        let path = regular_contained_file(root, relative)?;
         let text = String::from_utf8(
             read_bounded(&path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?,
         )
         .map_err(|_| "legacy_authentication_layout")?;
         for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
             let Some((key, candidate)) = line.split_once('=') else {
                 continue;
             };
@@ -173,6 +202,68 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
         }
     }
     Ok(value)
+}
+
+fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    let mut configured = BTreeMap::<String, PathBuf>::new();
+    let mut paths = Vec::new();
+    for name in [
+        "apollo.conf",
+        "sunshine.conf",
+        "vibeshine.conf",
+        "vibepollo.conf",
+    ] {
+        let relative = Path::new(name);
+        if !root
+            .join(relative)
+            .try_exists()
+            .map_err(|_| "legacy_authentication_layout")?
+        {
+            continue;
+        }
+        let path = regular_contained_file(root, relative)?;
+        let text = String::from_utf8(
+            read_bounded(&path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?,
+        )
+        .map_err(|_| "legacy_authentication_layout")?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            if !matches!(key.as_str(), "file_state" | "vibeshine_file_state") {
+                continue;
+            }
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            let relative = Path::new(value);
+            if relative.as_os_str().is_empty()
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+            {
+                return Err("legacy_authentication_layout");
+            }
+            if configured
+                .insert(key, relative.to_path_buf())
+                .is_some_and(|previous| previous != relative.to_path_buf())
+            {
+                return Err("legacy_authentication_credential_ambiguous");
+            }
+            if let Some(path) = optional_regular_contained_file(root, relative)?
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, &'static str> {
@@ -204,6 +295,49 @@ fn regular_contained_file(root: &Path, relative: &Path) -> Result<PathBuf, &'sta
         return Err("legacy_authentication_layout");
     }
     Ok(path)
+}
+
+fn optional_regular_contained_file(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, &'static str> {
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err("legacy_authentication_layout");
+    }
+    let path = root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => regular_contained_file(root, relative).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = path.parent();
+            while let Some(candidate) = ancestor {
+                match std::fs::symlink_metadata(candidate) {
+                    Ok(_) => {
+                        let canonical = candidate
+                            .canonicalize()
+                            .map_err(|_| "legacy_authentication_layout")?;
+                        if !canonical.starts_with(root)
+                            || !std::fs::metadata(canonical)
+                                .map_err(|_| "legacy_authentication_layout")?
+                                .is_dir()
+                        {
+                            return Err("legacy_authentication_layout");
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = candidate.parent();
+                    }
+                    Err(_) => return Err("legacy_authentication_layout"),
+                }
+            }
+            Err("legacy_authentication_layout")
+        }
+        Err(_) => Err("legacy_authentication_layout"),
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -308,6 +442,140 @@ mod tests {
             import_legacy_authentication(&source),
             Err("legacy_authentication_layout")
         ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn imports_custom_primary_state_and_ignores_an_absent_auxiliary_state_file() {
+        let source = temporary_directory("configured-state-source");
+        let state = temporary_directory("configured-state-target");
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("private/primary.json"),
+            serde_json::json!({"username":"Admin","password":hash,"salt":salt}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = private/primary.json # custom primary\nvibeshine_file_state = private/not_created_yet.json\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        let namespace: Namespace =
+            serde_json::from_slice(&std::fs::read(namespace_path(&state)).unwrap()).unwrap();
+        let document: Document =
+            serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
+        assert!(document.credential.unwrap().legacy_salt.is_some());
+        let reimported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            seed_authentication_state(&state, &reimported).unwrap(),
+            AuthenticationSeedOutcome::ExistingAmaterasuState
+        );
+
+        std::fs::write(
+            source.join("private/not_created_yet.json"),
+            r#"{"root":{"api_tokens":[{"token":"legacy-token"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_tokens_unsupported")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn rejects_multiple_configured_credential_records_as_ambiguous() {
+        let source = temporary_directory("ambiguous-configured-state");
+        let salt = "AbCdEfGhIjKlMnOp";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("correct horse battery staple{salt}").as_bytes())
+        );
+        let credential = serde_json::json!({
+            "username": "Admin",
+            "password": hash,
+            "salt": salt
+        })
+        .to_string();
+        std::fs::write(source.join("primary.json"), &credential).unwrap();
+        std::fs::write(source.join("auxiliary.json"), credential).unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = primary.json\nvibeshine_file_state = auxiliary.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn rejects_unsafe_configured_state_paths() {
+        let source = temporary_directory("unsafe-configured-state");
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = ../outside.json\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_layout")
+        ));
+
+        let outside = source.parent().unwrap().join("outside-auth-state.json");
+        std::fs::write(&outside, b"{}").unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            format!("file_state = {}\n", outside.display()),
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_layout")
+        ));
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_missing_state_path_beneath_an_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let source = temporary_directory("escaping-state-source");
+        let outside = source
+            .parent()
+            .unwrap()
+            .join("outside-auth-state-directory");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, source.join("external")).unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = external/not_created_yet.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_layout")
+        ));
+        let _ = std::fs::remove_dir_all(outside);
         let _ = std::fs::remove_dir_all(source);
     }
 }

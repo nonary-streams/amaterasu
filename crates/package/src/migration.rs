@@ -734,6 +734,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<Vec<PathBuf>
         }
     }
     collect_configured_sensitive_files(root, &mut files)?;
+    collect_configured_state_files(root, &mut files)?;
     for name in CONFIGURATION_DIRECTORIES {
         let path = root.join(name);
         if path.try_exists().map_err(io_error)? {
@@ -800,6 +801,110 @@ fn collect_configured_sensitive_files(root: &Path, files: &mut Vec<PathBuf>) -> 
         }
     }
     Ok(())
+}
+
+/// Preserve configured primary and auxiliary state files for the migration
+/// importers. State paths are followed only when their canonical regular files
+/// remain inside the supplied predecessor root.
+fn collect_configured_state_files(root: &Path, files: &mut Vec<PathBuf>) -> PackageResult<()> {
+    let canonical_root = root.canonicalize().map_err(io_error)?;
+    let mut configured = BTreeMap::<String, PathBuf>::new();
+    for name in [
+        "apollo.conf",
+        "sunshine.conf",
+        "vibeshine.conf",
+        "vibepollo.conf",
+    ] {
+        let config = root.join(name);
+        if !config.try_exists().map_err(io_error)? {
+            continue;
+        }
+        let text = String::from_utf8(read_configuration_file(&config)?).map_err(|_| {
+            "predecessor configuration contains a non-text settings file".to_owned()
+        })?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            if !matches!(key.as_str(), "file_state" | "vibeshine_file_state") {
+                continue;
+            }
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            let relative = Path::new(value);
+            if !relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err("predecessor configuration has an unsafe state path".into());
+            }
+            if configured
+                .insert(key, relative.to_path_buf())
+                .is_some_and(|previous| previous != relative.to_path_buf())
+            {
+                return Err("predecessor configuration has conflicting state paths".into());
+            }
+            let Some(canonical) = optional_contained_state_file(root, &canonical_root, relative)?
+            else {
+                continue;
+            };
+            let copied = canonical
+                .strip_prefix(&canonical_root)
+                .map_err(|_| "predecessor configuration layout is invalid")?
+                .to_path_buf();
+            if !files.contains(&copied) {
+                files.push(copied);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn optional_contained_state_file(
+    root: &Path,
+    canonical_root: &Path,
+    relative: &Path,
+) -> PackageResult<Option<PathBuf>> {
+    let path = root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let canonical = path.canonicalize().map_err(io_error)?;
+            if !canonical.starts_with(canonical_root) {
+                return Err("predecessor configuration has an escaping state path".into());
+            }
+            validate_regular_file(&canonical)?;
+            Ok(Some(canonical))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut ancestor = path.parent();
+            while let Some(candidate) = ancestor {
+                match fs::symlink_metadata(candidate) {
+                    Ok(_) => {
+                        let canonical = candidate.canonicalize().map_err(io_error)?;
+                        if !canonical.starts_with(canonical_root)
+                            || !fs::metadata(canonical).map_err(io_error)?.is_dir()
+                        {
+                            return Err("predecessor configuration has an unsafe state path".into());
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        ancestor = candidate.parent();
+                    }
+                    Err(error) => return Err(io_error(error)),
+                }
+            }
+            Err("predecessor configuration has an unsafe state path".into())
+        }
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 fn collect_directory_files(

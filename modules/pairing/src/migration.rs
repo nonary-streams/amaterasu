@@ -45,9 +45,9 @@ pub enum PairingSeedOutcome {
 /// Converts the standard current Sunshine/Vibeshine pairing configuration.
 ///
 /// `source_root` must be the copied predecessor configuration root, not an
-/// arbitrary parent directory. The importer reads no symlinks, follows no
-/// configured paths, and returns only fixed error codes so private material is
-/// never surfaced through installer logs.
+/// arbitrary parent directory. Configured state paths are resolved only to
+/// contained regular files; the importer returns fixed error codes so private
+/// material is never surfaced through installer logs.
 pub fn import_legacy_pairing(
     source_root: &Path,
     now: u64,
@@ -204,13 +204,24 @@ fn enabled_by_default() -> bool {
 }
 
 fn read_legacy_state(source_root: &Path) -> Result<ParsedLegacyState, &'static str> {
-    let candidates: Vec<_> = LEGACY_STATE_FILES
-        .iter()
-        .filter_map(|name| {
-            let path = source_root.join(name);
-            path.try_exists().ok()?.then_some(path)
-        })
-        .collect();
+    let source_root = source_root
+        .canonicalize()
+        .map_err(|_| "legacy_pairing_invalid_layout")?;
+    let mut candidates = Vec::new();
+    for name in LEGACY_STATE_FILES {
+        let relative = Path::new(name);
+        if source_root.join(relative).try_exists().ok() == Some(true) {
+            let path = contained_regular_file(&source_root, relative)?;
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+    }
+    for path in configured_state_paths(&source_root)? {
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
     let parsed: Vec<_> = candidates
         .iter()
         .filter_map(|path| {
@@ -237,6 +248,59 @@ fn read_legacy_state(source_root: &Path) -> Result<ParsedLegacyState, &'static s
         return Err("legacy_pairing_client_limit");
     }
     Ok(state)
+}
+
+fn configured_state_paths(source_root: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    let mut configured = BTreeMap::<String, PathBuf>::new();
+    let mut paths = Vec::new();
+    for name in [
+        "apollo.conf",
+        "sunshine.conf",
+        "vibeshine.conf",
+        "vibepollo.conf",
+    ] {
+        let config_relative = Path::new(name);
+        if source_root.join(config_relative).try_exists().ok() != Some(true) {
+            continue;
+        }
+        let config_path = contained_regular_file(source_root, config_relative)?;
+        let contents = String::from_utf8(read_legacy_bytes(&config_path, MAX_LEGACY_STATE_BYTES)?)
+            .map_err(|_| "legacy_pairing_invalid_layout")?;
+        for line in contents.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            if !matches!(key.as_str(), "file_state" | "vibeshine_file_state") {
+                continue;
+            }
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            let relative = Path::new(value);
+            if !is_normal_relative_path(relative) {
+                return Err("legacy_pairing_invalid_layout");
+            }
+            if configured
+                .insert(key, relative.to_path_buf())
+                .is_some_and(|previous| previous != relative)
+            {
+                return Err("legacy_pairing_state_ambiguous");
+            }
+            if let Some(path) = optional_contained_regular_file(source_root, relative)?
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+    }
+
+    Ok(paths)
 }
 
 fn legacy_identity_paths(source_root: &Path) -> Result<(PathBuf, PathBuf), &'static str> {
@@ -310,6 +374,45 @@ fn contained_regular_file(source_root: &Path, relative: &Path) -> Result<PathBuf
         return Err("legacy_pairing_invalid_layout");
     }
     Ok(canonical)
+}
+
+fn optional_contained_regular_file(
+    source_root: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, &'static str> {
+    if !is_normal_relative_path(relative) {
+        return Err("legacy_pairing_invalid_layout");
+    }
+    let path = source_root.join(relative);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => contained_regular_file(source_root, relative).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = path.parent();
+            while let Some(candidate) = ancestor {
+                match std::fs::symlink_metadata(candidate) {
+                    Ok(_) => {
+                        let canonical = candidate
+                            .canonicalize()
+                            .map_err(|_| "legacy_pairing_invalid_layout")?;
+                        if !canonical.starts_with(source_root)
+                            || !std::fs::metadata(canonical)
+                                .map_err(|_| "legacy_pairing_invalid_layout")?
+                                .is_dir()
+                        {
+                            return Err("legacy_pairing_invalid_layout");
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = candidate.parent();
+                    }
+                    Err(_) => return Err("legacy_pairing_invalid_layout"),
+                }
+            }
+            Err("legacy_pairing_invalid_layout")
+        }
+        Err(_) => Err("legacy_pairing_invalid_layout"),
+    }
 }
 
 fn read_legacy_file(path: &Path, maximum_bytes: u64) -> Result<String, &'static str> {
@@ -528,6 +631,93 @@ mod tests {
     }
 
     #[test]
+    fn imports_configured_state_files_only_when_their_canonical_paths_stay_contained() {
+        let fixture = TemporaryDirectory::new();
+        write_legacy_source(&fixture.0, true);
+        let configured_state = fixture.0.join("private/custom_state.json");
+        std::fs::create_dir_all(configured_state.parent().unwrap()).unwrap();
+        std::fs::rename(fixture.0.join("sunshine_state.json"), &configured_state).unwrap();
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            "file_state = private/custom_state.json # custom primary\nvibeshine_file_state = private/not_created_yet.json\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_pairing(&fixture.0, fixture_now()).unwrap();
+        assert_eq!(imported.document.clients.len(), 1);
+
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            "file_state = ../outside_state.json\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_pairing(&fixture.0, fixture_now()),
+            Err("legacy_pairing_invalid_layout")
+        ));
+
+        let outside = fixture.0.parent().unwrap().join("outside_state.json");
+        std::fs::write(&outside, std::fs::read(&configured_state).unwrap()).unwrap();
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            format!("file_state = {}\n", outside.display()),
+        )
+        .unwrap();
+        assert!(matches!(
+            import_legacy_pairing(&fixture.0, fixture_now()),
+            Err("legacy_pairing_invalid_layout")
+        ));
+    }
+
+    #[test]
+    fn conflicting_configured_state_paths_are_rejected() {
+        let fixture = TemporaryDirectory::new();
+        write_legacy_source(&fixture.0, true);
+        let state_bytes = std::fs::read(fixture.0.join("sunshine_state.json")).unwrap();
+        std::fs::write(fixture.0.join("sunshine_state.json"), b"{}").unwrap();
+        std::fs::create_dir_all(fixture.0.join("private")).unwrap();
+        std::fs::write(fixture.0.join("private/custom_state.json"), state_bytes).unwrap();
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            "file_state = private/custom_state.json\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.0.join("vibeshine.conf"),
+            "file_state = sunshine_state.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_pairing(&fixture.0, fixture_now()),
+            Err("legacy_pairing_state_ambiguous")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_missing_state_path_beneath_an_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TemporaryDirectory::new();
+        write_legacy_source(&fixture.0, true);
+        let outside = fixture.0.parent().unwrap().join("outside-state-directory");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, fixture.0.join("external")).unwrap();
+        std::fs::write(
+            fixture.0.join("sunshine.conf"),
+            "vibeshine_file_state = external/not_created_yet.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_pairing(&fixture.0, fixture_now()),
+            Err("legacy_pairing_invalid_layout")
+        ));
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
     fn disabled_and_ambiguous_legacy_pairings_do_not_expand_trust() {
         let fixture = TemporaryDirectory::new();
         write_legacy_source(&fixture.0, false);
@@ -572,6 +762,11 @@ mod tests {
         document.validate(fixture_now()).unwrap();
         assert_eq!(
             seed_pairing_state(&state.0, &imported).unwrap(),
+            PairingSeedOutcome::ExistingAmaterasuState
+        );
+        let reimported = import_legacy_pairing(&source.0, fixture_now()).unwrap();
+        assert_eq!(
+            seed_pairing_state(&state.0, &reimported).unwrap(),
             PairingSeedOutcome::ExistingAmaterasuState
         );
         let unchanged: StateNamespace =
