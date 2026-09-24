@@ -315,6 +315,8 @@ fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
     assert!(LUTRIS.calls.contains(&"amaterasu.steam/1"));
     assert!(LUTRIS.dependencies.contains(&CATALOG.id));
     assert!(LUTRIS.dependencies.contains(&STEAM.id));
+    assert!(LUTRIS.dependencies.contains(&STATE.id));
+    assert!(PLAYNITE.dependencies.contains(&STATE.id));
 
     let root = std::env::temp_dir().join(format!(
         "amaterasu-steam-import-profile-{}",
@@ -358,6 +360,11 @@ fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
         assert!(
             policy.principals[LUTRIS.id]
                 .call
+                .contains("amaterasu.state/1")
+        );
+        assert!(
+            policy.principals[LUTRIS.id]
+                .call
                 .contains("amaterasu.steam/1")
         );
         assert!(
@@ -369,6 +376,11 @@ fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
             policy.principals[PLAYNITE.id]
                 .call
                 .contains("amaterasu.configuration/1")
+        );
+        assert!(
+            policy.principals[PLAYNITE.id]
+                .call
+                .contains("amaterasu.state/1")
         );
         assert!(
             policy.principals[MANAGEMENT.id]

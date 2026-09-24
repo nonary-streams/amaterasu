@@ -138,11 +138,20 @@ const PLAYNITE: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.playnite",
     library: "amaterasu_playnite",
     provides: &["amaterasu.playnite/1"],
-    calls: &["amaterasu.catalog/1", "amaterasu.configuration/1"],
+    calls: &[
+        "amaterasu.catalog/1",
+        "amaterasu.configuration/1",
+        "amaterasu.state/1",
+    ],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.catalog", "amaterasu.configuration"],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.state",
+    ],
 };
 
 const LUTRIS: ComponentDefinition = ComponentDefinition {
@@ -152,6 +161,7 @@ const LUTRIS: ComponentDefinition = ComponentDefinition {
     calls: &[
         "amaterasu.catalog/1",
         "amaterasu.configuration/1",
+        "amaterasu.state/1",
         "amaterasu.steam/1",
     ],
     publishes: &[],
@@ -161,6 +171,7 @@ const LUTRIS: ComponentDefinition = ComponentDefinition {
         RUNTIME_ID,
         "amaterasu.catalog",
         "amaterasu.configuration",
+        "amaterasu.state",
         "amaterasu.steam",
     ],
 };
