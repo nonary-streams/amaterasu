@@ -1,4 +1,4 @@
-use crate::protocol::{Executable, Outcome, State};
+use crate::protocol::{ApplicationConfigOverrides, Executable, Outcome, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +36,8 @@ pub struct Record {
     pub resource: Option<String>,
     #[serde(skip)]
     pub executable: Option<Executable>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_overrides: Option<ApplicationConfigOverrides>,
     #[serde(skip)]
     pub session_requested: bool,
     #[serde(skip)]
@@ -132,6 +134,7 @@ impl Records {
                 process_operation: key,
                 resource,
                 executable: None,
+                config_overrides: None,
                 session_requested: false,
                 process_requested: false,
                 cleanup_outcome: Outcome::Completed,

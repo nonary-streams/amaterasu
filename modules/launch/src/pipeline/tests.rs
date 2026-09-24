@@ -47,6 +47,7 @@ struct Harness {
     catalog_wait_all: Option<bool>,
     catalog_exit_timeout_seconds: Option<u64>,
     catalog_detached: Option<Vec<String>>,
+    catalog_fec_percentage: Option<u8>,
     application_preparing_statuses: usize,
     preparation_terminal: Option<&'static str>,
     application_stopping_statuses: usize,
@@ -81,6 +82,7 @@ impl Harness {
             catalog_wait_all: None,
             catalog_exit_timeout_seconds: None,
             catalog_detached: None,
+            catalog_fec_percentage: None,
             application_preparing_statuses: 0,
             preparation_terminal: None,
             application_stopping_statuses: 0,
@@ -316,6 +318,10 @@ impl Harness {
                             "pipeline::tests::controlled_process"
                         };
                         let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":{"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}}});
+                        if let Some(fec_percentage) = self.catalog_fec_percentage {
+                            reply["entry"]["config_overrides"] =
+                                json!({"fec_percentage":fec_percentage});
+                        }
                         if let Some(preparation) = &self.catalog_preparation {
                             reply["entry"]["launch"]["preparation"] = preparation.clone();
                         }
@@ -537,6 +543,37 @@ fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
         .expect("launch workflow sends an application launch request");
     assert_eq!(application_launch["cwd"], working_directory);
     assert_eq!(application_launch["auto_detach"], false);
+}
+
+#[test]
+fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app() {
+    let mut harness = Harness::new();
+    harness.catalog_fec_percentage = Some(37);
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "nvhttp", launch_export("fec-snapshot"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(started["launch"]["config_overrides"]["fec_percentage"], 37);
+
+    // Later catalog edits do not replace the policy captured by this launch.
+    harness.catalog_fec_percentage = Some(81);
+    let status = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(status["launch"]["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, payload, _)| {
+                service == crate::workflow::CATALOG
+                    && payload["action"] == "resolve_exported_launch"
+            })
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -23,6 +23,7 @@ fn document() -> Document {
             name: "Client".into(),
             certificate_pem: CLIENT_CERT.into(),
             paired_at: 0,
+            config_overrides: crate::protocol::ClientConfigOverrides::default(),
         }],
     }
 }

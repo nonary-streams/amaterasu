@@ -54,6 +54,7 @@ struct Harness {
     output: Option<Value>,
     writes: usize,
     fail_write: bool,
+    conflict_next_write: bool,
     cancelled: bool,
     check_cancelled: bool,
 }
@@ -67,6 +68,7 @@ impl Harness {
             output: None,
             writes: 0,
             fail_write: false,
+            conflict_next_write: false,
             cancelled: false,
             check_cancelled: false,
         }
@@ -94,8 +96,35 @@ impl Harness {
                     json!({"ok":true,"revision":self.revision,"found":self.document.is_some(),"value":self.document})
                 } else {
                     self.writes += 1;
-                    assert_eq!(payload["expected_revision"], self.revision);
-                    if self.fail_write {
+                    if self.conflict_next_write {
+                        self.conflict_next_write = false;
+                        self.revision += 1;
+                        let clients = self.document.as_mut().unwrap()["clients"]
+                            .as_array_mut()
+                            .unwrap();
+                        let client = clients.first_mut().unwrap();
+                        if !client["config_overrides"].is_object() {
+                            client["config_overrides"] = json!({});
+                        }
+                        client["config_overrides"]["fec_percentage"] = json!(73);
+                        json!({
+                            "ok": false,
+                            "error": {
+                                "code": "revision_conflict",
+                                "message": "another administrator committed first",
+                                "current_revision": self.revision
+                            }
+                        })
+                    } else if payload["expected_revision"] != self.revision {
+                        json!({
+                            "ok": false,
+                            "error": {
+                                "code": "revision_conflict",
+                                "message": "stale revision",
+                                "current_revision": self.revision
+                            }
+                        })
+                    } else if self.fail_write {
                         json!({"ok":false,"error":{"message":"sensitive-state-detail"}})
                     } else {
                         self.document = Some(payload["value"].clone());
@@ -623,6 +652,187 @@ fn cancelled_pin_approval_is_checked_before_mutating_the_transcript() {
         )["pending"],
         true
     );
+}
+
+#[test]
+fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action": "import_client",
+                "client_id": "living-room",
+                "name": "Living room",
+                "certificate_pem": CLIENT_CERT
+            }),
+            now()
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action": "import_client",
+                "client_id": "living-room",
+                "name": "Second certificate with duplicate client id",
+                "certificate_pem": HOST_CERT
+            }),
+            now()
+        )["ok"],
+        true
+    );
+
+    let initial = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    let certificate_id = initial["clients"][0]["certificate_id"].as_str().unwrap();
+    assert_eq!(initial["clients"][1]["client_id"], "living-room");
+    let initial_revision = initial["revision"].as_u64().unwrap();
+    assert!(initial_revision > 0);
+    let writes_before_transport_attempt = state.writes;
+    let transport_write = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({
+            "action": "update_client_config_overrides",
+            "certificate_id": certificate_id,
+            "expected_revision": initial_revision,
+            "config_overrides": {"fec_percentage": 61}
+        }),
+        now(),
+    );
+    assert_eq!(transport_write["code"], "forbidden");
+    assert_eq!(state.writes, writes_before_transport_attempt);
+
+    let write = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action": "update_client_config_overrides",
+            "certificate_id": certificate_id,
+            "expected_revision": initial_revision,
+            "config_overrides": {"fec_percentage": 47}
+        }),
+        now(),
+    );
+    assert_eq!(write["ok"], true);
+
+    let certificate_readback = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(certificate_readback["paired"], 1);
+    assert_eq!(
+        certificate_readback["config_overrides"]["fec_percentage"],
+        47
+    );
+    let duplicate_client_id_readback = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":HOST_CERT}),
+        now(),
+    );
+    assert_eq!(duplicate_client_id_readback["client_id"], "living-room");
+    assert_eq!(duplicate_client_id_readback["config_overrides"], json!({}));
+    let persisted = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert!(persisted["revision"].as_u64().unwrap() > initial_revision);
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["fec_percentage"],
+        47
+    );
+
+    // A second administrator holding the same pre-write revision must reload
+    // and receive a conflict rather than silently replacing the committed value.
+    let writes_after_commit = state.writes;
+    let stale = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action": "update_client_config_overrides",
+            "certificate_id": certificate_id,
+            "expected_revision": initial_revision,
+            "config_overrides": {"fec_percentage": 61}
+        }),
+        now(),
+    );
+    assert_eq!(stale["code"], "revision_conflict");
+    assert_eq!(stale["current_revision"], persisted["revision"]);
+    assert_eq!(state.writes, writes_after_commit);
+    let unchanged = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(unchanged["config_overrides"]["fec_percentage"], 47);
+}
+
+#[test]
+fn external_state_cas_conflict_does_not_overwrite_another_admins_committed_value() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action": "import_client",
+                "client_id": "living-room",
+                "name": "Living room",
+                "certificate_pem": CLIENT_CERT
+            }),
+            now()
+        )["ok"],
+        true
+    );
+    let listed = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    let certificate_id = listed["clients"][0]["certificate_id"].as_str().unwrap();
+
+    // The state owner commits after our get but before our CAS set.
+    state.conflict_next_write = true;
+    let conflicted = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action": "update_client_config_overrides",
+            "certificate_id": certificate_id,
+            "expected_revision": listed["revision"],
+            "config_overrides": {"fec_percentage": 61}
+        }),
+        now(),
+    );
+    assert_eq!(conflicted["code"], "revision_conflict");
+    assert_eq!(conflicted["current_revision"], state.revision);
+
+    let readback = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        now(),
+    );
+    assert_eq!(readback["config_overrides"]["fec_percentage"], 73);
 }
 
 #[test]

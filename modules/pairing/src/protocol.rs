@@ -70,6 +70,11 @@ pub enum Operation {
     Unpair {
         certificate_id: String,
     },
+    UpdateClientConfigOverrides {
+        certificate_id: String,
+        config_overrides: ClientConfigOverrides,
+        expected_revision: u64,
+    },
     CheckClientCertificate {
         certificate_pem: String,
     },
@@ -136,6 +141,11 @@ impl Operation {
                     && hex_length(clientpairingsecret, clientpairingsecret.len() / 2)
             }
             Self::Unpair { certificate_id } => hex_length(certificate_id, 32),
+            Self::UpdateClientConfigOverrides {
+                certificate_id,
+                config_overrides,
+                expected_revision: _,
+            } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
             Self::CheckClientCertificate { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
         };
@@ -153,6 +163,7 @@ impl Operation {
                 | Self::ImportClient { .. }
                 | Self::ClientPairingSecret { .. }
                 | Self::Unpair { .. }
+                | Self::UpdateClientConfigOverrides { .. }
         )
     }
 
@@ -166,6 +177,7 @@ impl Operation {
                 | Self::Pending {}
                 | Self::ListClients {}
                 | Self::Unpair { .. }
+                | Self::UpdateClientConfigOverrides { .. }
         )
     }
 }
@@ -191,6 +203,31 @@ pub struct Client {
     pub name: String,
     pub certificate_pem: String,
     pub paired_at: u64,
+    #[serde(default, skip_serializing_if = "ClientConfigOverrides::is_empty")]
+    pub config_overrides: ClientConfigOverrides,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfigOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec_percentage: Option<u8>,
+}
+
+impl ClientConfigOverrides {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .fec_percentage
+            .is_some_and(|percentage| percentage == 0)
+        {
+            return Err("invalid_config_overrides");
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fec_percentage.is_none()
+    }
 }
 impl Document {
     pub fn validate(&self, now: u64) -> Result<(), &'static str> {
@@ -218,6 +255,7 @@ impl Document {
                 || !identifier(&client.client_id, 64)
                 || client.name.is_empty()
                 || client.name.len() > 128
+                || client.config_overrides.validate().is_err()
             {
                 return Err("invalid_state");
             }

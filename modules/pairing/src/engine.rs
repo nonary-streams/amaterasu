@@ -122,6 +122,16 @@ impl Engine {
             Operation::Pending {} => Ok(Change::Read(self.pending_metadata())),
             Operation::ListClients {} => Ok(Change::Read(client_metadata(&document))),
             Operation::Unpair { certificate_id } => self.unpair(document, &certificate_id, now),
+            Operation::UpdateClientConfigOverrides {
+                certificate_id,
+                config_overrides,
+                expected_revision: _,
+            } => Self::update_client_config_overrides(
+                document,
+                &certificate_id,
+                config_overrides,
+                now,
+            ),
             Operation::CheckClientCertificate { certificate_pem } => {
                 Self::check_certificate(&document, &certificate_pem, now)
             }
@@ -199,6 +209,7 @@ impl Engine {
             name,
             certificate_pem,
             paired_at: now,
+            config_overrides: ClientConfigOverrides::default(),
         });
         write(document, response, now)
     }
@@ -257,6 +268,7 @@ impl Engine {
                     name,
                     certificate_pem: pem,
                     paired_at: 0,
+                    config_overrides: ClientConfigOverrides::default(),
                 },
                 salt,
                 expires_at,
@@ -333,6 +345,25 @@ impl Engine {
             .retain(|_, pending| pending.client.certificate_id != id);
         write(document, json!({"ok":true}), now)
     }
+    fn update_client_config_overrides(
+        mut document: Document,
+        certificate_id: &str,
+        config_overrides: ClientConfigOverrides,
+        now: u64,
+    ) -> Result<Change, &'static str> {
+        config_overrides.validate()?;
+        let client = document
+            .clients
+            .iter_mut()
+            .find(|client| client.certificate_id == certificate_id)
+            .ok_or("not_paired")?;
+        client.config_overrides = config_overrides;
+        write(
+            document,
+            json!({"ok":true,"certificate_id":certificate_id}),
+            now,
+        )
+    }
     fn check_certificate(document: &Document, pem: &str, now: u64) -> Result<Change, &'static str> {
         let certificate = crypto::parse_certificate(pem, Some(now))?;
         let client = document
@@ -341,7 +372,7 @@ impl Engine {
             .find(|client| client.certificate_id == certificate.fingerprint)
             .ok_or("not_paired")?;
         Ok(Change::Read(
-            json!({"ok":true,"paired":1,"certificate_id":client.certificate_id,"client_id":client.client_id}),
+            json!({"ok":true,"paired":1,"certificate_id":client.certificate_id,"client_id":client.client_id,"config_overrides":client.config_overrides}),
         ))
     }
 }
@@ -362,7 +393,8 @@ fn client_metadata(document: &Document) -> Value {
                 "certificate_id": client.certificate_id,
                 "client_id": client.client_id,
                 "name": client.name,
-                "paired_at": client.paired_at
+                "paired_at": client.paired_at,
+                "config_overrides": client.config_overrides
             })
         })
         .collect();

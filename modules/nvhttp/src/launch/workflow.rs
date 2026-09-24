@@ -6,6 +6,7 @@ use super::{
     success_reply,
 };
 use crate::wire::Reply;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Instant;
 
@@ -172,7 +173,7 @@ impl Controller {
                             "bitrate_kbps": config.profile.bitrate_kbps,
                             "max_reference_frames": config.profile.max_reference_frames,
                             "packet_size": config.profile.packet_size,
-                            "fec_percentage": config.profile.fec_percentage,
+                            "fec_percentage": record.effective_fec_percentage,
                             "min_parity_shards": config.profile.min_parity_shards,
                             "max_fec_blocks": config.profile.max_fec_blocks,
                             "packet_ms": config.profile.packet_ms,
@@ -228,7 +229,29 @@ impl Controller {
                 match application_response(record, &payload) {
                     Ok((launch_id, "active", true)) if record.state == State::Starting => {
                         record.application_launch = Some(launch_id);
-                        record.stage = Stage::OpenRtsp;
+                        match application_fec_percentage(&payload) {
+                            Ok(application_fec_percentage) => {
+                                record.application_fec_percentage = application_fec_percentage;
+                                record.effective_fec_percentage = record
+                                    .peer
+                                    .client_fec_percentage
+                                    .or(application_fec_percentage)
+                                    .unwrap_or(record.global_fec_percentage);
+                                let mut profile = self
+                                    .config
+                                    .as_ref()
+                                    .expect("enabled streaming config")
+                                    .profile
+                                    .clone();
+                                profile.fec_percentage = record.effective_fec_percentage;
+                                if profile.validate().is_ok() {
+                                    record.stage = Stage::OpenRtsp;
+                                } else {
+                                    fail_record(record, "invalid_streaming_profile_override", now);
+                                }
+                            }
+                            Err(code) => fail_record(record, code, now),
+                        }
                     }
                     Ok((launch_id, "active", _)) => {
                         record.application_launch = Some(launch_id);
@@ -540,6 +563,29 @@ fn application_response<'a>(
         })
         .ok_or("invalid_application_response")?;
     Ok((id, state, launch["cleanup_error"].is_null()))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ApplicationConfigOverrides {
+    fec_percentage: Option<u8>,
+}
+
+fn application_fec_percentage(payload: &Value) -> Result<Option<u8>, &'static str> {
+    let launch = payload
+        .get("launch")
+        .filter(|value| value.is_object())
+        .ok_or("invalid_application_response")?;
+    let config_overrides = match launch.get("config_overrides") {
+        None | Some(Value::Null) => ApplicationConfigOverrides::default(),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|_| "invalid_application_response")?
+        }
+    };
+    if config_overrides.fec_percentage == Some(0) {
+        return Err("invalid_application_response");
+    }
+    Ok(config_overrides.fec_percentage)
 }
 
 fn rtsp_response<'a>(

@@ -15,7 +15,32 @@ pub struct Entry {
     pub description: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
+    pub config_overrides: ConfigOverrides,
     pub launch: Launch,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec_percentage: Option<u8>,
+}
+
+impl ConfigOverrides {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .fec_percentage
+            .is_some_and(|percentage| percentage == 0)
+        {
+            return Err("fec_percentage must be between 1 and 255");
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fec_percentage.is_none()
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -93,6 +118,7 @@ fn default_command_timeout_ms() -> u64 {
 
 impl Entry {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.config_overrides.validate()?;
         if !bounded_text(&self.name, 160) || self.name.trim().is_empty() {
             return Err("name must contain 1..160 bytes of printable text");
         }

@@ -942,7 +942,7 @@ fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complet
 }
 
 #[test]
-fn provider_snapshot_detaches_manual_edits_and_preserves_them_on_later_cleanup() {
+fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();
     let begin = backend.run_for(
@@ -968,9 +968,11 @@ fn provider_snapshot_detaches_manual_edits_and_preserves_them_on_later_cleanup()
     );
     assert_eq!(imported["revision"], 1);
 
+    let mut configured_entry = entry("Hand edited");
+    configured_entry["config_overrides"] = json!({"fec_percentage":37});
     let manual = backend.run_for(
         &mut pipeline,
-        json!({"action":"update","id":"app-0000000000000001","expected_revision":1,"entry":entry("Hand edited")}),
+        json!({"action":"update","id":"app-0000000000000001","expected_revision":1,"entry":configured_entry}),
         "management",
         "management",
         "management",
@@ -1003,6 +1005,10 @@ fn provider_snapshot_detaches_manual_edits_and_preserves_them_on_later_cleanup()
     assert_eq!(
         backend.entries["app-0000000000000001"]["name"],
         "Hand edited"
+    );
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["config_overrides"]["fec_percentage"],
+        37
     );
     let marker = backend.entries["~provider.entry:steam:steam:10"].clone();
     assert_eq!(marker["detached"], true);

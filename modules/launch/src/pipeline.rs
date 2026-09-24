@@ -363,6 +363,18 @@ impl Pipeline {
                     Ok(executable) => record.executable = Some(executable),
                     Err(code) => return self.dependency_failed(job, code, send),
                 }
+                let config_overrides = match payload["entry"].get("config_overrides") {
+                    Some(value) => match serde_json::from_value::<
+                        crate::protocol::ApplicationConfigOverrides,
+                    >(value.clone())
+                    {
+                        Ok(overrides) if overrides.validate().is_ok() => overrides,
+                        _ => return self.dependency_failed(job, "invalid_catalog_response", send),
+                    },
+                    None => crate::protocol::ApplicationConfigOverrides::default(),
+                };
+                record.config_overrides =
+                    (!config_overrides.is_empty()).then_some(config_overrides);
                 job.step = Step::CreateSession;
             }
             Step::CreateSession => {

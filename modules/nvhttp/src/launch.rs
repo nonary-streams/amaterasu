@@ -14,6 +14,7 @@ use crate::wire::{Reply, xml};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr},
@@ -43,6 +44,9 @@ pub struct LaunchRequest {
 pub struct PeerIdentity {
     remote: IpAddr,
     certificate: Vec<u8>,
+    client_id: Option<String>,
+    certificate_id: Option<String>,
+    client_fec_percentage: Option<u8>,
 }
 
 impl PeerIdentity {
@@ -56,8 +60,58 @@ impl PeerIdentity {
         Ok(Self {
             remote,
             certificate,
+            client_id: None,
+            certificate_id: None,
+            client_fec_percentage: None,
         })
     }
+
+    pub(crate) fn with_paired_identity(
+        mut self,
+        client_id: String,
+        certificate_id: String,
+        fec_percentage: Option<u8>,
+    ) -> Result<Self, &'static str> {
+        if !valid_client_id(&client_id)
+            || !valid_fingerprint(&certificate_id)
+            || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
+            || fec_percentage == Some(0)
+        {
+            return Err("invalid_paired_identity");
+        }
+        self.client_id = Some(client_id);
+        self.certificate_id = Some(certificate_id.to_ascii_lowercase());
+        self.client_fec_percentage = fec_percentage;
+        Ok(self)
+    }
+
+    fn paired(&self) -> bool {
+        self.client_id.is_some() && self.certificate_id.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paired_client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+}
+
+fn valid_client_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-:/".contains(&byte))
+}
+
+fn valid_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn fingerprint(certificate: &[u8]) -> String {
+    Sha256::digest(certificate)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -198,12 +252,16 @@ impl Controller {
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
+        if !peer.paired() {
+            return Some(private_error(401, "authenticated paired TLS is required"));
+        }
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
             || !config.profile.accepts(&request)
         {
             return Some(private_error(400, "unsupported streaming request"));
         }
+        let global_fec_percentage = config.profile.fec_percentage;
 
         if let Some(record) = self
             .records
@@ -246,6 +304,7 @@ impl Controller {
             operation_id(&self.nonce, id, "application"),
             operation_id(&self.nonce, id, "rtsp"),
             connect_data,
+            global_fec_percentage,
             connection,
             now + INITIAL_DEADLINE,
         );

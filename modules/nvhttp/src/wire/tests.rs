@@ -1,10 +1,13 @@
 use super::*;
+use crate::launch::{CaptureConfig, CaptureProvider, StreamProfile, StreamingConfig};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 struct Broker {
     next: u64,
     requests: BTreeMap<u64, Value>,
+    services: BTreeMap<u64, String>,
     accepted: Vec<Value>,
     cancelled: BTreeSet<u64>,
     approved: bool,
@@ -17,9 +20,13 @@ impl Broker {
             Command::Request {
                 service, payload, ..
             } => {
-                assert_eq!(service, PAIRING_SERVICE);
+                assert!(matches!(
+                    service.as_str(),
+                    PAIRING_SERVICE | "amaterasu.launch/1" | "amaterasu.rtsp/1"
+                ));
                 self.next += 1;
                 self.accepted.push(payload.clone());
+                self.services.insert(self.next, service);
                 self.requests.insert(self.next, payload);
                 Response::Accepted { id: self.next }
             }
@@ -34,32 +41,66 @@ impl Broker {
                 if self.pause_begin && payload["action"] == "begin" {
                     return Ok(Response::Pending);
                 }
-                let result = match payload["action"].as_str().unwrap() {
-                    "identity" => {
+                let service = &self.services[&request];
+                let result = match (service.as_str(), payload["action"].as_str().unwrap()) {
+                    (PAIRING_SERVICE, "identity") => {
                         json!({"ok":true,"host_id":"12345678-1234-4234-8234-123456789abc"})
                     }
-                    "begin" => {
+                    (PAIRING_SERVICE, "check_client_certificate") => {
+                        let encoded = payload["certificate_pem"].as_str().unwrap();
+                        let (_, certificate_der) =
+                            pem_rfc7468::decode_vec(encoded.as_bytes()).unwrap();
+                        json!({
+                            "ok": true,
+                            "paired": 1,
+                            "certificate_id": hex(&Sha256::digest(certificate_der)),
+                            "client_id": "certificate-bound-client",
+                            "config_overrides": {"fec_percentage": 49}
+                        })
+                    }
+                    (PAIRING_SERVICE, "begin") => {
                         json!({"ok":true,"pending":true,"pairing_id":"test-private-pairing-id"})
                     }
-                    "get_server_cert" if !self.approved => {
+                    (PAIRING_SERVICE, "get_server_cert") if !self.approved => {
                         json!({"ok":true,"pending":true,"paired":0})
                     }
-                    "get_server_cert" => {
+                    (PAIRING_SERVICE, "get_server_cert") => {
                         json!({"ok":true,"paired":1,"plaincert":hex(pem().as_bytes())})
                     }
-                    "client_challenge" => {
+                    (PAIRING_SERVICE, "client_challenge") => {
                         json!({"ok":true,"paired":1,"challengeresponse":"00".repeat(48)})
                     }
-                    "server_challenge_response" => {
+                    (PAIRING_SERVICE, "server_challenge_response") => {
                         json!({"ok":true,"paired":1,"pairingsecret":"00".repeat(272)})
                     }
-                    "client_pairing_secret" => {
+                    (PAIRING_SERVICE, "client_pairing_secret") => {
                         json!({"ok":true,"paired":1,"certificate_id":"00".repeat(32)})
                     }
-                    "cancel" => json!({"ok":true}),
-                    action => panic!("unexpected service operation {action}"),
+                    (PAIRING_SERVICE, "cancel") => json!({"ok":true}),
+                    ("amaterasu.launch/1", "launch_export") => json!({
+                        "ok": true,
+                        "launch": {
+                            "launch_id": 1,
+                            "operation_id": payload["operation_id"],
+                            "app_id": payload["app_id"],
+                            "state": "active",
+                            "failure": null,
+                            "cleanup_error": null,
+                            "config_overrides": {"fec_percentage": 37}
+                        }
+                    }),
+                    ("amaterasu.rtsp/1", "open") => json!({
+                        "ok": true,
+                        "ticket": 1,
+                        "rtsp_url": "rtspenc://127.0.0.1:48010",
+                        "state": "ready",
+                        "failure": null,
+                        "cleanup_error": null
+                    }),
+                    (service, action) => panic!("unexpected service operation {service} {action}"),
                 };
                 self.requests.remove(&request);
+                self.services.remove(&request);
                 Response::Result { payload: result }
             }
             Command::Cancel { request } => {
@@ -79,6 +120,41 @@ fn router() -> Router {
             https_port: 47984,
         },
         LaunchController::new(None).unwrap(),
+    )
+}
+
+fn streaming_router() -> Router {
+    Router::new(
+        RouterConfig {
+            hostname: "Amaterasu".into(),
+            http_port: 47989,
+            https_port: 47984,
+        },
+        LaunchController::new(Some(StreamingConfig {
+            capture: CaptureConfig {
+                capture_provider: CaptureProvider::Dxgi,
+                output: "display-one".into(),
+                encoder: 0,
+                audio_endpoint: "default".into(),
+            },
+            profile: StreamProfile {
+                max_width: 1920,
+                max_height: 1080,
+                max_fps: 60,
+                bitrate_kbps: 10_000,
+                max_reference_frames: 1,
+                packet_size: 1024,
+                fec_percentage: 20,
+                min_parity_shards: 2,
+                max_fec_blocks: 1,
+                packet_ms: 10,
+                audio_bitrate: 128_000,
+                encrypt_video: true,
+                encrypt_audio: true,
+                permit_legacy_audio_iv_wrap: false,
+            },
+        }))
+        .unwrap(),
     )
 }
 
@@ -214,6 +290,60 @@ fn public_launch_requires_paired_tls_before_parsing_private_fields() {
         .unwrap();
     assert_eq!(response.status, 400);
     assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn launch_identity_and_client_override_come_from_the_authenticated_certificate() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let target = concat!(
+        "/launch?appid=7&mode=1280x720x60&",
+        "rikey=00112233445566778899aabbccddeeff&rikeyid=17&uniqueid=forged-client"
+    );
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(target),
+                peer("127.0.0.1", true, Some(vec![1, 2, 3]), true),
+                now,
+                &mut |command| broker.send(command),
+            )
+            .is_none()
+    );
+
+    assert!(poll(&mut router, &mut broker, now).is_empty());
+    let pairing_lookup = broker.accepted.first().unwrap();
+    assert_eq!(pairing_lookup["action"], "check_client_certificate");
+    assert_eq!(pairing_lookup["certificate_pem"], pem());
+    assert!(pairing_lookup.get("uniqueid").is_none());
+
+    let mut replies = Vec::new();
+    for _ in 0..12 {
+        replies.extend(poll(&mut router, &mut broker, now));
+        if !replies.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].0, 19);
+    assert_eq!(replies[0].1.status, 200);
+
+    let launch = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "launch_export")
+        .unwrap();
+    assert_eq!(launch["app_id"], "app-0000000000000007");
+    let rtsp_open = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "open")
+        .unwrap();
+    // The pairing record's certificate-keyed value outranks the app value (37)
+    // and global value (20). The query's forged uniqueid has no effect.
+    assert_eq!(rtsp_open["profile"]["fec_percentage"], 49);
 }
 
 #[test]

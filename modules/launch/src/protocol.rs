@@ -196,6 +196,26 @@ impl Executable {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationConfigOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec_percentage: Option<u8>,
+}
+
+impl ApplicationConfigOverrides {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.fec_percentage == Some(0) {
+            return Err("invalid_catalog_response");
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fec_percentage.is_none()
+    }
+}
+
 fn apply_preparation_working_directories(
     preparation: &mut [PreparationStep],
     working_directory: Option<&str>,

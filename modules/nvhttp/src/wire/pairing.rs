@@ -1,6 +1,9 @@
 use super::RequestContext;
 use super::query::hex_bytes;
-use super::{Call, Job, PAIRING_TIMEOUT, Purpose, Query, Reply, Router, SERVICE_TIMEOUT, xml};
+use super::{
+    Call, ClientConfigOverrides, Job, PAIRING_TIMEOUT, Purpose, Query, Reply, Router,
+    SERVICE_TIMEOUT, xml,
+};
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -314,6 +317,18 @@ impl Router {
         if matches!(job.purpose, Purpose::Cleanup) {
             return None;
         }
+        if let Purpose::LaunchIdentity { .. } = &job.purpose
+            && let Ok(payload) = &result
+            && payload["ok"] != true
+            && payload["code"] == "not_paired"
+        {
+            complete(
+                &job,
+                xml::error(401, "authenticated client is no longer paired"),
+                replies,
+            );
+            return None;
+        }
         let payload = match result {
             Ok(payload) if payload["ok"] == true => payload,
             _ => {
@@ -362,6 +377,67 @@ impl Router {
                 let reply = phase.reply(&payload);
                 self.advance_transcript(&client, phase.next_stage(), reply.status == 200, now);
                 complete(&job, reply, replies);
+                None
+            }
+            Purpose::LaunchIdentity { request, peer } => {
+                let connection = job.connection?;
+                let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
+                    complete(
+                        &job,
+                        xml::error(503, "invalid paired client response"),
+                        replies,
+                    );
+                    return None;
+                };
+                let Some(certificate_id) = payload.get("certificate_id").and_then(Value::as_str)
+                else {
+                    complete(
+                        &job,
+                        xml::error(503, "invalid paired client response"),
+                        replies,
+                    );
+                    return None;
+                };
+                let config_overrides = match payload.get("config_overrides") {
+                    None | Some(Value::Null) => ClientConfigOverrides::default(),
+                    Some(value) => match serde_json::from_value(value.clone()) {
+                        Ok(config_overrides) => config_overrides,
+                        Err(_) => {
+                            complete(
+                                &job,
+                                xml::error(503, "invalid paired client response"),
+                                replies,
+                            );
+                            return None;
+                        }
+                    },
+                };
+                if payload["paired"] != 1 {
+                    complete(
+                        &job,
+                        xml::error(503, "invalid paired client response"),
+                        replies,
+                    );
+                    return None;
+                }
+                let peer = match peer.with_paired_identity(
+                    client_id.into(),
+                    certificate_id.into(),
+                    config_overrides.fec_percentage,
+                ) {
+                    Ok(peer) => peer,
+                    Err(_) => {
+                        complete(
+                            &job,
+                            xml::error(503, "invalid paired client response"),
+                            replies,
+                        );
+                        return None;
+                    }
+                };
+                if let Some(reply) = self.launches.launch(connection, request, peer, now) {
+                    complete(&job, reply, replies);
+                }
                 None
             }
             Purpose::Cleanup | Purpose::Applications => None,

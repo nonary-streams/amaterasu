@@ -31,7 +31,16 @@ fn config() -> StreamingConfig {
 }
 
 fn peer(marker: u8) -> PeerIdentity {
-    PeerIdentity::new("127.0.0.1".parse().unwrap(), vec![marker; 32]).unwrap()
+    peer_with_fec(marker, None)
+}
+
+fn peer_with_fec(marker: u8, fec_percentage: Option<u8>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    let certificate_id = fingerprint(&certificate);
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate)
+        .unwrap()
+        .with_paired_identity(format!("client-{marker}"), certificate_id, fec_percentage)
+        .unwrap()
 }
 
 fn request(key: u8) -> LaunchRequest {
@@ -50,6 +59,23 @@ fn settings_reject_unsupported_packetization_before_launch() {
     let mut invalid = config();
     invalid.profile.fec_percentage = 0;
     assert_eq!(invalid.validate().unwrap_err(), "invalid_streaming_profile");
+}
+
+#[test]
+fn pairing_lookup_identity_must_match_the_certificate_bytes() {
+    let certificate = vec![7; 32];
+    let peer = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone()).unwrap();
+    assert_eq!(
+        peer.with_paired_identity("moonlight-id".into(), "00".repeat(32), None)
+            .err()
+            .unwrap(),
+        "invalid_paired_identity"
+    );
+    let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity("moonlight-id".into(), fingerprint(&certificate), Some(37))
+        .unwrap();
+    assert_eq!(paired.paired_client_id(), Some("moonlight-id"));
 }
 
 #[test]
@@ -98,6 +124,7 @@ struct Broker {
     rtsp_closed: bool,
     application_stopped: bool,
     application_unhealthy: bool,
+    application_fec_percentage: Option<u8>,
 }
 
 impl Default for Broker {
@@ -120,6 +147,7 @@ impl Default for Broker {
             rtsp_closed: false,
             application_stopped: false,
             application_unhealthy: false,
+            application_fec_percentage: None,
         }
     }
 }
@@ -193,23 +221,24 @@ impl Broker {
             } else {
                 self.application_state
             };
-            return json!({
-                "ok": true,
-                "launch": {
-                    "launch_id": launch_id,
-                    "operation_id": operation,
-                    "app_id": app,
-                    "state": state,
-                    "session_id": 2,
-                    "process_id": 3,
-                    "failure": null,
-                    "cleanup_error": if self.application_unhealthy {
-                        Value::String("fixture_failure".into())
-                    } else {
-                        Value::Null
-                    },
-                }
+            let mut launch = json!({
+                "launch_id": launch_id,
+                "operation_id": operation,
+                "app_id": app,
+                "state": state,
+                "session_id": 2,
+                "process_id": 3,
+                "failure": null,
+                "cleanup_error": if self.application_unhealthy {
+                    Value::String("fixture_failure".into())
+                } else {
+                    Value::Null
+                },
             });
+            if let Some(fec_percentage) = self.application_fec_percentage {
+                launch["config_overrides"] = json!({"fec_percentage":fec_percentage});
+            }
+            return json!({"ok":true,"launch":launch});
         }
         let state = if action == "close" && self.fail_rtsp_cleanup {
             "cleanup_failed"
@@ -281,6 +310,39 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
     );
     controller.reply_delivered(connection, now);
     assert_eq!(controller.current_game(&peer(1)), 1);
+}
+
+#[test]
+fn global_app_and_verified_client_fec_values_apply_in_precedence_order() {
+    for (app_fec, client_fec, expected) in [
+        (None, None, 20),
+        (Some(37), None, 37),
+        (Some(37), Some(49), 49),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            application_fec_percentage: app_fec,
+            ..Default::default()
+        };
+        assert!(
+            controller
+                .launch(10, request(1), peer_with_fec(1, client_fec), now)
+                .is_none()
+        );
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["profile"]["fec_percentage"], expected);
+    }
 }
 
 #[test]

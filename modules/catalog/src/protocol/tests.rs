@@ -82,6 +82,43 @@ fn stable_ids_survive_rename_reload_and_deletion_without_reuse() {
 }
 
 #[test]
+fn sparse_fec_override_is_typed_defaulted_and_persisted_with_the_entry() {
+    let legacy: Entry = serde_json::from_value(json!({
+        "name":"Legacy entry",
+        "launch":{"kind":"executable","program":"/games/legacy"}
+    }))
+    .unwrap();
+    assert!(legacy.config_overrides.is_empty());
+
+    let configured: Entry = serde_json::from_value(json!({
+        "name":"Configured entry",
+        "launch":{"kind":"executable","program":"/games/configured"},
+        "config_overrides":{"fec_percentage":37}
+    }))
+    .unwrap();
+    configured.validate().unwrap();
+    assert_eq!(configured.config_overrides.fec_percentage, Some(37));
+    let persisted = serde_json::to_value(configured).unwrap();
+    assert_eq!(persisted["config_overrides"]["fec_percentage"], 37);
+
+    let invalid_percentage: Entry = serde_json::from_value(json!({
+        "name":"Invalid entry",
+        "launch":{"kind":"executable","program":"/games/invalid"},
+        "config_overrides":{"fec_percentage":0}
+    }))
+    .unwrap();
+    assert!(invalid_percentage.validate().is_err());
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name":"Invalid entry",
+            "launch":{"kind":"executable","program":"/games/invalid"},
+            "config_overrides":{"fec_percentage":30,"unknown_key":1}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn mutations_require_revision_and_reject_unknown_authority_fields() {
     assert!(
         serde_json::from_value::<Operation>(json!({"action":"create","entry":entry("Game")}))

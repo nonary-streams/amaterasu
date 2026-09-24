@@ -212,6 +212,23 @@ impl Pipeline {
                     }
                 }
             }
+            Response::Result { payload }
+                if matches!(&pending.stage, Stage::Saving { .. })
+                    && payload["ok"] == false
+                    && payload["error"]["code"] == "revision_conflict"
+                    && payload["error"]["current_revision"].as_u64().is_some() =>
+            {
+                self.identity.invalidate();
+                complete(
+                    send,
+                    pending.request.id,
+                    json!({
+                        "ok": false,
+                        "code": "revision_conflict",
+                        "current_revision": payload["error"]["current_revision"]
+                    }),
+                )
+            }
             // Never echo transport/state messages: they can contain input values.
             _ => {
                 self.identity.invalidate();
@@ -229,8 +246,24 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         let loaded = Snapshot::prepare(&document, now).map_err(str::to_owned)?;
+        if let Operation::UpdateClientConfigOverrides {
+            expected_revision, ..
+        } = &operation
+            && *expected_revision != revision
+        {
+            self.identity.publish(revision, loaded)?;
+            return complete(
+                send,
+                request.id,
+                json!({"ok":false,"code":"revision_conflict","current_revision":revision}),
+            );
+        }
+        let include_revision = matches!(&operation, Operation::ListClients {});
         match self.engine.apply(&request.caller, operation, document, now) {
-            Ok(Change::Read(response)) => {
+            Ok(Change::Read(mut response)) => {
+                if include_revision {
+                    response["revision"] = revision.into();
+                }
                 self.identity.publish(revision, loaded)?;
                 complete(send, request.id, response)
             }

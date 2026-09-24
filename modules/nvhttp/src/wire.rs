@@ -6,9 +6,10 @@ mod query;
 mod streaming;
 pub(crate) mod xml;
 
-use crate::launch::{Controller as LaunchController, PeerIdentity};
+use crate::launch::{Controller as LaunchController, LaunchRequest, PeerIdentity};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use query::Query;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -115,6 +116,10 @@ enum Purpose {
         client: String,
         phase: pairing::Phase,
     },
+    LaunchIdentity {
+        request: LaunchRequest,
+        peer: PeerIdentity,
+    },
     Cleanup,
     Applications,
 }
@@ -206,7 +211,28 @@ impl Router {
                         Ok(identity) => identity,
                         Err(error) => return Some(xml::error(401, error)),
                     };
-                    self.launches.launch(connection, request, identity, now)
+                    let certificate_pem = match peer.peer_certificate.as_deref().and_then(|der| {
+                        pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, der)
+                            .ok()
+                    }) {
+                        Some(certificate_pem) => certificate_pem,
+                        None => return Some(xml::error(401, "client certificate is unavailable")),
+                    };
+                    self.queue(
+                        Some(connection),
+                        Purpose::LaunchIdentity {
+                            request,
+                            peer: identity,
+                        },
+                        json!({
+                            "action": "check_client_certificate",
+                            "certificate_pem": certificate_pem
+                        }),
+                        now + SERVICE_TIMEOUT,
+                        now,
+                    )
+                    .err()
+                    .map(|error| xml::error(503, error))
                 }
             }
             "/cancel" => {
@@ -465,6 +491,12 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
         Ok(Response::Error { code, .. }) => code,
         _ => "runtime_error",
     }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ClientConfigOverrides {
+    fec_percentage: Option<u8>,
 }
 
 #[cfg(test)]
