@@ -20,12 +20,15 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 3 stores `keyboard`, `mouse`,
-`high_resolution_scrolling`, and `always_send_scancodes`; an absent document
-enables all four. Version 1 documents migrate in memory with high-resolution
+after startup. Version 4 stores `keyboard`, `mouse`,
+`high_resolution_scrolling`, `always_send_scancodes`, and
+`key_rightalt_to_key_win`; an absent document enables keyboard, mouse,
+high-resolution scrolling, and scancode mode, while leaving right-Alt mapping
+disabled. Version 1 documents migrate in memory with high-resolution
 scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
 Version 2 documents preserve all three saved values and default scancode mode to
-enabled. The next update writes the complete v3 document. The module needs calls to configuration and state
+enabled. Version 3 preserves all four earlier values and defaults right-Alt
+mapping to disabled. The next update writes the complete v4 document. The module needs calls to configuration and state
 and dependencies on both services; the configuration service uses the caller's
 delegated authority for its durable state read. Management cannot select another
 product namespace.
@@ -33,13 +36,13 @@ product namespace.
 Administrators use the fixed management routes `/v1/input/settings_get` and
 `/v1/input/settings_update`, protected by `configuration.read` and
 `configuration.write`. An update body contains both keyboard and mouse fields,
-`expected_revision`, and may contain `high_resolution_scrolling` and
-`always_send_scancodes`. Older updates that omit either newer field preserve
-its current durable value. Product settings
+`expected_revision`, and may contain `high_resolution_scrolling`,
+`always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
+newer fields preserve their current durable values. Product settings
 actions accept only the exact runtime caller `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -59,7 +62,8 @@ be polled. Settings reads do not block on the startup fetch; they return
 bootstrap defaults as persisted settings.
 
 The live global policy includes `keyboard`, `mouse`,
-`high_resolution_scrolling`, and `always_send_scancodes`. When high-resolution
+`high_resolution_scrolling`, `always_send_scancodes`, and
+`key_rightalt_to_key_win`. When high-resolution
 scrolling is disabled, the input controller accumulates signed wheel units
 separately per axis and emits legacy 120-unit detents. Fractional remainders are
 discarded on mode changes, mouse disable, and lease end. The default preserves
@@ -76,6 +80,14 @@ the setting changes while a key is held. Linux intentionally ignores this
 setting and maps either packet form through the existing fixed US-to-evdev table;
 unmapped raw keys are rejected during batch validation. Controller and gamepad
 parity remain pending.
+
+When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
+VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw
+Moonlight packets on Windows and Linux. The backend records the native key chosen
+at key-down so a setting change cannot send key-up for a different key. Linux
+maps VK_LWIN through its existing table to `KEY_LEFTMETA`; Linux runtime behavior
+has not been exercised on this Windows host. Repeat delay and frequency remain
+pending because this module does not yet have a lease-scoped repeat scheduler.
 
 ## JSON API
 

@@ -110,6 +110,14 @@ impl Key {
         }
     }
 }
+
+pub(crate) const fn effective_virtual_key(code: u8, key_rightalt_to_key_win: bool) -> u8 {
+    if key_rightalt_to_key_win && code == 0xa5 {
+        0x5b
+    } else {
+        code
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyState {
@@ -315,6 +323,17 @@ pub fn validate_operation_id(operation_id: &str) -> InputResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_alt_remapping_uses_left_windows_virtual_key() {
+        assert_eq!(effective_virtual_key(0xa5, true), 0x5b);
+        assert_eq!(effective_virtual_key(0xa5, false), 0xa5);
+        assert_eq!(effective_virtual_key(0xa4, true), 0xa4);
+        let mapping =
+            amaterasu_gamestream::control::virtual_key_mapping(effective_virtual_key(0xa5, true))
+                .expect("left Windows key has a Linux mapping");
+        assert_eq!(mapping.linux_evdev_code, 125); // KEY_LEFTMETA
+    }
 
     #[test]
     fn moonlight_key_wire_defaults_to_normalized_and_accepts_raw_vk_mode() {

@@ -1,5 +1,8 @@
 use super::Backend;
-use crate::model::{Axis, Button, Event, InputError, InputResult, Key, KeyState};
+use crate::model::{
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
+};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
@@ -119,6 +122,8 @@ pub struct LinuxBackend {
     path: String,
     keyboard: Option<Device>,
     pointer: Option<Device>,
+    key_rightalt_to_key_win: bool,
+    held_virtual_keycodes: HashMap<u8, u16>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
 }
@@ -128,6 +133,8 @@ impl LinuxBackend {
             path,
             keyboard: None,
             pointer: None,
+            key_rightalt_to_key_win: false,
+            held_virtual_keycodes: HashMap::new(),
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
         }
@@ -161,11 +168,11 @@ impl Backend for LinuxBackend {
                 "Linux requires evdev keys and relative pointer events; compositor-specific absolute mapping is unsupported",
             ));
         }
-        if let Event::Key {
-            key: Key::MoonlightVk { code, .. },
-            ..
-        } = event
-            && amaterasu_gamestream::control::virtual_key_mapping(*code).is_none()
+        if let Event::Key { key, state } = event
+            && let Key::MoonlightVk { code, normalized } = key
+            && self
+                .event_virtual_keycode(*code, *normalized, *state)
+                .is_none()
         {
             return Err(InputError::new(
                 "unsupported_event",
@@ -185,6 +192,7 @@ impl Backend for LinuxBackend {
         let pointer = Device::create(&self.path, false)?;
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
+        self.held_virtual_keycodes.clear();
         self.keyboard = Some(keyboard);
         self.pointer = Some(pointer);
         Ok(())
@@ -194,13 +202,11 @@ impl Backend for LinuxBackend {
         if let Event::Key { key, state } = event {
             let code = match key {
                 Key::LinuxEvdev { code } => *code,
-                Key::MoonlightVk { code, .. } => {
-                    amaterasu_gamestream::control::virtual_key_mapping(*code)
-                        .ok_or_else(|| {
-                            InputError::new("unsupported_event", "unmapped Moonlight key")
-                        })?
-                        .linux_evdev_code
-                }
+                Key::MoonlightVk { code, normalized } => self
+                    .event_virtual_keycode(*code, *normalized, *state)
+                    .ok_or_else(|| {
+                        InputError::new("unsupported_event", "unmapped Moonlight key")
+                    })?,
                 Key::WindowsScan { .. } => {
                     return Err(InputError::new(
                         "unsupported_event",
@@ -209,7 +215,21 @@ impl Backend for LinuxBackend {
                 }
             };
             let keyboard = self.keyboard.as_ref().ok_or_else(not_started)?;
-            return keyboard.emit(&[(
+            let identity = match key {
+                Key::MoonlightVk { code, .. } => Some(*code),
+                _ => None,
+            };
+            if let (Some(identity), Key::MoonlightVk { code, normalized }) = (identity, key)
+                && *state == KeyState::Down
+            {
+                // Retain the plan before the write; a failed write can have an
+                // uncertain outcome and a later cleanup must use this mapping.
+                self.held_virtual_keycodes.insert(
+                    identity,
+                    code_for_virtual_key(*code, *normalized, self.key_rightalt_to_key_win)?,
+                );
+            }
+            keyboard.emit(&[(
                 EV_KEY,
                 code,
                 match state {
@@ -217,7 +237,11 @@ impl Backend for LinuxBackend {
                     KeyState::Down => 1,
                     KeyState::Repeat => 2,
                 },
-            )]);
+            )])?;
+            if let (Some(identity), KeyState::Up) = (identity, state) {
+                self.held_virtual_keycodes.remove(&identity);
+            }
+            return Ok(());
         }
         let pointer = self.pointer.as_ref().ok_or_else(not_started)?;
         match event {
@@ -253,12 +277,27 @@ impl Backend for LinuxBackend {
     fn stop(&mut self) {
         self.pointer = None;
         self.keyboard = None;
+        self.held_virtual_keycodes.clear();
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
+    }
+
+    fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
+        self.key_rightalt_to_key_win = enabled;
     }
 }
 
 impl LinuxBackend {
+    fn event_virtual_keycode(&self, code: u8, normalized: bool, state: KeyState) -> Option<u16> {
+        let identity = code;
+        if matches!(state, KeyState::Up | KeyState::Repeat)
+            && let Some(keycode) = self.held_virtual_keycodes.get(&identity)
+        {
+            return Some(*keycode);
+        }
+        code_for_virtual_key(code, normalized, self.key_rightalt_to_key_win)
+    }
+
     fn scroll_units(&mut self, axis: Axis, amount: i16) -> InputResult<()> {
         let Self {
             pointer,
@@ -273,6 +312,12 @@ impl LinuxBackend {
         };
         emit_scroll_units(axis, amount, remainder, |events| pointer.emit(events))
     }
+}
+
+fn code_for_virtual_key(code: u8, _normalized: bool, key_rightalt_to_key_win: bool) -> Option<u16> {
+    let host_code = effective_virtual_key(code, key_rightalt_to_key_win);
+    amaterasu_gamestream::control::virtual_key_mapping(host_code)
+        .map(|mapping| mapping.linux_evdev_code)
 }
 
 fn emit_scroll_units(
@@ -320,6 +365,34 @@ fn scroll_unit_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_alt_mapping_targets_left_meta_and_preserves_held_keyup_plan() {
+        let left_meta = amaterasu_gamestream::control::virtual_key_mapping(0x5b)
+            .expect("left Windows key has an evdev mapping")
+            .linux_evdev_code;
+        let right_alt = amaterasu_gamestream::control::virtual_key_mapping(0xa5)
+            .expect("right Alt has an evdev mapping")
+            .linux_evdev_code;
+        assert_eq!(code_for_virtual_key(0xa5, true, true), Some(left_meta));
+        assert_eq!(code_for_virtual_key(0xa5, false, true), Some(left_meta));
+        assert_eq!(code_for_virtual_key(0xa5, true, false), Some(right_alt));
+
+        let mut backend = LinuxBackend::new(String::new());
+        backend.set_key_rightalt_to_key_win(true);
+        let down = backend
+            .event_virtual_keycode(0xa5, true, KeyState::Down)
+            .unwrap();
+        assert_eq!(down, left_meta);
+        backend.held_virtual_keycodes.insert(0xa5, down);
+
+        backend.set_key_rightalt_to_key_win(false);
+        assert_eq!(
+            backend.event_virtual_keycode(0xa5, false, KeyState::Up),
+            Some(left_meta),
+            "a setting change cannot change the native key selected at key-down"
+        );
+    }
 
     #[test]
     fn high_resolution_scroll_maps_raw_units_and_compatible_detents_per_axis() {

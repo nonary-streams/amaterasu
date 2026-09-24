@@ -78,7 +78,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true})
+        json!({"keyboard":true,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false})
     );
     assert_eq!(revision, 0);
 }
@@ -111,6 +111,7 @@ fn product_v1_load_preserves_values_and_defaults_a_missing_legacy_field() {
             mouse: true,
             high_resolution_scrolling: true,
             always_send_scancodes: true,
+            key_rightalt_to_key_win: false,
         }
     );
     assert_eq!(revision, 9);
@@ -142,6 +143,31 @@ fn product_v2_reads_high_resolution_value_and_defaults_a_missing_field() {
     assert!(!defaulted.keyboard);
     assert!(defaulted.mouse);
     assert!(defaulted.always_send_scancodes);
+    assert!(!defaulted.key_rightalt_to_key_win);
+}
+
+#[test]
+fn product_v4_reads_right_alt_mapping_and_legacy_versions_default_it_off() {
+    let (enabled, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":4,
+        "revision":14,
+        "values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true},
+    }))
+    .unwrap();
+    assert!(enabled.key_rightalt_to_key_win);
+    assert!(enabled.always_send_scancodes);
+
+    let (legacy, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":3,
+        "revision":15,
+        "values":{"keyboard":true,"mouse":true,"always_send_scancodes":false},
+    }))
+    .unwrap();
+    assert!(!legacy.key_rightalt_to_key_win);
 }
 
 #[test]
@@ -166,12 +192,13 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
     }))
     .unwrap();
     assert!(defaulted.always_send_scancodes);
+    assert!(!defaulted.key_rightalt_to_key_win);
 }
 
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":5,"revision":1,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -179,6 +206,8 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
         json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true,"high_resolution_scrolling":"true"}}),
         json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"keyboard":true,"mouse":true,"always_send_scancodes":false}}),
         json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"always_send_scancodes":"true"}}),
+        json!({"ok":true,"found":true,"version":4,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":"true"}}),
+        json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"keyboard":true,"mouse":true,"key_rightalt_to_key_win":true}}),
         json!({"ok":true,"found":false,"version":null,"revision":1,"values":{}}),
     ] {
         assert!(read_document(&document).is_err(), "accepted {document}");
@@ -186,7 +215,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v3_document() {
+fn update_requires_current_revision_and_sends_whole_v4_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -201,6 +230,7 @@ fn update_requires_current_revision_and_sends_whole_v3_document() {
                 mouse: true,
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
+                key_rightalt_to_key_win: false,
             },
             10_000,
         )
@@ -218,6 +248,7 @@ fn update_requires_current_revision_and_sends_whole_v3_document() {
                 mouse: false,
                 high_resolution_scrolling: false,
                 always_send_scancodes: false,
+                key_rightalt_to_key_win: false,
             },
             10_000,
         )
@@ -243,8 +274,8 @@ fn update_requires_current_revision_and_sends_whole_v3_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":3,
-            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false},
+            "version":4,
+            "values":{"keyboard":false,"mouse":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false},
         })
     );
 }
@@ -257,34 +288,46 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     settings.pending = None;
     settings.policy.high_resolution_scrolling = false;
     settings.policy.always_send_scancodes = false;
-    let legacy_desired = settings.merge_update(false, true, None, None);
+    settings.policy.key_rightalt_to_key_win = true;
+    let legacy_desired = settings.merge_update(false, true, None, None, None);
     assert!(!legacy_desired.high_resolution_scrolling);
     assert!(!legacy_desired.always_send_scancodes);
+    assert!(legacy_desired.key_rightalt_to_key_win);
     settings
         .begin_update(90, 9, legacy_desired, 10_000)
         .unwrap();
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 3);
+    assert_eq!(payload["version"], 4);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false})
+        json!({"keyboard":false,"mouse":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true})
     );
     assert!(
         !settings
-            .merge_update(false, true, Some(true), None)
+            .merge_update(false, true, Some(true), None, None)
             .always_send_scancodes
     );
     assert!(
         settings
-            .merge_update(false, true, Some(true), Some(true))
+            .merge_update(false, true, Some(true), Some(true), None)
             .high_resolution_scrolling
     );
     assert!(
         settings
-            .merge_update(false, true, None, Some(true))
+            .merge_update(false, true, None, Some(true), None)
             .always_send_scancodes
+    );
+    assert!(
+        settings
+            .merge_update(false, true, None, None, None)
+            .key_rightalt_to_key_win
+    );
+    assert!(
+        !settings
+            .merge_update(false, true, None, None, Some(false))
+            .key_rightalt_to_key_win
     );
 }
 
@@ -298,6 +341,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         mouse: true,
         high_resolution_scrolling: false,
         always_send_scancodes: false,
+        key_rightalt_to_key_win: true,
     };
 
     settings
@@ -312,10 +356,15 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
 
     assert!(!controller.high_resolution_scrolling());
     assert!(!controller.always_send_scancodes());
+    assert!(controller.key_rightalt_to_key_win());
     assert_eq!(settings.get_response(&controller)["applied"], true);
     assert_eq!(
         settings.get_response(&controller)["values"]["high_resolution_scrolling"],
         false
+    );
+    assert_eq!(
+        settings.get_response(&controller)["values"]["key_rightalt_to_key_win"],
+        true
     );
 }
 
@@ -327,6 +376,7 @@ fn management_readback_distinguishes_persisted_and_applied_policy() {
             mouse: true,
             high_resolution_scrolling: true,
             always_send_scancodes: true,
+            key_rightalt_to_key_win: false,
         },
         12,
         true,
@@ -370,9 +420,9 @@ fn terminal_configuration_result_is_retained_until_release_then_applied_once() {
     let updated = json!({
         "ok":true,
         "found":true,
-        "version":3,
+        "version":4,
         "revision":1,
-        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true},
+        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false},
     });
     let mut script = Script::new([
         Response::Accepted { id: 11 },
@@ -410,6 +460,7 @@ fn terminal_configuration_result_is_retained_until_release_then_applied_once() {
                 mouse: true,
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
+                key_rightalt_to_key_win: false,
             },
             10_000,
         )
@@ -505,8 +556,8 @@ fn native_release_failure_reports_saved_policy_as_pending() {
     );
 
     let product_result = json!({
-        "ok":true,"found":true,"version":3,"revision":1,
-        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true}
+        "ok":true,"found":true,"version":4,"revision":1,
+        "values":{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false}
     });
     let mut script = Script::new([Response::Ok, Response::Ok]);
     let mut settings = ProductSettings::new();
@@ -520,6 +571,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
                 mouse: true,
                 high_resolution_scrolling: true,
                 always_send_scancodes: true,
+                key_rightalt_to_key_win: false,
             },
         },
         call: Call::Releasing {

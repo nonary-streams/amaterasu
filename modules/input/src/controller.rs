@@ -38,6 +38,7 @@ pub struct Controller<B: Backend> {
     device_policy: DevicePolicy,
     high_resolution_scrolling: bool,
     always_send_scancodes: bool,
+    key_rightalt_to_key_win: bool,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
     lease: Option<Lease>,
@@ -54,6 +55,7 @@ impl<B: Backend> Controller<B> {
             device_policy: DevicePolicy::default(),
             high_resolution_scrolling: true,
             always_send_scancodes: true,
+            key_rightalt_to_key_win: false,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
             lease: None,
@@ -125,6 +127,15 @@ impl<B: Backend> Controller<B> {
     pub fn set_always_send_scancodes(&mut self, enabled: bool) {
         self.always_send_scancodes = enabled;
         self.backend.set_always_send_scancodes(enabled);
+    }
+
+    pub fn key_rightalt_to_key_win(&self) -> bool {
+        self.key_rightalt_to_key_win
+    }
+
+    pub fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
+        self.key_rightalt_to_key_win = enabled;
+        self.backend.set_key_rightalt_to_key_win(enabled);
     }
 
     fn reset_scroll_remainders(&mut self) {
@@ -536,7 +547,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

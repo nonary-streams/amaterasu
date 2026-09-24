@@ -1,18 +1,22 @@
 use super::Backend;
-use crate::model::{Axis, Button, Event, InputError, InputResult, Key, KeyState};
+use crate::model::{
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
+};
 use std::collections::HashMap;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub struct WindowsBackend {
     always_send_scancodes: bool,
-    held_raw_key_plans: HashMap<u8, KeyboardPlan>,
+    key_rightalt_to_key_win: bool,
+    held_key_plans: HashMap<u8, KeyboardPlan>,
 }
 
 impl WindowsBackend {
     pub fn new(_: String) -> Self {
         Self {
             always_send_scancodes: true,
-            held_raw_key_plans: HashMap::new(),
+            key_rightalt_to_key_win: false,
+            held_key_plans: HashMap::new(),
         }
     }
 
@@ -22,14 +26,14 @@ impl WindowsBackend {
                 code: *code,
                 extended: *extended,
             }),
-            Key::MoonlightVk {
-                code,
-                normalized: true,
-            } => normalized_keyboard_plan(*code),
-            Key::MoonlightVk {
-                code,
-                normalized: false,
-            } => raw_keyboard_plan(*code, self.always_send_scancodes, map_virtual_key),
+            Key::MoonlightVk { code, normalized } => {
+                let code = effective_virtual_key(*code, self.key_rightalt_to_key_win);
+                if *normalized {
+                    normalized_keyboard_plan(code)
+                } else {
+                    raw_keyboard_plan(code, self.always_send_scancodes, map_virtual_key)
+                }
+            }
             Key::LinuxEvdev { .. } => Err(InputError::new(
                 "unsupported_event",
                 "Windows requires scan codes or Moonlight virtual keys",
@@ -37,14 +41,9 @@ impl WindowsBackend {
         }
     }
 
-    fn raw_key_identity(key: &Key) -> Option<u8> {
+    fn moonlight_key_identity(key: &Key) -> Option<u8> {
         match key {
-            Key::MoonlightVk {
-                normalized: false, ..
-            } => match key.canonical() {
-                Key::MoonlightVk { code, .. } => Some(code),
-                _ => unreachable!("canonical Moonlight key retains its encoding"),
-            },
+            Key::MoonlightVk { code, .. } => Some(*code),
             _ => None,
         }
     }
@@ -56,9 +55,9 @@ impl WindowsBackend {
                 extended: false,
             });
         };
-        if let Some(identity) = Self::raw_key_identity(key)
+        if let Some(identity) = Self::moonlight_key_identity(key)
             && matches!(state, KeyState::Up | KeyState::Repeat)
-            && let Some(plan) = self.held_raw_key_plans.get(&identity)
+            && let Some(plan) = self.held_key_plans.get(&identity)
         {
             return Ok(*plan);
         }
@@ -106,13 +105,13 @@ impl Backend for WindowsBackend {
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.validate(event)?;
-        let raw_identity = match event {
-            Event::Key { key, .. } => Self::raw_key_identity(key),
+        let key_identity = match event {
+            Event::Key { key, .. } => Self::moonlight_key_identity(key),
             _ => None,
         };
         let plan = self.event_keyboard_plan(event)?;
         let input = native_input_with_plan(event, plan)?;
-        if let Some(identity) = raw_identity
+        if let Some(identity) = key_identity
             && matches!(
                 event,
                 Event::Key {
@@ -123,7 +122,7 @@ impl Backend for WindowsBackend {
         {
             // SendInput failure can leave delivery uncertain. Retain the plan
             // before attempting the down so cleanup uses the same representation.
-            self.held_raw_key_plans.insert(identity, plan);
+            self.held_key_plans.insert(identity, plan);
         }
         // SAFETY: input is a fully initialized INPUT with the matching union tag.
         // SendInput reads this one owned record synchronously and retains no pointer.
@@ -137,13 +136,13 @@ impl Backend for WindowsBackend {
                 ),
             ));
         }
-        if let (Some(identity), Event::Key { state, .. }) = (raw_identity, event) {
+        if let (Some(identity), Event::Key { state, .. }) = (key_identity, event) {
             match state {
                 KeyState::Down => {
-                    self.held_raw_key_plans.insert(identity, plan);
+                    self.held_key_plans.insert(identity, plan);
                 }
                 KeyState::Up => {
-                    self.held_raw_key_plans.remove(&identity);
+                    self.held_key_plans.remove(&identity);
                 }
                 KeyState::Repeat => {}
             }
@@ -155,8 +154,12 @@ impl Backend for WindowsBackend {
         self.always_send_scancodes = enabled;
     }
 
+    fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
+        self.key_rightalt_to_key_win = enabled;
+    }
+
     fn stop(&mut self) {
-        self.held_raw_key_plans.clear();
+        self.held_key_plans.clear();
     }
 }
 
@@ -443,7 +446,7 @@ mod tests {
             code: 0x1e,
             extended: false,
         };
-        backend.held_raw_key_plans.insert(0x41, down_plan);
+        backend.held_key_plans.insert(0x41, down_plan);
         backend.set_always_send_scancodes(false);
         let active = backend
             .event_keyboard_plan(&key(0x41, false, KeyState::Up))
@@ -455,6 +458,68 @@ mod tests {
         assert_eq!(release.wVk, 0);
         assert_eq!(release.wScan, 0x1e);
         assert_eq!(release.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
+    }
+
+    #[test]
+    fn right_alt_mapping_is_captured_for_key_up_across_setting_changes() {
+        for normalized in [false, true] {
+            let mut backend = WindowsBackend::new(String::new());
+            backend.set_key_rightalt_to_key_win(true);
+            let down = key(0xa5, normalized, KeyState::Down);
+            let plan = backend
+                .keyboard_plan(match &down {
+                    Event::Key { key, .. } => key,
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            backend.held_key_plans.insert(0xa5, plan);
+
+            backend.set_key_rightalt_to_key_win(false);
+            let release = backend
+                .event_keyboard_plan(&key(0xa5, !normalized, KeyState::Up))
+                .unwrap();
+            assert_eq!(release, plan);
+        }
+    }
+
+    #[test]
+    fn right_alt_mapping_uses_left_windows_key_and_preserves_raw_packet_mode() {
+        let mut backend = WindowsBackend::new(String::new());
+        let raw_right_alt = key(0xa5, false, KeyState::Down);
+        let unmapped = backend
+            .keyboard_plan(match &raw_right_alt {
+                Event::Key { key, .. } => key,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(
+            unmapped,
+            raw_keyboard_plan(0xa5, true, map_virtual_key).unwrap()
+        );
+
+        backend.set_key_rightalt_to_key_win(true);
+        let remapped = backend
+            .keyboard_plan(match &raw_right_alt {
+                Event::Key { key, .. } => key,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(
+            remapped,
+            KeyboardPlan::Virtual {
+                code: 0x5b,
+                extended: true,
+            }
+        );
+
+        backend.set_always_send_scancodes(false);
+        let raw_plan = backend
+            .keyboard_plan(match &raw_right_alt {
+                Event::Key { key, .. } => key,
+                _ => unreachable!(),
+            })
+            .unwrap();
+        assert_eq!(raw_plan, remapped);
     }
 
     #[test]

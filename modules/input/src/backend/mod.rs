@@ -11,6 +11,9 @@ pub trait Backend {
     /// Windows uses this for non-normalized Moonlight virtual keys. Other
     /// native backends deliberately retain their platform mapping behavior.
     fn set_always_send_scancodes(&mut self, _enabled: bool) {}
+    /// Maps the host's right-Alt virtual key to the left Windows key. Backends
+    /// preserve the selected mapping for matching key-up events.
+    fn set_key_rightalt_to_key_win(&mut self, _enabled: bool) {}
     fn stop(&mut self);
 }
 #[cfg(windows)]
