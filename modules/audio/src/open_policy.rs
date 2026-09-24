@@ -2,14 +2,12 @@ use crate::model::Operation;
 
 pub(super) fn normalize(mut operation: Operation) -> Operation {
     if let Operation::Open {
-        virtual_sink,
+        virtual_sink: Some(_),
         capture_sink_without_routing,
         ..
     } = &mut operation
     {
-        if virtual_sink.is_some() {
-            *capture_sink_without_routing = false;
-        }
+        *capture_sink_without_routing = false;
     }
 
     operation
