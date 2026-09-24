@@ -104,6 +104,16 @@ namespace Amaterasu {
       const edit = button("Edit", () => showEditor(row));
       edit.disabled = !api.allows("catalog.write") || providerLaunch;
       if (providerLaunch) edit.title = "Playnite launch targets are managed by the provider.";
+      const actions = [edit];
+      if (providerLaunch) {
+        const configure = button(
+          "Streaming settings",
+          () => showProviderOverrideEditor(row),
+          "secondary",
+        );
+        configure.disabled = !api.allows("catalog.write");
+        actions.unshift(configure);
+      }
       const remove = button(
         "Delete",
         async () => {
@@ -127,6 +137,7 @@ namespace Amaterasu {
         "quiet danger-text",
       );
       remove.disabled = !api.allows("catalog.write");
+      actions.push(remove);
       return el(
         "article",
         "app-card",
@@ -153,9 +164,92 @@ namespace Amaterasu {
           ),
           el("div", "tags", ...(row.entry.tags ?? []).map((tag) => badge(tag))),
           el("p", "path", launchPath(row.entry)),
-          el("div", "card-footer", edit, remove),
+          el("div", "card-footer", ...actions),
         ),
       );
+    }
+
+    function showProviderOverrideEditor(row: CatalogRow): void {
+      let editRevision = revision;
+      const currentFec = row.entry.config_overrides?.fec_percentage;
+      const fec = input(
+        "fec_percentage",
+        currentFec === undefined ? "" : String(currentFec),
+        "number",
+      );
+      fec.min = "1";
+      fec.max = "255";
+      fec.step = "1";
+      fec.placeholder = "Inherit";
+      fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+      const form = el(
+        "form",
+        "editor-form",
+        field(
+          "FEC percentage",
+          fec,
+          "Leave blank to inherit the global setting. Supported values are 1–255.",
+        ),
+      );
+      const feedback = el("div");
+      const save = el("button", "button primary", "Save streaming settings");
+      save.type = "submit";
+      const cancel = button("Cancel", () => editor.replaceChildren());
+      form.append(feedback, el("div", "actions", save, cancel));
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        void runAction(save, feedback, async () => {
+          const config_overrides = providerConfigOverrides(fec.value);
+          try {
+            const reply = await api.post<{
+              id: string;
+              revision: number;
+              config_overrides: { fec_percentage?: number };
+              changed: boolean;
+              replayed: boolean;
+            }>("catalog/update_provider_overrides", {
+              id: row.id,
+              expected_revision: editRevision,
+              config_overrides,
+            });
+            editRevision = reply.revision;
+            editor.replaceChildren();
+            notify(
+              reply.replayed
+                ? `The earlier streaming override save for ${row.entry.name} is confirmed.`
+                : reply.changed
+                  ? `Streaming override saved for ${row.entry.name}.`
+                  : `Streaming override for ${row.entry.name} is unchanged.`,
+            );
+            await load();
+          } catch (error) {
+            if (error instanceof ApiError && error.code === "revision_conflict") {
+              editor.replaceChildren();
+              await load();
+              notify(
+                `Streaming settings for ${row.entry.name} changed elsewhere. The latest value was reloaded; reopen the editor to review it.`,
+              );
+              return;
+            }
+            throw error;
+          }
+        });
+      });
+      editor.replaceChildren(
+        panel(
+          "Playnite streaming settings",
+          el("p", "muted", `${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`),
+          el(
+            "p",
+            "muted",
+            "The Playnite game identity and provider-managed launch metadata stay unchanged.",
+          ),
+          form,
+        ),
+      );
+      editor.scrollIntoView({ behavior: "smooth", block: "start" });
+      fec.focus();
     }
 
     function showEditor(row?: CatalogRow): void {

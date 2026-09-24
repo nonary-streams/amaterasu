@@ -201,6 +201,7 @@ fn catalog_action(action: &str) -> Option<&'static str> {
         "list" => Some("list"),
         "search" => Some("search"),
         "update" => Some("update"),
+        "update_provider_overrides" => Some("update_provider_overrides"),
         "delete" => Some("delete"),
         _ => None,
     }
@@ -336,6 +337,20 @@ mod tests {
             .is_err()
         );
         assert!(resolve("/v1/launch/resolve_launch").is_none());
+    }
+
+    #[test]
+    fn provider_override_route_is_catalog_write_only_and_pins_its_action() {
+        let route = resolve("/v1/catalog/update_provider_overrides").unwrap();
+        assert_eq!(route.service, "amaterasu.catalog/1");
+        assert_eq!(route.action, "update_provider_overrides");
+        assert_eq!(route.scope, Some("catalog.write"));
+        assert!(payload(
+            route,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":null}}"#,
+        )
+        .is_ok());
+        assert!(resolve("/v1/catalog/provider_overrides").is_none());
     }
 
     #[test]

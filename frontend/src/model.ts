@@ -23,6 +23,12 @@ namespace Amaterasu {
     return percentage;
   }
 
+  export function providerConfigOverrides(value: string): {
+    fec_percentage: number | null;
+  } {
+    return { fec_percentage: parseFecOverride(value) };
+  }
+
   export function parseDetachedCommands(value: string): string[] {
     const commands = value
       .split(/\r?\n/)

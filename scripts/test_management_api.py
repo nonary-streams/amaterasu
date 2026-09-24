@@ -81,6 +81,115 @@ class Api:
             return response
 
 
+def test_provider_override_route(api, administrator, fallback_id):
+    cursor = None
+    provider_row = None
+    revision = None
+    for _ in range(320):
+        request = {"limit": 32}
+        if cursor is not None:
+            request["cursor"] = cursor
+        status, page, _ = api.post("/v1/catalog/list", request, administrator)
+        assert status == 200 and page["ok"], page
+        revision = page["revision"]
+        provider_row = next(
+            (
+                row
+                for row in page["entries"]
+                if row.get("entry", {}).get("launch", {}).get("kind") == "playnite"
+            ),
+            None,
+        )
+        if provider_row is not None or page.get("next_cursor") is None:
+            break
+        cursor = page["next_cursor"]
+    else:
+        raise AssertionError("catalog paging exceeded its bound while looking for Playnite entries")
+
+    if provider_row is None:
+        status, result, _ = api.post(
+            "/v1/catalog/update_provider_overrides",
+            {
+                "id": fallback_id,
+                "expected_revision": revision,
+                "config_overrides": {"fec_percentage": 53},
+            },
+            administrator,
+        )
+        assert status == 200 and result.get("error", {}).get("code") in {
+            "provider_snapshot_incomplete",
+            "provider_entry_not_found",
+        }, result
+        print(
+            "Skipped successful provider-owned override CAS/replay exercise: no finished Playnite snapshot was imported; the manual-row request was rejected."
+        )
+        return None, None, revision
+
+    provider_id = provider_row["id"]
+    original_override = provider_row["entry"].get("config_overrides", {}).get("fec_percentage")
+    desired = 53 if original_override != 53 else 54
+    status, saved, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": provider_id,
+            "expected_revision": revision,
+            "config_overrides": {"fec_percentage": desired},
+        },
+        administrator,
+    )
+    assert status == 200 and saved.get("ok") and saved.get("changed"), saved
+    assert saved["config_overrides"] == {"fec_percentage": desired}, saved
+
+    status, conflict, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": provider_id,
+            "expected_revision": revision,
+            "config_overrides": {"fec_percentage": desired + 1},
+        },
+        administrator,
+    )
+    assert status == 200 and conflict.get("error", {}).get("code") == "revision_conflict", conflict
+    assert conflict["error"]["current_revision"] == saved["revision"], conflict
+
+    status, replayed, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": provider_id,
+            "expected_revision": revision,
+            "config_overrides": {"fec_percentage": desired},
+        },
+        administrator,
+    )
+    assert status == 200 and replayed.get("ok") and replayed.get("replayed"), replayed
+    assert replayed["revision"] == saved["revision"], replayed
+
+    status, cleared, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": provider_id,
+            "expected_revision": replayed["revision"],
+            "config_overrides": {"fec_percentage": None},
+        },
+        administrator,
+    )
+    assert status == 200 and cleared.get("ok") and cleared.get("changed"), cleared
+    assert cleared["config_overrides"] == {}, cleared
+    status, restored, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": provider_id,
+            "expected_revision": cleared["revision"],
+            "config_overrides": {"fec_percentage": desired},
+        },
+        administrator,
+    )
+    assert status == 200 and restored.get("ok") and restored.get("changed"), restored
+    status, readback, _ = api.post("/v1/catalog/get", {"id": provider_id}, administrator)
+    assert status == 200 and readback["entry"].get("config_overrides", {}).get("fec_percentage") == desired, readback
+    return provider_id, desired, restored["revision"]
+
+
 def test_auth_and_crud(console, api):
     setup = console.request("amaterasu.authentication/1", {
         "action": "setup", "username": "administrator", "password": PASSWORD,
@@ -294,6 +403,9 @@ def test_auth_and_crud(console, api):
     catalog_id = created["id"]
     catalog_revision = renamed["revision"]
     catalog_entry = saved_catalog_entry["entry"]
+    playnite_override_id, playnite_override_value, catalog_revision = test_provider_override_route(
+        api, administrator, catalog_id
+    )
     status, configured, _ = api.post("/v1/configuration/register", {"fields": {"fps": {"type": "integer", "default": 60}}}, administrator)
     assert status == 200 and configured["ok"], configured
     status, migrated, _ = api.post("/v1/configuration/migrate", {
@@ -639,6 +751,16 @@ def test_auth_and_crud(console, api):
     assert status == 403 and not result["ok"], result
     status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog_revision}, token["bearer"])
     assert status == 403 and not result["ok"], result
+    status, result, _ = api.post(
+        "/v1/catalog/update_provider_overrides",
+        {
+            "id": catalog_id,
+            "expected_revision": catalog_revision,
+            "config_overrides": {"fec_percentage": 53},
+        },
+        token["bearer"],
+    )
+    assert status == 403 and not result["ok"], result
     assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/steam/settings", token=token["bearer"])[0] == 403
     assert api.post("/v1/input/settings_get", token=token["bearer"])[0] == 403
@@ -669,6 +791,8 @@ def test_auth_and_crud(console, api):
         catalog_id,
         catalog_revision,
         catalog_entry,
+        playnite_override_id,
+        playnite_override_value,
     )
 
 
@@ -713,7 +837,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision, catalog_id, catalog_revision, catalog_entry = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values, auth_values, auth_revision, input_values, input_revision, fec_client_id, lutris_values, lutris_revision, playnite_values, playnite_revision, catalog_id, catalog_revision, catalog_entry, playnite_override_id, playnite_override_value = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -764,6 +888,12 @@ def main():
             )
             assert status == 200 and persisted_catalog_entry["entry"] == catalog_entry, persisted_catalog_entry
             assert persisted_catalog_entry["revision"] == catalog_revision, persisted_catalog_entry
+            if playnite_override_id is not None:
+                status, persisted_provider_entry, _ = api.post(
+                    "/v1/catalog/get", {"id": playnite_override_id}, relogged["bearer"]
+                )
+                assert status == 200, persisted_provider_entry
+                assert persisted_provider_entry["entry"].get("config_overrides", {}).get("fec_percentage") == playnite_override_value, persisted_provider_entry
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -788,6 +918,7 @@ def main():
         finally:
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, token persistence/revocation,")
+    print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
     print("Moonlight hostname/port live rebind, certificate-bound FEC override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery and restart persistence,")

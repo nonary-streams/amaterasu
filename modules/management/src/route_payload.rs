@@ -410,6 +410,16 @@ fn catalog(action: &str, object: &Object) -> Result<(), &'static str> {
             unsigned_u64(object, "expected_revision")?;
             catalog_entry(object.get("entry").ok_or(INVALID)?)
         }
+        "update_provider_overrides" => {
+            fields(
+                object,
+                &["id", "expected_revision", "config_overrides"],
+                &[],
+            )?;
+            catalog_id(text(object, "id")?)?;
+            unsigned_u64(object, "expected_revision")?;
+            catalog_config_overrides(object.get("config_overrides").ok_or(INVALID)?)
+        }
         "delete" => {
             fields(object, &["id", "expected_revision"], &[])?;
             catalog_id(text(object, "id")?)?;
@@ -487,18 +497,23 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
         }
     }
     if let Some(overrides) = entry.get("config_overrides") {
-        let overrides = overrides.as_object().ok_or(INVALID)?;
-        fields(overrides, &[], &["fec_percentage"])?;
-        if let Some(fec) = overrides.get("fec_percentage")
-            && !fec.is_null()
-            && !fec
-                .as_u64()
-                .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
-        {
-            return Err(INVALID);
-        }
+        catalog_config_overrides(overrides)?;
     }
     catalog_launch(entry.get("launch").ok_or(INVALID)?)
+}
+
+fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
+    let overrides = value.as_object().ok_or(INVALID)?;
+    fields(overrides, &[], &["fec_percentage"])?;
+    if let Some(fec) = overrides.get("fec_percentage")
+        && !fec.is_null()
+        && !fec
+            .as_u64()
+            .is_some_and(|value| (1..=u8::MAX as u64).contains(&value))
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn catalog_launch(value: &Value) -> Result<(), &'static str> {
@@ -1189,6 +1204,40 @@ mod catalog_tests {
             "expected_revision": 0
         });
         assert!(validate(route("create"), legacy.as_object().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn provider_override_route_accepts_only_sparse_fec_patch_and_revision() {
+        let route = route("update_provider_overrides");
+        for body in [
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":1}}"#.as_slice(),
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":255}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":null}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{}}"#,
+        ] {
+            let value: Value = serde_json::from_slice(body).unwrap();
+            assert!(
+                validate(route, value.as_object().unwrap()).is_ok(),
+                "rejected valid patch: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        for body in [
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":0}}"#.as_slice(),
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":256}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":"37"}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"config_overrides":{"fec_percentage":37,"unknown":true}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":-1,"config_overrides":{"fec_percentage":37}}"#,
+            br#"{"id":"app-0000000000000001","expected_revision":4,"client_id":"forged","config_overrides":{"fec_percentage":37}}"#,
+            br#"{"id":"app-0000000000000000","expected_revision":4,"config_overrides":{"fec_percentage":37}}"#,
+        ] {
+            let value: Value = serde_json::from_slice(body).unwrap();
+            assert!(
+                validate(route, value.as_object().unwrap()).is_err(),
+                "accepted invalid patch: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

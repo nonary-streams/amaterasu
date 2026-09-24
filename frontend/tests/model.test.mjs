@@ -76,6 +76,12 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
 
 test("blank FEC and timeout retain sparse inheritance and explicit bounds", () => {
   assert.equal(model.parseFecOverride("  "), null);
+  assert.deepEqual(ordinary(model.providerConfigOverrides("")), {
+    fec_percentage: null,
+  });
+  assert.deepEqual(ordinary(model.providerConfigOverrides("37")), {
+    fec_percentage: 37,
+  });
   assert.equal(model.parseExitTimeout(""), null);
   assert.equal(model.parseExitTimeout("0"), 0);
   assert.equal(model.parseExitTimeout("300"), 300);
