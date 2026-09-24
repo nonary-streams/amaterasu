@@ -222,6 +222,14 @@ pub struct ClientConfigOverrides {
     pub audio_sink_capture_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamepad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
 }
 
 impl ClientConfigOverrides {
@@ -246,6 +254,13 @@ impl ClientConfigOverrides {
         {
             return Err("invalid_config_overrides");
         }
+        if self
+            .gamepad
+            .as_deref()
+            .is_some_and(|profile| profile.len() > 32 || !valid_gamepad_profile(profile))
+        {
+            return Err("invalid_config_overrides");
+        }
         Ok(())
     }
 
@@ -256,6 +271,36 @@ impl ClientConfigOverrides {
             && self.virtual_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
+            && self.controller.is_none()
+            && self.gamepad.is_none()
+            && self.keyboard.is_none()
+            && self.mouse.is_none()
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 impl Document {
@@ -448,5 +493,47 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn client_input_overrides_keep_explicit_false_and_reject_wrong_platform_profiles() {
+        let overrides: ClientConfigOverrides = serde_json::from_value(json!({
+            "controller":false,
+            "gamepad":"auto",
+            "keyboard":true,
+            "mouse":false
+        }))
+        .unwrap();
+        overrides.validate().unwrap();
+        assert_eq!(overrides.controller, Some(false));
+        assert_eq!(overrides.gamepad.as_deref(), Some("auto"));
+        assert_eq!(overrides.keyboard, Some(true));
+        assert_eq!(overrides.mouse, Some(false));
+        assert_eq!(
+            serde_json::to_value(overrides).unwrap(),
+            json!({
+                "controller":false,
+                "gamepad":"auto",
+                "keyboard":true,
+                "mouse":false
+            })
+        );
+
+        #[cfg(windows)]
+        let invalid_profile = "xone";
+        #[cfg(target_os = "linux")]
+        let invalid_profile = "vhf";
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let invalid_profile = "ds4";
+        for value in [
+            json!({"controller":"false"}),
+            json!({"gamepad":invalid_profile}),
+            json!({"keyboard":0}),
+            json!({"mouse":[]} ),
+        ] {
+            if let Ok(invalid) = serde_json::from_value::<ClientConfigOverrides>(value) {
+                assert!(invalid.validate().is_err());
+            }
+        }
     }
 }

@@ -109,21 +109,26 @@ namespace Amaterasu {
   export function inputGamepadProfileChoices(
     selectedProfile: string,
     supportedProfiles: readonly string[],
+    recognizedProfiles: readonly string[] = supportedProfiles,
   ): GamepadProfileChoice[] {
     if (
       typeof selectedProfile !== "string" ||
       !Array.isArray(supportedProfiles) ||
-      !supportedProfiles.every((profile) => typeof profile === "string")
+      !supportedProfiles.every((profile) => typeof profile === "string") ||
+      !Array.isArray(recognizedProfiles) ||
+      !recognizedProfiles.every((profile) => typeof profile === "string")
     )
       throw new Error("Gamepad profile status is invalid.");
     const availableProfiles = [...new Set(supportedProfiles)];
     if (availableProfiles.length === 0) availableProfiles.push("auto");
-    const choices = availableProfiles.map((value) => ({
+    const choices = [...new Set([...recognizedProfiles, ...availableProfiles])].map((value) => ({
       value,
-      label: value,
-      available: true,
+      label: availableProfiles.includes(value)
+        ? value
+        : `${value} (recognized, unavailable on this backend)`,
+      available: availableProfiles.includes(value),
     }));
-    if (selectedProfile !== "" && !availableProfiles.includes(selectedProfile)) {
+    if (selectedProfile !== "" && !choices.some((choice) => choice.value === selectedProfile)) {
       choices.push({
         value: selectedProfile,
         label: `${selectedProfile} (recognized, unavailable on this backend)`,
@@ -181,6 +186,20 @@ namespace Amaterasu {
     if (percentage > 255)
       throw new Error("FEC percentage must be a whole number from 1 to 255, or blank to inherit.");
     return { fec_percentage: percentage };
+  }
+
+  function sparseInputOverrideSelect(name: string, current: boolean | undefined): HTMLSelectElement {
+    const select = el("select");
+    select.name = name;
+    select.setAttribute("aria-label", `${name} override`);
+    const choices: Array<[string, string]> = [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]];
+    for (const [value, label] of choices) {
+      const option = el("option", "", label);
+      option.value = value;
+      select.append(option);
+    }
+    select.value = current === undefined ? "" : String(current);
+    return select;
   }
 
   export function inputPolicyStatusDescription(
@@ -1337,6 +1356,12 @@ namespace Amaterasu {
       pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
       try {
         const settings = await context.api.post<PairingClients>("pairing/list_clients");
+        let inputStatus: InputRuntimeStatus | null = null;
+        try {
+          inputStatus = await context.api.post<InputRuntimeStatus>("input/status");
+        } catch {
+          // Paired audio/FEC values stay editable if the input backend is offline.
+        }
         if (!context.content.isConnected) return;
         if (settings.clients.length === 0) {
           pairingArea.replaceChildren(
@@ -1369,6 +1394,28 @@ namespace Amaterasu {
           backButtonTimeout.step = "1";
           backButtonTimeout.placeholder = "Inherit";
           backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${client.name}`);
+          const controller = sparseInputOverrideSelect("controller", client.config_overrides?.controller);
+          controller.setAttribute("aria-label", `Controller input override for ${client.name}`);
+          const gamepadChoices = inputGamepadProfileChoices(
+            client.config_overrides?.gamepad ?? "",
+            inputStatus?.supported_profiles ?? ["auto"],
+            inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
+          );
+          const gamepad = el("select");
+          gamepad.setAttribute("aria-label", `Gamepad profile override for ${client.name}`);
+          const inheritGamepad = el("option", "", "Inherit");
+          inheritGamepad.value = "";
+          gamepad.append(inheritGamepad);
+          for (const choice of gamepadChoices) {
+            const option = el("option", "", choice.label);
+            option.value = choice.value;
+            gamepad.append(option);
+          }
+          gamepad.value = client.config_overrides?.gamepad ?? "";
+          const keyboard = sparseInputOverrideSelect("keyboard", client.config_overrides?.keyboard);
+          keyboard.setAttribute("aria-label", `Keyboard input override for ${client.name}`);
+          const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse);
+          mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
           const streamAudio = el("select");
           streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
           const audioChoices: Array<[string, string]> = [
@@ -1453,6 +1500,13 @@ namespace Amaterasu {
                     audio_sink: parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                     virtual_sink: parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
                     audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+                    controller: parseInputBooleanOverride(controller.value, "Controller input"),
+                    gamepad: parseGamepadProfileOverride(
+                      gamepad.value,
+                      inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])],
+                    ),
+                    keyboard: parseInputBooleanOverride(keyboard.value, "Keyboard input"),
+                    mouse: parseInputBooleanOverride(mouse.value, "Mouse input"),
                   },
                 });
                 context.notify(`Streaming override saved for ${client.name}.`);
@@ -1475,13 +1529,13 @@ namespace Amaterasu {
             el("strong", "", client.name),
             el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`),
           );
-          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, el("div", "", save, status)];
+          return [identity, fec, backButtonTimeout, streamAudio, el("div", "", audioSinkMode, audioSinkId), el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, el("div", "", save, status)];
         });
-        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", ""], rows);
+        const tableView = table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", ""], rows);
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
-            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Each save uses the current pairing revision."),
+            el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save uses the current pairing revision."),
             tableView,
             el("div", "actions", badge(`Revision ${settings.revision}`)),
           ),
@@ -1647,6 +1701,7 @@ namespace Amaterasu {
         const gamepadProfileChoices = inputGamepadProfileChoices(
           settings.values.gamepad,
           runtimeStatus.supported_profiles,
+          runtimeStatus.recognized_profiles,
         );
         for (const choice of gamepadProfileChoices) {
           const option = el("option", "", choice.label);

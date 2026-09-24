@@ -55,6 +55,10 @@ pub struct PeerIdentity {
     client_virtual_sink: Option<String>,
     client_audio_sink_capture_only: Option<bool>,
     client_back_button_timeout: Option<i32>,
+    client_controller: Option<bool>,
+    client_gamepad: Option<String>,
+    client_keyboard: Option<bool>,
+    client_mouse: Option<bool>,
 }
 
 impl PeerIdentity {
@@ -76,6 +80,10 @@ impl PeerIdentity {
             client_virtual_sink: None,
             client_audio_sink_capture_only: None,
             client_back_button_timeout: None,
+            client_controller: None,
+            client_gamepad: None,
+            client_keyboard: None,
+            client_mouse: None,
         })
     }
 
@@ -92,6 +100,10 @@ impl PeerIdentity {
             virtual_sink,
             audio_sink_capture_only,
             back_button_timeout,
+            controller,
+            gamepad,
+            keyboard,
+            mouse,
         } = config_overrides;
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
@@ -103,6 +115,9 @@ impl PeerIdentity {
             || virtual_sink
                 .as_deref()
                 .is_some_and(|value| !valid_audio_sink_override(value))
+            || gamepad
+                .as_deref()
+                .is_some_and(|profile| !valid_gamepad_profile(profile))
         {
             return Err("invalid_paired_identity");
         }
@@ -114,6 +129,10 @@ impl PeerIdentity {
         self.client_virtual_sink = virtual_sink;
         self.client_audio_sink_capture_only = audio_sink_capture_only;
         self.client_back_button_timeout = back_button_timeout;
+        self.client_controller = controller;
+        self.client_gamepad = gamepad;
+        self.client_keyboard = keyboard;
+        self.client_mouse = mouse;
         Ok(self)
     }
 
@@ -124,6 +143,32 @@ impl PeerIdentity {
     #[cfg(test)]
     pub(crate) fn paired_client_id(&self) -> Option<&str> {
         self.client_id.as_deref()
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 

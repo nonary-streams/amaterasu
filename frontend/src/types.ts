@@ -57,6 +57,10 @@ namespace Amaterasu {
       virtual_sink?: string;
       audio_sink_capture_only?: boolean;
       back_button_timeout?: number;
+      controller?: boolean;
+      gamepad?: string;
+      keyboard?: boolean;
+      mouse?: boolean;
     };
   }
   export interface CatalogRow {
@@ -225,6 +229,10 @@ namespace Amaterasu {
       virtual_sink?: string;
       audio_sink_capture_only?: boolean;
       back_button_timeout?: number;
+      controller?: boolean;
+      gamepad?: string;
+      keyboard?: boolean;
+      mouse?: boolean;
     };
   }
   export interface PairingClients {
@@ -255,6 +263,7 @@ namespace Amaterasu {
     ok: boolean;
     gamepad: string;
     supported_profiles: string[];
+    recognized_profiles: string[];
     effective_gamepad_profile: string | null;
     gamepad_unavailable_reason: string | null;
     controller_input: boolean;

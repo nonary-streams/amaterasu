@@ -145,12 +145,18 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
     "ds4",
   );
   assert.throws(() => parsePolicy(true, true, true, true, false, 500, 24.9, -1, "switch", ["auto", "x360", "ds4"]));
+  assert.deepEqual(ordinary(choices("", ["auto", "x360"], ["auto", "x360", "vhf_ds4"])), [
+    { value: "auto", label: "auto", available: true },
+    { value: "x360", label: "x360", available: true },
+    { value: "vhf_ds4", label: "vhf_ds4 (recognized, unavailable on this backend)", available: false },
+  ]);
 
   const describe = context.Amaterasu.inputGamepadStatusDescription;
   assert.match(
     describe("ds4", {
       gamepad: "ds4",
       supported_profiles: ["auto", "x360"],
+      recognized_profiles: ["auto", "x360", "ds4"],
       effective_gamepad_profile: null,
       gamepad_unavailable_reason: "ViGEm profile is not implemented",
       controller_input: false,
@@ -164,6 +170,7 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
     describe("auto", {
       gamepad: "auto",
       supported_profiles: ["auto", "x360"],
+      recognized_profiles: ["auto", "x360", "ds4"],
       effective_gamepad_profile: null,
       gamepad_unavailable_reason: null,
       controller_input: false,
@@ -177,6 +184,7 @@ test("gamepad editor uses backend profiles and labels a selected unavailable pro
     describe("auto", {
       gamepad: "auto",
       supported_profiles: ["auto", "x360"],
+      recognized_profiles: ["auto", "x360", "ds4"],
       effective_gamepad_profile: null,
       gamepad_unavailable_reason: null,
       controller_input: false,

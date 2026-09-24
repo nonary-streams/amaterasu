@@ -19,6 +19,16 @@ const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
 
+struct AcquireRequest {
+    operation_id: Option<String>,
+    ttl_ms: Option<u64>,
+    back_button_timeout: Option<i32>,
+    controller: Option<bool>,
+    gamepad: Option<GamepadProfile>,
+    keyboard: Option<bool>,
+    mouse: Option<bool>,
+}
+
 struct Lease {
     owner: String,
     token: String,
@@ -27,6 +37,10 @@ struct Lease {
     operation_id: Option<String>,
     requested_ttl_ms: Option<u64>,
     requested_back_button_timeout: Option<i32>,
+    requested_controller: Option<bool>,
+    requested_gamepad: Option<GamepadProfile>,
+    requested_keyboard: Option<bool>,
+    requested_mouse: Option<bool>,
     back_button_timeout_ms: i32,
     termination_reason: Option<&'static str>,
     key_encoding: Option<KeyEncoding>,
@@ -40,6 +54,10 @@ struct TerminalAcquire {
     operation_id: String,
     requested_ttl_ms: Option<u64>,
     requested_back_button_timeout: Option<i32>,
+    requested_controller: Option<bool>,
+    requested_gamepad: Option<GamepadProfile>,
+    requested_keyboard: Option<bool>,
+    requested_mouse: Option<bool>,
     reason: &'static str,
     retained_until: Instant,
 }
@@ -111,11 +129,21 @@ impl<B: Backend> Controller<B> {
                 operation_id,
                 ttl_ms,
                 back_button_timeout,
+                controller,
+                gamepad,
+                keyboard,
+                mouse,
             } => self.acquire(
                 caller,
-                operation_id,
-                ttl_ms,
-                back_button_timeout,
+                AcquireRequest {
+                    operation_id,
+                    ttl_ms,
+                    back_button_timeout,
+                    controller,
+                    gamepad,
+                    keyboard,
+                    mouse,
+                },
                 now,
                 guard,
             ),
@@ -167,6 +195,32 @@ impl<B: Backend> Controller<B> {
 
     pub fn device_policy(&self) -> DevicePolicy {
         self.device_policy
+    }
+
+    fn effective_device_policy(&self) -> DevicePolicy {
+        let lease = self.lease.as_ref();
+        DevicePolicy {
+            keyboard: lease
+                .and_then(|lease| lease.requested_keyboard)
+                .unwrap_or(self.device_policy.keyboard),
+            mouse: lease
+                .and_then(|lease| lease.requested_mouse)
+                .unwrap_or(self.device_policy.mouse),
+        }
+    }
+
+    fn effective_controller_enabled(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_controller)
+            .unwrap_or(self.controller_enabled)
+    }
+
+    fn effective_gamepad_profile(&self) -> GamepadProfile {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_gamepad)
+            .unwrap_or(self.gamepad_profile)
     }
 
     pub fn high_resolution_scrolling(&self) -> bool {
@@ -227,7 +281,8 @@ impl<B: Backend> Controller<B> {
 
     pub fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
         self.gamepad_profile = profile;
-        self.backend.set_gamepad_profile(profile);
+        self.backend
+            .set_gamepad_profile(self.effective_gamepad_profile());
     }
 
     pub fn controller_enabled(&self) -> bool {
@@ -238,7 +293,8 @@ impl<B: Backend> Controller<B> {
     /// A failed removal is retried without disabling keyboard or pointer input.
     pub fn set_controller_enabled(&mut self, enabled: bool, now: Instant) -> InputResult<()> {
         self.controller_enabled = enabled;
-        if enabled && !self.controller_cleanup_pending {
+        let effective_enabled = self.effective_controller_enabled();
+        if effective_enabled && !self.controller_cleanup_pending {
             return Ok(());
         }
         self.controller_cleanup_pending = true;
@@ -272,18 +328,19 @@ impl<B: Backend> Controller<B> {
     /// releasing an already-held input needs a retry.
     pub fn set_device_policy(&mut self, policy: DevicePolicy, now: Instant) -> InputResult<()> {
         self.device_policy = policy;
-        if !policy.keyboard {
+        let effective_policy = self.effective_device_policy();
+        if !effective_policy.keyboard {
             self.repeating_key = None;
         }
-        if !policy.mouse {
+        if !effective_policy.mouse {
             self.reset_scroll_remainders();
         }
         let mut failure = None;
         for index in (0..self.pressed.len()).rev() {
             let pressed = &self.pressed[index];
             let should_release = match pressed {
-                Pressed::Key(_) => !policy.keyboard,
-                Pressed::Button(_) => !policy.mouse,
+                Pressed::Key(_) => !effective_policy.keyboard,
+                Pressed::Button(_) => !effective_policy.mouse,
             };
             if !should_release {
                 continue;
@@ -332,12 +389,19 @@ impl<B: Backend> Controller<B> {
     fn acquire(
         &mut self,
         caller: &str,
-        operation_id: Option<String>,
-        ttl_ms: Option<u64>,
-        requested_back_button_timeout: Option<i32>,
+        request: AcquireRequest,
         now: Instant,
         guard: &mut impl FnMut() -> InputResult<()>,
     ) -> InputResult<Value> {
+        let AcquireRequest {
+            operation_id,
+            ttl_ms,
+            back_button_timeout: requested_back_button_timeout,
+            controller: requested_controller,
+            gamepad: requested_gamepad,
+            keyboard: requested_keyboard,
+            mouse: requested_mouse,
+        } = request;
         if let Some(operation_id) = operation_id.as_deref() {
             validate_operation_id(operation_id)?;
             if let Some(lease) = self.lease.as_ref().filter(|lease| {
@@ -345,6 +409,10 @@ impl<B: Backend> Controller<B> {
             }) {
                 if lease.requested_ttl_ms != ttl_ms
                     || lease.requested_back_button_timeout != requested_back_button_timeout
+                    || lease.requested_controller != requested_controller
+                    || lease.requested_gamepad != requested_gamepad
+                    || lease.requested_keyboard != requested_keyboard
+                    || lease.requested_mouse != requested_mouse
                 {
                     return Err(operation_conflict());
                 }
@@ -363,6 +431,10 @@ impl<B: Backend> Controller<B> {
             {
                 if terminal.requested_ttl_ms != ttl_ms
                     || terminal.requested_back_button_timeout != requested_back_button_timeout
+                    || terminal.requested_controller != requested_controller
+                    || terminal.requested_gamepad != requested_gamepad
+                    || terminal.requested_keyboard != requested_keyboard
+                    || terminal.requested_mouse != requested_mouse
                 {
                     return Err(operation_conflict());
                 }
@@ -407,11 +479,13 @@ impl<B: Backend> Controller<B> {
         guard()?;
         let back_button_timeout_ms =
             requested_back_button_timeout.unwrap_or(self.back_button_timeout_ms);
+        let gamepad_profile = requested_gamepad.unwrap_or(self.gamepad_profile);
         self.backend.set_back_button_timeout(back_button_timeout_ms);
-        self.backend.set_gamepad_profile(self.gamepad_profile);
+        self.backend.set_gamepad_profile(gamepad_profile);
         if let Err(error) = self.backend.start() {
             self.backend
                 .set_back_button_timeout(self.back_button_timeout_ms);
+            self.backend.set_gamepad_profile(self.gamepad_profile);
             return Err(error);
         }
         self.reset_scroll_remainders();
@@ -423,10 +497,14 @@ impl<B: Backend> Controller<B> {
             operation_id,
             requested_ttl_ms: ttl_ms,
             requested_back_button_timeout,
+            requested_controller,
+            requested_gamepad,
+            requested_keyboard,
+            requested_mouse,
             back_button_timeout_ms,
             termination_reason: None,
             key_encoding: None,
-            gamepad_profile: self.gamepad_profile,
+            gamepad_profile,
             effective_gamepad_profile: self.backend.effective_gamepad_profile(),
             gamepad_unavailable_reason: self
                 .backend
@@ -517,7 +595,7 @@ impl<B: Backend> Controller<B> {
         {
             return self.failure(error);
         }
-        let policy = self.device_policy;
+        let policy = self.effective_device_policy();
         let mut suppressed = 0;
         for (accepted, event) in events.iter().enumerate() {
             let result = guard().and_then(|()| {
@@ -572,7 +650,7 @@ impl<B: Backend> Controller<B> {
         let mut key_encoding = self.lease.as_ref().and_then(|lease| lease.key_encoding);
         for event in events {
             event.validate()?;
-            if !self.event_enabled(event, self.device_policy) {
+            if !self.event_enabled(event, self.effective_device_policy()) {
                 continue;
             }
             self.backend.validate(event)?;
@@ -703,7 +781,7 @@ impl<B: Backend> Controller<B> {
     fn event_enabled(&self, event: &Event, policy: DevicePolicy) -> bool {
         event.enabled_by(policy)
             && (!matches!(event, Event::Controller { .. })
-                || (self.controller_enabled && !self.controller_cleanup_pending))
+                || (self.effective_controller_enabled() && !self.controller_cleanup_pending))
     }
 
     fn update_repeat_after_event(&mut self, event: &Event, now: Instant) -> InputResult<()> {
@@ -846,6 +924,7 @@ impl<B: Backend> Controller<B> {
         self.controller_cleanup_pending = false;
         self.backend
             .set_back_button_timeout(self.back_button_timeout_ms);
+        self.backend.set_gamepad_profile(self.gamepad_profile);
         let Some(lease) = self.lease.take() else {
             self.reset_scroll_remainders();
             self.retry_at = now;
@@ -858,6 +937,10 @@ impl<B: Backend> Controller<B> {
                 operation_id,
                 requested_ttl_ms: lease.requested_ttl_ms,
                 requested_back_button_timeout: lease.requested_back_button_timeout,
+                requested_controller: lease.requested_controller,
+                requested_gamepad: lease.requested_gamepad,
+                requested_keyboard: lease.requested_keyboard,
+                requested_mouse: lease.requested_mouse,
                 reason: lease.termination_reason.unwrap_or(reason),
                 retained_until: now + OPERATION_RETENTION,
             });
@@ -883,12 +966,15 @@ impl<B: Backend> Controller<B> {
                 "expires_in_ms":lease.expires.saturating_duration_since(now).as_millis() as u64,
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
                 "back_button_timeout":lease.back_button_timeout_ms,
+                "controller_enabled":lease.requested_controller.unwrap_or(self.controller_enabled),
+                "keyboard":lease.requested_keyboard.unwrap_or(self.device_policy.keyboard),
+                "mouse":lease.requested_mouse.unwrap_or(self.device_policy.mouse),
                 "gamepad_profile":lease.gamepad_profile.as_str(),
                 "effective_gamepad_profile":lease.effective_gamepad_profile,
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

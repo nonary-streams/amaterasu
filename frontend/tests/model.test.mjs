@@ -171,6 +171,10 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: null,
+    controller: null,
+    gamepad: null,
+    keyboard: null,
+    mouse: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("37", "false")), {
     fec_percentage: 37,
@@ -179,6 +183,10 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: null,
+    controller: null,
+    gamepad: null,
+    keyboard: null,
+    mouse: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("", "", "inherit", "", "false")), {
     fec_percentage: null,
@@ -187,6 +195,10 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     virtual_sink: null,
     audio_sink_capture_only: false,
     back_button_timeout: null,
+    controller: null,
+    gamepad: null,
+    keyboard: null,
+    mouse: null,
   });
   assert.deepEqual(ordinary(model.providerConfigOverrides("", "", "inherit", "", "", "-1")), {
     fec_percentage: null,
@@ -195,6 +207,10 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
     virtual_sink: null,
     audio_sink_capture_only: null,
     back_button_timeout: -1,
+    controller: null,
+    gamepad: null,
+    keyboard: null,
+    mouse: null,
   });
   assert.equal(model.parseAudioSinkCaptureOnlyOverride(""), null);
   assert.equal(model.parseAudioSinkCaptureOnlyOverride("true"), true);
@@ -205,6 +221,28 @@ test("blank FEC and timeout retain sparse inheritance and explicit bounds", () =
   assert.equal(model.parseVirtualSinkOverride("specific", "Steam Virtual Speakers"), "Steam Virtual Speakers");
   assert.throws(() => model.parseVirtualSinkOverride("specific", "bad\nselector"));
   assert.throws(() => model.parseVirtualSinkOverride("specific", "x".repeat(4097)));
+  assert.equal(model.parseInputBooleanOverride("", "Controller"), null);
+  assert.equal(model.parseInputBooleanOverride("false", "Controller"), false);
+  assert.equal(model.parseInputBooleanOverride("true", "Keyboard"), true);
+  assert.throws(() => model.parseInputBooleanOverride("yes", "Mouse"));
+  assert.equal(model.parseGamepadProfileOverride("", ["auto", "vhf_ds4"]), null);
+  assert.equal(model.parseGamepadProfileOverride("vhf_ds4", ["auto", "vhf_ds4"]), "vhf_ds4");
+  assert.throws(() => model.parseGamepadProfileOverride("xone", ["auto", "vhf_ds4"]));
+  assert.deepEqual(ordinary(model.providerConfigOverrides(
+    "", "", "inherit", "", "", "", "inherit", "",
+    "false", "vhf_ds4", "true", "false", ["auto", "vhf_ds4"],
+  )), {
+    fec_percentage: null,
+    stream_audio: null,
+    audio_sink: null,
+    virtual_sink: null,
+    audio_sink_capture_only: null,
+    back_button_timeout: null,
+    controller: false,
+    gamepad: "vhf_ds4",
+    keyboard: true,
+    mouse: false,
+  });
   assert.equal(model.parseStreamAudioOverride(""), null);
   assert.equal(model.parseStreamAudioOverride("true"), true);
   assert.equal(model.parseStreamAudioOverride("false"), false);

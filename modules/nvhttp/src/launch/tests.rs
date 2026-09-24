@@ -138,6 +138,30 @@ fn peer_with_back_button_timeout(marker: u8, timeout: Option<i32>) -> PeerIdenti
         .unwrap()
 }
 
+fn peer_with_input_overrides(
+    marker: u8,
+    controller: Option<bool>,
+    gamepad: Option<&str>,
+    keyboard: Option<bool>,
+    mouse: Option<bool>,
+) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                controller,
+                gamepad: gamepad.map(str::to_owned),
+                keyboard,
+                mouse,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn request(key: u8) -> LaunchRequest {
     LaunchRequest {
         app_id: 1,
@@ -540,6 +564,78 @@ fn scoped_back_button_timeout_uses_client_then_application_and_preserves_disable
 }
 
 #[test]
+fn scoped_input_overrides_use_client_then_application_precedence_and_preserve_false() {
+    let now = Instant::now();
+    let client_gamepad = selected_supported_gamepad_profile();
+    let client_peer = peer_with_input_overrides(
+        42,
+        Some(false),
+        Some(client_gamepad),
+        Some(false),
+        Some(true),
+    );
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "controller":true,
+            "gamepad":"auto",
+            "keyboard":true,
+            "mouse":false
+        })),
+        ..Broker::default()
+    };
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(
+        controller
+            .launch(10, request(1), client_peer, now)
+            .is_none()
+    );
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let rtsp_open = opened_rtsp_payload(&broker);
+    assert_eq!(rtsp_open["controller"], false);
+    assert_eq!(rtsp_open["gamepad"], client_gamepad);
+    assert_eq!(rtsp_open["keyboard"], false);
+    assert_eq!(rtsp_open["mouse"], true);
+
+    let application_only = {
+        let now = Instant::now();
+        let peer = peer(43);
+        let mut broker = Broker {
+            application_input_overrides: Some(json!({
+                "controller":false,
+                "gamepad":"auto",
+                "keyboard":true,
+                "mouse":false
+            })),
+            ..Broker::default()
+        };
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(controller.launch(11, request(2), peer, now).is_none());
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        opened_rtsp_payload(&broker)
+    };
+    assert_eq!(application_only["controller"], false);
+    assert_eq!(application_only["gamepad"], "auto");
+    assert_eq!(application_only["keyboard"], true);
+    assert_eq!(application_only["mouse"], false);
+}
+
+fn selected_supported_gamepad_profile() -> &'static str {
+    #[cfg(windows)]
+    {
+        "x360"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "xone"
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        "auto"
+    }
+}
+
+#[test]
 fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
     let now = Instant::now();
     let selected = "endpoint.unavailable";
@@ -738,6 +834,7 @@ struct Broker {
     application_virtual_sink: Option<String>,
     application_audio_sink_capture_only: Option<bool>,
     application_back_button_timeout: Option<i32>,
+    application_input_overrides: Option<Value>,
 }
 
 impl Default for Broker {
@@ -768,6 +865,7 @@ impl Default for Broker {
             application_virtual_sink: None,
             application_audio_sink_capture_only: None,
             application_back_button_timeout: None,
+            application_input_overrides: None,
         }
     }
 }
@@ -883,6 +981,14 @@ impl Broker {
                 || self.application_virtual_sink.is_some()
                 || self.application_audio_sink_capture_only.is_some()
                 || self.application_back_button_timeout.is_some()
+                || self
+                    .application_input_overrides
+                    .as_ref()
+                    .is_some_and(|overrides| {
+                        overrides
+                            .as_object()
+                            .is_some_and(|object| !object.is_empty())
+                    })
             {
                 let mut config_overrides = json!({});
                 if let Some(fec_percentage) = self.application_fec_percentage {
@@ -902,6 +1008,13 @@ impl Broker {
                 }
                 if let Some(timeout) = self.application_back_button_timeout {
                     config_overrides["back_button_timeout"] = json!(timeout);
+                }
+                if let Some(input_overrides) = &self.application_input_overrides
+                    && let Some(overrides) = input_overrides.as_object()
+                {
+                    for (key, value) in overrides {
+                        config_overrides[key] = value.clone();
+                    }
                 }
                 launch["config_overrides"] = config_overrides;
             }

@@ -77,6 +77,34 @@ impl GamepadProfile {
             &["auto"]
         }
     }
+
+    /// Choices accepted from Vibeshine configuration on this target. This is
+    /// broader than `implemented_profiles`: recognized unavailable choices
+    /// must remain visible and must never silently fall back to `auto`.
+    pub const fn recognized_profiles() -> &'static [&'static str] {
+        #[cfg(windows)]
+        {
+            &[
+                "auto",
+                "x360",
+                "vhf",
+                "vhf_xbox",
+                "vhf_xbox_one",
+                "vhf_ds4",
+                "vhf_ds5",
+                "vhf_switch",
+                "ds4",
+            ]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            &["auto", "xone", "ds4", "ds5", "switch"]
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            &["auto"]
+        }
+    }
 }
 
 #[cfg(test)]

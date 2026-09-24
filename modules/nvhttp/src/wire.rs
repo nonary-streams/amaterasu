@@ -558,6 +558,10 @@ pub(super) struct ClientConfigOverrides {
     pub(super) virtual_sink: Option<String>,
     pub(super) audio_sink_capture_only: Option<bool>,
     pub(super) back_button_timeout: Option<i32>,
+    pub(super) controller: Option<bool>,
+    pub(super) gamepad: Option<String>,
+    pub(super) keyboard: Option<bool>,
+    pub(super) mouse: Option<bool>,
 }
 
 #[cfg(test)]

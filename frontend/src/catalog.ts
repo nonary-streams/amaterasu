@@ -77,6 +77,29 @@ namespace Amaterasu {
     return select;
   }
 
+  function inputGamepadOverrideSelect(
+    name: string,
+    current: string | undefined,
+    status: InputRuntimeStatus,
+  ): HTMLSelectElement {
+    const select = el("select");
+    select.name = name;
+    const inherit = el("option", "", "Inherit application/host");
+    inherit.value = "";
+    select.append(inherit);
+    for (const choice of inputGamepadProfileChoices(
+      current ?? "",
+      status.supported_profiles,
+      status.recognized_profiles,
+    )) {
+      const option = el("option", "", choice.label);
+      option.value = choice.value;
+      select.append(option);
+    }
+    select.value = current ?? "";
+    return select;
+  }
+
   function audioSinkOverrideControls(current: string | undefined): {
     mode: HTMLSelectElement;
     id: HTMLInputElement;
@@ -328,6 +351,32 @@ namespace Amaterasu {
     }
 
     function showProviderOverrideEditor(row: CatalogRow): void {
+      editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
+      void loadInputRuntimeStatus().then((status) => {
+        if (context.content.isConnected) renderProviderOverrideEditor(row, status);
+      });
+    }
+
+    async function loadInputRuntimeStatus(): Promise<InputRuntimeStatus> {
+      try {
+        return await api.post<InputRuntimeStatus>("input/status");
+      } catch {
+        return {
+          ok: false,
+          gamepad: "auto",
+          supported_profiles: ["auto"],
+          recognized_profiles: ["auto"],
+          effective_gamepad_profile: null,
+          gamepad_unavailable_reason: null,
+          controller_input: false,
+          controller_enabled: true,
+          controller_cleanup_required: false,
+          lease: null,
+        };
+      }
+    }
+
+    function renderProviderOverrideEditor(row: CatalogRow, runtimeStatus: InputRuntimeStatus): void {
       let editRevision = revision;
       const currentFec = row.entry.config_overrides?.fec_percentage;
       const fec = input(
@@ -360,6 +409,10 @@ namespace Amaterasu {
       backButtonTimeout.step = "1";
       backButtonTimeout.placeholder = "Inherit";
       backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
+      const controller = audioOverrideSelect("controller", row.entry.config_overrides?.controller);
+      const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
+      const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
+      const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
       const form = el(
         "form",
         "editor-form",
@@ -373,6 +426,10 @@ namespace Amaterasu {
         virtualSink.controls,
         field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
         field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
+        field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
+        field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
+        field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
+        field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
       );
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -383,12 +440,12 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value);
+          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles);
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number; controller?: boolean; gamepad?: string; keyboard?: boolean; mouse?: boolean };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -436,8 +493,14 @@ namespace Amaterasu {
     }
 
     function showEditor(row?: CatalogRow): void {
+      void loadInputRuntimeStatus().then((runtimeStatus) => {
+        if (context.content.isConnected) renderEditor(row, runtimeStatus);
+      });
+    }
+
+    function renderEditor(row: CatalogRow | undefined, runtimeStatus: InputRuntimeStatus): void {
       const editRevision = revision;
-      const form = entryForm(row?.entry);
+      const form = entryForm(row?.entry, runtimeStatus);
       const feedback = el("div");
       const save = el(
         "button",
@@ -451,7 +514,7 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const entry = entryFromForm(new FormData(form));
+          const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
           await api.post(row ? "catalog/update" : "catalog/create", {
             ...(row ? { id: row.id } : {}),
             entry,
@@ -479,7 +542,7 @@ namespace Amaterasu {
     void load();
   }
 
-  function entryForm(entry?: Entry): HTMLFormElement {
+  function entryForm(entry: Entry | undefined, runtimeStatus: InputRuntimeStatus): HTMLFormElement {
     const form = el("form", "editor-form");
     const name = input("name", entry?.name ?? "");
     name.required = true;
@@ -573,6 +636,10 @@ namespace Amaterasu {
     backButtonTimeout.max = String(0x7fff_ffff);
     backButtonTimeout.step = "1";
     backButtonTimeout.placeholder = "Inherit";
+    const controller = audioOverrideSelect("controller", entry?.config_overrides?.controller);
+    const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
+    const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
+    const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -640,6 +707,10 @@ namespace Amaterasu {
       virtualSink.controls,
       field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."),
       field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."),
+      field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."),
+      field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."),
+      field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."),
+      field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."),
       steamIdField,
       steamInstallDirField,
       fullscreen,

@@ -60,7 +60,11 @@ impl Broker {
                                 "stream_audio": false,
                                 "audio_sink": "endpoint.client",
                                 "audio_sink_capture_only": true,
-                                "back_button_timeout": -1
+                                "back_button_timeout": -1,
+                                "controller": false,
+                                "gamepad": "auto",
+                                "keyboard": false,
+                                "mouse": true
                             }
                         })
                     }
@@ -97,7 +101,11 @@ impl Broker {
                                 "stream_audio": true,
                                 "audio_sink": "endpoint.app",
                                 "audio_sink_capture_only": false,
-                                "back_button_timeout": 1200
+                                "back_button_timeout": 1200,
+                                "controller": true,
+                                "gamepad": "auto",
+                                "keyboard": true,
+                                "mouse": false
                             }
                         }
                     }),
@@ -406,6 +414,10 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["device_name"], "Moonlight Desk");
     // The authenticated certificate-scoped explicit disable wins over the app.
     assert_eq!(rtsp_open["back_button_timeout"], -1);
+    assert_eq!(rtsp_open["controller"], false);
+    assert_eq!(rtsp_open["gamepad"], "auto");
+    assert_eq!(rtsp_open["keyboard"], false);
+    assert_eq!(rtsp_open["mouse"], true);
 }
 
 #[test]

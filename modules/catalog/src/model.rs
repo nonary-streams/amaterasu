@@ -78,6 +78,14 @@ pub struct ConfigOverrides {
     pub audio_sink_capture_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamepad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
 }
 
 impl ConfigOverrides {
@@ -102,6 +110,13 @@ impl ConfigOverrides {
         {
             return Err("virtual_sink must be a bounded device selector without controls");
         }
+        if self
+            .gamepad
+            .as_deref()
+            .is_some_and(|profile| profile.len() > 32 || !valid_gamepad_profile(profile))
+        {
+            return Err("gamepad must be a recognized profile for this platform");
+        }
         Ok(())
     }
 
@@ -112,6 +127,36 @@ impl ConfigOverrides {
             && self.virtual_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
+            && self.controller.is_none()
+            && self.gamepad.is_none()
+            && self.keyboard.is_none()
+            && self.mouse.is_none()
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 

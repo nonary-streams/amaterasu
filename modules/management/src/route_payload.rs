@@ -761,6 +761,10 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "virtual_sink",
             "audio_sink_capture_only",
             "back_button_timeout",
+            "controller",
+            "gamepad",
+            "keyboard",
+            "mouse",
         ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
@@ -781,6 +785,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     optional_virtual_sink(overrides)?;
     optional_audio_sink_capture_only(overrides)?;
     optional_back_button_timeout(overrides)?;
+    optional_input_overrides(overrides)?;
     Ok(())
 }
 
@@ -832,6 +837,26 @@ fn optional_back_button_timeout(overrides: &Object) -> Result<(), &'static str> 
             && !value
                 .as_i64()
                 .is_some_and(|timeout| i32::try_from(timeout).is_ok())
+    }) {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
+    for key in ["controller", "keyboard", "mouse"] {
+        if overrides
+            .get(key)
+            .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+        {
+            return Err(INVALID);
+        }
+    }
+    if overrides.get("gamepad").is_some_and(|value| {
+        !value.is_null()
+            && value
+                .as_str()
+                .is_none_or(|profile| !valid_gamepad_profile(profile))
     }) {
         return Err(INVALID);
     }
@@ -1841,6 +1866,67 @@ mod pairing_override_tests {
         assert!(catalog_config_overrides(&float_integer).is_err());
         assert!(catalog_config_overrides(&serde_json::json!({})).is_ok());
     }
+
+    #[test]
+    fn scoped_input_overrides_accept_null_and_false_but_reject_wrong_platform_profiles() {
+        let provider = Route {
+            service: "amaterasu.catalog/1",
+            action: "update_provider_overrides",
+            scope: Some("catalog.write"),
+            requires_empty_body: false,
+        };
+        let pairing = Route {
+            service: "amaterasu.pairing/1",
+            action: "update_client_config_overrides",
+            scope: Some("pairing.admin"),
+            requires_empty_body: false,
+        };
+        let overrides = serde_json::json!({
+            "controller":false,
+            "gamepad":"auto",
+            "keyboard":null,
+            "mouse":true
+        });
+        assert!(catalog_config_overrides(&overrides).is_ok());
+        for (route, payload) in [
+            (
+                provider,
+                serde_json::json!({
+                    "id":"app-0000000000000001", "expected_revision":0,
+                    "config_overrides":overrides.clone(),
+                }),
+            ),
+            (
+                pairing,
+                serde_json::json!({
+                    "certificate_id":"a".repeat(64), "expected_revision":0,
+                    "config_overrides":overrides.clone(),
+                }),
+            ),
+        ] {
+            assert!(validate(route, payload.as_object().unwrap()).is_ok());
+        }
+
+        #[cfg(windows)]
+        let wrong_platform = "xone";
+        #[cfg(target_os = "linux")]
+        let wrong_platform = "vhf";
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let wrong_platform = "ds4";
+        for invalid in [
+            serde_json::json!({"controller":"false"}),
+            serde_json::json!({"gamepad":wrong_platform}),
+            serde_json::json!({"keyboard":0}),
+            serde_json::json!({"mouse":[]}),
+        ] {
+            assert!(catalog_config_overrides(&invalid).is_err(), "{invalid}");
+            let pairing_payload = serde_json::json!({
+                "certificate_id":"a".repeat(64), "expected_revision":0,
+                "config_overrides":invalid,
+            });
+            assert!(validate(pairing, pairing_payload.as_object().unwrap()).is_err());
+        }
+    }
 }
 
 fn safe_bind_address(value: &str) -> Option<IpAddr> {
@@ -1925,6 +2011,10 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "virtual_sink",
                     "audio_sink_capture_only",
                     "back_button_timeout",
+                    "controller",
+                    "gamepad",
+                    "keyboard",
+                    "mouse",
                 ],
             )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
@@ -1945,6 +2035,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             optional_virtual_sink(config_overrides)?;
             optional_audio_sink_capture_only(config_overrides)?;
             optional_back_button_timeout(config_overrides)?;
+            optional_input_overrides(config_overrides)?;
             Ok(())
         }
         _ => Err(INVALID),

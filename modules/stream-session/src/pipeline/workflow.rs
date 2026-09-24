@@ -142,7 +142,11 @@ impl Job {
             Step::AcquireInput => (
                 "amaterasu.input/1".into(),
                 json!({"action":"acquire","operation_id":record.input_operation(),"ttl_ms":record.input_ttl_ms,
-                    "back_button_timeout":record.start.as_ref().expect("validated start configuration").back_button_timeout}),
+                    "back_button_timeout":record.start.as_ref().expect("validated start configuration").back_button_timeout,
+                    "controller":record.start.as_ref().expect("validated start configuration").controller,
+                    "gamepad":record.start.as_ref().expect("validated start configuration").gamepad,
+                    "keyboard":record.start.as_ref().expect("validated start configuration").keyboard,
+                    "mouse":record.start.as_ref().expect("validated start configuration").mouse}),
             ),
             Step::FindInput => (
                 "amaterasu.input/1".into(),

@@ -1,3 +1,4 @@
+use crate::gamepad_profile::GamepadProfile;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -29,6 +30,14 @@ pub enum Operation {
         ttl_ms: Option<u64>,
         #[serde(default)]
         back_button_timeout: Option<i32>,
+        #[serde(default)]
+        controller: Option<bool>,
+        #[serde(default)]
+        gamepad: Option<GamepadProfile>,
+        #[serde(default)]
+        keyboard: Option<bool>,
+        #[serde(default)]
+        mouse: Option<bool>,
     },
     Lookup {
         operation_id: String,
@@ -535,6 +544,57 @@ mod tests {
             let mut payload = json!({"action":"acquire"});
             payload["back_button_timeout"] = value;
             assert!(serde_json::from_value::<Operation>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn acquire_accepts_sparse_input_policy_values_and_rejects_unknown_profiles() {
+        let scoped: Operation = serde_json::from_value(json!({
+            "action":"acquire",
+            "controller":false,
+            "gamepad":"auto",
+            "keyboard":true,
+            "mouse":false
+        }))
+        .unwrap();
+        assert!(matches!(
+            scoped,
+            Operation::Acquire {
+                controller: Some(false),
+                gamepad: Some(GamepadProfile::Auto),
+                keyboard: Some(true),
+                mouse: Some(false),
+                ..
+            }
+        ));
+        for profile in ["not-a-profile", "xone"] {
+            #[cfg(windows)]
+            if profile == "xone" {
+                assert!(
+                    serde_json::from_value::<Operation>(json!({
+                        "action":"acquire", "gamepad":profile
+                    }))
+                    .is_err()
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if profile == "not-a-profile" {
+                assert!(
+                    serde_json::from_value::<Operation>(json!({
+                        "action":"acquire", "gamepad":profile
+                    }))
+                    .is_err()
+                );
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                assert!(
+                    serde_json::from_value::<Operation>(json!({
+                        "action":"acquire", "gamepad":profile
+                    }))
+                    .is_err()
+                );
+            }
         }
     }
 

@@ -34,13 +34,34 @@ namespace Amaterasu {
     return timeout;
   }
 
-  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = ""): {
+  export function parseInputBooleanOverride(value: string, name: string): boolean | null {
+    if (value === "") return null;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    throw new Error(`${name} must be Inherit, Enabled, or Disabled.`);
+  }
+
+  export function parseGamepadProfileOverride(
+    value: string,
+    recognizedProfiles: readonly string[],
+  ): string | null {
+    if (value === "") return null;
+    if (typeof value !== "string" || !recognizedProfiles.includes(value))
+      throw new Error("Choose a recognized gamepad profile for this host platform.");
+    return value;
+  }
+
+  export function providerConfigOverrides(value: string, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = "", controllerValue = "", gamepadValue = "", keyboardValue = "", mouseValue = "", recognizedGamepadProfiles: readonly string[] = ["auto"]): {
     fec_percentage: number | null;
     stream_audio: boolean | null;
     audio_sink: string | null;
     virtual_sink: string | null;
     audio_sink_capture_only: boolean | null;
     back_button_timeout: number | null;
+    controller: boolean | null;
+    gamepad: string | null;
+    keyboard: boolean | null;
+    mouse: boolean | null;
   } {
     return {
       fec_percentage: parseFecOverride(value),
@@ -49,6 +70,10 @@ namespace Amaterasu {
       virtual_sink: parseVirtualSinkOverride(virtualSinkMode, virtualSinkSelector),
       audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
       back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
+      controller: parseInputBooleanOverride(controllerValue, "Controller input"),
+      gamepad: parseGamepadProfileOverride(gamepadValue, recognizedGamepadProfiles),
+      keyboard: parseInputBooleanOverride(keyboardValue, "Keyboard input"),
+      mouse: parseInputBooleanOverride(mouseValue, "Mouse input"),
     };
   }
 
@@ -268,7 +293,7 @@ namespace Amaterasu {
     }
   }
 
-  export function entryFromForm(data: FormData): Entry {
+  export function entryFromForm(data: FormData, recognizedGamepadProfiles: readonly string[] = ["auto"]): Entry {
     const text = (name: string) => String(data.get(name) ?? "").trim();
     const kind = text("kind") === "executable"
       ? "executable"
@@ -281,10 +306,14 @@ namespace Amaterasu {
     const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
     const virtualSink = parseVirtualSinkOverride(text("virtual_sink_mode") || "inherit", String(data.get("virtual_sink_selector") ?? ""));
     const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
+    const controller = parseInputBooleanOverride(text("controller"), "Controller input");
+    const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
+    const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
+    const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
+      fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null && controller === null && gamepad === null && keyboard === null && mouse === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
@@ -293,6 +322,10 @@ namespace Amaterasu {
             ...(virtualSink === null ? {} : { virtual_sink: virtualSink }),
             ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
             ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
+            ...(controller === null ? {} : { controller }),
+            ...(gamepad === null ? {} : { gamepad }),
+            ...(keyboard === null ? {} : { keyboard }),
+            ...(mouse === null ? {} : { mouse }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

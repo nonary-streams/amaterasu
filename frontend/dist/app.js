@@ -34,7 +34,25 @@ var Amaterasu;
         return timeout;
     }
     Amaterasu.parseBackButtonTimeoutOverride = parseBackButtonTimeoutOverride;
-    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = "") {
+    function parseInputBooleanOverride(value, name) {
+        if (value === "")
+            return null;
+        if (value === "true")
+            return true;
+        if (value === "false")
+            return false;
+        throw new Error(`${name} must be Inherit, Enabled, or Disabled.`);
+    }
+    Amaterasu.parseInputBooleanOverride = parseInputBooleanOverride;
+    function parseGamepadProfileOverride(value, recognizedProfiles) {
+        if (value === "")
+            return null;
+        if (typeof value !== "string" || !recognizedProfiles.includes(value))
+            throw new Error("Choose a recognized gamepad profile for this host platform.");
+        return value;
+    }
+    Amaterasu.parseGamepadProfileOverride = parseGamepadProfileOverride;
+    function providerConfigOverrides(value, streamAudioValue = "", audioSinkMode = "inherit", audioSinkId = "", audioSinkCaptureOnlyValue = "", backButtonTimeoutValue = "", virtualSinkMode = "inherit", virtualSinkSelector = "", controllerValue = "", gamepadValue = "", keyboardValue = "", mouseValue = "", recognizedGamepadProfiles = ["auto"]) {
         return {
             fec_percentage: parseFecOverride(value),
             stream_audio: parseStreamAudioOverride(streamAudioValue),
@@ -42,6 +60,10 @@ var Amaterasu;
             virtual_sink: parseVirtualSinkOverride(virtualSinkMode, virtualSinkSelector),
             audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(audioSinkCaptureOnlyValue),
             back_button_timeout: parseBackButtonTimeoutOverride(backButtonTimeoutValue),
+            controller: parseInputBooleanOverride(controllerValue, "Controller input"),
+            gamepad: parseGamepadProfileOverride(gamepadValue, recognizedGamepadProfiles),
+            keyboard: parseInputBooleanOverride(keyboardValue, "Keyboard input"),
+            mouse: parseInputBooleanOverride(mouseValue, "Mouse input"),
         };
     }
     Amaterasu.providerConfigOverrides = providerConfigOverrides;
@@ -247,7 +269,7 @@ var Amaterasu;
             throw new Error("Existing preparation commands are malformed or outside supported bounds; reload before saving.");
         }
     }
-    function entryFromForm(data) {
+    function entryFromForm(data, recognizedGamepadProfiles = ["auto"]) {
         const text = (name) => String(data.get(name) ?? "").trim();
         const kind = text("kind") === "executable"
             ? "executable"
@@ -260,9 +282,13 @@ var Amaterasu;
         const audioSinkCaptureOnly = parseAudioSinkCaptureOnlyOverride(text("audio_sink_capture_only"));
         const virtualSink = parseVirtualSinkOverride(text("virtual_sink_mode") || "inherit", String(data.get("virtual_sink_selector") ?? ""));
         const backButtonTimeout = parseBackButtonTimeoutOverride(text("back_button_timeout"));
+        const controller = parseInputBooleanOverride(text("controller"), "Controller input");
+        const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
+        const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
+        const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
         const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
-        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null
+        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null && controller === null && gamepad === null && keyboard === null && mouse === null
             ? undefined
             : {
                 ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
@@ -271,6 +297,10 @@ var Amaterasu;
                 ...(virtualSink === null ? {} : { virtual_sink: virtualSink }),
                 ...(audioSinkCaptureOnly === null ? {} : { audio_sink_capture_only: audioSinkCaptureOnly }),
                 ...(backButtonTimeout === null ? {} : { back_button_timeout: backButtonTimeout }),
+                ...(controller === null ? {} : { controller }),
+                ...(gamepad === null ? {} : { gamepad }),
+                ...(keyboard === null ? {} : { keyboard }),
+                ...(mouse === null ? {} : { mouse }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
@@ -773,6 +803,20 @@ var Amaterasu;
         select.value = current === undefined ? "" : String(current);
         return select;
     }
+    function inputGamepadOverrideSelect(name, current, status) {
+        const select = Amaterasu.el("select");
+        select.name = name;
+        const inherit = Amaterasu.el("option", "", "Inherit application/host");
+        inherit.value = "";
+        select.append(inherit);
+        for (const choice of Amaterasu.inputGamepadProfileChoices(current ?? "", status.supported_profiles, status.recognized_profiles)) {
+            const option = Amaterasu.el("option", "", choice.label);
+            option.value = choice.value;
+            select.append(option);
+        }
+        select.value = current ?? "";
+        return select;
+    }
     function audioSinkOverrideControls(current) {
         const mode = Amaterasu.el("select");
         mode.name = "audio_sink_mode";
@@ -942,6 +986,32 @@ var Amaterasu;
             return Amaterasu.el("article", "app-card", art, Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
         }
         function showProviderOverrideEditor(row) {
+            editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
+            void loadInputRuntimeStatus().then((status) => {
+                if (context.content.isConnected)
+                    renderProviderOverrideEditor(row, status);
+            });
+        }
+        async function loadInputRuntimeStatus() {
+            try {
+                return await api.post("input/status");
+            }
+            catch {
+                return {
+                    ok: false,
+                    gamepad: "auto",
+                    supported_profiles: ["auto"],
+                    recognized_profiles: ["auto"],
+                    effective_gamepad_profile: null,
+                    gamepad_unavailable_reason: null,
+                    controller_input: false,
+                    controller_enabled: true,
+                    controller_cleanup_required: false,
+                    lease: null,
+                };
+            }
+        }
+        function renderProviderOverrideEditor(row, runtimeStatus) {
             let editRevision = revision;
             const currentFec = row.entry.config_overrides?.fec_percentage;
             const fec = Amaterasu.input("fec_percentage", currentFec === undefined ? "" : String(currentFec), "number");
@@ -960,7 +1030,11 @@ var Amaterasu;
             backButtonTimeout.step = "1";
             backButtonTimeout.placeholder = "Inherit";
             backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${row.entry.name}`);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."));
+            const controller = audioOverrideSelect("controller", row.entry.config_overrides?.controller);
+            const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
+            const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
+            const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -971,7 +1045,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value);
+                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -1003,8 +1077,14 @@ var Amaterasu;
             fec.focus();
         }
         function showEditor(row) {
+            void loadInputRuntimeStatus().then((runtimeStatus) => {
+                if (context.content.isConnected)
+                    renderEditor(row, runtimeStatus);
+            });
+        }
+        function renderEditor(row, runtimeStatus) {
             const editRevision = revision;
-            const form = entryForm(row?.entry);
+            const form = entryForm(row?.entry, runtimeStatus);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
             save.type = "submit";
@@ -1015,7 +1095,7 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const entry = Amaterasu.entryFromForm(new FormData(form));
+                    const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
                     await api.post(row ? "catalog/update" : "catalog/create", {
                         ...(row ? { id: row.id } : {}),
                         entry,
@@ -1033,7 +1113,7 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderCatalog = renderCatalog;
-    function entryForm(entry) {
+    function entryForm(entry, runtimeStatus) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -1101,6 +1181,10 @@ var Amaterasu;
         backButtonTimeout.max = String(0x7fff_ffff);
         backButtonTimeout.step = "1";
         backButtonTimeout.placeholder = "Inherit";
+        const controller = audioOverrideSelect("controller", entry?.config_overrides?.controller);
+        const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
+        const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
+        const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -1130,7 +1214,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -1209,20 +1293,24 @@ var Amaterasu;
         };
     }
     Amaterasu.parseInputPolicy = parseInputPolicy;
-    function inputGamepadProfileChoices(selectedProfile, supportedProfiles) {
+    function inputGamepadProfileChoices(selectedProfile, supportedProfiles, recognizedProfiles = supportedProfiles) {
         if (typeof selectedProfile !== "string" ||
             !Array.isArray(supportedProfiles) ||
-            !supportedProfiles.every((profile) => typeof profile === "string"))
+            !supportedProfiles.every((profile) => typeof profile === "string") ||
+            !Array.isArray(recognizedProfiles) ||
+            !recognizedProfiles.every((profile) => typeof profile === "string"))
             throw new Error("Gamepad profile status is invalid.");
         const availableProfiles = [...new Set(supportedProfiles)];
         if (availableProfiles.length === 0)
             availableProfiles.push("auto");
-        const choices = availableProfiles.map((value) => ({
+        const choices = [...new Set([...recognizedProfiles, ...availableProfiles])].map((value) => ({
             value,
-            label: value,
-            available: true,
+            label: availableProfiles.includes(value)
+                ? value
+                : `${value} (recognized, unavailable on this backend)`,
+            available: availableProfiles.includes(value),
         }));
-        if (selectedProfile !== "" && !availableProfiles.includes(selectedProfile)) {
+        if (selectedProfile !== "" && !choices.some((choice) => choice.value === selectedProfile)) {
             choices.push({
                 value: selectedProfile,
                 label: `${selectedProfile} (recognized, unavailable on this backend)`,
@@ -1276,6 +1364,19 @@ var Amaterasu;
         return { fec_percentage: percentage };
     }
     Amaterasu.parseClientFecOverride = parseClientFecOverride;
+    function sparseInputOverrideSelect(name, current) {
+        const select = Amaterasu.el("select");
+        select.name = name;
+        select.setAttribute("aria-label", `${name} override`);
+        const choices = [["", "Inherit"], ["true", "Enabled"], ["false", "Disabled"]];
+        for (const [value, label] of choices) {
+            const option = Amaterasu.el("option", "", label);
+            option.value = value;
+            select.append(option);
+        }
+        select.value = current === undefined ? "" : String(current);
+        return select;
+    }
     function inputPolicyStatusDescription(settings) {
         if (!settings.persisted)
             return "The saved input policy has not been confirmed yet.";
@@ -2079,6 +2180,12 @@ var Amaterasu;
             pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
             try {
                 const settings = await context.api.post("pairing/list_clients");
+                let inputStatus = null;
+                try {
+                    inputStatus = await context.api.post("input/status");
+                }
+                catch {
+                }
                 if (!context.content.isConnected)
                     return;
                 if (settings.clients.length === 0) {
@@ -2098,6 +2205,24 @@ var Amaterasu;
                     backButtonTimeout.step = "1";
                     backButtonTimeout.placeholder = "Inherit";
                     backButtonTimeout.setAttribute("aria-label", `Back button timeout override for ${client.name}`);
+                    const controller = sparseInputOverrideSelect("controller", client.config_overrides?.controller);
+                    controller.setAttribute("aria-label", `Controller input override for ${client.name}`);
+                    const gamepadChoices = inputGamepadProfileChoices(client.config_overrides?.gamepad ?? "", inputStatus?.supported_profiles ?? ["auto"], inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]);
+                    const gamepad = Amaterasu.el("select");
+                    gamepad.setAttribute("aria-label", `Gamepad profile override for ${client.name}`);
+                    const inheritGamepad = Amaterasu.el("option", "", "Inherit");
+                    inheritGamepad.value = "";
+                    gamepad.append(inheritGamepad);
+                    for (const choice of gamepadChoices) {
+                        const option = Amaterasu.el("option", "", choice.label);
+                        option.value = choice.value;
+                        gamepad.append(option);
+                    }
+                    gamepad.value = client.config_overrides?.gamepad ?? "";
+                    const keyboard = sparseInputOverrideSelect("keyboard", client.config_overrides?.keyboard);
+                    keyboard.setAttribute("aria-label", `Keyboard input override for ${client.name}`);
+                    const mouse = sparseInputOverrideSelect("mouse", client.config_overrides?.mouse);
+                    mouse.setAttribute("aria-label", `Mouse input override for ${client.name}`);
                     const streamAudio = Amaterasu.el("select");
                     streamAudio.setAttribute("aria-label", `Audio streaming override for ${client.name}`);
                     const audioChoices = [
@@ -2180,6 +2305,10 @@ var Amaterasu;
                                     audio_sink: Amaterasu.parseAudioSinkOverride(audioSinkMode.value, audioSinkId.value),
                                     virtual_sink: Amaterasu.parseVirtualSinkOverride(virtualSinkMode.value, virtualSinkSelector.value),
                                     audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
+                                    controller: Amaterasu.parseInputBooleanOverride(controller.value, "Controller input"),
+                                    gamepad: Amaterasu.parseGamepadProfileOverride(gamepad.value, inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]),
+                                    keyboard: Amaterasu.parseInputBooleanOverride(keyboard.value, "Keyboard input"),
+                                    mouse: Amaterasu.parseInputBooleanOverride(mouse.value, "Mouse input"),
                                 },
                             });
                             context.notify(`Streaming override saved for ${client.name}.`);
@@ -2196,10 +2325,10 @@ var Amaterasu;
                     }), "primary");
                     save.disabled = !context.api.allows("pairing.admin");
                     const identity = Amaterasu.el("div", "", Amaterasu.el("strong", "", client.name), Amaterasu.el("small", "muted", `${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`));
-                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, Amaterasu.el("div", "", save, status)];
+                    return [identity, fec, backButtonTimeout, streamAudio, Amaterasu.el("div", "", audioSinkMode, audioSinkId), Amaterasu.el("div", "", virtualSinkMode, virtualSinkSelector), captureOnly, controller, gamepad, keyboard, mouse, Amaterasu.el("div", "", save, status)];
                 });
-                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", ""], rows);
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
+                const tableView = Amaterasu.table(["Paired client", "FEC percentage", "Back button timeout (ms)", "Audio streaming", "Audio endpoint", "Virtual sink", "Capture only", "Controller", "Gamepad", "Keyboard", "Mouse", ""], rows);
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Blank inherits the application and host value. Back button timeout accepts signed 32-bit milliseconds, with -1 disabling the timeout. Recognized unavailable gamepad profiles stay labeled. Each save uses the current pairing revision."), tableView, Amaterasu.el("div", "actions", Amaterasu.badge(`Revision ${settings.revision}`))));
             }
             catch (error) {
                 if (context.content.isConnected)
@@ -2296,7 +2425,7 @@ var Amaterasu;
                 backButtonTimeout.step = "1";
                 const gamepadProfile = Amaterasu.el("select");
                 gamepadProfile.name = "input_gamepad_profile";
-                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus.supported_profiles);
+                const gamepadProfileChoices = inputGamepadProfileChoices(settings.values.gamepad, runtimeStatus.supported_profiles, runtimeStatus.recognized_profiles);
                 for (const choice of gamepadProfileChoices) {
                     const option = Amaterasu.el("option", "", choice.label);
                     option.value = choice.value;

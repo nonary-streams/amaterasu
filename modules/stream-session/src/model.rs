@@ -287,6 +287,14 @@ pub struct StartConfig {
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamepad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
     /// Moonlight's device name for the session; independent from capture output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
@@ -308,6 +316,13 @@ impl StartConfig {
             .device_name
             .as_deref()
             .is_some_and(|name| !valid_name(name))
+        {
+            return Err("invalid_start_configuration");
+        }
+        if self
+            .gamepad
+            .as_deref()
+            .is_some_and(|profile| !valid_gamepad_profile(profile))
         {
             return Err("invalid_start_configuration");
         }
@@ -341,6 +356,32 @@ impl StartConfig {
             (Some(_), _) => return Err("invalid_virtual_sink_channels"),
         }
         Ok(())
+    }
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
     }
 }
 

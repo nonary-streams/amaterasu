@@ -101,13 +101,17 @@ fn sparse_fec_override_is_typed_defaulted_and_persisted_with_the_entry() {
     let configured: Entry = serde_json::from_value(json!({
         "name":"Configured entry",
         "launch":{"kind":"executable","program":"/games/configured"},
-        "config_overrides":{"fec_percentage":37}
+        "config_overrides":{"fec_percentage":37,"controller":false,"gamepad":"auto","keyboard":true,"mouse":false}
     }))
     .unwrap();
     configured.validate().unwrap();
     assert_eq!(configured.config_overrides.fec_percentage, Some(37));
     let persisted = serde_json::to_value(configured).unwrap();
     assert_eq!(persisted["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(persisted["config_overrides"]["controller"], false);
+    assert_eq!(persisted["config_overrides"]["gamepad"], "auto");
+    assert_eq!(persisted["config_overrides"]["keyboard"], true);
+    assert_eq!(persisted["config_overrides"]["mouse"], false);
 
     let invalid_percentage: Entry = serde_json::from_value(json!({
         "name":"Invalid entry",

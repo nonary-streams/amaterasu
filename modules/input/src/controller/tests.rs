@@ -16,6 +16,7 @@ struct FakeBackend {
     reject_absolute: bool,
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
+    gamepad_profile: GamepadProfile,
     back_button_timeout_ms: i32,
     fail_controller_disable: bool,
     controller_disable_calls: usize,
@@ -83,6 +84,9 @@ impl Backend for FakeBackend {
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.back_button_timeout_ms = timeout_ms;
     }
+    fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
+        self.gamepad_profile = profile;
+    }
     fn disable_controller_input(&mut self) -> InputResult<()> {
         self.controller_disable_calls += 1;
         if std::mem::take(&mut self.fail_controller_disable) {
@@ -133,6 +137,10 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
             operation_id: None,
             ttl_ms: Some(1000),
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -158,6 +166,10 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             operation_id: Some("client-one-stream".into()),
             ttl_ms: None,
             back_button_timeout: Some(-1),
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -183,6 +195,10 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             operation_id: Some("client-two-stream".into()),
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -201,6 +217,10 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             operation_id: Some("timeout-retry".into()),
             ttl_ms: Some(2000),
             back_button_timeout: Some(400),
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -212,6 +232,10 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             operation_id: Some("timeout-retry".into()),
             ttl_ms: Some(2000),
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -236,6 +260,10 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             operation_id: Some("gamepad-capability".into()),
             ttl_ms: Some(1000),
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -277,6 +305,10 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             operation_id: Some("profile-snapshot".into()),
             ttl_ms: Some(1000),
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -289,6 +321,147 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
     assert_eq!(status["gamepad"], selected_profile.as_str());
     assert_eq!(status["lease"]["gamepad_profile"], "auto");
     assert_eq!(status["lease"]["effective_gamepad_profile"], "x360");
+}
+
+#[test]
+fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let global_gamepad = selected_supported_profile();
+    controller.set_gamepad_profile(global_gamepad);
+    controller.set_controller_enabled(false, now).unwrap();
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: false,
+                mouse: false,
+            },
+            now,
+        )
+        .unwrap();
+
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("scoped-input-policy".into()),
+            ttl_ms: Some(1_000),
+            back_button_timeout: None,
+            controller: Some(true),
+            gamepad: Some(GamepadProfile::Auto),
+            keyboard: Some(true),
+            mouse: Some(false),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["gamepad_profile"], "auto");
+    assert_eq!(controller.backend.gamepad_profile, GamepadProfile::Auto);
+
+    let lease = acquired["lease"].as_str().unwrap();
+    let mixed = batch(
+        &mut controller,
+        lease,
+        vec![
+            key(30, KeyState::Down),
+            Event::Button {
+                button: Button::Left,
+                pressed: true,
+            },
+            controller_event(),
+        ],
+    );
+    assert_eq!(mixed["ok"], true);
+    assert_eq!(mixed["accepted"], 3);
+    assert_eq!(mixed["suppressed"], 1);
+    assert_eq!(controller.backend.trace.borrow().len(), 2);
+    assert_eq!(
+        controller.backend.active_controller_slots,
+        BTreeSet::from([0])
+    );
+
+    // Host changes stay recorded as defaults while an active session keeps its
+    // explicit policy; in particular, it can still release its held key.
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: false,
+                mouse: true,
+            },
+            now,
+        )
+        .unwrap();
+    let key_up = batch(&mut controller, lease, vec![key(30, KeyState::Up)]);
+    assert_eq!(key_up["ok"], true);
+    assert_eq!(key_up["suppressed"], 0);
+
+    controller.handle(
+        "owner",
+        Operation::Release {
+            lease: lease.into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert!(controller.lease.is_none());
+    assert_eq!(controller.backend.gamepad_profile, global_gamepad);
+    assert!(!controller.controller_enabled());
+    assert!(!controller.device_policy().keyboard);
+    assert!(controller.device_policy().mouse);
+
+    let next_lease = acquire(&mut controller, now);
+    let suppressed = batch(&mut controller, &next_lease, vec![controller_event()]);
+    assert_eq!(suppressed["suppressed"], 1);
+    controller.handle(
+        "owner",
+        Operation::Release { lease: next_lease },
+        now,
+        &mut || Ok(()),
+    );
+
+    let second_owner = controller.handle(
+        "second-owner",
+        Operation::Acquire {
+            operation_id: Some("second-owner-stream".into()),
+            ttl_ms: Some(1_000),
+            back_button_timeout: None,
+            controller: Some(true),
+            gamepad: Some(global_gamepad),
+            keyboard: Some(true),
+            mouse: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(second_owner["ok"], true);
+    assert_eq!(second_owner["gamepad_profile"], global_gamepad.as_str());
+    assert_eq!(controller.backend.gamepad_profile, global_gamepad);
+    let second_input = controller.handle(
+        "second-owner",
+        Operation::Batch {
+            lease: second_owner["lease"].as_str().unwrap().into(),
+            events: vec![controller_event()],
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(second_input["ok"], true);
+    assert_eq!(second_input["suppressed"], 0);
+    controller.handle(
+        "second-owner",
+        Operation::Release {
+            lease: second_owner["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(controller.backend.gamepad_profile, global_gamepad);
 }
 
 fn selected_supported_profile() -> GamepadProfile {
@@ -745,6 +918,10 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             operation_id: None,
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),
@@ -816,6 +993,10 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             operation_id: None,
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -829,6 +1010,10 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             operation_id: None,
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         Instant::now(),
         &mut || Err(InputError::new("cancelled", "ended")),
@@ -861,6 +1046,10 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             operation_id: None,
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         Operation::Renew {
             lease: token.clone(),
@@ -899,6 +1088,10 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             operation_id: None,
             ttl_ms: None,
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -942,6 +1135,10 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         operation_id: Some("session.input.7".into()),
         ttl_ms: Some(2000),
         back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        keyboard: None,
+        mouse: None,
     };
     let first = controller.handle("owner", acquire(), now, &mut || Ok(()));
     let token = first["lease"].as_str().unwrap().to_owned();
@@ -983,6 +1180,10 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             operation_id: Some("session.input.7".into()),
             ttl_ms: Some(3000),
             back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            keyboard: None,
+            mouse: None,
         },
         now,
         &mut || Ok(()),

@@ -53,6 +53,11 @@ pub struct Record {
     /// Sparse client-over-application timeout override captured for this launch.
     /// Input resolves `None` against its authoritative global policy at acquire.
     pub scoped_back_button_timeout: Option<i32>,
+    /// Sparse client-over-application input gates/profile captured for this launch.
+    pub scoped_controller: Option<bool>,
+    pub scoped_gamepad: Option<String>,
+    pub scoped_keyboard: Option<bool>,
+    pub scoped_mouse: Option<bool>,
     pub global_ping_timeout_ms: u32,
     pub global_video_max_batch_size_kb: u8,
     pub global_max_bitrate_kbps: Option<u32>,
@@ -137,6 +142,10 @@ impl Record {
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,
             scoped_back_button_timeout: None,
+            scoped_controller: None,
+            scoped_gamepad: None,
+            scoped_keyboard: None,
+            scoped_mouse: None,
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,

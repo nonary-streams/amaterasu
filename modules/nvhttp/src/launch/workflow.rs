@@ -179,6 +179,10 @@ impl Controller {
                         "virtual_sink": record.resolved_virtual_sink,
                         "channels": record.resolved_virtual_sink.as_ref().map(|_| 2),
                         "back_button_timeout": record.scoped_back_button_timeout,
+                        "controller": record.scoped_controller,
+                        "gamepad": record.scoped_gamepad,
+                        "keyboard": record.scoped_keyboard,
+                        "mouse": record.scoped_mouse,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
@@ -319,6 +323,21 @@ impl Controller {
                                     .peer
                                     .client_back_button_timeout
                                     .or(application_overrides.back_button_timeout);
+                                record.scoped_controller = record
+                                    .peer
+                                    .client_controller
+                                    .or(application_overrides.controller);
+                                record.scoped_gamepad = record
+                                    .peer
+                                    .client_gamepad
+                                    .clone()
+                                    .or(application_overrides.gamepad);
+                                record.scoped_keyboard = record
+                                    .peer
+                                    .client_keyboard
+                                    .or(application_overrides.keyboard);
+                                record.scoped_mouse =
+                                    record.peer.client_mouse.or(application_overrides.mouse);
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -656,6 +675,10 @@ struct ApplicationConfigOverrides {
     virtual_sink: Option<String>,
     audio_sink_capture_only: Option<bool>,
     back_button_timeout: Option<i32>,
+    controller: Option<bool>,
+    gamepad: Option<String>,
+    keyboard: Option<bool>,
+    mouse: Option<bool>,
 }
 
 fn application_config_overrides(
@@ -686,7 +709,40 @@ fn application_config_overrides(
     {
         return Err("invalid_application_response");
     }
+    if config_overrides
+        .gamepad
+        .as_deref()
+        .is_some_and(|profile| !valid_gamepad_profile(profile))
+    {
+        return Err("invalid_application_response");
+    }
     Ok(config_overrides)
+}
+
+fn valid_gamepad_profile(profile: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            profile,
+            "auto"
+                | "x360"
+                | "vhf"
+                | "vhf_xbox"
+                | "vhf_xbox_one"
+                | "vhf_ds4"
+                | "vhf_ds5"
+                | "vhf_switch"
+                | "ds4"
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(profile, "auto" | "xone" | "ds4" | "ds5" | "switch")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        profile == "auto"
+    }
 }
 
 fn rtsp_response<'a>(
