@@ -98,6 +98,8 @@ pub enum Operation {
         #[serde(default)]
         channels: Option<u32>,
         #[serde(default)]
+        host_audio_enabled: bool,
+        #[serde(default)]
         operation_id: Option<String>,
         #[serde(default)]
         capture_sink_without_routing: bool,
@@ -115,7 +117,7 @@ pub enum Operation {
 }
 
 pub fn validate_endpoint(endpoint: &str) -> AudioResult<()> {
-    if endpoint.is_empty() || endpoint.len() > 4096 || endpoint.chars().any(char::is_control) {
+    if endpoint.len() > 4096 || endpoint.chars().any(char::is_control) {
         return Err("invalid_endpoint");
     }
     Ok(())

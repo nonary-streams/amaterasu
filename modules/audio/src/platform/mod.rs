@@ -15,7 +15,13 @@ mod unsupported {
 
     pub struct Capture;
     impl Capture {
-        pub fn open(_: &str, _: Option<&str>, _: Option<u32>, _: bool) -> AudioResult<Self> {
+        pub fn open(
+            _: &str,
+            _: Option<&str>,
+            _: Option<u32>,
+            _: bool,
+            _: bool,
+        ) -> AudioResult<Self> {
             Err("unsupported_platform")
         }
         pub fn format(&self) -> Format {

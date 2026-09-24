@@ -10,7 +10,7 @@ Strict JSON controls:
 
 ```json
 {"action":"enumerate"}
-{"action":"open","endpoint":"default","operation_id":"living-room-audio"}
+{"action":"open","endpoint":"default","host_audio_enabled":false,"operation_id":"living-room-audio"}
 {"action":"open","endpoint":"","virtual_sink":"","channels":6,"operation_id":"surround-audio"}
 {"action":"lookup","operation_id":"living-room-audio"}
 {"action":"status"}
@@ -19,14 +19,16 @@ Strict JSON controls:
 ```
 
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
-for active render endpoints. Explicit endpoint IDs come from that list; `default`
-resolves the current multimedia render endpoint once when opened. The selected
-endpoint remains fixed for the session. Enumeration is limited to 64 endpoints
-and a 12,000-byte metadata reply. On Windows, opening an explicit endpoint with
-`capture_sink_without_routing` omitted or false temporarily assigns that endpoint
-as the Console, Multimedia, and Communications render default, unless it is
-already the Console default. Concurrent captures of the same endpoint share the
-assignment; a conflicting endpoint open fails. When the final capture closes,
+for active render endpoints. Explicit endpoint IDs come from that list. Unless
+the virtual-sink policy selects Steam speakers, `default` and an empty ordinary
+endpoint resolve the current multimedia render endpoint once when opened. The
+selected endpoint remains fixed for the session. Enumeration is limited to 64
+endpoints and a 12,000-byte metadata reply. On Windows, opening an explicit
+endpoint with `capture_sink_without_routing` omitted or false temporarily
+assigns that endpoint as the Console, Multimedia, and Communications render
+default, unless it is already the Console default. Concurrent captures of the
+same endpoint share the assignment; a conflicting endpoint open fails. When the
+final capture closes,
 the provider restores only roles it assigned that still point to the selected
 endpoint, preserving role changes made elsewhere. If assignment fails, open
 fails and attempts to restore roles changed earlier in the same open. A failed
@@ -35,9 +37,18 @@ background retry. Opening `default`
 does not change default roles. The provider does not change volume or mute state.
 
 An open with `virtual_sink` selects a managed virtual render endpoint before the
-regular `endpoint`. `virtual_sink:null` or omission keeps regular endpoint
-selection. An empty string matches the active endpoint whose adapter name is
-exactly `Steam Streaming Speakers`; nonempty text matches an active endpoint's
+regular `endpoint`. `virtual_sink:null` or omission allows the audio policy to
+choose automatically. `host_audio_enabled` defaults to false; on Windows that
+policy selects the active `Steam Streaming Speakers` endpoint when host audio is
+disabled, or when the ordinary endpoint is empty or `default` has no active
+multimedia endpoint. It uses stereo for this automatic virtual selection. If
+Steam speakers are unavailable, capture falls back to the requested ordinary
+endpoint and reports its actual ID; if that endpoint is unavailable, open fails.
+When host audio is enabled and an ordinary endpoint is available, regular
+selection is preserved. An explicit `virtual_sink` always takes precedence and
+remains strict: it does not fall back when missing. An empty explicit selector
+matches the active endpoint whose adapter name is exactly
+`Steam Streaming Speakers`; nonempty text matches an active endpoint's
 ID, friendly name, device description, or adapter name, in that priority order.
 Matching is exact and case-sensitive. The virtual selector never falls back to
 the regular endpoint or the default endpoint when it is unavailable. `channels`
@@ -61,11 +72,13 @@ sink present, no configured virtual sink, and the selected sink equal to that
 configured sink. The audio module receives this per-open policy snapshot; it does
 not derive eligibility from product settings.
 
-Open/lookup return `{ok:true,stream,endpoint,requested_endpoint,virtual_sink,channels,capture_sink_without_routing,format}`.
+Open/lookup return `{ok:true,stream,endpoint,requested_endpoint,virtual_sink,channels,host_audio_enabled,capture_sink_without_routing,format}`.
 `endpoint` is the selected endpoint ID, `requested_endpoint` is the caller's
-regular selector, `virtual_sink` is the requested virtual selector, and `channels`
-is the resolved requested virtual layout. An omitted policy field is accepted
-as false for older callers. Format contains
+regular selector, `virtual_sink` is the requested virtual selector, `channels`
+is the resolved requested virtual layout, and `host_audio_enabled` echoes the
+selection policy. The actual selected endpoint ID shows whether automatic
+fallback was available. An omitted policy field defaults to false for existing
+callers. Format contains
 `sample_rate`, `channels`, `channel_mask`, and `format:"f32"|"i16"`. Status returns
 `{ok:true,enabled,audio_route_restore_pending,streams:[...]}` with only the
 caller's streams, optionally filtered by ID. The route flag reports a failed
@@ -165,7 +178,10 @@ of routed opens must exercise successful switching/restoration, each partial
 switch failure and rollback, role changes made by another application, device
 removal, and recovery after restoration failure. Waveform/channel correctness,
 silence, sustained backpressure, discontinuities, and cancellation while drivers
-initialize also need hardware coverage.
+initialize also need hardware coverage. Automatic Steam fallback has pure
+endpoint-policy tests only; it requires an active Steam Streaming Speakers
+device, which Amaterasu does not install, and has not yet been qualified on that
+hardware. Non-Windows audio capture remains unsupported.
 
 Primary API references:
 

@@ -7,7 +7,7 @@ use crate::{
     },
     virtual_sink::{
         ChannelLayout, VirtualFormatCandidate, VirtualSampleFormat, channel_layout,
-        preferred_format_candidates, select_endpoint,
+        preferred_format_candidates, select_endpoint, select_policy_virtual_sink,
     },
 };
 use amaterasu_media::{
@@ -657,26 +657,44 @@ impl Capture {
         requested: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Self> {
         let apartment = Apartment::start()?;
         let enumerator = enumerator()?;
-        let desired_layout = virtual_sink
-            .map(|_| channel_layout(channels.unwrap_or(2)))
+        let active_endpoints = if virtual_sink.is_some() {
+            Some(active_render_endpoints(&enumerator)?)
+        } else if !host_audio_enabled || requested.is_empty() || requested == "default" {
+            active_render_endpoints(&enumerator).ok()
+        } else {
+            None
+        };
+        let automatic_virtual_sink = active_endpoints.as_deref().and_then(|endpoints| {
+            select_policy_virtual_sink(endpoints, requested, virtual_sink, host_audio_enabled)
+        });
+        let uses_virtual_sink = virtual_sink.is_some() || automatic_virtual_sink.is_some();
+        let effective_channels = channels.or_else(|| automatic_virtual_sink.map(|_| 2));
+        let desired_layout = uses_virtual_sink
+            .then(|| channel_layout(effective_channels.unwrap_or(2)))
             .transpose()?;
         if virtual_sink.is_some() && capture_sink_without_routing {
             return Err("invalid_open_policy");
         }
+        let effective_capture_only =
+            capture_sink_without_routing && automatic_virtual_sink.is_none();
         let preferred_valid_bits = desired_layout.map(|_| default_render_valid_bits(&enumerator));
         // SAFETY: activation and capture interface references never leave this
         // apartment. The mix-format allocation stays live through Initialize.
         unsafe {
             let device = if let Some(selector) = virtual_sink {
-                let endpoints = active_render_endpoints(&enumerator)?;
-                let selected = select_endpoint(&endpoints, selector).ok_or("endpoint_not_found")?;
+                let endpoints = active_endpoints.as_deref().ok_or("endpoint_not_found")?;
+                let selected = select_endpoint(endpoints, selector).ok_or("endpoint_not_found")?;
                 let wide: Vec<u16> = selected.id.encode_utf16().chain(Some(0)).collect();
                 enumerator.GetDevice(PCWSTR(wide.as_ptr()))
-            } else if requested == "default" {
+            } else if let Some(selected) = automatic_virtual_sink {
+                let wide: Vec<u16> = selected.id.encode_utf16().chain(Some(0)).collect();
+                enumerator.GetDevice(PCWSTR(wide.as_ptr()))
+            } else if requested.is_empty() || requested == "default" {
                 enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)
             } else {
                 let wide: Vec<u16> = requested.encode_utf16().chain(Some(0)).collect();
@@ -692,8 +710,7 @@ impl Capture {
                 return Err("not_render_endpoint");
             }
             let endpoint = identifier(&device)?;
-            let route_lease =
-                RouteLease::acquire(&enumerator, &endpoint, capture_sink_without_routing)?;
+            let route_lease = RouteLease::acquire(&enumerator, &endpoint, effective_capture_only)?;
             let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
                 (Some(layout), Some(valid_bits)) => {
                     Some(set_virtual_device_layout(&endpoint, layout, valid_bits)?)
@@ -984,7 +1001,7 @@ mod tests {
             .or(devices.first())
             .expect("test needs an active render endpoint");
         let before = defaults();
-        let mut capture = Capture::open(&endpoint.id, None, None, true).unwrap();
+        let mut capture = Capture::open(&endpoint.id, None, None, true, true).unwrap();
         assert_eq!(capture.endpoint(), endpoint.id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut packets = 0;

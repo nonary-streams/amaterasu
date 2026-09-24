@@ -33,6 +33,7 @@ pub trait Backend: Send {
         endpoint: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Opened>;
 }
@@ -48,12 +49,14 @@ impl Backend for NativeBackend {
         endpoint: &str,
         virtual_sink: Option<&str>,
         channels: Option<u32>,
+        host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<Opened> {
         let (source, endpoint, format) = Worker::open(
             endpoint.to_owned(),
             virtual_sink.map(str::to_owned),
             channels,
+            host_audio_enabled,
             capture_sink_without_routing,
         )?;
         Ok(Opened {
@@ -76,6 +79,7 @@ impl Worker {
         endpoint: String,
         virtual_sink: Option<String>,
         channels: Option<u32>,
+        host_audio_enabled: bool,
         capture_sink_without_routing: bool,
     ) -> AudioResult<(Self, String, Format)> {
         let (sender, packets) = mpsc::sync_channel(QUEUE_PACKETS);
@@ -91,6 +95,7 @@ impl Worker {
                     &endpoint,
                     virtual_sink.as_deref(),
                     channels,
+                    host_audio_enabled,
                     capture_sink_without_routing,
                 ) {
                     Ok(capture) => capture,

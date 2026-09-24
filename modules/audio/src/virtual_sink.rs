@@ -1,5 +1,8 @@
-use crate::model::{AudioResult, Endpoint};
+use crate::model::AudioResult;
+#[cfg(any(windows, test))]
+use crate::model::Endpoint;
 
+#[cfg(any(windows, test))]
 pub const DEFAULT_VIRTUAL_SINK_ADAPTER: &str = "Steam Streaming Speakers";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8,6 +11,7 @@ pub struct ChannelLayout {
     pub masks: &'static [u32],
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtualSampleFormat {
     Float32,
@@ -17,7 +21,9 @@ pub enum VirtualSampleFormat {
     Signed16,
 }
 
+#[cfg(any(windows, test))]
 impl VirtualSampleFormat {
+    #[cfg(windows)]
     pub const fn container_bits(self) -> u16 {
         match self {
             Self::Signed24 => 24,
@@ -26,6 +32,7 @@ impl VirtualSampleFormat {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub const fn valid_bits(self) -> u16 {
         match self {
             Self::Signed24 => 24,
@@ -35,11 +42,13 @@ impl VirtualSampleFormat {
         }
     }
 
+    #[cfg(windows)]
     pub const fn is_float(self) -> bool {
         matches!(self, Self::Float32)
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtualFormatCandidate {
     pub sample_format: VirtualSampleFormat,
@@ -61,6 +70,7 @@ pub fn channel_layout(channels: u32) -> AudioResult<ChannelLayout> {
 }
 
 /// Builds candidate order from Vibeshine's channel-specific preferred formats.
+#[cfg(any(windows, test))]
 pub fn format_candidates(channels: u32) -> AudioResult<Vec<VirtualFormatCandidate>> {
     use VirtualSampleFormat::{Float32 as F32, Signed16 as S16, Signed24 as S24};
     use VirtualSampleFormat::{Signed24In32 as S24In32, Signed32 as S32};
@@ -86,6 +96,7 @@ pub fn format_candidates(channels: u32) -> AudioResult<Vec<VirtualFormatCandidat
         .collect())
 }
 
+#[cfg(any(windows, test))]
 pub fn preferred_format_candidates(
     channels: u32,
     preferred_valid_bits: u16,
@@ -98,6 +109,7 @@ pub fn preferred_format_candidates(
 
 /// Matches the configured text against the endpoint fields in Vibeshine's
 /// priority order. Empty selection means the built-in Steam adapter match.
+#[cfg(any(windows, test))]
 pub fn select_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Option<&'a Endpoint> {
     if selector.is_empty() {
         return endpoints.iter().find(|endpoint| {
@@ -122,6 +134,30 @@ pub fn select_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Option<
     })
 }
 
+/// Selects the default Steam endpoint when product policy disables host audio
+/// or no ordinary sink is available. An explicit virtual selector always wins.
+#[cfg(any(windows, test))]
+pub fn select_policy_virtual_sink<'a>(
+    endpoints: &'a [Endpoint],
+    requested_endpoint: &str,
+    explicit_virtual_sink: Option<&str>,
+    host_audio_enabled: bool,
+) -> Option<&'a Endpoint> {
+    if explicit_virtual_sink.is_some() {
+        return None;
+    }
+
+    let ordinary_sink_missing = requested_endpoint.is_empty()
+        || (requested_endpoint == "default"
+            && !endpoints.iter().any(|endpoint| endpoint.default_multimedia));
+    if host_audio_enabled && !ordinary_sink_missing {
+        return None;
+    }
+
+    select_endpoint(endpoints, "")
+}
+
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy)]
 enum MatchField {
     Id,
@@ -197,6 +233,60 @@ mod tests {
             "render.virtual"
         );
         assert!(select_endpoint(&endpoints[..1], "").is_none());
+    }
+
+    #[test]
+    fn audio_policy_uses_steam_when_host_audio_is_disabled_or_ordinary_sink_is_missing() {
+        let mut endpoints = [
+            endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
+            endpoint(
+                "render.virtual",
+                "Steam Streaming Speakers",
+                "virtual speakers",
+                DEFAULT_VIRTUAL_SINK_ADAPTER,
+            ),
+        ];
+        endpoints[0].default_multimedia = true;
+        assert_eq!(
+            select_policy_virtual_sink(&endpoints, "render.default", None, false)
+                .unwrap()
+                .id,
+            "render.virtual"
+        );
+        assert_eq!(
+            select_policy_virtual_sink(&endpoints, "", None, true)
+                .unwrap()
+                .id,
+            "render.virtual"
+        );
+        assert!(select_policy_virtual_sink(&endpoints, "default", None, true).is_none());
+    }
+
+    #[test]
+    fn explicit_virtual_selection_is_never_replaced_by_policy_fallback() {
+        let endpoints = [endpoint(
+            "render.virtual",
+            "Steam Streaming Speakers",
+            "virtual speakers",
+            DEFAULT_VIRTUAL_SINK_ADAPTER,
+        )];
+
+        assert!(
+            select_policy_virtual_sink(&endpoints, "render.default", Some("missing"), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_steam_endpoint_keeps_regular_sink_selection() {
+        let endpoints = [endpoint(
+            "render.default",
+            "Speakers",
+            "speakers",
+            "Realtek Audio",
+        )];
+
+        assert!(select_policy_virtual_sink(&endpoints, "render.default", None, false).is_none());
     }
 
     #[test]
