@@ -71,6 +71,8 @@ pub enum CatalogLaunch {
         arguments: Vec<String>,
         #[serde(default)]
         working_directory: Option<String>,
+        #[serde(default = "default_auto_detach", alias = "auto-detach")]
+        auto_detach: bool,
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
@@ -105,11 +107,16 @@ fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
 }
 
+fn default_auto_detach() -> bool {
+    true
+}
+
 #[derive(Clone, Debug)]
 pub struct Executable {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: Option<String>,
+    pub auto_detach: bool,
     pub preparation: Vec<PreparationStep>,
 }
 impl Executable {
@@ -121,21 +128,34 @@ impl Executable {
                 program,
                 arguments,
                 working_directory,
-                preparation,
+                auto_detach,
+                mut preparation,
             } => {
+                let working_directory = working_directory.filter(|directory| !directory.is_empty());
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
                     || working_directory
                         .as_deref()
                         .is_some_and(|cwd| !valid_native_path(cwd))
-                    || !valid_preparation(&preparation)
                 {
+                    return Err("unsupported_launch_spec");
+                }
+                // Match Vibeshine's command-directory fallback for this structured executable.
+                let resolved_working_directory = working_directory
+                    .clone()
+                    .or_else(|| inferred_working_directory(&program));
+                apply_preparation_working_directories(
+                    &mut preparation,
+                    working_directory.as_deref(),
+                );
+                if !valid_preparation(&preparation) {
                     return Err("unsupported_launch_spec");
                 }
                 Ok(Self {
                     program,
                     arguments,
-                    working_directory,
+                    working_directory: resolved_working_directory,
+                    auto_detach,
                     preparation,
                 })
             }
@@ -146,6 +166,37 @@ impl Executable {
         }
     }
 }
+
+fn apply_preparation_working_directories(
+    preparation: &mut [PreparationStep],
+    working_directory: Option<&str>,
+) {
+    for step in preparation {
+        apply_command_working_directory(&mut step.run, working_directory);
+        if let Some(undo) = &mut step.undo {
+            apply_command_working_directory(undo, working_directory);
+        }
+    }
+}
+
+fn apply_command_working_directory(
+    command: &mut ConfiguredCommand,
+    application_directory: Option<&str>,
+) {
+    if command.cwd.is_none() {
+        command.cwd = application_directory
+            .map(str::to_owned)
+            .or_else(|| inferred_working_directory(&command.executable));
+    }
+}
+
+fn inferred_working_directory(executable: &str) -> Option<String> {
+    Path::new(executable)
+        .parent()
+        .and_then(Path::to_str)
+        .map(str::to_owned)
+}
+
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -335,21 +386,33 @@ mod tests {
             "program":std::env::current_exe().unwrap(),
             "arguments":[],
             "working_directory":null,
+            "auto_detach":true,
             "preparation":preparation,
         })
     }
 
     #[test]
     fn catalog_preparation_is_strict_and_applies_defaults() {
-        let executable = Executable::from_catalog(&catalog_launch(json!([{
+        let inferred_directory = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut catalog_value = catalog_launch(json!([{
             "run":{"executable":std::env::current_exe().unwrap()},
-        }])))
-        .unwrap();
+        }]));
+        catalog_value["working_directory"] = json!("");
+        let executable = Executable::from_catalog(&catalog_value).unwrap();
         let command = &executable.preparation[0].run;
+        assert_eq!(
+            executable.working_directory.as_deref(),
+            Some(inferred_directory.as_str())
+        );
         assert_eq!(command.timeout_ms, DEFAULT_COMMAND_TIMEOUT_MS);
         assert!(command.args.is_empty());
         assert!(command.environment.is_empty());
-        assert!(command.cwd.is_none());
+        assert_eq!(command.cwd.as_deref(), Some(inferred_directory.as_str()));
         assert!(executable.preparation[0].undo.is_none());
 
         let mut unknown = catalog_launch(json!([{
@@ -363,6 +426,85 @@ mod tests {
         assert_eq!(
             Executable::from_catalog(&unknown).unwrap_err(),
             "unsupported_launch_spec"
+        );
+    }
+
+    #[test]
+    fn absent_application_directory_is_inferred_for_each_preparation_command() {
+        let command_directory = std::env::temp_dir().join("amaterasu-preparation-command-bin");
+        let undo_directory = std::env::temp_dir().join("amaterasu-undo-command-bin");
+        let command_executable = command_directory.join("prepare.exe");
+        let undo_executable = undo_directory.join("undo.exe");
+        let value = catalog_launch(json!([{
+            "run":{"executable":command_executable},
+            "undo":{"executable":undo_executable},
+        }]));
+
+        let executable = Executable::from_catalog(&value).unwrap();
+        assert_eq!(
+            executable.preparation[0].run.cwd.as_deref(),
+            Some(command_directory.to_str().unwrap())
+        );
+        assert_eq!(
+            executable.preparation[0]
+                .undo
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(undo_directory.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn catalog_working_directory_inherits_into_preparation_without_overriding_step_cwd() {
+        let application_directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let run_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let undo_directory = std::env::temp_dir()
+            .join("amaterasu-explicit-undo-directory")
+            .to_string_lossy()
+            .into_owned();
+        let mut value = catalog_launch(json!([
+            {
+                "run":{"executable":std::env::current_exe().unwrap()},
+                "undo":{"executable":std::env::current_exe().unwrap()},
+            },
+            {
+                "run":{"executable":std::env::current_exe().unwrap(),"cwd":run_directory},
+                "undo":{"executable":std::env::current_exe().unwrap(),"cwd":undo_directory},
+            }
+        ]));
+        value["working_directory"] = json!(application_directory);
+
+        let executable = Executable::from_catalog(&value).unwrap();
+        assert_eq!(
+            executable.preparation[0].run.cwd.as_deref(),
+            Some(application_directory.as_str())
+        );
+        assert_eq!(
+            executable.preparation[0]
+                .undo
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(application_directory.as_str())
+        );
+        assert_eq!(
+            executable.preparation[1].run.cwd.as_deref(),
+            Some(run_directory.as_str())
+        );
+        assert_eq!(
+            executable.preparation[1]
+                .undo
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(undo_directory.as_str())
         );
     }
 

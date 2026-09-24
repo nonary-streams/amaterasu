@@ -63,6 +63,10 @@ struct ProcessRecord {
     stop_deadline: Option<Instant>,
     #[serde(skip)]
     completion: Option<Completion>,
+    #[serde(skip)]
+    application_started_at: Option<Instant>,
+    #[serde(skip)]
+    auto_detached: bool,
 }
 
 impl ProcessRecord {
@@ -79,6 +83,8 @@ impl ProcessRecord {
             child: None,
             stop_deadline: None,
             completion: None,
+            application_started_at: None,
+            auto_detached: false,
         };
         if record.lifecycle.is_none() {
             record.spawn_application();
@@ -102,6 +108,7 @@ impl ProcessRecord {
             Ok(child) => {
                 self.pid = Some(child.id());
                 self.child = Some(child);
+                self.application_started_at = Some(Instant::now());
                 self.state = ProcessState::Running;
             }
             Err(error) => self.complete_or_clean(Completion::LaunchFailed {
@@ -139,10 +146,17 @@ impl ProcessRecord {
             .child
             .as_mut()
             .expect("running process has child")
-            .exited();
+            .successful_exit();
         match observation {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(None) => {}
+            Ok(Some(success)) => {
+                let exited_quickly = self.application_started_at.is_some_and(|started_at| {
+                    now.saturating_duration_since(started_at) < Duration::from_secs(5)
+                });
+                if self.spec.auto_detach && success && exited_quickly {
+                    self.auto_detached = true;
+                    return;
+                }
                 if self
                     .begin_main_stop(Completion::ExitedPending, now)
                     .is_err()
@@ -254,7 +268,8 @@ impl ProcessRecord {
         let now = Instant::now();
         match self.state {
             ProcessState::Preparing => self.advance_preparation(now),
-            ProcessState::Running => self.observe_running(now),
+            ProcessState::Running if !self.auto_detached => self.observe_running(now),
+            ProcessState::Running => {}
             ProcessState::Stopping if self.child.is_some() => self.advance_main_stop(now),
             ProcessState::Stopping => self.advance_lifecycle_cleanup(now),
             ProcessState::CleanupFailed { .. }
@@ -375,6 +390,7 @@ impl ProcessManager {
                 args,
                 environment,
                 cwd,
+                auto_detach,
                 preparation,
             } => {
                 let spec = LaunchSpec {
@@ -382,6 +398,7 @@ impl ProcessManager {
                     args,
                     environment,
                     cwd,
+                    auto_detach,
                     preparation,
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;

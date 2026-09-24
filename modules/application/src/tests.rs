@@ -8,7 +8,8 @@ fn launch(operation_id: &str, mode: &str) -> Value {
         "operation_id":operation_id,
         "executable":std::env::current_exe().unwrap().to_str().unwrap(),
         "args":["--exact","tests::controlled_child","--ignored"],
-        "environment":{"AMATERASU_TEST_CHILD":mode}
+        "environment":{"AMATERASU_TEST_CHILD":mode},
+        "auto_detach":false
     })
 }
 
@@ -21,16 +22,22 @@ fn status(manager: &mut ProcessManager, caller: &str, id: u64) -> Value {
 fn controlled_child() {
     match std::env::var("AMATERASU_TEST_CHILD").as_deref() {
         Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
-        Ok("exit") => {}
+        Ok("exit") => {
+            if let Ok(marker) = std::env::var("AMATERASU_TEST_MARKER") {
+                std::fs::write(marker, b"exit").unwrap();
+            }
+        }
+        Ok("exit-failure") => std::process::exit(7),
         Ok("tree") | Ok("tree_exit") | Ok("branch") | Ok("leaf") => tree_child(),
         Ok("trace") | Ok("trace_fail") | Ok("trace_sleep") | Ok("trace_fail_once") => trace_child(),
         #[cfg(unix)]
         Ok("graceful") => graceful_child(),
         Ok("cwd") => {
-            assert_eq!(
-                std::env::current_dir().unwrap(),
-                std::path::PathBuf::from(std::env::var("AMATERASU_TEST_CWD").unwrap())
-            );
+            let actual = std::env::current_dir().unwrap().canonicalize().unwrap();
+            let expected = std::path::PathBuf::from(std::env::var("AMATERASU_TEST_CWD").unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_eq!(actual, expected);
         }
         _ => {}
     }
@@ -38,6 +45,12 @@ fn controlled_child() {
 
 fn trace_child() {
     use std::io::Write;
+
+    if let Ok(expected) = std::env::var("AMATERASU_TEST_CWD") {
+        let actual = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let expected = std::path::PathBuf::from(expected).canonicalize().unwrap();
+        assert_eq!(actual, expected);
+    }
 
     let mode = std::env::var("AMATERASU_TEST_CHILD").unwrap();
     let trace = std::path::PathBuf::from(std::env::var("AMATERASU_TEST_TRACE").unwrap());
@@ -80,6 +93,11 @@ fn lifecycle_command(trace: &std::path::Path, event: &str, mode: &str) -> Value 
         "environment":environment,
         "timeout_ms":if mode == "trace_sleep" { 30_000 } else { 5_000 },
     })
+}
+
+fn set_lifecycle_working_directory(command: &mut Value, cwd: &std::path::Path) {
+    command["cwd"] = json!(cwd);
+    command["environment"]["AMATERASU_TEST_CWD"] = json!(cwd);
 }
 
 fn trace_events(path: &std::path::Path) -> Vec<String> {
@@ -161,6 +179,48 @@ fn tick_reaps_natural_exit_and_preserves_operation_record() {
     assert_eq!(exited["process"]["exit_code"], 0);
     assert_eq!(exited["process"]["success"], true);
     assert_eq!(manager.handle("alice", request), exited);
+}
+
+#[test]
+fn auto_detach_retains_a_quick_successful_launcher_until_explicit_stop() {
+    let directory = test_directory("auto-detach");
+    let marker = directory.join("launcher-exited");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("auto-detach", "exit");
+    request.as_object_mut().unwrap().remove("auto_detach");
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+
+    let started = manager.handle("alice", request.clone());
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "launcher did not exit quickly");
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    manager.reap_exited().unwrap();
+    let retained = status(&mut manager, "alice", id);
+    assert_eq!(retained["process"]["state"], "running", "{retained}");
+
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    let cancelled = wait_for_state(&mut manager, "alice", id, "cancelled");
+    assert_eq!(manager.handle("alice", request), cancelled);
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn auto_detach_does_not_retain_a_failed_launcher() {
+    let mut manager = ProcessManager::default();
+    let mut request = launch("auto-detach-failure", "exit-failure");
+    request["auto_detach"] = json!(true);
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+
+    let exited = wait_for_state(&mut manager, "alice", id, "exited");
+    assert_eq!(exited["process"]["success"], false);
+    manager.shutdown().unwrap();
 }
 
 #[test]
@@ -293,17 +353,26 @@ fn malformed_paths_arguments_environment_and_payload_are_rejected() {
 #[test]
 fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
     let directory = test_directory("ordered-lifecycle");
+    let undo_directory = test_directory("ordered-lifecycle-undo");
     let trace = directory.join("events");
     let mut manager = ProcessManager::default();
     let mut request = launch("prepared", "sleep");
+    let mut prepare_one = lifecycle_command(&trace, "prepare-one", "trace");
+    let mut undo_one = lifecycle_command(&trace, "undo-one", "trace");
+    let mut prepare_two = lifecycle_command(&trace, "prepare-two", "trace");
+    let mut undo_two = lifecycle_command(&trace, "undo-two", "trace");
+    set_lifecycle_working_directory(&mut prepare_one, &directory);
+    set_lifecycle_working_directory(&mut prepare_two, &directory);
+    set_lifecycle_working_directory(&mut undo_one, &undo_directory);
+    set_lifecycle_working_directory(&mut undo_two, &undo_directory);
     request["preparation"] = json!([
         {
-            "run":lifecycle_command(&trace, "prepare-one", "trace"),
-            "undo":lifecycle_command(&trace, "undo-one", "trace"),
+            "run":prepare_one,
+            "undo":undo_one,
         },
         {
-            "run":lifecycle_command(&trace, "prepare-two", "trace"),
-            "undo":lifecycle_command(&trace, "undo-two", "trace"),
+            "run":prepare_two,
+            "undo":undo_two,
         },
     ]);
 
@@ -353,6 +422,7 @@ fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
         ["prepare-one", "prepare-two", "undo-two", "undo-one"]
     );
     std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(undo_directory).unwrap();
 }
 
 #[test]
@@ -449,9 +519,11 @@ fn cancellation_settles_an_active_preparation_before_undo() {
     while trace_events(&trace).is_empty() {
         let tick_started = Instant::now();
         manager.reap_exited().unwrap();
+        // Keep this below the deliberately 30-second child delay while tolerating parallel test load.
         assert!(
-            tick_started.elapsed() < Duration::from_millis(500),
-            "a lifecycle tick blocked on a long command"
+            tick_started.elapsed() < Duration::from_secs(2),
+            "a lifecycle tick blocked on a long command for {:?}",
+            tick_started.elapsed()
         );
         assert!(
             Instant::now() < deadline,

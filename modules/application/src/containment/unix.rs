@@ -22,6 +22,10 @@ impl ContainedChild {
     }
 
     pub fn exited(&mut self) -> io::Result<bool> {
+        Ok(self.successful_exit()?.is_some())
+    }
+
+    pub fn successful_exit(&mut self) -> io::Result<Option<bool>> {
         // SAFETY: info is initialized writable storage. WNOWAIT deliberately keeps
         // our exclusive child unreaped, pinning its PID/PGID until final signaling.
         // The embedding host must not install SIGCHLD=SIG_IGN, SA_NOCLDWAIT, or reap
@@ -39,7 +43,13 @@ impl ContainedChild {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: successful waitid initialized siginfo_t with child status or zero.
-        Ok(unsafe { info.si_pid() } != 0)
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        // SAFETY: si_code and si_status are initialized for the reported child.
+        Ok(Some(
+            unsafe { info.si_code() } == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+        ))
     }
 
     fn signal(&mut self, signal: i32) -> io::Result<()> {

@@ -25,13 +25,32 @@ pub enum Launch {
         program: String,
         #[serde(default)]
         arguments: Vec<String>,
+        // Accept the sibling's per-application spelling but store one canonical field.
+        #[serde(
+            default,
+            alias = "working-dir",
+            deserialize_with = "empty_working_directory_as_none"
+        )]
         working_directory: Option<String>,
+        #[serde(default = "default_auto_detach", alias = "auto-detach")]
+        auto_detach: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         preparation: Vec<PreparationStep>,
     },
     Application {
         path: String,
     },
+}
+
+fn empty_working_directory_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|directory| !directory.is_empty()))
+}
+
+fn default_auto_detach() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,6 +98,7 @@ impl Entry {
                 program,
                 arguments,
                 working_directory,
+                auto_detach: _,
                 preparation,
             } => {
                 validate_path(program)?;

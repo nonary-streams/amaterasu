@@ -42,6 +42,8 @@ struct Harness {
     fail_release: bool,
     released: usize,
     catalog_preparation: Option<Value>,
+    catalog_working_directory: Option<String>,
+    catalog_auto_detach: Option<bool>,
     application_preparing_statuses: usize,
     preparation_terminal: Option<&'static str>,
     application_stopping_statuses: usize,
@@ -71,6 +73,8 @@ impl Harness {
             fail_release: false,
             released: 0,
             catalog_preparation: None,
+            catalog_working_directory: None,
+            catalog_auto_detach: None,
             application_preparing_statuses: 0,
             preparation_terminal: None,
             application_stopping_statuses: 0,
@@ -309,6 +313,13 @@ impl Harness {
                         if let Some(preparation) = &self.catalog_preparation {
                             reply["entry"]["launch"]["preparation"] = preparation.clone();
                         }
+                        if let Some(working_directory) = &self.catalog_working_directory {
+                            reply["entry"]["launch"]["working_directory"] =
+                                json!(working_directory);
+                        }
+                        if let Some(auto_detach) = self.catalog_auto_detach {
+                            reply["entry"]["launch"]["auto_detach"] = json!(auto_detach);
+                        }
                         if action == "resolve_exported_launch" {
                             reply["catalog_owner"] = json!("management");
                         }
@@ -449,6 +460,8 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
         .map(|(_, payload, _)| payload)
         .collect();
     assert_eq!(application[0]["action"], "launch");
+    assert_eq!(application[0]["cwd"], json!(command.parent().unwrap()));
+    assert_eq!(application[0]["auto_detach"], true);
     assert_eq!(
         application[0]["preparation"],
         json!([{
@@ -456,7 +469,7 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
                 "executable":command,
                 "args":[],
                 "environment":{},
-                "cwd":null,
+                "cwd":command.parent().unwrap(),
                 "timeout_ms":10_000,
             },
             "undo":null,
@@ -480,6 +493,90 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
         .rposition(|(_, payload, _)| payload["action"] == "status")
         .unwrap();
     assert!(activate > last_status);
+}
+
+#[test]
+fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
+    let mut harness = Harness::new();
+    let working_directory = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    harness.catalog_working_directory = Some(working_directory.clone());
+    harness.catalog_auto_detach = Some(false);
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", launch("working-directory"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("launch workflow sends an application launch request");
+    assert_eq!(application_launch["cwd"], working_directory);
+    assert_eq!(application_launch["auto_detach"], false);
+}
+
+#[test]
+fn persisted_catalog_working_directory_reaches_defaulted_preparation_and_undo_cwds() {
+    let mut harness = Harness::new();
+    let working_directory = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let explicit_directory = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let command = std::env::current_exe().unwrap();
+    harness.catalog_working_directory = Some(working_directory.clone());
+    harness.catalog_preparation = Some(json!([
+        {
+            "run":{"executable":command},
+            "undo":{"executable":command},
+        },
+        {
+            "run":{"executable":command,"cwd":explicit_directory},
+            "undo":{"executable":command,"cwd":explicit_directory},
+        }
+    ]));
+    let mut pipeline = pipeline();
+
+    let started = harness.request(
+        &mut pipeline,
+        "alice",
+        launch("working-directory-preparation"),
+    );
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let application_launch = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "launch"
+        })
+        .map(|(_, payload, _)| payload)
+        .expect("launch workflow sends an application launch request");
+    assert_eq!(application_launch["cwd"], working_directory);
+    assert_eq!(
+        application_launch["preparation"][0]["run"]["cwd"],
+        working_directory
+    );
+    assert_eq!(
+        application_launch["preparation"][0]["undo"]["cwd"],
+        working_directory
+    );
+    assert_eq!(
+        application_launch["preparation"][1]["run"]["cwd"],
+        explicit_directory
+    );
+    assert_eq!(
+        application_launch["preparation"][1]["undo"]["cwd"],
+        explicit_directory
+    );
 }
 
 #[test]

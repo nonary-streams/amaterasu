@@ -14,6 +14,8 @@ pub(crate) enum Action {
         #[serde(default)]
         environment: BTreeMap<String, String>,
         cwd: Option<String>,
+        #[serde(default = "default_auto_detach")]
+        auto_detach: bool,
         #[serde(default)]
         preparation: Vec<PreparationStep>,
     },
@@ -38,12 +40,17 @@ fn list_limit() -> usize {
     16
 }
 
+fn default_auto_detach() -> bool {
+    true
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LaunchSpec {
     pub executable: String,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub cwd: Option<String>,
+    pub auto_detach: bool,
     pub preparation: Vec<PreparationStep>,
 }
 

@@ -69,7 +69,10 @@ impl ContainedChild {
         self.child.id()
     }
     pub fn exited(&mut self) -> io::Result<bool> {
-        Ok(self.child.try_wait()?.is_some())
+        Ok(self.successful_exit()?.is_some())
+    }
+    pub fn successful_exit(&mut self) -> io::Result<Option<bool>> {
+        Ok(self.child.try_wait()?.map(|status| status.success()))
     }
     // Windows has no universal graceful termination primitive for arbitrary GUI
     // and console programs. Retain a grace interval, then terminate the owned job.

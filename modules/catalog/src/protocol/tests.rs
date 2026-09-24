@@ -139,6 +139,7 @@ fn validates_launch_metadata_cross_platform_and_persisted_identity() {
             program: program.into(),
             arguments: vec!["--literal=$HOME".into()],
             working_directory: None,
+            auto_detach: true,
             preparation: Vec::new(),
         };
         game.validate().unwrap();
@@ -171,6 +172,7 @@ fn preparation_defaults_serialize_as_canonical_metadata() {
     game.validate().unwrap();
 
     let encoded = serde_json::to_value(&game).unwrap();
+    assert_eq!(encoded["launch"]["auto_detach"], true);
     assert_eq!(
         encoded["launch"]["preparation"],
         json!([{
@@ -193,6 +195,94 @@ fn preparation_defaults_serialize_as_canonical_metadata() {
 
     let unprepared = serde_json::to_value(entry("Unprepared game")).unwrap();
     assert!(unprepared["launch"].get("preparation").is_none());
+}
+
+#[test]
+fn auto_detach_can_be_disabled_and_persists_across_reload() {
+    let game: Entry = serde_json::from_value(json!({
+        "name":"Explicit foreground app",
+        "launch":{
+            "kind":"executable",
+            "program":"/games/example/game",
+            "auto-detach":false
+        }
+    }))
+    .unwrap();
+    game.validate().unwrap();
+    let encoded = serde_json::to_value(&game).unwrap();
+    assert_eq!(encoded["launch"]["auto_detach"], false);
+    let reloaded: Entry = serde_json::from_value(encoded).unwrap();
+    assert_eq!(
+        serde_json::to_value(reloaded).unwrap()["launch"]["auto_detach"],
+        false
+    );
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name":"Ambiguous detach policy",
+            "launch":{
+                "kind":"executable",
+                "program":"/games/example/game",
+                "auto-detach":false,
+                "auto_detach":true
+            }
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn vibeshine_working_dir_alias_persists_as_the_canonical_launch_directory() {
+    let entry: Entry = serde_json::from_value(json!({
+        "name": "Game with a working directory",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/example/bin/game",
+            "working-dir": "/games/example"
+        }
+    }))
+    .unwrap();
+    entry.validate().unwrap();
+
+    let Change::Write { document, .. } = apply(
+        Operation::Create {
+            entry,
+            expected_revision: 0,
+        },
+        None,
+    )
+    .unwrap() else {
+        panic!("creating a catalog entry must persist it");
+    };
+    let persisted_document = serde_json::to_value(&document).unwrap();
+    let persisted: Document = serde_json::from_value(persisted_document).unwrap();
+    let persisted = serde_json::to_value(persisted.entries.values().next().unwrap()).unwrap();
+    assert_eq!(persisted["launch"]["working_directory"], "/games/example");
+    assert!(persisted["launch"].get("working-dir").is_none());
+
+    let empty_alias: Entry = serde_json::from_value(json!({
+        "name": "Use executable directory",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/example/bin/game",
+            "working-dir": ""
+        }
+    }))
+    .unwrap();
+    empty_alias.validate().unwrap();
+    let empty_alias = serde_json::to_value(empty_alias).unwrap();
+    assert!(empty_alias["launch"]["working_directory"].is_null());
+    assert!(empty_alias["launch"].get("working-dir").is_none());
+
+    let duplicate_aliases = json!({
+        "name": "Ambiguous working directory",
+        "launch": {
+            "kind": "executable",
+            "program": "/games/example/bin/game",
+            "working-dir": "/games/example",
+            "working_directory": "/games/other"
+        }
+    });
+    assert!(serde_json::from_value::<Entry>(duplicate_aliases).is_err());
 }
 
 #[test]
