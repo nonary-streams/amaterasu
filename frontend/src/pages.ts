@@ -365,6 +365,8 @@ namespace Amaterasu {
         ]);
         if (!context.content.isConnected) return;
         revision = reply.revision;
+        scan.disabled =
+          !context.api.allows("steam.refresh") || provider.enabled === false;
         const rows = reply.games.map((game) => [
           el(
             "div",
@@ -380,7 +382,9 @@ namespace Amaterasu {
             "div",
             "section-meta",
             badge(
-              provider.scanning
+              provider.enabled === false
+                ? "Discovery disabled"
+                : provider.scanning
                 ? "Scan in progress"
                 : provider.complete
                   ? "Scan complete"
@@ -396,7 +400,9 @@ namespace Amaterasu {
             ? table(["Application", "Steam app ID", "Status"], rows)
             : empty(
                 "No Steam discoveries",
-                "Configure Steam library roots on the host, then scan. Discovery does not import or launch games.",
+                provider.enabled === false
+                  ? "Enable Steam discovery in Settings to scan local libraries."
+                  : "Configure Steam library roots on the host, then scan. Discovery does not import or launch games.",
               ),
           ...(provider.warnings ?? []).map((warning) =>
             el("p", "notice", warning),

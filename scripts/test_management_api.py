@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 
 from test_component_updates import CARGO, run
 from test_host_service import Console
-from test_platform_modules import PlatformHarness
+from test_platform_modules import PlatformHarness, configure_steam_fixture
 
 ORIGIN = "http://127.0.0.1:3000"
 PASSWORD = "test-password-for-local-api-only"
@@ -122,12 +122,71 @@ def test_auth_and_crud(console, api):
         "renames": {"fps": "refresh"}, "removed_fields": [], "values": {"refresh": 120},
     }, administrator)
     assert status == 200 and migrated["ok"] and migrated["values"]["refresh"] == 120, migrated
+    status, host_settings, _ = api.post("/v1/nvhttp/settings", token=administrator)
+    assert status == 200 and host_settings["hostname"] == "Amaterasu-test", host_settings
+    status, default_host, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "", "expected_revision": host_settings["revision"],
+    }, administrator)
+    assert status == 200 and default_host["configured_hostname"] == "" and default_host["hostname"], default_host
+    connection = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        connection.request("GET", "/serverinfo")
+        default_info = ET.fromstring(connection.getresponse().read())
+    finally:
+        connection.close()
+    assert default_info.findtext("hostname") == default_host["hostname"], ET.tostring(default_info)
+    status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games",
+        "expected_revision": default_host["revision"],
+    }, administrator)
+    assert status == 200 and renamed_host["hostname"] == "Living Room & Games", renamed_host
+    status, conflict, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Stale", "expected_revision": host_settings["revision"],
+    }, administrator)
+    assert status == 200 and conflict["code"] == "revision_conflict", conflict
+    assert api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Foreign", "expected_revision": renamed_host["revision"],
+        "owner": "amaterasu.other",
+    }, administrator)[0] == 400
+    connection = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        connection.request("GET", "/serverinfo")
+        refreshed = ET.fromstring(connection.getresponse().read())
+    finally:
+        connection.close()
+    assert refreshed.findtext("hostname") == "Living Room & Games", ET.tostring(refreshed)
+    status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
+    assert status == 200 and steam_settings["values"]["enabled"] is False, steam_settings
+    status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
+    assert status == 200 and blocked_refresh["ok"] is False, blocked_refresh
+    status, steam_enabled, _ = api.post("/v1/steam/settings_update", {
+        "enabled": True, "expected_revision": steam_settings["revision"],
+    }, administrator)
+    assert status == 200 and steam_enabled["values"]["enabled"] is True, steam_enabled
+    status, stale, _ = api.post("/v1/steam/settings_update", {
+        "enabled": False, "expected_revision": steam_settings["revision"],
+    }, administrator)
+    assert status == 200 and stale.get("code", stale.get("error", {}).get("code")) == "revision_conflict", stale
+    status, refresh, _ = api.post("/v1/steam/refresh", token=administrator)
+    assert status == 200 and refresh["ok"], refresh
+    deadline = time.monotonic() + 5
+    while True:
+        status, games, _ = api.post("/v1/steam/list", token=administrator)
+        assert status == 200 and games["ok"], games
+        if games["complete"] and not games["scanning"]:
+            break
+        assert time.monotonic() < deadline, games
+        time.sleep(0.02)
+    assert len(games["games"]) == 1 and games["games"][0]["stable_id"] == "steam:730", games
+    assert games["games"][0]["installed"], games
     token = console.request("amaterasu.authentication/1", {"action": "issue_token", "scopes": ["catalog.read"], "ttl_seconds": 3600})
     assert token["ok"], token
     status, result, _ = api.post("/v1/catalog/list", token=token["bearer"])
     assert status == 200 and result["ok"], result
     status, result, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": deleted["revision"]}, token["bearer"])
     assert status == 403 and not result["ok"], result
+    assert api.post("/v1/nvhttp/settings", token=token["bearer"])[0] == 403
+    assert api.post("/v1/steam/settings", token=token["bearer"])[0] == 403
     assert token["bearer"] not in json.dumps(result)
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
@@ -151,6 +210,7 @@ def main():
     run(CARGO, "build", "--workspace", "--offline")
     with tempfile.TemporaryDirectory(prefix="amaterasu-management-") as temporary:
         harness = PlatformHarness(Path(temporary))
+        configure_steam_fixture(harness)
         bootstrap_path = harness.root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
         bootstrap["policy"]["settings"]["amaterasu.management"] = {
@@ -176,6 +236,16 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
+            status, host_settings, _ = api.post("/v1/nvhttp/settings", token=token["bearer"])
+            assert status == 403, host_settings
+            # The administrator login session expires on worker restart; a new
+            # login confirms product settings survived without leaking access.
+            status, relogged, _ = api.post("/v1/auth/login", {"username": "administrator", "password": PASSWORD})
+            assert status == 200 and relogged["ok"], relogged
+            status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
+            assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
+            status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
+            assert status == 200 and steam_settings["values"]["enabled"] is True, steam_settings
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.
@@ -190,7 +260,8 @@ def main():
         finally:
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog CRUD, token persistence/revocation,")
-    print("session restart invalidation, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("Moonlight hostname/Steam settings CAS, discovery and restart persistence, session restart invalidation,")
+    print("strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":

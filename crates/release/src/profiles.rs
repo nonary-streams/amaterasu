@@ -118,11 +118,11 @@ const STEAM: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.steam",
     library: "amaterasu_steam",
     provides: &["amaterasu.steam/1"],
-    calls: &[],
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration", "amaterasu.state"],
 };
 
 const AUTHENTICATION: ComponentDefinition = ComponentDefinition {
@@ -152,6 +152,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_nvhttp",
     provides: &["amaterasu.nvhttp/1"],
     calls: &[
+        "amaterasu.configuration/1",
         "amaterasu.input/1",
         "amaterasu.pairing/1",
         "amaterasu.state/1",
@@ -175,6 +176,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
     native_uses: &["amaterasu.identity/1"],
     dependencies: &[
         RUNTIME_ID,
+        "amaterasu.configuration",
         "amaterasu.pairing",
         "amaterasu.state",
         "amaterasu.catalog",
@@ -490,6 +492,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode/1",
         "amaterasu.encode/1",
         "amaterasu.video/1",
+        "amaterasu.nvhttp/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -513,6 +516,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode",
         "amaterasu.encode",
         "amaterasu.video",
+        "amaterasu.nvhttp",
     ],
 };
 
@@ -535,6 +539,7 @@ impl PackageProfile {
             Self::StreamProbe => &[
                 RUNTIME,
                 STATE,
+                CONFIGURATION,
                 CATALOG,
                 APPLICATION,
                 LAUNCH,
@@ -722,7 +727,6 @@ pub fn installer_policy(
                 "http_bind": "127.0.0.1:47989",
                 "https_bind": "127.0.0.1:47984",
                 "allow_remote": false,
-                "hostname": "Amaterasu",
             }),
         ),
         (

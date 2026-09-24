@@ -37,18 +37,26 @@ namespace Amaterasu {
     entries: CatalogRow[];
     next_cursor: unknown | null;
   }
-  export interface Field {
-    type: "boolean" | "integer" | "string";
-    default: boolean | number | string;
-    minimum?: number;
-    maximum?: number;
-    min_length?: number;
-    max_length?: number;
-  }
+  export type Field =
+    | { type: "boolean"; default: boolean }
+    | { type: "integer" | "decimal"; default: number; minimum?: number; maximum?: number }
+    | { type: "string"; default: string; min_length?: number; max_length?: number }
+    | { type: "enum"; default: string; options: string[] }
+    | { type: "list"; default: unknown[]; item: Field; min_items?: number; max_items?: number }
+    | { type: "object"; default: Record<string, unknown>; fields: Record<string, Field> };
   export interface Configuration {
     revision: number;
     fields: Record<string, Field>;
-    values: Record<string, boolean | number | string>;
+    values: Record<string, unknown>;
+  }
+  export interface NvhttpSettings {
+    revision: number;
+    hostname: string;
+    configured_hostname: string;
+  }
+  export interface SteamSettings {
+    revision: number;
+    values: { enabled: boolean };
   }
   export interface Session {
     id: number;
@@ -90,6 +98,7 @@ namespace Amaterasu {
   }
   export interface SteamStatus {
     revision: number;
+    enabled?: boolean;
     game_count: number;
     scanning: boolean;
     complete: boolean;

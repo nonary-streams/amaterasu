@@ -37,11 +37,37 @@ var Amaterasu;
             return input.checked;
         if (field.type === "string")
             return input.value;
+        if (field.type === "enum") {
+            if (!field.options.includes(input.value))
+                throw new Error("Choose a listed setting value.");
+            return input.value;
+        }
+        if (field.type === "list" || field.type === "object") {
+            let value;
+            try {
+                value = JSON.parse(input.value);
+            }
+            catch {
+                throw new Error("Enter valid JSON for this setting.");
+            }
+            const wrongShape = field.type === "list"
+                ? !Array.isArray(value)
+                : value === null || Array.isArray(value) || typeof value !== "object";
+            if (wrongShape)
+                throw new Error(`Enter a JSON ${field.type === "list" ? "array" : "object"} for this setting.`);
+            return value;
+        }
         if (!input.value.trim())
-            throw new Error("Integer settings cannot be empty.");
+            throw new Error("Numeric settings cannot be empty.");
         const value = Number(input.value);
-        if (!Number.isSafeInteger(value))
-            throw new Error("Enter a whole number within the safe numeric range.");
+        if (!Number.isFinite(value) ||
+            (field.type === "integer" && !Number.isSafeInteger(value)))
+            throw new Error(field.type === "integer"
+                ? "Enter a whole number within the safe numeric range."
+                : "Enter a finite decimal number.");
+        if ((field.minimum != null && value < field.minimum) ||
+            (field.maximum != null && value > field.maximum))
+            throw new Error("Setting value is outside its allowed range.");
         return value;
     }
     Amaterasu.fieldValue = fieldValue;
@@ -462,7 +488,77 @@ var Amaterasu;
 (function (Amaterasu) {
     function renderSettings(context) {
         const area = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Settings", "Edit the values registered for this management console.", Amaterasu.button("Refresh", load)), area);
+        const hostArea = Amaterasu.el("div");
+        const steamArea = Amaterasu.el("div");
+        context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
+            void load();
+            void loadHost();
+            void loadSteam();
+        })), area, hostArea, steamArea);
+        async function loadSteam() {
+            steamArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Steam settings…"));
+            try {
+                const settings = await context.api.post("steam/settings");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const enabled = Amaterasu.input("steam_enabled", "", "checkbox");
+                enabled.checked = settings.values.enabled;
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save Steam settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Catalog synchronization and Steam launch support are not available yet."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        await context.api.post("steam/settings_update", {
+                            enabled: enabled.checked,
+                            expected_revision: settings.revision,
+                        });
+                        context.notify("Steam discovery setting saved.");
+                        await loadSteam();
+                    });
+                });
+                steamArea.replaceChildren(Amaterasu.panel("Steam", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    steamArea.replaceChildren(Amaterasu.errorPanel(error, loadSteam));
+            }
+        }
+        async function loadHost() {
+            hostArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host name…"));
+            try {
+                const settings = await context.api.post("nvhttp/settings");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const hostname = Amaterasu.input("hostname", settings.configured_hostname);
+                hostname.maxLength = 128;
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save host name");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        await context.api.post("nvhttp/settings_update", {
+                            hostname: hostname.value,
+                            expected_revision: settings.revision,
+                        });
+                        context.notify("Host name saved.");
+                        await loadHost();
+                    });
+                });
+                hostArea.replaceChildren(Amaterasu.panel("Moonlight host name", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    hostArea.replaceChildren(Amaterasu.errorPanel(error, loadHost));
+            }
+        }
         async function load() {
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading settings…"));
             try {
@@ -472,25 +568,51 @@ var Amaterasu;
                 const form = Amaterasu.el("form", "settings-form");
                 const inputs = new Map();
                 for (const [name, definition] of Object.entries(document.fields)) {
-                    const control = Amaterasu.input(name, String(document.values[name] ?? definition.default), definition.type === "boolean"
-                        ? "checkbox"
-                        : definition.type === "integer"
-                            ? "number"
-                            : "text");
+                    const value = document.values[name] ?? definition.default;
+                    let control;
+                    if (definition.type === "enum") {
+                        const select = Amaterasu.el("select");
+                        select.name = name;
+                        for (const optionValue of definition.options) {
+                            const option = Amaterasu.el("option", "", optionValue);
+                            option.value = optionValue;
+                            select.append(option);
+                        }
+                        select.value = String(value);
+                        control = select;
+                    }
+                    else if (definition.type === "list" ||
+                        definition.type === "object") {
+                        const editor = Amaterasu.el("textarea");
+                        editor.name = name;
+                        editor.rows = 6;
+                        editor.value = JSON.stringify(value, null, 2);
+                        control = editor;
+                    }
+                    else {
+                        control = Amaterasu.input(name, String(value), definition.type === "boolean"
+                            ? "checkbox"
+                            : definition.type === "integer" ||
+                                definition.type === "decimal"
+                                ? "number"
+                                : "text");
+                    }
                     if (definition.type === "boolean")
-                        control.checked = Boolean(document.values[name] ?? definition.default);
-                    if (definition.type === "integer") {
-                        control.step = "1";
+                        control.checked = Boolean(value);
+                    if (definition.type === "integer" || definition.type === "decimal") {
+                        const numericControl = control;
+                        numericControl.step = definition.type === "integer" ? "1" : "any";
                         if (definition.minimum != null)
-                            control.min = String(definition.minimum);
+                            numericControl.min = String(definition.minimum);
                         if (definition.maximum != null)
-                            control.max = String(definition.maximum);
+                            numericControl.max = String(definition.maximum);
                     }
                     if (definition.type === "string") {
+                        const textControl = control;
                         if (definition.min_length != null)
-                            control.minLength = definition.min_length;
+                            textControl.minLength = definition.min_length;
                         if (definition.max_length != null)
-                            control.maxLength = definition.max_length;
+                            textControl.maxLength = definition.max_length;
                     }
                     inputs.set(name, control);
                     form.append(Amaterasu.field(name, control, `Type: ${definition.type}`));
@@ -530,6 +652,8 @@ var Amaterasu;
             }
         }
         void load();
+        void loadHost();
+        void loadSteam();
     }
     Amaterasu.renderSettings = renderSettings;
 })(Amaterasu || (Amaterasu = {}));
@@ -736,18 +860,24 @@ var Amaterasu;
                 if (!context.content.isConnected)
                     return;
                 revision = reply.revision;
+                scan.disabled =
+                    !context.api.allows("steam.refresh") || provider.enabled === false;
                 const rows = reply.games.map((game) => [
                     Amaterasu.el("div", "", Amaterasu.el("strong", "", game.name), Amaterasu.el("small", "path block", game.install_directory ?? "")),
                     String(game.app_id),
                     Amaterasu.badge(game.installed ? "Installed" : "Discovered"),
                 ]);
-                area.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.badge(provider.scanning
-                    ? "Scan in progress"
-                    : provider.complete
-                        ? "Scan complete"
-                        : "Scan incomplete"), Amaterasu.el("span", "muted", `${provider.game_count} discoveries · revision ${reply.revision}`)), reply.games.length
+                area.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.badge(provider.enabled === false
+                    ? "Discovery disabled"
+                    : provider.scanning
+                        ? "Scan in progress"
+                        : provider.complete
+                            ? "Scan complete"
+                            : "Scan incomplete"), Amaterasu.el("span", "muted", `${provider.game_count} discoveries · revision ${reply.revision}`)), reply.games.length
                     ? Amaterasu.table(["Application", "Steam app ID", "Status"], rows)
-                    : Amaterasu.empty("No Steam discoveries", "Configure Steam library roots on the host, then scan. Discovery does not import or launch games."), ...(provider.warnings ?? []).map((warning) => Amaterasu.el("p", "notice", warning)), Amaterasu.pager(history.length > 1
+                    : Amaterasu.empty("No Steam discoveries", provider.enabled === false
+                        ? "Enable Steam discovery in Settings to scan local libraries."
+                        : "Configure Steam library roots on the host, then scan. Discovery does not import or launch games."), ...(provider.warnings ?? []).map((warning) => Amaterasu.el("p", "notice", warning)), Amaterasu.pager(history.length > 1
                     ? () => {
                         history.pop();
                         after = history[history.length - 1];

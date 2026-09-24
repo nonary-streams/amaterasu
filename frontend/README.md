@@ -44,9 +44,14 @@ browser API calls.
   catalog revisions; conflicts require refresh and are never retried silently.
   Application/executable paths, literal JSON argument arrays, description and tags
   are editable. Catalog operations do not launch applications.
-- Settings forms use the registered schema's boolean, integer, and string fields;
-  updates include expected revision. Empty/unregistered schemas explain what is
-  missing. Integer editing is limited to JavaScript's safe integer range.
+- Settings forms use the registered schema's boolean, integer, decimal, string,
+  enum, list, and object fields; updates include expected revision. List and object
+  values use JSON editors, with server-side nested validation. Empty/unregistered
+  schemas explain what is missing. Integer editing is limited to JavaScript's safe
+  integer range. The Moonlight host-name panel uses a separate product settings
+  route with its own revision and applies an accepted change to subsequent server
+  information responses. A separate Steam discovery toggle controls explicit local
+  library scans; synchronization with the application catalog remains unavailable.
 - Session pagination, stop requests, and explicit finish-stop actions. No client
   connection or streaming state is fabricated.
 - Process inventory and termination with confirmation, plus explicit status refresh.

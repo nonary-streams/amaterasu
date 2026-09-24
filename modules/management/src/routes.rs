@@ -42,6 +42,16 @@ pub fn resolve(path: &str) -> Option<Route> {
             "migrate",
             Some("configuration.write"),
         ),
+        ("nvhttp", "settings") => (
+            "amaterasu.nvhttp/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("nvhttp", "settings_update") => (
+            "amaterasu.nvhttp/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
         ("session", action) => (
             "amaterasu.session/1",
             session_action(action)?,
@@ -70,6 +80,16 @@ pub fn resolve(path: &str) -> Option<Route> {
         ("steam", "list") => ("amaterasu.steam/1", "list", Some("steam.read")),
         ("steam", "status") => ("amaterasu.steam/1", "status", Some("steam.read")),
         ("steam", "refresh") => ("amaterasu.steam/1", "refresh", Some("steam.refresh")),
+        ("steam", "settings") => (
+            "amaterasu.steam/1",
+            "settings_get",
+            Some("configuration.read"),
+        ),
+        ("steam", "settings_update") => (
+            "amaterasu.steam/1",
+            "settings_update",
+            Some("configuration.write"),
+        ),
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "counters") => (
             "amaterasu.diagnostics/1",
@@ -367,5 +387,57 @@ mod tests {
         assert!(payload(route, br#"{"action":"get"}"#).is_err());
         assert!(resolve("/v1/auth/issue_token").is_none());
         assert!(resolve("/v1/state/set").is_none());
+    }
+
+    #[test]
+    fn nvhttp_settings_routes_pin_domain_and_reject_unexpected_fields() {
+        let get = resolve("/v1/nvhttp/settings").unwrap();
+        assert_eq!(get.service, "amaterasu.nvhttp/1");
+        assert_eq!(get.scope, Some("configuration.read"));
+        assert_eq!(payload(get, br#"{}"#).unwrap()["action"], "settings_get");
+        assert!(payload(get, br#"{"owner":"amaterasu.other"}"#).is_err());
+
+        let update = resolve("/v1/nvhttp/settings_update").unwrap();
+        assert_eq!(update.scope, Some("configuration.write"));
+        assert_eq!(
+            payload(
+                update,
+                br#"{"hostname":"Living Room","expected_revision":0}"#
+            )
+            .unwrap()["action"],
+            "settings_update"
+        );
+        for rejected in [
+            br#"{"hostname":"Living Room"}"#.as_slice(),
+            br#"{"hostname":"Living Room","expected_revision":0,"owner":"other"}"#,
+            br#"{"hostname":"Living Room","expected_revision":-1}"#,
+            br#"{"hostname":"Long\nName","expected_revision":0}"#,
+        ] {
+            assert!(payload(update, rejected).is_err());
+        }
+        assert!(payload(update, br#"{"hostname":"","expected_revision":0}"#).is_ok());
+    }
+
+    #[test]
+    fn steam_settings_routes_require_configuration_scopes_and_fixed_payloads() {
+        let get = resolve("/v1/steam/settings").unwrap();
+        assert_eq!(get.service, "amaterasu.steam/1");
+        assert_eq!(get.scope, Some("configuration.read"));
+        assert_eq!(payload(get, br#"{}"#).unwrap()["action"], "settings_get");
+        assert!(payload(get, br#"{"principal":"amaterasu.other"}"#).is_err());
+
+        let update = resolve("/v1/steam/settings_update").unwrap();
+        assert_eq!(update.scope, Some("configuration.write"));
+        assert_eq!(
+            payload(update, br#"{"enabled":true,"expected_revision":0}"#).unwrap()["action"],
+            "settings_update"
+        );
+        for rejected in [
+            br#"{"enabled":true}"#.as_slice(),
+            br#"{"enabled":1,"expected_revision":0}"#,
+            br#"{"enabled":true,"expected_revision":0,"owner":"other"}"#,
+        ] {
+            assert!(payload(update, rejected).is_err());
+        }
     }
 }

@@ -53,6 +53,30 @@ test("integer settings reject blank, fractional and unsafe integer values", () =
   );
 });
 
+test("structured settings reject malformed or mismatched JSON before saving", () => {
+  const list = { type: "list" };
+  const object = { type: "object" };
+  for (const value of ["[", "{}", "null", "42"]) {
+    assert.throws(() => model.fieldValue(list, { value }));
+  }
+  for (const value of ["{", "[]", "null", '"text"']) {
+    assert.throws(() => model.fieldValue(object, { value }));
+  }
+  assert.deepEqual(ordinary(model.fieldValue(list, { value: '["left", "right"]' })), ["left", "right"]);
+  assert.deepEqual(ordinary(model.fieldValue(object, { value: '{"enabled":true}' })), { enabled: true });
+});
+
+test("decimal and enum settings validate numeric bounds and listed choices", () => {
+  const decimal = { type: "decimal", minimum: 0, maximum: 2 };
+  for (const value of ["", "NaN", "Infinity", "-0.1", "2.1"]) {
+    assert.throws(() => model.fieldValue(decimal, { value }));
+  }
+  assert.equal(model.fieldValue(decimal, { value: "1.25" }), 1.25);
+  const choice = { type: "enum", options: ["fast", "balanced"] };
+  assert.equal(model.fieldValue(choice, { value: "balanced" }), "balanced");
+  assert.throws(() => model.fieldValue(choice, { value: "unsupported" }));
+});
+
 test("page counts never claim an exact total while continuation exists", () => {
   assert.equal(model.countLabel(12, { after: "next" }), "12+");
   assert.equal(model.countLabel(0, { after: "continue-search" }), "0+");

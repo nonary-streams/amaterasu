@@ -43,6 +43,12 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
 }
 
 #[test]
+fn management_loads_after_its_nvhttp_settings_provider() {
+    assert!(MANAGEMENT.calls.contains(&"amaterasu.nvhttp/1"));
+    assert!(MANAGEMENT.dependencies.contains(&NVHTTP.id));
+}
+
+#[test]
 fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
     let probe = PackageProfile::StreamProbe.components();
     assert!(

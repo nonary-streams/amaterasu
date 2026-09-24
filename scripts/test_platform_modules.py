@@ -265,19 +265,19 @@ def configure_steam_fixture(harness: PlatformHarness) -> None:
     bootstrap_path.write_text(json.dumps(bootstrap))
 
 
-def test_steam_discovery(harness: PlatformHarness) -> None:
+def test_steam_disabled_policy(harness: PlatformHarness) -> None:
     responses = harness.requests(
         "amaterasu.steam/1",
         {"action": "refresh"},
         *[{"action": "status"} for _ in range(8)],
         {"action": "list"},
     )
-    assert all(response["ok"] for response in responses), responses
+    assert responses[0]["ok"] is False and responses[0]["code"] in {
+        "settings_loading", "disabled"
+    }, responses
+    assert all(response["ok"] for response in responses[1:]), responses
     result = responses[-1]
-    assert result["complete"] and not result["scanning"], result
-    assert len(result["games"]) == 1, result
-    assert result["games"][0]["stable_id"] == "steam:730", result
-    assert result["games"][0]["installed"], result
+    assert not result["enabled"] and not result["scanning"] and result["games"] == [], result
 
 
 def test_disabled_native_devices(harness: PlatformHarness) -> None:
@@ -321,12 +321,14 @@ def test_disabled_media_controls(harness: PlatformHarness) -> None:
     encoders, rejected, missing, status, unchanged = harness.requests(
         "amaterasu.encode/1",
         {"action": "enumerate"},
-        {"action": "open", "encoder": 0, "operation_id": "disabled.encode", "configuration": configuration},
+        {"action": "open", "encoder": {"clsid": "{00000000-0000-0000-0000-000000000000}",
+                               "hardware_url": None, "friendly_name": "disabled-test"},
+         "operation_id": "disabled.encode", "configuration": configuration},
         {"action": "lookup", "operation_id": "disabled.encode"},
         {"action": "status", "session_id": 1},
         {"action": "enumerate"},
     )
-    assert encoders == {"ok": True, "enabled": False, "encoders": []}, encoders
+    assert encoders["ok"] and not encoders["enabled"] and encoders["encoders"] == [], encoders
     assert not rejected["ok"] and rejected["code"] == "disabled", rejected
     for result in (missing, status):
         assert not result["ok"] and result["code"] == "session_not_found", result
@@ -335,7 +337,10 @@ def test_disabled_media_controls(harness: PlatformHarness) -> None:
     before, rejected, absent, closed, after = harness.requests(
         "amaterasu.video/1",
         {"action": "status"},
-        {"action": "open", "output": "disabled-test-output", "encoder": 0, "configuration": configuration},
+        {"action": "open", "output": "disabled-test-output",
+         "encoder": {"clsid": "{00000000-0000-0000-0000-000000000000}",
+                     "hardware_url": None, "friendly_name": "disabled-test"},
+         "configuration": configuration},
         {"action": "status", "stream": 1},
         {"action": "close", "stream": 1},
         {"action": "status"},
@@ -437,7 +442,7 @@ def main() -> None:
         test_diagnostics(harness)
         test_catalog(harness)
         test_application_process(harness)
-        test_steam_discovery(harness)
+        test_steam_disabled_policy(harness)
         test_disabled_native_devices(harness)
         test_disabled_media_controls(harness)
         test_disabled_audio_controls(harness)
@@ -449,7 +454,7 @@ def main() -> None:
     print("Passed: persistent state, CAS conflicts, schema validation, configuration reload,")
     print("session transitions, shared lease retention, request error isolation,")
     print("catalog persistence/CRUD, diagnostic records/counters, child process lifecycle,")
-    print("local Steam discovery, disabled native input/virtual-display policy,")
+    print("disabled Steam discovery, disabled native input/virtual-display policy,")
     print("and disabled DXGI/WGC/audio/Opus/encoder/video/UDP/stream-session controls without opening media sessions, plus disabled Moonlight HTTP/RTSP listeners.")
 
 

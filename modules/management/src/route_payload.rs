@@ -14,7 +14,49 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
         "amaterasu.launch/1" => launch(route.action, object),
+        "amaterasu.nvhttp/1" => nvhttp(route.action, object),
+        "amaterasu.steam/1" => steam(route.action, object),
         _ => Ok(()),
+    }
+}
+
+fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(object, &["enabled", "expected_revision"], &[])?;
+            if object.get("enabled").and_then(Value::as_bool).is_none()
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(object, &["hostname", "expected_revision"], &[])?;
+            let hostname = text(object, "hostname")?;
+            if hostname.len() > 128
+                || hostname.chars().any(char::is_control)
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
     }
 }
 

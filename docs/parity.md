@@ -5,9 +5,34 @@ the [implementation checkpoint](implementation-checkpoint.md). This advances the
 foundation but does not claim full application or streaming-host parity.
 
 Reference: sibling checkout commit `aa292c4cb097f22beab19d6ebf0307367f9bf449`.
-This initial ledger names the known feature domains and acceptance gates. A full
-configuration/route-by-route behavior inventory remains necessary. No unlisted
-feature is implicitly declared complete or out of scope.
+This initial ledger names the known feature domains and acceptance gates. The
+configuration inventory below is pinned separately; a full route-by-route behavior
+inventory remains necessary. No unlisted feature is implicitly declared complete
+or out of scope.
+
+## Configuration inventory and current progress
+
+The pinned [configuration inventory](configuration-parity.md) uses Vibeshine
+`vibe-test` commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d`. It records
+197 global settings, 41 application fields, 103 shared application/client override
+keys, and four aliases. [Coverage status](configuration-coverage.json) remains
+pending for every reference ID until its full behavior is verified.
+The [execution plan](configuration-execution-plan.md) assigns bounded domains
+and defines the evidence needed to close each ID.
+
+The configuration service now validates decimal, enum, list, and object fields
+and persists separate caller-owned product documents with versioned CAS updates.
+Management can edit the NVHTTP host name and Steam discovery toggle through
+fixed, scope-checked routes. The signed HTTP regression verifies durable updates,
+conflict handling, live Moonlight server-info naming (including the PC-name
+fallback), Steam discovery gating, and both settings after restart. These are
+partial implementations of their Vibeshine options: legacy host-name consumers
+and exact validation, and Steam catalog sync, artwork, and launch behavior still
+need parity work. The inventory statuses stay pending accordingly.
+The application catalog accepts Vibeshine's `working-dir` spelling and applies
+its directory precedence to launch, preparation and undo commands. That ID
+remains pending because Vibeshine also accepts shell/PATH command forms that
+Amaterasu's structured absolute-executable model does not represent.
 
 The pinned [route declaration inventory](reference-routes.json) and
 [Windows regression gates](windows-regression-gates.md) make part of that audit
@@ -71,6 +96,15 @@ The current unit tests cover abstract ownership and state behavior; they do not
 claim those hardware-specific regressions are fixed in this new project.
 
 ## Current verification evidence
+
+For the configuration increment, the locked full workspace test suite, strict
+workspace Clippy, rustfmt check, frontend tests, configuration inventory drift
+check, signed management HTTP regression, platform composition regression, and
+component update regression pass on the Windows development host. The
+application cwd test now compares canonical paths, and the long-child
+tick guard tolerates parallel test load while remaining below the child's
+30-second delay. Non-Windows hostname compilation and live target behavior
+remain unverified.
 
 The completed application lifecycle increment passed its focused application,
 catalog and launch suites, the locked full Rust workspace, strict workspace
