@@ -173,6 +173,7 @@ impl Controller {
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
+                        "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "capture": capture,

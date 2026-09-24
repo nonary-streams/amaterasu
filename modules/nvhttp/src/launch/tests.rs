@@ -766,6 +766,32 @@ fn global_video_batch_size_reaches_rtsp_open_and_is_snapshotted_at_admission() {
 }
 
 #[test]
+fn global_ping_timeout_reaches_rtsp_open_and_is_snapshotted_at_admission() {
+    for (configured, later_value) in [(0, 250), (250, 10_000), (i32::MAX as u32, 0)] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_ping_timeout_ms(configured);
+        let mut broker = Broker::default();
+
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        controller.set_global_ping_timeout_ms(later_value);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["ping_timeout_ms"], configured);
+    }
+}
+
+#[test]
 fn global_max_bitrate_caps_rtsp_profile_and_is_snapshotted_at_admission() {
     for (configured, later_value, expected) in [
         (Some(5_000), Some(8_000), 5_000),

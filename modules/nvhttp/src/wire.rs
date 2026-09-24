@@ -164,6 +164,10 @@ impl Router {
         self.launches.set_global_stream_audio(stream_audio);
     }
 
+    pub fn set_global_ping_timeout_ms(&mut self, ping_timeout_ms: u32) {
+        self.launches.set_global_ping_timeout_ms(ping_timeout_ms);
+    }
+
     pub fn set_global_video_max_batch_size_kb(&mut self, max_batch_size_kb: u8) {
         self.launches
             .set_global_video_max_batch_size_kb(max_batch_size_kb);

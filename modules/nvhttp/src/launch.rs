@@ -260,6 +260,7 @@ pub struct Controller {
     configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
+    global_ping_timeout_ms: u32,
     global_video_max_batch_size_kb: u8,
     global_max_bitrate_kbps: Option<u32>,
     global_minimum_fps_target: f64,
@@ -285,6 +286,7 @@ impl Controller {
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
+            global_ping_timeout_ms: 10_000,
             global_video_max_batch_size_kb: 64,
             global_max_bitrate_kbps: None,
             global_minimum_fps_target: 20.0,
@@ -316,6 +318,10 @@ impl Controller {
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.global_stream_audio = stream_audio;
+    }
+
+    pub fn set_global_ping_timeout_ms(&mut self, ping_timeout_ms: u32) {
+        self.global_ping_timeout_ms = ping_timeout_ms;
     }
 
     pub fn set_global_video_max_batch_size_kb(&mut self, value: u8) {
@@ -374,6 +380,7 @@ impl Controller {
         }
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
+        let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
         let global_minimum_fps_target = self.global_minimum_fps_target;
@@ -437,6 +444,7 @@ impl Controller {
             connect_data,
             global_fec_percentage,
             global_stream_audio,
+            global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
             global_minimum_fps_target,
