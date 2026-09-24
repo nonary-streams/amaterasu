@@ -143,6 +143,41 @@ fn four_streams_receive_equal_tick_budget_and_owner_limits_cannot_be_evicted() {
 }
 
 #[test]
+fn open_reports_batch_size_normalization_and_video_frame_uses_selected_allowance() {
+    for (requested, effective, fallback, expected_sends) in [
+        (0_u8, 64_u8, false, 64_usize),
+        (16, 16, false, 16),
+        (32, 32, false, 32),
+        (64, 64, false, 64),
+        (17, 64, true, 64),
+    ] {
+        let (video, audio) = receivers();
+        let mut request = request(&video, &audio, false);
+        request.video.max_batch_size_kb = requested;
+        let mut controller = controller();
+        let opened = controller
+            .handle("owner", Operation::Open(request))
+            .unwrap()
+            .payload;
+        assert_eq!(opened["video"]["max_batch_size_kb"], effective);
+        assert_eq!(opened["video_batch_size_fallback"], fallback);
+
+        let stream_id = opened["stream"].as_u64().unwrap();
+        controller
+            .streams
+            .get_mut(&stream_id)
+            .unwrap()
+            .delivery
+            .push_video(1, vec![vec![0; 1024]; 72]);
+        controller.tick();
+
+        let stream = &controller.streams[&stream_id];
+        assert_eq!(stream.delivery.sent_datagrams, expected_sends as u64);
+        assert_eq!(stream.delivery.queued(), 72 - expected_sends);
+    }
+}
+
+#[test]
 fn impossible_audio_wire_lengths_and_mapped_destinations_fail_before_open() {
     let (video, audio) = receivers();
     for encrypted in [false, true] {

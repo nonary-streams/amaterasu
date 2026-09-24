@@ -12,6 +12,8 @@ const DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
 const RECEIVES_PER_LANE: usize = 16;
 const SS_PING_BYTES: usize = DISCOVERY_TOKEN_BYTES + size_of::<u32>();
 const MAX_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
+const MAX_VIDEO_BATCH_BYTES: usize = 64 * 1024;
+const MAX_VIDEO_BATCH_PACKETS: usize = 64;
 
 #[derive(Clone, Copy)]
 pub enum Medium {
@@ -21,6 +23,7 @@ pub enum Medium {
 
 struct Datagram {
     medium: Medium,
+    video_frame: Option<u32>,
     bytes: Vec<u8>,
 }
 
@@ -108,6 +111,7 @@ pub struct Delivery {
     discovery_deadline: Option<Instant>,
     queue: VecDeque<Datagram>,
     bytes: usize,
+    video_max_batch_size_kb: u8,
     last_progress: Instant,
     pub sent_datagrams: u64,
     pub discarded_datagrams: u64,
@@ -150,6 +154,7 @@ impl Delivery {
             discovery_deadline,
             queue: VecDeque::new(),
             bytes: 0,
+            video_max_batch_size_kb: 64,
             last_progress: Instant::now(),
             sent_datagrams: 0,
             discarded_datagrams: 0,
@@ -191,13 +196,37 @@ impl Delivery {
                 .is_some_and(|total| total <= MAX_QUEUE_BYTES)
     }
 
+    #[cfg(test)]
     pub fn push(&mut self, medium: Medium, packets: Vec<Vec<u8>>) {
+        self.push_batch(medium, None, packets);
+    }
+
+    pub fn push_video(&mut self, frame: u32, packets: Vec<Vec<u8>>) {
+        self.push_batch(Medium::Video, Some(frame), packets);
+    }
+
+    pub fn push_audio(&mut self, packets: Vec<Vec<u8>>) {
+        self.push_batch(Medium::Audio, None, packets);
+    }
+
+    pub fn set_video_max_batch_size_kb(&mut self, value: u8) {
+        self.video_max_batch_size_kb = match value {
+            16 | 32 | 64 => value,
+            _ => 64,
+        };
+    }
+
+    fn push_batch(&mut self, medium: Medium, video_frame: Option<u32>, packets: Vec<Vec<u8>>) {
         if self.queue.is_empty() {
             self.last_progress = Instant::now();
         }
         for bytes in packets {
             self.bytes += bytes.len();
-            self.queue.push_back(Datagram { medium, bytes });
+            self.queue.push_back(Datagram {
+                medium,
+                video_frame,
+                bytes,
+            });
         }
     }
 
@@ -208,24 +237,51 @@ impl Delivery {
         self.bytes
     }
 
+    #[cfg(test)]
     pub fn tick(&mut self) {
+        self.tick_with_limit(SENDS_PER_STREAM);
+    }
+
+    pub fn tick_with_limit(&mut self, send_limit: usize) -> usize {
         if self.failure.is_some() {
-            return;
+            return 0;
         }
         if !self.ready() {
             self.tick_discovery();
             if !self.ready() || self.failure.is_some() {
-                return;
+                return 0;
             }
         }
         if !self.queue.is_empty() && self.last_progress.elapsed() >= Duration::from_secs(5) {
             self.fail("udp_stalled");
-            return;
+            return 0;
         }
-        for _ in 0..SENDS_PER_STREAM {
+        let mut sent = 0;
+        let mut audio_sent = 0;
+        let mut active_video_batch: Option<(Option<u32>, usize, usize)> = None;
+        while sent < send_limit.min(MAX_VIDEO_BATCH_PACKETS) {
             let Some(packet) = self.queue.front() else {
                 break;
             };
+            let (medium, video_frame, packet_bytes) =
+                (packet.medium, packet.video_frame, packet.bytes.len());
+            if matches!(medium, Medium::Video) {
+                if active_video_batch.is_none_or(|(active_frame, _, _)| active_frame != video_frame)
+                {
+                    active_video_batch =
+                        Some((video_frame, self.video_batch_packet_limit(packet_bytes), 0));
+                }
+                if active_video_batch
+                    .is_some_and(|(_, batch_limit, batch_sent)| batch_sent >= batch_limit)
+                {
+                    break;
+                }
+            } else {
+                active_video_batch = None;
+                if audio_sent >= SENDS_PER_STREAM {
+                    break;
+                }
+            }
             let socket = match packet.medium {
                 Medium::Video => &self.video.socket,
                 Medium::Audio => &self.audio.socket,
@@ -234,7 +290,22 @@ impl Delivery {
             if !self.record_send(result) {
                 break;
             }
+            sent += 1;
+            if matches!(medium, Medium::Video) {
+                if let Some((_, _, batch_sent)) = &mut active_video_batch {
+                    *batch_sent += 1;
+                }
+            } else {
+                audio_sent += 1;
+            }
         }
+        sent
+    }
+
+    fn video_batch_packet_limit(&self, packet_bytes: usize) -> usize {
+        let requested = usize::from(self.video_max_batch_size_kb) * 1024;
+        let cap = requested.min(MAX_VIDEO_BATCH_BYTES);
+        (cap / packet_bytes.max(1)).clamp(1, MAX_VIDEO_BATCH_PACKETS)
     }
 
     fn tick_discovery(&mut self) {

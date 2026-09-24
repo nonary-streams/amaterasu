@@ -20,6 +20,7 @@ pub struct Controller {
     issued: BTreeSet<u64>,
     used_keys: Vec<[u8; 16]>,
     used_discoveries: Vec<DiscoveryTokens>,
+    tick_cursor: usize,
 }
 
 impl Controller {
@@ -31,6 +32,7 @@ impl Controller {
             issued: BTreeSet::new(),
             used_keys: Vec::new(),
             used_discoveries: Vec::new(),
+            tick_cursor: 0,
         }
     }
 
@@ -189,10 +191,23 @@ impl Controller {
     }
 
     pub fn tick(&mut self) {
-        // Each stream has the same bounded send allowance, even when an earlier
-        // stream is blocked. Four streams bound the aggregate to 64 sends/tick.
-        for stream in self.streams.values_mut() {
-            stream.delivery.tick();
+        let stream_ids: Vec<_> = self.streams.keys().copied().collect();
+        let stream_count = stream_ids.len();
+        if stream_count == 0 {
+            return;
+        }
+        let start = self.tick_cursor % stream_count;
+        self.tick_cursor = (start + 1) % stream_count;
+        let base_budget = SENDS_PER_TICK / stream_count;
+        let extra_sends = SENDS_PER_TICK % stream_count;
+        // Rotate the remainder so stream order cannot claim the same extra
+        // allowance on every tick. The aggregate never exceeds 64 sends.
+        for offset in 0..stream_count {
+            let index = (start + offset) % stream_count;
+            let budget = base_budget + usize::from(offset < extra_sends);
+            if let Some(stream) = self.streams.get_mut(&stream_ids[index]) {
+                stream.delivery.tick_with_limit(budget);
+            }
         }
     }
 
@@ -243,6 +258,7 @@ fn metadata(id: u64, stream: &Stream) -> Value {
         "video_local":stream.video_local,
         "audio_local":stream.audio_local,
         "video":stream.video_settings,
+        "video_batch_size_fallback":stream.video_batch_size_fallback,
         "audio":stream.audio_settings,
         "stream_audio":stream.stream_audio,
         "video_encrypted":video_encrypted,

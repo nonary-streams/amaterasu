@@ -15,6 +15,7 @@ pub struct Stream {
     pub owner: String,
     pub peer: IpAddr,
     pub video_settings: VideoSettings,
+    pub video_batch_size_fallback: bool,
     pub audio_settings: AudioSettings,
     pub stream_audio: bool,
     pub video_local: SocketAddr,
@@ -38,7 +39,7 @@ impl Stream {
     pub fn open(owner: &str, request: &Open) -> TransportResult<Self> {
         let (video, audio) = packetizers(request)?;
         let (video_sealer, audio_sealer) = ciphers(request)?;
-        let delivery = match (&request.discovery, request.video_port, request.audio_port) {
+        let mut delivery = match (&request.discovery, request.video_port, request.audio_port) {
             (Some(discovery), None, None) => Delivery::discover(
                 request.local(true),
                 request.local(false),
@@ -56,11 +57,14 @@ impl Stream {
             _ => return Err("invalid_destination"),
         }
         .map_err(|_| "udp_bind_failed")?;
+        let video_settings = request.video.effective();
+        delivery.set_video_max_batch_size_kb(video_settings.max_batch_size_kb);
         let (video_local, audio_local) = delivery.addresses().map_err(|_| "udp_bind_failed")?;
         Ok(Self {
             owner: owner.into(),
             peer: request.peer_ip,
-            video_settings: request.video,
+            video_settings,
+            video_batch_size_fallback: request.video.batch_size_fallback(),
             audio_settings: request.audio,
             stream_audio: request.stream_audio,
             video_local,
@@ -189,7 +193,7 @@ impl Stream {
             Ok(datagrams) => datagrams,
             Err(code) => return self.fail(code),
         };
-        self.delivery.push(Medium::Video, datagrams);
+        self.delivery.push_video(frame_index, datagrams);
         self.video_sequence = Some(packet.sequence);
         self.video_timestamp = Some(packet.timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
@@ -246,7 +250,7 @@ impl Stream {
         };
         match result {
             Ok(datagrams) => {
-                self.delivery.push(Medium::Audio, datagrams);
+                self.delivery.push_audio(datagrams);
                 self.audio_sequence = Some(packet.sequence);
                 STATUS_OK
             }

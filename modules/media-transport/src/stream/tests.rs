@@ -281,6 +281,7 @@ fn one_batch_larger_than_hard_byte_limit_is_invalid_instead_of_permanently_busy(
         fec_percentage: 0,
         min_parity_shards: 0,
         max_fec_blocks: 1,
+        max_batch_size_kb: 64,
     };
     let mut stream = Stream::open("owner", &settings).unwrap();
     let mut bytes = vec![0x55; MAX_QUEUE_BYTES];

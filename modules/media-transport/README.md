@@ -43,7 +43,7 @@ The action and all fields are strict. Open fields:
 | `video_port`, `audio_port` | Fixed destination UDP ports, 1–65535; both omitted for discovery |
 | `discovery` | Optional `{video_ping_payload,audio_ping_payload}`; both are distinct 16-character unpadded base64url strings |
 | `video_bind`, `audio_bind` | Optional local socket addresses, normally port zero |
-| `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1}` |
+| `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1,max_batch_size_kb:64}` |
 | `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
 | `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
 | `encryption` | Optional `{key_hex:32 hexadecimal characters,key_id:u32,video:bool,audio:bool,permit_legacy_audio_iv_wrap:false}` |
@@ -56,6 +56,13 @@ safe legacy default. A negotiated modern client may explicitly select up to
 four blocks. FEC-disabled configurations must satisfy the packetizer's own
 zero-parity requirements. Audio uses the established stereo 48 kHz 4-data/2-parity
 profile. Surround and alternative channel mappings are unsupported.
+
+`video.max_batch_size_kb` defaults to 64 and accepts integer values from 0 to
+64. Zero means automatic and resolves to 64 KiB. The supported explicit values
+are 16, 32, and 64; another in-range value resolves to 64 KiB and is reported as
+`video_batch_size_fallback:true` in open, lookup, and status metadata. Values
+above 64 fail with `invalid_video_configuration`. The effective value is
+returned as `video.max_batch_size_kb`.
 
 `wire_payload_bytes` is the constant audio data-shard length, excluding RTP,
 and must be 1–1275 for plaintext or a multiple of 16 between 16 and 1280
@@ -85,7 +92,8 @@ bearer evidence supplied by the authenticated session; it is not cryptographic
 sender authentication.
 
 Open replies contain `ok`, `stream`, `peer_ip`, `stream_audio`, `peer_discovery`, `ready`, destination ports,
-`video_local`/`audio_local`, the `video`/`audio` configuration, `video_encrypted`,
+`video_local`/`audio_local`, the effective `video`/`audio` configuration,
+`video_batch_size_fallback`, `video_encrypted`,
 `audio_encrypted`, and `permit_legacy_audio_iv_wrap`. Keys/key IDs are not returned.
 Discovery destination ports are null until the corresponding lane freezes, then
 report the learned source port. Payloads are never returned.
@@ -141,14 +149,21 @@ return. There is no media service-request replay or automatic retransmission.
 Discovery admission returns `MEDIA_BUSY` without validating or changing media
 state until both lanes freeze.
 
-Every tick permits at most 16 sends per stream, at most 64 globally. A blocked
-stream does not consume another stream's allowance. `WouldBlock` or `Interrupted`
+Each controller tick distributes at most 64 sends evenly across its live
+streams; the remainder rotates between streams, and a blocked stream does not
+consume another stream's allowance. Video frames are queued as complete
+packetizer groups. A frame's software send allowance is the integer number of
+actual UDP payloads that fit in `min(64 KiB, max_batch_size_kb * 1024)`, clamped
+to 1–64 packets. A single payload larger than the byte cap still gets one send.
+Audio remains limited to 16 sends per stream per tick. `WouldBlock` or `Interrupted`
 retains the exact queued datagram, including its existing ciphertext, for a
 later tick. Other socket errors, short UDP sends, or five seconds without send
 progress fail the stream visibly and discard its remaining queue. Crypto
 failure also fails and discards the queue; consumed nonces are never rewound.
 UDP send success is only kernel admission: delivery loss, decoding failure,
 congestion control, retransmission and peer acknowledgements are not measured.
+This is a software send allowance using individual `UdpSocket::send` calls, not
+OS UDP segmentation offload. Windows USO and Linux GSO batching remain pending.
 Discovery reads at most 16 datagrams per lane per tick. Five seconds from open
 without both lanes fails with `udp_discovery_timeout`; queued pings cannot revive
 an expired stream.

@@ -5,6 +5,7 @@ pub type TransportResult<T> = Result<T, &'static str>;
 pub const MAX_DATAGRAMS: usize = 2048;
 pub const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub const SENDS_PER_STREAM: usize = 16;
+pub const SENDS_PER_TICK: usize = 64;
 pub const DISCOVERY_TOKEN_BYTES: usize = 16;
 
 fn yes() -> bool {
@@ -41,6 +42,12 @@ pub struct VideoSettings {
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
     pub max_fec_blocks: u8,
+    #[serde(default = "default_video_max_batch_size_kb")]
+    pub max_batch_size_kb: u8,
+}
+
+fn default_video_max_batch_size_kb() -> u8 {
+    64
 }
 
 impl Default for VideoSettings {
@@ -50,7 +57,32 @@ impl Default for VideoSettings {
             fec_percentage: 20,
             min_parity_shards: 2,
             max_fec_blocks: 1,
+            max_batch_size_kb: default_video_max_batch_size_kb(),
         }
+    }
+}
+
+impl VideoSettings {
+    pub fn valid_batch_size_kb(self) -> bool {
+        self.max_batch_size_kb <= 64
+    }
+
+    pub fn effective(self) -> Self {
+        Self {
+            max_batch_size_kb: self.effective_batch_size_kb(),
+            ..self
+        }
+    }
+
+    pub fn effective_batch_size_kb(self) -> u8 {
+        match self.max_batch_size_kb {
+            16 | 32 | 64 => self.max_batch_size_kb,
+            _ => 64,
+        }
+    }
+
+    pub fn batch_size_fallback(self) -> bool {
+        self.max_batch_size_kb != 0 && !matches!(self.max_batch_size_kb, 16 | 32 | 64)
     }
 }
 
@@ -177,6 +209,9 @@ impl Open {
         if !allow_remote && !self.peer_ip.is_loopback() {
             return Err("remote_disabled");
         }
+        if !self.video.valid_batch_size_kb() {
+            return Err("invalid_video_configuration");
+        }
         for bind in [self.video_bind, self.audio_bind].into_iter().flatten() {
             if bind.is_ipv4() != self.peer_ip.is_ipv4()
                 || bind.ip().is_multicast()
@@ -280,6 +315,60 @@ mod tests {
         .unwrap();
         assert!(request.stream_audio);
         assert!(request.validate(false).is_ok());
+        assert_eq!(request.video.max_batch_size_kb, 64);
+    }
+
+    #[test]
+    fn video_batch_size_accepts_reference_range_and_reports_normalized_values() {
+        for value in 0..=64 {
+            let settings = VideoSettings {
+                max_batch_size_kb: value,
+                ..VideoSettings::default()
+            };
+            assert!(settings.valid_batch_size_kb());
+            assert_eq!(
+                settings.effective_batch_size_kb(),
+                match value {
+                    16 | 32 | 64 => value,
+                    _ => 64,
+                }
+            );
+            assert_eq!(
+                settings.batch_size_fallback(),
+                value != 0 && !matches!(value, 16 | 32 | 64)
+            );
+        }
+        assert!(
+            !VideoSettings {
+                max_batch_size_kb: 65,
+                ..VideoSettings::default()
+            }
+            .valid_batch_size_kb()
+        );
+    }
+
+    #[test]
+    fn video_batch_size_open_field_is_optional_bounded_and_normalized_at_runtime() {
+        let base = json!({
+            "peer_ip":"127.0.0.1",
+            "video_port":50001,
+            "audio_port":50002,
+            "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":16}
+        });
+        let mut omitted = base.clone();
+        let request: Open = serde_json::from_value(omitted.clone()).unwrap();
+        assert_eq!(request.video.effective_batch_size_kb(), 64);
+
+        omitted["video"] = json!({"max_batch_size_kb":17});
+        let request: Open = serde_json::from_value(omitted).unwrap();
+        assert!(request.validate(false).is_ok());
+        assert_eq!(request.video.effective_batch_size_kb(), 64);
+        assert!(request.video.batch_size_fallback());
+
+        let mut out_of_range = base;
+        out_of_range["video"] = json!({"max_batch_size_kb":65});
+        let request: Open = serde_json::from_value(out_of_range).unwrap();
+        assert_eq!(request.validate(false), Err("invalid_video_configuration"));
     }
 
     #[test]
