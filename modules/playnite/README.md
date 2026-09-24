@@ -10,8 +10,12 @@ settings update that omits the optional field preserves its stored value.
 `autosync_remove_uninstalled`, the provider sends tombstones only for explicit
 Playnite records whose `installed` value is `false`. The catalog applies those
 tombstones only after a complete snapshot and removes only unchanged entries
-still owned by this provider. A manual refresh with `auto_sync` disabled does
-not send uninstalled tombstones. Missing IDs, excluded games, and ambiguous
+still owned by this provider. A manual refresh with `auto_sync` disabled updates
+metadata only for attached provider-owned rows whose IDs appear in the complete
+Playnite snapshot. It preserves each row's recorded source flags and does not
+add rows, change selection membership, or remove or replace entries. After a
+successful refresh, launch eligibility is limited to those matching attached
+rows in the complete snapshot. Missing IDs, excluded games, and ambiguous
 installation state are not treated as uninstalled. The catalog keeps user FEC
 overrides on retained entries and does not remove manual or other-provider
 entries.
@@ -29,6 +33,15 @@ Inventory pages are bound to one catalog collection revision; if it changes
 during enumeration, synchronization restarts before writing a snapshot. Cleanup
 is committed only after the provider completes that snapshot, and catalog CAS
 plus unchanged-entry checks preserve manual edits.
+
+With `enabled` and `auto_sync` both true, the provider starts a background
+snapshot when settings load or change, then schedules another attempt 30 seconds
+after each start; an active snapshot or catalog transaction can delay the next
+attempt. This polling also retries when Playnite is stopped or a snapshot fails.
+Vibeshine instead requests a sync when its configuration is applied and
+otherwise reconciles snapshots sent by the Playnite extension, which coalesces
+library changes with a three-second debounce. The 30-second polling interval
+and retry behavior are known timing differences.
 
 The typed GUID launch route uses the bounded extension connection and ticket
 protocol. Fullscreen entry is a separate Windows-only launch action, authorized

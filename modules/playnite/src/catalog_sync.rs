@@ -44,9 +44,11 @@ struct Transaction {
     remove_source_id_batches: Vec<Vec<String>>,
     expire_source_id_batches: Vec<Vec<String>>,
     selection_remove_source_id_batches: Vec<Vec<String>>,
+    manual_refresh_batches: Option<Vec<Vec<ManualRefreshEntry>>>,
     remove_uninstalled: bool,
     remove_expired: bool,
     remove_selection: bool,
+    publish_launchable_game_ids: bool,
     autosync_delete_after_days: u32,
     autosync_require_replacement: bool,
     sync_all_installed: bool,
@@ -78,6 +80,13 @@ struct InventoryEntry {
     attached: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ManualRefreshEntry {
+    candidate_batch_index: usize,
+    candidate_entry_index: usize,
+    source_flags: u32,
+}
+
 impl Transaction {
     fn payload(&self) -> Value {
         match self.stage {
@@ -100,7 +109,7 @@ impl Transaction {
                 "source_revision":self.source_revision,
                 "sequence":self.sequence,
                 "expected_revision":self.revision.expect("begin provides revision"),
-                "entries":self.entries.get(self.batch_index).cloned().unwrap_or_default(),
+                "entries":self.entries_for_batch(),
                 "remove_source_ids":self.uninstalled_ids_for_batch(),
                 "expire_source_ids":self.expired_ids_for_batch(),
                 "selection_remove_source_ids":self.selection_ids_for_batch()
@@ -121,15 +130,45 @@ impl Transaction {
         }
     }
 
+    fn entry_batch_count(&self) -> usize {
+        self.manual_refresh_batches
+            .as_ref()
+            .map_or(self.entries.len(), Vec::len)
+    }
+
     fn batch_count(&self) -> usize {
-        self.entries.len()
+        self.entry_batch_count()
             + self.remove_source_id_batches.len()
             + self.expire_source_id_batches.len()
             + self.selection_remove_source_id_batches.len()
     }
 
+    fn entries_for_batch(&self) -> Vec<Value> {
+        let Some(manual_batches) = &self.manual_refresh_batches else {
+            return self
+                .entries
+                .get(self.batch_index)
+                .cloned()
+                .unwrap_or_default();
+        };
+        manual_batches
+            .get(self.batch_index)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| {
+                let mut entry = self
+                    .entries
+                    .get(reference.candidate_batch_index)?
+                    .get(reference.candidate_entry_index)?
+                    .clone();
+                entry["source_flags"] = json!(reference.source_flags);
+                Some(entry)
+            })
+            .collect()
+    }
+
     fn uninstalled_ids_for_batch(&self) -> Vec<String> {
-        let Some(index) = self.batch_index.checked_sub(self.entries.len()) else {
+        let Some(index) = self.batch_index.checked_sub(self.entry_batch_count()) else {
             return Vec::new();
         };
         self.remove_source_id_batches
@@ -141,7 +180,7 @@ impl Transaction {
     fn expired_ids_for_batch(&self) -> Vec<String> {
         let index = self
             .batch_index
-            .saturating_sub(self.entries.len() + self.remove_source_id_batches.len());
+            .saturating_sub(self.entry_batch_count() + self.remove_source_id_batches.len());
         self.expire_source_id_batches
             .get(index)
             .cloned()
@@ -150,7 +189,7 @@ impl Transaction {
 
     fn selection_ids_for_batch(&self) -> Vec<String> {
         let index = self.batch_index.saturating_sub(
-            self.entries.len()
+            self.entry_batch_count()
                 + self.remove_source_id_batches.len()
                 + self.expire_source_id_batches.len(),
         );
@@ -182,6 +221,7 @@ impl Transaction {
         self.remove_source_id_batches.clear();
         self.expire_source_id_batches.clear();
         self.selection_remove_source_id_batches.clear();
+        self.manual_refresh_batches = None;
         self.call = Call::Submit {
             operation_id: self.next_operation_id(),
         };
@@ -377,14 +417,18 @@ impl Transaction {
             .iter()
             .map(|entry| entry.source_id.to_ascii_lowercase())
             .collect();
-        let replacements = if self.recent_mode && self.autosync_require_replacement {
-            self.selected_source_ids
-                .iter()
-                .filter(|source_id| !existing_ids.contains(*source_id))
-                .count()
-        } else {
-            0
-        };
+        if !self.remove_selection {
+            self.prepare_manual_refresh_batches();
+        }
+        let replacements =
+            if self.remove_selection && self.recent_mode && self.autosync_require_replacement {
+                self.selected_source_ids
+                    .iter()
+                    .filter(|source_id| !existing_ids.contains(*source_id))
+                    .count()
+            } else {
+                0
+            };
         let mut uninstalled = Vec::new();
         let mut expired = Vec::new();
         let mut selection = Vec::new();
@@ -456,6 +500,41 @@ impl Transaction {
             .map(<[String]>::to_vec)
             .collect();
     }
+
+    fn prepare_manual_refresh_batches(&mut self) {
+        let attached_source_flags: std::collections::BTreeMap<_, _> = self
+            .inventory
+            .iter()
+            .filter(|entry| entry.attached)
+            .map(|entry| (entry.source_id.to_ascii_lowercase(), entry.source_flags))
+            .collect();
+        let mut launchable_game_ids = std::collections::BTreeSet::new();
+        let manual_refresh_batches = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate_batch_index, candidate_batch)| {
+                let matching_entries: Vec<_> = candidate_batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate_entry_index, candidate)| {
+                        let source_id = candidate.get("source_id")?.as_str()?;
+                        let source_flags =
+                            attached_source_flags.get(&source_id.to_ascii_lowercase())?;
+                        launchable_game_ids.insert(source_id.to_ascii_lowercase());
+                        Some(ManualRefreshEntry {
+                            candidate_batch_index,
+                            candidate_entry_index,
+                            source_flags: *source_flags,
+                        })
+                    })
+                    .collect();
+                (!matching_entries.is_empty()).then_some(matching_entries)
+            })
+            .collect();
+        self.launchable_game_ids = launchable_game_ids;
+        self.manual_refresh_batches = Some(manual_refresh_batches);
+    }
 }
 
 fn should_expire(
@@ -502,23 +581,35 @@ impl CatalogSync {
         if self.transaction.is_some() {
             return Err("catalog_sync_busy".into());
         }
-        let selected = select_game_sources(snapshot, settings, now_unix);
-        let (entries, skipped) = prepare_selected_entries(&selected)?;
+        let (entries, skipped) = if settings.auto_sync {
+            let selected = select_game_sources(snapshot, settings, now_unix);
+            prepare_selected_entries(&selected)?
+        } else {
+            prepare_entries(&snapshot.games)?
+        };
         let remove_uninstalled = settings.auto_sync && settings.autosync_remove_uninstalled;
         let remove_expired = settings.auto_sync && settings.autosync_delete_after_days > 0;
         let remove_selection = settings.auto_sync;
-        let launchable_game_ids = entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry["source_id"].as_str())
-            .map(str::to_ascii_lowercase)
-            .collect();
-        let selected_source_ids = entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry["source_id"].as_str())
-            .map(str::to_ascii_lowercase)
-            .collect();
+        let launchable_game_ids = if settings.auto_sync {
+            entries
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry["source_id"].as_str())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        } else {
+            Default::default()
+        };
+        let selected_source_ids = if settings.auto_sync {
+            entries
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry["source_id"].as_str())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        } else {
+            Default::default()
+        };
         let uninstalled_game_ids = if remove_uninstalled {
             snapshot
                 .games
@@ -557,9 +648,11 @@ impl CatalogSync {
             remove_source_id_batches: Vec::new(),
             expire_source_id_batches: Vec::new(),
             selection_remove_source_id_batches: Vec::new(),
+            manual_refresh_batches: None,
             remove_uninstalled,
             remove_expired,
             remove_selection,
+            publish_launchable_game_ids: true,
             autosync_delete_after_days: settings.autosync_delete_after_days,
             autosync_require_replacement: settings.autosync_require_replacement,
             sync_all_installed: settings.sync_all_installed,
@@ -686,7 +779,10 @@ impl CatalogSync {
     fn finish_call(&mut self, mut transaction: Transaction, payload: Value) {
         match transaction.consume(payload) {
             Ok(true) => {
-                self.completed_launchable_game_ids = Some(transaction.launchable_game_ids.clone());
+                if transaction.publish_launchable_game_ids {
+                    self.completed_launchable_game_ids =
+                        Some(transaction.launchable_game_ids.clone());
+                }
                 self.last_error = None;
             }
             Ok(false) => self.transaction = Some(transaction),
@@ -705,7 +801,6 @@ impl CatalogSync {
     }
 }
 
-#[cfg(test)]
 fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
     let selected: Vec<_> = games
         .iter()
@@ -1032,6 +1127,96 @@ mod tests {
         finish_inventory(manual_transaction, inventory, 4);
         assert!(!manual_transaction.remove_uninstalled);
         assert!(manual_transaction.remove_source_id_batches.is_empty());
+    }
+
+    #[test]
+    fn manual_refresh_updates_only_attached_snapshot_rows_without_changing_membership() {
+        let attached_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let detached_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let absent_id = "c1b2c3d4-1234-5678-9abc-0123456789ab";
+        let new_id = "d1b2c3d4-1234-5678-9abc-0123456789ab";
+        let existing_source_flags =
+            crate::snapshot::SOURCE_RECENT | crate::snapshot::SOURCE_CATEGORY | SOURCE_INSTALLED;
+        let snapshot = Snapshot {
+            games: vec![
+                game(attached_id, "Updated attached", r"C:\Games\attached.exe"),
+                game(detached_id, "Detached", r"C:\Games\detached.exe"),
+                game(new_id, "New", r"C:\Games\new.exe"),
+            ],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let settings = ProductSettings {
+            auto_sync: false,
+            recent_games: 0,
+            ..ProductSettings::default()
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot, &settings, 1, 0).unwrap();
+        let mut transaction = sync.transaction.take().unwrap();
+        assert!(transaction.publish_launchable_game_ids);
+
+        finish_inventory(
+            &mut transaction,
+            vec![
+                inventory_entry(attached_id, None, existing_source_flags, true),
+                inventory_entry(detached_id, None, SOURCE_INSTALLED, false),
+                inventory_entry(absent_id, None, SOURCE_INSTALLED, true),
+            ],
+            4,
+        );
+        assert_eq!(transaction.entry_batch_count(), 1);
+        assert!(transaction.remove_source_id_batches.is_empty());
+        assert!(transaction.expire_source_id_batches.is_empty());
+        assert!(transaction.selection_remove_source_id_batches.is_empty());
+
+        assert!(
+            !transaction
+                .consume(json!({
+                    "ok":true,
+                    "revision":5,
+                    "generation":2,
+                    "next_sequence":0
+                }))
+                .unwrap()
+        );
+        let batch = transaction.payload();
+        let entries = batch["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["source_id"], attached_id);
+        assert_eq!(entries[0]["entry"]["name"], "Updated attached");
+        assert_eq!(entries[0]["source_flags"], existing_source_flags);
+
+        assert!(
+            !transaction
+                .consume(json!({
+                    "ok":true,
+                    "revision":6,
+                    "generation":2,
+                    "next_sequence":1
+                }))
+                .unwrap()
+        );
+        sync.finish_call(
+            transaction,
+            json!({
+                "ok":true,
+                "revision":6,
+                "generation":2,
+                "complete":true,
+                "cleanup_pending":false,
+                "remove_stale":false,
+                "remove_uninstalled":false,
+                "remove_expired":false,
+                "remove_selection":false
+            }),
+        );
+        assert_eq!(
+            sync.take_completed_launchable_game_ids(),
+            Some(std::collections::BTreeSet::from([
+                attached_id.to_ascii_lowercase()
+            ]))
+        );
     }
 
     #[test]
