@@ -49,6 +49,20 @@ in memory, requiring sign-in after reload or module restart. The active-session
 TTL arithmetic matches, but these visible fallback and retention differences
 keep both IDs pending.
 
+`global:origin_web_ui_allowed` remains pending. Vibeshine recognizes the exact
+lowercase `pc|lan|wan` values, defaults to `lan`, and checks the remote peer IP
+against that maximum tier: loopback is PC; RFC1918, CGNAT, link-local, and IPv6
+ULA addresses are LAN; other addresses are WAN. This is separate from the
+browser `Origin` header, and `/welcome` is an early request-policy exception.
+Amaterasu's management service is disabled by default and accepts only loopback
+binds and peers over plain HTTP, so its effective policy is PC. Its
+`allowed_origins` setting is a separate browser-origin check. Do not expose LAN
+or WAN peers until management has TLS ingress. Vibeshine also maps its
+configuration UI port through UPnP only in WAN mode when UPnP is enabled;
+Amaterasu has no UPnP mapping. The pinned implementation is in `src/config.cpp`,
+`src/network.cpp`, `src/http_auth_request_policy.cpp`, and `src/upnp.cpp`.
+These transport and exposure gaps keep this ID pending.
+
 Each worker commits its owned implementation after rustfmt, meaningful tests,
 and Clippy. Use the repository's Nonary Git identity and include these exact
 lines in every plan commit, including integration commits:
@@ -107,12 +121,9 @@ has no runtime reader; its documentation promises automatic detection when
 blank. Address detection and advertisement remain pending in Amaterasu, as
 does qualification of the source's unbounded text acceptance.
 
-`origin_web_ui_allowed` and `csrf_allowed_origins` remain pending. The first
-controls which remote peer networks may reach Vibeshine's web UI; Amaterasu's
-management listener currently enforces loopback peers. The second is a
-cookie-session CSRF bypass allowlist in the reference, whereas Amaterasu uses
-scoped bearer authorization. Its existing CORS `allowed_origins` setting does
-not grant authentication and must not be treated as either parity field.
+`csrf_allowed_origins` remains pending. It is a cookie-session CSRF bypass
+allowlist in the reference, whereas Amaterasu uses scoped bearer authorization.
+The existing CORS `allowed_origins` setting does not grant authentication.
 
 Per-application process lifecycle fields now preserve omitted values and apply
 explicit values at launch. `fec_percentage` resolves from the global stream
