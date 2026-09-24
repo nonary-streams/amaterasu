@@ -189,6 +189,19 @@ reported and retried before another routed Open. Live Windows endpoint and
 role-transition qualification, virtual-sink behavior, and audio endpoint
 qualification on other supported platforms remain pending. The other shared
 override keys and their runtime consumers remain pending.
+Product document v15 now stores `virtual_sink` separately from `audio_sink`.
+Signed global, application, and certificate-bound client values preserve an
+explicit empty string; each new stream resolves client, then application,
+then global. A nonempty selector bypasses regular endpoint routing and
+capture-only mode, and Windows AudioCapture matches the selected endpoint by
+ID, friendly name, description, then adapter name. The backend tries the
+reference format candidates against the current default render bit depth and
+captures the selected device as 48 kHz float PCM. Stream-session and Opus
+remain stereo-only even though the backend can select 5.1/7.1 layouts.
+The reference's default Steam virtual-endpoint fallback when host audio is
+disabled or the regular endpoint is empty is absent, as is hardware and
+cross-platform qualification. `global:virtual_sink` and its scoped overrides
+remain pending.
 Request-supplied client IDs are not used as authority. The editor also
 preserves explicit executable lifecycle values and preparation steps.
 
@@ -279,18 +292,27 @@ nonfatal to the stream. The Linux input service now persists a global
 `back_button_timeout` default of -1 ms and applies a per-slot Back/Select
 deadline. At expiry it suppresses Back and pulses Guide for 100 ms, cancelling
 the timer on release or slot teardown. Failed native updates retain a retry
-state. Windows `SendInput` does not create a virtual controller, and macOS
-reports native injection as unsupported. Linux still needs runtime device and
-permission qualification, the reference controller profile choices are
-incomplete. Sparse application and certificate-bound client timeout overrides
+state. Windows now uses a dynamically loaded ViGEm X360 client and probes
+the bus at lease start; keyboard and mouse remain usable if the driver or
+client DLL is absent. No DLL or driver is bundled. macOS reports native
+injection as unsupported. Linux still needs runtime device and permission
+qualification, and the reference controller profile choices are incomplete.
+Sparse application and certificate-bound client timeout overrides
 now resolve client, then application, then durable global policy at input lease
 acquisition. The lease snapshots its effective value, so later global edits
 apply to later leases.
-Persisting either setting or displaying an editor control alone would not
-complete gamepad parity.
+The input product document v7 now persists a platform-specific `gamepad`
+choice. Versions 1 through 6 migrate to `auto`. Leases snapshot the requested
+and effective profile; status reports backend-supported choices and an
+unavailability reason. Windows implements `auto` and `x360` through ViGEm;
+Linux implements `auto` and `xone` through uinput. The remaining pinned choices
+are recognized but cannot inject controller packets. The signed management
+route and editor preserve profile choices and show lease-time availability.
+Native runtime qualification and missing profiles still block
+full gamepad parity.
 
-The live path follows this order; steps 1, 2, and 4 plus the initial Linux
-backend in step 3 are implemented:
+The live path follows this order; steps 1, 2, and 4 plus initial Linux and
+Windows backends in step 3 are implemented:
 
 1. Preserve each decoded controller snapshot through the GameStream translator
    and stream-session queue into the input service, including the complete
@@ -328,7 +350,8 @@ virtual devices. A native Linux implementation also requires a working kernel
 uinput/UHID path and service-account permissions to create those devices.
 Amaterasu now has a probed Linux uinput Xbox-like output, but does not yet
 implement the other reference profiles or qualify the device path on a Linux
-host. Windows driver integration remains an implementation and runtime gate.
+host. Windows ViGEm X360 integration needs installed-driver and device
+qualification; VHF/UMDF remains unimplemented.
 The pinned macOS backend has no virtual gamepad implementation; keep it
 unsupported until a genuine macOS virtual HID provider is selected and tested.
 

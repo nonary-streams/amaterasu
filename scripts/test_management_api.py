@@ -288,7 +288,7 @@ def test_auth_and_crud(console, api):
         {
             "certificate_id": first_client["certificate_id"],
             "expected_revision": paired_clients["revision"],
-            "config_overrides": {"fec_percentage": 47, "stream_audio": True, "audio_sink": "client-endpoint", "audio_sink_capture_only": False, "back_button_timeout": -1},
+            "config_overrides": {"fec_percentage": 47, "stream_audio": True, "audio_sink": "client-endpoint", "virtual_sink": "client-virtual-endpoint", "audio_sink_capture_only": False, "back_button_timeout": -1},
         },
         administrator,
     )
@@ -306,10 +306,12 @@ def test_auth_and_crud(console, api):
     assert first_after_update.get("config_overrides", {}).get("fec_percentage") == 47, first_after_update
     assert first_after_update.get("config_overrides", {}).get("stream_audio") is True, first_after_update
     assert first_after_update.get("config_overrides", {}).get("audio_sink") == "client-endpoint", first_after_update
+    assert first_after_update.get("config_overrides", {}).get("virtual_sink") == "client-virtual-endpoint", first_after_update
     assert first_after_update.get("config_overrides", {}).get("audio_sink_capture_only") is False, first_after_update
     assert first_after_update.get("config_overrides", {}).get("back_button_timeout") == -1, first_after_update
     assert second_after_update.get("config_overrides", {}).get("fec_percentage") is None, second_after_update
     assert second_after_update.get("config_overrides", {}).get("audio_sink_capture_only") is None, second_after_update
+    assert second_after_update.get("config_overrides", {}).get("virtual_sink") is None, second_after_update
     assert second_after_update.get("config_overrides", {}).get("back_button_timeout") is None, second_after_update
     for invalid_timeout in (2147483648, -2147483649, 0.5, "300"):
         status, rejected_timeout, _ = api.post(
@@ -322,6 +324,17 @@ def test_auth_and_crud(console, api):
             administrator,
         )
         assert status == 400 and not rejected_timeout["ok"], rejected_timeout
+    for invalid_virtual_sink in ("line\nbreak", "x" * 4097, 1):
+        status, rejected_sink, _ = api.post(
+            "/v1/pairing/update_client_config_overrides",
+            {
+                "certificate_id": first_client["certificate_id"],
+                "expected_revision": paired_after_update["revision"],
+                "config_overrides": {"virtual_sink": invalid_virtual_sink},
+            },
+            administrator,
+        )
+        assert status == 400 and not rejected_sink["ok"], rejected_sink
     status, stale_fec_update, _ = api.post(
         "/v1/pairing/update_client_config_overrides",
         {
@@ -342,6 +355,7 @@ def test_auth_and_crud(console, api):
     assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
     assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
     assert persisted_client.get("config_overrides", {}).get("audio_sink") == "client-endpoint", persisted_client
+    assert persisted_client.get("config_overrides", {}).get("virtual_sink") == "client-virtual-endpoint", persisted_client
     assert persisted_client.get("config_overrides", {}).get("audio_sink_capture_only") is False, persisted_client
     assert persisted_client.get("config_overrides", {}).get("back_button_timeout") == -1, persisted_client
     status, auth_settings, _ = api.post("/v1/auth/settings", token=administrator)
@@ -389,7 +403,7 @@ def test_auth_and_crud(console, api):
         "name": "HTTP Game",
         "steam_id": "730",
         "steam_install_dir": steam_install_dir,
-        "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250},
+        "config_overrides": {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250},
         "launch": {
             "kind": "executable",
             "program": game_path,
@@ -404,7 +418,7 @@ def test_auth_and_crud(console, api):
     status, created, _ = api.post("/v1/catalog/create", {"entry": entry, "expected_revision": catalog["revision"]}, administrator)
     assert status == 200 and created["ok"], created
     status, found, _ = api.post("/v1/catalog/get", {"id": created["id"]}, administrator)
-    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, found
+    assert status == 200 and found["entry"]["config_overrides"] == {"fec_percentage": 37, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, found
     assert found["entry"]["steam_id"] == "730", found
     assert found["entry"]["steam_install_dir"] == steam_install_dir, found
     assert found["entry"]["launch"]["auto_detach"] is False, found
@@ -422,6 +436,16 @@ def test_auth_and_crud(console, api):
             administrator,
         )
         assert status == 400 and not rejected_timeout["ok"], rejected_timeout
+    for invalid_virtual_sink in ("line\nbreak", "x" * 4097, 1):
+        status, rejected_sink, _ = api.post(
+            "/v1/catalog/create",
+            {
+                "entry": {**entry, "config_overrides": {"virtual_sink": invalid_virtual_sink}},
+                "expected_revision": created["revision"],
+            },
+            administrator,
+        )
+        assert status == 400 and not rejected_sink["ok"], rejected_sink
     for invalid_metadata in ({"steam_id": "000730"}, {"steam_install_dir": "C:\\" if os.name == "nt" else "/"}):
         status, rejected, _ = api.post("/v1/catalog/create", {
             "entry": {**entry, **invalid_metadata}, "expected_revision": created["revision"],
@@ -430,7 +454,7 @@ def test_auth_and_crud(console, api):
     updated_entry = {
         **entry,
         "name": "Renamed",
-        "config_overrides": {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250},
+        "config_overrides": {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250},
         "launch": {**entry["launch"], "auto_detach": True, "wait_all": False},
     }
     status, renamed, _ = api.post("/v1/catalog/update", {"id": created["id"], "entry": updated_entry, "expected_revision": created["revision"]}, administrator)
@@ -446,7 +470,7 @@ def test_auth_and_crud(console, api):
     assert status == 200 and saved_catalog_entry["entry"]["name"] == "Renamed", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_id"] == "730", saved_catalog_entry
     assert saved_catalog_entry["entry"]["steam_install_dir"] == steam_install_dir, saved_catalog_entry
-    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, saved_catalog_entry
+    assert saved_catalog_entry["entry"]["config_overrides"] == {"fec_percentage": 43, "stream_audio": False, "audio_sink": "", "virtual_sink": "", "audio_sink_capture_only": True, "back_button_timeout": 250}, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["auto_detach"] is True, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["wait_all"] is False, saved_catalog_entry
     assert saved_catalog_entry["entry"]["launch"]["exit_timeout_seconds"] == 0, saved_catalog_entry
@@ -526,6 +550,7 @@ def test_auth_and_crud(console, api):
     assert host_settings["configured_minimum_fps_target"] is None, host_settings
     assert host_settings["effective_minimum_fps_target"] == 20, host_settings
     assert host_settings["configured_audio_sink"] is None, host_settings
+    assert host_settings["configured_virtual_sink"] is None, host_settings
     assert host_settings["configured_external_ip"] is None, host_settings
     assert isinstance(host_settings["effective_audio_sink"], str), host_settings
     assert host_settings["configured_wgc_pacing_smoothing"] is None, host_settings
@@ -570,6 +595,7 @@ def test_auth_and_crud(console, api):
         "max_bitrate": 50_000,
         "minimum_fps_target": 37.5,
         "audio_sink": "test-audio-endpoint",
+        "virtual_sink": "test-virtual-endpoint",
         "audio_sink_capture_only": True,
         "external_ip": "203.0.113.42",
         "wgc_pacing_smoothing": False,
@@ -589,6 +615,7 @@ def test_auth_and_crud(console, api):
     assert renamed_host["configured_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["effective_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["configured_audio_sink"] == "test-audio-endpoint", renamed_host
+    assert renamed_host["configured_virtual_sink"] == "test-virtual-endpoint", renamed_host
     assert renamed_host["audio_sink_capture_only"] is True, renamed_host
     assert renamed_host["configured_external_ip"] == "203.0.113.42", renamed_host
     assert renamed_host["effective_audio_sink"] == "test-audio-endpoint", renamed_host
@@ -640,6 +667,12 @@ def test_auth_and_crud(console, api):
             "hostname": "Living Room & Games", "port": renamed_host["port"],
             "expected_revision": renamed_host["revision"],
             "audio_sink": invalid_sink,
+        }, administrator)[0] == 400
+    for invalid_sink in ("bad\nvirtual endpoint", "x" * 4097, 42):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "virtual_sink": invalid_sink,
         }, administrator)[0] == 400
     for invalid_capture_only in (None, 1, "true"):
         assert api.post("/v1/nvhttp/settings_update", {
@@ -716,7 +749,14 @@ def test_auth_and_crud(console, api):
     assert input_defaults["values"]["key_repeat_delay"] == 500, input_defaults
     assert input_defaults["values"]["key_repeat_frequency"] == 24.9, input_defaults
     assert input_defaults["values"]["back_button_timeout"] == -1, input_defaults
+    assert input_defaults["values"]["gamepad"] == "auto", input_defaults
     assert input_defaults["revision"] == 0 and input_defaults["persisted"] and input_defaults["applied"], input_defaults
+    selected_gamepad = "x360" if sys.platform == "win32" else "xone" if sys.platform == "linux" else "auto"
+    assert api.post("/v1/input/status")[0] == 401
+    status, input_status, _ = api.post("/v1/input/status", token=administrator)
+    assert status == 200 and input_status["gamepad"] == "auto", input_status
+    assert "auto" in input_status["supported_profiles"], input_status
+    assert selected_gamepad in input_status["supported_profiles"], input_status
     input_policy_update = {
         "keyboard": False,
         "mouse": True,
@@ -726,6 +766,7 @@ def test_auth_and_crud(console, api):
         "key_repeat_delay": 275,
         "key_repeat_frequency": 31.25,
         "back_button_timeout": 300,
+        "gamepad": selected_gamepad,
     }
     input_values = {**input_defaults["values"], **input_policy_update}
     status, input_updated, _ = api.post("/v1/input/settings_update", {
@@ -733,6 +774,8 @@ def test_auth_and_crud(console, api):
     }, administrator)
     assert status == 200 and input_updated["ok"] and input_updated["persisted"] and input_updated["applied"], input_updated
     assert input_updated["values"] == input_values and input_updated["revision"] == 1, input_updated
+    status, input_status, _ = api.post("/v1/input/status", token=administrator)
+    assert status == 200 and input_status["gamepad"] == selected_gamepad, input_status
     status, input_conflict, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
         "mouse": True,
@@ -754,6 +797,8 @@ def test_auth_and_crud(console, api):
         {"back_button_timeout": -2147483649},
         {"back_button_timeout": 0.5},
         {"back_button_timeout": None},
+        {"gamepad": "not_a_gamepad"},
+        {"gamepad": 1},
     ]:
         invalid_status, _, _ = api.post("/v1/input/settings_update", {
             "keyboard": input_values["keyboard"],
@@ -774,7 +819,7 @@ def test_auth_and_crud(console, api):
     assert input_zero_repeat["values"] == input_values and input_zero_repeat["revision"] == 2, input_zero_repeat
     status, input_saved, _ = api.post("/v1/input/settings_get", token=administrator)
     assert status == 200 and input_saved["values"] == input_values and input_saved["revision"] == 2, input_saved
-    # A v3 client omits Right Alt, repeat, and controller timeout fields; preserve them while it
+    # A v3 client omits Right Alt, repeat, controller timeout, and gamepad fields; preserve them while it
     # updates the older keyboard, mouse, scrolling and scancode settings.
     status, input_legacy_updated, _ = api.post("/v1/input/settings_update", {
         "keyboard": True,
@@ -1240,6 +1285,7 @@ def main():
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
             assert host_settings["audio_sink_capture_only"] is True, host_settings
+            assert host_settings["configured_virtual_sink"] == "test-virtual-endpoint", host_settings
             assert host_settings["address_family"] == "ipv4", host_settings
             assert host_settings["configured_address_family"] == "ipv4", host_settings
             assert host_settings["configured_bind_address"] == "", host_settings
@@ -1272,6 +1318,7 @@ def main():
             assert persisted_client.get("config_overrides", {}).get("fec_percentage") == 47, persisted_client
             assert persisted_client.get("config_overrides", {}).get("stream_audio") is True, persisted_client
             assert persisted_client.get("config_overrides", {}).get("audio_sink") == "client-endpoint", persisted_client
+            assert persisted_client.get("config_overrides", {}).get("virtual_sink") == "client-virtual-endpoint", persisted_client
             assert persisted_client.get("config_overrides", {}).get("audio_sink_capture_only") is False, persisted_client
             assert persisted_client.get("config_overrides", {}).get("back_button_timeout") == -1, persisted_client
             status, lutris_settings, _ = api.post("/v1/lutris/settings", token=relogged["bearer"])
@@ -1314,6 +1361,7 @@ def main():
                 "max_bitrate": None,
                 "minimum_fps_target": None,
                 "audio_sink": None,
+                "virtual_sink": None,
                 "audio_sink_capture_only": False,
                 "external_ip": None,
                 "wgc_pacing_smoothing": None,
@@ -1335,6 +1383,7 @@ def main():
             assert reset_host["configured_minimum_fps_target"] is None, reset_host
             assert reset_host["effective_minimum_fps_target"] == 20, reset_host
             assert reset_host["configured_audio_sink"] is None, reset_host
+            assert reset_host["configured_virtual_sink"] is None, reset_host
             assert reset_host["configured_external_ip"] is None, reset_host
             assert isinstance(reset_host["effective_audio_sink"], str), reset_host
             assert reset_host["configured_wgc_pacing_smoothing"] is None, reset_host
@@ -1349,15 +1398,15 @@ def main():
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, manual Playnite Fullscreen validation, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
-    print("Moonlight hostname/port live rebind, capture backend/output and audio policy persistence,")
-    print("certificate-bound FEC/audio/Back timeout override CAS and restart persistence,")
+    print("Moonlight hostname/port live rebind, capture backend/output and audio/virtual-sink policy persistence,")
+    print("certificate-bound FEC/audio/virtual-sink/Back timeout override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery, authorized artwork retrieval and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
     print("session history authorization, settings CAS, status, and restart persistence,")
     print("session restart invalidation,")
-    print("input policy CAS, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
+    print("input policy CAS, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
 if __name__ == "__main__":
