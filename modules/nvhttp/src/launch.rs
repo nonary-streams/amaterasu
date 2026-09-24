@@ -10,6 +10,7 @@ mod workflow;
 #[cfg(test)]
 mod tests;
 
+use crate::preparation::PreparationStep;
 use crate::wire::{ClientConfigOverrides, Reply, xml};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use record::{Record, Stage, State};
@@ -302,6 +303,7 @@ pub struct Controller {
     configured_output_name: Option<String>,
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
+    global_preparation: Vec<PreparationStep>,
     global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
@@ -331,6 +333,7 @@ impl Controller {
             configured_output_name: None,
             configured_audio_sink: None,
             configured_virtual_sink: None,
+            global_preparation: Vec::new(),
             global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
@@ -364,6 +367,10 @@ impl Controller {
 
     pub fn set_virtual_sink_settings(&mut self, configured_virtual_sink: Option<&str>) {
         self.configured_virtual_sink = configured_virtual_sink.map(str::to_owned);
+    }
+
+    pub fn set_global_preparation(&mut self, preparation: &[PreparationStep]) {
+        self.global_preparation = preparation.to_vec();
     }
 
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
@@ -453,6 +460,7 @@ impl Controller {
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
+        let global_preparation = self.global_preparation.clone();
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
@@ -521,6 +529,7 @@ impl Controller {
             global_audio_sink_capture_only,
             self.configured_audio_sink.clone(),
             self.configured_virtual_sink.clone(),
+            global_preparation,
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,

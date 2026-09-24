@@ -1,6 +1,7 @@
 //! Caller-scoped NVHTTP product settings persisted by the configuration service.
 use crate::{
     launch::CaptureMode,
+    preparation::{PreparationStep, validate_preparation},
     settings::{self, AddressFamily, Settings},
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
@@ -24,7 +25,8 @@ const EXTERNAL_IP_SETTINGS_VERSION: u64 = 12;
 const PING_TIMEOUT_SETTINGS_VERSION: u64 = 13;
 const AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION: u64 = 14;
 const VIRTUAL_SINK_SETTINGS_VERSION: u64 = 15;
-const SETTINGS_VERSION: u64 = VIRTUAL_SINK_SETTINGS_VERSION;
+const GLOBAL_PREPARATION_SETTINGS_VERSION: u64 = 16;
+const SETTINGS_VERSION: u64 = GLOBAL_PREPARATION_SETTINGS_VERSION;
 const DEFAULT_MINIMUM_FPS_TARGET: f64 = 20.0;
 const DEFAULT_PING_TIMEOUT_MS: u32 = 10_000;
 const MAX_OUTPUT_NAME_BYTES: usize = 512;
@@ -33,7 +35,9 @@ const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
-pub enum AdminAction {
+// Keeping the complete bounded update together preserves typed CAS semantics.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum AdminAction {
     Get,
     Update {
         hostname: String,
@@ -52,6 +56,7 @@ pub enum AdminAction {
         minimum_fps_target: FieldUpdate<f64>,
         wgc_pacing_smoothing: FieldUpdate<bool>,
         ping_timeout_ms: FieldUpdate<i32>,
+        global_preparation: FieldUpdate<Vec<PreparationStep>>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -130,6 +135,7 @@ enum Purpose {
         minimum_fps_target: Option<f64>,
         wgc_pacing_smoothing: Option<bool>,
         ping_timeout_ms: Option<i32>,
+        global_preparation: Vec<PreparationStep>,
         expected_revision: u64,
         require_listener_apply: bool,
     },
@@ -170,6 +176,7 @@ struct ProductDocument {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     ping_timeout_ms: Option<i32>,
+    global_preparation: Vec<PreparationStep>,
 }
 
 #[derive(Clone)]
@@ -185,6 +192,7 @@ struct ProductStreamingSettings {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     ping_timeout_ms: Option<i32>,
+    global_preparation: Vec<PreparationStep>,
 }
 
 /// Maintains the last confirmed product hostname and serializes its CAS writes.
@@ -211,6 +219,7 @@ pub struct ProductSettings {
     configured_minimum_fps_target: Option<f64>,
     configured_wgc_pacing_smoothing: Option<bool>,
     configured_ping_timeout_ms: Option<i32>,
+    configured_global_preparation: Vec<PreparationStep>,
     stream_audio: bool,
     active_http_port: Option<u16>,
     active_https_port: Option<u16>,
@@ -310,6 +319,7 @@ impl ProductSettings {
             configured_minimum_fps_target: None,
             configured_wgc_pacing_smoothing: None,
             configured_ping_timeout_ms: None,
+            configured_global_preparation: Vec::new(),
             stream_audio: true,
             active_http_port: None,
             active_https_port: None,
@@ -351,6 +361,10 @@ impl ProductSettings {
 
     pub fn configured_virtual_sink(&self) -> Option<&str> {
         self.configured_virtual_sink.as_deref()
+    }
+
+    pub fn global_preparation(&self) -> &[PreparationStep] {
+        &self.configured_global_preparation
     }
 
     pub fn audio_sink_capture_only(&self) -> bool {
@@ -910,6 +924,7 @@ impl ProductSettings {
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 ping_timeout_ms,
+                global_preparation,
                 expected_revision,
                 require_listener_apply,
             } => {
@@ -1055,6 +1070,22 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let global_preparation = match apply_global_preparation_update(
+                    global_preparation,
+                    self.configured_global_preparation.clone(),
+                ) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.queue_completion(
+                            request.request,
+                            failure(
+                                "invalid_global_preparation",
+                                "global_preparation must contain at most 8 valid preparation steps",
+                            ),
+                        );
+                        return;
+                    }
+                };
                 let target = NetworkTarget {
                     port,
                     address_family: apply_field_update(
@@ -1125,6 +1156,7 @@ impl ProductSettings {
                             minimum_fps_target,
                             wgc_pacing_smoothing,
                             ping_timeout_ms,
+                            global_preparation: global_preparation.clone(),
                         },
                     ),
                     Some(request.request),
@@ -1145,6 +1177,7 @@ impl ProductSettings {
                         minimum_fps_target,
                         wgc_pacing_smoothing,
                         ping_timeout_ms,
+                        global_preparation,
                         expected_revision,
                         require_listener_apply,
                     },
@@ -1267,6 +1300,7 @@ impl ProductSettings {
                 minimum_fps_target,
                 wgc_pacing_smoothing,
                 ping_timeout_ms,
+                global_preparation,
                 expected_revision,
                 require_listener_apply,
             } => match outcome {
@@ -1287,6 +1321,7 @@ impl ProductSettings {
                         minimum_fps_target,
                         wgc_pacing_smoothing,
                         ping_timeout_ms,
+                        global_preparation: &global_preparation,
                     };
                     match update_result(&payload, &expected) {
                         Ok(document) if self.validate_document(&document).is_ok() => {
@@ -1582,6 +1617,7 @@ impl ProductSettings {
         self.configured_minimum_fps_target = document.minimum_fps_target;
         self.configured_wgc_pacing_smoothing = document.wgc_pacing_smoothing;
         self.configured_ping_timeout_ms = document.ping_timeout_ms;
+        self.configured_global_preparation = document.global_preparation;
         self.loaded = true;
     }
 
@@ -1599,6 +1635,7 @@ impl ProductSettings {
             "configured_output_name":self.configured_output_name,
             "configured_audio_sink":self.configured_audio_sink,
             "configured_virtual_sink":self.configured_virtual_sink,
+            "configured_global_preparation":self.configured_global_preparation,
             "audio_sink_capture_only":self.audio_sink_capture_only,
             "configured_external_ip":self.configured_external_ip,
             "effective_audio_sink":self.effective_audio_sink(),
@@ -1693,6 +1730,7 @@ fn product_update_payload(
             "minimum_fps_target":streaming.minimum_fps_target,
             "wgc_pacing_smoothing":streaming.wgc_pacing_smoothing,
             "ping_timeout_ms":streaming.ping_timeout_ms,
+            "global_preparation":streaming.global_preparation,
         },
     })
 }
@@ -1748,6 +1786,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
             ping_timeout_ms: None,
+            global_preparation: Vec::new(),
         });
     }
 
@@ -1772,6 +1811,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | PING_TIMEOUT_SETTINGS_VERSION
             | AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION
             | VIRTUAL_SINK_SETTINGS_VERSION
+            | GLOBAL_PREPARATION_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -1794,6 +1834,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         PING_TIMEOUT_SETTINGS_VERSION => 14,
         AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION => 15,
         VIRTUAL_SINK_SETTINGS_VERSION => 16,
+        GLOBAL_PREPARATION_SETTINGS_VERSION => 17,
         _ => unreachable!(),
     };
     if values.len() != expected_value_count
@@ -1816,6 +1857,8 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION
             && !values.contains_key("audio_sink_capture_only"))
         || (version >= VIRTUAL_SINK_SETTINGS_VERSION && !values.contains_key("virtual_sink"))
+        || (version >= GLOBAL_PREPARATION_SETTINGS_VERSION
+            && !values.contains_key("global_preparation"))
     {
         return Err(invalid_state(
             "product settings contain unknown or missing values",
@@ -1988,6 +2031,20 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         false
     };
+    let global_preparation = if version >= GLOBAL_PREPARATION_SETTINGS_VERSION {
+        serde_json::from_value::<Vec<PreparationStep>>(
+            values
+                .get("global_preparation")
+                .cloned()
+                .ok_or_else(|| invalid_state("persisted global_preparation is missing"))?,
+        )
+        .map_err(|_| invalid_state("persisted global_preparation is invalid"))?
+    } else {
+        Vec::new()
+    };
+    if !validate_preparation(&global_preparation) {
+        return Err(invalid_state("persisted global_preparation is invalid"));
+    }
     Ok(ProductDocument {
         revision,
         hostname: Some(hostname.to_owned()),
@@ -2006,6 +2063,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         minimum_fps_target,
         wgc_pacing_smoothing,
         ping_timeout_ms,
+        global_preparation,
     })
 }
 
@@ -2026,6 +2084,7 @@ struct UpdateExpectation<'a> {
     minimum_fps_target: Option<f64>,
     wgc_pacing_smoothing: Option<bool>,
     ping_timeout_ms: Option<i32>,
+    global_preparation: &'a [PreparationStep],
 }
 
 fn update_result(
@@ -2036,7 +2095,7 @@ fn update_result(
         return Err(parse_failure(payload));
     }
     if payload.get("version").and_then(Value::as_u64) != Some(SETTINGS_VERSION) {
-        return Err(invalid_state("product_update did not confirm v15 settings"));
+        return Err(invalid_state("product_update did not confirm v16 settings"));
     }
     let document = parse_document(payload)?;
     if document.hostname.as_deref() != Some(expected.hostname)
@@ -2055,6 +2114,7 @@ fn update_result(
         || document.minimum_fps_target != expected.minimum_fps_target
         || document.wgc_pacing_smoothing != expected.wgc_pacing_smoothing
         || document.ping_timeout_ms != expected.ping_timeout_ms
+        || document.global_preparation != expected.global_preparation
         || expected.revision.checked_add(1) != Some(document.revision)
     {
         return Err(invalid_state(
@@ -2090,6 +2150,20 @@ fn apply_ping_timeout_update(
         FieldUpdate::Value(value) if value >= 0 => Ok(Some(value)),
         FieldUpdate::Value(_) => Err(()),
     }
+}
+
+fn apply_global_preparation_update(
+    update: FieldUpdate<Vec<PreparationStep>>,
+    current: Vec<PreparationStep>,
+) -> Result<Vec<PreparationStep>, ()> {
+    let preparation = match update {
+        FieldUpdate::Omitted => current,
+        FieldUpdate::Null => Vec::new(),
+        FieldUpdate::Value(preparation) => preparation,
+    };
+    validate_preparation(&preparation)
+        .then_some(preparation)
+        .ok_or(())
 }
 
 fn normalize_output_name(value: &str) -> Result<Option<String>, ()> {
@@ -2983,10 +3057,11 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 ping_timeout_ms: reset,
+                global_preparation: Vec::new(),
             },
         );
 
-        assert_eq!(payload["version"], 15);
+        assert_eq!(payload["version"], 16);
         assert_eq!(payload["values"]["ping_timeout_ms"], Value::Null);
     }
 
@@ -3031,6 +3106,7 @@ mod tests {
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: update,
                         ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -3039,7 +3115,7 @@ mod tests {
             product.start_next();
             let pending = product.pending.take().expect("product update request");
             let expected_raw = expected.map_or(Value::Null, |value| json!(value));
-            assert_eq!(pending.payload["version"], 15);
+            assert_eq!(pending.payload["version"], 16);
             assert_eq!(
                 pending.payload["values"]["wgc_pacing_smoothing"],
                 expected_raw
@@ -3048,12 +3124,12 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":15,"revision":revision + 1,
+                    "ok":true,"found":true,"version":16,"revision":revision + 1,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
                         "max_bitrate":null,"minimum_fps_target":20.0,
-                        "wgc_pacing_smoothing":expected_raw,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                        "wgc_pacing_smoothing":expected_raw,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
                 })),
             );
             assert_eq!(product.configured_wgc_pacing_smoothing(), expected);
@@ -3128,6 +3204,7 @@ mod tests {
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
                     expected_revision: 11,
                     require_listener_apply: false,
                 },
@@ -3135,11 +3212,11 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("v15 product update");
-        assert_eq!(pending.payload["version"], 15);
+        assert_eq!(pending.payload["version"], 16);
         assert_eq!(pending.payload["expected_revision"], 11);
         assert_eq!(pending.payload["values"]["audio_sink_capture_only"], true);
         let response = json!({
-            "ok":true,"found":true,"version":15,"revision":12,
+            "ok":true,"found":true,"version":16,"revision":12,
             "values":pending.payload["values"].clone()
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
@@ -3195,6 +3272,7 @@ mod tests {
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
                     expected_revision: 8,
                     require_listener_apply: false,
                 },
@@ -3202,16 +3280,16 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 15);
+        assert_eq!(pending.payload["version"], 16);
         assert_eq!(pending.payload["values"]["audio_sink"], "render.selected");
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":9,
+                "ok":true,"found":true,"version":16,"revision":9,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":"render.selected","virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"auto","video_max_batch_size_kb":32,
-                    "max_bitrate":null,"minimum_fps_target":20.0,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                    "max_bitrate":null,"minimum_fps_target":20.0,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             })),
         );
 
@@ -3261,6 +3339,7 @@ mod tests {
                         minimum_fps_target: update,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -3268,7 +3347,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 15);
+            assert_eq!(pending.payload["version"], 16);
             assert_eq!(
                 pending.payload["values"]["minimum_fps_target"],
                 expected_raw
@@ -3281,12 +3360,12 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":15,"revision":reply_revision,
+                    "ok":true,"found":true,"version":16,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":32,"max_bitrate":null,
-                        "minimum_fps_target":persisted_value,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                        "minimum_fps_target":persisted_value,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
                 })),
             );
         }
@@ -3338,6 +3417,7 @@ mod tests {
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -3345,18 +3425,18 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 15);
+            assert_eq!(pending.payload["version"], 16);
             assert_eq!(
                 pending.payload["values"]["max_bitrate"],
                 expected.map_or(Value::Null, |value| json!(value))
             );
 
             let response = json!({
-                "ok":true,"found":true,"version":15,"revision":revision + 1,
+                "ok":true,"found":true,"version":16,"revision":revision + 1,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"auto",
-                    "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                    "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             });
             product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
             assert_eq!(product.configured_max_bitrate(), expected);
@@ -3495,8 +3575,8 @@ mod tests {
     #[test]
     fn update_reply_must_confirm_the_requested_revision_and_hostname() {
         let success = json!({
-            "ok":true,"found":true,"version":15,"revision":4,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":16,"revision":4,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
         });
         let target = NetworkTarget {
             port: 48_000,
@@ -3519,6 +3599,7 @@ mod tests {
             minimum_fps_target: None,
             wgc_pacing_smoothing: None,
             ping_timeout_ms: None,
+            global_preparation: &[],
         };
         assert_eq!(update_result(&success, &expected).unwrap().revision, 4);
         assert_eq!(
@@ -3562,8 +3643,8 @@ mod tests {
         );
 
         let reset_to_machine_name = json!({
-            "ok":true,"found":true,"version":15,"revision":5,
-            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":16,"revision":5,
+            "values":{"hostname":"","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
         });
         assert_eq!(
             update_result(
@@ -3581,8 +3662,8 @@ mod tests {
         );
 
         let selected = json!({
-            "ok":true,"found":true,"version":15,"revision":9,
-            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+            "ok":true,"found":true,"version":16,"revision":9,
+            "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":"selected-display-id","audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
         });
         assert_eq!(
             update_result(
@@ -3648,6 +3729,7 @@ mod tests {
                 "configured_output_name":null,
                 "configured_audio_sink":null,
                 "configured_virtual_sink":null,
+                "configured_global_preparation":[],
                 "audio_sink_capture_only":false,
                 "configured_external_ip":null,
             "effective_audio_sink":"",
@@ -3753,16 +3835,17 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
-            ping_timeout_ms: None,
+                ping_timeout_ms: None,
+                global_preparation: Vec::new(),
                 expected_revision: 1,
                 require_listener_apply: false,
             },
             CallOutcome::Payload(json!({
                 "ok":true,
                 "found":true,
-                "version":15,
+                "version":16,
                 "revision":2,
-                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "values":{"hostname":"New Host","port":48000,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             })),
         );
 
@@ -3817,13 +3900,14 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
-            ping_timeout_ms: None,
+                ping_timeout_ms: None,
+                global_preparation: Vec::new(),
                 expected_revision: 1,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":2,
-                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "ok":true,"found":true,"version":16,"revision":2,
+                "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             })),
         );
 
@@ -3994,13 +4078,14 @@ mod tests {
                 max_bitrate: None,
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
-            ping_timeout_ms: None,
+                ping_timeout_ms: None,
+                global_preparation: Vec::new(),
                 expected_revision: 3,
                 require_listener_apply: true,
             },
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":4,
-                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                "ok":true,"found":true,"version":16,"revision":4,
+                "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             })),
         );
 
@@ -4081,6 +4166,7 @@ mod tests {
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation: FieldUpdate::Omitted,
                         expected_revision,
                         require_listener_apply: false,
                     },
@@ -4094,10 +4180,10 @@ mod tests {
             .pending
             .take()
             .expect("explicit empty selector write");
-        assert_eq!(pending.payload["version"], 15);
+        assert_eq!(pending.payload["version"], 16);
         assert_eq!(pending.payload["values"]["virtual_sink"], "");
         let response = json!({
-            "ok":true,"found":true,"version":15,"revision":2,
+            "ok":true,"found":true,"version":16,"revision":2,
             "values":pending.payload["values"].clone()
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
@@ -4113,7 +4199,7 @@ mod tests {
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":3,
+                "ok":true,"found":true,"version":16,"revision":3,
                 "values":pending.payload["values"].clone()
             })),
         );
@@ -4130,7 +4216,7 @@ mod tests {
             "Steam Streaming Speakers"
         );
         let response = json!({
-            "ok":true,"found":true,"version":15,"revision":4,
+            "ok":true,"found":true,"version":16,"revision":4,
             "values":pending.payload["values"].clone()
         });
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
@@ -4151,7 +4237,7 @@ mod tests {
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":5,
+                "ok":true,"found":true,"version":16,"revision":5,
                 "values":pending.payload["values"].clone()
             })),
         );
@@ -4164,6 +4250,123 @@ mod tests {
         );
         assert_eq!(normalize_virtual_sink("bad\nselector"), Err(()));
         assert_eq!(normalize_virtual_sink(&"x".repeat(4097)), Err(()));
+    }
+
+    #[test]
+    fn global_preparation_v15_migration_update_null_restart_and_readback() {
+        let legacy_v15 = json!({
+            "ok":true,"found":true,"version":15,"revision":1,
+            "values":{
+                "hostname":"Host","port":47989,"address_family":null,"bind_address":null,
+                "output_name":null,"audio_sink":null,"virtual_sink":null,
+                "audio_sink_capture_only":false,"external_ip":null,"stream_audio":true,
+                "capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,
+                "minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null
+            }
+        });
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&legacy_v15).unwrap());
+        assert!(product.global_preparation().is_empty());
+        assert_eq!(
+            product.settings_payload()["configured_global_preparation"],
+            json!([])
+        );
+
+        let step: PreparationStep = serde_json::from_value(json!({
+            "run":{"executable":std::env::current_exe().unwrap(),"args":["setup"]},
+            "undo":{"executable":std::env::current_exe().unwrap(),"args":["undo"]}
+        }))
+        .unwrap();
+        let update = |product: &mut ProductSettings,
+                      global_preparation: FieldUpdate<Vec<PreparationStep>>,
+                      revision: u64| {
+            product
+                .enqueue(
+                    revision + 10,
+                    5_000,
+                    AdminAction::Update {
+                        hostname: "Host".into(),
+                        port: 47_989,
+                        address_family: FieldUpdate::Omitted,
+                        bind_address: FieldUpdate::Omitted,
+                        output_name: FieldUpdate::Omitted,
+                        audio_sink: FieldUpdate::Omitted,
+                        virtual_sink: FieldUpdate::Omitted,
+                        audio_sink_capture_only: FieldUpdate::Omitted,
+                        external_ip: FieldUpdate::Omitted,
+                        stream_audio: FieldUpdate::Omitted,
+                        capture: FieldUpdate::Omitted,
+                        video_max_batch_size_kb: FieldUpdate::Omitted,
+                        max_bitrate: FieldUpdate::Omitted,
+                        minimum_fps_target: FieldUpdate::Omitted,
+                        wgc_pacing_smoothing: FieldUpdate::Omitted,
+                        ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation,
+                        expected_revision: revision,
+                        require_listener_apply: false,
+                    },
+                )
+                .unwrap();
+            product.start_next();
+            let pending = product.pending.take().expect("product update request");
+            assert_eq!(pending.payload["version"], 16);
+            let response = json!({
+                "ok":true,"found":true,"version":16,"revision":revision + 1,
+                "values":pending.payload["values"].clone()
+            });
+            product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
+            response
+        };
+
+        let persisted = update(&mut product, FieldUpdate::Value(vec![step.clone()]), 1);
+        assert_eq!(
+            persisted["values"]["global_preparation"][0]["run"]["args"],
+            json!(["setup"])
+        );
+        assert_eq!(product.global_preparation(), std::slice::from_ref(&step));
+        assert_eq!(
+            product.settings_payload()["configured_global_preparation"],
+            persisted["values"]["global_preparation"]
+        );
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&persisted).unwrap());
+        assert_eq!(restarted.global_preparation(), std::slice::from_ref(&step));
+
+        let preserved = update(&mut product, FieldUpdate::Omitted, 2);
+        assert_eq!(
+            preserved["values"]["global_preparation"][0]["undo"]["args"],
+            json!(["undo"])
+        );
+        let reset = update(&mut product, FieldUpdate::Null, 3);
+        assert_eq!(reset["values"]["global_preparation"], json!([]));
+        assert!(product.global_preparation().is_empty());
+
+        let mut invalid = reset;
+        invalid["values"]["global_preparation"] = Value::Null;
+        assert_eq!(
+            parse_document(&invalid).unwrap_err().code,
+            "invalid_state_response"
+        );
+    }
+
+    #[test]
+    fn global_preparation_update_rejects_invalid_and_over_limit_lists() {
+        let invalid: PreparationStep = serde_json::from_value(json!({
+            "run":{"executable":"relative-command"}
+        }))
+        .unwrap();
+        assert_eq!(
+            apply_global_preparation_update(FieldUpdate::Value(vec![invalid]), Vec::new()),
+            Err(())
+        );
+        let valid: PreparationStep = serde_json::from_value(json!({
+            "run":{"executable":std::env::current_exe().unwrap()}
+        }))
+        .unwrap();
+        assert_eq!(
+            apply_global_preparation_update(FieldUpdate::Value(vec![valid; 9]), Vec::new()),
+            Err(())
+        );
     }
 
     #[test]
@@ -4189,9 +4392,10 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: None,
                 ping_timeout_ms: None,
+                global_preparation: Vec::new(),
             },
         );
-        assert_eq!(reset["version"], 15);
+        assert_eq!(reset["version"], 16);
         assert_eq!(reset["expected_revision"], 7);
         assert_eq!(reset["values"]["stream_audio"], false);
         assert_eq!(reset["values"]["address_family"], Value::Null);
@@ -4222,6 +4426,7 @@ mod tests {
                 minimum_fps_target: None,
                 wgc_pacing_smoothing: Some(false),
                 ping_timeout_ms: None,
+                global_preparation: Vec::new(),
             },
         );
         assert_eq!(explicit_blank["values"]["address_family"], "both");
@@ -4304,6 +4509,7 @@ mod tests {
                         minimum_fps_target: FieldUpdate::Omitted,
                         wgc_pacing_smoothing: FieldUpdate::Omitted,
                         ping_timeout_ms: FieldUpdate::Omitted,
+                        global_preparation: FieldUpdate::Omitted,
                         expected_revision: revision,
                         require_listener_apply: false,
                     },
@@ -4311,7 +4517,7 @@ mod tests {
                 .unwrap();
             product.start_next();
             let pending = product.pending.take().expect("product update request");
-            assert_eq!(pending.payload["version"], 15);
+            assert_eq!(pending.payload["version"], 16);
             assert_eq!(
                 pending.payload["values"]["video_max_batch_size_kb"],
                 expected_raw
@@ -4324,12 +4530,12 @@ mod tests {
             product.finish_call(
                 pending.purpose,
                 CallOutcome::Payload(json!({
-                    "ok":true,"found":true,"version":15,"revision":reply_revision,
+                    "ok":true,"found":true,"version":16,"revision":reply_revision,
                     "values":{"hostname":"Host","port":47989,"address_family":null,
                         "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                         "stream_audio":true,"capture":"auto",
                         "video_max_batch_size_kb":persisted_value,"max_bitrate":null,
-                    "minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                    "minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
                 })),
             );
         }
@@ -4375,6 +4581,7 @@ mod tests {
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -4382,7 +4589,7 @@ mod tests {
             .unwrap();
         product.start_next();
         let payload = &product.pending.as_ref().unwrap().payload;
-        assert_eq!(payload["version"], 15);
+        assert_eq!(payload["version"], 16);
         assert_eq!(payload["expected_revision"], 4);
         assert_eq!(payload["values"]["stream_audio"], false);
         assert_eq!(payload["values"]["capture"], "auto");
@@ -4417,6 +4624,7 @@ mod tests {
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: true,
                 },
@@ -4462,6 +4670,7 @@ mod tests {
                     minimum_fps_target: FieldUpdate::Omitted,
                     wgc_pacing_smoothing: FieldUpdate::Omitted,
                     ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
                     expected_revision: 4,
                     require_listener_apply: false,
                 },
@@ -4469,17 +4678,17 @@ mod tests {
             .unwrap();
         product.start_next();
         let pending = product.pending.take().expect("product update request");
-        assert_eq!(pending.payload["version"], 15);
+        assert_eq!(pending.payload["version"], 16);
         assert_eq!(pending.payload["values"]["capture"], "wgcc");
 
         product.finish_call(
             pending.purpose,
             CallOutcome::Payload(json!({
-                "ok":true,"found":true,"version":15,"revision":5,
+                "ok":true,"found":true,"version":16,"revision":5,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"wgcc",
-                    "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false}
+                    "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
             })),
         );
         assert_eq!(product.configured_capture(), CaptureMode::Wgcc);

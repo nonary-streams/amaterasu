@@ -1,6 +1,7 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 mod launch;
 mod network_settings;
+mod preparation;
 mod product_settings;
 mod server;
 mod settings;
@@ -27,6 +28,9 @@ fn should_attempt_listener_rebind(
 }
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+// The update variant intentionally carries all typed fields to preserve the
+// omission/null/value distinction across the signed settings request.
+#[allow(clippy::large_enum_variant)]
 enum Operation {
     Status,
     SettingsGet,
@@ -61,6 +65,8 @@ enum Operation {
         wgc_pacing_smoothing: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         ping_timeout_ms: FieldUpdate<i32>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        global_preparation: FieldUpdate<Vec<preparation::PreparationStep>>,
         expected_revision: u64,
     },
 }
@@ -182,6 +188,7 @@ impl ManagedModule for NvhttpModule {
             );
             router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
             router.set_virtual_sink_settings(self.product_settings.configured_virtual_sink());
+            router.set_global_preparation(self.product_settings.global_preparation());
             router.set_audio_sink_capture_only(self.product_settings.audio_sink_capture_only());
             router.set_global_stream_audio(self.product_settings.stream_audio());
             router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
@@ -454,6 +461,7 @@ impl NvhttpModule {
                                 minimum_fps_target,
                                 wgc_pacing_smoothing,
                                 ping_timeout_ms,
+                                global_preparation,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -487,6 +495,7 @@ impl NvhttpModule {
                                     minimum_fps_target,
                                     wgc_pacing_smoothing,
                                     ping_timeout_ms,
+                                    global_preparation,
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -804,5 +813,39 @@ mod tests {
             deserialize(Some(json!("Steam Streaming Speakers"))),
             FieldUpdate::Value("Steam Streaming Speakers".into())
         );
+    }
+
+    #[test]
+    fn global_preparation_update_distinguishes_omission_null_and_list() {
+        let deserialize = |value: Option<serde_json::Value>| {
+            let mut request = json!({
+                "action":"settings_update","hostname":"Host","port":48000,
+                "expected_revision":2
+            });
+            if let Some(value) = value {
+                request["global_preparation"] = value;
+            }
+            let Operation::SettingsUpdate {
+                global_preparation, ..
+            } = serde_json::from_value(request).unwrap()
+            else {
+                panic!("settings update expected");
+            };
+            global_preparation
+        };
+
+        assert_eq!(deserialize(None), FieldUpdate::Omitted);
+        assert_eq!(
+            deserialize(Some(serde_json::Value::Null)),
+            FieldUpdate::Null
+        );
+        let list = json!([{"run":{"executable":"C:\\games\\prepare.exe"}}]);
+        match deserialize(Some(list)) {
+            FieldUpdate::Value(steps) => {
+                assert_eq!(steps.len(), 1);
+                assert!(steps[0].run.executable.ends_with("prepare.exe"));
+            }
+            _ => panic!("preparation list expected"),
+        }
     }
 }

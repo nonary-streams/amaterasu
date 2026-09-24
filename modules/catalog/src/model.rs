@@ -23,7 +23,17 @@ pub struct Entry {
     pub steam_install_dir: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        alias = "exclude-global-prep-cmd"
+    )]
+    pub exclude_global_prep_cmd: bool,
     pub launch: Launch,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// An opaque provider-owned image reference. The source path is never stored in

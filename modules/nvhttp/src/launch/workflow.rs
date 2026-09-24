@@ -140,6 +140,7 @@ impl Controller {
                         "action": "launch_export",
                         "operation_id": record.application_operation,
                         "app_id": app_id(record.request.app_id),
+                        "global_preparation": record.global_preparation,
                     }),
                     30_000,
                 )

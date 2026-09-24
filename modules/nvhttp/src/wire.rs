@@ -6,7 +6,10 @@ mod query;
 mod streaming;
 pub(crate) mod xml;
 
-use crate::launch::{Controller as LaunchController, LaunchRequest, PeerIdentity};
+use crate::{
+    launch::{Controller as LaunchController, LaunchRequest, PeerIdentity},
+    preparation::PreparationStep,
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use query::Query;
 use serde::Deserialize;
@@ -165,6 +168,10 @@ impl Router {
     pub fn set_virtual_sink_settings(&mut self, configured_virtual_sink: Option<&str>) {
         self.launches
             .set_virtual_sink_settings(configured_virtual_sink);
+    }
+
+    pub fn set_global_preparation(&mut self, preparation: &[PreparationStep]) {
+        self.launches.set_global_preparation(preparation);
     }
 
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {

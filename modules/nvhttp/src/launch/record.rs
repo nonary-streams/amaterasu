@@ -1,5 +1,6 @@
 use super::{CaptureProvider, LaunchRequest, PeerIdentity};
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
+use crate::preparation::PreparationStep;
 use std::{collections::VecDeque, time::Instant};
 
 use super::{call::Call, workflow::Phase};
@@ -46,6 +47,7 @@ pub struct Record {
     pub global_audio_sink_capture_only: bool,
     pub global_configured_audio_sink: Option<String>,
     pub global_configured_virtual_sink: Option<String>,
+    pub global_preparation: Vec<PreparationStep>,
     pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
     /// Sparse client-over-application timeout override captured for this launch.
@@ -104,6 +106,7 @@ impl Record {
         global_audio_sink_capture_only: bool,
         global_configured_audio_sink: Option<String>,
         global_configured_virtual_sink: Option<String>,
+        global_preparation: Vec<PreparationStep>,
         global_ping_timeout_ms: u32,
         global_video_max_batch_size_kb: u8,
         global_max_bitrate_kbps: Option<u32>,
@@ -130,6 +133,7 @@ impl Record {
             global_audio_sink_capture_only,
             global_configured_audio_sink,
             global_configured_virtual_sink,
+            global_preparation,
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,
             scoped_back_button_timeout: None,

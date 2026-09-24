@@ -1317,6 +1317,43 @@ fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
 }
 
 #[test]
+fn launch_export_uses_the_preparation_snapshot_captured_at_admission() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let original: PreparationStep = serde_json::from_value(json!({
+        "run":{"executable":std::env::current_exe().unwrap(),"args":["original"]}
+    }))
+    .unwrap();
+    let changed: PreparationStep = serde_json::from_value(json!({
+        "run":{"executable":std::env::current_exe().unwrap(),"args":["changed"]}
+    }))
+    .unwrap();
+    controller.set_global_preparation(std::slice::from_ref(&original));
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    controller.set_global_preparation(std::slice::from_ref(&changed));
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export request");
+    assert_eq!(
+        launch_payload["global_preparation"][0]["run"]["args"],
+        json!(["original"])
+    );
+}
+
+#[test]
 fn response_loss_before_first_flush_stops_rtsp_and_application() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

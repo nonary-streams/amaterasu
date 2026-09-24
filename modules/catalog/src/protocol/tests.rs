@@ -127,6 +127,64 @@ fn sparse_fec_override_is_typed_defaulted_and_persisted_with_the_entry() {
 }
 
 #[test]
+fn global_preparation_exclusion_defaults_aliases_and_persists_with_entry() {
+    let legacy: Entry = serde_json::from_value(json!({
+        "name":"Legacy entry",
+        "launch":{"kind":"executable","program":"/games/legacy"}
+    }))
+    .unwrap();
+    assert!(!legacy.exclude_global_prep_cmd);
+    assert_eq!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("exclude_global_prep_cmd"),
+        None
+    );
+
+    for field in ["exclude_global_prep_cmd", "exclude-global-prep-cmd"] {
+        let mut value = json!({
+            "name":"Prepared exclusion",
+            "launch":{"kind":"executable","program":"/games/excluded"}
+        });
+        value[field] = json!(true);
+        let excluded: Entry = serde_json::from_value(value).unwrap();
+        assert!(excluded.exclude_global_prep_cmd);
+        let persisted = serde_json::to_value(excluded).unwrap();
+        assert_eq!(persisted["exclude_global_prep_cmd"], true);
+    }
+
+    assert!(
+        serde_json::from_value::<Entry>(json!({
+            "name":"Ambiguous exclusion",
+            "exclude_global_prep_cmd":false,
+            "exclude-global-prep-cmd":true,
+            "launch":{"kind":"executable","program":"/games/game"}
+        }))
+        .is_err()
+    );
+
+    let excluded: Entry = serde_json::from_value(json!({
+        "name":"Persisted exclusion",
+        "exclude_global_prep_cmd":true,
+        "launch":{"kind":"executable","program":"/games/excluded"}
+    }))
+    .unwrap();
+    let Change::Write { document, .. } = apply(
+        Operation::Create {
+            entry: excluded,
+            expected_revision: 0,
+        },
+        None,
+    )
+    .unwrap() else {
+        panic!()
+    };
+    let reloaded: Document =
+        serde_json::from_value(serde_json::to_value(document).unwrap()).unwrap();
+    assert!(reloaded.entries["app-0000000000000001"].exclude_global_prep_cmd);
+}
+
+#[test]
 fn mutations_require_revision_and_reject_unknown_authority_fields() {
     assert!(
         serde_json::from_value::<Operation>(json!({"action":"create","entry":entry("Game")}))

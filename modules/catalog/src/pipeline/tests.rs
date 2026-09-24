@@ -2509,6 +2509,7 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
     assert_eq!(imported["revision"], 1);
 
     let mut configured_entry = entry("Hand edited");
+    configured_entry["exclude_global_prep_cmd"] = json!(true);
     configured_entry["config_overrides"] =
         json!({"fec_percentage":37,"audio_sink_capture_only":false,"back_button_timeout":-1});
     let manual = backend.run_for(
@@ -2546,6 +2547,10 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
     assert_eq!(
         backend.entries["app-0000000000000001"]["name"],
         "Hand edited"
+    );
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["exclude_global_prep_cmd"],
+        true
     );
     assert_eq!(
         backend.entries["app-0000000000000001"]["config_overrides"]["fec_percentage"],
