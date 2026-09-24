@@ -464,7 +464,7 @@ impl CatalogSync {
             .exclude_games
             .iter()
             .filter_map(|exclusion| match exclusion {
-                crate::settings::Exclusion::Metadata(metadata) if metadata.id.is_empty() => {
+                crate::settings::Exclusion::Metadata(metadata) if !metadata.name.is_empty() => {
                     Some(metadata.name.clone())
                 }
                 _ => None,
@@ -1012,18 +1012,15 @@ mod tests {
     #[test]
     fn exclusions_match_numeric_ids_or_case_insensitive_names() {
         let settings = ProductSettings {
-            exclude_games: vec![
-                Exclusion::Id("7".into()),
-                Exclusion::Metadata(ExclusionMetadata {
-                    name: "EXCLUDED BY NAME".into(),
-                    ..ExclusionMetadata::default()
-                }),
-            ],
+            exclude_games: vec![Exclusion::Metadata(ExclusionMetadata {
+                id: "7".into(),
+                name: "EXCLUDED BY NAME".into(),
+            })],
             ..ProductSettings::default()
         };
         let entries = prepare_entries(
             &snapshot(vec![
-                game(7, "Keep?", "wine", "", ""),
+                game(7, "Different Name", "wine", "", ""),
                 game(8, "Excluded By Name", "wine", "", ""),
                 game(9, "Keep", "wine", "", ""),
             ]),
@@ -1206,11 +1203,11 @@ mod tests {
     }
 
     #[test]
-    fn name_exclusions_remove_only_attached_absent_rows_at_the_inventory_revision() {
+    fn paired_exclusion_name_removes_only_attached_absent_rows_at_inventory_revision() {
         let settings = ProductSettings {
             autosync_remove_uninstalled: false,
             exclude_games: vec![Exclusion::Metadata(ExclusionMetadata {
-                id: String::new(),
+                id: "99".into(),
                 name: "Legacy title".into(),
             })],
             ..ProductSettings::default()
@@ -1257,7 +1254,7 @@ mod tests {
         let batch = transaction.payload();
         assert_eq!(batch["action"], "provider_snapshot_batch");
         assert_eq!(batch["entries"][0]["source_id"], "1");
-        assert_eq!(batch["selection_remove_source_ids"], json!(["2"]));
+        assert_eq!(batch["selection_remove_source_ids"], json!(["2", "99"]));
     }
 
     #[test]

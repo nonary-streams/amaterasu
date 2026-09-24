@@ -28,9 +28,10 @@ enabled on Linux and disabled elsewhere, automatic sync every 30 seconds,
 stale removal enabled, Steam inclusion disabled, and no exclusions.
 
 An exclusion is a positive decimal game ID string or an object containing a
-positive decimal `id`, a printable `name`, or both. A supplied ID takes
-precedence; names match exact case-insensitively. The list is limited to 256
-unique entries and 12,000 encoded bytes.
+positive decimal `id`, a printable `name`, or both. When both fields are
+present, either a matching ID or an ASCII case-insensitive name match excludes
+the game. Single-field ID and name exclusions keep the same matching rules. The
+list is limited to 256 unique entries and 12,000 encoded bytes.
 
 When `include_steam` is enabled, Lutris asks `amaterasu.steam/1` for a complete,
 revision-stable paginated game list. It will not write a snapshot if the list is
@@ -43,10 +44,11 @@ cannot select or impersonate an owner.
 `autosync_remove_uninstalled=true` removes stale Lutris-owned entries only
 after a successful complete scan. The catalog preserves manually edited or
 detached entries. When removal is false, source IDs absent from the scan are
-retained unless an exclusion names them. Name exclusions use a revision-bound
-inventory of attached Lutris-owned rows before snapshot begin, so an absent row
-can be removed by its previous catalog name without touching another provider's
-or a user's entries. Detached rows do not expose a name and remain unchanged.
+retained unless an exclusion names them. Name-only and paired ID/name
+exclusions use a revision-bound inventory of attached Lutris-owned rows before
+snapshot begin, so an absent row can be removed by its previous catalog name.
+The inventory is scoped to this provider, so another provider's and a user's
+entries are untouched. Detached rows do not expose a name and remain unchanged.
 Currently discovered games that became excluded, non-importable under the Steam
 setting, or shadowed by a direct Steam entry are selectively removed after the
 complete scan. Catalog revision changes during inventory restart the inventory

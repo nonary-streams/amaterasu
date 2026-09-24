@@ -50,8 +50,10 @@ impl Exclusion {
     pub fn matches(&self, id: i64, name: &str) -> bool {
         match self {
             Self::Id(excluded) => excluded == &id.to_string(),
-            Self::Metadata(value) if !value.id.is_empty() => value.id == id.to_string(),
-            Self::Metadata(value) => value.name.eq_ignore_ascii_case(name),
+            Self::Metadata(value) => {
+                (!value.id.is_empty() && value.id == id.to_string())
+                    || (!value.name.is_empty() && value.name.eq_ignore_ascii_case(name))
+            }
         }
     }
 }
@@ -216,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_forms_preserve_id_precedence_and_name_matching() {
+    fn exclusions_match_id_or_name_and_keep_single_field_forms() {
         let by_id = Exclusion::Id("42".into());
         assert!(by_id.matches(42, "Any Name"));
         assert!(!by_id.matches(7, "42"));
@@ -225,7 +227,8 @@ mod tests {
             name: "Old Name".into(),
         });
         assert!(by_metadata.matches(42, "New Name"));
-        assert!(!by_metadata.matches(7, "Old Name"));
+        assert!(by_metadata.matches(7, "old name"));
+        assert!(!by_metadata.matches(7, "Different Name"));
         let by_name = Exclusion::Metadata(ExclusionMetadata {
             id: String::new(),
             name: "Example Game".into(),
