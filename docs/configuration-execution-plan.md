@@ -49,6 +49,17 @@ in memory, requiring sign-in after reload or module restart. The active-session
 TTL arithmetic matches, but these visible fallback and retention differences
 keep both IDs pending.
 
+Legacy migration now follows configured `file_state` and
+`vibeshine_file_state` auxiliary paths when they resolve to contained regular
+files. Missing auxiliary leaves are skipped after their existing ancestors are
+checked; escaping, dangling, or conflicting paths are rejected. The package
+snapshot, pairing identity importer, and administrator credential importer
+apply the same containment rule, while nonempty legacy API tokens remain a
+preflight blocker. This preserves more predecessor state without making the
+configured paths live Amaterasu settings. `file_state`,
+`vibeshine_file_state`, `credentials_file`, `cert`, and `pkey` remain pending;
+the Unix symlink cases also need execution on Unix CI.
+
 `global:origin_web_ui_allowed` remains pending. Vibeshine recognizes the exact
 lowercase `pc|lan|wan` values, defaults to `lan`, and checks the remote peer IP
 against that maximum tier: loopback is PC; RFC1918, CGNAT, link-local, and IPv6
@@ -227,16 +238,19 @@ well. These seven IDs remain pending.
 already produces a validated snapshot containing a controller number (0..15),
 the client's full active-controller mask, button flags, triggers, and four
 axes. The translator now preserves that complete state through a bounded JSON
-event and input model. Current stream sessions count controllers as unsupported
-without forwarding them to `amaterasu.input/1`, preserving the active stream
-until a native backend advertises genuine controller support. The input
-module and native backends currently inject keyboard and mouse only; Windows
-`SendInput` does not create a virtual controller, Linux uinput currently creates
-only keyboard and pointer devices, and macOS reports native injection as
-unsupported. Persisting either setting or displaying an editor control alone
-would not implement gamepad behavior.
+event and input model. On Linux, stream sessions forward snapshots only after
+the input service probes a working uinput controller device. Lease-owned slots
+then create and update up to 16 native controllers, remove slots absent from
+the active mask, and retain failed cleanup for retry. Controller failures are
+nonfatal to the stream. Windows `SendInput` does not create a virtual
+controller, and macOS reports native injection as unsupported. Linux still
+needs runtime device and permission qualification, the reference controller
+profile choices are incomplete, and `back_button_timeout` is not implemented.
+Persisting either setting or displaying an editor control alone would not
+complete gamepad parity.
 
-Implement the live path in this order:
+The live path follows this order; steps 1 and 2 and the initial Linux backend
+in step 3 are implemented:
 
 1. Preserve each decoded controller snapshot through the GameStream translator
    and stream-session queue into the input service, including the complete
@@ -272,8 +286,9 @@ should not be introduced as an unqualified dependency. Linux's reference choices
 are `auto`, `xone`, `ds4`, `ds5`, and `switch`, implemented through Inputtino
 virtual devices. A native Linux implementation also requires a working kernel
 uinput/UHID path and service-account permissions to create those devices.
-Amaterasu has no current gamepad output dependency or driver integration, so
-these are implementation and runtime qualification gates, not current support.
+Amaterasu now has a probed Linux uinput Xbox-like output, but does not yet
+implement the other reference profiles or qualify the device path on a Linux
+host. Windows driver integration remains an implementation and runtime gate.
 The pinned macOS backend has no virtual gamepad implementation; keep it
 unsupported until a genuine macOS virtual HID provider is selected and tested.
 
