@@ -61,7 +61,9 @@ discovery and browser display. A fixed official Steam CDN portrait can now be
 fetched when no local artwork exists, through a single bounded worker and
 revision-checked signed reads. The transfer accepts the reference's 16 MiB
 remote image limit; cached images do not survive restart, and
-low-resolution local art is not replaced or converted as in the reference.
+low-resolution local art is not replaced with converted remote art as in the
+reference. Local discovery now ranks bounded portrait candidates by parsed
+resolution across configured Steam roots.
 Platform qualification remains pending. Manual catalog entries can preserve explicit
 Steam ID and install-directory metadata. On Linux, a launch snapshots a
 baseline of same-user processes and associates new process identities only
@@ -131,10 +133,13 @@ support remain pending.
 The Windows WGC pacing option now defaults enabled, persists as a nullable
 product document v11 setting, and snapshots into Video Open. After a missed
 capture slot, ordinary WGC streams keep the prior frame grid only when the
-next fresh frame lands within the source phase and hold bounds. Constant-rate
-WGC currently hides whether a returned frame is fresh, so that mode does not
-apply smoothing. The nonblocking capture pump also cannot reproduce the
-reference's 200 ms blocking wait; those two timing behaviors remain pending.
+next fresh frame lands within the source phase and hold bounds. A versioned
+capture v1.2 callback now distinguishes newly acquired WGC frames from
+constant-rate cached reuse, so cached deliveries advance the existing grid
+without creating a false fresh-frame anchor. Older capture providers keep the
+v1.0/v1.1 path. The nonblocking capture pump still cannot reproduce the
+reference's 200 ms blocking wait, and live Windows timing qualification
+remains pending.
 
 The media transport now caps each software video send batch to a selected
 16, 32, or 64 KiB frame allowance. Product document v7 persists the nullable
@@ -197,7 +202,8 @@ complete scans now remove currently discovered entries that become excluded,
 non-importable under Steam policy, or shadowed by direct Steam entries even
 when stale removal is disabled. Explicit excluded IDs also remove older rows
 absent from the scan, while unrelated disappeared entries remain retained.
-Cross-session discovery, generic-launch eligibility after disabling the
-provider, and name-only exclusions of rows absent from the scan remain
-pending. The last case needs a Lutris-authorized catalog inventory of prior
-attached entry names at a stable collection revision.
+Name-only exclusions also remove matching absent rows through a Lutris-authorized
+catalog inventory of attached names, pinned to the collection revision used to
+begin the snapshot. Detached rows and other providers' entries remain untouched.
+Cross-session discovery and generic-launch eligibility after disabling the
+provider remain pending.
