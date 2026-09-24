@@ -128,8 +128,16 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
             STREAM_SESSION
                 .calls
                 .iter()
+                .filter(|service| **service != "amaterasu.session-history/1")
                 .all(|service| rtsp.calls.contains(service))
         );
+        // History is internal to stream-session; RTSP has no direct grant.
+        assert!(
+            STREAM_SESSION
+                .calls
+                .contains(&"amaterasu.session-history/1")
+        );
+        assert!(!rtsp.calls.contains(&"amaterasu.session-history/1"));
         assert!(rtsp.native_uses.is_empty());
     }
 }
@@ -148,6 +156,15 @@ fn development_policy_keeps_stream_session_disabled_and_console_non_native() {
     assert_ne!(settings["enable_input"], true);
     assert_eq!(policy.settings[INPUT.id]["allow_injection"], false);
     assert_eq!(policy.settings[INPUT_PROBE.id]["enabled"], false);
+    let history_database = std::path::PathBuf::from(
+        policy.settings["amaterasu.session-history"]["database_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(history_database.is_absolute());
+    let private_state_directory = root.join("data").join("state").canonicalize().unwrap();
+    assert!(history_database.starts_with(private_state_directory));
+    assert_eq!(history_database.file_name().unwrap(), "history.db");
     let http_settings = &policy.settings[NVHTTP.id];
     assert_eq!(http_settings["enabled"], false);
     assert_eq!(http_settings["address_family"], "ipv4");

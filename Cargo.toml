@@ -41,6 +41,7 @@ members = [
     "modules/media-transport",
     "modules/control-transport",
     "modules/stream-session",
+    "modules/session-history",
     "modules/rtsp",
     "modules/encode",
     "modules/video",
@@ -61,6 +62,7 @@ amaterasu-contracts = { path = "crates/contracts" }
 amaterasu-package = { path = "crates/package" }
 amaterasu-module-sdk = { path = "crates/module-sdk" }
 amaterasu-storage = { path = "crates/storage" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libloading = "0.8"

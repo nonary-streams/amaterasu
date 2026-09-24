@@ -414,6 +414,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-session-history"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "amaterasu-storage",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-state"
 version = "0.1.0"
 dependencies = [

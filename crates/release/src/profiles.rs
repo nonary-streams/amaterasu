@@ -70,6 +70,17 @@ const SESSION: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID],
 };
 
+const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.session-history",
+    library: "amaterasu_session_history",
+    provides: &["amaterasu.session-history/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+
 const CONFIGURATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.configuration",
     library: "amaterasu_configuration",
@@ -414,6 +425,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-dxgi/1",
         "amaterasu.capture-wgc/1",
         "amaterasu.encode/1",
+        "amaterasu.session-history/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -428,6 +440,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.input",
         RUNTIME_ID,
         "amaterasu.session",
+        "amaterasu.session-history",
         "amaterasu.video",
         "amaterasu.audio",
         "amaterasu.audio-encode",
@@ -476,6 +489,7 @@ const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.input-probe",
         RUNTIME_ID,
         "amaterasu.session",
+        "amaterasu.session-history",
         "amaterasu.stream-source",
         "amaterasu.audio-encode",
         "amaterasu.media-transport",
@@ -556,6 +570,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.rtsp/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
+        "amaterasu.session-history/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -583,6 +598,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode",
         "amaterasu.video",
         "amaterasu.nvhttp",
+        "amaterasu.session-history",
     ],
 };
 
@@ -613,6 +629,7 @@ impl PackageProfile {
                 PAIRING,
                 NVHTTP,
                 SESSION,
+                SESSION_HISTORY,
                 STREAM_SOURCE,
                 INPUT_PROBE,
                 AUDIO_ENCODE,
@@ -625,6 +642,7 @@ impl PackageProfile {
                 RUNTIME,
                 STATE,
                 SESSION,
+                SESSION_HISTORY,
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,
@@ -697,6 +715,12 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     let state_directory = state_directory
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let history_directory = state_directory.join("session-history");
+    create_private_directory(&history_directory)?;
+    let history_database = history_directory
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .join("history.db");
     policy.settings = BTreeMap::from([
         (
             "amaterasu.rtsp".into(),
@@ -750,6 +774,10 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
         (
             "amaterasu.state".into(),
             json!({"data_directory": state_directory}),
+        ),
+        (
+            "amaterasu.session-history".into(),
+            json!({"database_path": history_database.to_string_lossy()}),
         ),
         (
             "amaterasu.authentication".into(),
