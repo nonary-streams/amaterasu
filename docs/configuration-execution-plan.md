@@ -37,6 +37,18 @@ session renewal, network policy, Steam and Playnite provider slices, a live
 input policy, and certificate-bound streaming overrides. It does not pass
 the final parity gate.
 
+The authentication TTLs accept 1 through 2,147,483,647 seconds. Amaterasu stores
+them in revisioned v1 product settings; authentication tests cover bounds, CAS,
+restart loading, refresh rotation, and expiry. Host defaults are 7,200 seconds for
+`global:session_token_ttl_seconds` and 604,800 seconds for
+`global:remember_me_refresh_token_ttl_seconds`. Vibeshine's host defaults match,
+but its web settings merge shows 86,400 seconds for an unset session TTL. Its
+secure HTTP-only cookies and persisted server-side session state survive browser
+reload and host restart; Amaterasu keeps bearer strings and session digests only
+in memory, requiring sign-in after reload or module restart. The active-session
+TTL arithmetic matches, but these visible fallback and retention differences
+keep both IDs pending.
+
 Each worker commits its owned implementation after rustfmt, meaningful tests,
 and Clippy. Use the repository's Nonary Git identity and include these exact
 lines in every plan commit, including integration commits:
