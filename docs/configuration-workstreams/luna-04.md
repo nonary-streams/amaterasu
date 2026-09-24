@@ -2,6 +2,22 @@
 
 ## Current bounded slice
 
+- Candidate source commit: `431acd70a632f6960b22be18a915cc49107c215a` (cherry-picked from worker candidate `bd03e85c2b26fb62dbe08e73a9a2c813e28092cb`).
+- Follow-up test expectation commit: `2f8775d230628f272c8290f802f6e193ab2b7de7` updates the v9 absent-document bootstrap default assertion discovered by the full package suite.
+- Base SHA: `3adbd51f434c2956dfedb6301e0fd9d008b4ce0e`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable ID: `global:ds4_back_as_touchpad_click` (global and sparse per-application/per-client override).
+- Worker: session `01a0d559-d1e8-7fd2-aa27-6a2b42fc7fa6`, verified `gpt-6-luna`/`xhigh` before edits; task was lease snapshot/retry semantics in the input controller.
+- Changed paths: `modules/input/src/controller.rs`, `modules/input/src/controller/tests.rs`, and `modules/input/src/product_settings/tests.rs`.
+
+The lease now stores the effective DS4 back mapping computed at acquisition. The original sparse request stays as `Option<bool>` for operation replay and conflict checks: an explicit false remains `Some(false)`, and the v9 default continues to pass through as `None`. A global settings change cannot alter the active lease; release restores the latest global value. The backend setting only affects the DS4 report mapping.
+
+Validation: `rustfmt --edition 2024 --check` passed on the changed Rust files. `cargo test -p amaterasu-input --target x86_64-pc-windows-msvc ds4_back` passed all 5 matching tests. The full package command `cargo test -p amaterasu-input --target x86_64-pc-windows-msvc` passed all 113 tests after updating the stale v9 bootstrap expectation. It reports the existing `windows_gamepad.rs::start_with` dead-code warning. The installed Windows MSVC target verifies cross-target compilation and pure unit tests; no ViGEmBus device/runtime qualification was performed.
+
+The coordinator's landing policy is direct lane-commit cherry-picks into `main`; no integration branch is used. The coordinator owns those cherry-picks. This correction leaves `global:ds4_back_as_touchpad_click` pending until management/client/app resolution and Windows device qualification are reviewed.
+
+## Initial DS4 profile and settings wire-up
+
 - Candidate code commit: `50163b7dff4eefc4e4de14638d2861940c1f849e`
 - Lane start/base commit: `30acd5de34ac5548ebf4d46086fc32ccad7b6913`
 - Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
@@ -97,4 +113,16 @@ The lane-start coverage snapshot reported all 23 IDs pending. This candidate doe
 
 ## Next bounded slice
 
-Continue with Windows audio capture recovery in `modules/audio/src/worker.rs` and its owned platform/packet files. The audit found that `device_lost` currently ends capture permanently, while the pinned reference retries acquisition until shutdown. Keep the AudioCapture API stable, make retry shutdown-cancellable, preserve packet sequence/timestamp continuity and mark the first recovered packet discontinuous. Add fake-source retry/continuity tests but do not execute them in this lightweight checkout. Then continue independent audio and input settings work while cross-lane consumers integrate.
+The next candidate is Windows audio capture recovery in `modules/audio/src/worker.rs` and its owned platform/packet files, for `global:audio_sink` and `global:virtual_sink`. The audit found that `device_lost` currently ends capture permanently, while the pinned reference retries acquisition until shutdown. Keep the AudioCapture API stable, make retry shutdown-cancellable, preserve packet sequence/timestamp continuity and mark the first recovered packet discontinuous. Add fake-source retry/continuity tests but do not execute them in this lightweight checkout.
+
+Continue with independent audio and input settings work while cross-lane consumers integrate.
+
+## Recovery slice attempt (blocked before code edits)
+
+- Recovery base SHA: `4af446961b46a516305d49dc53376d7cf8a2d35e` (the DS4 handoff commit); no recovery code candidate exists.
+- Blocker-record commit: `554ac24` (`docs(audio): record recovery worker effort blocker`).
+- IDs and scope: `global:audio_sink`, `global:virtual_sink`.
+- Proposed owned paths: `modules/audio/src/worker.rs`, `modules/audio/src/platform/windows.rs`, `modules/audio/src/platform/mod.rs`, `modules/audio/src/packet.rs`, `modules/audio/src/model.rs`, `modules/audio/src/controller.rs`, and `modules/audio/README.md`.
+- Tests: none run or added for capture recovery in that attempt; Windows capture/device qualification is unavailable here.
+- Worker request: `recovery_timeline` was requested as `gpt-6-luna`/`xhigh`, with exclusive ownership of `modules/audio/src/packet.rs` and a requirement to confirm settings before edits. Its runtime attribution reported session `01a0d516-8713-7b83-87f1-d35c0828ae10` as `gpt-6-luna`/`max`, so it made no changes and this recovery attempt stopped before code edits. The DS4 lease correction separately confirmed a native XHigh worker can start, but audio recovery was not assigned in that slice.
+- No recovery code was written. No platform evidence changed. Capture recovery remains pending for a separate bounded slice; it was not part of the DS4 lease correction.
