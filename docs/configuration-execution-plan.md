@@ -157,6 +157,13 @@ editor preserves raw 0..64 selections while reporting the effective fallback.
 Platform UDP segmentation offload and its compatibility behavior remain
 pending.
 
+The `ping_timeout` setting now has a signed editor and nullable product
+document v13 value. Its 10,000 ms default and 0..2,147,483,647 ms range are
+snapshotted at launch, carried through RTSP and stream preparation, and used
+for post-prepare expiry, authenticated control idleness, and UDP peer discovery.
+The editor's blank/-1 resets to the default. Cross-platform client timing and
+live-stream qualification remain pending; this ID is not yet verified.
+
 The `max_bitrate` host option now stores a signed raw value in product document
 v8. Positive values cap Amaterasu's initial configured stream bitrate; zero and
 negative values mean no configured cap. The current encoder profile accepts

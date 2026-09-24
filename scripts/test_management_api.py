@@ -503,6 +503,8 @@ def test_auth_and_crud(console, api):
     assert isinstance(host_settings["effective_audio_sink"], str), host_settings
     assert host_settings["configured_wgc_pacing_smoothing"] is None, host_settings
     assert host_settings["effective_wgc_pacing_smoothing"] is True, host_settings
+    assert host_settings["configured_ping_timeout_ms"] is None, host_settings
+    assert host_settings["effective_ping_timeout_ms"] == 10_000, host_settings
     assert host_settings["stream_audio"] is True, host_settings
     assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
     assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
@@ -542,6 +544,7 @@ def test_auth_and_crud(console, api):
         "audio_sink": "test-audio-endpoint",
         "external_ip": "203.0.113.42",
         "wgc_pacing_smoothing": False,
+        "ping_timeout_ms": 2300,
         "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
     }, administrator)
@@ -561,6 +564,8 @@ def test_auth_and_crud(console, api):
     assert renamed_host["effective_audio_sink"] == "test-audio-endpoint", renamed_host
     assert renamed_host["configured_wgc_pacing_smoothing"] is False, renamed_host
     assert renamed_host["effective_wgc_pacing_smoothing"] is False, renamed_host
+    assert renamed_host["configured_ping_timeout_ms"] == 2300, renamed_host
+    assert renamed_host["effective_ping_timeout_ms"] == 2300, renamed_host
     assert renamed_host["stream_audio"] is False, renamed_host
     assert renamed_host["configured_address_family"] == "ipv4", renamed_host
     assert renamed_host["configured_bind_address"] == "", renamed_host
@@ -617,6 +622,12 @@ def test_auth_and_crud(console, api):
         "expected_revision": renamed_host["revision"],
         "wgc_pacing_smoothing": "false",
     }, administrator)[0] == 400
+    for invalid_timeout in (-2, 2_147_483_648, "2300"):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "ping_timeout_ms": invalid_timeout,
+        }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
         connection.request("GET", "/serverinfo")
@@ -642,6 +653,8 @@ def test_auth_and_crud(console, api):
     assert moved_host["effective_audio_sink"] == "test-audio-endpoint", moved_host
     assert moved_host["configured_wgc_pacing_smoothing"] is False, moved_host
     assert moved_host["effective_wgc_pacing_smoothing"] is False, moved_host
+    assert moved_host["configured_ping_timeout_ms"] == 2300, moved_host
+    assert moved_host["effective_ping_timeout_ms"] == 2300, moved_host
     assert moved_host["stream_audio"] is False, moved_host
     assert moved_host["active_http_port"] == moved_port, moved_host
     assert moved_host["active_https_port"] == moved_port - 5, moved_host
@@ -1148,6 +1161,8 @@ def main():
             assert host_settings["effective_audio_sink"] == "test-audio-endpoint", host_settings
             assert host_settings["configured_wgc_pacing_smoothing"] is False, host_settings
             assert host_settings["effective_wgc_pacing_smoothing"] is False, host_settings
+            assert host_settings["configured_ping_timeout_ms"] == 2300, host_settings
+            assert host_settings["effective_ping_timeout_ms"] == 2300, host_settings
             assert host_settings["stream_audio"] is False, host_settings
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
@@ -1203,6 +1218,7 @@ def main():
                 "audio_sink": None,
                 "external_ip": None,
                 "wgc_pacing_smoothing": None,
+                "ping_timeout_ms": None,
                 "stream_audio": True,
                 "expected_revision": reset_revision,
             }, relogged["bearer"])
@@ -1223,6 +1239,8 @@ def main():
             assert isinstance(reset_host["effective_audio_sink"], str), reset_host
             assert reset_host["configured_wgc_pacing_smoothing"] is None, reset_host
             assert reset_host["effective_wgc_pacing_smoothing"] is True, reset_host
+            assert reset_host["configured_ping_timeout_ms"] is None, reset_host
+            assert reset_host["effective_ping_timeout_ms"] == 10_000, reset_host
             assert reset_host["stream_audio"] is True, reset_host
             assert reset_host["address_family"] == "ipv4", reset_host
             assert reset_host["bind_address"] == "127.0.0.1", reset_host
