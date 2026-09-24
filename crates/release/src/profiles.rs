@@ -145,6 +145,26 @@ const PLAYNITE: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID, "amaterasu.catalog", "amaterasu.configuration"],
 };
 
+const LUTRIS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.lutris",
+    library: "amaterasu_lutris",
+    provides: &["amaterasu.lutris/1"],
+    calls: &[
+        "amaterasu.catalog/1",
+        "amaterasu.configuration/1",
+        "amaterasu.steam/1",
+    ],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.catalog",
+        "amaterasu.configuration",
+        "amaterasu.steam",
+    ],
+};
+
 const AUTHENTICATION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.authentication",
     library: "amaterasu_authentication",
@@ -504,6 +524,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.input/1",
         "amaterasu.steam/1",
         "amaterasu.playnite/1",
+        "amaterasu.lutris/1",
         "amaterasu.diagnostics/1",
         "amaterasu.pairing/1",
         "amaterasu.display/1",
@@ -535,6 +556,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.input",
         "amaterasu.steam",
         "amaterasu.playnite",
+        "amaterasu.lutris",
         "amaterasu.diagnostics",
         "amaterasu.pairing",
         "amaterasu.display",
@@ -593,6 +615,7 @@ impl PackageProfile {
                 DIAGNOSTICS,
                 STEAM,
                 PLAYNITE,
+                LUTRIS,
                 AUTHENTICATION,
                 MANAGEMENT,
                 PAIRING,
@@ -693,6 +716,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",
                     "amaterasu.playnite": "amaterasu.management",
+                    "amaterasu.lutris": "amaterasu.management",
                 },
             }),
         ),
@@ -778,6 +802,7 @@ pub fn installer_policy(
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",
                     "amaterasu.playnite": "amaterasu.management",
+                    "amaterasu.lutris": "amaterasu.management",
                 },
             }),
         ),

@@ -25,6 +25,7 @@ members = [
     "modules/diagnostics",
     "modules/steam",
     "modules/playnite",
+    "modules/lutris",
     "modules/authentication",
     "modules/management",
     "modules/pairing",
