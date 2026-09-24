@@ -43,10 +43,12 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
         "settings_update" => {
-            fields(object, &["hostname", "expected_revision"], &[])?;
+            fields(object, &["hostname", "port", "expected_revision"], &[])?;
             let hostname = text(object, "hostname")?;
+            let port = object.get("port").and_then(Value::as_u64);
             if hostname.len() > 128
                 || hostname.chars().any(char::is_control)
+                || !port.is_some_and(|port| (1029..=65514).contains(&port))
                 || object
                     .get("expected_revision")
                     .and_then(Value::as_u64)

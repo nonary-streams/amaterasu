@@ -40,3 +40,9 @@ The Steam import options `steam_include_tools`, `steam_exclude_games`, and
 data. Vibeshine applies them to import and launch eligibility. Filtering the raw
 discovery feed would change that behavior, so these IDs remain pending until the
 catalog integration owns those effects.
+
+The live NVHTTP HTTP/HTTPS base-port slice does not close `global:port` yet.
+Vibeshine derives RTSP and streaming UDP ports from the same base, while those
+Amaterasu services still use separate startup settings. `address_family` and
+`bind_address` likewise remain pending until every listener follows their
+policy without weakening the loopback control plane.

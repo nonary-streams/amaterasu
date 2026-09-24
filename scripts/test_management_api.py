@@ -19,6 +19,22 @@ PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
 
 
+def available_moonlight_port_pair():
+    for _ in range(30):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as http_socket:
+            http_socket.bind(("127.0.0.1", 0))
+            port = http_socket.getsockname()[1]
+            if not 1029 <= port <= 65514:
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as https_socket:
+                    https_socket.bind(("127.0.0.1", port - 5))
+            except OSError:
+                continue
+            return port
+    raise AssertionError("no available Moonlight HTTP/HTTPS port pair")
+
+
 class Api:
     def __init__(self, console):
         status = console.request("amaterasu.management/1", {"action": "status"})
@@ -124,8 +140,11 @@ def test_auth_and_crud(console, api):
     assert status == 200 and migrated["ok"] and migrated["values"]["refresh"] == 120, migrated
     status, host_settings, _ = api.post("/v1/nvhttp/settings", token=administrator)
     assert status == 200 and host_settings["hostname"] == "Amaterasu-test", host_settings
+    assert host_settings["active_http_port"] == host_settings["port"], host_settings
+    assert host_settings["active_https_port"] == host_settings["port"] - 5, host_settings
     status, default_host, _ = api.post("/v1/nvhttp/settings_update", {
-        "hostname": "", "expected_revision": host_settings["revision"],
+        "hostname": "", "port": host_settings["port"],
+        "expected_revision": host_settings["revision"],
     }, administrator)
     assert status == 200 and default_host["configured_hostname"] == "" and default_host["hostname"], default_host
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
@@ -137,15 +156,18 @@ def test_auth_and_crud(console, api):
     assert default_info.findtext("hostname") == default_host["hostname"], ET.tostring(default_info)
     status, renamed_host, _ = api.post("/v1/nvhttp/settings_update", {
         "hostname": "Living Room & Games",
+        "port": default_host["port"],
         "expected_revision": default_host["revision"],
     }, administrator)
     assert status == 200 and renamed_host["hostname"] == "Living Room & Games", renamed_host
     status, conflict, _ = api.post("/v1/nvhttp/settings_update", {
-        "hostname": "Stale", "expected_revision": host_settings["revision"],
+        "hostname": "Stale", "port": renamed_host["port"],
+        "expected_revision": host_settings["revision"],
     }, administrator)
     assert status == 200 and conflict["code"] == "revision_conflict", conflict
     assert api.post("/v1/nvhttp/settings_update", {
-        "hostname": "Foreign", "expected_revision": renamed_host["revision"],
+        "hostname": "Foreign", "port": renamed_host["port"],
+        "expected_revision": renamed_host["revision"],
         "owner": "amaterasu.other",
     }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
@@ -155,6 +177,21 @@ def test_auth_and_crud(console, api):
     finally:
         connection.close()
     assert refreshed.findtext("hostname") == "Living Room & Games", ET.tostring(refreshed)
+    moved_port = available_moonlight_port_pair()
+    status, moved_host, _ = api.post("/v1/nvhttp/settings_update", {
+        "hostname": "Living Room & Games", "port": moved_port,
+        "expected_revision": renamed_host["revision"],
+    }, administrator)
+    assert status == 200 and moved_host["ok"], moved_host
+    assert moved_host["active_http_port"] == moved_port, moved_host
+    assert moved_host["active_https_port"] == moved_port - 5, moved_host
+    connection = http.client.HTTPConnection(host, moved_port, timeout=5)
+    try:
+        connection.request("GET", "/serverinfo")
+        moved_info = ET.fromstring(connection.getresponse().read())
+    finally:
+        connection.close()
+    assert moved_info.findtext("hostname") == "Living Room & Games", ET.tostring(moved_info)
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
     assert status == 200 and steam_settings["values"]["enabled"] is False, steam_settings
     status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
@@ -191,7 +228,7 @@ def test_auth_and_crud(console, api):
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
     assert api.post("/v1/runtime/request", {"service": "amaterasu.state/1"}, administrator)[0] == 404
-    return token, administrator
+    return token, administrator, moved_port
 
 
 def test_http_framing(api):
@@ -211,6 +248,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="amaterasu-management-") as temporary:
         harness = PlatformHarness(Path(temporary))
         configure_steam_fixture(harness)
+        initial_port = available_moonlight_port_pair()
         bootstrap_path = harness.root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
         bootstrap["policy"]["settings"]["amaterasu.management"] = {
@@ -218,8 +256,8 @@ def main():
         }
         bootstrap["policy"]["settings"]["amaterasu.nvhttp"] = {
             "enabled": True,
-            "http_bind": "127.0.0.1:0",
-            "https_bind": "127.0.0.1:0",
+            "http_bind": f"127.0.0.1:{initial_port}",
+            "https_bind": f"127.0.0.1:{initial_port - 5}",
             "allow_remote": False,
             "hostname": "Amaterasu-test",
         }
@@ -228,7 +266,7 @@ def main():
         console = Console(harness)
         try:
             api = Api(console)
-            token, session = test_auth_and_crud(console, api)
+            token, session, moved_port = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -244,6 +282,7 @@ def main():
             assert status == 200 and relogged["ok"], relogged
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=relogged["bearer"])
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
+            assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
             assert status == 200 and steam_settings["values"]["enabled"] is True, steam_settings
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
@@ -260,7 +299,8 @@ def main():
         finally:
             console.close()
     print("Passed: real HTTP login/authentication, route scopes, catalog CRUD, token persistence/revocation,")
-    print("Moonlight hostname/Steam settings CAS, discovery and restart persistence, session restart invalidation,")
+    print("Moonlight hostname/port live rebind and Steam settings CAS, discovery and restart persistence,")
+    print("session restart invalidation,")
     print("strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 

@@ -65,12 +65,20 @@ namespace Amaterasu {
         const form = el("form", "settings-form");
         const hostname = input("hostname", settings.configured_hostname);
         hostname.maxLength = 128;
+        const port = input("port", String(settings.port), "number");
+        port.required = true;
+        port.min = "1029";
+        port.max = "65514";
+        port.step = "1";
         const status = el("div");
-        const save = el("button", "button primary", "Save host name");
+        const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
         form.append(
           field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."),
+          field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."),
+          el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`),
+          ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -79,9 +87,10 @@ namespace Amaterasu {
           void runAction(save, status, async () => {
             await context.api.post("nvhttp/settings_update", {
               hostname: hostname.value,
+              port: port.valueAsNumber,
               expected_revision: settings.revision,
             });
-            context.notify("Host name saved.");
+            context.notify("Host settings saved.");
             await loadHost();
           });
         });

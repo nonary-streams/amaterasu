@@ -402,20 +402,29 @@ mod tests {
         assert_eq!(
             payload(
                 update,
-                br#"{"hostname":"Living Room","expected_revision":0}"#
+                br#"{"hostname":"Living Room","port":47989,"expected_revision":0}"#
             )
             .unwrap()["action"],
             "settings_update"
         );
         for rejected in [
-            br#"{"hostname":"Living Room"}"#.as_slice(),
-            br#"{"hostname":"Living Room","expected_revision":0,"owner":"other"}"#,
-            br#"{"hostname":"Living Room","expected_revision":-1}"#,
-            br#"{"hostname":"Long\nName","expected_revision":0}"#,
+            br#"{"hostname":"Living Room","port":47989}"#.as_slice(),
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"owner":"other"}"#,
+            br#"{"hostname":"Living Room","port":47989,"expected_revision":-1}"#,
+            br#"{"hostname":"Long\nName","port":47989,"expected_revision":0}"#,
+            br#"{"hostname":"Living Room","port":1028,"expected_revision":0}"#,
+            br#"{"hostname":"Living Room","port":65515,"expected_revision":0}"#,
+            br#"{"hostname":"Living Room","port":47989.5,"expected_revision":0}"#,
         ] {
             assert!(payload(update, rejected).is_err());
         }
-        assert!(payload(update, br#"{"hostname":"","expected_revision":0}"#).is_ok());
+        assert!(
+            payload(
+                update,
+                br#"{"hostname":"","port":47989,"expected_revision":0}"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]

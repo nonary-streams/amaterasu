@@ -22,17 +22,19 @@ and defines the evidence needed to close each ID.
 
 The configuration service now validates decimal, enum, list, and object fields
 and persists separate caller-owned product documents with versioned CAS updates.
-Management can edit the NVHTTP host name and Steam discovery toggle through
-fixed, scope-checked routes. The signed HTTP regression verifies durable updates,
+Management can edit the NVHTTP host name, its HTTP/HTTPS listener port pair,
+and the Steam discovery toggle through fixed, scope-checked routes. The signed
+HTTP regression verifies durable updates,
 conflict handling, live Moonlight server-info naming (including the PC-name
-fallback), Steam discovery gating, and both settings after restart. These are
-partial implementations of their Vibeshine options: legacy host-name consumers
-and exact validation, and Steam catalog sync, artwork, and launch behavior still
-need parity work. The inventory statuses stay pending accordingly.
+fallback), listener rebinding, Steam discovery gating, and settings after
+restart. Legacy host-name consumers, exact validation, RTSP/UDP port
+propagation, and Steam catalog sync, artwork, and launch behavior still need
+parity work. The inventory statuses stay pending accordingly.
 The application catalog accepts Vibeshine's `working-dir` spelling and applies
-its directory precedence to launch, preparation and undo commands. That ID
-remains pending because Vibeshine also accepts shell/PATH command forms that
-Amaterasu's structured absolute-executable model does not represent.
+its directory precedence to launch, preparation and undo commands. Its
+`auto-detach` policy retains a quick successful launcher for explicit cleanup.
+Those IDs remain pending because Vibeshine also accepts shell/PATH command
+forms and further process-group behavior that Amaterasu does not represent.
 
 The pinned [route declaration inventory](reference-routes.json) and
 [Windows regression gates](windows-regression-gates.md) make part of that audit

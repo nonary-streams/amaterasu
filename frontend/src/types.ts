@@ -53,6 +53,11 @@ namespace Amaterasu {
     revision: number;
     hostname: string;
     configured_hostname: string;
+    port: number;
+    https_port: number;
+    active_http_port: number | null;
+    active_https_port: number | null;
+    listener_error: string | null;
   }
   export interface SteamSettings {
     revision: number;
