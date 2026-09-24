@@ -759,6 +759,57 @@ fn old_provider_markers_default_to_no_uninstalled_tombstone() {
     assert_eq!(marker.source_flags, 0);
     assert_eq!(marker.remove_reason, None);
     assert!(marker.config_overrides.validate().is_ok());
+    assert_eq!(marker.config_overrides.max_bitrate, None);
+    assert_eq!(marker.config_overrides.minimum_fps_target, None);
+    assert_eq!(marker.config_overrides.video_max_batch_size_kb, None);
+
+    let mut old_marker_value = serde_json::to_value(marker).unwrap();
+    old_marker_value["config_overrides"] = json!({"fec_percentage":37});
+    let old_marker_with_overrides: Marker = serde_json::from_value(old_marker_value).unwrap();
+    assert_eq!(
+        old_marker_with_overrides.config_overrides.fec_percentage,
+        Some(37)
+    );
+    assert_eq!(old_marker_with_overrides.config_overrides.max_bitrate, None);
+    assert_eq!(
+        old_marker_with_overrides
+            .config_overrides
+            .minimum_fps_target,
+        None
+    );
+    assert_eq!(
+        old_marker_with_overrides
+            .config_overrides
+            .video_max_batch_size_kb,
+        None
+    );
+    assert!(
+        old_marker_with_overrides
+            .config_overrides
+            .validate()
+            .is_ok()
+    );
+
+    let mut persisted_marker = old_marker_with_overrides;
+    persisted_marker.config_overrides.max_bitrate = Some(42_000);
+    persisted_marker.config_overrides.minimum_fps_target = Some(59.94);
+    persisted_marker.config_overrides.video_max_batch_size_kb = Some(32);
+    let stored_marker = marker_value(&persisted_marker);
+    let restored_marker: Marker = serde_json::from_value(stored_marker).unwrap();
+    assert!(validate_marker(
+        &restored_marker,
+        "amaterasu.playnite",
+        "playnite:10"
+    ));
+    assert_eq!(restored_marker.config_overrides.max_bitrate, Some(42_000));
+    assert_eq!(
+        restored_marker.config_overrides.minimum_fps_target,
+        Some(59.94)
+    );
+    assert_eq!(
+        restored_marker.config_overrides.video_max_batch_size_kb,
+        Some(32)
+    );
 }
 
 #[test]

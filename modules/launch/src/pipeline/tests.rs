@@ -64,6 +64,10 @@ struct Harness {
     catalog_steam_id: Option<String>,
     catalog_steam_install_dir: Option<String>,
     catalog_fec_percentage: Option<u8>,
+    catalog_max_bitrate: Option<i32>,
+    catalog_minimum_fps_target: Option<f64>,
+    catalog_video_max_batch_size_kb: Option<u8>,
+    catalog_stream_audio: Option<bool>,
     catalog_audio_sink: Option<String>,
     catalog_audio_sink_capture_only: Option<bool>,
     catalog_back_button_timeout: Option<i32>,
@@ -119,6 +123,10 @@ impl Harness {
             catalog_steam_id: None,
             catalog_steam_install_dir: None,
             catalog_fec_percentage: None,
+            catalog_max_bitrate: None,
+            catalog_minimum_fps_target: None,
+            catalog_video_max_batch_size_kb: None,
+            catalog_stream_audio: None,
             catalog_audio_sink: None,
             catalog_audio_sink_capture_only: None,
             catalog_back_button_timeout: None,
@@ -559,6 +567,23 @@ impl Harness {
                         if let Some(fec_percentage) = self.catalog_fec_percentage {
                             overrides.insert("fec_percentage".into(), json!(fec_percentage));
                         }
+                        if let Some(max_bitrate) = self.catalog_max_bitrate {
+                            overrides.insert("max_bitrate".into(), json!(max_bitrate));
+                        }
+                        if let Some(minimum_fps_target) = self.catalog_minimum_fps_target {
+                            overrides
+                                .insert("minimum_fps_target".into(), json!(minimum_fps_target));
+                        }
+                        if let Some(video_max_batch_size_kb) = self.catalog_video_max_batch_size_kb
+                        {
+                            overrides.insert(
+                                "video_max_batch_size_kb".into(),
+                                json!(video_max_batch_size_kb),
+                            );
+                        }
+                        if let Some(stream_audio) = self.catalog_stream_audio {
+                            overrides.insert("stream_audio".into(), json!(stream_audio));
+                        }
                         if let Some(audio_sink) = &self.catalog_audio_sink {
                             overrides.insert("audio_sink".into(), json!(audio_sink));
                         }
@@ -938,6 +963,10 @@ fn persisted_catalog_working_directory_reaches_application_launch_cwd() {
 fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app() {
     let mut harness = Harness::new();
     harness.catalog_fec_percentage = Some(37);
+    harness.catalog_max_bitrate = Some(0);
+    harness.catalog_minimum_fps_target = Some(59.94);
+    harness.catalog_video_max_batch_size_kb = Some(0);
+    harness.catalog_stream_audio = Some(false);
     harness.catalog_audio_sink = Some(String::new());
     harness.catalog_audio_sink_capture_only = Some(false);
     harness.catalog_back_button_timeout = Some(-1);
@@ -946,6 +975,16 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     let started = harness.request(&mut pipeline, "nvhttp", launch_export("fec-snapshot"));
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(started["launch"]["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(started["launch"]["config_overrides"]["max_bitrate"], 0);
+    assert_eq!(
+        started["launch"]["config_overrides"]["minimum_fps_target"],
+        59.94
+    );
+    assert_eq!(
+        started["launch"]["config_overrides"]["video_max_batch_size_kb"],
+        0
+    );
+    assert_eq!(started["launch"]["config_overrides"]["stream_audio"], false);
     assert_eq!(started["launch"]["config_overrides"]["audio_sink"], "");
     assert_eq!(
         started["launch"]["config_overrides"]["audio_sink_capture_only"],
@@ -958,6 +997,10 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
 
     // Later catalog edits do not replace the policy captured by this launch.
     harness.catalog_fec_percentage = Some(81);
+    harness.catalog_max_bitrate = Some(-100);
+    harness.catalog_minimum_fps_target = Some(120.0);
+    harness.catalog_video_max_batch_size_kb = Some(64);
+    harness.catalog_stream_audio = Some(true);
     harness.catalog_audio_sink = Some("later-endpoint".into());
     harness.catalog_audio_sink_capture_only = Some(true);
     harness.catalog_back_button_timeout = Some(300);
@@ -967,6 +1010,16 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(status["launch"]["config_overrides"]["fec_percentage"], 37);
+    assert_eq!(status["launch"]["config_overrides"]["max_bitrate"], 0);
+    assert_eq!(
+        status["launch"]["config_overrides"]["minimum_fps_target"],
+        59.94
+    );
+    assert_eq!(
+        status["launch"]["config_overrides"]["video_max_batch_size_kb"],
+        0
+    );
+    assert_eq!(status["launch"]["config_overrides"]["stream_audio"], false);
     assert_eq!(status["launch"]["config_overrides"]["audio_sink"], "");
     assert_eq!(
         status["launch"]["config_overrides"]["audio_sink_capture_only"],

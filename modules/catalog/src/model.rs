@@ -65,11 +65,17 @@ impl ArtworkReference {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_fps_target: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +107,15 @@ impl ConfigOverrides {
             .is_some_and(|percentage| percentage == 0)
         {
             return Err("fec_percentage must be between 1 and 255");
+        }
+        if self
+            .minimum_fps_target
+            .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
+        {
+            return Err("minimum_fps_target must be finite and between 0 and 1000");
+        }
+        if self.video_max_batch_size_kb.is_some_and(|size| size > 64) {
+            return Err("video_max_batch_size_kb must be between 0 and 64");
         }
         if self
             .audio_sink
@@ -136,6 +151,9 @@ impl ConfigOverrides {
 
     pub fn is_empty(&self) -> bool {
         self.fec_percentage.is_none()
+            && self.max_bitrate.is_none()
+            && self.minimum_fps_target.is_none()
+            && self.video_max_batch_size_kb.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.virtual_sink.is_none()
@@ -579,6 +597,9 @@ mod tests {
         legacy.validate().unwrap();
         assert!(!legacy.elevated);
         assert_eq!(legacy.config_overrides.fec_percentage, Some(37));
+        assert_eq!(legacy.config_overrides.max_bitrate, None);
+        assert_eq!(legacy.config_overrides.minimum_fps_target, None);
+        assert_eq!(legacy.config_overrides.video_max_batch_size_kb, None);
         assert_eq!(legacy.config_overrides.stream_audio, None);
         let legacy_json = serde_json::to_value(legacy).unwrap();
         assert_eq!(legacy_json["config_overrides"]["fec_percentage"], 37);
@@ -671,6 +692,106 @@ mod tests {
                 "accepted non-string mode {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn video_overrides_preserve_sparse_values_and_validate_bounds() {
+        let inherited = ConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "max_bitrate": null,
+                "minimum_fps_target": null,
+                "video_max_batch_size_kb": null
+            }))
+            .unwrap(),
+            inherited
+        );
+
+        for max_bitrate in [i32::MIN, -1, 0, 42_000] {
+            let selected: ConfigOverrides = serde_json::from_value(json!({
+                "max_bitrate":max_bitrate,
+                "minimum_fps_target":59.94,
+                "video_max_batch_size_kb":0
+            }))
+            .unwrap();
+            selected.validate().unwrap();
+            assert_eq!(selected.max_bitrate, Some(max_bitrate));
+            assert_eq!(selected.minimum_fps_target, Some(59.94));
+            assert_eq!(selected.video_max_batch_size_kb, Some(0));
+            assert_eq!(
+                serde_json::to_value(selected).unwrap(),
+                json!({
+                    "max_bitrate":max_bitrate,
+                    "minimum_fps_target":59.94,
+                    "video_max_batch_size_kb":0
+                })
+            );
+        }
+
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"Video override entry",
+            "config_overrides":{
+                "max_bitrate":-1,
+                "minimum_fps_target":59.94,
+                "video_max_batch_size_kb":64
+            },
+            "launch":{"kind":"executable","program":"/games/example"}
+        }))
+        .unwrap();
+        entry.validate().unwrap();
+        let persisted_entry = serde_json::to_value(&entry).unwrap();
+        assert_eq!(persisted_entry["config_overrides"]["max_bitrate"], -1);
+        assert_eq!(
+            persisted_entry["config_overrides"]["minimum_fps_target"],
+            59.94
+        );
+        assert_eq!(
+            persisted_entry["config_overrides"]["video_max_batch_size_kb"],
+            64
+        );
+        let restored_entry: Entry = serde_json::from_value(persisted_entry).unwrap();
+        restored_entry.validate().unwrap();
+        assert_eq!(
+            restored_entry.config_overrides.minimum_fps_target,
+            Some(59.94)
+        );
+
+        for target in [0.0, 1000.0] {
+            ConfigOverrides {
+                minimum_fps_target: Some(target),
+                ..ConfigOverrides::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        for target in [-0.1, 1000.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                ConfigOverrides {
+                    minimum_fps_target: Some(target),
+                    ..ConfigOverrides::default()
+                }
+                .validate()
+                .is_err(),
+                "accepted minimum FPS target {target}"
+            );
+        }
+        for size in [0, 64] {
+            ConfigOverrides {
+                video_max_batch_size_kb: Some(size),
+                ..ConfigOverrides::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        assert!(
+            ConfigOverrides {
+                video_max_batch_size_kb: Some(65),
+                ..ConfigOverrides::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

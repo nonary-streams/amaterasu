@@ -696,11 +696,19 @@ impl Executable {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_fps_target: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_max_batch_size_kb: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -716,6 +724,13 @@ pub struct ApplicationConfigOverrides {
 impl ApplicationConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.fec_percentage == Some(0) {
+            return Err("invalid_catalog_response");
+        }
+        if self
+            .minimum_fps_target
+            .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
+            || self.video_max_batch_size_kb.is_some_and(|size| size > 64)
+        {
             return Err("invalid_catalog_response");
         }
         if self
@@ -738,6 +753,10 @@ impl ApplicationConfigOverrides {
 
     pub fn is_empty(&self) -> bool {
         self.fec_percentage.is_none()
+            && self.max_bitrate.is_none()
+            && self.minimum_fps_target.is_none()
+            && self.video_max_batch_size_kb.is_none()
+            && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
@@ -1063,6 +1082,66 @@ mod tests {
                 "audio_sink_capture_only":"no"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn application_video_overrides_preserve_sparse_values_and_validate_bounds() {
+        let inherited = ApplicationConfigOverrides::default();
+        assert!(inherited.is_empty());
+        let null_values: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "max_bitrate":null,
+            "minimum_fps_target":null,
+            "video_max_batch_size_kb":null
+        }))
+        .unwrap();
+        assert!(null_values.is_empty());
+        assert_eq!(serde_json::to_value(null_values).unwrap(), json!({}));
+
+        let selected: ApplicationConfigOverrides = serde_json::from_value(json!({
+            "max_bitrate":0,
+            "minimum_fps_target":59.94,
+            "video_max_batch_size_kb":0
+        }))
+        .unwrap();
+        selected.validate().unwrap();
+        assert_eq!(selected.max_bitrate, Some(0));
+        assert_eq!(selected.minimum_fps_target, Some(59.94));
+        assert_eq!(selected.video_max_batch_size_kb, Some(0));
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            json!({
+                "max_bitrate":0,
+                "minimum_fps_target":59.94,
+                "video_max_batch_size_kb":0
+            })
+        );
+
+        for max_bitrate in [i32::MIN, -1] {
+            ApplicationConfigOverrides {
+                max_bitrate: Some(max_bitrate),
+                ..ApplicationConfigOverrides::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        for minimum_fps_target in [-0.1, 1000.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                ApplicationConfigOverrides {
+                    minimum_fps_target: Some(minimum_fps_target),
+                    ..ApplicationConfigOverrides::default()
+                }
+                .validate(),
+                Err("invalid_catalog_response")
+            );
+        }
+        assert_eq!(
+            ApplicationConfigOverrides {
+                video_max_batch_size_kb: Some(65),
+                ..ApplicationConfigOverrides::default()
+            }
+            .validate(),
+            Err("invalid_catalog_response")
         );
     }
 

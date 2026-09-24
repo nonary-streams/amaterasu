@@ -143,6 +143,16 @@ reject the catalog response. Launch, status, and same-operation retries retain t
 value captured from the catalog revision used to start the application. Launch
 does not resolve global or client precedence or project this value into nested
 encode settings; L02 supplies route-aware resolution and projection.
+When a catalog entry has application overrides, launch and status responses also
+include a sparse `config_overrides` object: `fec_percentage`, `max_bitrate`,
+`minimum_fps_target`, `video_max_batch_size_kb`, `stream_audio`, `audio_sink`,
+`virtual_sink`, `audio_sink_capture_only`, `back_button_timeout`, `controller`,
+`gamepad`, `keyboard`, and `mouse`. Missing values remain absent; explicit zero,
+`false` values, and empty audio selectors are preserved from the catalog revision
+used to start the application. `minimum_fps_target` must be finite and from 0
+through 1000, and `video_max_batch_size_kb` must be from 0 through 64. The
+application lifecycle module retains these values in its result; NVHTTP remains
+responsible for applying application and paired-client stream settings.
 
 `ok:true` acknowledges a retained lifecycle record, not necessarily a successful
 launch. Inspect `state`: `starting`, `active`, `stopping`, `stopped`, `cancelled`,

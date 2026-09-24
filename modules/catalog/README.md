@@ -180,12 +180,15 @@ transport message or rewrites the whole catalog for an individual edit.
 
 Vibeshine's catalog-policy interface and macOS application defaults were used
 only as behavioral references for durable identity and manual launch metadata.
-No source was copied or translated. This implementation does not yet provide
-provider discovery/conversion policies (Steam, Playnite, Lutris), legacy IDs/aliases, portable
-UUIDs, artwork loading/fingerprints, provider identifiers, per-application config
-overrides, desktop entries, shell-command launch forms, environment overlays,
-launch/session integration or migration from Vibeshine data. These remain explicit
-parity requirements. There is no cross-caller aggregation API.
+No source was copied or translated. The catalog stores sparse per-application
+configuration overrides, including the video fields `max_bitrate`,
+`minimum_fps_target`, and `video_max_batch_size_kb`; the launch provider retains
+them in launch and status results. NVHTTP consumer resolution and management UI
+support for these video fields remain cross-module parity requirements. Other
+catalog gaps include legacy IDs/aliases, portable UUIDs, artwork loading and
+fingerprinting, desktop entries, shell-command launch forms, environment
+overlays, and migration from Vibeshine data. There is no cross-caller aggregation
+API.
 
 ## Launch delegation
 

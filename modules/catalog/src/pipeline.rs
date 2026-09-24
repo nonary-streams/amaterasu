@@ -805,7 +805,7 @@ impl Pipeline {
                 context.request_id,
                 error(
                     "invalid_request",
-                    "provider overrides contain an invalid ID or FEC value",
+                    "provider overrides contain an invalid ID or config value",
                 ),
             );
         }
