@@ -212,8 +212,13 @@ raw Moonlight key mode on Windows and preserves the native key release plan.
 It also has a signed management editor. Right Alt can now map to the Windows
 key with stable key-up behavior and a signed editor. Lease-scoped keyboard
 repeat now applies configurable delay and frequency, including zero-delay
-disable and legacy document migration, with a signed editor. Controller,
-gamepad, and other platform-specific input effects remain pending.
+disable and legacy document migration, with a signed editor. Vibeshine also
+accepts all seven keyboard, mouse, scrolling, scan-code, Right Alt, and repeat
+settings as per-application and per-client overrides, with client values taking
+precedence over application values. Amaterasu currently exposes only a global
+input policy. Scroll remainder handling across policy changes, per-client repeat
+timing, and the `keybindings` precedence over the Right Alt alias differ as
+well. These seven IDs remain pending.
 
 ### Controller and gamepad implementation sequence
 
@@ -221,8 +226,10 @@ gamepad, and other platform-specific input effects remain pending.
 `configuration-coverage.json`. The GameStream controller packet decoder
 already produces a validated snapshot containing a controller number (0..15),
 the client's full active-controller mask, button flags, triggers, and four
-axes. The current translator rejects that snapshot as unsupported, so the
-stream session counts it but never sends it to `amaterasu.input/1`. The input
+axes. The translator now preserves that complete state through a bounded JSON
+event and input model. Current stream sessions count controllers as unsupported
+without forwarding them to `amaterasu.input/1`, preserving the active stream
+until a native backend advertises genuine controller support. The input
 module and native backends currently inject keyboard and mouse only; Windows
 `SendInput` does not create a virtual controller, Linux uinput currently creates
 only keyboard and pointer devices, and macOS reports native injection as
