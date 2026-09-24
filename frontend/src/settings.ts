@@ -1,6 +1,25 @@
 namespace Amaterasu {
   const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
   const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
+  const maxHistoryLimit = 0x7fff_ffff;
+
+  export function parseHistorySettings(
+    enabled: boolean,
+    ttlDays: number,
+    sizeLimitMb: number,
+  ): HistorySettingsReply["settings"] {
+    if (
+      typeof enabled !== "boolean" ||
+      !Number.isSafeInteger(ttlDays) ||
+      ttlDays < 0 ||
+      ttlDays > maxHistoryLimit ||
+      !Number.isSafeInteger(sizeLimitMb) ||
+      sizeLimitMb < 0 ||
+      sizeLimitMb > maxHistoryLimit
+    )
+      throw new Error("History limits must be whole numbers from 0 to 2147483647.");
+    return { enabled, ttl_days: ttlDays, db_size_limit_mb: sizeLimitMb };
+  }
 
   export function parseAuthTokenLifetimes(
     sessionTokenTtlSeconds: number,
@@ -544,6 +563,7 @@ namespace Amaterasu {
     const lutrisArea = el("div");
     const playniteArea = el("div");
     const inputArea = el("div");
+    const historyArea = el("div");
     const pairingArea = el("div");
     context.content.append(
       sectionHeading(
@@ -557,6 +577,7 @@ namespace Amaterasu {
           void loadLutris();
           void loadPlaynite();
           void loadInput();
+          void loadHistorySettings();
           void loadPairing();
         }),
       ),
@@ -567,6 +588,7 @@ namespace Amaterasu {
       lutrisArea,
       playniteArea,
       inputArea,
+      historyArea,
       pairingArea,
     );
     async function loadAuth(): Promise<void> {
@@ -1325,6 +1347,98 @@ namespace Amaterasu {
           pairingArea.replaceChildren(errorPanel(error, loadPairing));
       }
     }
+    async function loadHistorySettings(): Promise<void> {
+      historyArea.replaceChildren(el("p", "muted", "Loading session history settings…"));
+      try {
+        const reply = await context.api.post<HistorySettingsReply>(
+          "history/settings_get",
+        );
+        if (!context.content.isConnected) return;
+        const form = el("form", "settings-form");
+        const enabled = input("session_history_enabled", "", "checkbox");
+        enabled.checked = reply.settings.enabled;
+        const ttl = input(
+          "session_history_ttl_days",
+          String(reply.settings.ttl_days),
+          "number",
+        );
+        const size = input(
+          "session_history_db_size_limit_mb",
+          String(reply.settings.db_size_limit_mb),
+          "number",
+        );
+        for (const control of [ttl, size]) {
+          control.required = true;
+          control.min = "0";
+          control.max = String(maxHistoryLimit);
+          control.step = "1";
+        }
+        const ttlField = field(
+          "Keep ended sessions for (days)",
+          ttl,
+          "Zero disables age pruning.",
+        );
+        const sizeField = field(
+          "Approximate live database limit (MiB)",
+          size,
+          "Zero disables size pruning. Active sessions are never deleted to meet this limit.",
+        );
+        const updateVisibility = (): void => {
+          ttlField.hidden = !enabled.checked;
+          sizeField.hidden = !enabled.checked;
+        };
+        enabled.addEventListener("change", updateVisibility);
+        updateVisibility();
+        const status = el(
+          "p",
+          "muted",
+          reply.effective_enabled === reply.settings.enabled
+            ? "The saved history policy is active."
+            : "The enable change will apply after active streams end.",
+        );
+        const save = el("button", "button primary", "Save history settings");
+        save.type = "submit";
+        save.disabled = !context.api.allows("configuration.write");
+        form.append(
+          field(
+            "Record session history",
+            enabled,
+            "Changes to recording during an active stream take effect after streams end.",
+          ),
+          ttlField,
+          sizeField,
+          status,
+          el("div", "actions", save, badge(`Revision ${reply.revision}`)),
+        );
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void runAction(save, status, async () => {
+            const updated = await context.api.post<HistorySettingsReply>(
+              "history/settings_update",
+              {
+                settings: parseHistorySettings(
+                  enabled.checked,
+                  ttl.valueAsNumber,
+                  size.valueAsNumber,
+                ),
+                expected_revision: reply.revision,
+              },
+            );
+            context.notify(
+              updated.effective_enabled === updated.settings.enabled
+                ? "Session history settings saved."
+                : "Session history settings saved; the recording change is deferred.",
+            );
+            await loadHistorySettings();
+          });
+        });
+        historyArea.replaceChildren(panel("Session history", form));
+      } catch (error) {
+        if (context.content.isConnected)
+          historyArea.replaceChildren(errorPanel(error, loadHistorySettings));
+      }
+    }
+
     async function loadInput(): Promise<void> {
       inputArea.replaceChildren(el("p", "muted", "Loading input policy…"));
       try {
@@ -1887,6 +2001,7 @@ namespace Amaterasu {
     void loadLutris();
     void loadPlaynite();
     void loadInput();
+    void loadHistorySettings();
     void loadPairing();
   }
 }

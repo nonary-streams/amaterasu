@@ -238,6 +238,61 @@ namespace Amaterasu {
       key_repeat_frequency: number;
     };
   }
+  export interface HistorySettingsReply {
+    ok: boolean;
+    settings: {
+      enabled: boolean;
+      ttl_days: number;
+      db_size_limit_mb: number;
+    };
+    revision: number;
+    effective_enabled: boolean;
+  }
+  export interface HistorySessionSummary {
+    session_id: string;
+    protocol: string;
+    client_name: string;
+    device_name: string;
+    app_name: string;
+    width: number;
+    height: number;
+    target_fps: number;
+    target_bitrate_kbps: number;
+    codec: string;
+    started_at_unix: number;
+    ended_at_unix: number | null;
+    duration_seconds: number | null;
+  }
+  export interface HistoryListReply {
+    ok: boolean;
+    sessions: HistorySessionSummary[];
+  }
+  export interface HistoryDetailReply {
+    ok: boolean;
+    detail: {
+      session: HistorySessionSummary;
+      sample_count: number;
+      event_count: number;
+      samples_truncated: boolean;
+      events_truncated: boolean;
+      samples: {
+        session_id: string;
+        recorded_at_unix: number;
+        frames_sent: number;
+        bytes_sent: number;
+        dropped_frames: number;
+        actual_fps: number;
+        actual_bitrate_kbps: number;
+        encode_latency_ms: number;
+      }[];
+      events: {
+        session_id: string;
+        recorded_at_unix: number;
+        event_type: string;
+        payload: unknown | null;
+      }[];
+    } | null;
+  }
   export interface Session {
     id: number;
     key: string;

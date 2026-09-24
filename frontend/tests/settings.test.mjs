@@ -87,6 +87,32 @@ test("input policy editor validates key repeat settings and reports cleanup hone
   assert.match(describe(settings), /policy is active/);
 });
 
+test("history settings preserve disabled pruning and enforce host integer bounds", () => {
+  const parseHistory = context.Amaterasu.parseHistorySettings;
+  assert.deepEqual(ordinary(parseHistory(true, 0, 0)), {
+    enabled: true,
+    ttl_days: 0,
+    db_size_limit_mb: 0,
+  });
+  assert.deepEqual(ordinary(parseHistory(false, 0x7fff_ffff, 1)), {
+    enabled: false,
+    ttl_days: 0x7fff_ffff,
+    db_size_limit_mb: 1,
+  });
+  for (const values of [
+    ["true", 0, 0],
+    [true, -1, 0],
+    [true, 1.5, 0],
+    [true, Number.NaN, 0],
+    [true, 0x8000_0000, 0],
+    [true, 0, -1],
+    [true, 0, 1.5],
+    [true, 0, 0x8000_0000],
+  ]) {
+    assert.throws(() => parseHistory(...values));
+  }
+});
+
 test("Playnite editor validates complete sparse settings and bounded filter lists", () => {
   const parseSettings = context.Amaterasu.parsePlayniteSettings;
   const values = {

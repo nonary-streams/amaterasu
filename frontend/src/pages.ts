@@ -129,16 +129,24 @@ namespace Amaterasu {
   export function renderSessions(context: PageContext): void {
     const area = el("div");
     const status = el("div");
+    const savedArea = el("div");
+    const savedDetail = el("div");
+    const savedStatus = el("div");
     let offset = 0;
     const history = [0];
+    let savedOffset = 0;
     context.content.append(
       sectionHeading(
         "Sessions",
         "Inspect and stop sessions owned by this management console.",
-        button("Refresh", load),
+        button("Refresh", () => {
+          void load();
+          void loadSaved();
+        }),
       ),
       status,
       area,
+      panel("Recorded stream sessions", savedArea, savedStatus, savedDetail),
     );
     async function load(): Promise<void> {
       try {
@@ -215,7 +223,124 @@ namespace Amaterasu {
           area.replaceChildren(errorPanel(error, load));
       }
     }
+    async function loadSaved(): Promise<void> {
+      savedArea.replaceChildren(el("p", "muted", "Loading recorded sessions…"));
+      try {
+        const reply = await context.api.post<HistoryListReply>(
+          "history/list_sessions",
+          { limit: 25, offset: savedOffset },
+        );
+        if (!context.content.isConnected) return;
+        const rows = reply.sessions.map((session) => {
+          const details = button("Details", () => loadSavedDetail(session.session_id));
+          const remove = button(
+            "Delete",
+            async () => {
+              if (
+                !(await confirmAction(
+                  "Delete this recorded session?",
+                  `The history for ${session.app_name || session.session_id} will be removed.`,
+                  "Delete history",
+                ))
+              )
+                return;
+              await runAction(remove, savedStatus, async () => {
+                await context.api.post("history/delete_session", {
+                  session_id: session.session_id,
+                });
+                savedDetail.replaceChildren();
+                context.notify("Recorded session deleted.");
+                await loadSaved();
+              });
+            },
+            "quiet danger-text",
+          );
+          remove.disabled =
+            session.ended_at_unix == null || !context.api.allows("session.write");
+          return [
+            el("div", "", el("strong", "", session.app_name || session.session_id),
+              el("small", "muted block", session.client_name || session.protocol)),
+            new Date(session.started_at_unix * 1000).toLocaleString(),
+            session.ended_at_unix == null ? badge("Active", "good") :
+              `${session.duration_seconds ?? 0} seconds`,
+            el("div", "actions", details, remove),
+          ];
+        });
+        savedArea.replaceChildren(
+          reply.sessions.length
+            ? table(["Application / client", "Started", "Duration", "Actions"], rows)
+            : empty("No recorded streams", "Completed streams appear here when history recording is enabled."),
+          pager(
+            savedOffset > 0
+              ? () => {
+                  savedOffset = Math.max(0, savedOffset - 25);
+                  void loadSaved();
+                }
+              : null,
+            reply.sessions.length === 25
+              ? () => {
+                  savedOffset += 25;
+                  void loadSaved();
+                }
+              : null,
+            `Showing from ${savedOffset + 1}`,
+          ),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          savedArea.replaceChildren(errorPanel(error, loadSaved));
+      }
+    }
+
+    async function loadSavedDetail(sessionId: string): Promise<void> {
+      savedDetail.replaceChildren(el("p", "muted", "Loading session details…"));
+      try {
+        const reply = await context.api.post<HistoryDetailReply>(
+          "history/session_detail",
+          { session_id: sessionId },
+        );
+        if (!context.content.isConnected) return;
+        const detail = reply.detail;
+        if (!detail) {
+          savedDetail.replaceChildren(empty("Session unavailable", "The recorded session was removed."));
+          return;
+        }
+        savedDetail.replaceChildren(
+          panel(
+            `History for ${detail.session.app_name || detail.session.session_id}`,
+            el("p", "muted", `${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`),
+            el("p", "muted", `${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`),
+            detail.samples.length
+              ? table(
+                  ["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"],
+                  detail.samples.map((sample) => [
+                    new Date(sample.recorded_at_unix * 1000).toLocaleString(),
+                    String(sample.frames_sent),
+                    String(sample.bytes_sent),
+                    String(sample.dropped_frames),
+                    sample.actual_fps.toFixed(1),
+                    sample.actual_bitrate_kbps.toFixed(1),
+                  ]),
+                )
+              : el("p", "muted", "No samples recorded."),
+            detail.events.length
+              ? table(
+                  ["Event time", "Event"],
+                  detail.events.map((event) => [
+                    new Date(event.recorded_at_unix * 1000).toLocaleString(),
+                    event.event_type,
+                  ]),
+                )
+              : el("p", "muted", "No events recorded."),
+          ),
+        );
+      } catch (error) {
+        if (context.content.isConnected)
+          savedDetail.replaceChildren(errorPanel(error, () => loadSavedDetail(sessionId)));
+      }
+    }
     void load();
+    void loadSaved();
   }
 
   export function renderApplications(context: PageContext): void {

@@ -971,6 +971,19 @@ var Amaterasu;
 (function (Amaterasu) {
     const maxConfiguredAuthTtlSeconds = 0x7fff_ffff;
     const maxInputKeyRepeatDelayMs = 0x7fff_ffff;
+    const maxHistoryLimit = 0x7fff_ffff;
+    function parseHistorySettings(enabled, ttlDays, sizeLimitMb) {
+        if (typeof enabled !== "boolean" ||
+            !Number.isSafeInteger(ttlDays) ||
+            ttlDays < 0 ||
+            ttlDays > maxHistoryLimit ||
+            !Number.isSafeInteger(sizeLimitMb) ||
+            sizeLimitMb < 0 ||
+            sizeLimitMb > maxHistoryLimit)
+            throw new Error("History limits must be whole numbers from 0 to 2147483647.");
+        return { enabled, ttl_days: ttlDays, db_size_limit_mb: sizeLimitMb };
+    }
+    Amaterasu.parseHistorySettings = parseHistorySettings;
     function parseAuthTokenLifetimes(sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
         if (!Number.isSafeInteger(sessionTokenTtlSeconds) ||
             sessionTokenTtlSeconds < 1 ||
@@ -1457,6 +1470,7 @@ var Amaterasu;
         const lutrisArea = Amaterasu.el("div");
         const playniteArea = Amaterasu.el("div");
         const inputArea = Amaterasu.el("div");
+        const historyArea = Amaterasu.el("div");
         const pairingArea = Amaterasu.el("div");
         context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
             void load();
@@ -1466,8 +1480,9 @@ var Amaterasu;
             void loadLutris();
             void loadPlaynite();
             void loadInput();
+            void loadHistorySettings();
             void loadPairing();
-        })), area, authArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, pairingArea);
+        })), area, authArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {
@@ -1905,6 +1920,58 @@ var Amaterasu;
                     pairingArea.replaceChildren(Amaterasu.errorPanel(error, loadPairing));
             }
         }
+        async function loadHistorySettings() {
+            historyArea.replaceChildren(Amaterasu.el("p", "muted", "Loading session history settings…"));
+            try {
+                const reply = await context.api.post("history/settings_get");
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const enabled = Amaterasu.input("session_history_enabled", "", "checkbox");
+                enabled.checked = reply.settings.enabled;
+                const ttl = Amaterasu.input("session_history_ttl_days", String(reply.settings.ttl_days), "number");
+                const size = Amaterasu.input("session_history_db_size_limit_mb", String(reply.settings.db_size_limit_mb), "number");
+                for (const control of [ttl, size]) {
+                    control.required = true;
+                    control.min = "0";
+                    control.max = String(maxHistoryLimit);
+                    control.step = "1";
+                }
+                const ttlField = Amaterasu.field("Keep ended sessions for (days)", ttl, "Zero disables age pruning.");
+                const sizeField = Amaterasu.field("Approximate live database limit (MiB)", size, "Zero disables size pruning. Active sessions are never deleted to meet this limit.");
+                const updateVisibility = () => {
+                    ttlField.hidden = !enabled.checked;
+                    sizeField.hidden = !enabled.checked;
+                };
+                enabled.addEventListener("change", updateVisibility);
+                updateVisibility();
+                const status = Amaterasu.el("p", "muted", reply.effective_enabled === reply.settings.enabled
+                    ? "The saved history policy is active."
+                    : "The enable change will apply after active streams end.");
+                const save = Amaterasu.el("button", "button primary", "Save history settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Record session history", enabled, "Changes to recording during an active stream take effect after streams end."), ttlField, sizeField, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${reply.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    void Amaterasu.runAction(save, status, async () => {
+                        const updated = await context.api.post("history/settings_update", {
+                            settings: parseHistorySettings(enabled.checked, ttl.valueAsNumber, size.valueAsNumber),
+                            expected_revision: reply.revision,
+                        });
+                        context.notify(updated.effective_enabled === updated.settings.enabled
+                            ? "Session history settings saved."
+                            : "Session history settings saved; the recording change is deferred.");
+                        await loadHistorySettings();
+                    });
+                });
+                historyArea.replaceChildren(Amaterasu.panel("Session history", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    historyArea.replaceChildren(Amaterasu.errorPanel(error, loadHistorySettings));
+            }
+        }
         async function loadInput() {
             inputArea.replaceChildren(Amaterasu.el("p", "muted", "Loading input policy…"));
             try {
@@ -2280,6 +2347,7 @@ var Amaterasu;
         void loadLutris();
         void loadPlaynite();
         void loadInput();
+        void loadHistorySettings();
         void loadPairing();
     }
     Amaterasu.renderSettings = renderSettings;
@@ -2332,9 +2400,16 @@ var Amaterasu;
     function renderSessions(context) {
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
+        const savedArea = Amaterasu.el("div");
+        const savedDetail = Amaterasu.el("div");
+        const savedStatus = Amaterasu.el("div");
         let offset = 0;
         const history = [0];
-        context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect and stop sessions owned by this management console.", Amaterasu.button("Refresh", load)), status, area);
+        let savedOffset = 0;
+        context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect and stop sessions owned by this management console.", Amaterasu.button("Refresh", () => {
+            void load();
+            void loadSaved();
+        })), status, area, Amaterasu.panel("Recorded stream sessions", savedArea, savedStatus, savedDetail));
         async function load() {
             try {
                 const reply = await context.api.post("session/list", {
@@ -2383,7 +2458,89 @@ var Amaterasu;
                     area.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }
+        async function loadSaved() {
+            savedArea.replaceChildren(Amaterasu.el("p", "muted", "Loading recorded sessions…"));
+            try {
+                const reply = await context.api.post("history/list_sessions", { limit: 25, offset: savedOffset });
+                if (!context.content.isConnected)
+                    return;
+                const rows = reply.sessions.map((session) => {
+                    const details = Amaterasu.button("Details", () => loadSavedDetail(session.session_id));
+                    const remove = Amaterasu.button("Delete", async () => {
+                        if (!(await Amaterasu.confirmAction("Delete this recorded session?", `The history for ${session.app_name || session.session_id} will be removed.`, "Delete history")))
+                            return;
+                        await Amaterasu.runAction(remove, savedStatus, async () => {
+                            await context.api.post("history/delete_session", {
+                                session_id: session.session_id,
+                            });
+                            savedDetail.replaceChildren();
+                            context.notify("Recorded session deleted.");
+                            await loadSaved();
+                        });
+                    }, "quiet danger-text");
+                    remove.disabled =
+                        session.ended_at_unix == null || !context.api.allows("session.write");
+                    return [
+                        Amaterasu.el("div", "", Amaterasu.el("strong", "", session.app_name || session.session_id), Amaterasu.el("small", "muted block", session.client_name || session.protocol)),
+                        new Date(session.started_at_unix * 1000).toLocaleString(),
+                        session.ended_at_unix == null ? Amaterasu.badge("Active", "good") :
+                            `${session.duration_seconds ?? 0} seconds`,
+                        Amaterasu.el("div", "actions", details, remove),
+                    ];
+                });
+                savedArea.replaceChildren(reply.sessions.length
+                    ? Amaterasu.table(["Application / client", "Started", "Duration", "Actions"], rows)
+                    : Amaterasu.empty("No recorded streams", "Completed streams appear here when history recording is enabled."), Amaterasu.pager(savedOffset > 0
+                    ? () => {
+                        savedOffset = Math.max(0, savedOffset - 25);
+                        void loadSaved();
+                    }
+                    : null, reply.sessions.length === 25
+                    ? () => {
+                        savedOffset += 25;
+                        void loadSaved();
+                    }
+                    : null, `Showing from ${savedOffset + 1}`));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    savedArea.replaceChildren(Amaterasu.errorPanel(error, loadSaved));
+            }
+        }
+        async function loadSavedDetail(sessionId) {
+            savedDetail.replaceChildren(Amaterasu.el("p", "muted", "Loading session details…"));
+            try {
+                const reply = await context.api.post("history/session_detail", { session_id: sessionId });
+                if (!context.content.isConnected)
+                    return;
+                const detail = reply.detail;
+                if (!detail) {
+                    savedDetail.replaceChildren(Amaterasu.empty("Session unavailable", "The recorded session was removed."));
+                    return;
+                }
+                savedDetail.replaceChildren(Amaterasu.panel(`History for ${detail.session.app_name || detail.session.session_id}`, Amaterasu.el("p", "muted", `${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`), Amaterasu.el("p", "muted", `${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`), detail.samples.length
+                    ? Amaterasu.table(["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"], detail.samples.map((sample) => [
+                        new Date(sample.recorded_at_unix * 1000).toLocaleString(),
+                        String(sample.frames_sent),
+                        String(sample.bytes_sent),
+                        String(sample.dropped_frames),
+                        sample.actual_fps.toFixed(1),
+                        sample.actual_bitrate_kbps.toFixed(1),
+                    ]))
+                    : Amaterasu.el("p", "muted", "No samples recorded."), detail.events.length
+                    ? Amaterasu.table(["Event time", "Event"], detail.events.map((event) => [
+                        new Date(event.recorded_at_unix * 1000).toLocaleString(),
+                        event.event_type,
+                    ]))
+                    : Amaterasu.el("p", "muted", "No events recorded.")));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    savedDetail.replaceChildren(Amaterasu.errorPanel(error, () => loadSavedDetail(sessionId)));
+            }
+        }
         void load();
+        void loadSaved();
     }
     Amaterasu.renderSessions = renderSessions;
     function renderApplications(context) {
