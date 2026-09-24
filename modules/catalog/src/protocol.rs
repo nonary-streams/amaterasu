@@ -1,4 +1,4 @@
-use crate::model::{Document, Entry, MAX_ENTRIES, bounded_text, parse_id};
+use crate::model::{Document, Entry, Launch, MAX_ENTRIES, bounded_text, parse_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -132,6 +132,12 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;
+            if matches!(&entry.launch, Launch::Playnite { .. }) {
+                return Err(error(
+                    "provider_launch_required",
+                    "Playnite launch targets can only be written by the trusted provider",
+                ));
+            }
             if document.entries.len() >= MAX_ENTRIES {
                 return Err(error("resource_exhausted", "catalog entry limit reached"));
             }
@@ -154,6 +160,12 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;
+            if matches!(&entry.launch, Launch::Playnite { .. }) {
+                return Err(error(
+                    "provider_launch_required",
+                    "Playnite launch targets can only be written by the trusted provider",
+                ));
+            }
             let reply = json!({"id":id,"entry":entry});
             document.entries.insert(id, entry);
             reply

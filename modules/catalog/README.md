@@ -75,8 +75,9 @@ Delete returns `ok`, `revision`, `id`, `deleted:true`.
 
 Executable lifecycle options are sparse per-application values. When omitted,
 launch resolves `auto_detach` and `wait_all` to `true` and
-`exit_timeout_seconds` to 10 seconds; these defaults are not written into the
-catalog document. `detached` defaults to an empty ordered list. The accepted
+`exit_timeout_seconds` to 5 seconds; these defaults are not written into the
+catalog document. Typed Playnite launch targets default to a 10-second exit
+timeout. `detached` defaults to an empty ordered list. The accepted
 aliases `auto-detach`, `wait-all`, and `exit-timeout` are serialized using their
 canonical underscore names. `exit_timeout_seconds` is limited to 300;
 `detached` accepts up to 16 nonempty command strings of 2048 bytes each.

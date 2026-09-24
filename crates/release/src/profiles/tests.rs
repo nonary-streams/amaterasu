@@ -59,6 +59,13 @@ fn management_loads_after_its_nvhttp_settings_provider() {
 }
 
 #[test]
+fn launch_can_call_only_the_typed_playnite_provider_service_it_uses() {
+    assert!(LAUNCH.calls.contains(&"amaterasu.playnite/1"));
+    assert!(LAUNCH.dependencies.contains(&PLAYNITE.id));
+    assert!(!PLAYNITE.calls.contains(&"amaterasu.launch/1"));
+}
+
+#[test]
 fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
     let probe = PackageProfile::StreamProbe.components();
     assert!(

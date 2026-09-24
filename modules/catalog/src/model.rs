@@ -79,6 +79,25 @@ pub enum Launch {
     Application {
         path: String,
     },
+    /// A launch target owned by the trusted Playnite provider. The game ID is
+    /// resolved by Playnite's authenticated extension IPC, never by a shell.
+    Playnite {
+        game_id: String,
+        #[serde(default = "default_playnite_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+    },
+}
+
+fn default_playnite_exit_timeout_seconds() -> u64 {
+    10
+}
+
+pub fn valid_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 fn empty_working_directory_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -164,6 +183,17 @@ impl Entry {
                 validate_preparation(preparation)?;
             }
             Launch::Application { path } => validate_path(path)?,
+            Launch::Playnite {
+                game_id,
+                exit_timeout_seconds,
+            } => {
+                if !valid_guid(game_id) {
+                    return Err("Playnite launch target must contain a GUID");
+                }
+                if *exit_timeout_seconds == 0 || *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+                    return Err("invalid Playnite exit timeout");
+                }
+            }
         }
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > 11_950) {
             return Err("encoded entry exceeds 11950 bytes");
@@ -319,4 +349,41 @@ impl Document {
 pub fn parse_id(id: &str) -> Option<u64> {
     let number = u64::from_str_radix(id.strip_prefix("app-")?, 16).ok()?;
     (number != 0 && id == format!("app-{number:016x}")).then_some(number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn playnite_target_requires_a_canonical_guid_and_bounded_exit_timeout() {
+        let valid: Entry = serde_json::from_value(json!({
+            "name":"Playnite game",
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+        }))
+        .unwrap();
+        valid.validate().unwrap();
+        let persisted = serde_json::to_value(valid).unwrap();
+        assert_eq!(persisted["launch"]["exit_timeout_seconds"], 10);
+
+        for game_id in [
+            "../other",
+            "a1b2c3d4-1234-5678-9abc-0123456789a",
+            "{a1b2c3d4-1234-5678-9abc-0123456789ab}",
+        ] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Invalid Playnite game",
+                "launch":{"kind":"playnite","game_id":game_id}
+            }))
+            .unwrap();
+            assert!(entry.validate().is_err(), "accepted {game_id}");
+        }
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"Invalid timeout",
+            "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab","exit_timeout_seconds":301}
+        }))
+        .unwrap();
+        assert!(entry.validate().is_err());
+    }
 }

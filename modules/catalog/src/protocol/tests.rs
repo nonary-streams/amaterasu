@@ -31,6 +31,14 @@ fn prepared_entry(preparation: Vec<Value>) -> Entry {
     .unwrap()
 }
 
+fn playnite_entry() -> Entry {
+    serde_json::from_value(json!({
+        "name":"Playnite game",
+        "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+    }))
+    .unwrap()
+}
+
 fn preparation_step() -> Value {
     json!({"run":{"executable":command_path()}})
 }
@@ -139,6 +147,34 @@ fn mutations_require_revision_and_reject_unknown_authority_fields() {
     .unwrap();
     assert_eq!(failure["error"]["code"], "revision_conflict");
     assert_eq!(failure["error"]["current_revision"], 1);
+}
+
+#[test]
+fn manual_mutations_cannot_forge_provider_owned_playnite_launch_targets() {
+    let create_error = apply(
+        Operation::Create {
+            entry: playnite_entry(),
+            expected_revision: 0,
+        },
+        None,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(create_error["error"]["code"], "provider_launch_required");
+
+    let document = create(Document::default(), "Ordinary game");
+    let update_error = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: playnite_entry(),
+            expected_revision: 1,
+        },
+        Some(document.clone()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(update_error["error"]["code"], "provider_launch_required");
+    assert_eq!(document.entries.len(), 1);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::protocol::{Outcome, State};
+use crate::protocol::{LaunchTarget, Outcome, State};
 use crate::records::{CatalogSelection, Record};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -6,20 +6,28 @@ use std::time::{Duration, Instant};
 pub const CATALOG: &str = "amaterasu.catalog/1";
 pub const SESSION: &str = "amaterasu.session/1";
 pub const APPLICATION: &str = "amaterasu.application/1";
-#[derive(Clone, Copy, PartialEq, Eq)]
+pub const PLAYNITE: &str = "amaterasu.playnite/1";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Catalog,
     CreateSession,
     Acquire,
     Spawn,
     AwaitApplication,
+    StartPlaynite,
+    AwaitPlayniteStart,
+    MonitorPlaynite,
     Activate,
     Monitor,
     FindSession,
     FindProcess,
+    FindPlaynite,
+    RecoverPlayniteStop,
     StopSession,
     Terminate,
     AwaitTermination,
+    StopPlaynite,
+    AwaitPlayniteStop,
     Finish,
 }
 #[derive(Clone)]
@@ -42,12 +50,16 @@ impl Workflow {
             cleanup: false,
         }
     }
-    pub fn monitor(id: u64) -> Self {
+    pub fn monitor(id: u64, playnite: bool) -> Self {
         Self {
             launch_id: id,
             request: None,
             deadline: Instant::now() + Duration::from_secs(5),
-            step: Step::Monitor,
+            step: if playnite {
+                Step::MonitorPlaynite
+            } else {
+                Step::Monitor
+            },
             pending: None,
             cleanup: false,
         }
@@ -66,7 +78,16 @@ impl Workflow {
         record.cleanup_error = None;
         self.cleanup = true;
         self.pending = None;
-        self.deadline = Instant::now() + Duration::from_secs(20);
+        let cleanup_seconds = match record.target.as_ref() {
+            Some(LaunchTarget::Playnite {
+                exit_timeout_seconds,
+                ..
+            // The provider may spend up to two 8-second authenticated pipe
+            // connections before its bounded stop wait, plus one poll interval.
+            }) => exit_timeout_seconds.saturating_add(21).min(321),
+            _ => 20,
+        };
+        self.deadline = Instant::now() + Duration::from_secs(cleanup_seconds);
         self.step = first_cleanup_step(record);
     }
     pub fn parent(&self) -> Option<u64> {
@@ -92,12 +113,60 @@ impl Workflow {
                 json!({"action":"acquire","session_id":session.ok_or("invalid_workflow")?,"resource":record.resource.as_deref().ok_or("invalid_workflow")?,"mode":"exclusive"}),
             ),
             Step::Spawn => {
-                let executable = record.executable.as_ref().ok_or("invalid_workflow")?;
+                let Some(LaunchTarget::Executable(executable)) = record.target.as_ref() else {
+                    return Err("invalid_workflow");
+                };
                 (
                     APPLICATION,
                     json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
+            Step::StartPlaynite => {
+                let Some(LaunchTarget::Playnite { game_id, .. }) = record.target.as_ref() else {
+                    return Err("invalid_workflow");
+                };
+                (
+                    PLAYNITE,
+                    json!({"action":"launch_start","operation_id":record.process_operation,"game_id":game_id}),
+                )
+            }
+            Step::FindPlaynite => (
+                PLAYNITE,
+                json!({"action":"launch_lookup","operation_id":record.process_operation}),
+            ),
+            Step::RecoverPlayniteStop => {
+                let Some(LaunchTarget::Playnite {
+                    game_id,
+                    exit_timeout_seconds,
+                }) = record.target.as_ref()
+                else {
+                    return Err("invalid_workflow");
+                };
+                (
+                    PLAYNITE,
+                    json!({"action":"launch_recover_stop","operation_id":record.process_operation,"game_id":game_id,"exit_timeout_seconds":exit_timeout_seconds}),
+                )
+            }
+            Step::StopPlaynite => {
+                let (
+                    Some(LaunchTarget::Playnite {
+                        exit_timeout_seconds,
+                        ..
+                    }),
+                    Some(ticket),
+                ) = (record.target.as_ref(), record.provider_ticket.as_deref())
+                else {
+                    return Err("invalid_workflow");
+                };
+                (
+                    PLAYNITE,
+                    json!({"action":"launch_stop","ticket":ticket,"exit_timeout_seconds":exit_timeout_seconds}),
+                )
+            }
+            Step::AwaitPlayniteStart | Step::MonitorPlaynite | Step::AwaitPlayniteStop => (
+                PLAYNITE,
+                json!({"action":"launch_status","ticket":record.provider_ticket.as_deref().ok_or("invalid_workflow")?}),
+            ),
             Step::Activate => (
                 SESSION,
                 json!({"action":"activate","session_id":session.ok_or("invalid_workflow")?}),
@@ -129,6 +198,10 @@ impl Workflow {
 pub fn first_cleanup_step(record: &Record) -> Step {
     if record.session_requested && record.session_id.is_none() {
         Step::FindSession
+    } else if record.provider_launch_requested && record.provider_ticket.is_none() {
+        Step::FindPlaynite
+    } else if record.provider_ticket.is_some() && !record.provider_stopped {
+        Step::StopPlaynite
     } else if record.process_requested && record.process_id.is_none() {
         Step::FindProcess
     } else if record.session_id.is_some() {
@@ -137,5 +210,37 @@ pub fn first_cleanup_step(record: &Record) -> Step {
         Step::Terminate
     } else {
         Step::Finish
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::records::Records;
+
+    #[test]
+    fn ambiguous_playnite_start_looks_up_its_operation_and_stop_deadline_is_bounded() {
+        let mut records = Records::new().unwrap();
+        let (launch_id, _) = records
+            .start(
+                "alice",
+                "alice",
+                "operation".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Initiator,
+            )
+            .unwrap();
+        let record = records.values.get_mut(&launch_id).unwrap();
+        record.target = Some(LaunchTarget::Playnite {
+            game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
+            exit_timeout_seconds: 300,
+        });
+        record.provider_launch_requested = true;
+        let mut workflow = Workflow::launch(launch_id, 1, 30_000);
+        workflow.begin_cleanup(record, Outcome::Failed, Some("unknown_start_result"));
+        assert_eq!(workflow.step, Step::FindPlaynite);
+        let deadline = workflow.deadline.saturating_duration_since(Instant::now());
+        assert!(deadline <= Duration::from_secs(321));
+        assert!(deadline >= Duration::from_secs(320));
     }
 }

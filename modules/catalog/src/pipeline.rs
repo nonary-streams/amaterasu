@@ -1,5 +1,5 @@
 use crate::STATE_SERVICE;
-use crate::model::{Document, Entry, MAX_ENTRIES, bounded_text};
+use crate::model::{Document, Entry, Launch, MAX_ENTRIES, bounded_text};
 use crate::product::{
     CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, STATE_PREFIX,
     SnapshotState, entry_fingerprint, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
@@ -578,9 +578,12 @@ impl Pipeline {
         for provider_entry in entries {
             let source_id = provider_entry.source_id;
             let entry = provider_entry.entry;
+            let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
+                && session.caller != "amaterasu.playnite";
             if !valid_source_id(&source_id)
                 || !source_ids.insert(source_id.clone())
                 || entry.validate().is_err()
+                || invalid_launch_owner
             {
                 return complete(
                     send,

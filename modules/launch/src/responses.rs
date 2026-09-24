@@ -1,5 +1,5 @@
 //! Validate dependency reply identities before adopting IDs or advancing ownership.
-use crate::protocol::{ApplicationOutcome, ApplicationState};
+use crate::protocol::{ApplicationOutcome, ApplicationState, LaunchTarget};
 use crate::records::Record;
 use serde_json::Value;
 
@@ -55,6 +55,87 @@ pub fn process<'a>(
         return Err("invalid_application_response");
     }
     Ok((process, state))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    LaunchFailed,
+    CleanupFailed,
+}
+
+pub struct ProviderLaunch {
+    pub ticket: String,
+    pub state: ProviderState,
+}
+
+pub fn provider_start_not_started(payload: &Value) -> bool {
+    let Some(object) = payload.as_object() else {
+        return false;
+    };
+    object.len() == 3
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "ok" | "code" | "launch_state"))
+        && payload["ok"] == false
+        && payload["code"]
+            .as_str()
+            .is_some_and(|code| !code.is_empty())
+        && payload["launch_state"] == "not_started"
+}
+
+pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunch, &'static str> {
+    if payload["ok"] != true {
+        return Err("invalid_provider_response");
+    }
+    let Some(LaunchTarget::Playnite { game_id, .. }) = record.target.as_ref() else {
+        return Err("invalid_provider_response");
+    };
+    let ticket = payload["ticket"]
+        .as_str()
+        .filter(|ticket| {
+            ticket.len() == 48
+                && ticket
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or("invalid_provider_response")?;
+    let response_game_id = payload["game_id"]
+        .as_str()
+        .filter(|value| value.eq_ignore_ascii_case(game_id))
+        .ok_or("invalid_provider_response")?;
+    if response_game_id.to_ascii_lowercase() != *game_id
+        || record
+            .provider_ticket
+            .as_deref()
+            .is_some_and(|expected| expected != ticket)
+    {
+        return Err("invalid_provider_response");
+    }
+    let state = match payload["state"].as_str() {
+        Some("starting") => ProviderState::Starting,
+        Some("running") => ProviderState::Running,
+        Some("stopping") => ProviderState::Stopping,
+        Some("stopped") => ProviderState::Stopped,
+        Some("launch_failed") => ProviderState::LaunchFailed,
+        Some("cleanup_failed") => ProviderState::CleanupFailed,
+        _ => return Err("invalid_provider_response"),
+    };
+    let object = payload.as_object().ok_or("invalid_provider_response")?;
+    if object.len() != 4
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "ok" | "ticket" | "game_id" | "state"))
+    {
+        return Err("invalid_provider_response");
+    }
+    Ok(ProviderLaunch {
+        ticket: ticket.into(),
+        state,
+    })
 }
 
 #[cfg(test)]
@@ -118,6 +199,22 @@ mod tests {
                 process(&payload, &records.values[&id]).unwrap_err(),
                 "invalid_application_response"
             );
+        }
+    }
+
+    #[test]
+    fn a_preflight_rejection_proves_no_start_only_with_the_exact_marker_shape() {
+        assert!(provider_start_not_started(
+            &json!({"ok":false,"code":"playnite_disabled","launch_state":"not_started"})
+        ));
+        for payload in [
+            json!({"ok":false,"code":"playnite_disabled"}),
+            json!({"ok":false,"code":"playnite_disabled","launch_state":"unknown"}),
+            json!({"ok":false,"code":"playnite_disabled","launch_state":"not_started","ticket":"ab".repeat(24)}),
+            json!({"ok":true,"code":"playnite_disabled","launch_state":"not_started"}),
+            json!({"ok":false,"launch_state":"not_started"}),
+        ] {
+            assert!(!provider_start_not_started(&payload), "{payload}");
         }
     }
 }

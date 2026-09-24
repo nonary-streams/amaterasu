@@ -20,15 +20,16 @@ Requests are strict JSON:
 
 Callers cannot override the executable, arguments, environment, working directory,
 process ID, session ID, lease resource, preparation commands, or catalog owner.
-Only catalog entries with `launch.kind:"executable"` are supported. The application
-provider receives the catalog program, argument array, optional working directory,
-and canonical catalog preparation plan. Bundle/URI `application` entries, detached
-launchers, and streaming startup remain unsupported. Paths must be absolute on the
-current native host and fit application limits (1024-byte program/cwd, 64 arguments,
-1024 bytes each, 8192 total argument bytes); a catalog entry valid as cross-platform
-metadata may still be unsupported on this host. The application provider enforces
-its remaining native launch constraints, including rejection of implicit batch
-executables.
+Catalog entries with `launch.kind:"executable"` use the application provider's
+native process path. Fixed-owner Playnite entries use the typed `launch.kind:"playnite"`
+target and a validated Playnite GUID; launch sends that ID to the Playnite extension
+and never turns it into an executable or URI. Bundle/URI `application` entries,
+detached launchers, and streaming startup remain unsupported. Executable paths must
+be absolute on the current native host and fit application limits (1024-byte program/cwd,
+64 arguments, 1024 bytes each, 8192 total argument bytes); a catalog entry valid as
+cross-platform metadata may still be unsupported on this host. The application provider
+enforces its remaining native launch constraints, including rejection of implicit
+batch executables.
 
 A preparation plan contains at most eight ordered `run` commands with optional
 paired `undo` commands. Each command uses literal argv, a cleared explicit
@@ -36,11 +37,11 @@ environment, an optional native working directory, and a 1–30000 ms timeout
 (10000 ms by default). Command paths, arguments, and environments use the same
 native application bounds. Launch parses and validates the resolved catalog plan,
 applies private process defaults only where the catalog has no per-application
-value (`auto_detach:true`, `wait_all:true`, `exit_timeout_seconds:10`), and forwards
+value (`auto_detach:true`, `wait_all:true`, `exit_timeout_seconds:5`), and forwards
 the resolved plan without accepting request-level additions or overrides. Explicit
-catalog values reach the application provider. The application runs preparation
-before the main executable and owes reverse-order undo for every run command it
-started.
+catalog values reach the application provider. Typed Playnite catalog targets default
+to a separate 10-second exit timeout. The application runs preparation before the
+main executable and owes reverse-order undo for every run command it started.
 
 Catalog lookup uses `resolve_launch` with the original runtime parent. Catalog
 accepts this action only from configured launch principals and selects the
@@ -77,9 +78,10 @@ ASCII letters/digits/underscore, 1024-byte values, 4096 total bytes, no NUL or
 case-insensitive duplicate keys). No request-level environment override exists.
 
 The module needs a provide grant for `amaterasu.launch/1` and call grants for
-`amaterasu.catalog/1`, `amaterasu.state/1`, `amaterasu.session/1`, and
-`amaterasu.application/1`. Catalog settings must include this module principal in
-`launch_principals`. Launch callers also need these downstream grants under the
+`amaterasu.catalog/1`, `amaterasu.state/1`, `amaterasu.session/1`,
+`amaterasu.application/1`, and `amaterasu.playnite/1`. Catalog settings must include
+this module principal in `launch_principals`. Playnite-owned entries are writable only
+by the fixed Playnite importer. Launch callers also need these downstream grants under the
 runtime's parent-delegation rules. Cleanup deliberately uses parentless requests
 under the launch provider's own grants so cancellation of the originating request
 cannot block teardown. All native providers are trusted code; grants are not a
@@ -154,6 +156,19 @@ launch. State and provider mutation replies are validated against expected
 operation/session identities before adopting IDs. Consumed internal runtime
 results use the SDK's ephemeral-result release helper.
 
+For a typed Playnite launch, launch acquires the same catalog-app session lease,
+then waits for the Playnite provider's opaque ticket to report `running` before
+activating. Stop waits for a matching extension `gameStopped` event before it finishes
+the session. If the start acknowledgement is lost, launch looks up the stable internal
+operation ID and never replays `launch_start`. If the Playnite provider lost its
+in-memory ticket after a reload, launch asks it to reconnect and issue a bounded stop;
+the extension's launcher connection receives an active-game sync for a running
+matching GUID. Missing or malformed status, disconnect, and stop timeout retain the
+lease as `cleanup_failed`, where an explicit stop retries recovery. The Playnite
+cleanup deadline allows for two authenticated pipe connections and status polling,
+with a 321-second maximum for a 300-second provider timeout. This slice does not
+implement the reference helper's focus policy or process watchdog verification.
+
 Launch records, idempotency, and reconciliation are in memory. They assume the
 catalog/session/application providers retain their instance state while this
 provider runs. Independent provider reloads, host crashes, and durable restart
@@ -172,4 +187,7 @@ results before and after spawn, cancellation/release failure with retained lease
 cancellation at activation completion, canonical preparation forwarding,
 preparing/stopping waits, cleanup-failed outcome retention and retry,
 exported-owner lease contention and lookup, and retry after a termination failure.
-Full dynamic-provider/HTTP integration is tested separately by the host.
+Typed Playnite tests cover fixed-owner target validation, explicit preflight proof
+of no start, lost acknowledgement reconciliation, provider-module status loss,
+missing ticket recovery, and bounded stop timeout. Full dynamic-provider/HTTP
+integration is tested separately by the host.

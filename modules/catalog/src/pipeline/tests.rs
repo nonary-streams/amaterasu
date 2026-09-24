@@ -159,6 +159,21 @@ fn steam_importer() -> Pipeline {
     )
 }
 
+fn playnite_importer() -> Pipeline {
+    Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([("amaterasu.playnite".into(), "amaterasu.management".into())]),
+    )
+}
+
+fn playnite_entry(name: &str) -> Value {
+    json!({
+        "name":name,
+        "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
+    })
+}
+
 fn snapshot_begin(sync_id: &str, source_revision: u64) -> Value {
     json!({
         "action":"provider_snapshot_begin",
@@ -1046,6 +1061,66 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
         !backend
             .entries
             .contains_key("~provider.entry:steam:steam:10")
+    );
+}
+
+#[test]
+fn only_the_fixed_playnite_importer_can_write_typed_playnite_launch_targets() {
+    let mut backend = Backend::default();
+    let mut steam = steam_importer();
+    let begin = backend.run_for(
+        &mut steam,
+        snapshot_begin("scan-steam", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    let denied = backend.run_for(
+        &mut steam,
+        snapshot_batch(
+            "scan-steam",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![("steam:1", playnite_entry("Forged target"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(denied["error"]["code"], "invalid_entry");
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+
+    let mut playnite = playnite_importer();
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("scan-playnite", 1),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    let accepted = backend.run_for(
+        &mut playnite,
+        snapshot_batch(
+            "scan-playnite",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![(
+                "a1b2c3d4-1234-5678-9abc-0123456789ab",
+                playnite_entry("Trusted target"),
+            )],
+        ),
+        "amaterasu.playnite",
+        "management",
+        "amaterasu.management",
+    );
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["launch"]["kind"],
+        "playnite"
     );
 }
 

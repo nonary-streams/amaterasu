@@ -8,7 +8,8 @@ const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_AUTO_DETACH: bool = true;
 const DEFAULT_WAIT_ALL: bool = true;
-const DEFAULT_EXIT_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -88,6 +89,11 @@ pub enum CatalogLaunch {
     Application {
         path: String,
     },
+    Playnite {
+        game_id: String,
+        #[serde(default = "default_playnite_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -131,6 +137,55 @@ pub struct Executable {
     pub detached: Vec<String>,
     pub preparation: Vec<PreparationStep>,
 }
+
+#[derive(Clone, Debug)]
+pub enum LaunchTarget {
+    Executable(Executable),
+    Playnite {
+        game_id: String,
+        exit_timeout_seconds: u64,
+    },
+}
+
+fn default_playnite_exit_timeout_seconds() -> u64 {
+    DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS
+}
+
+impl LaunchTarget {
+    pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
+        let launch: CatalogLaunch =
+            serde_json::from_value(value.clone()).map_err(|_| "invalid_catalog_response")?;
+        match launch {
+            CatalogLaunch::Executable { .. } => {
+                Executable::from_catalog(value).map(Self::Executable)
+            }
+            CatalogLaunch::Playnite {
+                game_id,
+                exit_timeout_seconds,
+            } => {
+                if !valid_guid(&game_id)
+                    || !(1..=MAX_EXIT_TIMEOUT_SECONDS).contains(&exit_timeout_seconds)
+                {
+                    return Err("invalid_catalog_response");
+                }
+                Ok(Self::Playnite {
+                    game_id: game_id.to_ascii_lowercase(),
+                    exit_timeout_seconds,
+                })
+            }
+            CatalogLaunch::Application { .. } => Err("unsupported_launch_kind"),
+        }
+    }
+}
+
+fn valid_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
 impl Executable {
     pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
         let launch: CatalogLaunch =
@@ -149,7 +204,7 @@ impl Executable {
                 let auto_detach = auto_detach.unwrap_or(DEFAULT_AUTO_DETACH);
                 let wait_all = wait_all.unwrap_or(DEFAULT_WAIT_ALL);
                 let exit_timeout_seconds =
-                    exit_timeout_seconds.unwrap_or(DEFAULT_EXIT_TIMEOUT_SECONDS);
+                    exit_timeout_seconds.unwrap_or(DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS);
                 let working_directory = working_directory.filter(|directory| !directory.is_empty());
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
@@ -192,6 +247,7 @@ impl Executable {
                 let _ = path;
                 Err("unsupported_launch_kind")
             }
+            CatalogLaunch::Playnite { .. } => Err("unsupported_launch_kind"),
         }
     }
 }
@@ -453,6 +509,7 @@ mod tests {
         }]));
         catalog_value["working_directory"] = json!("");
         let executable = Executable::from_catalog(&catalog_value).unwrap();
+        assert_eq!(executable.exit_timeout_seconds, 5);
         let command = &executable.preparation[0].run;
         assert_eq!(
             executable.working_directory.as_deref(),
@@ -476,6 +533,42 @@ mod tests {
             Executable::from_catalog(&unknown).unwrap_err(),
             "unsupported_launch_spec"
         );
+    }
+
+    #[test]
+    fn ordinary_executable_defaults_to_five_but_preserves_explicit_zero_and_playnite_ten() {
+        let executable = std::env::current_exe().unwrap();
+        let mut ordinary = json!({
+            "kind":"executable",
+            "program":executable,
+            "arguments":[],
+        });
+        assert_eq!(
+            Executable::from_catalog(&ordinary)
+                .unwrap()
+                .exit_timeout_seconds,
+            5
+        );
+        ordinary["exit_timeout_seconds"] = json!(0);
+        assert_eq!(
+            Executable::from_catalog(&ordinary)
+                .unwrap()
+                .exit_timeout_seconds,
+            0
+        );
+
+        let playnite = LaunchTarget::from_catalog(&json!({
+            "kind":"playnite",
+            "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab",
+        }))
+        .unwrap();
+        assert!(matches!(
+            playnite,
+            LaunchTarget::Playnite {
+                exit_timeout_seconds: 10,
+                ..
+            }
+        ));
     }
 
     #[test]

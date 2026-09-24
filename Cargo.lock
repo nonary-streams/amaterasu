@@ -362,6 +362,7 @@ name = "amaterasu-playnite"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

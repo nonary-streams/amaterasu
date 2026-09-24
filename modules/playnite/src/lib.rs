@@ -3,6 +3,7 @@ mod catalog_sync;
 mod configuration;
 mod connector;
 mod discovery;
+mod launch;
 mod settings;
 mod snapshot;
 
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVICE: &str = "amaterasu.playnite/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -48,11 +50,41 @@ enum Action {
         exclude_games: Option<Vec<String>>,
         expected_revision: u64,
     },
+    LaunchStart {
+        operation_id: String,
+        game_id: String,
+    },
+    LaunchLookup {
+        operation_id: String,
+    },
+    LaunchStatus {
+        ticket: String,
+    },
+    LaunchStop {
+        ticket: String,
+        exit_timeout_seconds: u64,
+    },
+    LaunchRecoverStop {
+        operation_id: String,
+        game_id: String,
+        exit_timeout_seconds: u64,
+    },
 }
 
 impl Action {
     fn is_settings(&self) -> bool {
         matches!(self, Self::SettingsGet {} | Self::SettingsUpdate { .. })
+    }
+
+    fn is_launch(&self) -> bool {
+        matches!(
+            self,
+            Self::LaunchStart { .. }
+                | Self::LaunchLookup { .. }
+                | Self::LaunchStatus { .. }
+                | Self::LaunchStop { .. }
+                | Self::LaunchRecoverStop { .. }
+        )
     }
 }
 
@@ -105,6 +137,8 @@ struct PlayniteModule {
     last_error: Option<String>,
     last_snapshot_games: usize,
     last_discovery: discovery::Discovery,
+    eligible_launch_ids: std::collections::BTreeSet<String>,
+    launches: launch::Launches,
     next_discovery: Instant,
 }
 
@@ -124,6 +158,8 @@ impl ManagedModule for PlayniteModule {
             last_error: None,
             last_snapshot_games: 0,
             last_discovery: discovery::Discovery::default(),
+            eligible_launch_ids: std::collections::BTreeSet::new(),
+            launches: launch::Launches::default(),
             next_discovery: Instant::now(),
         })
     }
@@ -132,12 +168,16 @@ impl ManagedModule for PlayniteModule {
         self.configuration
             .advance(&self.runtime, &mut self.settings_epoch)?;
         self.observe_settings();
+        self.launches.advance();
         self.refresh_discovery();
         self.poll_snapshot();
         self.start_automatic_snapshot();
         self.catalog
             .advance(&self.runtime, self.settings_epoch)
             .map_err(|error| format!("Playnite catalog import failed: {error}"))?;
+        if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids() {
+            self.eligible_launch_ids = launchable_game_ids;
+        }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -157,6 +197,7 @@ impl PlayniteModule {
             return;
         }
         self.observed_settings_epoch = self.settings_epoch;
+        self.eligible_launch_ids.clear();
         let settings = self.configuration.settings();
         self.next_auto_sync = if settings.enabled && settings.auto_sync {
             Some(Instant::now())
@@ -192,7 +233,7 @@ impl PlayniteModule {
                     self.settings_epoch,
                     now,
                 ) {
-                    Ok(_) => self.last_error = None,
+                    Ok(()) => self.last_error = None,
                     Err(error) => self.last_error = Some(error),
                 }
             }
@@ -235,6 +276,9 @@ impl PlayniteModule {
         if action.is_settings() && !settings_caller_is_authorized(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
         }
+        if action.is_launch() && !launch_caller_is_authorized(caller) {
+            return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+        }
         if action.is_settings() && self.configuration.busy() {
             let code = if self.configuration.ready() {
                 "settings_busy"
@@ -245,6 +289,62 @@ impl PlayniteModule {
         }
         match action {
             Action::Status {} => self.complete(id, self.status()),
+            Action::LaunchStart {
+                operation_id,
+                game_id,
+            } => {
+                if !self.configuration.ready() {
+                    return self.complete(id, launch::not_started_error("settings_loading"));
+                }
+                if !self.configuration.settings().enabled {
+                    return self.complete(id, launch::not_started_error("playnite_disabled"));
+                }
+                self.refresh_discovery();
+                if !self.last_discovery.running {
+                    return self.complete(id, launch::not_started_error("playnite_not_running"));
+                }
+                let response = self.launches.start(
+                    &operation_id,
+                    &game_id,
+                    &self.eligible_launch_ids,
+                    self.last_discovery.processes.clone(),
+                );
+                self.complete(id, response)
+            }
+            Action::LaunchLookup { operation_id } => {
+                let response = self.launches.lookup(&operation_id);
+                self.complete(id, response)
+            }
+            Action::LaunchStatus { ticket } => {
+                let response = self.launches.status(&ticket);
+                self.complete(id, response)
+            }
+            Action::LaunchStop {
+                ticket,
+                exit_timeout_seconds,
+            } => {
+                self.refresh_discovery();
+                let response = self.launches.stop(
+                    &ticket,
+                    exit_timeout_seconds,
+                    self.last_discovery.processes.clone(),
+                );
+                self.complete(id, response)
+            }
+            Action::LaunchRecoverStop {
+                operation_id,
+                game_id,
+                exit_timeout_seconds,
+            } => {
+                self.refresh_discovery();
+                let response = self.launches.recover_stop(
+                    &operation_id,
+                    &game_id,
+                    exit_timeout_seconds,
+                    self.last_discovery.processes.clone(),
+                );
+                self.complete(id, response)
+            }
             Action::SettingsGet {} => {
                 if !self.configuration.ready() {
                     self.complete(id, json!({"ok":false,"code":"settings_loading"}))
@@ -325,6 +425,8 @@ impl PlayniteModule {
             "playnite_paths":self.last_discovery.executable_paths,
             "snapshot_pending":self.snapshot_worker.busy(),
             "snapshot_game_count":self.last_snapshot_games,
+            "launchable_game_count":self.eligible_launch_ids.len(),
+            "active_provider_launches":self.launches.active_count(),
             "catalog_sync":self.catalog.status(),
             "last_error":self.last_error,
             "revision":self.configuration.revision()
@@ -344,6 +446,10 @@ impl PlayniteModule {
 
 fn settings_caller_is_authorized(caller: &str) -> bool {
     caller == MANAGEMENT_CALLER
+}
+
+fn launch_caller_is_authorized(caller: &str) -> bool {
+    caller == LAUNCH_CALLER
 }
 
 amaterasu_module_sdk::export_module!(PlayniteModule);

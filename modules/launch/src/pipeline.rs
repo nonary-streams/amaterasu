@@ -246,7 +246,8 @@ impl Pipeline {
         if let Some(record) = next {
             self.ingress_since_monitor = 0;
             self.monitor_after = record.launch_id;
-            self.job = Some(Workflow::monitor(record.launch_id));
+            let playnite = matches!(record.target, Some(LaunchTarget::Playnite { .. }));
+            self.job = Some(Workflow::monitor(record.launch_id, playnite));
         }
     }
     fn dispatch(
@@ -296,6 +297,9 @@ impl Pipeline {
         if job.step == Step::Spawn {
             record.process_requested = true;
         }
+        if job.step == Step::StartPlaynite {
+            record.provider_launch_requested = true;
+        }
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -330,6 +334,17 @@ impl Pipeline {
             return self.consume_cleanup(job, payload, send);
         }
         if payload["ok"] != true {
+            if job.step == Step::StartPlaynite && responses::provider_start_not_started(&payload) {
+                let record = self
+                    .records
+                    .values
+                    .get_mut(&job.launch_id)
+                    .expect("workflow record");
+                record.provider_launch_requested = false;
+                record.provider_stopped = true;
+                job.begin_cleanup(record, Outcome::Failed, Some("playnite_launch_rejected"));
+                return self.retain(job);
+            }
             return self.dependency_failed(job, "dependency_rejected", send);
         }
         let record = self
@@ -359,8 +374,8 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
-                match Executable::from_catalog(&payload["entry"]["launch"]) {
-                    Ok(executable) => record.executable = Some(executable),
+                match LaunchTarget::from_catalog(&payload["entry"]["launch"]) {
+                    Ok(target) => record.target = Some(target),
                     Err(code) => return self.dependency_failed(job, code, send),
                 }
                 let config_overrides = match payload["entry"].get("config_overrides") {
@@ -396,7 +411,11 @@ impl Pipeline {
                 if !valid {
                     return self.dependency_failed(job, "invalid_session_response", send);
                 }
-                job.step = Step::Spawn;
+                job.step = match record.target.as_ref() {
+                    Some(LaunchTarget::Executable(_)) => Step::Spawn,
+                    Some(LaunchTarget::Playnite { .. }) => Step::StartPlaynite,
+                    None => return self.dependency_failed(job, "invalid_catalog_response", send),
+                };
             }
             Step::Spawn | Step::AwaitApplication => {
                 let (process, state) = match responses::process(&payload, record) {
@@ -424,6 +443,61 @@ impl Pipeline {
                         apply_application_outcome(record, outcome);
                         return self.cleanup_failed(job, "application_cleanup_failed", send);
                     }
+                }
+            }
+            Step::StartPlaynite => {
+                let provider = match responses::provider_launch(&payload, record) {
+                    Ok(provider) => provider,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.provider_ticket = Some(provider.ticket);
+                match provider.state {
+                    responses::ProviderState::Starting => job.step = Step::AwaitPlayniteStart,
+                    responses::ProviderState::Running => job.step = Step::Activate,
+                    responses::ProviderState::Stopping => {
+                        job.begin_cleanup(record, Outcome::Completed, None);
+                    }
+                    responses::ProviderState::Stopped => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(record, Outcome::Completed, None);
+                    }
+                    responses::ProviderState::LaunchFailed => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(record, Outcome::Failed, Some("playnite_launch_failed"));
+                    }
+                    responses::ProviderState::CleanupFailed => {
+                        return self.cleanup_failed(job, "playnite_cleanup_unconfirmed", send);
+                    }
+                }
+            }
+            Step::AwaitPlayniteStart | Step::MonitorPlaynite => {
+                let provider = match responses::provider_launch(&payload, record) {
+                    Ok(provider) => provider,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                match provider.state {
+                    responses::ProviderState::Starting if job.step == Step::AwaitPlayniteStart => {}
+                    responses::ProviderState::Running if job.step == Step::AwaitPlayniteStart => {
+                        job.step = Step::Activate
+                    }
+                    responses::ProviderState::Running if job.step == Step::MonitorPlaynite => {
+                        return Ok(());
+                    }
+                    responses::ProviderState::Stopping => {
+                        job.begin_cleanup(record, Outcome::Completed, None);
+                    }
+                    responses::ProviderState::Stopped => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(record, Outcome::Completed, None);
+                    }
+                    responses::ProviderState::LaunchFailed => {
+                        record.provider_stopped = true;
+                        job.begin_cleanup(record, Outcome::Failed, Some("playnite_launch_failed"));
+                    }
+                    responses::ProviderState::CleanupFailed => {
+                        return self.cleanup_failed(job, "playnite_cleanup_unconfirmed", send);
+                    }
+                    _ => return self.dependency_failed(job, "invalid_provider_response", send),
                 }
             }
             Step::Activate => {
@@ -503,6 +577,88 @@ impl Pipeline {
                     return self.cleanup_failed(job, "process_lookup_failed", send);
                 }
                 job.step = first_cleanup_step(record);
+            }
+            Step::FindPlaynite => {
+                if payload["ok"] == true {
+                    let provider = match responses::provider_launch(&payload, record) {
+                        Ok(provider) => provider,
+                        Err(code) => return self.cleanup_failed(job, code, send),
+                    };
+                    record.provider_ticket = Some(provider.ticket);
+                    job.step = match provider.state {
+                        responses::ProviderState::Stopped
+                        | responses::ProviderState::LaunchFailed => {
+                            record.provider_stopped = true;
+                            first_cleanup_step(record)
+                        }
+                        responses::ProviderState::CleanupFailed => Step::RecoverPlayniteStop,
+                        responses::ProviderState::Starting | responses::ProviderState::Running => {
+                            Step::StopPlaynite
+                        }
+                        responses::ProviderState::Stopping => Step::AwaitPlayniteStop,
+                    };
+                } else if payload["code"] == "launch_not_found" {
+                    job.step = Step::RecoverPlayniteStop;
+                } else {
+                    return self.cleanup_failed(job, "playnite_lookup_failed", send);
+                }
+            }
+            Step::RecoverPlayniteStop => {
+                record.provider_ticket = None;
+                let provider = match responses::provider_launch(&payload, record) {
+                    Ok(provider) => provider,
+                    Err(code) => return self.cleanup_failed(job, code, send),
+                };
+                record.provider_ticket = Some(provider.ticket);
+                match provider.state {
+                    responses::ProviderState::Stopped | responses::ProviderState::LaunchFailed => {
+                        record.provider_stopped = true;
+                        job.step = first_cleanup_step(record);
+                    }
+                    responses::ProviderState::Stopping => job.step = Step::AwaitPlayniteStop,
+                    responses::ProviderState::Starting | responses::ProviderState::Running => {
+                        job.step = Step::StopPlaynite;
+                    }
+                    responses::ProviderState::CleanupFailed => {
+                        return self.cleanup_failed(job, "playnite_stop_unconfirmed", send);
+                    }
+                }
+            }
+            Step::StopPlaynite => {
+                if payload["ok"] == false && payload["code"] == "launch_not_found" {
+                    job.step = Step::RecoverPlayniteStop;
+                } else {
+                    let provider = match responses::provider_launch(&payload, record) {
+                        Ok(provider) => provider,
+                        Err(code) => return self.cleanup_failed(job, code, send),
+                    };
+                    match provider.state {
+                        responses::ProviderState::Stopped => {
+                            record.provider_stopped = true;
+                            job.step = first_cleanup_step(record);
+                        }
+                        responses::ProviderState::Stopping => {
+                            job.step = Step::AwaitPlayniteStop;
+                        }
+                        _ => {
+                            return self.cleanup_failed(job, "playnite_stop_unconfirmed", send);
+                        }
+                    }
+                }
+            }
+            Step::AwaitPlayniteStop => {
+                let provider = match responses::provider_launch(&payload, record) {
+                    Ok(provider) => provider,
+                    Err(code) => return self.cleanup_failed(job, code, send),
+                };
+                match provider.state {
+                    responses::ProviderState::Stopped => {
+                        record.provider_stopped = true;
+                        job.step = first_cleanup_step(record);
+                    }
+                    responses::ProviderState::Stopping => {}
+                    _ => return self.cleanup_failed(job, "playnite_stop_unconfirmed", send),
+                }
             }
             Step::StopSession => {
                 // Process termination is still attempted if the session provider
@@ -654,7 +810,8 @@ impl Pipeline {
             .expect("workflow record");
         record.state = record.cleanup_outcome.state();
         record.cleanup_error = None;
-        record.executable = None;
+        record.target = None;
+        record.provider_ticket = None;
         self.reply(job, send)
     }
     fn reply(

@@ -2,7 +2,7 @@
 //! assigned to this provider by catalog startup policy.
 
 use crate::settings::ProductSettings;
-use crate::snapshot::{Game, Snapshot, executable_launch, select_games};
+use crate::snapshot::{Game, Snapshot, playnite_launch, select_games};
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,7 @@ struct Transaction {
     sync_id: String,
     source_revision: u64,
     settings_epoch: u64,
+    launchable_game_ids: std::collections::BTreeSet<String>,
     entries: Vec<Vec<Value>>,
     generation: Option<u64>,
     revision: Option<u64>,
@@ -182,6 +183,7 @@ impl Transaction {
 #[derive(Default)]
 pub struct CatalogSync {
     transaction: Option<Transaction>,
+    completed_launchable_game_ids: Option<std::collections::BTreeSet<String>>,
     source_revision: u64,
     last_error: Option<String>,
     skipped_launches: u64,
@@ -194,12 +196,18 @@ impl CatalogSync {
         settings: &ProductSettings,
         settings_epoch: u64,
         now_unix: i64,
-    ) -> Result<usize, String> {
+    ) -> Result<(), String> {
         if self.transaction.is_some() {
             return Err("catalog_sync_busy".into());
         }
         let selected = select_games(snapshot, settings, now_unix);
         let (entries, skipped) = prepare_entries(&selected)?;
+        let launchable_game_ids = entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry["source_id"].as_str())
+            .map(str::to_ascii_lowercase)
+            .collect();
         self.skipped_launches = skipped;
         self.source_revision = self
             .source_revision
@@ -209,6 +217,7 @@ impl CatalogSync {
             sync_id: new_sync_id(self.source_revision),
             source_revision: self.source_revision,
             settings_epoch,
+            launchable_game_ids,
             entries,
             generation: None,
             revision: None,
@@ -225,12 +234,19 @@ impl CatalogSync {
             operation_id: transaction.next_operation_id(),
         };
         self.transaction = Some(transaction);
+        self.completed_launchable_game_ids = None;
         self.last_error = None;
-        Ok(selected.len().saturating_sub(skipped as usize))
+        Ok(())
     }
 
     pub fn busy(&self) -> bool {
         self.transaction.is_some()
+    }
+
+    pub fn take_completed_launchable_game_ids(
+        &mut self,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        self.completed_launchable_game_ids.take()
     }
 
     pub fn status(&self) -> Value {
@@ -316,7 +332,10 @@ impl CatalogSync {
 
     fn finish_call(&mut self, mut transaction: Transaction, payload: Value) {
         match transaction.consume(payload) {
-            Ok(true) => self.last_error = None,
+            Ok(true) => {
+                self.completed_launchable_game_ids = Some(transaction.launchable_game_ids.clone());
+                self.last_error = None;
+            }
             Ok(false) => self.transaction = Some(transaction),
             Err(error) => self.last_error = Some(error),
         }
@@ -378,81 +397,18 @@ fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
 }
 
 fn provider_entry(game: &Game) -> Option<Value> {
-    if game.id.trim().is_empty()
-        || game.id.len() > 96
-        || game.id.chars().any(char::is_control)
+    if !crate::snapshot::valid_playnite_id(&game.id)
         || game.name.trim().is_empty()
         || game.name.len() > 160
         || game.name.chars().any(char::is_control)
-        || !paths_fit_catalog(game)
     {
         return None;
     }
-    let launch = executable_launch(game)?;
-    if !launch_is_catalog_safe(&launch) {
-        return None;
-    }
+    let launch = playnite_launch(game)?;
     Some(json!({
-        "source_id":game.id,
+        "source_id":game.id.to_ascii_lowercase(),
         "entry":{"name":game.name,"description":"","tags":[],"launch":launch}
     }))
-}
-
-fn launch_is_catalog_safe(launch: &Value) -> bool {
-    let Some(program) = launch.get("program").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(arguments) = launch.get("arguments").and_then(Value::as_array) else {
-        return false;
-    };
-    if !valid_catalog_path(program)
-        || arguments.len() > 32
-        || arguments.iter().any(|argument| {
-            argument.as_str().is_none_or(|argument| {
-                argument.len() > 1_024 || argument.chars().any(char::is_control)
-            })
-        })
-    {
-        return false;
-    }
-    launch
-        .get("working_directory")
-        .is_none_or(|working_directory| {
-            working_directory.is_null()
-                || working_directory.as_str().is_some_and(valid_catalog_path)
-        })
-}
-
-fn valid_catalog_path(path: &str) -> bool {
-    path.len() <= 2_048
-        && !path.is_empty()
-        && !path.chars().any(char::is_control)
-        && (path.starts_with('/')
-            || path.starts_with("\\\\")
-            || (path.len() >= 3
-                && path.as_bytes()[0].is_ascii_alphabetic()
-                && path.as_bytes()[1] == b':'
-                && matches!(path.as_bytes()[2], b'/' | b'\\')))
-        && path
-            .split(['/', '\\'])
-            .all(|part| part != "." && part != "..")
-}
-
-fn paths_fit_catalog(game: &Game) -> bool {
-    [
-        Some(game.exe.as_str()),
-        Some(game.working_directory.as_str()),
-        Some(game.install_directory.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|path| !path.is_empty())
-    .all(|path| {
-        path.len() <= 2_048
-            && path
-                .split(['/', '\\'])
-                .all(|part| part != "." && part != "..")
-    })
 }
 
 fn new_sync_id(source_revision: u64) -> String {
@@ -489,13 +445,21 @@ mod tests {
     }
 
     #[test]
-    fn prepares_only_native_launches_before_a_catalog_transaction() {
+    fn imports_typed_playnite_launches_with_or_without_native_executable_metadata() {
         let snapshot = Snapshot {
             games: vec![
-                game("supported", "A game", r"C:\Games\game.exe"),
-                game("not-native", "URI game", "playnite://game/1"),
-                game(&"x".repeat(97), "Long ID", r"C:\Games\other.exe"),
-                game("long-name", &"x".repeat(161), r"C:\Games\large.exe"),
+                game(
+                    "a1b2c3d4-1234-5678-9abc-0123456789ab",
+                    "A game",
+                    r"C:\Games\game.exe",
+                ),
+                game("b1b2c3d4-1234-5678-9abc-0123456789ab", "No executable", ""),
+                game("not-a-guid", "Invalid ID", r"C:\Games\other.exe"),
+                game(
+                    "c1b2c3d4-1234-5678-9abc-0123456789ab",
+                    &"x".repeat(161),
+                    r"C:\Games\large.exe",
+                ),
             ],
             categories: vec![Category {
                 id: "c".into(),
@@ -507,17 +471,30 @@ mod tests {
             }],
         };
         let (batches, skipped) = prepare_entries(&snapshot.games).unwrap();
-        assert_eq!(skipped, 3);
+        assert_eq!(skipped, 2);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0][0]["source_id"], "supported");
-        assert_eq!(batches[0][0]["entry"]["launch"]["kind"], "executable");
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(
+            batches[0][0]["source_id"],
+            "a1b2c3d4-1234-5678-9abc-0123456789ab"
+        );
+        assert_eq!(batches[0][0]["entry"]["launch"]["kind"], "playnite");
+        assert_eq!(batches[0][1]["entry"]["launch"]["kind"], "playnite");
+        assert_eq!(
+            batches[0][1]["entry"]["launch"]["game_id"],
+            "b1b2c3d4-1234-5678-9abc-0123456789ab"
+        );
     }
 
     #[test]
     fn complete_import_finish_never_deletes_prior_provider_entries() {
         let mut sync = CatalogSync::default();
         let snapshot = Snapshot {
-            games: vec![game("game-1", "Game", r"C:\Games\game.exe")],
+            games: vec![game(
+                "a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "Game",
+                r"C:\Games\game.exe",
+            )],
             categories: vec![],
             plugins: vec![],
         };
@@ -542,24 +519,68 @@ mod tests {
     }
 
     #[test]
+    fn launch_eligibility_is_published_only_after_complete_catalog_finish() {
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let mut sync = CatalogSync::default();
+        sync.start(
+            &Snapshot {
+                games: vec![game(game_id, "Game", r"C:\Games\game.exe")],
+                categories: vec![],
+                plugins: vec![],
+            },
+            &ProductSettings {
+                sync_all_installed: true,
+                ..ProductSettings::default()
+            },
+            7,
+            0,
+        )
+        .unwrap();
+        assert!(sync.take_completed_launchable_game_ids().is_none());
+
+        let mut transaction = sync.transaction.take().unwrap();
+        transaction.stage = Stage::Finish;
+        transaction.generation = Some(1);
+        transaction.revision = Some(2);
+        sync.finish_call(
+            transaction,
+            json!({
+                "ok":true,
+                "generation":1,
+                "revision":3,
+                "complete":true,
+                "cleanup_pending":false,
+                "remove_stale":false
+            }),
+        );
+        assert_eq!(
+            sync.take_completed_launchable_game_ids(),
+            Some(std::collections::BTreeSet::from([game_id.into()]))
+        );
+    }
+
+    #[test]
     fn selected_entries_are_prevalidated_before_begin() {
-        let large = game("large", "Game", &format!(r"C:\{}", "a".repeat(3_000)));
+        let large = game(
+            "a1b2c3d4-1234-5678-9abc-0123456789ab",
+            &"x".repeat(161),
+            r"C:\Games\game.exe",
+        );
         assert!(provider_entry(&large).is_none());
     }
 
     #[test]
-    fn catalog_path_and_argument_limits_fail_before_snapshot_begin() {
-        let control_path = game("control", "Game", "C:\\Games\\bad\nname.exe");
-        let control_argument = Game {
-            args: "\"bad\nargument\"".into(),
-            ..game("argument", "Game", r"C:\Games\game.exe")
+    fn playnite_launch_ignores_native_executable_and_argument_metadata() {
+        let game = Game {
+            exe: "playnite://not-a-command".into(),
+            args: "malformed \" command metadata".into(),
+            working_directory: "relative\u{0001}path".into(),
+            install_directory: String::new(),
+            ..game("a1b2c3d4-1234-5678-9abc-0123456789ab", "Game", "")
         };
-        let oversized_working_directory = Game {
-            working_directory: format!(r"C:\{}", "a".repeat(2_050)),
-            ..game("working", "Game", r"C:\Games\game.exe")
-        };
-        assert!(provider_entry(&control_path).is_none());
-        assert!(provider_entry(&control_argument).is_none());
-        assert!(provider_entry(&oversized_working_directory).is_none());
+        assert_eq!(
+            provider_entry(&game).unwrap()["entry"]["launch"]["kind"],
+            "playnite"
+        );
     }
 }

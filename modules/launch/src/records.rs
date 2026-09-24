@@ -1,4 +1,4 @@
-use crate::protocol::{ApplicationConfigOverrides, Executable, Outcome, State};
+use crate::protocol::{ApplicationConfigOverrides, LaunchTarget, Outcome, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -35,13 +35,19 @@ pub struct Record {
     #[serde(skip)]
     pub resource: Option<String>,
     #[serde(skip)]
-    pub executable: Option<Executable>,
+    pub target: Option<LaunchTarget>,
+    #[serde(skip)]
+    pub provider_ticket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
     #[serde(skip)]
     pub session_requested: bool,
     #[serde(skip)]
     pub process_requested: bool,
+    #[serde(skip)]
+    pub provider_launch_requested: bool,
+    #[serde(skip)]
+    pub provider_stopped: bool,
     #[serde(skip)]
     pub cleanup_outcome: Outcome,
     // Retained until cancellation and broker release are confirmed.
@@ -133,10 +139,13 @@ impl Records {
                 session_key: key.clone(),
                 process_operation: key,
                 resource,
-                executable: None,
+                target: None,
+                provider_ticket: None,
                 config_overrides: None,
                 session_requested: false,
                 process_requested: false,
+                provider_launch_requested: false,
+                provider_stopped: false,
                 cleanup_outcome: Outcome::Completed,
             },
         );

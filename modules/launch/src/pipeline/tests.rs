@@ -20,6 +20,12 @@ struct TestProcess {
     stopping_statuses: usize,
     fail_stopping_cleanup_once: bool,
 }
+struct TestProviderLaunch {
+    operation: String,
+    game_id: String,
+    ticket: String,
+    state: &'static str,
+}
 #[derive(Default)]
 struct Harness {
     incoming: Option<Response>,
@@ -48,6 +54,14 @@ struct Harness {
     catalog_exit_timeout_seconds: Option<u64>,
     catalog_detached: Option<Vec<String>>,
     catalog_fec_percentage: Option<u8>,
+    catalog_playnite_game_id: Option<String>,
+    catalog_playnite_exit_timeout_seconds: u64,
+    provider_launches: Vec<TestProviderLaunch>,
+    provider_start_rejection: Option<Value>,
+    drop_provider_start_result: bool,
+    provider_status_not_found_once: bool,
+    provider_stop_failure_once: bool,
+    provider_recovery_failure_once: bool,
     application_preparing_statuses: usize,
     preparation_terminal: Option<&'static str>,
     application_stopping_statuses: usize,
@@ -83,6 +97,14 @@ impl Harness {
             catalog_exit_timeout_seconds: None,
             catalog_detached: None,
             catalog_fec_percentage: None,
+            catalog_playnite_game_id: None,
+            catalog_playnite_exit_timeout_seconds: 10,
+            provider_launches: Vec::new(),
+            provider_start_rejection: None,
+            drop_provider_start_result: false,
+            provider_status_not_found_once: false,
+            provider_stop_failure_once: false,
+            provider_recovery_failure_once: false,
             application_preparing_statuses: 0,
             preparation_terminal: None,
             application_stopping_statuses: 0,
@@ -274,6 +296,109 @@ impl Harness {
         }
         Self::process_reply(process)
     }
+    fn playnite(&mut self, payload: &Value) -> Value {
+        let action = payload["action"].as_str().unwrap();
+        match action {
+            "launch_start" => {
+                if let Some(response) = self.provider_start_rejection.take() {
+                    return response;
+                }
+                let operation = payload["operation_id"].as_str().unwrap();
+                let game_id = payload["game_id"].as_str().unwrap();
+                if let Some(existing) = self
+                    .provider_launches
+                    .iter()
+                    .find(|launch| launch.operation == operation)
+                {
+                    return Self::provider_reply(existing);
+                }
+                let launch = TestProviderLaunch {
+                    operation: operation.into(),
+                    game_id: game_id.into(),
+                    ticket: "cd".repeat(24),
+                    state: "running",
+                };
+                let response = Self::provider_reply(&launch);
+                self.provider_launches.push(launch);
+                response
+            }
+            "launch_lookup" => self
+                .provider_launches
+                .iter()
+                .find(|launch| launch.operation == payload["operation_id"])
+                .map(Self::provider_reply)
+                .unwrap_or(json!({"ok":false,"code":"launch_not_found"})),
+            "launch_status" => {
+                if self.provider_status_not_found_once {
+                    self.provider_status_not_found_once = false;
+                    self.provider_launches.clear();
+                    return json!({"ok":false,"code":"launch_not_found"});
+                }
+                self.provider_launches
+                    .iter()
+                    .find(|launch| launch.ticket == payload["ticket"])
+                    .map(Self::provider_reply)
+                    .unwrap_or(json!({"ok":false,"code":"launch_not_found"}))
+            }
+            "launch_stop" => {
+                let Some(launch) = self
+                    .provider_launches
+                    .iter_mut()
+                    .find(|launch| launch.ticket == payload["ticket"])
+                else {
+                    return json!({"ok":false,"code":"launch_not_found"});
+                };
+                if self.provider_stop_failure_once {
+                    self.provider_stop_failure_once = false;
+                    launch.state = "cleanup_failed";
+                } else {
+                    launch.state = "stopped";
+                }
+                Self::provider_reply(launch)
+            }
+            "launch_recover_stop" => {
+                let operation = payload["operation_id"].as_str().unwrap();
+                let game_id = payload["game_id"].as_str().unwrap();
+                if let Some(launch) = self
+                    .provider_launches
+                    .iter_mut()
+                    .find(|launch| launch.operation == operation)
+                {
+                    launch.state = if self.provider_recovery_failure_once {
+                        self.provider_recovery_failure_once = false;
+                        "cleanup_failed"
+                    } else {
+                        "stopped"
+                    };
+                    return Self::provider_reply(launch);
+                }
+                let state = if self.provider_recovery_failure_once {
+                    self.provider_recovery_failure_once = false;
+                    "cleanup_failed"
+                } else {
+                    "stopped"
+                };
+                let launch = TestProviderLaunch {
+                    operation: operation.into(),
+                    game_id: game_id.into(),
+                    ticket: "ef".repeat(24),
+                    state,
+                };
+                let response = Self::provider_reply(&launch);
+                self.provider_launches.push(launch);
+                response
+            }
+            _ => panic!("unexpected Playnite action"),
+        }
+    }
+    fn provider_reply(launch: &TestProviderLaunch) -> Value {
+        json!({
+            "ok":true,
+            "ticket":launch.ticket,
+            "game_id":launch.game_id,
+            "state":launch.state
+        })
+    }
     fn send(&mut self, command: Command) -> Transport {
         Ok(match command {
             Command::Poll {} => self.incoming.take().unwrap_or(Response::Pending),
@@ -317,7 +442,11 @@ impl Harness {
                         } else {
                             "pipeline::tests::controlled_process"
                         };
-                        let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":{"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}}});
+                        let launch = self.catalog_playnite_game_id.as_ref().map_or_else(
+                            || json!({"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}),
+                            |game_id| json!({"kind":"playnite","game_id":game_id,"exit_timeout_seconds":self.catalog_playnite_exit_timeout_seconds}),
+                        );
+                        let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":launch}});
                         if let Some(fec_percentage) = self.catalog_fec_percentage {
                             reply["entry"]["config_overrides"] =
                                 json!({"fec_percentage":fec_percentage});
@@ -349,6 +478,7 @@ impl Harness {
                     }
                     crate::workflow::SESSION => self.session(&payload),
                     crate::workflow::APPLICATION => self.application(&payload),
+                    crate::workflow::PLAYNITE => self.playnite(&payload),
                     _ => panic!("unexpected dependency"),
                 };
                 if (action == "launch" && self.cancel_after_spawn)
@@ -387,6 +517,16 @@ impl Harness {
                     self.drop_spawn_result = false;
                     self.reply = None;
                     return Err("simulated transport failure".into());
+                }
+                if self.drop_provider_start_result
+                    && self
+                        .commands
+                        .last()
+                        .is_some_and(|(_, payload, _)| payload["action"] == "launch_start")
+                {
+                    self.drop_provider_start_result = false;
+                    self.reply = None;
+                    return Err("simulated Playnite start acknowledgement loss".into());
                 }
                 self.reply.take().unwrap()
             }
@@ -485,7 +625,7 @@ fn canonical_catalog_preparation_is_forwarded_and_launch_waits_until_running() {
     assert_eq!(application[0]["cwd"], json!(command.parent().unwrap()));
     assert_eq!(application[0]["auto_detach"], true);
     assert_eq!(application[0]["wait_all"], true);
-    assert_eq!(application[0]["exit_timeout_seconds"], 10);
+    assert_eq!(application[0]["exit_timeout_seconds"], 5);
     assert_eq!(application[0]["detached"], json!([]));
     assert_eq!(
         application[0]["preparation"],
@@ -1163,4 +1303,180 @@ fn unconfirmed_cancellation_or_release_preserves_request_and_lease_for_retry() {
         assert!(pipeline.records.values[&1].outstanding_request.is_none());
         assert_eq!(harness.released, 1);
     }
+}
+
+fn playnite_catalog(game_id: &str, exit_timeout_seconds: u64) -> Harness {
+    let mut harness = Harness::new();
+    harness.catalog_playnite_game_id = Some(game_id.into());
+    harness.catalog_playnite_exit_timeout_seconds = exit_timeout_seconds;
+    harness
+}
+
+#[test]
+fn typed_playnite_launch_uses_provider_ticket_and_holds_lease_until_stop_confirmation() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 300);
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "alice", launch("playnite-start"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(
+        harness.processes.is_empty(),
+        "Playnite GUIDs never become executable commands"
+    );
+    let start_request = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::PLAYNITE && payload["action"] == "launch_start"
+        })
+        .unwrap();
+    assert_eq!(
+        start_request.1["game_id"],
+        "a1b2c3d4-1234-5678-9abc-0123456789ab"
+    );
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "alice",
+            json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+        )["launch"]["state"],
+        "stopped"
+    );
+    assert!(harness.sessions[0].lease.is_none());
+    let stop_request = harness
+        .commands
+        .iter()
+        .find(|(service, payload, _)| {
+            service == crate::workflow::PLAYNITE && payload["action"] == "launch_stop"
+        })
+        .unwrap();
+    assert_eq!(stop_request.1["exit_timeout_seconds"], 300);
+}
+
+#[test]
+fn exact_not_started_marker_releases_only_after_a_preflight_rejection() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.provider_start_rejection =
+        Some(json!({"ok":false,"code":"playnite_not_running","launch_state":"not_started"}));
+    let mut pipeline = pipeline();
+    let failed = harness.request(&mut pipeline, "alice", launch("known-no-start"));
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    assert_eq!(failed["launch"]["failure"], "playnite_launch_rejected");
+    assert!(harness.sessions[0].lease.is_none());
+    assert!(harness.provider_launches.is_empty());
+    assert!(
+        !harness.commands.iter().any(|(_, payload, _)| matches!(
+            payload["action"].as_str(),
+            Some("launch_lookup" | "launch_recover_stop")
+        )),
+        "a strict preflight proof makes speculative recovery unnecessary"
+    );
+}
+
+#[test]
+fn lost_start_ack_is_reconciled_by_operation_lookup_and_stopped_without_respawn() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.drop_provider_start_result = true;
+    let mut pipeline = pipeline();
+    let failed = harness.request(&mut pipeline, "alice", launch("lost-playnite-ack"));
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    assert_eq!(harness.provider_launches.len(), 1);
+    assert_eq!(harness.provider_launches[0].state, "stopped");
+    assert!(harness.sessions[0].lease.is_none());
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, payload, _)| {
+                service == crate::workflow::PLAYNITE && payload["action"] == "launch_start"
+            })
+            .count(),
+        1,
+        "the acknowledged start is resolved by lookup, never replayed"
+    );
+    assert!(harness.commands.iter().any(|(service, payload, parent)| {
+        service == crate::workflow::PLAYNITE
+            && payload["action"] == "launch_lookup"
+            && parent.is_none()
+    }));
+}
+
+#[test]
+fn malformed_not_started_marker_and_missing_lookup_hold_lease_until_recovery_retry() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.provider_start_rejection = Some(json!({
+        "ok":false,
+        "code":"playnite_not_running",
+        "launch_state":"not_started",
+        "untrusted_extra":true
+    }));
+    harness.provider_recovery_failure_once = true;
+    let mut pipeline = pipeline();
+    let uncertain = harness.request(&mut pipeline, "alice", launch("uncertain-playnite-start"));
+    assert_eq!(
+        uncertain["launch"]["state"], "cleanup_failed",
+        "{uncertain}"
+    );
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(
+        harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| { payload["action"] == "launch_lookup" })
+    );
+    assert!(
+        harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| { payload["action"] == "launch_recover_stop" })
+    );
+
+    let recovered = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":uncertain["launch"]["launch_id"]}),
+    );
+    assert_eq!(recovered["launch"]["state"], "failed", "{recovered}");
+    assert!(harness.sessions[0].lease.is_none());
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(_, payload, _)| payload["action"] == "launch_recover_stop")
+            .count(),
+        1,
+        "the first recovery is unconfirmed; its returned ticket makes an explicit stop retry safe"
+    );
+    assert!(harness.commands.iter().any(|(service, payload, _)| {
+        service == crate::workflow::PLAYNITE && payload["action"] == "launch_stop"
+    }));
+}
+
+#[test]
+fn missing_provider_status_after_module_restart_reacquires_extension_and_stops_before_release() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "alice", launch("provider-restart"));
+    assert_eq!(started["launch"]["state"], "active");
+    harness.provider_status_not_found_once = true;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while harness.sessions[0].lease.is_some()
+        || (pipeline.records.values[&1].state != State::Failed
+            && pipeline.records.values[&1].state != State::Stopped)
+    {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "provider recovery stalled"
+        );
+    }
+    assert_eq!(
+        pipeline.records.values[&1].response()["launch"]["state"],
+        "failed"
+    );
+    assert!(harness.commands.iter().any(|(service, payload, _)| {
+        service == crate::workflow::PLAYNITE && payload["action"] == "launch_recover_stop"
+    }));
+    assert!(harness.sessions[0].lease.is_none());
 }

@@ -417,103 +417,28 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
-fn is_windows_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || value.starts_with("\\\\")
+pub fn valid_playnite_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
-pub fn executable_launch(game: &Game) -> Option<serde_json::Value> {
-    if game.name.trim().is_empty() || !is_windows_absolute_path(&game.exe) {
-        return None;
-    }
-    let arguments = parse_windows_arguments(&game.args)?;
-    let working_directory = if !game.working_directory.is_empty() {
-        game.working_directory.as_str()
-    } else if !game.install_directory.is_empty() {
-        game.install_directory.as_str()
-    } else {
-        ""
-    };
-    if !working_directory.is_empty() && !is_windows_absolute_path(working_directory) {
-        return None;
-    }
-    Some(serde_json::json!({
-        "kind":"executable",
-        "program":game.exe,
-        "arguments":arguments,
-        "working_directory":if working_directory.is_empty() { None } else { Some(working_directory) },
-    }))
-}
-
-/// Splits the Windows CRT command-line argument string without invoking a shell.
-fn parse_windows_arguments(value: &str) -> Option<Vec<String>> {
-    if value.is_empty() {
-        return Some(Vec::new());
-    }
-    if value.len() > 8_192 || value.contains('\0') {
-        return None;
-    }
-    let chars: Vec<char> = value.chars().collect();
-    let mut arguments = Vec::new();
-    let mut position = 0;
-    while position < chars.len() {
-        while chars
-            .get(position)
-            .is_some_and(|character| character.is_whitespace())
-        {
-            position += 1;
-        }
-        if position == chars.len() {
-            break;
-        }
-        let mut argument = String::new();
-        let mut quoted = false;
-        while position < chars.len() {
-            let mut backslashes = 0;
-            while chars.get(position) == Some(&'\\') {
-                backslashes += 1;
-                position += 1;
-            }
-            if chars.get(position) == Some(&'"') {
-                argument.extend(std::iter::repeat_n('\\', backslashes / 2));
-                if backslashes % 2 == 1 {
-                    argument.push('"');
-                    position += 1;
-                } else if quoted && chars.get(position + 1) == Some(&'"') {
-                    argument.push('"');
-                    position += 2;
-                } else {
-                    quoted = !quoted;
-                    position += 1;
-                }
-                continue;
-            }
-            argument.extend(std::iter::repeat_n('\\', backslashes));
-            if position == chars.len() || (!quoted && chars[position].is_whitespace()) {
-                break;
-            }
-            argument.push(chars[position]);
-            position += 1;
-        }
-        if quoted {
-            return None;
-        }
-        arguments.push(argument);
-        if arguments.len() > 32 || arguments.iter().map(String::len).sum::<usize>() > 8_192 {
-            return None;
-        }
-    }
-    Some(arguments)
+pub fn playnite_launch(game: &Game) -> Option<serde_json::Value> {
+    (game.name.trim().len() <= 160 && !game.name.trim().is_empty() && valid_playnite_id(&game.id))
+        .then(|| {
+            serde_json::json!({
+                "kind":"playnite",
+                "game_id":game.id.to_ascii_lowercase(),
+                "exit_timeout_seconds":10
+            })
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn game(id: &str, categories: &[&str], plugin: &str, last_played: &str) -> Game {
         Game {
@@ -634,30 +559,25 @@ mod tests {
     }
 
     #[test]
-    fn extension_arguments_use_windows_quoting_and_reject_unmatched_quotes() {
-        assert_eq!(
-            parse_windows_arguments(r#"--profile "space dir" "quote\"inside""#),
-            Some(vec![
-                "--profile".into(),
-                "space dir".into(),
-                "quote\"inside".into()
-            ])
-        );
-        assert_eq!(parse_windows_arguments("\"unfinished"), None);
-        assert_eq!(
-            executable_launch(&Game {
-                exe: "playnite://game/id".into(),
-                ..game("uri", &[], "", "")
-            }),
-            None
-        );
-        let launch = executable_launch(&Game {
-            args: r#""quoted value" --quiet"#.into(),
-            ..game("valid", &[], "", "")
+    fn playnite_launch_is_guid_typed_and_ignores_catalog_executable_metadata() {
+        let valid_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let launch = playnite_launch(&Game {
+            id: valid_id.into(),
+            exe: "playnite://untrusted-executable-metadata".into(),
+            args: "ignored by typed Playnite launch".into(),
+            ..game("unused", &[], "", "")
         })
         .unwrap();
-        assert_eq!(launch["arguments"], json!(["quoted value", "--quiet"]));
-        assert_eq!(launch["working_directory"], r"C:\Games\valid");
+        assert_eq!(launch["kind"], "playnite");
+        assert_eq!(launch["game_id"], valid_id);
+        assert_eq!(launch["exit_timeout_seconds"], 10);
+        assert!(
+            playnite_launch(&Game {
+                id: "../../fake".into(),
+                ..game("bad", &[], "", "")
+            })
+            .is_none()
+        );
     }
 
     #[test]
