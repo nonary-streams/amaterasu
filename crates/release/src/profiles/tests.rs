@@ -59,6 +59,79 @@ fn management_loads_after_its_nvhttp_settings_provider() {
 }
 
 #[test]
+fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
+    let platform = PackageProfile::Platform.components();
+    let provider = platform
+        .iter()
+        .find(|component| component.id == HOST_CONFIGURATION.id)
+        .unwrap();
+
+    assert_eq!(provider.library, "amaterasu_host_configuration");
+    assert_eq!(provider.provides, &["amaterasu.host-configuration/1"]);
+    assert_eq!(provider.calls, &["amaterasu.state/1"]);
+    assert!(provider.dependencies.contains(&RUNTIME_ID));
+    assert!(provider.dependencies.contains(&STATE.id));
+    assert!(
+        !PackageProfile::Example
+            .components()
+            .iter()
+            .any(|component| component.id == HOST_CONFIGURATION.id)
+    );
+    assert!(
+        !PackageProfile::MediaProbe
+            .components()
+            .iter()
+            .any(|component| component.id == HOST_CONFIGURATION.id)
+    );
+    assert!(
+        !PackageProfile::StreamProbe
+            .components()
+            .iter()
+            .any(|component| component.id == HOST_CONFIGURATION.id)
+    );
+}
+
+#[test]
+fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
+    let host_configuration_service = "amaterasu.host-configuration/1";
+    assert_eq!(DIAGNOSTICS.calls, &[host_configuration_service]);
+    assert!(MANAGEMENT.calls.contains(&host_configuration_service));
+    assert!(MANAGEMENT.dependencies.contains(&HOST_CONFIGURATION.id));
+
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-host-configuration-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+
+    for policy in [development, installer] {
+        let diagnostics_calls = &policy.principals[DIAGNOSTICS.id].call;
+        assert_eq!(diagnostics_calls.len(), 1);
+        assert!(diagnostics_calls.contains(host_configuration_service));
+        assert!(
+            policy.principals[MANAGEMENT.id]
+                .call
+                .contains(host_configuration_service)
+        );
+
+        let host_configuration = &policy.principals[HOST_CONFIGURATION.id];
+        assert_eq!(host_configuration.provide.len(), 1);
+        assert!(
+            host_configuration
+                .provide
+                .contains(host_configuration_service)
+        );
+        assert_eq!(host_configuration.call.len(), 1);
+        assert!(host_configuration.call.contains("amaterasu.state/1"));
+    }
+}
+
+#[test]
 fn launch_can_call_only_the_typed_playnite_provider_service_it_uses() {
     assert!(LAUNCH.calls.contains(&"amaterasu.playnite/1"));
     assert!(LAUNCH.dependencies.contains(&PLAYNITE.id));

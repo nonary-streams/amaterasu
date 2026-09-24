@@ -115,11 +115,22 @@ const APPLICATION: ComponentDefinition = ComponentDefinition {
     dependencies: &[RUNTIME_ID],
 };
 
+const HOST_CONFIGURATION: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.host-configuration",
+    library: "amaterasu_host_configuration",
+    provides: &["amaterasu.host-configuration/1"],
+    calls: &["amaterasu.state/1"],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.state"],
+};
+
 const DIAGNOSTICS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.diagnostics",
     library: "amaterasu_diagnostics",
     provides: &["amaterasu.diagnostics/1"],
-    calls: &[],
+    calls: &["amaterasu.host-configuration/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
@@ -556,6 +567,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.playnite/1",
         "amaterasu.lutris/1",
         "amaterasu.diagnostics/1",
+        "amaterasu.host-configuration/1",
         "amaterasu.pairing/1",
         "amaterasu.display/1",
         "amaterasu.launch/1",
@@ -589,6 +601,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.playnite",
         "amaterasu.lutris",
         "amaterasu.diagnostics",
+        "amaterasu.host-configuration",
         "amaterasu.pairing",
         "amaterasu.display",
         "amaterasu.launch",
@@ -647,6 +660,7 @@ impl PackageProfile {
                 CONFIGURATION,
                 CATALOG,
                 APPLICATION,
+                HOST_CONFIGURATION,
                 DIAGNOSTICS,
                 STEAM,
                 PLAYNITE,
