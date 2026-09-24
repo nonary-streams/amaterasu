@@ -1,4 +1,4 @@
-//! Linux-only best-effort association of a newly launched Steam game process.
+//! Best-effort association of a newly launched Steam game process.
 //! Steam's client remains outside the managed process group; only game PIDs
 //! attributed by install-tree evidence can be signaled.
 use std::time::Instant;
@@ -8,7 +8,7 @@ use std::time::Instant;
 pub(crate) enum SteamGameLiveness {
     Unknown,
     Searching,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Associated,
     Stopping,
 }
@@ -16,6 +16,8 @@ pub(crate) enum SteamGameLiveness {
 pub(crate) struct SteamProcessTracker {
     #[cfg(target_os = "linux")]
     inner: linux::Tracker,
+    #[cfg(windows)]
+    inner: windows::Tracker,
 }
 
 impl SteamProcessTracker {
@@ -24,7 +26,11 @@ impl SteamProcessTracker {
         {
             linux::Tracker::begin(install_directory).map(|inner| Self { inner })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            windows::Tracker::begin(install_directory).map(|inner| Self { inner })
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = install_directory;
             None
@@ -36,7 +42,11 @@ impl SteamProcessTracker {
         {
             self.inner.observe(now)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.observe(now)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = now;
             SteamGameLiveness::Unknown
@@ -48,7 +58,11 @@ impl SteamProcessTracker {
         {
             self.inner.was_associated()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.was_associated()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             false
         }
@@ -61,7 +75,11 @@ impl SteamProcessTracker {
         {
             self.inner.request_stop(now)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.request_stop(now)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = now;
             false
@@ -74,7 +92,11 @@ impl SteamProcessTracker {
         {
             self.inner.advance_stop(now)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.advance_stop(now)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = now;
             false
@@ -86,12 +108,20 @@ impl SteamProcessTracker {
         {
             self.inner.is_stopping()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.is_stopping()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             false
         }
     }
 }
+
+#[cfg(windows)]
+#[path = "steam_tracking/windows.rs"]
+mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux {
