@@ -1,6 +1,13 @@
 use crate::STATE_SERVICE;
 use crate::model::{Document, Entry, MAX_ENTRIES, bounded_text};
-use crate::protocol::{Change, Cursor, Operation, apply, error, matches_query, project_entry};
+use crate::product::{
+    CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, STATE_PREFIX,
+    SnapshotState, entry_fingerprint, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
+    state_key, valid_source_id, valid_sync_id, validate_marker,
+};
+use crate::protocol::{
+    Change, Cursor, Operation, ProviderEntry, apply, error, matches_query, project_entry,
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -13,6 +20,7 @@ type TransportResult = ModuleResult<Response>;
 
 struct Incoming {
     request_id: u64,
+    caller: String,
     key: String,
     catalog_owner: Option<String>,
     operation: Operation,
@@ -22,6 +30,8 @@ struct Context {
     request_id: u64,
     key: String,
     catalog_owner: Option<String>,
+    importer: Option<String>,
+    provider_count: u64,
     deadline: Instant,
 }
 struct Pending {
@@ -35,6 +45,60 @@ enum Stage {
     Migrating(Operation),
     Paging(Scan),
     Saving(Value),
+    ProviderLoading(Operation),
+    ProviderPaging(ProviderScan),
+    ProviderSaving(ProviderSave),
+}
+
+struct ProviderScan {
+    operation: Operation,
+    state_revision: u64,
+    document_revision: u64,
+    next_id: u64,
+    total_count: u64,
+    provider_count: u64,
+    hidden_rows: u64,
+    after: Option<String>,
+    scanned: usize,
+    fingerprints: BTreeMap<String, String>,
+    entry_ids: BTreeSet<String>,
+    markers: BTreeMap<String, Marker>,
+    provider_state: Option<SnapshotState>,
+}
+
+#[derive(Clone)]
+struct ProviderSession {
+    caller: String,
+    key: String,
+    collection_revision: u64,
+    document_revision: u64,
+    next_id: u64,
+    provider_count: u64,
+    entry_ids: BTreeSet<String>,
+    fingerprints: BTreeMap<String, String>,
+    markers: BTreeMap<String, Marker>,
+    state: SnapshotState,
+}
+
+struct ProviderSave {
+    session: ProviderSession,
+    reply: Value,
+    remaining_cleanup: Vec<Marker>,
+    finish: bool,
+}
+struct ProviderBatch {
+    sequence: u64,
+    expected_revision: u64,
+    fingerprint: String,
+    entries: Vec<ProviderEntry>,
+}
+struct ProviderFinish {
+    sync_id: String,
+    generation: u64,
+    source_revision: u64,
+    expected_revision: u64,
+    next_sequence: u64,
+    source_complete: bool,
 }
 struct Scan {
     export: bool,
@@ -51,6 +115,8 @@ struct Scan {
 pub struct Pipeline {
     launch_principals: BTreeSet<String>,
     export_principals: BTreeMap<String, String>,
+    import_principals: BTreeMap<String, String>,
+    provider_sessions: BTreeMap<String, ProviderSession>,
     queued: VecDeque<Incoming>,
     pending: Option<Pending>,
     sequence: u64,
@@ -59,10 +125,12 @@ impl Pipeline {
     pub fn new(
         launch_principals: BTreeSet<String>,
         export_principals: BTreeMap<String, String>,
+        import_principals: BTreeMap<String, String>,
     ) -> Self {
         Self {
             launch_principals,
             export_principals,
+            import_principals,
             ..Self::default()
         }
     }
@@ -74,6 +142,17 @@ impl Pipeline {
         operation: Operation,
     ) -> Result<(String, Option<String>, Operation), Value> {
         match operation {
+            operation @ (Operation::ProviderSnapshotBegin { .. }
+            | Operation::ProviderSnapshotBatch { .. }
+            | Operation::ProviderSnapshotFinish { .. }) => {
+                let owner = self.import_principals.get(caller).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "caller is not an authorized catalog importer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
+            }
             operation @ Operation::ExportList { .. } => {
                 let owner = self.export_principals.get(caller).ok_or_else(|| {
                     error(
@@ -131,9 +210,27 @@ impl Pipeline {
                 request_id: incoming.request_id,
                 key: incoming.key,
                 catalog_owner: incoming.catalog_owner,
+                importer: match &incoming.operation {
+                    Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotBatch { .. }
+                    | Operation::ProviderSnapshotFinish { .. } => Some(incoming.caller.clone()),
+                    _ => None,
+                },
+                provider_count: 0,
                 deadline: incoming.deadline,
             };
-            self.load(context, incoming.operation, &mut send)?;
+            // The importer is the Poll caller, retained separately from the fixed
+            // owner collection key. It cannot be supplied by request payload.
+            if matches!(
+                incoming.operation,
+                Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotBatch { .. }
+                    | Operation::ProviderSnapshotFinish { .. }
+            ) {
+                self.start_provider(context, incoming.operation, &mut send)?;
+            } else {
+                self.load(context, incoming.operation, &mut send)?;
+            }
         }
         Ok(())
     }
@@ -161,6 +258,7 @@ impl Pipeline {
                     };
                 self.queued.push_back(Incoming {
                     request_id: id,
+                    caller,
                     key,
                     catalog_owner,
                     operation,
@@ -186,6 +284,572 @@ impl Pipeline {
         };
         let payload = json!({"action":"collection_get","collection":context.key,"key":key});
         self.submit(context, payload, Stage::Loading(operation), send)
+    }
+
+    fn start_provider(
+        &mut self,
+        context: Context,
+        operation: Operation,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let Some(caller) = context.importer.as_deref() else {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "permission_denied",
+                    "provider caller identity is unavailable",
+                ),
+            );
+        };
+        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
+            && let Some(session) = self.provider_sessions.get(caller).cloned()
+        {
+            return self.apply_provider_operation(context, operation, session, send);
+        }
+        let payload = json!({"action":"collection_get","collection":context.key,"key":null});
+        self.submit(context, payload, Stage::ProviderLoading(operation), send)
+    }
+
+    fn scan_provider_page(
+        &mut self,
+        context: Context,
+        scan: ProviderScan,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let payload = json!({
+            "action":"collection_page",
+            "collection":context.key,
+            "revision":scan.state_revision,
+            "after":scan.after,
+            "limit":128,
+        });
+        self.submit(context, payload, Stage::ProviderPaging(scan), send)
+    }
+
+    fn finish_provider_scan(
+        &mut self,
+        context: Context,
+        scan: ProviderScan,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let caller = context.importer.clone().expect("authorized importer");
+        let state = scan.provider_state.unwrap_or_else(SnapshotState::initial);
+        if !state.validate() {
+            return complete(send, context.request_id, malformed());
+        }
+        let session = ProviderSession {
+            caller,
+            key: context.key.clone(),
+            collection_revision: scan.state_revision,
+            document_revision: scan.document_revision,
+            next_id: scan.next_id,
+            provider_count: scan.provider_count,
+            entry_ids: scan.entry_ids,
+            fingerprints: scan.fingerprints,
+            markers: scan.markers,
+            state,
+        };
+        self.apply_provider_operation(context, scan.operation, session, send)
+    }
+
+    fn apply_provider_operation(
+        &mut self,
+        context: Context,
+        operation: Operation,
+        session: ProviderSession,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        match operation {
+            Operation::ProviderSnapshotBegin {
+                sync_id,
+                source_revision,
+            } => self.begin_snapshot(context, session, sync_id, source_revision, send),
+            Operation::ProviderSnapshotBatch {
+                sync_id,
+                generation,
+                source_revision,
+                sequence,
+                expected_revision,
+                entries,
+            } => {
+                let encoded = serde_json::to_vec(&entries).map_or(usize::MAX, |bytes| bytes.len());
+                if !valid_sync_id(&sync_id)
+                    || entries.is_empty()
+                    || entries.len() > MAX_BATCH_ENTRIES
+                    || encoded > MAX_BATCH_BYTES
+                {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("invalid_request", "provider batch exceeds its bounds"),
+                    );
+                }
+                let batch_fingerprint = serde_json::to_vec(&entries)
+                    .map(|bytes| fingerprint_bytes(&bytes))
+                    .unwrap_or_default();
+                if !snapshot_matches(&session, &sync_id, generation, source_revision) {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("snapshot_conflict", "provider snapshot generation differs"),
+                    );
+                }
+                if let Some(last) = &session.state.last_batch
+                    && sequence == last.sequence
+                {
+                    if expected_revision == last.expected_revision
+                        && batch_fingerprint == last.fingerprint
+                    {
+                        return complete(
+                            send,
+                            context.request_id,
+                            json!({"ok":true,"revision":last.revision,"generation":generation,"next_sequence":last.next_sequence,"replayed":true}),
+                        );
+                    }
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("sequence_conflict", "replayed batch revision differs"),
+                    );
+                }
+                if session.state.finished {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("snapshot_finished", "provider snapshot is already finished"),
+                    );
+                }
+                if sequence != session.state.next_sequence {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("sequence_conflict", "provider batch sequence is not next"),
+                    );
+                }
+                if expected_revision != session.document_revision {
+                    return complete(
+                        send,
+                        context.request_id,
+                        revision_conflict(session.document_revision),
+                    );
+                }
+                self.commit_provider_batch(
+                    context,
+                    session,
+                    ProviderBatch {
+                        sequence,
+                        expected_revision,
+                        fingerprint: batch_fingerprint,
+                        entries,
+                    },
+                    send,
+                )
+            }
+            Operation::ProviderSnapshotFinish {
+                sync_id,
+                generation,
+                source_revision,
+                expected_revision,
+                next_sequence,
+                complete: source_complete,
+            } => self.finish_snapshot(
+                context,
+                session,
+                ProviderFinish {
+                    sync_id,
+                    generation,
+                    source_revision,
+                    expected_revision,
+                    next_sequence,
+                    source_complete,
+                },
+                send,
+            ),
+            _ => complete(
+                send,
+                context.request_id,
+                error(
+                    "invalid_request",
+                    "operation is not a provider snapshot action",
+                ),
+            ),
+        }
+    }
+
+    fn begin_snapshot(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        sync_id: String,
+        source_revision: u64,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if !valid_sync_id(&sync_id) {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "invalid_request",
+                    "sync_id must contain 1..128 printable bytes",
+                ),
+            );
+        }
+        if session.state.sync_id == sync_id {
+            if session.state.source_revision != source_revision {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "snapshot_conflict",
+                        "sync_id was reused for another source revision",
+                    ),
+                );
+            }
+            self.provider_sessions
+                .insert(session.caller.clone(), session.clone());
+            return complete(
+                send,
+                context.request_id,
+                json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"next_sequence":session.state.next_sequence}),
+            );
+        }
+        let is_new_state = session.state.generation == 0;
+        let Some(generation) = session.state.generation.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "provider generation space exhausted"),
+            );
+        };
+        session.state = SnapshotState {
+            version: 1,
+            generation,
+            sync_id,
+            source_revision,
+            next_sequence: 0,
+            last_batch: None,
+            finished: false,
+            cleanup_pending: false,
+            finish_expected_revision: None,
+        };
+        let key = state_key(&session.caller);
+        if is_new_state {
+            session.provider_count = session.provider_count.saturating_add(1);
+        }
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":generation,"next_sequence":0});
+        let payload = collection_commit(
+            &session,
+            vec![json!({"key":key,"value":session.state.clone()})],
+        );
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn commit_provider_batch(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        batch: ProviderBatch,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let ProviderBatch {
+            sequence,
+            expected_revision,
+            fingerprint: batch_fingerprint,
+            entries,
+        } = batch;
+        let mut source_ids = BTreeSet::new();
+        let mut edits = Vec::new();
+        let mut entries_changed = false;
+        for provider_entry in entries {
+            let source_id = provider_entry.source_id;
+            let entry = provider_entry.entry;
+            if !valid_source_id(&source_id)
+                || !source_ids.insert(source_id.clone())
+                || entry.validate().is_err()
+            {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "invalid_entry",
+                        "provider entry identity or value is invalid",
+                    ),
+                );
+            }
+            let key = entry_key(&session.caller, &source_id);
+            let desired_fingerprint = entry_fingerprint(&entry);
+            let existing = session.markers.get(&key).cloned();
+            let (entry_id, detached) = if let Some(marker) = existing {
+                if !validate_marker(&marker, &session.caller, &source_id) {
+                    return complete(send, context.request_id, malformed());
+                }
+                if session.markers.values().any(|other| {
+                    other.entry_id == marker.entry_id
+                        && (other.caller != marker.caller || other.source_id != marker.source_id)
+                }) {
+                    return complete(send, context.request_id, malformed());
+                }
+                if marker.detached
+                    || session.fingerprints.get(&marker.entry_id) != Some(&marker.fingerprint)
+                {
+                    (marker.entry_id, true)
+                } else {
+                    (marker.entry_id, false)
+                }
+            } else {
+                if session.entry_ids.len() >= MAX_ENTRIES {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("resource_exhausted", "catalog entry limit reached"),
+                    );
+                }
+                let entry_id = format!("app-{:016x}", session.next_id);
+                if session.entry_ids.contains(&entry_id)
+                    || session
+                        .markers
+                        .values()
+                        .any(|marker| marker.entry_id == entry_id)
+                {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("entry_conflict", "next catalog ID is already owned"),
+                    );
+                }
+                let Some(next_id) = session.next_id.checked_add(1) else {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("resource_exhausted", "catalog ID space exhausted"),
+                    );
+                };
+                session.next_id = next_id;
+                session.entry_ids.insert(entry_id.clone());
+                (entry_id, false)
+            };
+            let mut marker = Marker {
+                version: 1,
+                caller: session.caller.clone(),
+                source_id: source_id.clone(),
+                entry_id: entry_id.clone(),
+                generation: session.state.generation,
+                fingerprint: desired_fingerprint.clone(),
+                detached,
+            };
+            if detached {
+                // A changed or deleted Entry has become user-owned. Keep it and
+                // stop provider updates from silently replacing it.
+                marker.fingerprint = session
+                    .fingerprints
+                    .get(&entry_id)
+                    .cloned()
+                    .unwrap_or_else(|| "0".repeat(64));
+            } else {
+                if session.fingerprints.get(&entry_id) != Some(&desired_fingerprint) {
+                    session
+                        .fingerprints
+                        .insert(entry_id.clone(), desired_fingerprint);
+                    edits.push(json!({"key":entry_id,"value":entry}));
+                    entries_changed = true;
+                }
+                session.entry_ids.insert(entry_id.clone());
+            }
+            if !session.markers.contains_key(&key) {
+                session.provider_count = session.provider_count.saturating_add(1);
+            }
+            session.markers.insert(key.clone(), marker.clone());
+            edits.push(json!({"key":key,"value":marker_value(&marker)}));
+        }
+        let new_revision = if entries_changed {
+            let Some(revision) = session.document_revision.checked_add(1) else {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("resource_exhausted", "catalog revision exhausted"),
+                );
+            };
+            revision
+        } else {
+            session.document_revision
+        };
+        let Some(next_sequence) = session.state.next_sequence.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "provider sequence space exhausted"),
+            );
+        };
+        session.state.next_sequence = next_sequence;
+        session.state.finished = false;
+        session.state.cleanup_pending = false;
+        session.state.finish_expected_revision = None;
+        session.state.last_batch = Some(CommittedBatch {
+            sequence,
+            expected_revision,
+            revision: new_revision,
+            next_sequence,
+            fingerprint: batch_fingerprint,
+        });
+        session.document_revision = new_revision;
+        edits.push(json!({
+            "key":state_key(&session.caller),
+            "value":session.state.clone(),
+        }));
+        let payload = collection_commit(&session, edits);
+        let reply = json!({"ok":true,"revision":new_revision,"generation":session.state.generation,"next_sequence":next_sequence});
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn finish_snapshot(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        finish: ProviderFinish,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let ProviderFinish {
+            sync_id,
+            generation,
+            source_revision,
+            expected_revision,
+            next_sequence,
+            source_complete,
+        } = finish;
+        if !source_complete {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "incomplete_snapshot",
+                    "incomplete provider scans cannot be finished",
+                ),
+            );
+        }
+        if !snapshot_matches(&session, &sync_id, generation, source_revision)
+            || next_sequence != session.state.next_sequence
+        {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "snapshot_conflict",
+                    "provider snapshot generation or sequence differs",
+                ),
+            );
+        }
+        if session.state.finished {
+            if session.state.finish_expected_revision != Some(expected_revision) {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("snapshot_conflict", "finish retry revision differs"),
+                );
+            }
+            if !session.state.cleanup_pending {
+                return complete(
+                    send,
+                    context.request_id,
+                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false}),
+                );
+            }
+        } else {
+            if expected_revision != session.document_revision {
+                return complete(
+                    send,
+                    context.request_id,
+                    revision_conflict(session.document_revision),
+                );
+            }
+            session.state.finished = true;
+            session.state.finish_expected_revision = Some(expected_revision);
+        }
+        let mut stale: Vec<Marker> = session
+            .markers
+            .values()
+            .filter(|marker| marker.caller == session.caller && marker.generation < generation)
+            .cloned()
+            .collect();
+        stale.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        session.state.cleanup_pending = !stale.is_empty();
+        self.commit_provider_cleanup(context, session, stale, send)
+    }
+
+    fn commit_provider_cleanup(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        mut stale: Vec<Marker>,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        const CLEANUP_BATCH: usize = 63;
+        let count = stale.len().min(CLEANUP_BATCH);
+        let remaining = stale.split_off(count);
+        let mut edits = Vec::with_capacity(count * 2 + 1);
+        let mut removed_entry = false;
+        for marker in stale {
+            let key = entry_key(&session.caller, &marker.source_id);
+            if !marker.detached
+                && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint)
+            {
+                edits.push(json!({"key":marker.entry_id,"value":null}));
+                session.entry_ids.remove(&marker.entry_id);
+                session.fingerprints.remove(&marker.entry_id);
+                removed_entry = true;
+            }
+            edits.push(json!({"key":key,"value":null}));
+            session.markers.remove(&key);
+            session.provider_count = session.provider_count.saturating_sub(1);
+        }
+        if removed_entry {
+            let Some(revision) = session.document_revision.checked_add(1) else {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("resource_exhausted", "catalog revision exhausted"),
+                );
+            };
+            session.document_revision = revision;
+        }
+        session.state.cleanup_pending = !remaining.is_empty();
+        edits.push(json!({
+            "key":state_key(&session.caller),
+            "value":session.state.clone(),
+        }));
+        let payload = collection_commit(&session, edits);
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty()});
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: remaining,
+                finish: true,
+            }),
+            send,
+        )
     }
     fn submit(
         &mut self,
@@ -243,6 +907,11 @@ impl Pipeline {
                     } else {
                         malformed()
                     };
+                    if matches!(&pending.stage, Stage::ProviderSaving(_))
+                        && let Some(caller) = &pending.context.importer
+                    {
+                        self.provider_sessions.remove(caller);
+                    }
                     return complete(send, pending.context.request_id, failure);
                 }
                 let Some(revision) = payload["revision"].as_u64() else {
@@ -250,19 +919,185 @@ impl Pipeline {
                 };
                 self.consume(pending.context, pending.stage, revision, payload, send)
             }
-            failure => complete(send, pending.context.request_id, runtime_failure(failure)),
+            failure => {
+                if matches!(&pending.stage, Stage::ProviderSaving(_))
+                    && let Some(caller) = &pending.context.importer
+                {
+                    self.provider_sessions.remove(caller);
+                }
+                complete(send, pending.context.request_id, runtime_failure(failure))
+            }
         }
     }
     fn consume(
         &mut self,
-        context: Context,
+        mut context: Context,
         stage: Stage,
         state_revision: u64,
         payload: Value,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         match stage {
-            Stage::Saving(reply) => complete(send, context.request_id, reply),
+            Stage::Saving(reply) => {
+                self.provider_sessions
+                    .retain(|_, session| session.key != context.key);
+                complete(send, context.request_id, reply)
+            }
+            Stage::ProviderSaving(mut save) => {
+                save.session.collection_revision = state_revision;
+                if save.finish && !save.remaining_cleanup.is_empty() {
+                    return self.commit_provider_cleanup(
+                        context,
+                        save.session,
+                        save.remaining_cleanup,
+                        send,
+                    );
+                }
+                if let Some(caller) = &context.importer {
+                    self.provider_sessions
+                        .insert(caller.clone(), save.session.clone());
+                }
+                complete(send, context.request_id, save.reply)
+            }
+            Stage::ProviderLoading(operation) => {
+                let found = payload["found"] == true;
+                if payload["found"] != true && payload["found"] != false {
+                    return complete(send, context.request_id, malformed());
+                }
+                let metadata = if found {
+                    payload["metadata"].clone()
+                } else {
+                    json!({"revision":0,"next_id":1,"provider_count":0})
+                };
+                let Some(total_count) = payload["count"].as_u64().or_else(|| (!found).then_some(0))
+                else {
+                    return complete(send, context.request_id, malformed());
+                };
+                let Some(provider_count) = metadata["provider_count"]
+                    .as_u64()
+                    .or_else(|| metadata.get("provider_count").is_none().then_some(0))
+                else {
+                    return complete(send, context.request_id, malformed());
+                };
+                let document = match header(&metadata) {
+                    Ok(document) => document,
+                    Err(failure) => return complete(send, context.request_id, failure),
+                };
+                let scan = ProviderScan {
+                    operation,
+                    state_revision,
+                    document_revision: document.revision,
+                    next_id: document.next_id,
+                    total_count,
+                    provider_count,
+                    hidden_rows: 0,
+                    after: None,
+                    scanned: 0,
+                    fingerprints: BTreeMap::new(),
+                    entry_ids: BTreeSet::new(),
+                    markers: BTreeMap::new(),
+                    provider_state: None,
+                };
+                self.scan_provider_page(context, scan, send)
+            }
+            Stage::ProviderPaging(mut scan) => {
+                if payload["revision"] != scan.state_revision {
+                    return complete(send, context.request_id, malformed());
+                }
+                let Some(entries) = payload["entries"].as_array() else {
+                    return complete(send, context.request_id, malformed());
+                };
+                for row in entries {
+                    let Some(key) = row["key"].as_str() else {
+                        return complete(send, context.request_id, malformed());
+                    };
+                    if scan.after.as_deref().is_some_and(|after| key <= after) {
+                        return complete(send, context.request_id, malformed());
+                    }
+                    scan.after = Some(key.into());
+                    scan.scanned = scan.scanned.saturating_add(1);
+                    if scan.scanned > 100_000 {
+                        return complete(
+                            send,
+                            context.request_id,
+                            error("resource_exhausted", "catalog snapshot exceeds item limit"),
+                        );
+                    }
+                    if let Some((caller, source_id)) = parse_entry_key(key) {
+                        let marker: Marker = match serde_json::from_value(row["value"].clone()) {
+                            Ok(marker) if validate_marker(&marker, caller, source_id) => marker,
+                            _ => return complete(send, context.request_id, malformed()),
+                        };
+                        if scan
+                            .markers
+                            .values()
+                            .any(|existing| existing.entry_id == marker.entry_id)
+                        {
+                            return complete(send, context.request_id, malformed());
+                        }
+                        scan.markers.insert(key.into(), marker);
+                        scan.hidden_rows += 1;
+                    } else if let Some(caller) = key.strip_prefix(STATE_PREFIX) {
+                        scan.hidden_rows += 1;
+                        if Some(caller) == context.importer.as_deref() {
+                            let state: SnapshotState =
+                                match serde_json::from_value::<SnapshotState>(row["value"].clone())
+                                {
+                                    Ok(state) if state.validate() => state,
+                                    _ => return complete(send, context.request_id, malformed()),
+                                };
+                            scan.provider_state = Some(state);
+                        }
+                    } else if crate::model::parse_id(key).is_some() {
+                        if crate::model::parse_id(key).is_some_and(|id| id >= scan.next_id) {
+                            return complete(send, context.request_id, malformed());
+                        }
+                        let entry: Entry =
+                            match serde_json::from_value::<Entry>(row["value"].clone()) {
+                                Ok(entry) if entry.validate().is_ok() => entry,
+                                _ => return complete(send, context.request_id, malformed()),
+                            };
+                        if scan
+                            .fingerprints
+                            .insert(key.into(), entry_fingerprint(&entry))
+                            .is_some()
+                        {
+                            return complete(send, context.request_id, malformed());
+                        }
+                        scan.entry_ids.insert(key.into());
+                    } else {
+                        return complete(send, context.request_id, malformed());
+                    }
+                }
+                if let Some(next) = payload["next"].as_str() {
+                    if entries.is_empty() || scan.after.as_deref() != Some(next) {
+                        return complete(send, context.request_id, malformed());
+                    }
+                    self.scan_provider_page(context, scan, send)
+                } else {
+                    if scan.total_count != scan.hidden_rows + scan.entry_ids.len() as u64
+                        || scan.provider_count != scan.hidden_rows
+                    {
+                        return complete(send, context.request_id, malformed());
+                    }
+                    let caller = context.importer.as_deref().expect("provider caller");
+                    if scan.markers.values().any(|marker| {
+                        crate::model::parse_id(&marker.entry_id).is_none_or(|id| id >= scan.next_id)
+                    }) {
+                        return complete(send, context.request_id, malformed());
+                    }
+                    if scan.markers.values().any(|marker| {
+                        marker.caller == caller
+                            && scan
+                                .provider_state
+                                .as_ref()
+                                .is_none_or(|state| marker.generation > state.generation)
+                    }) {
+                        return complete(send, context.request_id, malformed());
+                    }
+                    self.finish_provider_scan(context, scan, send)
+                }
+            }
             Stage::Migrating(operation) => self.load(context, operation, send),
             Stage::Legacy(operation) => self.migrate(context, operation, payload, send),
             Stage::Paging(scan) => self.consume_page(context, scan, payload, send),
@@ -277,6 +1112,19 @@ impl Pipeline {
                 let Some(count) = payload["count"].as_u64() else {
                     return complete(send, context.request_id, malformed());
                 };
+                let Some(provider_count) =
+                    payload["metadata"]["provider_count"].as_u64().or_else(|| {
+                        payload["metadata"]
+                            .get("provider_count")
+                            .is_none()
+                            .then_some(0)
+                    })
+                else {
+                    return complete(send, context.request_id, malformed());
+                };
+                if provider_count > count {
+                    return complete(send, context.request_id, malformed());
+                }
                 let mut document = match header(&payload["metadata"]) {
                     Ok(value) => value,
                     Err(failure) => return complete(send, context.request_id, failure),
@@ -296,7 +1144,11 @@ impl Pipeline {
                         return complete(send, context.request_id, malformed());
                     }
                 }
-                if matches!(operation, Operation::Create { .. }) && count >= MAX_ENTRIES as u64 {
+                context.provider_count = provider_count;
+                let public_count = count.saturating_sub(context.provider_count);
+                if matches!(operation, Operation::Create { .. })
+                    && public_count >= MAX_ENTRIES as u64
+                {
                     return complete(
                         send,
                         context.request_id,
@@ -337,7 +1189,7 @@ impl Pipeline {
         ) {
             return complete_read(send, context, operation, document);
         }
-        let metadata = json!({"revision":document.revision,"next_id":document.next_id});
+        let metadata = json!({"revision":document.revision,"next_id":document.next_id,"provider_count":context.provider_count});
         let edits: Vec<_> = document
             .entries
             .into_iter()
@@ -383,7 +1235,7 @@ impl Pipeline {
                     Ok(Change::Read(reply)) => complete_selected(send, context, reply),
                     Ok(Change::Write { document, reply }) => {
                         let id = reply["id"].as_str().expect("mutation ID");
-                        let payload = json!({"action":"collection_commit","collection":context.key,"expected_revision":state_revision,"metadata":{"revision":document.revision,"next_id":document.next_id},"edits":[{"key":id,"value":document.entries.get(id)}]});
+                        let payload = json!({"action":"collection_commit","collection":context.key,"expected_revision":state_revision,"metadata":{"revision":document.revision,"next_id":document.next_id,"provider_count":context.provider_count},"edits":[{"key":id,"value":document.entries.get(id)}]});
                         self.submit(context, payload, Stage::Saving(reply), send)
                     }
                     Err(failure) => complete(send, context.request_id, failure),
@@ -406,7 +1258,7 @@ impl Pipeline {
                     json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog revision differs","current_revision":document.revision}}),
                 );
             }
-            if cursor.query != query || crate::model::parse_id(&cursor.after).is_none() {
+            if cursor.query != query || !valid_collection_cursor(&cursor.after) {
                 return complete(
                     send,
                     context.request_id,
@@ -460,6 +1312,11 @@ impl Pipeline {
             let Some(id) = row["key"].as_str() else {
                 return complete(send, context.request_id, malformed());
             };
+            if row["key"].as_str().is_some_and(is_provider_key) {
+                scan.after = Some(row["key"].as_str().unwrap().into());
+                scan.scanned += 1;
+                continue;
+            }
             let entry: Entry = match serde_json::from_value(row["value"].clone()) {
                 Ok(entry) => entry,
                 Err(_) => return complete(send, context.request_id, malformed()),
@@ -538,10 +1395,51 @@ fn header(metadata: &Value) -> Result<Document, Value> {
     if !value.is_object() {
         return Err(malformed());
     }
+    value
+        .as_object_mut()
+        .expect("metadata object")
+        .remove("provider_count");
     value["entries"] = json!({});
     let document: Document = serde_json::from_value(value).map_err(|_| malformed())?;
     document.validate().map_err(|_| malformed())?;
     Ok(document)
+}
+
+fn collection_commit(session: &ProviderSession, edits: Vec<Value>) -> Value {
+    json!({
+        "action":"collection_commit",
+        "collection":session.key,
+        "expected_revision":session.collection_revision,
+        "metadata":{
+            "revision":session.document_revision,
+            "next_id":session.next_id,
+            "provider_count":session.provider_count,
+        },
+        "edits":edits,
+    })
+}
+
+fn snapshot_matches(
+    session: &ProviderSession,
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+) -> bool {
+    session.state.generation == generation
+        && session.state.sync_id == sync_id
+        && session.state.source_revision == source_revision
+}
+
+fn revision_conflict(current_revision: u64) -> Value {
+    json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog revision differs","current_revision":current_revision}})
+}
+
+fn valid_collection_cursor(value: &str) -> bool {
+    crate::model::parse_id(value).is_some() || is_provider_key(value)
+}
+
+fn is_provider_key(key: &str) -> bool {
+    key.starts_with(ENTRY_PREFIX) || key.starts_with(STATE_PREFIX)
 }
 fn malformed() -> Value {
     error(

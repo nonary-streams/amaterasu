@@ -40,6 +40,35 @@ pub enum Operation {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
+    /// Provider snapshots are authorized from the Poll caller and the catalog's
+    /// fixed startup import map. The request has no catalog owner selector.
+    ProviderSnapshotBegin {
+        sync_id: String,
+        source_revision: u64,
+    },
+    ProviderSnapshotBatch {
+        sync_id: String,
+        generation: u64,
+        source_revision: u64,
+        sequence: u64,
+        expected_revision: u64,
+        entries: Vec<ProviderEntry>,
+    },
+    ProviderSnapshotFinish {
+        sync_id: String,
+        generation: u64,
+        source_revision: u64,
+        expected_revision: u64,
+        next_sequence: u64,
+        complete: bool,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEntry {
+    pub source_id: String,
+    pub entry: Entry,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -80,6 +109,14 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
                 ));
             }
             return page(&document, &query.to_lowercase(), cursor, limit, false);
+        }
+        Operation::ProviderSnapshotBegin { .. }
+        | Operation::ProviderSnapshotBatch { .. }
+        | Operation::ProviderSnapshotFinish { .. } => {
+            return Err(error(
+                "invalid_request",
+                "provider snapshots are handled by the catalog pipeline",
+            ));
         }
         Operation::Create {
             entry,

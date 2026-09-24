@@ -4,7 +4,8 @@
 It registers `amaterasu.catalog/1`. Required grants: register that service and call
 `amaterasu.state/1`; consumers need call grants for `amaterasu.catalog/1` and `amaterasu.state/1`,
 because delegated state requests preserve the initiating caller's authority.
-Dependencies are the module SDK, serde and serde_json. Native modules are trusted
+Dependencies are the module SDK, serde, serde_json and SHA-256 for provider-owned
+entry fingerprints. Native modules are trusted
 code; API grants are not a native-code sandbox.
 
 Ordinary operations store a separate manual catalog for each authenticated immediate
@@ -161,7 +162,7 @@ transport message or rewrites the whole catalog for an individual edit.
 Vibeshine's catalog-policy interface and macOS application defaults were used
 only as behavioral references for durable identity and manual launch metadata.
 No source was copied or translated. This implementation does not yet provide
-provider discovery/import (Steam, Playnite, Lutris), legacy IDs/aliases, portable
+provider discovery/conversion policies (Steam, Playnite, Lutris), legacy IDs/aliases, portable
 UUIDs, artwork loading/fingerprints, provider identifiers, per-application config
 overrides, desktop entries, shell-command launch forms, environment overlays,
 launch/session integration or migration from Vibeshine data. These remain explicit
@@ -223,3 +224,64 @@ snapshot is retained across requests. Consumers needing a complete consistent
 export must discard accumulated rows on a revision or state failure. Empty
 catalogs return revision 0, no entries and a null cursor. This action never writes
 or migrates storage, including when reading a legacy document.
+
+## Provider snapshot import
+
+Startup `import_principals` maps each trusted provider caller to one fixed catalog
+owner. It defaults to `{}` and has the same 16-entry principal validation as
+`export_principals`. For Steam, release policy maps
+`amaterasu.steam` to `amaterasu.management`. The importer identity comes from the
+authenticated immediate caller of `Poll`; requests do not accept an owner or
+domain selector. The catalog stores provider ownership and sync state in separate
+reserved collection rows, not in user-editable `Entry` metadata.
+
+Begin a source snapshot and retain the returned generation and catalog revision:
+
+```json
+{"action":"provider_snapshot_begin","sync_id":"steam-scan-42","source_revision":42}
+```
+
+```json
+{"ok":true,"revision":0,"generation":1,"next_sequence":0}
+```
+
+Send batches with stable source IDs and validated catalog entries. Batches hold
+1–8 entries and at most 12,000 encoded bytes. `expected_revision` is the public
+catalog revision returned by the previous batch; `sequence` must equal
+`next_sequence`:
+
+```json
+{"action":"provider_snapshot_batch","sync_id":"steam-scan-42","generation":1,"source_revision":42,"sequence":0,"expected_revision":0,"entries":[{"source_id":"steam:480","entry":{"name":"Spacewar","launch":{"kind":"application","path":"/Applications/Spacewar.app"}}}]}
+```
+
+```json
+{"ok":true,"revision":1,"generation":1,"next_sequence":1}
+```
+
+The last committed batch can be retried after an ambiguous timeout. The replay
+must have the same sequence, expected revision and SHA-256 payload fingerprint;
+it returns the committed revision without applying the batch again. Earlier or
+out-of-order sequences return `sequence_conflict`. State collection compare-and-
+set also detects edits by ordinary catalog clients; reload/retry after a
+`revision_conflict`.
+
+Finish only after the provider has completed its full source scan:
+
+```json
+{"action":"provider_snapshot_finish","sync_id":"steam-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true}
+```
+
+Success returns `ok`, `revision`, `generation`, `complete:true`, and
+`cleanup_pending:false`. An incomplete scan is rejected and does not remove
+anything. The catalog removes stale provider-managed entries only after this
+explicit complete finish. Cleanup is committed in bounded chunks and can be
+reconciled by repeating the same finish after an ambiguous timeout. Entries
+changed or deleted by a user are detached from provider ownership and are never
+silently overwritten or removed. Begin retries with the same `sync_id` resume
+that generation; a new or restarted source scan must use a fresh ID so partial
+data from the old generation cannot be mistaken for a complete snapshot.
+
+The catalog API provides durable snapshot mechanics, not source discovery or
+product policy. Providers remain responsible for validating their domain data,
+constructing `Entry` values, and declaring a scan complete only when every source
+page was read successfully.

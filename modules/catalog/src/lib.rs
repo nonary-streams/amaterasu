@@ -1,6 +1,7 @@
 //! Durable, caller-scoped manual application catalogs.
 mod model;
 mod pipeline;
+mod product;
 mod protocol;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -14,6 +15,7 @@ const STATE_SERVICE: &str = "amaterasu.state/1";
 struct Settings {
     launch_principals: std::collections::BTreeSet<String>,
     export_principals: std::collections::BTreeMap<String, String>,
+    import_principals: std::collections::BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -26,6 +28,11 @@ impl Settings {
             || self.export_principals.len() > 16
             || self
                 .export_principals
+                .iter()
+                .any(|(consumer, owner)| !valid_principal(consumer) || !valid_principal(owner))
+            || self.import_principals.len() > 16
+            || self
+                .import_principals
                 .iter()
                 .any(|(consumer, owner)| !valid_principal(consumer) || !valid_principal(owner))
         {
@@ -61,7 +68,11 @@ impl ManagedModule for CatalogModule {
         })?;
         Ok(Self {
             runtime,
-            pipeline: Pipeline::new(settings.launch_principals, settings.export_principals),
+            pipeline: Pipeline::new(
+                settings.launch_principals,
+                settings.export_principals,
+                settings.import_principals,
+            ),
         })
     }
 
@@ -81,6 +92,7 @@ mod tests {
     fn export_settings_validate_both_sides_and_capacity() {
         let defaults: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaults.export_principals.is_empty());
+        assert!(defaults.import_principals.is_empty());
         for (consumer, owner) in [
             ("", "owner"),
             ("consumer", "../owner"),
@@ -104,5 +116,18 @@ mod tests {
             .export_principals
             .insert("extra".into(), "owner".into());
         assert!(settings.validate().is_err());
+
+        let mut imports = Settings {
+            import_principals: std::collections::BTreeMap::from([(
+                "amaterasu.steam".into(),
+                "amaterasu.management".into(),
+            )]),
+            ..Default::default()
+        };
+        assert!(imports.validate().is_ok());
+        imports
+            .import_principals
+            .insert("../steam".into(), "owner".into());
+        assert!(imports.validate().is_err());
     }
 }

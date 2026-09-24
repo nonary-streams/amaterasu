@@ -8,6 +8,7 @@ struct Backend {
     entries: BTreeMap<String, Value>,
     legacy: Option<Value>,
     fail: bool,
+    lose_commit_ack_once: bool,
 }
 impl Backend {
     fn handle(&mut self, request: Value) -> Value {
@@ -114,7 +115,14 @@ impl Backend {
                                     .unwrap(),
                                 format!("principal/{owner}").as_str()
                             );
-                            state_result = Some(self.handle(payload));
+                            let is_commit = payload["action"] == "collection_commit";
+                            let result = self.handle(payload);
+                            state_result = Some(if is_commit && self.lose_commit_ack_once {
+                                self.lose_commit_ack_once = false;
+                                error("deadline_exceeded", "injected lost commit acknowledgement")
+                            } else {
+                                result
+                            });
                             Response::Accepted { id: 20 }
                         }
                         Command::TakeResult { .. } => {
@@ -141,6 +149,60 @@ impl Backend {
 }
 fn entry(name: &str) -> Value {
     json!({"name":name,"launch":{"kind":"application","path":"/Applications/Game.app"}})
+}
+
+fn steam_importer() -> Pipeline {
+    Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([("steam".into(), "management".into())]),
+    )
+}
+
+fn snapshot_begin(sync_id: &str, source_revision: u64) -> Value {
+    json!({
+        "action":"provider_snapshot_begin",
+        "sync_id":sync_id,
+        "source_revision":source_revision,
+    })
+}
+
+fn snapshot_batch(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    sequence: u64,
+    expected_revision: u64,
+    items: Vec<(&str, Value)>,
+) -> Value {
+    json!({
+        "action":"provider_snapshot_batch",
+        "sync_id":sync_id,
+        "generation":generation,
+        "source_revision":source_revision,
+        "sequence":sequence,
+        "expected_revision":expected_revision,
+        "entries":items.into_iter().map(|(source_id,entry)| json!({"source_id":source_id,"entry":entry})).collect::<Vec<_>>(),
+    })
+}
+
+fn snapshot_finish(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    expected_revision: u64,
+    next_sequence: u64,
+    complete: bool,
+) -> Value {
+    json!({
+        "action":"provider_snapshot_finish",
+        "sync_id":sync_id,
+        "generation":generation,
+        "source_revision":source_revision,
+        "expected_revision":expected_revision,
+        "next_sequence":next_sequence,
+        "complete":complete,
+    })
 }
 
 #[test]
@@ -398,6 +460,8 @@ fn cancelled_or_malformed_state_replies_complete_without_stalling() {
                     request_id: 7,
                     key: "principal/caller".into(),
                     catalog_owner: None,
+                    importer: None,
+                    provider_count: 0,
                     deadline: Instant::now(),
                 },
                 state_request_id: 20,
@@ -430,7 +494,11 @@ fn cancelled_or_malformed_state_replies_complete_without_stalling() {
 
 #[test]
 fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority() {
-    let pipeline = Pipeline::new(BTreeSet::from(["launch".into()]), BTreeMap::new());
+    let pipeline = Pipeline::new(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
     let resolve = || Operation::ResolveLaunch {
         id: "app-0000000000000001".into(),
     };
@@ -468,6 +536,7 @@ fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
     let mut pipeline = Pipeline::new(
         BTreeSet::new(),
         BTreeMap::from([("consumer".into(), "owner".into())]),
+        BTreeMap::new(),
     );
     let mut backend = Backend::default();
     let denied = backend.run_for(
@@ -515,6 +584,7 @@ fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner(
     let pipeline = Pipeline::new(
         BTreeSet::from(["launch".into()]),
         BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
     );
     let resolve = || Operation::ResolveExportedLaunch {
         id: "app-0000000000000001".into(),
@@ -612,6 +682,7 @@ fn export_pages_are_sanitized_revision_bound_and_read_only() {
         let mut pipeline = Pipeline::new(
             BTreeSet::new(),
             BTreeMap::from([("consumer".into(), "owner".into())]),
+            BTreeMap::new(),
         );
         let mut cursor = Value::Null;
         let mut first_cursor = Value::Null;
@@ -668,4 +739,243 @@ fn export_pages_are_sanitized_revision_bound_and_read_only() {
         );
         assert_eq!(invalid["error"]["code"], "invalid_request");
     }
+}
+
+#[test]
+fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complete_finish() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+
+    let denied = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-1", 7),
+        "untrusted",
+        "management",
+        "management",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let mut spoofed = snapshot_begin("scan-1", 7);
+    spoofed["owner"] = "victim".into();
+    let malformed = backend.run_for(&mut pipeline, spoofed, "steam", "management", "management");
+    assert_eq!(malformed["error"]["code"], "invalid_request");
+
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-1", 7),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(begin["ok"], true);
+    assert_eq!(begin["generation"], 1);
+    assert_eq!(begin["revision"], 0);
+
+    let batch = snapshot_batch("scan-1", 1, 7, 0, 0, vec![("steam:10", entry("Imported"))]);
+    backend.lose_commit_ack_once = true;
+    let unknown = backend.run_for(
+        &mut pipeline,
+        batch.clone(),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(unknown["error"]["code"], "deadline_exceeded");
+    assert_eq!(backend.metadata["revision"], 1);
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+
+    let altered_replay = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "scan-1",
+            1,
+            7,
+            0,
+            0,
+            vec![("steam:10", entry("Different payload"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(altered_replay["error"]["code"], "sequence_conflict");
+
+    let replay = backend.run_for(&mut pipeline, batch, "steam", "management", "management");
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["revision"], 1);
+    assert_eq!(backend.metadata["revision"], 1);
+    assert_eq!(backend.entries["app-0000000000000001"]["name"], "Imported");
+
+    let visible = backend.run_for(
+        &mut pipeline,
+        json!({"action":"list","limit":32}),
+        "management",
+        "management",
+        "management",
+    );
+    assert_eq!(visible["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(visible["entries"][0]["entry"]["name"], "Imported");
+    assert!(visible["next_cursor"].is_null());
+
+    let stale_revision = backend.run_for(
+        &mut pipeline,
+        snapshot_batch("scan-1", 1, 7, 1, 0, vec![("steam:11", entry("Stale"))]),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(stale_revision["error"]["code"], "revision_conflict");
+
+    let gap = backend.run_for(
+        &mut pipeline,
+        snapshot_batch("scan-1", 1, 7, 2, 1, vec![("steam:11", entry("Gap"))]),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(gap["error"]["code"], "sequence_conflict");
+
+    let incomplete = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-1", 1, 7, 1, 1, false),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(incomplete["error"]["code"], "incomplete_snapshot");
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+
+    let finish = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-1", 1, 7, 1, 1, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(finish["ok"], true);
+    assert_eq!(finish["cleanup_pending"], false);
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+
+    let next = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-2", 8),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(next["generation"], 2);
+    let empty_complete = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-2", 2, 8, 1, 0, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(empty_complete["ok"], true);
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+    assert_eq!(backend.entries.len(), 1, "the provider state row remains");
+    assert_eq!(backend.metadata["provider_count"], 1);
+}
+
+#[test]
+fn provider_snapshot_detaches_manual_edits_and_preserves_them_on_later_cleanup() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-1", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    let imported = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "scan-1",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![("steam:10", entry("Imported"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(imported["revision"], 1);
+
+    let manual = backend.run_for(
+        &mut pipeline,
+        json!({"action":"update","id":"app-0000000000000001","expected_revision":1,"entry":entry("Hand edited")}),
+        "management",
+        "management",
+        "management",
+    );
+    assert_eq!(manual["ok"], true);
+    assert_eq!(manual["revision"], 2);
+
+    let restarted = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-2", 2),
+        "steam",
+        "management",
+        "management",
+    );
+    let imported_again = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "scan-2",
+            restarted["generation"].as_u64().unwrap(),
+            2,
+            0,
+            2,
+            vec![("steam:10", entry("Provider changed name"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(imported_again["revision"], 2);
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["name"],
+        "Hand edited"
+    );
+    let marker = backend.entries["~provider.entry:steam:steam:10"].clone();
+    assert_eq!(marker["detached"], true);
+
+    let finished = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-2", 2, 2, 2, 1, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(finished["ok"], true);
+
+    let third = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("scan-3", 3),
+        "steam",
+        "management",
+        "management",
+    );
+    let cleaned = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("scan-3", 3, 3, 2, 0, true),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(third["generation"], 3);
+    assert_eq!(cleaned["ok"], true);
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["name"],
+        "Hand edited"
+    );
+    assert!(
+        !backend
+            .entries
+            .contains_key("~provider.entry:steam:steam:10")
+    );
 }
