@@ -24,12 +24,31 @@ pub enum ScrollAxis {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputEvent {
-    Key { virtual_key: u8, state: KeyState },
-    Button { button: MouseButton, pressed: bool },
-    Relative { dx: i32, dy: i32 },
-    Absolute { x: u16, y: u16 },
-    Scroll { axis: ScrollAxis, steps: i32 },
-    ScrollUnits { axis: ScrollAxis, amount: i16 },
+    Key {
+        virtual_key: u8,
+        normalized: bool,
+        state: KeyState,
+    },
+    Button {
+        button: MouseButton,
+        pressed: bool,
+    },
+    Relative {
+        dx: i32,
+        dy: i32,
+    },
+    Absolute {
+        x: u16,
+        y: u16,
+    },
+    Scroll {
+        axis: ScrollAxis,
+        steps: i32,
+    },
+    ScrollUnits {
+        axis: ScrollAxis,
+        amount: i16,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -81,15 +100,21 @@ impl AbsoluteViewport {
 }
 
 pub struct InputTranslator {
-    held_keys: [bool; 256],
+    held_keys: [Option<HeldKey>; 256],
     held_buttons: [bool; 5],
     absolute_viewport: Option<AbsoluteViewport>,
+}
+
+#[derive(Clone, Copy)]
+struct HeldKey {
+    virtual_key: u8,
+    normalized: bool,
 }
 
 impl InputTranslator {
     pub fn new(absolute_viewport: Option<AbsoluteViewport>) -> Self {
         Self {
-            held_keys: [false; 256],
+            held_keys: [None; 256],
             held_buttons: [false; 5],
             absolute_viewport,
         }
@@ -140,34 +165,42 @@ impl InputTranslator {
         modifiers: u8,
         flags: u8,
     ) -> Result<Vec<InputEvent>, TranslationError> {
-        if key_code & 0xff00 != 0x8000 {
+        if flags & !1 != 0 {
             return Err(TranslationError::UnsupportedKeyboardEncoding);
         }
-        if flags != 0 {
+        let normalized = flags & 1 == 0;
+        if normalized && key_code & 0xff00 != 0x8000 {
             return Err(TranslationError::UnsupportedKeyboardEncoding);
         }
-        let virtual_key = canonical_virtual_key(key_code as u8);
-        if virtual_key_mapping(virtual_key).is_none() {
+        let incoming_key = key_code as u8;
+        let key_index = canonical_virtual_key(incoming_key);
+        if normalized && virtual_key_mapping(key_index).is_none() {
             return Err(TranslationError::UnsupportedKey);
         }
+        let held = self.held_keys[usize::from(key_index)];
         if !pressed {
-            if !self.held_keys[usize::from(virtual_key)] {
+            let Some(held) = held else {
                 return Ok(Vec::new());
-            }
-            self.held_keys[usize::from(virtual_key)] = false;
+            };
+            self.held_keys[usize::from(key_index)] = None;
             return Ok(vec![InputEvent::Key {
-                virtual_key,
+                virtual_key: held.virtual_key,
+                normalized: held.normalized,
                 state: KeyState::Up,
             }]);
         }
 
-        let state = if self.held_keys[usize::from(virtual_key)] {
+        let state = if held.is_some() {
             KeyState::Repeat
         } else {
             KeyState::Down
         };
+        let held_key = held.unwrap_or(HeldKey {
+            virtual_key: if normalized { key_index } else { incoming_key },
+            normalized,
+        });
         let mut synthetic = Vec::new();
-        if !is_modifier(virtual_key) {
+        if !is_modifier(held_key.virtual_key) {
             for (mask, key) in [(1, 0x10), (2, 0x11), (4, 0x12)] {
                 if modifiers & mask != 0 && !self.modifier_held(mask) {
                     synthetic.push(key);
@@ -180,14 +213,20 @@ impl InputTranslator {
         let mut events = Vec::with_capacity(synthetic.len() * 2 + 1);
         events.extend(synthetic.iter().map(|key| InputEvent::Key {
             virtual_key: *key,
+            normalized,
             state: KeyState::Down,
         }));
-        events.push(InputEvent::Key { virtual_key, state });
+        events.push(InputEvent::Key {
+            virtual_key: held_key.virtual_key,
+            normalized: held_key.normalized,
+            state,
+        });
         events.extend(synthetic.iter().rev().map(|key| InputEvent::Key {
             virtual_key: *key,
+            normalized,
             state: KeyState::Up,
         }));
-        self.held_keys[usize::from(virtual_key)] = true;
+        self.held_keys[usize::from(key_index)] = Some(held_key);
         Ok(events)
     }
 
@@ -199,7 +238,8 @@ impl InputTranslator {
             8 => &[0x5b, 0x5c],
             _ => return false,
         };
-        keys.iter().any(|key| self.held_keys[usize::from(*key)])
+        keys.iter()
+            .any(|key| self.held_keys[usize::from(canonical_virtual_key(*key))].is_some())
     }
 
     fn button(
@@ -423,22 +463,27 @@ mod tests {
             &[
                 InputEvent::Key {
                     virtual_key: 0x10,
+                    normalized: true,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x11,
+                    normalized: true,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x41,
+                    normalized: true,
                     state: KeyState::Down
                 },
                 InputEvent::Key {
                     virtual_key: 0x11,
+                    normalized: true,
                     state: KeyState::Up
                 },
                 InputEvent::Key {
                     virtual_key: 0x10,
+                    normalized: true,
                     state: KeyState::Up
                 },
             ]
@@ -455,6 +500,7 @@ mod tests {
                 .events(),
             &[InputEvent::Key {
                 virtual_key: 0x41,
+                normalized: true,
                 state: KeyState::Repeat
             }]
         );
@@ -480,6 +526,7 @@ mod tests {
                     .events(),
                 &[InputEvent::Key {
                     virtual_key: 0xa0,
+                    normalized: true,
                     state: expected,
                 }]
             );
@@ -575,7 +622,7 @@ mod tests {
     #[test]
     fn ambiguous_keyboard_encodings_and_unsupported_input_never_map_to_events() {
         let mut translator = InputTranslator::default();
-        for (key_code, flags) in [(0x0041, 0), (0x8041, 1), (0x80ff, 0)] {
+        for (key_code, flags) in [(0x0041, 0), (0x80ff, 0)] {
             assert!(
                 translator
                     .translate(Input::Keyboard {
@@ -590,6 +637,61 @@ mod tests {
         assert_eq!(
             translator.translate(Input::Text("a")),
             Err(TranslationError::UnsupportedInput)
+        );
+    }
+
+    #[test]
+    fn non_normalized_packets_are_supported_and_keep_the_keydown_mode_for_repeat_and_up() {
+        let mut translator = InputTranslator::default();
+        let down = translator
+            .translate(Input::Keyboard {
+                pressed: true,
+                key_code: 0x0041,
+                modifiers: 0,
+                flags: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            down.events(),
+            &[InputEvent::Key {
+                virtual_key: 0x41,
+                normalized: false,
+                state: KeyState::Down,
+            }]
+        );
+
+        let repeat_after_mode_change = translator
+            .translate(Input::Keyboard {
+                pressed: true,
+                key_code: 0x8041,
+                modifiers: 0,
+                flags: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            repeat_after_mode_change.events(),
+            &[InputEvent::Key {
+                virtual_key: 0x41,
+                normalized: false,
+                state: KeyState::Repeat,
+            }]
+        );
+
+        let up_after_mode_change = translator
+            .translate(Input::Keyboard {
+                pressed: false,
+                key_code: 0x8041,
+                modifiers: 0,
+                flags: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            up_after_mode_change.events(),
+            &[InputEvent::Key {
+                virtual_key: 0x41,
+                normalized: false,
+                state: KeyState::Up,
+            }]
         );
     }
 

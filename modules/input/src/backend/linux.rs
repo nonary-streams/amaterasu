@@ -161,6 +161,17 @@ impl Backend for LinuxBackend {
                 "Linux requires evdev keys and relative pointer events; compositor-specific absolute mapping is unsupported",
             ));
         }
+        if let Event::Key {
+            key: Key::MoonlightVk { code, .. },
+            ..
+        } = event
+            && amaterasu_gamestream::control::virtual_key_mapping(*code).is_none()
+        {
+            return Err(InputError::new(
+                "unsupported_event",
+                "Linux cannot map this Moonlight virtual key to evdev",
+            ));
+        }
         Ok(())
     }
     fn start(&mut self) -> InputResult<()> {
@@ -183,7 +194,7 @@ impl Backend for LinuxBackend {
         if let Event::Key { key, state } = event {
             let code = match key {
                 Key::LinuxEvdev { code } => *code,
-                Key::MoonlightVk { code } => {
+                Key::MoonlightVk { code, .. } => {
                     amaterasu_gamestream::control::virtual_key_mapping(*code)
                         .ok_or_else(|| {
                             InputError::new("unsupported_event", "unmapped Moonlight key")

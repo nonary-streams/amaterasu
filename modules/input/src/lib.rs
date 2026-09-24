@@ -53,6 +53,8 @@ enum SettingsOperation {
         mouse: bool,
         #[serde(default)]
         high_resolution_scrolling: Option<bool>,
+        #[serde(default)]
+        always_send_scancodes: Option<bool>,
         expected_revision: u64,
     },
 }
@@ -197,6 +199,7 @@ impl InputModule {
                     keyboard,
                     mouse,
                     high_resolution_scrolling,
+                    always_send_scancodes,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -210,6 +213,7 @@ impl InputModule {
                         keyboard,
                         mouse,
                         high_resolution_scrolling,
+                        always_send_scancodes,
                     );
                     match self.product_settings.begin_update(
                         request.id,
@@ -371,6 +375,7 @@ mod tests {
             legacy,
             SettingsOperation::SettingsUpdate {
                 high_resolution_scrolling: None,
+                always_send_scancodes: None,
                 ..
             }
         ));
@@ -380,6 +385,7 @@ mod tests {
             "keyboard":false,
             "mouse":true,
             "high_resolution_scrolling":false,
+            "always_send_scancodes":false,
             "expected_revision":4,
         }))
         .unwrap();
@@ -387,6 +393,7 @@ mod tests {
             current,
             SettingsOperation::SettingsUpdate {
                 high_resolution_scrolling: Some(false),
+                always_send_scancodes: Some(false),
                 ..
             }
         ));

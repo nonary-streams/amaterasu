@@ -6,7 +6,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 2;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 3;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
@@ -19,6 +19,8 @@ pub struct InputPolicy {
     pub mouse: bool,
     #[serde(default = "default_enabled")]
     pub high_resolution_scrolling: bool,
+    #[serde(default = "default_enabled")]
+    pub always_send_scancodes: bool,
 }
 
 const fn default_enabled() -> bool {
@@ -38,6 +40,7 @@ impl InputPolicy {
             "keyboard":self.keyboard,
             "mouse":self.mouse,
             "high_resolution_scrolling":self.high_resolution_scrolling,
+            "always_send_scancodes":self.always_send_scancodes,
         })
     }
 
@@ -57,6 +60,7 @@ impl Default for InputPolicy {
             keyboard: true,
             mouse: true,
             high_resolution_scrolling: true,
+            always_send_scancodes: true,
         }
     }
 }
@@ -139,12 +143,15 @@ impl ProductSettings {
         keyboard: bool,
         mouse: bool,
         high_resolution_scrolling: Option<bool>,
+        always_send_scancodes: Option<bool>,
     ) -> InputPolicy {
         InputPolicy {
             keyboard,
             mouse,
             high_resolution_scrolling: high_resolution_scrolling
                 .unwrap_or(self.policy.high_resolution_scrolling),
+            always_send_scancodes: always_send_scancodes
+                .unwrap_or(self.policy.always_send_scancodes),
         }
     }
 
@@ -392,6 +399,7 @@ impl ProductSettings {
                         self.revision = revision;
                         self.ready = true;
                         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
+                        controller.set_always_send_scancodes(policy.always_send_scancodes);
                         let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
@@ -456,6 +464,7 @@ impl ProductSettings {
                         self.revision = revision;
                         self.ready = true;
                         controller.set_high_resolution_scrolling(actual.high_resolution_scrolling);
+                        controller.set_always_send_scancodes(actual.always_send_scancodes);
                         let cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
@@ -492,6 +501,7 @@ impl ProductSettings {
         self.revision = revision;
         self.ready = true;
         controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
+        controller.set_always_send_scancodes(policy.always_send_scancodes);
         let cleanup = controller
             .set_device_policy(policy.device_policy(), std::time::Instant::now())
             .is_err();
@@ -515,6 +525,7 @@ impl ProductSettings {
         let cleanup_required = controller.cleanup_required();
         let applied = controller.device_policy() == self.policy.device_policy()
             && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
+            && controller.always_send_scancodes() == self.policy.always_send_scancodes
             && !cleanup_required;
         settings_response_with_state(
             self.policy,
@@ -587,7 +598,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1 | 2)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=3)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -595,6 +606,10 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                 2 => !matches!(
                     key.as_str(),
                     "keyboard" | "mouse" | "high_resolution_scrolling"
+                ),
+                3 => !matches!(
+                    key.as_str(),
+                    "keyboard" | "mouse" | "high_resolution_scrolling" | "always_send_scancodes"
                 ),
                 _ => true,
             });

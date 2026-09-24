@@ -37,6 +37,7 @@ pub struct Controller<B: Backend> {
     enabled: bool,
     device_policy: DevicePolicy,
     high_resolution_scrolling: bool,
+    always_send_scancodes: bool,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
     lease: Option<Lease>,
@@ -52,6 +53,7 @@ impl<B: Backend> Controller<B> {
             enabled,
             device_policy: DevicePolicy::default(),
             high_resolution_scrolling: true,
+            always_send_scancodes: true,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
             lease: None,
@@ -114,6 +116,15 @@ impl<B: Backend> Controller<B> {
             self.high_resolution_scrolling = enabled;
             self.reset_scroll_remainders();
         }
+    }
+
+    pub fn always_send_scancodes(&self) -> bool {
+        self.always_send_scancodes
+    }
+
+    pub fn set_always_send_scancodes(&mut self, enabled: bool) {
+        self.always_send_scancodes = enabled;
+        self.backend.set_always_send_scancodes(enabled);
     }
 
     fn reset_scroll_remainders(&mut self) {
@@ -525,7 +536,7 @@ impl<B: Backend> Controller<B> {
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

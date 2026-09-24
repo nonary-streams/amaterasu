@@ -8,6 +8,9 @@ pub trait Backend {
     fn validate(&self, event: &Event) -> InputResult<()>;
     fn start(&mut self) -> InputResult<()>;
     fn inject(&mut self, event: &Event) -> InputResult<()>;
+    /// Windows uses this for non-normalized Moonlight virtual keys. Other
+    /// native backends deliberately retain their platform mapping behavior.
+    fn set_always_send_scancodes(&mut self, _enabled: bool) {}
     fn stop(&mut self);
 }
 #[cfg(windows)]

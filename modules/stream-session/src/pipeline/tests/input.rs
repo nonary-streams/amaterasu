@@ -6,10 +6,30 @@ fn enable_input(host: &mut Harness) {
 }
 
 fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
+    keyboard_packet(pressed, u16::from(virtual_key) | 0x8000, 0)
+}
+
+fn keyboard_packet(pressed: bool, key_code: u16, flags: u8) -> crate::plane::ControlRecord {
     let magic = if pressed { 3 } else { 4 };
+    let key_code = key_code.to_le_bytes();
     crate::plane::ControlRecord {
         message_type: 0x0206,
-        payload: vec![0, 0, 0, 10, magic, 0, 0, 0, 0, virtual_key, 0x80, 0, 0, 0],
+        payload: vec![
+            0,
+            0,
+            0,
+            10,
+            magic,
+            0,
+            0,
+            0,
+            flags,
+            key_code[0],
+            key_code[1],
+            0,
+            0,
+            0,
+        ],
         sequence: 1,
     }
 }
@@ -104,6 +124,28 @@ fn active_input_is_batched_and_released_before_media_drain() {
         .unwrap();
     assert!(release < drain);
     assert!(host.broker.input_lease.is_none());
+}
+
+#[test]
+fn raw_keyboard_packets_keep_the_keydown_mode_through_release() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    host.plane.borrow_mut().controls.extend([
+        keyboard_packet(true, 0x0041, 1),
+        keyboard_packet(false, 0x8041, 0),
+    ]);
+    host.idle();
+
+    assert_eq!(
+        host.broker.input_events,
+        [
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x41,"normalized":false},"state":"down"}),
+            json!({"kind":"key","key":{"platform":"moonlight_vk","code":0x41,"normalized":false},"state":"up"}),
+        ]
+    );
 }
 
 #[test]

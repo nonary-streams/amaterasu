@@ -56,7 +56,15 @@ pub enum Key {
     },
     MoonlightVk {
         code: u8,
+        /// `true` preserves Moonlight's normalized fixed-US key form. Older
+        /// clients omitted this field and therefore retain that behavior.
+        #[serde(default = "default_true")]
+        normalized: bool,
     },
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,9 +85,27 @@ impl Key {
 
     pub fn canonical(&self) -> Self {
         match self {
-            Self::MoonlightVk { code: 0x10 } => Self::MoonlightVk { code: 0xa0 },
-            Self::MoonlightVk { code: 0x11 } => Self::MoonlightVk { code: 0xa2 },
-            Self::MoonlightVk { code: 0x12 } => Self::MoonlightVk { code: 0xa4 },
+            Self::MoonlightVk {
+                code: 0x10,
+                normalized,
+            } => Self::MoonlightVk {
+                code: 0xa0,
+                normalized: *normalized,
+            },
+            Self::MoonlightVk {
+                code: 0x11,
+                normalized,
+            } => Self::MoonlightVk {
+                code: 0xa2,
+                normalized: *normalized,
+            },
+            Self::MoonlightVk {
+                code: 0x12,
+                normalized,
+            } => Self::MoonlightVk {
+                code: 0xa4,
+                normalized: *normalized,
+            },
             key => key.clone(),
         }
     }
@@ -145,7 +171,11 @@ impl Event {
                 "evdev keyboard codes must be 1..248 excluding KEY_UNKNOWN",
             )),
             Self::Key {
-                key: Key::MoonlightVk { code },
+                key:
+                    Key::MoonlightVk {
+                        code,
+                        normalized: true,
+                    },
                 ..
             } if amaterasu_gamestream::control::virtual_key_mapping(*code).is_none() => {
                 Err(InputError::new(
@@ -187,11 +217,44 @@ impl Event {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Pressed {
     Key(Key),
     Button(Button),
 }
+
+impl PartialEq for Pressed {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Key(left), Self::Key(right)) => key_identity_eq(left, right),
+            (Self::Button(left), Self::Button(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Pressed {}
+
+fn key_identity_eq(left: &Key, right: &Key) -> bool {
+    match (left, right) {
+        (
+            Key::WindowsScan {
+                code: left_code,
+                extended: left_extended,
+            },
+            Key::WindowsScan {
+                code: right_code,
+                extended: right_extended,
+            },
+        ) => left_code == right_code && left_extended == right_extended,
+        (Key::LinuxEvdev { code: left }, Key::LinuxEvdev { code: right }) => left == right,
+        (Key::MoonlightVk { code: left, .. }, Key::MoonlightVk { code: right, .. }) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
 impl Pressed {
     pub fn release_event(&self) -> Event {
         match self {
@@ -247,4 +310,47 @@ pub fn validate_operation_id(operation_id: &str) -> InputResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moonlight_key_wire_defaults_to_normalized_and_accepts_raw_vk_mode() {
+        let legacy: Event = serde_json::from_value(json!({
+            "kind":"key",
+            "key":{"platform":"moonlight_vk","code":65},
+            "state":"down",
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            Event::Key {
+                key: Key::MoonlightVk {
+                    code: 65,
+                    normalized: true,
+                },
+                state: KeyState::Down,
+            }
+        );
+
+        let raw: Event = serde_json::from_value(json!({
+            "kind":"key",
+            "key":{"platform":"moonlight_vk","code":255,"normalized":false},
+            "state":"down",
+        }))
+        .unwrap();
+        assert!(raw.validate().is_ok());
+        assert_eq!(
+            raw,
+            Event::Key {
+                key: Key::MoonlightVk {
+                    code: 255,
+                    normalized: false,
+                },
+                state: KeyState::Down,
+            }
+        );
+    }
 }

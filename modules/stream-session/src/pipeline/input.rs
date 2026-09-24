@@ -281,15 +281,25 @@ fn valid_label(value: &str, maximum: usize) -> bool {
 
 fn event_payload(event: InputEvent) -> Value {
     match event {
-        InputEvent::Key { virtual_key, state } => json!({
-            "kind": "key",
-            "key": {"platform": "moonlight_vk", "code": virtual_key},
-            "state": match state {
-                TranslatedKeyState::Down => "down",
-                TranslatedKeyState::Up => "up",
-                TranslatedKeyState::Repeat => "repeat",
-            },
-        }),
+        InputEvent::Key {
+            virtual_key,
+            normalized,
+            state,
+        } => {
+            let mut key = json!({"platform": "moonlight_vk", "code": virtual_key});
+            if !normalized {
+                key["normalized"] = json!(false);
+            }
+            json!({
+                "kind": "key",
+                "key": key,
+                "state": match state {
+                    TranslatedKeyState::Down => "down",
+                    TranslatedKeyState::Up => "up",
+                    TranslatedKeyState::Repeat => "repeat",
+                },
+            })
+        }
         InputEvent::Button { button, pressed } => json!({
             "kind": "button",
             "button": match button {

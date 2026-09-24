@@ -527,11 +527,17 @@ fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() 
     let mut controller = Controller::new(FakeBackend::default(), true);
     let token = acquire(&mut controller, Instant::now());
     let generic_shift = Event::Key {
-        key: Key::MoonlightVk { code: 0x10 },
+        key: Key::MoonlightVk {
+            code: 0x10,
+            normalized: true,
+        },
         state: KeyState::Down,
     };
     let left_shift_up = Event::Key {
-        key: Key::MoonlightVk { code: 0xa0 },
+        key: Key::MoonlightVk {
+            code: 0xa0,
+            normalized: true,
+        },
         state: KeyState::Up,
     };
     assert_eq!(
@@ -553,6 +559,54 @@ fn moonlight_modifier_aliases_share_ownership_and_native_encodings_cannot_mix() 
         "invalid_sequence"
     );
     assert!(controller.pressed.is_empty());
+}
+
+#[test]
+fn raw_key_cleanup_keeps_the_keydown_mode_and_rejects_cross_mode_duplicate() {
+    let backend = FakeBackend::default();
+    let trace = backend.trace.clone();
+    let mut controller = Controller::new(backend, true);
+    let token = acquire(&mut controller, Instant::now());
+    let raw_down = Event::Key {
+        key: Key::MoonlightVk {
+            code: 0x41,
+            normalized: false,
+        },
+        state: KeyState::Down,
+    };
+    assert_eq!(batch(&mut controller, &token, vec![raw_down])["ok"], true);
+
+    let normalized_duplicate = Event::Key {
+        key: Key::MoonlightVk {
+            code: 0x41,
+            normalized: true,
+        },
+        state: KeyState::Down,
+    };
+    assert_eq!(
+        batch(&mut controller, &token, vec![normalized_duplicate])["error"]["code"],
+        "invalid_sequence"
+    );
+
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            Instant::now(),
+            &mut || Ok(()),
+        )["released"],
+        true
+    );
+    assert_eq!(
+        trace.borrow().last(),
+        Some(&Event::Key {
+            key: Key::MoonlightVk {
+                code: 0x41,
+                normalized: false,
+            },
+            state: KeyState::Up,
+        })
+    );
 }
 
 #[test]

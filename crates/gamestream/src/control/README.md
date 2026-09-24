@@ -48,11 +48,16 @@ platform input effect is implied.
 records to owned input-service events. Normalized keyboard packets must use the
 primary client's `0x80xx` virtual-key form and a zero Sunshine
 `NON_NORMALIZED` flag. The translator uses a fixed US physical-key table shared
-with the input service. Generic and left Shift/Ctrl/Alt aliases share one logical
-key; duplicate downs become repeats and duplicate ups produce an empty batch.
-Missing Shift/Ctrl/Alt modifiers around an ordinary down are emitted as a bounded
-synthetic chord. A missing Meta modifier, a non-normalized or unmapped key, text,
-controller state, and haptics return an explicit translation error.
+with the input service. Non-normalized packets preserve their low-byte virtual
+key and carry an explicit mode bit to the input service; the Windows backend
+uses the configured current-layout scancode policy, while Linux continues to
+use its fixed US physical-key table. Generic and left Shift/Ctrl/Alt aliases
+share one logical key; duplicate downs become repeats and duplicate ups produce
+an empty batch. The translator remembers the keydown mode for repeats and
+release even if later packets change form. Missing Shift/Ctrl/Alt modifiers
+around an ordinary down are emitted as a bounded synthetic chord. A missing Meta
+modifier, unsupported normalized key, text, controller state, and haptics return
+an explicit translation error.
 
 Wire mouse buttons map as 1 left, 2 middle, 3 right, 4 back, and 5 forward.
 Relative `-32768` is rejected because the input service's symmetric range ends at

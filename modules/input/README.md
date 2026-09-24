@@ -20,11 +20,12 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 2 stores `keyboard`, `mouse`, and
-`high_resolution_scrolling`; an absent document enables all three. Version 1
-documents migrate in memory with high-resolution scrolling enabled, preserving
-the saved keyboard and mouse values. The next update writes the complete v2
-document. The module needs calls to configuration and state
+after startup. Version 3 stores `keyboard`, `mouse`,
+`high_resolution_scrolling`, and `always_send_scancodes`; an absent document
+enables all four. Version 1 documents migrate in memory with high-resolution
+scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
+Version 2 documents preserve all three saved values and default scancode mode to
+enabled. The next update writes the complete v3 document. The module needs calls to configuration and state
 and dependencies on both services; the configuration service uses the caller's
 delegated authority for its durable state read. Management cannot select another
 product namespace.
@@ -32,12 +33,13 @@ product namespace.
 Administrators use the fixed management routes `/v1/input/settings_get` and
 `/v1/input/settings_update`, protected by `configuration.read` and
 `configuration.write`. An update body contains both keyboard and mouse fields,
-`expected_revision`, and may contain `high_resolution_scrolling`. Older updates
-that omit the new field preserve its current durable value. Product settings
+`expected_revision`, and may contain `high_resolution_scrolling` and
+`always_send_scancodes`. Older updates that omit either newer field preserve
+its current durable value. Product settings
 actions accept only the exact runtime caller `amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -56,12 +58,24 @@ be polled. Settings reads do not block on the startup fetch; they return
 `settings_unavailable` until the stored document has loaded rather than presenting
 bootstrap defaults as persisted settings.
 
-The live global policy includes `keyboard`, `mouse`, and
-`high_resolution_scrolling`. When high-resolution scrolling is disabled, the
-input controller accumulates signed wheel units separately per axis and emits
-legacy 120-unit detents. Fractional remainders are discarded on mode changes,
-mouse disable, and lease end. The default preserves raw high-resolution units.
-Scancode mode, controller, and gamepad parity remain pending.
+The live global policy includes `keyboard`, `mouse`,
+`high_resolution_scrolling`, and `always_send_scancodes`. When high-resolution
+scrolling is disabled, the input controller accumulates signed wheel units
+separately per axis and emits legacy 120-unit detents. Fractional remainders are
+discarded on mode changes, mouse disable, and lease end. The default preserves
+raw high-resolution units.
+
+On Windows, `always_send_scancodes` affects non-normalized Moonlight keyboard
+packets only. When enabled, the backend maps their virtual key through the
+current Windows keyboard layout and injects a scan code; Windows, Pause, and
+unmapped keys fall back to virtual-key injection. When disabled, non-normalized
+packets use virtual-key injection. Normalized packets retain the existing fixed
+US physical-key mapping in either mode. The backend remembers the representation
+selected on key-down so repeats, releases, and lease cleanup remain paired if
+the setting changes while a key is held. Linux intentionally ignores this
+setting and maps either packet form through the existing fixed US-to-evdev table;
+unmapped raw keys are rejected during batch validation. Controller and gamepad
+parity remain pending.
 
 ## JSON API
 
@@ -114,6 +128,10 @@ At most 128 keys/buttons may be held. Supported events:
   and left Shift/Ctrl/Alt aliases have one pressed identity. A lease cannot mix
   native and Moonlight key encodings, preventing two names from owning one native
   key independently.
+  `moonlight_vk.normalized` is optional and defaults to `true` for older clients.
+  Protocol adapters set it to `false` for a non-normalized virtual-key packet.
+  Windows then applies `always_send_scancodes`; Linux uses its fixed mapping and
+  rejects raw virtual keys without an evdev mapping.
   `state` is `down`, `up`, or `repeat`. Repeat requires a held key. Duplicate
   presses and releases of unowned keys are rejected.
 - `button`: `left`, `right`, `middle`, `back`, or `forward`, with `pressed` true or
@@ -146,8 +164,14 @@ result. Errors contain `ok:false`, `error.code`, `error.message`, and
 `cleanup_required`. Injection errors also report the fully accepted event prefix
 and `partial_event_possible:true`. Batches are not atomic OS transactions: pointer
 movement or an input prefix cannot be undone, and even a failing event may have
-partially reached the OS. Reconcile lease status before retrying an ambiguous
-request. Reuse the runtime operation ID only for the same logical request.
+partially reached the OS. A disabled-high-resolution raw wheel packet can
+produce several bounded legacy detent events. If native injection fails after
+earlier detents were delivered, that packet has a partially applied prefix; its
+lease cannot accept another batch. Successful cleanup ends the lease and clears
+fractional remainder; failed cleanup leaves the lease marked `cleanup_required`
+while releases are retried. Clients must not replay the wheel packet under that
+lease. Reconcile lease status before retrying an ambiguous request. Reuse the
+runtime operation ID only for the same logical request.
 
 ## Pressed-state ownership and cleanup
 
