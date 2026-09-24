@@ -145,8 +145,14 @@ impl Settings {
     ) -> Result<Vec<SocketAddr>, &'static str> {
         let family = self.effective_address_family(address_family, bind_address, legacy.ip());
         let addresses = match bind_address {
-            None => vec![legacy.ip()],
-            Some(address) if address.trim().is_empty() => match (family, self.allow_remote) {
+            Some(address) if !address.trim().is_empty() => vec![
+                address
+                    .trim()
+                    .parse::<IpAddr>()
+                    .map_err(|_| "invalid_bind_address")?,
+            ],
+            None if address_family.is_none() => vec![legacy.ip()],
+            Some(_) if address_family.is_none() => match (family, self.allow_remote) {
                 (AddressFamily::Ipv4, true) => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
                 (AddressFamily::Ipv4, false) => vec![legacy.ip()],
                 (AddressFamily::Both, true) => vec![
@@ -158,12 +164,18 @@ impl Settings {
                     IpAddr::V6(Ipv6Addr::LOCALHOST),
                 ],
             },
-            Some(address) => vec![
-                address
-                    .trim()
-                    .parse::<IpAddr>()
-                    .map_err(|_| "invalid_bind_address")?,
-            ],
+            _ => match (family, self.allow_remote) {
+                (AddressFamily::Ipv4, true) => vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
+                (AddressFamily::Ipv4, false) => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                (AddressFamily::Both, true) => vec![
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                ],
+                (AddressFamily::Both, false) => vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+            },
         };
         addresses
             .into_iter()
@@ -307,8 +319,8 @@ mod tests {
         assert!(settings.address_family.is_none());
         assert!(settings.bind_address.is_none());
         assert_eq!(
-            settings.resolved_http_bind().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
+            settings.resolved_http_binds().unwrap(),
+            vec!["127.0.0.1:47989".parse().unwrap()]
         );
         let mut settings: Settings =
             serde_json::from_str(r#"{"http_bind":"0.0.0.0:47989"}"#).unwrap();
@@ -404,6 +416,101 @@ mod tests {
                 "[::1]:47989".parse().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn explicit_address_family_without_bind_address_uses_family_defaults() {
+        let cases = [
+            (
+                AddressFamily::Ipv4,
+                false,
+                vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ),
+            (
+                AddressFamily::Ipv4,
+                true,
+                vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
+            ),
+            (
+                AddressFamily::Both,
+                false,
+                vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+            ),
+            (
+                AddressFamily::Both,
+                true,
+                vec![
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                ],
+            ),
+        ];
+
+        for (address_family, allow_remote, expected_ips) in cases {
+            let settings = Settings {
+                address_family: Some(address_family),
+                allow_remote,
+                ..Settings::default()
+            };
+
+            for resolved_binds in [
+                settings.resolved_http_binds().unwrap(),
+                settings.resolved_https_binds().unwrap(),
+            ] {
+                assert_eq!(
+                    resolved_binds
+                        .into_iter()
+                        .map(|address| address.ip())
+                        .collect::<Vec<_>>(),
+                    expected_ips
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_ipv4_family_uses_family_defaults_for_empty_binds_over_legacy_ipv6() {
+        for allow_remote in [false, true] {
+            for bind_address in [None, Some(""), Some(" \t ")] {
+                let settings = Settings {
+                    address_family: Some(AddressFamily::Ipv4),
+                    bind_address: bind_address.map(str::to_owned),
+                    allow_remote,
+                    http_bind: "[::1]:47989".parse().unwrap(),
+                    https_bind: "[::1]:47984".parse().unwrap(),
+                    ..Settings::default()
+                };
+                let expected_ip = if allow_remote {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                };
+
+                settings.validate().unwrap();
+                assert_eq!(settings.bind_address.as_deref(), bind_address);
+                assert_eq!(
+                    settings
+                        .resolved_http_binds()
+                        .unwrap()
+                        .into_iter()
+                        .map(|address| address.ip())
+                        .collect::<Vec<_>>(),
+                    vec![expected_ip]
+                );
+                assert_eq!(
+                    settings
+                        .resolved_https_binds()
+                        .unwrap()
+                        .into_iter()
+                        .map(|address| address.ip())
+                        .collect::<Vec<_>>(),
+                    vec![expected_ip]
+                );
+            }
+        }
     }
 
     #[test]

@@ -817,6 +817,42 @@ mod tests {
     }
 
     #[test]
+    fn omitted_bind_address_uses_explicit_ipv4_family_for_live_listeners() {
+        for allow_remote in [false, true] {
+            let settings = Settings {
+                enabled: true,
+                address_family: Some(crate::settings::AddressFamily::Ipv4),
+                allow_remote,
+                http_bind: "127.0.0.1:0".parse().unwrap(),
+                https_bind: "127.0.0.1:0".parse().unwrap(),
+                ..Settings::default()
+            };
+            let server = Server::bind(&settings).expect("bind explicit IPv4 family");
+            let expected_ip = if allow_remote {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            };
+            let bound_addresses = server
+                .http_addresses()
+                .into_iter()
+                .chain(server.https_addresses())
+                .collect::<Vec<_>>();
+
+            for address in bound_addresses {
+                assert_eq!(address.ip(), expected_ip);
+                assert!(
+                    TcpStream::connect(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        address.port(),
+                    ))
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn both_family_accepts_ipv4_and_ipv6_with_or_without_remote_access() {
         for allow_remote in [false, true] {
             let settings: Settings = serde_json::from_value(serde_json::json!({
