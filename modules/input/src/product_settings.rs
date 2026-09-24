@@ -1,12 +1,13 @@
 //! Durable input policy and asynchronous configuration RPC lifecycle.
 use crate::controller::Controller;
+use crate::gamepad_profile::GamepadProfile;
 use crate::model::DevicePolicy;
 use crate::{CONFIGURATION_SERVICE, backend::Backend};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PRODUCT_SETTINGS_VERSION: u32 = 6;
+pub const PRODUCT_SETTINGS_VERSION: u32 = 7;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
@@ -31,6 +32,8 @@ pub struct InputPolicy {
     pub key_repeat_frequency: f64,
     #[serde(default = "default_back_button_timeout")]
     pub back_button_timeout: i32,
+    #[serde(default)]
+    pub gamepad: GamepadProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,6 +46,7 @@ pub struct InputPolicyUpdate {
     pub key_repeat_delay: Option<u32>,
     pub key_repeat_frequency: Option<f64>,
     pub back_button_timeout: Option<i32>,
+    pub gamepad: Option<GamepadProfile>,
 }
 
 const fn default_enabled() -> bool {
@@ -67,6 +71,7 @@ impl InputPolicy {
             "key_repeat_delay":self.key_repeat_delay,
             "key_repeat_frequency":self.key_repeat_frequency,
             "back_button_timeout":self.back_button_timeout,
+            "gamepad":self.gamepad.as_str(),
         })
     }
 
@@ -113,6 +118,7 @@ impl Default for InputPolicy {
             key_repeat_delay: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout: default_back_button_timeout(),
+            gamepad: GamepadProfile::Auto,
         }
     }
 }
@@ -212,6 +218,7 @@ impl ProductSettings {
             back_button_timeout: update
                 .back_button_timeout
                 .unwrap_or(self.policy.back_button_timeout),
+            gamepad: update.gamepad.unwrap_or(self.policy.gamepad),
         }
     }
 
@@ -469,6 +476,7 @@ impl ProductSettings {
                             policy.key_repeat_frequency,
                         );
                         controller.set_back_button_timeout_ms(policy.back_button_timeout);
+                        controller.set_gamepad_profile(policy.gamepad);
                         let _ = controller
                             .set_device_policy(policy.device_policy(), std::time::Instant::now());
                     }
@@ -540,6 +548,7 @@ impl ProductSettings {
                             actual.key_repeat_frequency,
                         );
                         controller.set_back_button_timeout_ms(actual.back_button_timeout);
+                        controller.set_gamepad_profile(actual.gamepad);
                         let cleanup = controller
                             .set_device_policy(actual.device_policy(), std::time::Instant::now())
                             .is_err();
@@ -580,6 +589,7 @@ impl ProductSettings {
         controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
         controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
         controller.set_back_button_timeout_ms(policy.back_button_timeout);
+        controller.set_gamepad_profile(policy.gamepad);
         let cleanup = controller
             .set_device_policy(policy.device_policy(), std::time::Instant::now())
             .is_err();
@@ -611,6 +621,7 @@ impl ProductSettings {
                     self.policy.key_repeat_frequency,
                 )
             && controller.back_button_timeout_ms() == self.policy.back_button_timeout
+            && controller.gamepad_profile() == self.policy.gamepad
             && !cleanup_required;
         settings_response_with_state(
             self.policy,
@@ -683,7 +694,7 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
         {
             Ok((InputPolicy::default(), 0))
         }
-        Some(true) if matches!(payload["version"].as_u64(), Some(1..=6)) => {
+        Some(true) if matches!(payload["version"].as_u64(), Some(1..=7)) => {
             let values = payload["values"].as_object().ok_or("values not object")?;
             let version = payload["version"].as_u64().unwrap_or_default();
             let has_unknown_key = values.keys().any(|key| match version {
@@ -724,6 +735,18 @@ fn read_document(payload: &Value) -> Result<(InputPolicy, u64), &'static str> {
                         | "key_repeat_delay"
                         | "key_repeat_frequency"
                         | "back_button_timeout"
+                ),
+                7 => !matches!(
+                    key.as_str(),
+                    "keyboard"
+                        | "mouse"
+                        | "high_resolution_scrolling"
+                        | "always_send_scancodes"
+                        | "key_rightalt_to_key_win"
+                        | "key_repeat_delay"
+                        | "key_repeat_frequency"
+                        | "back_button_timeout"
+                        | "gamepad"
                 ),
                 _ => true,
             });

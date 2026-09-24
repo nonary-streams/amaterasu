@@ -3,6 +3,7 @@ use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
 };
+use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
 };
@@ -228,6 +229,9 @@ pub struct LinuxBackend {
     gamepads: GamepadSlots<UinputGamepad>,
     gamepad_probe: Option<Device>,
     controller_input_supported: bool,
+    profile: GamepadProfile,
+    effective_profile: Option<&'static str>,
+    controller_unavailable_reason: Option<String>,
     back_button_timeout_ms: i32,
 }
 impl LinuxBackend {
@@ -243,6 +247,9 @@ impl LinuxBackend {
             gamepads: GamepadSlots::new(),
             gamepad_probe: None,
             controller_input_supported: false,
+            profile: GamepadProfile::Auto,
+            effective_profile: None,
+            controller_unavailable_reason: None,
             back_button_timeout_ms: -1,
         }
     }
@@ -260,6 +267,19 @@ impl Backend for LinuxBackend {
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
     }
+    fn effective_gamepad_profile(&self) -> Option<&'static str> {
+        self.effective_profile
+    }
+    fn gamepad_unavailable_reason(&self) -> Option<&str> {
+        self.controller_unavailable_reason
+            .as_deref()
+            .or(match self.profile {
+                GamepadProfile::Auto | GamepadProfile::Xone => None,
+                GamepadProfile::Ds4 => Some("Linux gamepad profile 'ds4' is recognized but not implemented by this backend"),
+                GamepadProfile::Ds5 => Some("Linux gamepad profile 'ds5' is recognized but not implemented by this backend"),
+                GamepadProfile::Switch => Some("Linux gamepad profile 'switch' is recognized but not implemented by this backend"),
+            })
+    }
     fn key_encoding(&self) -> &'static str {
         "linux_evdev"
     }
@@ -267,8 +287,10 @@ impl Backend for LinuxBackend {
         event.validate()?;
         if matches!(event, Event::Controller { .. }) && !self.controller_input_supported {
             return Err(InputError::new(
-                "unsupported_event",
-                "Linux uinput gamepad support was not available for this lease",
+                "controller_unavailable",
+                self.controller_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("Linux uinput gamepad support was not available for this lease"),
             ));
         }
         if matches!(
@@ -318,11 +340,32 @@ impl Backend for LinuxBackend {
         self.keyboard = Some(keyboard);
         self.pointer = Some(pointer);
         self.controller_input_supported = false;
-        if let Ok(mut probe) = Device::create_gamepad(&self.path, 0) {
-            match probe.destroy() {
-                Ok(()) => self.controller_input_supported = true,
-                Err(_) => self.gamepad_probe = Some(probe),
+        self.effective_profile = None;
+        self.controller_unavailable_reason = None;
+        if profile_uses_uinput_backend(self.profile) {
+            match Device::create_gamepad(&self.path, 0) {
+                Ok(mut probe) => match probe.destroy() {
+                    Ok(()) => {
+                        self.controller_input_supported = true;
+                        self.effective_profile = Some("xone");
+                    }
+                    Err(error) => {
+                        self.controller_unavailable_reason = Some(format!(
+                            "Linux uinput gamepad probe device could not be destroyed: {}",
+                            error.message
+                        ));
+                        self.gamepad_probe = Some(probe);
+                    }
+                },
+                Err(error) => {
+                    self.controller_unavailable_reason = Some(error.message);
+                }
             }
+        } else {
+            self.controller_unavailable_reason = Some(format!(
+                "Linux gamepad profile '{}' is recognized but not implemented by this backend",
+                self.profile.as_str()
+            ));
         }
         Ok(())
     }
@@ -455,6 +498,8 @@ impl Backend for LinuxBackend {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.controller_input_supported = false;
+        self.effective_profile = None;
+        self.controller_unavailable_reason = None;
         Ok(())
     }
 
@@ -475,6 +520,39 @@ impl Backend for LinuxBackend {
         if timeout_ms < 0 {
             self.gamepads.disable_pending_back_timeouts();
         }
+    }
+
+    fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
+        self.profile = profile;
+    }
+}
+
+fn profile_uses_uinput_backend(profile: GamepadProfile) -> bool {
+    matches!(profile, GamepadProfile::Auto | GamepadProfile::Xone)
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn only_auto_and_xbox_like_uinput_profiles_select_the_linux_backend() {
+        assert!(profile_uses_uinput_backend(GamepadProfile::Auto));
+        assert!(profile_uses_uinput_backend(GamepadProfile::Xone));
+        assert!(!profile_uses_uinput_backend(GamepadProfile::Ds4));
+        assert!(!profile_uses_uinput_backend(GamepadProfile::Ds5));
+        assert!(!profile_uses_uinput_backend(GamepadProfile::Switch));
+
+        let mut backend = LinuxBackend::new("/dev/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        assert!(!backend.controller_input_supported());
+        assert_eq!(backend.effective_gamepad_profile(), None);
+        assert!(
+            backend
+                .gamepad_unavailable_reason()
+                .unwrap()
+                .contains("ds4")
+        );
     }
 }
 

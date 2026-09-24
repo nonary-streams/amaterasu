@@ -20,19 +20,21 @@ other platforms report unsupported native injection instead of simulated success
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`
-after startup. Version 6 stores `keyboard`, `mouse`,
+after startup. Version 7 stores `keyboard`, `mouse`,
 `high_resolution_scrolling`, `always_send_scancodes`, and
 `key_rightalt_to_key_win`, `key_repeat_delay`, and
-`key_repeat_frequency`, and `back_button_timeout`; an absent document enables keyboard, mouse,
+`key_repeat_frequency`, `back_button_timeout`, and the global `gamepad` profile;
+an absent document enables keyboard, mouse,
 high-resolution scrolling, and scancode mode, leaves right-Alt mapping disabled,
 uses a 500 ms initial key-repeat delay at 24.9 Hz, and disables the Back timeout
-with `-1`. Versions 1 through 5
+with `-1`, and selects `auto` for gamepads. Versions 1 through 6 migrate in
+memory with `auto` for the profile and their prior defaults. Versions 1 through 5
 migrate in memory with the new repeat defaults. Version 1 documents migrate in
 memory with high-resolution
 scrolling and scancode mode enabled, preserving saved keyboard and mouse values.
 Version 2 documents preserve all three saved values and default scancode mode to
 enabled. Version 3 preserves all four earlier values and defaults right-Alt
-mapping to disabled. The next update writes the complete v6 document. Delay is
+mapping to disabled. The next update writes the complete v7 document. Delay is
 an integer from 0 through 2,147,483,647 milliseconds; zero disables repeat.
 Frequency is a finite nonnegative decimal in Hz. Zero keeps Vibeshine's 24.9 Hz
 default. Back timeout is a signed 32-bit millisecond value; any negative value
@@ -47,11 +49,19 @@ Administrators use the fixed management routes `/v1/input/settings_get` and
 `expected_revision`, and may contain `high_resolution_scrolling`,
 `always_send_scancodes`, and `key_rightalt_to_key_win`. Older updates that omit
 newer fields preserve their current durable values. The update may also include
-`key_repeat_delay`, `key_repeat_frequency`, and `back_button_timeout`. Product settings
-actions accept only the exact runtime caller `amaterasu.management`.
+`key_repeat_delay`, `key_repeat_frequency`, `back_button_timeout`, and `gamepad`.
+Windows recognizes `auto`, `x360`, `ds4`, `vhf`, `vhf_xbox`, `vhf_xbox_one`,
+`vhf_ds4`, `vhf_ds5`, and `vhf_switch`. Linux recognizes `auto`, `xone`, `ds4`,
+`ds5`, and `switch`. These names follow Vibeshine's pinned option lists at
+`457237db7e57f9c4be21c35bb07e28d1c100eb7d`. Unsupported-but-recognized profiles
+remain valid settings so deployments can retain an intended choice; a lease
+reports them unavailable, rejects controller snapshots, and never silently
+selects another profile. The next update writes the complete v7 document.
+Product settings actions accept only the exact runtime caller
+`amaterasu.management`.
 
 ```json
-{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"expected_revision":4}
+{"keyboard":false,"mouse":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","expected_revision":4}
 ```
 
 The policy gates event delivery after it is loaded. Disabled keys are suppressed;
@@ -73,7 +83,7 @@ bootstrap defaults as persisted settings.
 The live global policy includes `keyboard`, `mouse`,
 `high_resolution_scrolling`, `always_send_scancodes`,
 `key_rightalt_to_key_win`, `key_repeat_delay`,
-`key_repeat_frequency`, and `back_button_timeout`. When high-resolution
+`key_repeat_frequency`, `back_button_timeout`, and `gamepad`. When high-resolution
 scrolling is disabled, the input controller accumulates signed wheel units
 separately per axis and emits legacy 120-unit detents. Fractional remainders are
 discarded on mode changes, mouse disable, and lease end. The default preserves
@@ -89,6 +99,16 @@ selected on key-down so repeats, releases, and lease cleanup remain paired if
 the setting changes while a key is held. Linux intentionally ignores this
 setting and maps either packet form through the existing fixed US-to-evdev table;
 unmapped raw keys are rejected during batch validation.
+
+With `gamepad:"auto"`, Windows probes a real ViGEmClient/ViGEmBus connection
+and selects `x360` only after that connection succeeds. Linux probes a temporary
+uinput Xbox-like device and selects its `xone` profile only after creation and
+destruction succeed. Explicit `x360` and `xone` make the same platform probe;
+other recognized explicit profiles return `controller_input:false` with a
+status reason, leave keyboard and mouse usable, and never fall back to `auto`.
+Status reports the requested `gamepad`, `supported_profiles`, and the effective
+profile as `effective_gamepad_profile` (null until a real backend is available).
+An active lease retains the requested and effective profiles from acquisition.
 
 Linux creates per-lease uinput gamepads when its startup probe succeeds. It maps
 controller number and active mask across 16 slots, projects assigned buttons,
@@ -115,7 +135,10 @@ ends. Timer-driven update failures stay dirty and retry on module ticks; failed
 detach remains owned for release retry. The global and per-lease Back timeout state
 machine is shared across Linux and Windows. Windows currently exposes only the
 wired Xbox 360 XUSB profile and does not select another profile when ViGEm is
-missing. Linux runtime behavior has not been exercised on this Windows host, and
+missing. Linux exposes the Xbox-like uinput backend under the pinned `xone`
+choice; it does not use Inputtino. DS4, DS5, Switch, VHF profiles, VHF/UMDF device
+creation, and Inputtino integration remain unimplemented. Linux runtime behavior
+has not been exercised on this Windows host, and
 Windows virtual-device delivery has not been qualified against an installed
 ViGEmBus driver, so platform-qualified controller parity remains pending.
 
@@ -302,9 +325,9 @@ to open the configured uinput device. No permissions/udev rules are changed by
 this module. Device creation does not acknowledge compositor readiness; udev and
 libinput discovery are asynchronous, and delivery during device activation needs
 native acceptance testing. Seat selection, captured-monitor coordinate mapping,
-Wayland absolute-pointer integration, touch/pen, non-X360 controller profiles,
-rumble/LED feedback, and crash-surviving Windows keyboard/mouse cleanup remain
-unimplemented.
+Wayland absolute-pointer integration, touch/pen, DS4/DS5/Switch reports, VHF/UMDF
+and Inputtino integrations, rumble/LED feedback, and crash-surviving Windows
+keyboard/mouse cleanup remain unimplemented.
 
 ## Validation and reference
 

@@ -14,6 +14,7 @@ struct FakeBackend {
     fail_controller_input: bool,
     reject_absolute: bool,
     controller_input_supported: bool,
+    effective_gamepad_profile: Option<&'static str>,
     back_button_timeout_ms: i32,
 }
 impl Backend for FakeBackend {
@@ -28,6 +29,9 @@ impl Backend for FakeBackend {
     }
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
+    }
+    fn effective_gamepad_profile(&self) -> Option<&'static str> {
+        self.effective_gamepad_profile
     }
     fn key_encoding(&self) -> &'static str {
         "test_only"
@@ -196,6 +200,7 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
     let mut controller = Controller::new(
         FakeBackend {
             controller_input_supported: true,
+            effective_gamepad_profile: Some("x360"),
             ..Default::default()
         },
         true,
@@ -212,6 +217,8 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
         &mut || Ok(()),
     );
     assert_eq!(acquired["controller_input"], true);
+    assert_eq!(acquired["gamepad_profile"], "auto");
+    assert_eq!(acquired["effective_gamepad_profile"], "x360");
 
     let lookup = controller.handle(
         "owner",
@@ -225,6 +232,54 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
 
     let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
     assert_eq!(status["controller_input"], true);
+    assert_eq!(status["effective_gamepad_profile"], "x360");
+    assert_eq!(status["supported_profiles"][0], "auto");
+}
+
+#[test]
+fn active_lease_keeps_the_profile_selected_at_acquire_time() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            effective_gamepad_profile: Some("x360"),
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("profile-snapshot".into()),
+            ttl_ms: Some(1000),
+            back_button_timeout: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    let selected_profile = selected_supported_profile();
+    controller.set_gamepad_profile(selected_profile);
+
+    let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
+    assert_eq!(acquired["gamepad_profile"], "auto");
+    assert_eq!(status["gamepad"], selected_profile.as_str());
+    assert_eq!(status["lease"]["gamepad_profile"], "auto");
+    assert_eq!(status["lease"]["effective_gamepad_profile"], "x360");
+}
+
+fn selected_supported_profile() -> GamepadProfile {
+    #[cfg(windows)]
+    {
+        GamepadProfile::X360
+    }
+    #[cfg(target_os = "linux")]
+    {
+        GamepadProfile::Xone
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        GamepadProfile::Auto
+    }
 }
 
 #[test]

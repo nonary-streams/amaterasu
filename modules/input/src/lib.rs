@@ -3,6 +3,7 @@ mod backend;
 mod controller;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;
+mod gamepad_profile;
 mod model;
 mod product_settings;
 
@@ -65,6 +66,8 @@ enum SettingsOperation {
         key_repeat_frequency: Option<f64>,
         #[serde(default)]
         back_button_timeout: Option<i32>,
+        #[serde(default)]
+        gamepad: Option<gamepad_profile::GamepadProfile>,
         expected_revision: u64,
     },
 }
@@ -214,6 +217,7 @@ impl InputModule {
                     key_repeat_delay,
                     key_repeat_frequency,
                     back_button_timeout,
+                    gamepad,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -232,6 +236,7 @@ impl InputModule {
                         key_repeat_delay,
                         key_repeat_frequency,
                         back_button_timeout,
+                        gamepad,
                     });
                     match self.product_settings.begin_update(
                         request.id,
@@ -398,6 +403,7 @@ mod tests {
                 key_repeat_delay: None,
                 key_repeat_frequency: None,
                 back_button_timeout: None,
+                gamepad: None,
                 ..
             }
         ));
@@ -412,6 +418,7 @@ mod tests {
             "key_repeat_delay":250,
             "key_repeat_frequency":30.5,
             "back_button_timeout":-1,
+            "gamepad":"auto",
             "expected_revision":4,
         }))
         .unwrap();
@@ -424,6 +431,7 @@ mod tests {
                 key_repeat_delay: Some(250),
                 key_repeat_frequency: Some(30.5),
                 back_button_timeout: Some(-1),
+                gamepad: Some(gamepad_profile::GamepadProfile::Auto),
                 ..
             }
         ));

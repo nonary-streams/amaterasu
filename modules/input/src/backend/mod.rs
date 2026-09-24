@@ -1,3 +1,4 @@
+use crate::gamepad_profile::GamepadProfile;
 use crate::model::{Event, InputResult};
 use std::time::Instant;
 
@@ -7,6 +8,15 @@ pub trait Backend {
     fn absolute_pointer(&self) -> bool;
     fn controller_input_supported(&self) -> bool {
         false
+    }
+    fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
+        GamepadProfile::implemented_profiles()
+    }
+    fn effective_gamepad_profile(&self) -> Option<&'static str> {
+        None
+    }
+    fn gamepad_unavailable_reason(&self) -> Option<&str> {
+        None
     }
     fn key_encoding(&self) -> &'static str;
     fn validate(&self, event: &Event) -> InputResult<()>;
@@ -23,6 +33,7 @@ pub trait Backend {
         Ok(())
     }
     fn set_back_button_timeout(&mut self, _timeout_ms: i32) {}
+    fn set_gamepad_profile(&mut self, _profile: GamepadProfile) {}
     fn stop(&mut self) -> InputResult<()>;
 }
 #[cfg(windows)]

@@ -1,4 +1,5 @@
 use crate::backend::Backend;
+use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
     DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS, MAX_PRESSED,
     Operation, Pressed, is_temporary_modifier, lease_duration, repeat_modifiers,
@@ -29,6 +30,9 @@ struct Lease {
     back_button_timeout_ms: i32,
     termination_reason: Option<&'static str>,
     key_encoding: Option<KeyEncoding>,
+    gamepad_profile: GamepadProfile,
+    effective_gamepad_profile: Option<&'static str>,
+    gamepad_unavailable_reason: Option<String>,
 }
 
 struct TerminalAcquire {
@@ -57,6 +61,7 @@ pub struct Controller<B: Backend> {
     key_repeat_delay_ms: u32,
     key_repeat_frequency_hz: f64,
     back_button_timeout_ms: i32,
+    gamepad_profile: GamepadProfile,
     repeating_key: Option<RepeatingKey>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
@@ -78,6 +83,7 @@ impl<B: Backend> Controller<B> {
             key_repeat_delay_ms: DEFAULT_KEY_REPEAT_DELAY_MS,
             key_repeat_frequency_hz: DEFAULT_KEY_REPEAT_FREQUENCY_HZ,
             back_button_timeout_ms: DEFAULT_BACK_BUTTON_TIMEOUT_MS,
+            gamepad_profile: GamepadProfile::Auto,
             repeating_key: None,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
@@ -198,6 +204,15 @@ impl<B: Backend> Controller<B> {
         if self.lease.is_none() {
             self.backend.set_back_button_timeout(timeout_ms);
         }
+    }
+
+    pub fn gamepad_profile(&self) -> GamepadProfile {
+        self.gamepad_profile
+    }
+
+    pub fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
+        self.gamepad_profile = profile;
+        self.backend.set_gamepad_profile(profile);
     }
 
     fn reset_scroll_remainders(&mut self) {
@@ -338,6 +353,7 @@ impl<B: Backend> Controller<B> {
         let back_button_timeout_ms =
             requested_back_button_timeout.unwrap_or(self.back_button_timeout_ms);
         self.backend.set_back_button_timeout(back_button_timeout_ms);
+        self.backend.set_gamepad_profile(self.gamepad_profile);
         if let Err(error) = self.backend.start() {
             self.backend
                 .set_back_button_timeout(self.back_button_timeout_ms);
@@ -355,6 +371,12 @@ impl<B: Backend> Controller<B> {
             back_button_timeout_ms,
             termination_reason: None,
             key_encoding: None,
+            gamepad_profile: self.gamepad_profile,
+            effective_gamepad_profile: self.backend.effective_gamepad_profile(),
+            gamepad_unavailable_reason: self
+                .backend
+                .gamepad_unavailable_reason()
+                .map(str::to_owned),
         });
         Ok(active_lease(
             self.lease.as_ref().expect("new input lease"),
@@ -782,6 +804,14 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
     fn status(&self, caller: &str, now: Instant) -> Value {
+        let effective_gamepad_profile = match self.lease.as_ref() {
+            Some(lease) => lease.effective_gamepad_profile,
+            None => self.backend.effective_gamepad_profile(),
+        };
+        let gamepad_unavailable_reason = match self.lease.as_ref() {
+            Some(lease) => lease.gamepad_unavailable_reason.as_deref(),
+            None => self.backend.gamepad_unavailable_reason(),
+        };
         let lease = self.lease.as_ref().map(|lease| {
             let owned = lease.owner == caller;
             json!({
@@ -791,9 +821,12 @@ impl<B: Backend> Controller<B> {
                 "expires_in_ms":lease.expires.saturating_duration_since(now).as_millis() as u64,
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
                 "back_button_timeout":lease.back_button_timeout_ms,
+                "gamepad_profile":lease.gamepad_profile.as_str(),
+                "effective_gamepad_profile":lease.effective_gamepad_profile,
+                "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"supported_profiles":self.backend.supported_gamepad_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -834,6 +867,9 @@ fn active_lease(
         "backend": backend,
         "absolute_pointer": absolute_pointer,
         "controller_input": controller_input,
+        "gamepad_profile": lease.gamepad_profile.as_str(),
+        "effective_gamepad_profile": lease.effective_gamepad_profile,
+        "gamepad_unavailable_reason": lease.gamepad_unavailable_reason,
         "cleanup_required": lease.cleanup_required,
     })
 }

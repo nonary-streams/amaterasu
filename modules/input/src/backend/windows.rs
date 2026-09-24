@@ -1,4 +1,5 @@
 use super::Backend;
+use crate::gamepad_profile::GamepadProfile;
 #[path = "windows_gamepad.rs"]
 mod windows_gamepad;
 use crate::model::{
@@ -87,6 +88,14 @@ impl Backend for WindowsBackend {
 
     fn controller_input_supported(&self) -> bool {
         self.gamepads.supported()
+    }
+
+    fn effective_gamepad_profile(&self) -> Option<&'static str> {
+        self.gamepads.effective_profile()
+    }
+
+    fn gamepad_unavailable_reason(&self) -> Option<&str> {
+        self.gamepads.unavailable_reason()
     }
 
     fn key_encoding(&self) -> &'static str {
@@ -182,6 +191,10 @@ impl Backend for WindowsBackend {
 
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.gamepads.set_back_button_timeout(timeout_ms);
+    }
+
+    fn set_gamepad_profile(&mut self, profile: GamepadProfile) {
+        self.gamepads.set_profile(profile);
     }
 
     fn stop(&mut self) -> InputResult<()> {

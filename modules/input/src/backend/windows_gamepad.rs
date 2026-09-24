@@ -1,6 +1,7 @@
 use crate::gamepad::{
     BACK_BUTTON_MASK, ControllerSnapshot, GUIDE_BUTTON_MASK, GamepadDevice, GamepadSlots,
 };
+use crate::gamepad_profile::GamepadProfile;
 use crate::model::{Event, InputError, InputResult};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -299,6 +300,8 @@ pub(super) struct WindowsGamepads {
     slots: GamepadSlots<VigemGamepad>,
     connection: Option<Rc<VigemConnection>>,
     unavailable_reason: Option<String>,
+    profile: GamepadProfile,
+    effective_profile: Option<&'static str>,
     back_button_timeout_ms: i32,
 }
 
@@ -308,12 +311,32 @@ impl WindowsGamepads {
             slots: GamepadSlots::new(),
             connection: None,
             unavailable_reason: None,
+            profile: GamepadProfile::Auto,
+            effective_profile: None,
             back_button_timeout_ms: -1,
         }
     }
 
     pub(super) fn start(&mut self) -> InputResult<()> {
-        self.start_with(VigemConnection::connect_default)
+        match self.profile {
+            GamepadProfile::Auto | GamepadProfile::X360 => {
+                self.start_with(VigemConnection::connect_default)
+            }
+            unsupported => {
+                if !self.slots.is_empty() || self.connection.is_some() {
+                    return Err(InputError::new(
+                        "backend_busy",
+                        "Windows ViGEm gamepad resources are still active",
+                    ));
+                }
+                self.effective_profile = None;
+                self.unavailable_reason = Some(format!(
+                    "Windows gamepad profile '{}' is recognized but not implemented by this backend",
+                    unsupported.as_str()
+                ));
+                Ok(())
+            }
+        }
     }
 
     fn start_with(
@@ -327,8 +350,12 @@ impl WindowsGamepads {
             ));
         }
         self.unavailable_reason = None;
+        self.effective_profile = None;
         match probe() {
-            Ok(connection) => self.connection = Some(Rc::new(connection)),
+            Ok(connection) => {
+                self.connection = Some(Rc::new(connection));
+                self.effective_profile = Some("x360");
+            }
             Err(error) => self.unavailable_reason = Some(error.message),
         }
         Ok(())
@@ -336,6 +363,27 @@ impl WindowsGamepads {
 
     pub(super) fn supported(&self) -> bool {
         self.connection.is_some()
+    }
+
+    pub(super) fn effective_profile(&self) -> Option<&'static str> {
+        self.effective_profile
+    }
+
+    pub(super) fn unavailable_reason(&self) -> Option<&str> {
+        self.unavailable_reason.as_deref().or(match self.profile {
+            GamepadProfile::Auto | GamepadProfile::X360 => None,
+            GamepadProfile::Ds4 => Some("Windows gamepad profile 'ds4' is recognized but not implemented by this backend"),
+            GamepadProfile::Vhf => Some("Windows gamepad profile 'vhf' is recognized but not implemented by this backend"),
+            GamepadProfile::VhfXbox => Some("Windows gamepad profile 'vhf_xbox' is recognized but not implemented by this backend"),
+            GamepadProfile::VhfXboxOne => Some("Windows gamepad profile 'vhf_xbox_one' is recognized but not implemented by this backend"),
+            GamepadProfile::VhfDs4 => Some("Windows gamepad profile 'vhf_ds4' is recognized but not implemented by this backend"),
+            GamepadProfile::VhfDs5 => Some("Windows gamepad profile 'vhf_ds5' is recognized but not implemented by this backend"),
+            GamepadProfile::VhfSwitch => Some("Windows gamepad profile 'vhf_switch' is recognized but not implemented by this backend"),
+        })
+    }
+
+    pub(super) fn set_profile(&mut self, profile: GamepadProfile) {
+        self.profile = profile;
     }
 
     pub(super) fn validate(&self, event: &Event) -> InputResult<()> {
@@ -412,6 +460,7 @@ impl WindowsGamepads {
         self.slots.stop()?;
         self.connection = None;
         self.unavailable_reason = None;
+        self.effective_profile = None;
         Ok(())
     }
 }
@@ -541,6 +590,57 @@ mod tests {
         let error = gamepads.validate(&event).unwrap_err();
         assert_eq!(error.code, "controller_unavailable");
         assert!(error.message.contains("simulated"));
+    }
+
+    #[test]
+    fn explicit_unimplemented_profile_reports_unavailable_without_claiming_support() {
+        let mut gamepads = WindowsGamepads::new();
+        gamepads.set_profile(GamepadProfile::Ds4);
+        gamepads.start().unwrap();
+
+        assert!(!gamepads.supported());
+        assert_eq!(gamepads.effective_profile(), None);
+        assert!(gamepads.unavailable_reason().unwrap().contains("ds4"));
+        let event = Event::Controller {
+            number: 0,
+            active_mask: 1,
+            buttons: 1,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        };
+        assert_eq!(
+            gamepads.validate(&event).unwrap_err().code,
+            "controller_unavailable"
+        );
+        gamepads.stop().unwrap();
+        assert!(gamepads.unavailable_reason().unwrap().contains("ds4"));
+    }
+
+    #[test]
+    fn auto_profile_invokes_the_real_backend_probe() {
+        let mut gamepads = WindowsGamepads::new();
+        let mut probed = false;
+        gamepads
+            .start_with(|| {
+                probed = true;
+                Err(InputError::new(
+                    "controller_unavailable",
+                    "test driver probe failure",
+                ))
+            })
+            .unwrap();
+
+        assert!(probed);
+        assert!(!gamepads.supported());
+        assert_eq!(gamepads.effective_profile(), None);
+        assert_eq!(
+            gamepads.unavailable_reason(),
+            Some("test driver probe failure")
+        );
     }
 
     #[test]
