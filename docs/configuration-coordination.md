@@ -2,9 +2,9 @@
 
 - Run: `f220bcaa-20260924-152010`
 - Clean source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b` on `main`
-- Current integration SHA: `30acd5de34ac5548ebf4d46086fc32ccad7b6913` (guide and ID assignment commits)
-- Source checkout for integration validation and final promotion: `C:\Users\Chase\sources\amaterasu`
-- Integration branch/worktree: `config-parity/integration` / `D:\sources\worktrees\amaterasu-config-integration`
+- Main branch is the direct landing and validation destination; inspect its current tip with `git rev-parse HEAD`.
+- Main checkout: `C:\Users\Chase\sources\amaterasu`
+- No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
 - Status: all six lane CLI sessions are running; XHigh worker startup and work are tracked in the external run directory.
 
@@ -311,17 +311,23 @@ Coordinator decisions and dependency acknowledgments are tracked here and in the
 
 | Request | Ownership / contract | Status |
 | --- | --- | --- |
-| `luna-02-stream-overrides-01` | `luna-02` owns global stream-value resolution and nvhttp persistence; `luna-05` owns catalog/launch persistence; `luna-06` owns signed management routes and frontend controls. Preserve absent/null versus explicit zero; per-client values are keyed by paired certificate identity and take precedence over per-application, global, then reference defaults. | Relayed to all three owners; implementation and schema acknowledgments pending. |
-| `luna-03-frame-limiter-path-001` | `luna-03` owns `modules/frame-limiter/**`; `luna-02` is the only writer for nvhttp persistence and launch projection. | Path ownership assigned. Interface and launch contract pending. |
-| Product-settings migration | Reserve nvhttp v17 once for the combined v16-to-v17 parity batch, with `luna-02` as sole writer. Include the frame-limiter global fields supplied by `luna-03`; do not create a second v17 migration. | Coordinator reservation issued; lane acknowledgment pending. |
-| Host settings provider | `luna-01` owns `modules/host-configuration/**`, `amaterasu.host-configuration/1`, and its revisioned v1 product document for host paths/identity plus `log_path` and `min_log_level`. `file_state` and `vibeshine_file_state` select contained legacy import files and do not replace live Amaterasu state storage. `luna-02` consumes read-only identity/import values; `luna-06` owns the signed editor and diagnostics behavior. | Coordinator decision relayed; provider API/readiness and consumer acknowledgments pending. |
-| Session TTL and browser session parity | `luna-01` owns auth persistence and configured TTL behavior; `luna-06` owns management cookie and frontend behavior. Keep management loopback-only and retain Secure, HttpOnly, SameSite and Origin protections. | Dependency relayed; route, browser-origin and restart evidence pending. |
-| DS4 Back mapping | `luna-04` owns the input policy and reserves `amaterasu.input` settings v9; `luna-02` owns stream launch projection, `luna-05` owns sparse catalog overrides, and `luna-06` owns management/frontend changes. Explicit `false` is preserved; only selected DS4 profiles change. | Input v9 and behavior approved; exact consumer acknowledgments pending. |
+| `luna-02-stream-overrides-01` | `luna-02` owns global stream-value resolution and NVHTTP persistence; `luna-05` owns catalog/application launch persistence; `luna-06` owns signed management routes and editor. Preserve absent/null versus explicit zero; paired-certificate client values take precedence over app, global, then reference defaults. | L02 runtime slice committed; L05 catalog and L06 editor work is active. End-to-end persistence and stream tests remain pending. |
+| `luna-03-frame-limiter-path-001` | `luna-03` owns `modules/frame-limiter/**`; `luna-02` is the only writer for NVHTTP persistence and launch projection; L05 owns app lifecycle apply/restore. | Provider and launch contract acknowledged; module implementation and host registration remain pending. |
+| Product-settings migration | Reserve NVHTTP v17 once for the combined v16-to-v17 batch, with `luna-02` as sole writer. It includes L03's global frame-limiter settings, L05's raw `legacy_global_preparation`, and LAN/WAN encryption modes. Preserve structured `global_preparation`; do not create a second v17 migration. | L02 acknowledged the single batch. L06 confirmed management maps `global_prep_cmd` to `legacy_global_preparation` and reads `configured_legacy_global_preparation`. |
+| LAN/WAN video encryption | `luna-02` owns global mode persistence and launch policy; `luna-06` owns signed management and editor controls. Modes are 0=never, 1=opportunistic, 2=mandatory; defaults are LAN 0 and WAN 1. Preserve negotiated audio behavior and choose the mode from the normalized peer address. | Added to the existing v17 batch; code and editor remain in progress. |
+| Host settings provider | `luna-01` owns `modules/host-configuration/**`, `amaterasu.host-configuration/1`, and the revisioned v1 document for host paths/identity plus `log_path` and `min_log_level`. `file_state` and `vibeshine_file_state` select contained legacy import files and do not replace live Amaterasu state storage. `luna-02` consumes read-only identity/import values; `luna-06` owns the signed editor and diagnostics behavior. | Contract acknowledged; provider and editor implementations are in progress. |
+| Session TTL and browser session parity | `luna-01` owns auth persistence and configured TTL behavior; `luna-06` owns management cookies and frontend behavior. Keep management loopback-only and retain Secure, HttpOnly, SameSite and Origin protections. Access cookie uses `Path=/v1/`; refresh cookie uses `Path=/v1/auth`. | Contract acknowledged; authentication and cookie workers are active. Restart and browser qualification remain pending. |
+| DS4 Back mapping and gamepad profile | `luna-04` owns input policy, global `gamepad` and `ds4_back_as_touchpad_click`, and input settings v9. L02 owns the stream launch projection; L05 owns sparse app overrides; L06 owns signed management/editor changes. Explicit false is preserved; only selected DS4 profiles change. | Input slice landed on main; L02 acknowledged projection ownership. L05 app overrides and L06 editor remain pending. |
+| Playnite path controls | Pinned reference removed both install/path overrides and the current provider discovers its executable without consuming them. Do not invent semantics for `global:playnite_install_dir` or `global:playnite_extensions_dir`. | Classified as removed/inert reference controls; keep stable IDs pending until the coverage inventory supports a retired status. |
 | Updater, tray and host metrics | `luna-06` owns `modules/updater/**`, `modules/system-tray/**`, and `modules/host-metrics/**`; `luna-01` owns host startup integration in `crates/host/**`; `luna-02` owns stream-session metric emission. | Path ownership assigned; module contracts and lifecycle integration pending. |
 
-## Merge queue
+## Mainline cherry-pick queue
 
-No candidates submitted yet. Trial merges and full builds/tests occur in the clean source checkout; lightweight lane worktrees remain non-buildable.
+| Lane | Source commit(s) | Main commit(s) | Status |
+| --- | --- | --- | --- |
+| luna-04 DS4 input slice | `50163b7d`, `4af44696` | `627dc591`, `e306b332` | Cherry-picked cleanly. Rustfmt and diff checks passed in lane; tests were authored but not run. Windows ViGEm device qualification and management/app/stream integration remain pending; both input IDs stay pending. |
+
+Cherry-pick each new lane candidate directly onto `main`, resolve clear conflicts in the main checkout, and record the resulting main commit here. Lightweight lane worktrees remain non-buildable.
 
 ## Shared-resource queue
 

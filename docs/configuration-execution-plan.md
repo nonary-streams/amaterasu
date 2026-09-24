@@ -24,9 +24,10 @@ not launch any processes or create worktrees.
 
 ## Launching and supervising the separate sessions
 
-The coordinator runs as `gpt-6-luna` with reasoning effort `max`. It prepares
-the integration worktree and six lane worktrees described below, then launches
-all six `codex exec` processes before waiting for any one to finish. Each lead
+The coordinator runs as `gpt-6-luna` with reasoning effort `max`. It uses the
+clean `main` checkout as the landing and validation checkout, prepares the six
+lane worktrees described below, then launches all six `codex exec` processes
+before waiting for any one to finish. Each lead
 uses `gpt-6-luna` with `model_reasoning_effort="max"`; its implementation workers
 use `gpt-6-luna` with `xhigh`. Set `agents.enabled=true`,
 `agents.default_subagent_model="gpt-6-luna"`,
@@ -48,8 +49,8 @@ lead's checkout; do not assume they have a separate directory or branch. When a
 child shares the lane branch, serialize Git operations, require exact-path
 staging, and review its commit on that branch; there is no separate child branch
 to merge. In both cases, the Luna Max lead owns the lane handoff and submits its
-lane branch to the coordinator. No worker merges directly into another lane or
-the coordinator's integration branch.
+lane commit to the coordinator. Workers do not write to `main` or another lane;
+the coordinator cherry-picks accepted lane commits onto `main`.
 
 Use one external run directory, for example
 `D:\sources\worktrees\amaterasu-config-runs\<run-id>`, outside every Git
@@ -111,7 +112,7 @@ sequenced messages published by temporary-file rename, with request IDs and
 acknowledgments. Leads check their inbox at task boundaries and report
 progress, blockers, dependency requests, worker ownership, and candidate SHAs
 to their outbox. The coordinator relays cross-lane requests and commits durable
-decisions to the integration ledger. A file written in one worktree is not
+decisions to the mainline coordination ledger. A file written in one worktree is not
 automatically visible in another worktree's copy of that file.
 
 A lead completing a bounded batch returns its handoff and may exit. After
@@ -167,20 +168,21 @@ entry starts `pending`; ownership is not evidence of implementation.
    application, catalog, input, launch, and management work must be reconciled
    with its owners; do not stage, stash, reset, or include it implicitly. Record
    the chosen baseline SHA and any deferred changes in the coordination ledger.
-2. Create a dedicated integration branch `config-parity/integration` and
-   worktree `D:\sources\worktrees\amaterasu-config-integration`. Create six
-   branches `config-parity/<suffix>` and corresponding
+2. Keep the clean repository checkout on `main` as the only landing checkout.
+   Do not create an integration branch or worktree. Create six branches
+   `config-parity/<suffix>` and corresponding
    `D:\sources\worktrees\amaterasu-config-<suffix>` worktrees from the recorded
    baseline, using the suffixes in the table. Check existing branches and paths
-   before creation; verify repository, HEAD, branch, and clean status in each.
+   before creation; verify repository, HEAD, branch, and clean status in each
+   lane and in the main checkout.
    Copy applicable local setup and AGENTS.md using the worktree workflow. If
    provisioning build-enabled worktrees under that workflow, use its required
    `_large` suffix on both branch and directory names and record actual names.
-3. The coordinator is the sole writer of the integration worktree and its coordination
-   ledger, `docs/configuration-coordination.md`. Record the baseline, actual
+3. The coordinator is the sole writer of `main` and its coordination ledger,
+   `docs/configuration-coordination.md`. Record the baseline, actual
    worktree/branch map, coverage-ID assignments, path owners, active writers,
    dependency requests, schema reservations, review assignments, candidate
-   SHAs, and last validated integration SHA there. Other leads send structured
+   SHAs, and validation status there. Other leads send structured
    requests; they never edit this central file from their own branches.
 4. Every lead receives an explicit absolute working directory and checks
    `git rev-parse --show-toplevel` and `git branch --show-current` before edits
@@ -198,16 +200,16 @@ entry starts `pending`; ownership is not evidence of implementation.
    and requesting leads, exact paths, proposed data contract, migration/version
    needs, acceptance tests, dependency SHAs, and blocking status. The receiving
    lead acknowledges ownership and reports delivery or a concrete blocker in
-   its handoff. Review requests and the merge queue at every slice boundary;
+   its handoff. Review requests and the mainline landing queue at every slice boundary;
    an unavailable owner blocks that change instead of inviting another writer.
 
 The default for a cross-domain edit is an owner-authored prerequisite commit.
 For example, an audio setting can require Luna 02 to change NVHTTP persistence
 and stream snapshots, Luna 05 to change catalog overrides, and Luna 06 to change
 the signed route and editor. Luna 04 supplies the contract and runtime tests.
-Land the contract prerequisites first, then let consumers merge the validated
-integration commit into their own branches. Do not independently cherry-pick
-the same dependency into multiple lanes.
+Land contract prerequisites on `main` first. A dependent lane cherry-picks the
+accepted prerequisite commit into its own branch before starting that work. Do
+not independently implement the same dependency in multiple lanes.
 
 If an ownership transfer is necessary, the coordinator records the exact paths, previous
 and new owners, starting SHA, and return condition. The previous owner must
@@ -218,10 +220,10 @@ persisted document version and ABI/protocol change with its file owner before
 implementation. Concurrent settings work must not independently allocate the
 same next document version or overwrite a neighbor's migration.
 
-## Merge queue and review
+## Mainline cherry-pick queue and review
 
 1. Each lead first reviews and integrates its workers' committed slices, then
-   submits a small committed lane slice with its base integration SHA,
+   submits a small committed lane slice with its base SHA,
    exact candidate SHA, stable IDs/scopes, changed paths, dependencies, test
    commands/results, platform evidence, and remaining gaps in its handoff file.
    Run rustfmt, meaningful tests, and strict Clippy before submission. An editor
@@ -231,43 +233,34 @@ same next document version or overwrite a neighbor's migration.
    another Luna Max lead. The author cannot approve its own slice. The coordinator's
    changes and conflict resolutions also require an independent lead's review.
    Consumers review shared contracts and security-sensitive changes before merge.
-3. Freeze the submitted candidate while it is in the queue. With a clean
-   integration worktree, merge that SHA using `git merge --no-ff --no-commit`.
-   Process one candidate at a time in dependency order. On conflicts, abort
-   the trial merge and return the current integration SHA and conflicting
-   paths to the owning leads. They coordinate a correction in their own lane,
-   rerun affected checks, and resubmit for review. Never choose one side blindly
-   for settings schemas, migrations, authorization, or override precedence.
-4. Lightweight worktrees are non-buildable under the worktree policy. First
-   trial-merge the candidate into the clean source checkout, which is reserved
-   for integration validation and final promotion. Run
+3. Freeze the submitted candidate while it is reviewed. With a clean `main`
+   checkout, cherry-pick that SHA directly onto `main`. Process one candidate
+   at a time in dependency order. Resolve clear path conflicts in the main
+   checkout and record the resolution; coordinate with the owner when the
+   intended settings, migration, authorization, or precedence behavior is
+   unclear. Do not merge lane branches or use a separate integration branch.
+4. Lightweight worktrees are non-buildable under the worktree policy. Run
    `cargo fmt --all --check`, `cargo test --workspace --locked`, and
    `cargo clippy --workspace --all-targets --locked -- -D warnings`, plus
    `python scripts/inventory_configuration.py --check`. Run relevant signed
    host/script regressions and `npm test` in `frontend` for editor changes.
    Meet the platform gates in CI and the native qualification requirements of
-   the changed settings. On failure, abort the trial merge, retain the logs,
-   and return the failure to its owner. Keep the last validated integration
-   SHA as the common base until a candidate passes. Abort the trial merge on
-   failure and return the evidence to its owner. Commit each passing merge with
-   the attribution below on the source integration checkout, then fast-forward
-   the integration worktree to that commit.
-5. Publish the accepted SHA to all leads through the coordination ledger.
-   Idle/ready leads merge that SHA into their clean lane branches before starting
-   dependent work; busy leads finish their bounded slice first. Resubmit and
-   revalidate any candidate changed by synchronization. Do not rebase or
+   the changed settings. Cherry-picked work stays on `main` while its validation
+   gaps are recorded; fix failures with reviewed follow-up commits instead of
+   rewriting the shared branch. Partial slices retain `pending` IDs.
+5. Publish the resulting main SHA to all leads through the coordination ledger.
+   A dependent lead cherry-picks needed prerequisite commits into its lane
+   before implementation; busy leads finish their bounded slice first. Resubmit
+   and revalidate any candidate changed by synchronization. Do not rebase or
    force-update another lead's branch.
 6. Only the coordinator updates the shared coverage ledger and consolidated progress
    narrative after independent review confirms all evidence. Keep local and
    platform validation distinct; a test that was not run cannot close a gate.
    Integrate partial improvements with explicit `pending` IDs and missing
    behavior, while reserving `verified` for complete parity.
-7. After a validated batch, coordinate with the destination branch's owner
-   before merging the integration branch back with `--no-ff`. The destination
-   checkout must be clean and free of another active writer. If it advanced,
-   merge its new head into integration and rerun the affected and required
-   gates before promotion. Preserve source branches/worktrees for follow-up;
-   cleanup occurs only after successful promotion and an explicit cleanup task.
+7. `main` is the destination branch. Keep lane branches and worktrees while
+   follow-up slices remain. Remove them only after their work has landed and
+   there are no outstanding reviews or worker commits.
 
 ## Definition of complete
 
@@ -363,7 +356,7 @@ These transport and exposure gaps keep this ID pending.
 
 Each worker commits its owned implementation after rustfmt, meaningful tests,
 and Clippy. Use the repository's Nonary Git identity and include these exact
-lines in every plan commit, including integration commits:
+lines in every plan or coordination commit, including mainline landing updates:
 
 ```text
 Orchestrated By: GPT-6 Luna Max
