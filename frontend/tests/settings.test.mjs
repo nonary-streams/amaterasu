@@ -260,6 +260,16 @@ test("maximum bitrate editor preserves signed source values and reset", () => {
     assert.throws(() => parse(value));
 });
 
+test("minimum frame rate editor preserves default, zero, and fractional targets", () => {
+  const parse = context.Amaterasu.parseMinimumFpsTarget;
+  assert.equal(parse(""), null);
+  assert.equal(parse("  "), null);
+  for (const [input, expected] of [["0", 0], ["20", 20], ["59.94", 59.94], ["1e3", 1000]])
+    assert.equal(parse(input), expected);
+  for (const invalid of ["-1", "1000.01", "Infinity", "NaN", "0x10", "20 FPS", "1e309"])
+    assert.throws(() => parse(invalid));
+});
+
 test("Steam exclusions preserve valid ID and name objects without normalization", () => {
   const exclusions = [
     { id: "730", name: "Counter-Strike 2" },

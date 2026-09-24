@@ -425,6 +425,50 @@ def test_auth_and_crud(console, api):
     catalog_id = created["id"]
     catalog_revision = renamed["revision"]
     catalog_entry = saved_catalog_entry["entry"]
+    fullscreen_entry = {
+        "name": "Manual Playnite Fullscreen",
+        "launch": {"kind": "playnite_fullscreen", "exit_timeout_seconds": 0},
+    }
+    status, fullscreen_created, _ = api.post(
+        "/v1/catalog/create",
+        {"entry": fullscreen_entry, "expected_revision": catalog_revision},
+        administrator,
+    )
+    assert status == 200 and fullscreen_created["ok"], fullscreen_created
+    status, fullscreen_saved, _ = api.post(
+        "/v1/catalog/get", {"id": fullscreen_created["id"]}, administrator
+    )
+    assert status == 200 and fullscreen_saved["entry"]["launch"] == fullscreen_entry["launch"], fullscreen_saved
+    fullscreen_updated_entry = {
+        **fullscreen_entry,
+        "launch": {"kind": "playnite_fullscreen", "exit_timeout_seconds": 300},
+    }
+    status, fullscreen_updated, _ = api.post(
+        "/v1/catalog/update",
+        {
+            "id": fullscreen_created["id"],
+            "entry": fullscreen_updated_entry,
+            "expected_revision": fullscreen_created["revision"],
+        },
+        administrator,
+    )
+    assert status == 200 and fullscreen_updated["ok"], fullscreen_updated
+    status, fullscreen_saved, _ = api.post(
+        "/v1/catalog/get", {"id": fullscreen_created["id"]}, administrator
+    )
+    assert status == 200 and fullscreen_saved["entry"]["launch"] == fullscreen_updated_entry["launch"], fullscreen_saved
+    catalog_revision = fullscreen_updated["revision"]
+    for invalid_launch in (
+        {"kind": "playnite_fullscreen", "exit_timeout_seconds": 301},
+        {"kind": "playnite_fullscreen", "exit_timeout_seconds": 10, "path": game_path},
+        {"kind": "playnite_fullscreen"},
+    ):
+        status, rejected, _ = api.post(
+            "/v1/catalog/create",
+            {"entry": {"name": "Invalid Fullscreen", "launch": invalid_launch}, "expected_revision": catalog_revision},
+            administrator,
+        )
+        assert status == 400 and not rejected["ok"], rejected
     playnite_override_id, playnite_override_value, catalog_revision = test_provider_override_route(
         api, administrator, catalog_id
     )
@@ -450,6 +494,8 @@ def test_auth_and_crud(console, api):
     assert host_settings["video_batch_size_fallback"] is False, host_settings
     assert host_settings["configured_max_bitrate"] is None, host_settings
     assert host_settings["effective_max_bitrate_kbps"] is None, host_settings
+    assert host_settings["configured_minimum_fps_target"] is None, host_settings
+    assert host_settings["effective_minimum_fps_target"] == 20, host_settings
     assert host_settings["stream_audio"] is True, host_settings
     assert host_settings["http_addresses"] == [f"127.0.0.1:{host_settings['port']}"], host_settings
     assert host_settings["https_addresses"] == [f"127.0.0.1:{host_settings['https_port']}"], host_settings
@@ -485,6 +531,7 @@ def test_auth_and_crud(console, api):
         "capture": "wgcc",
         "video_max_batch_size_kb": 20,
         "max_bitrate": 50_000,
+        "minimum_fps_target": 37.5,
         "stream_audio": False,
         "expected_revision": explicit_blank_host["revision"],
     }, administrator)
@@ -497,6 +544,8 @@ def test_auth_and_crud(console, api):
     assert renamed_host["video_batch_size_fallback"] is True, renamed_host
     assert renamed_host["configured_max_bitrate"] == 50_000, renamed_host
     assert renamed_host["effective_max_bitrate_kbps"] == 50_000, renamed_host
+    assert renamed_host["configured_minimum_fps_target"] == 37.5, renamed_host
+    assert renamed_host["effective_minimum_fps_target"] == 37.5, renamed_host
     assert renamed_host["stream_audio"] is False, renamed_host
     assert renamed_host["configured_address_family"] == "ipv4", renamed_host
     assert renamed_host["configured_bind_address"] == "", renamed_host
@@ -530,6 +579,12 @@ def test_auth_and_crud(console, api):
         "expected_revision": renamed_host["revision"],
         "max_bitrate": 2_147_483_648,
     }, administrator)[0] == 400
+    for invalid_target in (-0.1, 1000.1, "20"):
+        assert api.post("/v1/nvhttp/settings_update", {
+            "hostname": "Living Room & Games", "port": renamed_host["port"],
+            "expected_revision": renamed_host["revision"],
+            "minimum_fps_target": invalid_target,
+        }, administrator)[0] == 400
     connection = http.client.HTTPConnection(host, int(port), timeout=5)
     try:
         connection.request("GET", "/serverinfo")
@@ -548,6 +603,8 @@ def test_auth_and_crud(console, api):
     assert moved_host["configured_video_max_batch_size_kb"] == 20, moved_host
     assert moved_host["configured_max_bitrate"] == 50_000, moved_host
     assert moved_host["effective_max_bitrate_kbps"] == 50_000, moved_host
+    assert moved_host["configured_minimum_fps_target"] == 37.5, moved_host
+    assert moved_host["effective_minimum_fps_target"] == 37.5, moved_host
     assert moved_host["stream_audio"] is False, moved_host
     assert moved_host["active_http_port"] == moved_port, moved_host
     assert moved_host["active_https_port"] == moved_port - 5, moved_host
@@ -845,6 +902,57 @@ def test_auth_and_crud(console, api):
     status, blocked_playnite_refresh, _ = api.post("/v1/playnite/refresh", token=administrator)
     assert status == 200 and not blocked_playnite_refresh["ok"], blocked_playnite_refresh
     assert blocked_playnite_refresh["code"] == "playnite_disabled", blocked_playnite_refresh
+    if sys.platform == "win32":
+        status, fullscreen_settings, _ = api.post(
+            "/v1/playnite/settings_update",
+            {
+                **playnite_values,
+                "enabled": True,
+                "fullscreen_entry_enabled": True,
+                "expected_revision": playnite_revision,
+            },
+            administrator,
+        )
+        assert status == 200 and fullscreen_settings["ok"], fullscreen_settings
+        synthetic = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, fullscreen_catalog, _ = api.post("/v1/catalog/list", token=administrator)
+            assert status == 200 and fullscreen_catalog["ok"], fullscreen_catalog
+            synthetic = next(
+                (
+                    row for row in fullscreen_catalog["entries"]
+                    if row["entry"]["name"] == "Playnite (Fullscreen)"
+                    and row["entry"]["launch"]["kind"] == "playnite_fullscreen"
+                ),
+                None,
+            )
+            if synthetic is not None:
+                break
+            time.sleep(0.05)
+        assert synthetic is not None, "Playnite Fullscreen entry was not created"
+        status, managed, _ = api.post(
+            "/v1/catalog/delete",
+            {"id": synthetic["id"], "expected_revision": fullscreen_catalog["revision"]},
+            administrator,
+        )
+        assert status == 200 and managed.get("error", {}).get("code") == "provider_entry_managed", managed
+        status, restored_settings, _ = api.post(
+            "/v1/playnite/settings_update",
+            {**playnite_values, "expected_revision": fullscreen_settings["revision"]},
+            administrator,
+        )
+        assert status == 200 and restored_settings["ok"], restored_settings
+        playnite_revision = restored_settings["revision"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, fullscreen_catalog, _ = api.post("/v1/catalog/list", token=administrator)
+            assert status == 200 and fullscreen_catalog["ok"], fullscreen_catalog
+            if all(row["id"] != synthetic["id"] for row in fullscreen_catalog["entries"]):
+                break
+            time.sleep(0.05)
+        assert all(row["id"] != synthetic["id"] for row in fullscreen_catalog["entries"]), fullscreen_catalog
+        catalog_revision = fullscreen_catalog["revision"]
     token = console.request("amaterasu.authentication/1", {"action": "issue_token", "scopes": ["catalog.read"], "ttl_seconds": 3600})
     assert token["ok"], token
     status, result, _ = api.post("/v1/catalog/list", token=token["bearer"])
@@ -996,6 +1104,8 @@ def main():
             assert host_settings["video_batch_size_fallback"] is True, host_settings
             assert host_settings["configured_max_bitrate"] == 50_000, host_settings
             assert host_settings["effective_max_bitrate_kbps"] == 50_000, host_settings
+            assert host_settings["configured_minimum_fps_target"] == 37.5, host_settings
+            assert host_settings["effective_minimum_fps_target"] == 37.5, host_settings
             assert host_settings["stream_audio"] is False, host_settings
             reset_revision = host_settings["revision"]
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
@@ -1046,6 +1156,7 @@ def main():
                 "capture": None,
                 "video_max_batch_size_kb": None,
                 "max_bitrate": None,
+                "minimum_fps_target": None,
                 "stream_audio": True,
                 "expected_revision": reset_revision,
             }, relogged["bearer"])
@@ -1059,20 +1170,22 @@ def main():
             assert reset_host["video_batch_size_fallback"] is False, reset_host
             assert reset_host["configured_max_bitrate"] is None, reset_host
             assert reset_host["effective_max_bitrate_kbps"] is None, reset_host
+            assert reset_host["configured_minimum_fps_target"] is None, reset_host
+            assert reset_host["effective_minimum_fps_target"] == 20, reset_host
             assert reset_host["stream_audio"] is True, reset_host
             assert reset_host["address_family"] == "ipv4", reset_host
             assert reset_host["bind_address"] == "127.0.0.1", reset_host
             console.eof()
         finally:
             console.close()
-    print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, token persistence/revocation,")
+    print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle CAS and restart persistence, manual Playnite Fullscreen validation, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
     print("Moonlight hostname/port live rebind, capture backend/output and audio policy persistence,")
     print("certificate-bound FEC/audio override CAS and restart persistence,")
     print("duplicate client-ID isolation and pairing admin scope enforcement,")
     print("Steam settings CAS, discovery, authorized artwork retrieval and restart persistence,")
     print("Lutris settings CAS, platform policy and restart persistence,")
-    print("Playnite settings CAS, refresh policy and restart persistence,")
+    print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
     print("session restart invalidation,")
     print("input policy CAS, Right Alt and repeat settings, legacy field omission and restart persistence, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 

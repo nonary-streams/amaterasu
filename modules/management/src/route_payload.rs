@@ -895,6 +895,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "capture",
                     "video_max_batch_size_kb",
                     "max_bitrate",
+                    "minimum_fps_target",
                 ],
             )?;
             let hostname = text(object, "hostname")?;
@@ -968,9 +969,66 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }) {
                 return Err(INVALID);
             }
+            if object.get("minimum_fps_target").is_some_and(|value| {
+                !value.is_null()
+                    && !value.as_f64().is_some_and(|target| {
+                        target.is_finite() && (0.0..=1000.0).contains(&target)
+                    })
+            }) {
+                return Err(INVALID);
+            }
             Ok(())
         }
         _ => Err(INVALID),
+    }
+}
+
+#[cfg(test)]
+mod nvhttp_tests {
+    use super::*;
+
+    #[test]
+    fn minimum_fps_target_update_accepts_null_zero_and_fractional_values() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        for target in [
+            Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(59.94),
+            serde_json::json!(1000),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host",
+                "port": 47989,
+                "expected_revision": 0,
+                "minimum_fps_target": target,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+        for target in [
+            serde_json::json!(-0.1),
+            serde_json::json!(1000.1),
+            serde_json::json!("20"),
+            serde_json::json!(false),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host",
+                "port": 47989,
+                "expected_revision": 0,
+                "minimum_fps_target": target,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
     }
 }
 

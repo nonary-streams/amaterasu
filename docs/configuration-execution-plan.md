@@ -65,8 +65,12 @@ with executable or working-directory evidence inside the canonical install
 tree, plus their descendants. Stop signals only tracked identities through
 pidfds after revalidation; the Steam launcher/client is never signaled.
 Without a usable install directory, liveness remains unknown and stop only
-releases the stream. Linux runtime qualification, Windows Steam process
-tracking, and Gamescope handoff remain pending.
+releases the stream. On Windows, the tracker likewise associates only new
+same-user game processes with canonical install-tree image evidence and
+creation-time identity, expands to verified descendants, and rechecks the
+same process handle before a graceful window close or forced stop. Native
+tests cover both stop paths and unrelated processes. Linux runtime
+qualification and Gamescope capture-source handoff remain pending.
 
 The global base port now derives HTTP, HTTPS, RTSP, and streaming UDP ports.
 IPv4 and IPv6 listeners can coexist where the startup policy requests both.
@@ -123,7 +127,12 @@ than exceeding the configured cap. Vibeshine's live `/bitrate` update, higher
 absolute ceiling, client-requested bitrate parsing, and encoder-specific
 range behavior remain pending. The
 `minimum_fps_target` source initializer is 20 even though its documentation
-lists zero. Its capture wait and duplicate-frame behavior remains pending.
+lists zero. Product document v9 stores a nullable 0..1000 finite target,
+snapshots the effective value at launch, and uses an owned accepted-frame
+cache to repeat idle video with increasing frame metadata. Zero follows the
+negotiated stream FPS. New captures take precedence; busy encoder submissions
+do not cause an unbounded repeat burst. Live changes apply to future streams.
+Platform-specific encoder and capture timing still need qualification.
 
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when
@@ -156,5 +165,11 @@ Windows process verification remain pending.
 Lutris now imports complete current-user Linux library snapshots with
 exclusions and optional Steam deduplication. Lutris settings and status have a
 signed management editor;
-cross-session discovery, generic-launch eligibility after disabling the
-provider, and selective cleanup when stale removal is disabled remain pending.
+complete scans now remove currently discovered entries that become excluded,
+non-importable under Steam policy, or shadowed by direct Steam entries even
+when stale removal is disabled. Explicit excluded IDs also remove older rows
+absent from the scan, while unrelated disappeared entries remain retained.
+Cross-session discovery, generic-launch eligibility after disabling the
+provider, and name-only exclusions of rows absent from the scan remain
+pending. The last case needs a Lutris-authorized catalog inventory of prior
+attached entry names at a stable collection revision.

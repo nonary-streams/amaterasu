@@ -94,6 +94,8 @@ namespace Amaterasu {
     video_batch_size_fallback: boolean;
     configured_max_bitrate: number | null;
     effective_max_bitrate_kbps: number | null;
+    configured_minimum_fps_target: number | null;
+    effective_minimum_fps_target: number;
     stream_audio: boolean;
     http_addresses: string[] | null;
     https_addresses: string[] | null;

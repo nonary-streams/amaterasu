@@ -182,6 +182,16 @@ namespace Amaterasu {
     return bitrate;
   }
 
+  export function parseMinimumFpsTarget(value: string): number | null {
+    if (value.trim() === "") return null;
+    if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value))
+      throw new Error("Minimum frame rate must be a finite number from 0 to 1000, or blank to use 20.");
+    const target = Number(value);
+    if (!Number.isFinite(target) || target < 0 || target > 1000)
+      throw new Error("Minimum frame rate must be a finite number from 0 to 1000, or blank to use 20.");
+    return target;
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -1526,6 +1536,17 @@ namespace Amaterasu {
             : String(settings.configured_max_bitrate),
         );
         maxBitrate.placeholder = "No host cap";
+        const minimumFpsTarget = input(
+          "minimum_fps_target",
+          settings.configured_minimum_fps_target === null
+            ? ""
+            : String(settings.configured_minimum_fps_target),
+          "number",
+        );
+        minimumFpsTarget.min = "0";
+        minimumFpsTarget.max = "1000";
+        minimumFpsTarget.step = "any";
+        minimumFpsTarget.placeholder = "Default (20)";
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1569,6 +1590,11 @@ namespace Amaterasu {
             maxBitrate,
             `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`,
           ),
+          field(
+            "Minimum frame rate (FPS)",
+            minimumFpsTarget,
+            `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`,
+          ),
           ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           el(
             "p",
@@ -1597,6 +1623,7 @@ namespace Amaterasu {
               stream_audio: streamAudio.checked,
               video_max_batch_size_kb: parseVideoMaxBatchSize(videoBatchSize.value),
               max_bitrate: parseMaxBitrate(maxBitrate.value),
+              minimum_fps_target: parseMinimumFpsTarget(minimumFpsTarget.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");
