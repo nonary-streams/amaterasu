@@ -1,4 +1,75 @@
 namespace Amaterasu {
+  export function parseSteamExclusions(value: string): SteamExclusion[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value) as unknown;
+    } catch {
+      throw new Error("Excluded games must be valid JSON.");
+    }
+    if (!Array.isArray(parsed) || parsed.length > 256)
+      throw new Error("Excluded games must be a JSON array with at most 256 entries.");
+
+    const ids = new Set<string>();
+    const names = new Set<string>();
+    for (const item of parsed) {
+      if (typeof item !== "object" || item === null || Array.isArray(item))
+        throw new Error("Each excluded game must be an object.");
+      const exclusion = item as Record<string, unknown>;
+      if (Object.keys(exclusion).some((key) => key !== "id" && key !== "name"))
+        throw new Error("Excluded games may only contain id and name fields.");
+      const id = exclusion.id;
+      const name = exclusion.name;
+      if (id === undefined && name === undefined)
+        throw new Error("Each excluded game needs an app ID or name.");
+
+      if (id !== undefined) {
+        if (
+          typeof id !== "string" ||
+          !/^[1-9][0-9]*$/.test(id) ||
+          !Number.isSafeInteger(Number(id)) ||
+          Number(id) > 0xffff_ffff ||
+          String(Number(id)) !== id
+        )
+          throw new Error("Steam app IDs must be canonical nonzero decimal strings.");
+        if (ids.has(id)) throw new Error("Excluded Steam app IDs must be unique.");
+        ids.add(id);
+      }
+
+      if (name !== undefined) {
+        if (
+          typeof name !== "string" ||
+          name.trim().length === 0 ||
+          new TextEncoder().encode(name).length > 512 ||
+          /[\u0000-\u001f\u007f-\u009f]/.test(name)
+        )
+          throw new Error("Exclusion names must contain 1–512 printable UTF-8 bytes.");
+        if (id === undefined) {
+          const normalized = name.toLowerCase();
+          if (names.has(normalized))
+            throw new Error("Name-only exclusions must be unique, ignoring case.");
+          names.add(normalized);
+        }
+      }
+    }
+    return parsed as SteamExclusion[];
+  }
+
+  export function steamStatusDescription(status: SteamStatus): string {
+    if (status.settings_ready === false)
+      return "Provider settings are still loading; runtime state is not confirmed yet.";
+    if (typeof status.enabled !== "boolean")
+      return "The provider did not report whether Steam discovery is enabled.";
+    if (!status.enabled)
+      return "Steam discovery is disabled; no scan is running.";
+    const scanState = status.scanning
+      ? "scan in progress"
+      : status.complete
+        ? "last scan complete"
+        : "no complete scan is available";
+    const warningCount = `${status.warning_count} ${status.warning_count === 1 ? "warning" : "warnings"}`;
+    return `Steam discovery enabled · ${scanState} · ${status.game_count} games · ${warningCount}.`;
+  }
+
   export function renderSettings(context: PageContext): void {
     const area = el("div");
     const hostArea = el("div");
@@ -25,7 +96,19 @@ namespace Amaterasu {
         const form = el("form", "settings-form");
         const enabled = input("steam_enabled", "", "checkbox");
         enabled.checked = settings.values.enabled;
+        const autoSync = input("steam_auto_sync", "", "checkbox");
+        autoSync.checked = settings.values.auto_sync;
+        const exclusions = el("textarea");
+        exclusions.name = "steam_exclude_games";
+        exclusions.rows = 10;
+        exclusions.spellcheck = false;
+        exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
         const status = el("div");
+        const runtimeStatus = el(
+          "p",
+          "muted",
+          "Loading current provider status…",
+        );
         const save = el("button", "button primary", "Save Steam settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
@@ -33,8 +116,19 @@ namespace Amaterasu {
           field(
             "Enable Steam library discovery",
             enabled,
-            "Catalog synchronization and Steam launch support are not available yet.",
+            "Controls whether the provider exposes discovered Steam games and accepts scans.",
           ),
+          field(
+            "Automatic synchronization",
+            autoSync,
+            "Controls automatic scans of the configured Steam library roots.",
+          ),
+          field(
+            "Excluded games (JSON)",
+            exclusions,
+            'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.',
+          ),
+          runtimeStatus,
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -43,6 +137,8 @@ namespace Amaterasu {
           void runAction(save, status, async () => {
             await context.api.post("steam/settings_update", {
               enabled: enabled.checked,
+              auto_sync: autoSync.checked,
+              exclude_games: parseSteamExclusions(exclusions.value),
               expected_revision: settings.revision,
             });
             context.notify("Steam discovery setting saved.");
@@ -50,9 +146,26 @@ namespace Amaterasu {
           });
         });
         steamArea.replaceChildren(panel("Steam", form));
+        void loadSteamRuntimeStatus(runtimeStatus, context);
       } catch (error) {
         if (context.content.isConnected)
           steamArea.replaceChildren(errorPanel(error, loadSteam));
+      }
+    }
+    async function loadSteamRuntimeStatus(
+      target: HTMLElement,
+      context: PageContext,
+    ): Promise<void> {
+      try {
+        const status = await context.api.post<SteamStatus>("steam/status");
+        if (!target.isConnected) return;
+        target.textContent = steamStatusDescription(status);
+      } catch (error) {
+        if (!target.isConnected) return;
+        target.textContent =
+          error instanceof ApiError && error.code === "forbidden"
+            ? "Runtime status requires steam.read; settings remain available with configuration access."
+            : "Current provider status is unavailable; settings remain editable.";
       }
     }
     async function loadHost(): Promise<void> {

@@ -499,16 +499,48 @@ mod tests {
 
         let update = resolve("/v1/steam/settings_update").unwrap();
         assert_eq!(update.scope, Some("configuration.write"));
+        let valid = serde_json::json!({
+            "enabled":true,
+            "auto_sync":false,
+            "exclude_games":[
+                {"id":"730","name":"Counter-Strike 2"},
+                {"name":"Portal 2"}
+            ],
+            "expected_revision":0
+        });
         assert_eq!(
-            payload(update, br#"{"enabled":true,"expected_revision":0}"#).unwrap()["action"],
+            payload(update, &serde_json::to_vec(&valid).unwrap()).unwrap()["action"],
             "settings_update"
         );
-        for rejected in [
-            br#"{"enabled":true}"#.as_slice(),
-            br#"{"enabled":1,"expected_revision":0}"#,
-            br#"{"enabled":true,"expected_revision":0,"owner":"other"}"#,
-        ] {
-            assert!(payload(update, rejected).is_err());
+
+        let mut invalid_payloads = vec![
+            serde_json::json!({"enabled":true,"expected_revision":0}),
+            serde_json::json!({"enabled":1,"auto_sync":false,"exclude_games":[],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":0,"exclude_games":[],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"expected_revision":0,"exclude_games":[] ,"owner":"other"}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"name":" "}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"name":"bad\nname"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"name":"x".repeat(513)}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":730}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"0"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"0730"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"4294967296"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"730","name":"Game","extra":true}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"id":"730"},{"id":"730","name":"Game"}],"expected_revision":0}),
+            serde_json::json!({"enabled":true,"auto_sync":false,"exclude_games":[{"name":"Game"},{"name":"game"}],"expected_revision":0}),
+        ];
+        invalid_payloads.push(serde_json::json!({
+            "enabled":true,
+            "auto_sync":false,
+            "exclude_games":(0..257).map(|index| serde_json::json!({"id":(index + 1).to_string()})).collect::<Vec<_>>(),
+            "expected_revision":0
+        }));
+        for invalid in invalid_payloads {
+            assert!(
+                payload(update, &serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "accepted malformed Steam settings payload: {invalid}"
+            );
         }
     }
 }

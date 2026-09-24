@@ -61,7 +61,15 @@ namespace Amaterasu {
   }
   export interface SteamSettings {
     revision: number;
-    values: { enabled: boolean };
+    values: {
+      enabled: boolean;
+      auto_sync: boolean;
+      exclude_games: SteamExclusion[];
+    };
+  }
+  export interface SteamExclusion {
+    id?: string;
+    name?: string;
   }
   export interface Session {
     id: number;
@@ -103,6 +111,7 @@ namespace Amaterasu {
   }
   export interface SteamStatus {
     revision: number;
+    settings_ready?: boolean;
     enabled?: boolean;
     game_count: number;
     scanning: boolean;

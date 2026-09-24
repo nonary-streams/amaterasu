@@ -21,18 +21,31 @@ PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" /
 
 def available_moonlight_port_pair():
     for _ in range(30):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as http_socket:
+        probes = []
+        try:
+            http_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probes.append(http_socket)
             http_socket.bind(("127.0.0.1", 0))
             port = http_socket.getsockname()[1]
             if not 1029 <= port <= 65514:
                 continue
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as https_socket:
-                    https_socket.bind(("127.0.0.1", port - 5))
-            except OSError:
-                continue
+            for socket_type, offset in (
+                (socket.SOCK_STREAM, -5),
+                (socket.SOCK_STREAM, 21),
+                (socket.SOCK_DGRAM, 9),
+                (socket.SOCK_DGRAM, 10),
+                (socket.SOCK_DGRAM, 11),
+            ):
+                probe = socket.socket(socket.AF_INET, socket_type)
+                probes.append(probe)
+                probe.bind(("127.0.0.1", port + offset))
             return port
-    raise AssertionError("no available Moonlight HTTP/HTTPS port pair")
+        except OSError:
+            continue
+        finally:
+            for probe in probes:
+                probe.close()
+    raise AssertionError("no available Moonlight/RTSP/media port set")
 
 
 class Api:
@@ -193,17 +206,40 @@ def test_auth_and_crud(console, api):
         connection.close()
     assert moved_info.findtext("hostname") == "Living Room & Games", ET.tostring(moved_info)
     status, steam_settings, _ = api.post("/v1/steam/settings", token=administrator)
-    assert status == 200 and steam_settings["values"]["enabled"] is False, steam_settings
-    status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
-    assert status == 200 and blocked_refresh["ok"] is False, blocked_refresh
+    assert status == 200 and steam_settings["ok"], steam_settings
+    assert steam_settings["values"] == {
+        "enabled": steam_settings["values"]["enabled"],
+        "auto_sync": False,
+        "exclude_games": [],
+    }, steam_settings
+    if not steam_settings["values"]["enabled"]:
+        status, blocked_refresh, _ = api.post("/v1/steam/refresh", token=administrator)
+        assert status == 200 and blocked_refresh["ok"] is False, blocked_refresh
+    steam_values = {
+        "enabled": True,
+        "auto_sync": True,
+        "exclude_games": [
+            {"id": "731", "name": "Future Game"},
+            {"name": "Uninstalled Title"},
+        ],
+    }
     status, steam_enabled, _ = api.post("/v1/steam/settings_update", {
-        "enabled": True, "expected_revision": steam_settings["revision"],
+        **steam_values, "expected_revision": steam_settings["revision"],
     }, administrator)
-    assert status == 200 and steam_enabled["values"]["enabled"] is True, steam_enabled
+    assert status == 200 and steam_enabled["values"] == steam_values, steam_enabled
     status, stale, _ = api.post("/v1/steam/settings_update", {
-        "enabled": False, "expected_revision": steam_settings["revision"],
+        "enabled": False, "auto_sync": False, "exclude_games": [],
+        "expected_revision": steam_settings["revision"],
     }, administrator)
     assert status == 200 and stale.get("code", stale.get("error", {}).get("code")) == "revision_conflict", stale
+    assert api.post("/v1/steam/settings_update", {
+        **steam_values, "expected_revision": steam_enabled["revision"],
+        "owner": "amaterasu.other",
+    }, administrator)[0] == 400
+    assert api.post("/v1/steam/settings_update", {
+        "enabled": True, "auto_sync": True, "exclude_games": [{}],
+        "expected_revision": steam_enabled["revision"],
+    }, administrator)[0] == 400
     status, refresh, _ = api.post("/v1/steam/refresh", token=administrator)
     assert status == 200 and refresh["ok"], refresh
     deadline = time.monotonic() + 5
@@ -228,7 +264,7 @@ def test_auth_and_crud(console, api):
     # Route actions cannot be swapped through payloads or arbitrary command dispatch.
     assert api.post("/v1/catalog/list", {"action": "create"}, token["bearer"])[0] == 400
     assert api.post("/v1/runtime/request", {"service": "amaterasu.state/1"}, administrator)[0] == 404
-    return token, administrator, moved_port
+    return token, administrator, moved_port, steam_values
 
 
 def test_http_framing(api):
@@ -261,12 +297,18 @@ def main():
             "allow_remote": False,
             "hostname": "Amaterasu-test",
         }
+        bootstrap["policy"]["settings"]["amaterasu.rtsp"] = {
+            "enabled": True,
+            "allow_remote": False,
+            "bind": f"127.0.0.1:{initial_port + 21}",
+            "allowed_principals": ["amaterasu.nvhttp"],
+        }
         bootstrap_path.write_text(json.dumps(bootstrap))
         harness.stage(harness.package(1))
         console = Console(harness)
         try:
             api = Api(console)
-            token, session, moved_port = test_auth_and_crud(console, api)
+            token, session, moved_port, steam_values = test_auth_and_crud(console, api)
             test_http_framing(api)
             console.eof()
         finally:
@@ -284,7 +326,7 @@ def main():
             assert status == 200 and host_settings["hostname"] == "Living Room & Games", host_settings
             assert host_settings["port"] == moved_port and host_settings["active_http_port"] == moved_port, host_settings
             status, steam_settings, _ = api.post("/v1/steam/settings", token=relogged["bearer"])
-            assert status == 200 and steam_settings["values"]["enabled"] is True, steam_settings
+            assert status == 200 and steam_settings["values"] == steam_values, steam_settings
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 200
             # Each read performs auth verification + state lookup and catalog +
             # state lookup: over 512 internal RPCs must not exhaust retained slots.

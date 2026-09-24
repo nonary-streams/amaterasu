@@ -2,6 +2,7 @@
 //! Native domain services retain semantic validation and effect authorization.
 use crate::routes::Route;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 type Object = Map<String, Value>;
 const INVALID: &str = "unexpected or malformed route fields";
@@ -71,8 +72,13 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
         "settings_update" => {
-            fields(object, &["enabled", "expected_revision"], &[])?;
+            fields(
+                object,
+                &["enabled", "auto_sync", "exclude_games", "expected_revision"],
+                &[],
+            )?;
             if object.get("enabled").and_then(Value::as_bool).is_none()
+                || object.get("auto_sync").and_then(Value::as_bool).is_none()
                 || object
                     .get("expected_revision")
                     .and_then(Value::as_u64)
@@ -80,10 +86,55 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
-            Ok(())
+            steam_exclusions(object.get("exclude_games").ok_or(INVALID)?)
         }
         _ => Ok(()),
     }
+}
+
+fn steam_exclusions(value: &Value) -> Result<(), &'static str> {
+    let exclusions = value.as_array().ok_or(INVALID)?;
+    if exclusions.len() > 256 {
+        return Err(INVALID);
+    }
+
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for value in exclusions {
+        let exclusion = value.as_object().ok_or(INVALID)?;
+        if exclusion
+            .keys()
+            .any(|key| !matches!(key.as_str(), "id" | "name"))
+        {
+            return Err(INVALID);
+        }
+        let id = exclusion
+            .get("id")
+            .map(|value| value.as_str().ok_or(INVALID))
+            .transpose()?;
+        let name = exclusion
+            .get("name")
+            .map(|value| value.as_str().ok_or(INVALID))
+            .transpose()?;
+        if id.is_none() && name.is_none() {
+            return Err(INVALID);
+        }
+        if let Some(id) = id {
+            let parsed = id.parse::<u32>().ok().filter(|id| *id != 0);
+            if parsed.is_none_or(|parsed| parsed.to_string() != id) || !ids.insert(id) {
+                return Err(INVALID);
+            }
+        }
+        if let Some(name) = name {
+            if name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+            if id.is_none() && !names.insert(name.to_lowercase()) {
+                return Err(INVALID);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
