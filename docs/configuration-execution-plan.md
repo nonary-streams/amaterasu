@@ -216,9 +216,12 @@ structured executable/arguments form does not yet implement those semantics.
 `global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
 remain pending despite the working structured lifecycle.
 The launch default for an omitted per-application `exit-timeout` now matches
-Vibeshine's 10 seconds; an explicit zero remains distinct. Process parity still
-requires the reference's raw command and elevated launch semantics, environment
-substitution, bare-command lookup, and the source undo timeout behavior.
+Vibeshine's 10 seconds; an explicit zero remains distinct. Structured catalog
+executable and working-directory paths now expand bounded `$()` references,
+trim matching outer quotes, and resolve bare executables through absolute PATH
+entries. Process parity still requires the reference's raw command and elevated
+launch semantics, expansion in other command fields, full Windows quote/PATHEXT
+handling, relative PATH entries, and the source undo timeout behavior.
 
 The Windows global capture output can now be selected by exact provider ID
 and persists through host restart. A launch snapshots that output into RTSP
