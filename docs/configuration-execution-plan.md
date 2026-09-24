@@ -85,9 +85,12 @@ outputs and retains a saved ID even when discovery is unavailable. Automatic
 uses the bootstrap output. Output selection on other supported platforms and
 the complete capture-provider selection policy still need verification.
 The WGC backend now supports an explicit constant-rate mode that reuses the
-last owned frame on an idle read with monotonic frame metadata. It leaves
-event-driven WGC as the default; global `capture = wgcc` routing into this
-mode is still pending.
+last owned frame on an idle read with monotonic frame metadata. Global capture
+modes `auto`, `ddx`, `wgc`, and `wgcc` persist and route through each stream
+launch; explicit WGC modes fail when that provider is unavailable. The `auto`
+mode retains the startup provider. Vibeshine's virtual-display/game-context
+selection for `auto`, per-app/client capture overrides, and Linux/macOS capture
+support remain pending.
 
 Keyboard and mouse settings now persist and gate native input events; disabling
 a category releases its held keys or buttons and reports pending cleanup when
@@ -106,10 +109,14 @@ Playnite now imports only complete, bounded extension snapshots through its
 own provider. Explicit uninstalled IDs can remove still-owned catalog entries
 when automatic synchronization and its durable cleanup setting are enabled;
 missing, excluded, and incomplete records cannot imply uninstall. Its settings
-and status have a management editor. Typed GUID launches use authenticated
-extension IPC and hold the session lease until correlated stop proof. TTL and
-replacement cleanup, focus behavior, process verification, fullscreen entry,
-and extension management remain pending.
+and status have a management editor. TTL cleanup uses first-import timestamps
+and only expires eligible, unplayed Playnite entries; the default is 14 days,
+and zero disables this policy. Recent-selection cleanup can require a bounded
+replacement count, with both policies tied to a revision-checked provider
+inventory and reason-specific, replay-safe tombstones. Typed GUID launches use
+authenticated extension IPC and hold the session lease until correlated stop
+proof. Focus behavior, process verification, fullscreen entry, and extension
+management remain pending.
 
 Lutris now imports complete current-user Linux library snapshots with
 exclusions and optional Steam deduplication. Lutris settings and status have a
