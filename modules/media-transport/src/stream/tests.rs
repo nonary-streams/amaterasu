@@ -27,6 +27,7 @@ pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> 
             wire_payload_bytes: if encrypted { 16 } else { 4 },
             ssrc: 0,
         },
+        stream_audio: true,
         encryption: encrypted.then(|| Encryption {
             key_hex: "000102030405060708090a0b0c0d0e0f".into(),
             key_id: 9,
@@ -227,6 +228,48 @@ fn invalid_media_changes_no_queued_bytes_or_sequence_and_eos_closes_only_its_med
         unsafe { stream.submit_audio(&audio_packet(&[0x94, 1, 2, 3], 0)) },
         STATUS_OK
     );
+}
+
+#[test]
+fn disabled_audio_accepts_only_eos_and_never_queues_audio_datagrams() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.stream_audio = false;
+    settings.audio.wire_payload_bytes = 16;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    assert_eq!(stream.encryption(), (false, false));
+
+    let opus = [0x94, 1, 2, 3];
+    assert_eq!(
+        unsafe { stream.submit_audio(&audio_packet(&opus, 0)) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(stream.delivery.queued(), 0);
+    assert_eq!(stream.audio_sequence, None);
+
+    let eos = EncodedAudioPacket {
+        flags: AUDIO_PACKET_END_OF_STREAM,
+        frames: 0,
+        data: std::ptr::null(),
+        len: 0,
+        ..audio_packet(&[], 0)
+    };
+    assert_eq!(unsafe { stream.submit_audio(&eos) }, STATUS_OK);
+    assert_eq!(stream.state(), "sending");
+    assert_eq!(
+        unsafe { stream.submit_audio(&audio_packet(&opus, 0)) },
+        MEDIA_CLOSED
+    );
+    let video_eos = EncodedPacket {
+        flags: FLAG_END_OF_STREAM,
+        data: std::ptr::null(),
+        len: 0,
+        ..video_packet(&[], 0)
+    };
+    assert_eq!(unsafe { stream.submit_video(&video_eos) }, STATUS_OK);
+    assert_eq!(stream.state(), "drained");
+    assert_eq!(stream.delivery.queued(), 0);
+    assert!(audio.recv(&mut [0; 32]).is_err());
 }
 
 #[test]

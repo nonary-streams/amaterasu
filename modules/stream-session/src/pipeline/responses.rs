@@ -78,14 +78,16 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
     let video_port = optional_port(&payload["video_port"])?;
     let audio_port = optional_port(&payload["audio_port"])?;
     if payload["peer_ip"] != json!(config.peer_ip)
+        || payload["stream_audio"] != config.stream_audio
         || peer_discovery != expected_discovery
         || payload["video"] != json!(config.video)
         || payload["audio"]["packet_ms"] != config.audio.packet_ms
         || payload["audio"]["channels"] != 2
         || payload["audio"]["wire_payload_bytes"] != record.wire_audio_bytes
         || payload["video_encrypted"] != config.encrypt_video
-        || payload["audio_encrypted"] != config.encrypt_audio
-        || payload["permit_legacy_audio_iv_wrap"] != config.permit_legacy_audio_iv_wrap
+        || payload["audio_encrypted"] != (config.stream_audio && config.encrypt_audio)
+        || payload["permit_legacy_audio_iv_wrap"]
+            != (config.stream_audio && config.permit_legacy_audio_iv_wrap)
     {
         return Err("invalid_transport_response");
     }

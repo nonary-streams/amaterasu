@@ -15,6 +15,7 @@ struct Fake {
     control_failed: bool,
     videos_sent: Vec<(u32, Vec<u8>)>,
     audio_sent: Vec<Vec<u8>>,
+    audio_flags: Vec<u32>,
     pcm_sent: usize,
     encoder_drains: usize,
     transport_drains: usize,
@@ -63,6 +64,7 @@ impl Backend for Fake {
         // SAFETY: pump retains initialized encoded bytes throughout submission.
         self.audio_sent
             .push(unsafe { packet.bytes().unwrap() }.to_vec());
+        self.audio_flags.push(packet.flags);
         Ok(true)
     }
     fn drain_encoder(&mut self) -> PlaneResult<bool> {
@@ -184,6 +186,38 @@ fn blocked_audio_output_stops_encoder_reads_and_pcm_capture() {
     pump.tick(true).unwrap();
     assert_eq!(pump.backend.audio_sent, [vec![0xf4, 1, 2]]);
     assert_eq!(pump.backend.pcm_sent, 1);
+}
+
+#[test]
+fn disabled_audio_retries_only_eos_without_polling_capture_or_encoder() {
+    let mut backend = Fake {
+        audio_busy: true,
+        ..Fake::default()
+    };
+    backend.videos.push_back(video(&[], FLAG_END_OF_STREAM, 0));
+    backend.audios.push_back(audio(false));
+    backend.pcms.push_back(pcm());
+    let mut pump = Pump::with_audio(backend, false);
+
+    pump.tick(true).unwrap();
+    assert!(pump.video_ended);
+    assert!(!pump.audio_ended);
+    assert_eq!(pump.backend.audio_reads, 0);
+    assert_eq!(pump.backend.pcm_reads, 0);
+    assert!(pump.backend.audio_sent.is_empty());
+    assert_eq!(pump.backend.transport_drains, 0);
+
+    pump.backend.audio_busy = false;
+    pump.tick(true).unwrap();
+    assert!(pump.audio_ended);
+    assert_eq!(pump.backend.audio_reads, 0);
+    assert_eq!(pump.backend.pcm_reads, 0);
+    assert_eq!(pump.backend.pcm_sent, 0);
+    assert_eq!(pump.backend.encoder_drains, 0);
+    assert_eq!(pump.backend.audio_sent, [Vec::<u8>::new()]);
+    assert_eq!(pump.backend.audio_flags, [AUDIO_PACKET_END_OF_STREAM]);
+    assert_eq!(pump.backend.transport_drains, 1);
+    assert!(pump.transport_draining);
 }
 
 #[test]

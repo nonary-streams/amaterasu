@@ -100,6 +100,8 @@ pub struct PrepareConfig {
     #[serde(default)]
     pub audio: AudioWire,
     #[serde(default = "yes")]
+    pub stream_audio: bool,
+    #[serde(default = "yes")]
     pub encrypt_video: bool,
     #[serde(default = "yes")]
     pub encrypt_audio: bool,
@@ -253,9 +255,10 @@ pub struct StartConfig {
     pub audio_endpoint: String,
 }
 impl StartConfig {
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
         if !valid_label(&self.output, 512)
-            || !valid_label(&self.audio_endpoint, 4096)
+            || (stream_audio && !valid_label(&self.audio_endpoint, 4096))
+            || (!self.audio_endpoint.is_empty() && !valid_label(&self.audio_endpoint, 4096))
             || !self.configuration.valid()
         {
             return Err("invalid_start_configuration");
@@ -353,7 +356,14 @@ mod tests {
         );
         assert_eq!((config.audio.packet_ms, config.audio.bitrate), (10, 128000));
         let start: StartConfig = serde_json::from_value(start_json()).unwrap();
-        assert!(start.validate().is_ok());
+        assert!(start.validate(true).is_ok());
+        let without_audio: StartConfig = serde_json::from_value(json!({
+            "output":"display-1","encoder":0,"audio_endpoint":"",
+            "configuration":{"width":1920,"height":1080,"fps":60,"bitrate":5000000}
+        }))
+        .unwrap();
+        assert!(without_audio.validate(false).is_ok());
+        assert!(without_audio.validate(true).is_err());
         assert!(matches!(start.capture_provider, CaptureProvider::Dxgi));
         assert_eq!(start.configuration.max_reference_frames, 0);
         assert!(
@@ -547,7 +557,7 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<StartConfig>(config)
                     .unwrap()
-                    .validate(),
+                    .validate(true),
                 Err("invalid_start_configuration")
             );
         }
@@ -557,7 +567,7 @@ mod tests {
             assert!(
                 serde_json::from_value::<StartConfig>(config)
                     .unwrap()
-                    .validate()
+                    .validate(true)
                     .is_err()
             );
         }

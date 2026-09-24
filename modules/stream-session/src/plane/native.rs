@@ -9,8 +9,8 @@ use std::{
 
 pub(super) struct NativeBackend {
     video: NativeBinding,
-    capture: NativeBinding,
-    encoder: NativeBinding,
+    capture: Option<NativeBinding>,
+    encoder: Option<NativeBinding>,
     media: NativeBinding,
     control: NativeBinding,
     handles: Handles,
@@ -18,10 +18,26 @@ pub(super) struct NativeBackend {
 
 impl NativeBackend {
     pub(super) fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
+        let video = bind::<VideoApi>(runtime, "amaterasu.video/1")?;
+        let (capture, encoder) = match (
+            handles.stream_audio,
+            handles.audio_capture,
+            handles.audio_encoder,
+        ) {
+            (true, Some(_), Some(_)) => (
+                Some(bind::<AudioCaptureApi>(runtime, "amaterasu.audio/1")?),
+                Some(bind::<AudioEncoderApi>(
+                    runtime,
+                    "amaterasu.audio-encode/1",
+                )?),
+            ),
+            (false, None, None) => (None, None),
+            _ => return Err("invalid_audio_handles"),
+        };
         Ok(Self {
-            video: bind::<VideoApi>(runtime, "amaterasu.video/1")?,
-            capture: bind::<AudioCaptureApi>(runtime, "amaterasu.audio/1")?,
-            encoder: bind::<AudioEncoderApi>(runtime, "amaterasu.audio-encode/1")?,
+            video,
+            capture,
+            encoder,
             media: bind::<MediaTransportApi>(runtime, "amaterasu.media-transport/1")?,
             control: bind::<ControlTransportApi>(runtime, "amaterasu.control-transport/1")?,
             handles,
@@ -78,12 +94,14 @@ impl Backend for NativeBackend {
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>> {
         let mut output = Delivery::default();
         // SAFETY: callback copies initialized PCM before the provider borrow ends.
-        let api = unsafe { self.capture.table::<AudioCaptureApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
+        let capture = self.capture.as_ref().ok_or("audio_disabled")?;
+        let stream = self.handles.audio_capture.ok_or("audio_disabled")?;
+        let api =
+            unsafe { capture.table::<AudioCaptureApi>() }.map_err(|_| "native_layout_mismatch")?;
         let status = unsafe {
             (api.read_audio)(
-                self.capture.context(),
-                self.handles.audio_capture,
+                capture.context(),
+                stream,
                 AudioSink {
                     context: (&mut output as *mut Delivery<PcmPacket>).cast(),
                     write: copy_pcm,
@@ -96,12 +114,14 @@ impl Backend for NativeBackend {
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>> {
         let mut output = Delivery::default();
         // SAFETY: stack output and binding outlive the synchronous encoder call.
-        let api = unsafe { self.encoder.table::<AudioEncoderApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
+        let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
+        let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
+        let api =
+            unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
         let status = unsafe {
             (api.receive)(
-                self.encoder.context(),
-                self.handles.audio_encoder,
+                encoder.context(),
+                stream,
                 AudioPacketSink {
                     context: (&mut output as *mut Delivery<AudioPacket>).cast(),
                     write: copy_audio,
@@ -122,9 +142,11 @@ impl Backend for NativeBackend {
 
     fn submit_pcm(&mut self, frame: &AudioFrame) -> PlaneResult<bool> {
         // SAFETY: frame points into the plane's retained initialized PCM allocation.
-        let api = unsafe { self.encoder.table::<AudioEncoderApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe { (api.submit)(self.encoder.context(), self.handles.audio_encoder, frame) })
+        let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
+        let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
+        let api =
+            unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
+        accepted(unsafe { (api.submit)(encoder.context(), stream, frame) })
     }
 
     fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool> {
@@ -138,9 +160,11 @@ impl Backend for NativeBackend {
 
     fn drain_encoder(&mut self) -> PlaneResult<bool> {
         // SAFETY: binding and owned stream ID are retained by the pipeline.
-        let api = unsafe { self.encoder.table::<AudioEncoderApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe { (api.drain)(self.encoder.context(), self.handles.audio_encoder) })
+        let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
+        let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
+        let api =
+            unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
+        accepted(unsafe { (api.drain)(encoder.context(), stream) })
     }
 
     fn drain_transport(&mut self) -> PlaneResult<bool> {

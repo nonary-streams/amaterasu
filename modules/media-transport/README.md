@@ -45,6 +45,7 @@ The action and all fields are strict. Open fields:
 | `video_bind`, `audio_bind` | Optional local socket addresses, normally port zero |
 | `video` | Optional `{packet_size:1024,fec_percentage:20,min_parity_shards:2,max_fec_blocks:1}` |
 | `audio` | Required `{packet_ms:5\|10,channels:2,wire_payload_bytes:N,ssrc:0}`; `ssrc` defaults to zero |
+| `stream_audio` | Optional boolean, defaults to `true`; `false` keeps the negotiated audio lane but rejects audio payloads while accepting its EOS marker |
 | `encryption` | Optional `{key_hex:32 hexadecimal characters,key_id:u32,video:bool,audio:bool,permit_legacy_audio_iv_wrap:false}` |
 | `operation_id` | Optional caller-scoped idempotency key, 1–128 bytes without control characters |
 
@@ -83,7 +84,7 @@ port by connecting the socket. Later packets cannot rebind it. The payload is
 bearer evidence supplied by the authenticated session; it is not cryptographic
 sender authentication.
 
-Open replies contain `ok`, `stream`, `peer_ip`, `peer_discovery`, `ready`, destination ports,
+Open replies contain `ok`, `stream`, `peer_ip`, `stream_audio`, `peer_discovery`, `ready`, destination ports,
 `video_local`/`audio_local`, the `video`/`audio` configuration, `video_encrypted`,
 `audio_encrypted`, and `permit_legacy_audio_iv_wrap`. Keys/key IDs are not returned.
 Discovery destination ports are null until the corresponding lane freezes, then

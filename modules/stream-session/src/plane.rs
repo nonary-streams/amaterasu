@@ -13,10 +13,11 @@ const READ_BUDGET: usize = 4;
 #[derive(Clone, Copy)]
 pub struct Handles {
     pub video: u64,
-    pub audio_capture: u64,
-    pub audio_encoder: u64,
+    pub audio_capture: Option<u64>,
+    pub audio_encoder: Option<u64>,
     pub media_transport: u64,
     pub control_transport: u64,
+    pub stream_audio: bool,
 }
 
 pub struct ControlRecord {
@@ -37,7 +38,10 @@ pub struct Plane {
 impl Plane {
     pub fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
         Ok(Self {
-            pump: Pump::new(native::NativeBackend::new(runtime, handles)?),
+            pump: Pump::with_audio(
+                native::NativeBackend::new(runtime, handles)?,
+                handles.stream_audio,
+            ),
         })
     }
 
@@ -71,6 +75,7 @@ trait Backend {
 
 struct Pump<B> {
     backend: B,
+    stream_audio: bool,
     video: VideoAssembly,
     pending_pcm: Option<PcmPacket>,
     pending_audio: Option<AudioPacket>,
@@ -83,9 +88,15 @@ struct Pump<B> {
 }
 
 impl<B: Backend> Pump<B> {
+    #[cfg(test)]
     fn new(backend: B) -> Self {
+        Self::with_audio(backend, true)
+    }
+
+    fn with_audio(backend: B, stream_audio: bool) -> Self {
         Self {
             backend,
+            stream_audio,
             video: VideoAssembly::default(),
             pending_pcm: None,
             pending_audio: None,
@@ -164,6 +175,27 @@ impl<B: Backend> Pump<B> {
     }
 
     fn pump_audio(&mut self) -> PlaneResult<()> {
+        if !self.stream_audio {
+            if !self.audio_ended {
+                let end = EncodedAudioPacket {
+                    codec: CODEC_OPUS,
+                    flags: AUDIO_PACKET_END_OF_STREAM,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    frames: 0,
+                    data: std::ptr::null(),
+                    len: 0,
+                    timestamp_us: 0,
+                    sequence: 0,
+                };
+                if !self.backend.submit_audio(&end)? {
+                    return Ok(());
+                }
+                self.audio_ended = true;
+            }
+            return Ok(());
+        }
+
         // Output backpressure stops both encoder polling and further PCM capture.
         for _ in 0..READ_BUDGET {
             if let Some(packet) = &self.pending_audio {

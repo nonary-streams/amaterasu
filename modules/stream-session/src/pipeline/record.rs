@@ -205,12 +205,14 @@ impl Record {
                 .copied()
                 .ok_or("missing_component")
         };
+        let audio_handle = |resource| self.config.stream_audio.then(|| get(resource)).transpose();
         Ok(Handles {
             video: get(Resource::Video)?,
-            audio_capture: get(Resource::AudioCapture)?,
-            audio_encoder: get(Resource::AudioEncoder)?,
+            audio_capture: audio_handle(Resource::AudioCapture)?,
+            audio_encoder: audio_handle(Resource::AudioEncoder)?,
             media_transport: get(Resource::Media)?,
             control_transport: get(Resource::Control)?,
+            stream_audio: self.config.stream_audio,
         })
     }
 
@@ -219,6 +221,7 @@ impl Record {
             "ok": true,
             "session": self.id,
             "state": self.state,
+            "stream_audio": self.config.stream_audio,
             "packet_bytes": self.packet_bytes,
             "wire_audio_bytes": self.wire_audio_bytes,
             "control_local": self.control_local,
@@ -250,12 +253,16 @@ impl Record {
             Resource::AudioEncoder => json!({"action":"open","channels":2,
                 "packet_ms":config.audio.packet_ms,"bitrate":config.audio.bitrate}),
             Resource::Media => {
+                let audio_encrypted = config.stream_audio && config.encrypt_audio;
+                let permit_legacy_audio_iv_wrap =
+                    config.stream_audio && config.permit_legacy_audio_iv_wrap;
                 let mut payload = json!({"action":"open","peer_ip":config.peer_ip,
                     "video_bind":config.video_bind,"audio_bind":config.audio_bind,"video":config.video,
+                    "stream_audio":config.stream_audio,
                     "audio":{"packet_ms":config.audio.packet_ms,"channels":2,"wire_payload_bytes":self.wire_audio_bytes},
-                    "encryption":if config.encrypt_video || config.encrypt_audio {
+                    "encryption":if config.encrypt_video || audio_encrypted {
                         json!({"key_hex":config.key_hex,"key_id":config.key_id,"video":config.encrypt_video,
-                            "audio":config.encrypt_audio,"permit_legacy_audio_iv_wrap":config.permit_legacy_audio_iv_wrap})
+                            "audio":audio_encrypted,"permit_legacy_audio_iv_wrap":permit_legacy_audio_iv_wrap})
                     } else { Value::Null }});
                 if let Some(discovery) = &config.discovery {
                     payload["discovery"] = json!(discovery);

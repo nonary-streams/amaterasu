@@ -458,6 +458,7 @@ impl Broker {
                     "video_port":request["video_port"],"audio_port":request["audio_port"],
                     "video_local":"127.0.0.1:50001","audio_local":"127.0.0.1:50002",
                     "video":request["video"],"audio":request["audio"],
+                    "stream_audio":request["stream_audio"],
                     "video_encrypted":request["encryption"]["video"],
                     "audio_encrypted":request["encryption"]["audio"],
                     "permit_legacy_audio_iv_wrap":request["encryption"]["permit_legacy_audio_iv_wrap"]});

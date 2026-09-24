@@ -83,6 +83,61 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
 }
 
 #[test]
+fn disabled_audio_skips_encoder_capture_and_audio_lease_but_keeps_video_plane() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["stream_audio"] = json!(false);
+    let prepared = host.response(1, request);
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["stream_audio"], false);
+    assert_eq!(prepared["packet_bytes"], 0);
+    assert_eq!(prepared["wire_audio_bytes"], 16);
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioEncoder.service())
+    );
+    let media = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service())
+        .unwrap();
+    assert_eq!(media.payload["stream_audio"], false);
+    assert_eq!(media.payload["audio"]["wire_payload_bytes"], 16);
+    assert_eq!(media.payload["encryption"]["audio"], false);
+
+    let mut configuration = start(id);
+    configuration["configuration"]["audio_endpoint"] = json!("");
+    let active = host.response(2, configuration);
+    assert_eq!(active["state"], "active");
+    assert_eq!(host.broker.leases(), 1);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service())
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioCapture.service())
+    );
+    let leases: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.payload["action"] == "acquire")
+        .map(|call| call.payload["resource"].as_str().unwrap())
+        .collect();
+    assert_eq!(leases.len(), 1);
+}
+
+#[test]
 fn start_forwards_required_reference_frame_limit_to_video() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

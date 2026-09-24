@@ -149,7 +149,13 @@ impl Pipeline {
             return true;
         }
         let result = (|| match job.step {
-            Step::Open(resource) => self.opened(record, job, resource, &payload, now, send),
+            Step::Open(resource) => {
+                let result = self.opened(record, job, resource, &payload, now, send);
+                if result.is_ok() && resource == Resource::Video && !record.config.stream_audio {
+                    record.plane = Some(factory(record.handles()?)?);
+                }
+                result
+            }
             Step::Authenticate => {
                 let status = component_status(&payload, record.resources[&Resource::Control]);
                 if status.is_some_and(|value| {
@@ -306,7 +312,13 @@ impl Pipeline {
                 {
                     return Err("invalid_session_response");
                 }
-                job.step = Step::Open(Resource::AudioEncoder);
+                if record.config.stream_audio {
+                    job.step = Step::Open(Resource::AudioEncoder);
+                } else {
+                    record.packet_bytes = 0;
+                    record.wire_audio_bytes = 16;
+                    job.step = Step::Open(Resource::Media);
+                }
             }
             Resource::AudioEncoder => {
                 let bytes = payload["packet_bytes"]
@@ -348,7 +360,11 @@ impl Pipeline {
                     return Err("video_not_running");
                 }
                 configure_absolute_input(record, payload)?;
-                job.step = Step::Open(Resource::AudioCapture);
+                job.step = if record.config.stream_audio {
+                    Step::Open(Resource::AudioCapture)
+                } else {
+                    Step::Activate
+                };
             }
             Resource::AudioCapture => {
                 let format = &payload["format"];

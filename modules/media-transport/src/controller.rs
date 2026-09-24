@@ -244,6 +244,7 @@ fn metadata(id: u64, stream: &Stream) -> Value {
         "audio_local":stream.audio_local,
         "video":stream.video_settings,
         "audio":stream.audio_settings,
+        "stream_audio":stream.stream_audio,
         "video_encrypted":video_encrypted,
         "audio_encrypted":audio_encrypted,
         "permit_legacy_audio_iv_wrap":stream.permit_legacy_audio_iv_wrap

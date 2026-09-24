@@ -15,6 +15,7 @@ struct Host {
     media: MediaTransportApi,
     control: ControlTransportApi,
     released: Vec<u64>,
+    bindings: Vec<String>,
     reject_capture: bool,
 }
 
@@ -50,6 +51,7 @@ impl Host {
                 receive: control,
             },
             released: Vec::new(),
+            bindings: Vec::new(),
             reject_capture: false,
         }
     }
@@ -81,6 +83,7 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
     let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
     let response = match command {
         Command::NativeBind { service, .. } => {
+            host.bindings.push(service.clone());
             if host.reject_capture && service == "amaterasu.audio/1" {
                 Response::Error {
                     code: "denied".into(),
@@ -162,10 +165,22 @@ unsafe extern "C" fn drain(_: *mut c_void, _: u64) -> Status {
 fn handles() -> Handles {
     Handles {
         video: 10,
-        audio_capture: 20,
-        audio_encoder: 30,
+        audio_capture: Some(20),
+        audio_encoder: Some(30),
         media_transport: 40,
         control_transport: 50,
+        stream_audio: true,
+    }
+}
+
+fn disabled_audio_handles() -> Handles {
+    Handles {
+        video: 10,
+        audio_capture: None,
+        audio_encoder: None,
+        media_transport: 40,
+        control_transport: 50,
+        stream_audio: false,
     }
 }
 
@@ -193,6 +208,23 @@ fn partial_native_bind_failure_releases_previously_acquired_table() {
         Some("native_binding_failed")
     );
     assert_eq!(host.released, [1]);
+}
+
+#[test]
+fn disabled_audio_binds_no_capture_or_encoder_tables() {
+    let mut host = Host::new();
+    host.reject_capture = true;
+    let backend = NativeBackend::new(&host.runtime(), disabled_audio_handles()).unwrap();
+    assert_eq!(
+        host.bindings,
+        [
+            "amaterasu.video/1",
+            "amaterasu.media-transport/1",
+            "amaterasu.control-transport/1"
+        ]
+    );
+    drop(backend);
+    assert_eq!(host.released, [1, 4, 5]);
 }
 
 #[test]

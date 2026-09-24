@@ -147,10 +147,6 @@ impl Pipeline {
             remaining,
         } = input;
 
-        if let Err(code) = configuration.validate() {
-            rpc::complete(send, request, error(code));
-            return;
-        }
         let Some(record) = self
             .records
             .get_mut(&session)
@@ -159,6 +155,10 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if let Err(code) = configuration.validate(record.config.stream_audio) {
+            rpc::complete(send, request, error(code));
+            return;
+        }
         if record
             .start
             .as_ref()

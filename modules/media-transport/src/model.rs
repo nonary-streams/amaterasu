@@ -7,6 +7,10 @@ pub const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub const SENDS_PER_STREAM: usize = 16;
 pub const DISCOVERY_TOKEN_BYTES: usize = 16;
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -146,6 +150,8 @@ pub struct Open {
     #[serde(default)]
     pub video: VideoSettings,
     pub audio: AudioSettings,
+    #[serde(default = "yes")]
+    pub stream_audio: bool,
     #[serde(default)]
     pub encryption: Option<Encryption>,
     #[serde(default)]
@@ -184,6 +190,14 @@ impl Open {
             || !self.valid_audio_wire_length()
         {
             return Err("invalid_audio_configuration");
+        }
+        if !self.stream_audio
+            && self
+                .encryption
+                .as_ref()
+                .is_some_and(|encryption| encryption.audio)
+        {
+            return Err("invalid_encryption");
         }
         if let Some(operation) = &self.operation_id {
             validate_operation(operation)?;
@@ -248,4 +262,38 @@ pub fn validate_operation(operation: &str) -> TransportResult<()> {
         return Err("invalid_operation_id");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_stream_audio_field_preserves_the_enabled_legacy_default() {
+        let request: Open = serde_json::from_value(json!({
+            "peer_ip":"127.0.0.1",
+            "video_port":50001,
+            "audio_port":50002,
+            "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":16}
+        }))
+        .unwrap();
+        assert!(request.stream_audio);
+        assert!(request.validate(false).is_ok());
+    }
+
+    #[test]
+    fn disabled_audio_rejects_audio_encryption_configuration() {
+        let request: Open = serde_json::from_value(json!({
+            "peer_ip":"127.0.0.1",
+            "video_port":50001,
+            "audio_port":50002,
+            "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":16},
+            "stream_audio":false,
+            "encryption":{"key_hex":"000102030405060708090a0b0c0d0e0f","key_id":1,
+                "video":true,"audio":true}
+        }))
+        .unwrap();
+        assert_eq!(request.validate(false), Err("invalid_encryption"));
+    }
 }

@@ -16,6 +16,7 @@ pub struct Stream {
     pub peer: IpAddr,
     pub video_settings: VideoSettings,
     pub audio_settings: AudioSettings,
+    pub stream_audio: bool,
     pub video_local: SocketAddr,
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
@@ -61,6 +62,7 @@ impl Stream {
             peer: request.peer_ip,
             video_settings: request.video,
             audio_settings: request.audio,
+            stream_audio: request.stream_audio,
             video_local,
             audio_local,
             delivery,
@@ -213,6 +215,9 @@ impl Stream {
             self.audio_ended = true;
             return STATUS_OK;
         }
+        if !self.stream_audio {
+            return MEDIA_UNSUPPORTED;
+        }
         // SAFETY: packet validation established bounded shape; caller owns allocation validity.
         let opus = unsafe { packet.bytes().unwrap() };
         let discontinuity = match self.reserve_audio(packet, opus) {
@@ -349,7 +354,7 @@ fn ciphers(request: &Open) -> TransportResult<(Option<VideoSealer>, Option<Audio
             } else {
                 None
             },
-            settings.audio.then(|| {
+            (request.stream_audio && settings.audio).then(|| {
                 AudioSealer::new(
                     &key,
                     settings.key_id,
