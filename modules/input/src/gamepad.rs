@@ -2,39 +2,66 @@ use crate::model::{InputError, InputResult};
 use std::time::{Duration, Instant};
 
 pub(crate) const GAMEPAD_SLOT_COUNT: usize = 16;
-const BACK_BUTTON_MASK: u32 = 1 << 5;
-const GUIDE_BUTTON_MASK: u32 = 1 << 10;
+pub(crate) const BACK_BUTTON_MASK: u32 = 1 << 5;
+pub(crate) const GUIDE_BUTTON_MASK: u32 = 1 << 10;
 const GUIDE_PULSE: Duration = Duration::from_millis(100);
 
+#[cfg(any(target_os = "linux", test))]
 const EV_KEY: u16 = 1;
+#[cfg(any(target_os = "linux", test))]
 const EV_ABS: u16 = 3;
 
+#[cfg(any(target_os = "linux", test))]
 const BTN_SOUTH: u16 = 0x130;
+#[cfg(any(target_os = "linux", test))]
 const BTN_EAST: u16 = 0x131;
+#[cfg(any(target_os = "linux", test))]
 const BTN_NORTH: u16 = 0x133;
+#[cfg(any(target_os = "linux", test))]
 const BTN_WEST: u16 = 0x134;
+#[cfg(any(target_os = "linux", test))]
 const BTN_TL: u16 = 0x136;
+#[cfg(any(target_os = "linux", test))]
 const BTN_TR: u16 = 0x137;
+#[cfg(any(target_os = "linux", test))]
 const BTN_TL2: u16 = 0x138;
+#[cfg(any(target_os = "linux", test))]
 const BTN_TR2: u16 = 0x139;
+#[cfg(any(target_os = "linux", test))]
 const BTN_SELECT: u16 = 0x13a;
+#[cfg(any(target_os = "linux", test))]
 const BTN_START: u16 = 0x13b;
+#[cfg(any(target_os = "linux", test))]
 const BTN_MODE: u16 = 0x13c;
+#[cfg(any(target_os = "linux", test))]
 const BTN_THUMBL: u16 = 0x13d;
+#[cfg(any(target_os = "linux", test))]
 const BTN_THUMBR: u16 = 0x13e;
+#[cfg(any(target_os = "linux", test))]
 const BTN_DPAD_UP: u16 = 0x220;
+#[cfg(any(target_os = "linux", test))]
 const BTN_DPAD_DOWN: u16 = 0x221;
+#[cfg(any(target_os = "linux", test))]
 const BTN_DPAD_LEFT: u16 = 0x222;
+#[cfg(any(target_os = "linux", test))]
 const BTN_DPAD_RIGHT: u16 = 0x223;
+#[cfg(any(target_os = "linux", test))]
 const BTN_TRIGGER_HAPPY1: u16 = 0x2c0;
 
+#[cfg(any(target_os = "linux", test))]
 const ABS_X: u16 = 0x00;
+#[cfg(any(target_os = "linux", test))]
 const ABS_Y: u16 = 0x01;
+#[cfg(any(target_os = "linux", test))]
 const ABS_Z: u16 = 0x02;
+#[cfg(any(target_os = "linux", test))]
 const ABS_RX: u16 = 0x03;
+#[cfg(any(target_os = "linux", test))]
 const ABS_RY: u16 = 0x04;
+#[cfg(any(target_os = "linux", test))]
 const ABS_RZ: u16 = 0x05;
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const GAMEPAD_ABSOLUTE_AXES: [(u16, i32, i32); 6] = [
     (ABS_X, i16::MIN as i32, i16::MAX as i32),
     (ABS_Y, i16::MIN as i32, i16::MAX as i32),
@@ -47,6 +74,7 @@ pub(crate) const GAMEPAD_ABSOLUTE_AXES: [(u16, i32, i32); 6] = [
 // These bit values follow Vibeshine's pinned controller packet constants.
 // Bit 11 and bits 22..31 have no assigned button in that protocol and are
 // ignored just as Vibeshine's native button projections ignore them.
+#[cfg(any(target_os = "linux", test))]
 const BUTTON_MAP: [(u32, u16); 21] = [
     (1 << 0, BTN_DPAD_UP),
     (1 << 1, BTN_DPAD_DOWN),
@@ -82,6 +110,7 @@ pub(crate) struct ControllerSnapshot {
     pub right_y: i16,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeGamepadEvent {
     pub event_type: u16,
@@ -89,6 +118,7 @@ pub(crate) struct NativeGamepadEvent {
     pub value: i32,
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn possible_controller_state_after_write_failure(
     previous: ControllerSnapshot,
     next: ControllerSnapshot,
@@ -104,10 +134,12 @@ pub(crate) fn possible_controller_state_after_write_failure(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn possible_axis(previous: i16, next: i16) -> i16 {
     if next == 0 { previous } else { next }
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn controller_state_events(
     previous: ControllerSnapshot,
     next: ControllerSnapshot,
@@ -170,6 +202,7 @@ pub(crate) fn controller_state_events(
     events
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn gamepad_key_codes() -> impl Iterator<Item = u16> {
     BUTTON_MAP
         .into_iter()

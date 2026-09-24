@@ -1,14 +1,18 @@
 use super::Backend;
+#[path = "windows_gamepad.rs"]
+mod windows_gamepad;
 use crate::model::{
     Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
 };
 use std::collections::HashMap;
+use windows_gamepad::WindowsGamepads;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub struct WindowsBackend {
     always_send_scancodes: bool,
     key_rightalt_to_key_win: bool,
     held_key_plans: HashMap<u8, KeyboardPlan>,
+    gamepads: WindowsGamepads,
 }
 
 impl WindowsBackend {
@@ -17,6 +21,7 @@ impl WindowsBackend {
             always_send_scancodes: true,
             key_rightalt_to_key_win: false,
             held_key_plans: HashMap::new(),
+            gamepads: WindowsGamepads::new(),
         }
     }
 
@@ -80,18 +85,17 @@ impl Backend for WindowsBackend {
         true
     }
 
+    fn controller_input_supported(&self) -> bool {
+        self.gamepads.supported()
+    }
+
     fn key_encoding(&self) -> &'static str {
         "windows_scan"
     }
 
     fn validate(&self, event: &Event) -> InputResult<()> {
         event.validate()?;
-        if matches!(event, Event::Controller { .. }) {
-            return Err(InputError::new(
-                "unsupported_event",
-                "Windows SendInput does not create virtual gamepads",
-            ));
-        }
+        self.gamepads.validate(event)?;
         if matches!(
             event,
             Event::Key {
@@ -108,11 +112,16 @@ impl Backend for WindowsBackend {
     }
 
     fn start(&mut self) -> InputResult<()> {
+        self.gamepads.start()?;
+        self.held_key_plans.clear();
         Ok(())
     }
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.validate(event)?;
+        if matches!(event, Event::Controller { .. }) {
+            return self.gamepads.inject(event);
+        }
         let key_identity = match event {
             Event::Key { key, .. } => Self::moonlight_key_identity(key),
             _ => None,
@@ -166,7 +175,17 @@ impl Backend for WindowsBackend {
         self.key_rightalt_to_key_win = enabled;
     }
 
+    fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
+        self.gamepads.advance(now);
+        Ok(())
+    }
+
+    fn set_back_button_timeout(&mut self, timeout_ms: i32) {
+        self.gamepads.set_back_button_timeout(timeout_ms);
+    }
+
     fn stop(&mut self) -> InputResult<()> {
+        self.gamepads.stop()?;
         self.held_key_plans.clear();
         Ok(())
     }
@@ -358,7 +377,6 @@ fn native_input(event: &Event) -> InputResult<INPUT> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{controller::Controller, model::Operation};
 
     fn key(code: u8, normalized: bool, state: KeyState) -> Event {
         Event::Key {
@@ -605,45 +623,23 @@ mod tests {
         };
         let backend = WindowsBackend::new(String::new());
 
+        assert!(backend.supported());
         assert!(!backend.controller_input_supported());
         assert_eq!(
             backend.validate(&event).unwrap_err().code,
-            "unsupported_event"
+            "controller_unavailable"
         );
         assert_eq!(
             native_input(&event).err().unwrap().code,
             "unsupported_event"
         );
 
-        let mut controller = Controller::new(backend, true);
-        let now = std::time::Instant::now();
-        let acquired = controller.handle(
-            "owner",
-            Operation::Acquire {
-                operation_id: None,
-                ttl_ms: Some(1000),
-                back_button_timeout: None,
-            },
-            now,
-            &mut || Ok(()),
+        assert!(
+            backend
+                .validate(&event)
+                .unwrap_err()
+                .message
+                .contains("ViGEm")
         );
-        let lease = acquired["lease"].as_str().unwrap().to_owned();
-        assert_eq!(acquired["controller_input"], false);
-        let rejected = controller.handle(
-            "owner",
-            Operation::Batch {
-                lease: lease.clone(),
-                events: vec![event],
-            },
-            now,
-            &mut || Ok(()),
-        );
-        assert_eq!(rejected["error"]["code"], "unsupported_event");
-        assert!(rejected.get("accepted").is_none());
-
-        let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
-        assert_eq!(status["controller_input"], false);
-        assert_eq!(status["lease"]["token"], lease);
-        assert_eq!(status["lease"]["pressed_count"], 0);
     }
 }

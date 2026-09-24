@@ -103,9 +103,21 @@ request. NVHTTP resolves the certificate-bound client value before the
 application value; when both are absent, input uses the durable global policy.
 Input captures the effective value when the lease starts, so a global settings
 change during a stream affects the next lease and does not change the current
-stream's controller behavior. Windows currently reports controller input
-unsupported. Linux runtime behavior has not been exercised on this Windows host,
-so platform-qualified controller parity remains pending.
+stream's controller behavior. Windows uses ViGEm's Xbox 360 profile when a
+compatible ViGEmBus driver is installed and a vetted `ViGEmClient.dll` is
+deployed in an allowed load location. The lease-start probe connects to the bus
+independently of keyboard and mouse support; a missing DLL or driver leaves those
+input paths available, reports `controller_input:false`, and rejects controller
+snapshots with `controller_unavailable`. Windows creates
+targets only for active slots, projects complete button, trigger, and signed-axis
+snapshots, and removes targets when their active-mask bit clears or the lease
+ends. Timer-driven update failures stay dirty and retry on module ticks; failed
+detach remains owned for release retry. The global and per-lease Back timeout state
+machine is shared across Linux and Windows. Windows currently exposes only the
+wired Xbox 360 XUSB profile and does not select another profile when ViGEm is
+missing. Linux runtime behavior has not been exercised on this Windows host, and
+Windows virtual-device delivery has not been qualified against an installed
+ViGEmBus driver, so platform-qualified controller parity remains pending.
 
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
 VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw
@@ -253,6 +265,23 @@ bypass UIPI, the secure desktop, session boundaries or application restrictions.
 Text/Unicode composition, E1/Pause sequences, layout-aware key translation,
 AltGr/platform remapping and automatic text repeat policy remain adapter work.
 
+Windows loads a vetted ViGEmClient DLL from the application directory or
+System32, resolves the required SDK exports, and probes `vigem_connect` when an
+input lease starts. It retains keyboard and mouse support if the DLL, required
+exports, or ViGEmBus connection is unavailable. Active controller slots create wired Xbox 360 targets
+lazily and receive complete XUSB reports. The XUSB report contains the protocol's
+D-pad, Start/Back, stick clicks, shoulders, Guide, face buttons, two triggers,
+and four signed axes; the protocol's misc button maps to XUSB Guide, while paddle
+and touchpad bits without an XUSB equivalent are ignored. Successful removal
+detaches the target and frees its SDK object. If removal fails, the slot and
+target remain owned for retry; connection teardown
+disconnects from ViGEm before freeing remaining SDK target objects. The backend
+does not bundle or install a driver or SDK DLL, implement the VHF/UMDF protocol,
+create DS4 reports, or process rumble/LED feedback. ViGEmClient's `XUSB_REPORT` ABI is represented as
+a 12-byte C-layout record and is covered by pure mapping tests. Native Windows
+device delivery still needs qualification with the actual ViGEmClient DLL and
+ViGEmBus driver.
+
 Linux creates separate virtual keyboard and relative-pointer devices through
 uinput. It enables the relevant EV_KEY/EV_REL capabilities, configures devices
 with `UI_DEV_SETUP`, and emits frames terminated by `SYN_REPORT`. Descriptor
@@ -273,8 +302,9 @@ to open the configured uinput device. No permissions/udev rules are changed by
 this module. Device creation does not acknowledge compositor readiness; udev and
 libinput discovery are asynchronous, and delivery during device activation needs
 native acceptance testing. Seat selection, captured-monitor coordinate mapping,
-Wayland absolute-pointer integration, touch/pen, controllers/rumble, and
-crash-surviving Windows cleanup remain unimplemented.
+Wayland absolute-pointer integration, touch/pen, non-X360 controller profiles,
+rumble/LED feedback, and crash-surviving Windows keyboard/mouse cleanup remain
+unimplemented.
 
 ## Validation and reference
 
