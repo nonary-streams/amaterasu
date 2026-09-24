@@ -143,6 +143,7 @@ fn frame(timestamp_us: u64, sequence: u64, bytes: &[u8]) -> Frame {
         height: 1,
         stride: 8,
         timestamp_us,
+        capture_pacing_timestamp_us: timestamp_us,
         sequence,
         bytes: Arc::new(bytes.to_vec()),
     }
@@ -155,8 +156,8 @@ impl TestBinding {
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
             interface_major: INTERFACE_MAJOR,
-            min_minor: CAPTURE_INTERFACE_MINOR,
-            min_size: size_of::<CaptureApi>() as u32,
+            min_minor: CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
+            min_size: CAPTURE_API_V1_3_SIZE,
         };
         let mut result = std::ptr::null();
         // SAFETY: test supplies live factory, query, caller and output storage.
@@ -205,8 +206,8 @@ impl TestBinding {
     }
 
     fn read_freshness(&self, id: u64, values: &mut Vec<u32>) -> Status {
-        // SAFETY: capture-wgc binds a v1.2 table; the vector lives through the
-        // synchronous freshness callback and copies its scalar metadata.
+        // SAFETY: capture-wgc v1.3 retains the v1.2 table prefix; the vector
+        // lives through the synchronous freshness callback and copies metadata.
         unsafe {
             let api = &*self.0.cast::<CaptureApiV1_2>();
             (api.read_frame_with_freshness)(
@@ -215,6 +216,22 @@ impl TestBinding {
                 FreshFrameSinkV1_2 {
                     context: (values as *mut Vec<u32>).cast(),
                     write: record_freshness,
+                },
+            )
+        }
+    }
+
+    fn read_capture_timestamp(&self, id: u64, values: &mut Vec<(u64, u64, u64, u32)>) -> Status {
+        // SAFETY: capture-wgc binds the v1.3 table; the vector and callback
+        // context remain live until its synchronous delivery callback returns.
+        unsafe {
+            let api = &*self.0.cast::<CaptureApiV1_3>();
+            (api.read_frame_with_capture_timestamp)(
+                api.base.context,
+                id,
+                FreshFrameSinkV1_3 {
+                    context: (values as *mut Vec<(u64, u64, u64, u32)>).cast(),
+                    write: record_capture_timestamp,
                 },
             )
         }
@@ -269,6 +286,27 @@ unsafe extern "C" fn record_freshness(
 ) -> Status {
     // SAFETY: TestBinding::read_freshness passes a live Vec through the call.
     unsafe { (&mut *context.cast::<Vec<u32>>()).push(freshness) };
+    STATUS_OK
+}
+
+unsafe extern "C" fn record_capture_timestamp(
+    context: *mut c_void,
+    frame: *const CaptureFrameV1_3,
+    freshness: u32,
+) -> Status {
+    if frame.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: TestBinding passes a live vector for this synchronous callback.
+    let frame = unsafe { &*frame };
+    unsafe {
+        (&mut *context.cast::<Vec<(u64, u64, u64, u32)>>()).push((
+            frame.frame.timestamp_us,
+            frame.frame.sequence,
+            frame.capture_pacing_timestamp_us,
+            freshness,
+        ));
+    }
     STATUS_OK
 }
 
@@ -375,6 +413,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
             height: 1,
             stride: 8,
             timestamp_us: 1,
+            capture_pacing_timestamp_us: 17,
             sequence: 1,
             bytes: Arc::new(vec![1, 2, 3, 4, 5, 6, 7, 8]),
         })),
@@ -490,13 +529,13 @@ fn native_factory_rejects_incompatible_table_without_allocating_a_binding() {
         ),
         (
             INTERFACE_MAJOR,
-            CAPTURE_FRESHNESS_INTERFACE_MINOR,
-            CAPTURE_API_V1_2_SIZE + 1,
+            CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
+            CAPTURE_API_V1_3_SIZE + 1,
         ),
         (
             INTERFACE_MAJOR,
-            CAPTURE_FRESHNESS_INTERFACE_MINOR + 1,
-            CAPTURE_API_V1_2_SIZE,
+            CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR + 1,
+            CAPTURE_API_V1_3_SIZE,
         ),
     ] {
         let query = NativeInterfaceQuery {
@@ -518,6 +557,50 @@ fn native_factory_rejects_incompatible_table_without_allocating_a_binding() {
         assert_eq!(status, MEDIA_UNSUPPORTED);
         assert!(result.is_null());
         assert_eq!(Arc::strong_count(&controller), before);
+    }
+}
+
+#[test]
+fn native_factory_accepts_v1_0_through_v1_3_minimum_queries() {
+    let (controller, _) = setup(true);
+    let factory = native::Factory::new(controller.clone());
+    let expected_reference_count = Arc::strong_count(&controller);
+
+    for (minor, size) in [
+        (0, CAPTURE_API_V1_0_SIZE),
+        (CAPTURE_INTERFACE_MINOR, CAPTURE_API_V1_1_SIZE),
+        (CAPTURE_FRESHNESS_INTERFACE_MINOR, CAPTURE_API_V1_2_SIZE),
+        (
+            CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
+            CAPTURE_API_V1_3_SIZE,
+        ),
+    ] {
+        let query = NativeInterfaceQuery {
+            header: AbiHeader::of::<NativeInterfaceQuery>(),
+            interface_major: INTERFACE_MAJOR,
+            min_minor: minor,
+            min_size: size,
+        };
+        let mut result = std::ptr::null();
+        // SAFETY: factory, caller, query, and result storage remain live through bind.
+        let status = unsafe {
+            factory.api.bind.unwrap()(
+                factory.api.context,
+                BorrowedBytes::new(b"owner"),
+                &query,
+                &mut result,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        assert!(!result.is_null());
+        // SAFETY: successful bind transfers one live v1.3 table, released exactly once here.
+        unsafe {
+            let api = &*result;
+            assert_eq!(api.header.minor, CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR);
+            assert_eq!(api.header.size, CAPTURE_API_V1_3_SIZE);
+            (api.release.expect("owned test binding"))(api.context);
+        }
+        assert_eq!(Arc::strong_count(&controller), expected_reference_count);
     }
 }
 
@@ -590,6 +673,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
         height: 1,
         stride: 4,
         timestamp_us: 1,
+        capture_pacing_timestamp_us: 23,
         sequence: 1,
         bytes: Arc::new(vec![1, 2, 3, 4]),
     }))])));
@@ -672,11 +756,20 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
     assert!(controller.read("owner", stream, 0).unwrap().is_none());
     let first = controller.read("owner", stream, 0).unwrap().unwrap();
     assert_eq!(first.sequence, 1);
+    assert_eq!(first.capture_pacing_timestamp_us, 7);
     let second = controller.read("owner", stream, 0).unwrap().unwrap();
     let third = controller.read("owner", stream, 0).unwrap().unwrap();
     assert!(first.timestamp_us < second.timestamp_us);
     assert!(second.timestamp_us < third.timestamp_us);
     assert_eq!((first.sequence, second.sequence, third.sequence), (1, 2, 3));
+    assert_eq!(
+        (
+            first.capture_pacing_timestamp_us,
+            second.capture_pacing_timestamp_us,
+            third.capture_pacing_timestamp_us
+        ),
+        (7, 7, 7)
+    );
     assert_eq!(first.bytes.as_ref(), second.bytes.as_ref());
     assert_eq!(second.bytes.as_ref(), third.bytes.as_ref());
     assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
@@ -694,7 +787,52 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
 }
 
 #[test]
-fn v1_2_capture_callback_distinguishes_new_frames_from_cached_reuse() {
+fn v1_3_capture_callback_preserves_acquisition_time_across_timestamp_rewrite_and_reuse() {
+    let mut acquired = frame(0, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    acquired.capture_pacing_timestamp_us = 123;
+    let events = VecDeque::from([Ok(Some(acquired)), Ok(None)]);
+    let controller = Arc::new(Mutex::new(Controller::new(
+        FakeBackend {
+            events: Arc::new(Mutex::new(events)),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        true,
+    )));
+    let stream = open_constant_rate(&mut controller.lock().unwrap(), "owner");
+    let factory = native::Factory::new(controller);
+    let binding = TestBinding::new(&factory, "owner");
+    // SAFETY: the factory accepted the v1.3 query and the binding retains this table.
+    let advertised = unsafe { &*binding.0.cast::<CaptureApiV1_3>() };
+    assert_eq!(
+        advertised.base.header.minor,
+        CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR
+    );
+    assert_eq!(advertised.base.header.size, CAPTURE_API_V1_3_SIZE);
+    let mut deliveries = Vec::new();
+
+    assert_eq!(
+        binding.read_capture_timestamp(stream, &mut deliveries),
+        STATUS_OK
+    );
+    assert_eq!(
+        binding.read_capture_timestamp(stream, &mut deliveries),
+        STATUS_OK
+    );
+    assert_eq!(deliveries.len(), 2);
+    assert!(deliveries[0].0 > 0);
+    assert_eq!([deliveries[0].1, deliveries[1].1], [1, 2]);
+    assert!(deliveries[0].0 < deliveries[1].0);
+    assert_eq!(deliveries[0].2, 123);
+    assert_eq!(deliveries[1].2, 123);
+    assert_eq!(
+        [deliveries[0].3, deliveries[1].3],
+        [CAPTURE_FRAME_FRESH, CAPTURE_FRAME_CACHED_REUSE]
+    );
+}
+
+#[test]
+fn v1_2_prefix_callback_remains_usable_from_the_v1_3_table() {
     let events = VecDeque::from([Ok(Some(frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]))), Ok(None)]);
     let controller = Arc::new(Mutex::new(Controller::new(
         FakeBackend {

@@ -141,6 +141,7 @@ mod tests {
                 height: 1,
                 stride: 4,
                 timestamp_us: 0,
+                capture_pacing_timestamp_us: 42,
                 sequence: 1,
                 bytes: Arc::new(vec![1, 2, 3, 4]),
             }))

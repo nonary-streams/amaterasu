@@ -189,6 +189,7 @@ impl Readback {
             stride,
             bytes: Arc::new(bytes),
             timestamp_us: pending.timestamp_us,
+            capture_pacing_timestamp_us: pending.timestamp_us,
             sequence: self.sequence,
         };
         drop(mapping);

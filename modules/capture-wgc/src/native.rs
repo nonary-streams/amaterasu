@@ -1,9 +1,9 @@
 use crate::{backend::Backend, controller::Controller};
 use amaterasu_media::{
-    CAPTURE_API_V1_2_SIZE, CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH,
-    CAPTURE_FRESHNESS_INTERFACE_MINOR, CaptureApiV1_2, CaptureGeometry, CpuFrame, FrameSink,
-    FreshFrameSinkV1_2, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED,
-    MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
+    CAPTURE_API_V1_3_SIZE, CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH,
+    CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR, CaptureApiV1_3, CaptureFrameV1_3, CaptureGeometry,
+    CpuFrame, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3, INTERFACE_MAJOR,
+    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -36,7 +36,7 @@ impl<B: Backend + 'static> Factory<B> {
 }
 
 struct Binding<B: Backend> {
-    api: CaptureApiV1_2,
+    api: CaptureApiV1_3,
     controller: SharedController<B>,
     caller: String,
 }
@@ -44,12 +44,12 @@ struct Binding<B: Backend> {
 impl<B: Backend> Binding<B> {
     fn new(controller: SharedController<B>, caller: String) -> Box<Self> {
         let mut binding = Box::new(Binding {
-            api: CaptureApiV1_2 {
+            api: CaptureApiV1_3 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: CAPTURE_API_V1_2_SIZE,
+                        size: CAPTURE_API_V1_3_SIZE,
                         major: INTERFACE_MAJOR,
-                        minor: CAPTURE_FRESHNESS_INTERFACE_MINOR,
+                        minor: CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR,
                     },
                     context: std::ptr::null_mut(),
                     release: Some(release::<B>),
@@ -57,6 +57,7 @@ impl<B: Backend> Binding<B> {
                 read_frame: read_frame::<B>,
                 geometry: geometry::<B>,
                 read_frame_with_freshness: read_frame_with_freshness::<B>,
+                read_frame_with_capture_timestamp: read_frame_with_capture_timestamp::<B>,
             },
             controller,
             caller,
@@ -231,6 +232,50 @@ unsafe extern "C" fn read_frame_with_freshness<B: Backend>(
     .unwrap_or(STATUS_INTERNAL_ERROR)
 }
 
+unsafe extern "C" fn read_frame_with_capture_timestamp<B: Backend>(
+    context: *mut c_void,
+    stream: u64,
+    sink: FreshFrameSinkV1_3,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: binding is retained by broker through this synchronous call.
+        let binding = unsafe { &*context.cast::<Binding<B>>() };
+        let delivery = match binding.poll_frame_with_freshness(stream) {
+            Ok(delivery) => delivery,
+            Err(status) => return status,
+        };
+        let frame = CaptureFrameV1_3 {
+            frame: CpuFrame {
+                width: delivery.frame.width,
+                height: delivery.frame.height,
+                format: PIXEL_BGRA8,
+                stride: delivery.frame.stride,
+                data: delivery.frame.bytes.as_ptr(),
+                len: delivery.frame.bytes.len(),
+                timestamp_us: delivery.frame.timestamp_us,
+                sequence: delivery.frame.sequence,
+            },
+            capture_pacing_timestamp_us: delivery.frame.capture_pacing_timestamp_us,
+        };
+        let freshness = if delivery.is_fresh {
+            CAPTURE_FRAME_FRESH
+        } else {
+            CAPTURE_FRAME_CACHED_REUSE
+        };
+        // SAFETY: frame bytes stay owned through the synchronous callback;
+        // the callback must not retain its descriptor or borrowed bytes.
+        let status = unsafe { sink.send(&frame, freshness) };
+        if status != STATUS_OK && status != MEDIA_BUSY {
+            binding.discard_cached_frame(stream);
+        }
+        status
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
 unsafe extern "C" fn geometry<B: Backend>(
     context: *mut c_void,
     stream: u64,
@@ -264,10 +309,10 @@ unsafe extern "C" fn geometry<B: Backend>(
 }
 
 fn supports_query(query: &NativeInterfaceQuery) -> bool {
-    if query.min_minor > CAPTURE_FRESHNESS_INTERFACE_MINOR {
+    if query.min_minor > CAPTURE_PACING_TIMESTAMP_INTERFACE_MINOR {
         return false;
     }
     query.header.supports::<NativeInterfaceQuery>()
         && query.interface_major == INTERFACE_MAJOR
-        && query.min_size <= CAPTURE_API_V1_2_SIZE
+        && query.min_size <= CAPTURE_API_V1_3_SIZE
 }

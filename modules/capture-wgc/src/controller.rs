@@ -32,6 +32,8 @@ impl Stream {
         let timestamp_us = elapsed_us.max(next_timestamp_us);
         self.next_sequence = sequence;
         self.last_timestamp_us = timestamp_us;
+        // Keep capture_pacing_timestamp_us anchored to WGC acquisition time;
+        // this timestamp and sequence belong to the controller's output clock.
         frame.sequence = sequence;
         frame.timestamp_us = timestamp_us;
         Ok(())

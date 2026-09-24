@@ -76,13 +76,21 @@ stream separately.
 
 ## Native frames and lifetimes
 
-Bind `CaptureApi` version 1.1 on `amaterasu.capture-wgc/1`. Version 1.0 remains
-available as the unchanged prefix for older consumers. The 1.1 `geometry`
-callback returns the validated open-stream geometry, or `MEDIA_UNSUPPORTED` when
-open could not prove geometry. Once geometry was advertised, a changed rectangle,
-missing display, or changed physical target closes the stream. `MEDIA_BUSY`
-reports temporary controller contention and may be retried without consuming a
-frame.
+The provider advertises capture API version 1.3 on `amaterasu.capture-wgc/1`.
+Versions 1.0 through 1.2 remain available as unchanged prefixes for older
+consumers. The 1.1 `geometry` callback returns the validated open-stream
+geometry, or `MEDIA_UNSUPPORTED` when open could not prove geometry. Once
+geometry was advertised, a changed rectangle, missing display, or changed
+physical target closes the stream. `MEDIA_BUSY` reports temporary controller
+contention and may be retried without consuming a frame.
+
+The v1.2 freshness callback reports whether delivered pixels came from a fresh
+WGC frame or cached reuse. The v1.3 `read_frame_with_capture_timestamp` callback
+also returns the WGC acquisition timestamp separately from `CpuFrame.timestamp_us`.
+That source timestamp is captured before GPU readback and preserved while the
+controller keeps its own monotonic frame timestamp and sequence. Consumers can
+bind the v1.3 tail only after checking both its advertised minor version and
+table size; older prefixes retain their original layout and behavior.
 
 The broker supplies
 the authenticated immediate caller at bind time, and the provider copies it into

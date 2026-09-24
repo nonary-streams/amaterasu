@@ -167,6 +167,23 @@ fn media_records_have_explicit_64_bit_c_layouts() {
         std::mem::offset_of!(CaptureApiV1_2, read_frame_with_freshness),
         48
     );
+    assert_eq!(std::mem::size_of::<CaptureFrameV1_3>(), 56);
+    assert_eq!(std::mem::offset_of!(CaptureFrameV1_3, frame), 0);
+    assert_eq!(
+        std::mem::offset_of!(CaptureFrameV1_3, capture_pacing_timestamp_us),
+        48
+    );
+    assert_eq!(std::mem::size_of::<CaptureApiV1_3>(), 64);
+    assert_eq!(CAPTURE_API_V1_3_SIZE, 64);
+    assert_eq!(std::mem::offset_of!(CaptureApiV1_3, base), 0);
+    assert_eq!(
+        std::mem::offset_of!(CaptureApiV1_3, read_frame_with_freshness),
+        48
+    );
+    assert_eq!(
+        std::mem::offset_of!(CaptureApiV1_3, read_frame_with_capture_timestamp),
+        56
+    );
     assert_eq!(std::mem::size_of::<EncoderApi>(), 56);
     assert_eq!(std::mem::size_of::<VideoApi>(), 40);
 }
@@ -212,4 +229,52 @@ fn freshness_sink_accepts_only_defined_provenance_values() {
     // SAFETY: invalid freshness is rejected before the callback is called.
     assert_eq!(unsafe { sink.send(&frame, 2) }, STATUS_INVALID_ARGUMENT);
     assert_eq!(observed, CAPTURE_FRAME_CACHED_REUSE);
+}
+
+#[test]
+fn pacing_timestamp_sink_preserves_source_time_and_validates_freshness() {
+    unsafe extern "C" fn record(
+        context: *mut c_void,
+        frame: *const CaptureFrameV1_3,
+        freshness: u32,
+    ) -> Status {
+        if frame.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: test sends a live frame and a writable two-value result.
+        let frame = unsafe { &*frame };
+        unsafe {
+            let observed = context.cast::<[u64; 2]>();
+            (*observed)[0] = frame.capture_pacing_timestamp_us;
+            (*observed)[1] = u64::from(freshness);
+        }
+        STATUS_OK
+    }
+
+    let bytes = [0u8; 4];
+    let frame = CaptureFrameV1_3 {
+        frame: CpuFrame {
+            width: 1,
+            height: 1,
+            format: PIXEL_BGRA8,
+            stride: 4,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 900,
+            sequence: 5,
+        },
+        capture_pacing_timestamp_us: 123,
+    };
+    let mut observed = [u64::MAX; 2];
+    let sink = FreshFrameSinkV1_3 {
+        context: (&mut observed as *mut [u64; 2]).cast(),
+        write: record,
+    };
+
+    // SAFETY: bytes, result storage, and callback context live through send.
+    assert_eq!(unsafe { sink.send(&frame, CAPTURE_FRAME_FRESH) }, STATUS_OK);
+    assert_eq!(observed, [123, u64::from(CAPTURE_FRAME_FRESH)]);
+    // SAFETY: invalid freshness is rejected before entering the callback.
+    assert_eq!(unsafe { sink.send(&frame, 2) }, STATUS_INVALID_ARGUMENT);
+    assert_eq!(observed, [123, u64::from(CAPTURE_FRAME_FRESH)]);
 }

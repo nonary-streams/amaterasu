@@ -70,11 +70,14 @@ pub struct Frame {
     pub height: u32,
     pub stride: u32,
     pub timestamp_us: u64,
+    /// WGC acquisition timestamp retained even when the controller rewrites
+    /// `timestamp_us` to maintain the consumer-facing monotonic stream clock.
+    pub capture_pacing_timestamp_us: u64,
     pub sequence: u64,
     pub bytes: Arc<Vec<u8>>,
 }
 
-/// Delivery provenance retained by the controller for the v1.2 native API.
+/// Delivery provenance retained by the controller for the v1.2 and v1.3 APIs.
 /// Fresh means a new frame arrived from the WGC session; cached reuse means the
 /// controller returned the prior owned pixels after the session had no frame.
 pub struct FrameDelivery {
