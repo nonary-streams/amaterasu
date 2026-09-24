@@ -151,6 +151,11 @@ pub struct PlanItem {
     pub item: String,
 }
 
+struct CollectedConfigurationFiles {
+    files: Vec<PathBuf>,
+    configured_state_files: BTreeSet<PathBuf>,
+}
+
 /// Non-secret evidence that a product-specific importer validated a sensitive
 /// predecessor pairing identity. Package migration does not parse identity
 /// keys itself: it only removes the corresponding preflight gates after the
@@ -219,10 +224,15 @@ pub fn analyze_legacy_configuration(sources: &[LegacyConfigSource]) -> PackageRe
         critical_items: Vec::new(),
     };
     for source in sources {
-        let files = collect_configuration_files(&source.root)?
+        let collected = collect_configuration_files(&source.root)?
             .ok_or("a predecessor configuration source no longer contains supported files")?;
-        for relative in files {
-            analyze_source_file(source.product, &source.root.join(relative), &mut plan)?;
+        for relative in &collected.files {
+            analyze_source_file(
+                source.product,
+                &source.root.join(relative),
+                collected.configured_state_files.contains(relative),
+                &mut plan,
+            )?;
         }
     }
     plan.unsupported_items.sort();
@@ -398,24 +408,27 @@ pub fn rollback_legacy_configuration(receipt: &MigrationReceipt) -> PackageResul
 fn analyze_source_file(
     product: LegacyProduct,
     path: &Path,
+    is_configured_state_file: bool,
     plan: &mut ImportPlan,
 ) -> PackageResult<()> {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if filename == "apps.json" {
-        return analyze_applications(product, path, plan);
-    }
-    if filename.ends_with(".conf") {
-        return analyze_settings(product, path, plan);
-    }
-    if filename.ends_with("_state.json") {
+    let is_state_document = is_configured_state_file || filename.ends_with("_state.json");
+    if is_state_document {
         plan.critical_items.push(PlanItem {
             product,
             item: "pairing_identity_state".into(),
         });
         classify_legacy_state_credentials(product, path, plan)?;
+    }
+    if filename == "apps.json" {
+        return analyze_applications(product, path, plan);
+    } else if filename.ends_with(".conf") {
+        return analyze_settings(product, path, plan);
+    } else if is_state_document {
+        return Ok(());
     } else if path
         .components()
         .any(|component| component.as_os_str().eq_ignore_ascii_case("credentials"))
@@ -655,15 +668,15 @@ fn snapshot_sources(
 ) -> PackageResult<Vec<SourceSnapshot>> {
     let mut snapshots = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
-        let files = collect_configuration_files(&source.root)?
+        let collected = collect_configuration_files(&source.root)?
             .ok_or("a predecessor configuration source no longer contains supported files")?;
         let directory = backup_directory
             .join("source")
             .join(source.product.directory_name())
             .join(index.to_string());
         create_private_directory(&directory)?;
-        let mut copied = Vec::with_capacity(files.len());
-        for relative in files {
+        let mut copied = Vec::with_capacity(collected.files.len());
+        for relative in collected.files {
             let destination = directory.join(&relative);
             copy_regular_file(&source.root.join(&relative), &destination)?;
             copied.push(SnapshotFile {
@@ -717,7 +730,7 @@ fn merge_snapshots(
     Ok(())
 }
 
-fn collect_configuration_files(root: &Path) -> PackageResult<Option<Vec<PathBuf>>> {
+fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedConfigurationFiles>> {
     if !root.try_exists().map_err(io_error)? {
         return Ok(None);
     }
@@ -726,6 +739,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<Vec<PathBuf>
     }
 
     let mut files = Vec::new();
+    let mut configured_state_files = BTreeSet::new();
     for name in CONFIGURATION_FILES {
         let path = root.join(name);
         if path.try_exists().map_err(io_error)? {
@@ -734,7 +748,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<Vec<PathBuf>
         }
     }
     collect_configured_sensitive_files(root, &mut files)?;
-    collect_configured_state_files(root, &mut files)?;
+    collect_configured_state_files(root, &mut files, &mut configured_state_files)?;
     for name in CONFIGURATION_DIRECTORIES {
         let path = root.join(name);
         if path.try_exists().map_err(io_error)? {
@@ -742,7 +756,10 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<Vec<PathBuf>
         }
     }
     files.sort();
-    Ok((!files.is_empty()).then_some(files))
+    Ok((!files.is_empty()).then_some(CollectedConfigurationFiles {
+        files,
+        configured_state_files,
+    }))
 }
 
 /// Preserve only configured identity/credential files whose canonical regular
@@ -806,7 +823,11 @@ fn collect_configured_sensitive_files(root: &Path, files: &mut Vec<PathBuf>) -> 
 /// Preserve configured primary and auxiliary state files for the migration
 /// importers. State paths are followed only when their canonical regular files
 /// remain inside the supplied predecessor root.
-fn collect_configured_state_files(root: &Path, files: &mut Vec<PathBuf>) -> PackageResult<()> {
+fn collect_configured_state_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    configured_state_files: &mut BTreeSet<PathBuf>,
+) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
     let mut configured = BTreeMap::<String, PathBuf>::new();
     for name in [
@@ -859,6 +880,7 @@ fn collect_configured_state_files(root: &Path, files: &mut Vec<PathBuf>) -> Pack
                 .strip_prefix(&canonical_root)
                 .map_err(|_| "predecessor configuration layout is invalid")?
                 .to_path_buf();
+            configured_state_files.insert(copied.clone());
             if !files.contains(&copied) {
                 files.push(copied);
             }

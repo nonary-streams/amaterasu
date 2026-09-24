@@ -161,16 +161,42 @@ fn snapshots_configured_primary_and_auxiliary_state_files_only_when_contained() 
     );
 
     let files = collect_configuration_files(&predecessor).unwrap().unwrap();
-    assert!(files.contains(&PathBuf::from("private/primary_state.json")));
-    assert!(files.contains(&PathBuf::from("private/auxiliary_state.json")));
+    assert!(
+        files
+            .files
+            .contains(&PathBuf::from("private/primary_state.json"))
+    );
+    assert!(
+        files
+            .files
+            .contains(&PathBuf::from("private/auxiliary_state.json"))
+    );
+    assert!(
+        files
+            .configured_state_files
+            .contains(&PathBuf::from("private/primary_state.json"))
+    );
+    assert!(
+        files
+            .configured_state_files
+            .contains(&PathBuf::from("private/auxiliary_state.json"))
+    );
 
     write(
         &predecessor.join("vibeshine.conf"),
         b"file_state = private/primary_state.json\nvibeshine_file_state = private/not_created_yet.json\n",
     );
     let files = collect_configuration_files(&predecessor).unwrap().unwrap();
-    assert!(files.contains(&PathBuf::from("private/primary_state.json")));
-    assert!(!files.contains(&PathBuf::from("private/not_created_yet.json")));
+    assert!(
+        files
+            .files
+            .contains(&PathBuf::from("private/primary_state.json"))
+    );
+    assert!(
+        !files
+            .files
+            .contains(&PathBuf::from("private/not_created_yet.json"))
+    );
 
     write(
         &predecessor.join("vibeshine.conf"),
@@ -195,6 +221,170 @@ fn snapshots_configured_primary_and_auxiliary_state_files_only_when_contained() 
         b"file_state = private/auxiliary_state.json\n",
     );
     assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[test]
+fn classifies_custom_configured_primary_state_as_pairing_and_authentication_input() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    let private_password = "never expose this legacy verifier";
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/host-record.bin\n",
+    );
+    write(
+        &predecessor.join("private/host-record.bin"),
+        serde_json::json!({
+            "username": "Admin",
+            "password": private_password,
+            "salt": "salt",
+            "root": { "uniqueid": "host-id" }
+        })
+        .to_string()
+        .as_bytes(),
+    );
+
+    let legacy_source = source(LegacyProduct::Vibeshine, &predecessor);
+    let plan = analyze_legacy_configuration(std::slice::from_ref(&legacy_source)).unwrap();
+
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "legacy_administrator_credential")
+    );
+    assert!(
+        !plan
+            .unsupported_items
+            .iter()
+            .any(|item| item.item == "host-record.bin")
+    );
+    assert!(
+        !serde_json::to_string(&plan)
+            .unwrap()
+            .contains(private_password)
+    );
+    assert!(preflight_legacy_configuration(std::slice::from_ref(&legacy_source)).is_err());
+
+    let approved = preflight_legacy_configuration_with_sensitive_sources(
+        &[legacy_source],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Vibeshine,
+            pairing: true,
+            authentication: true,
+        }],
+    )
+    .unwrap();
+    assert!(approved.critical_items.is_empty());
+}
+
+#[test]
+fn custom_configured_auxiliary_state_keeps_legacy_api_tokens_blocking() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/web-record.bin\n",
+    );
+    write(
+        &predecessor.join("private/web-record.bin"),
+        br#"{"root":{"api_tokens":[{"token":"must-not-be-imported"}]}}"#,
+    );
+
+    let legacy_source = source(LegacyProduct::Vibeshine, &predecessor);
+    let plan = analyze_legacy_configuration(std::slice::from_ref(&legacy_source)).unwrap();
+
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "legacy_api_tokens")
+    );
+    assert!(
+        !plan
+            .unsupported_items
+            .iter()
+            .any(|item| item.item == "web-record.bin")
+    );
+    assert!(
+        preflight_legacy_configuration_with_sensitive_sources(
+            &[legacy_source],
+            &[ValidatedSensitiveSource {
+                product: LegacyProduct::Vibeshine,
+                pairing: true,
+                authentication: true,
+            }],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn configured_conf_target_retains_listener_critical_setting_after_pairing_approval() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/listener.conf\n",
+    );
+    write(
+        &predecessor.join("private/listener.conf"),
+        b"port = 47990\n",
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Vibeshine, &predecessor)]).unwrap();
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(plan.critical_items.iter().any(|item| item.item == "port"));
+    assert!(
+        preflight_legacy_configuration_with_sensitive_sources(
+            &[source(LegacyProduct::Vibeshine, &predecessor)],
+            &[ValidatedSensitiveSource {
+                product: LegacyProduct::Vibeshine,
+                pairing: true,
+                authentication: false,
+            }],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn configured_apps_json_target_still_imports_recognized_applications() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = private/apps.json\n",
+    );
+    write(
+        &predecessor.join("private/apps.json"),
+        br#"[{"name":"Example","cmd":"C:\\Games\\Example.exe"}]"#,
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Vibeshine, &predecessor)]).unwrap();
+
+    assert_eq!(plan.applications.len(), 1);
+    assert_eq!(plan.applications[0].name, "Example");
+    assert_eq!(plan.applications[0].executable, "C:\\Games\\Example.exe");
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
 }
 
 #[cfg(unix)]
