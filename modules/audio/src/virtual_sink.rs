@@ -147,9 +147,8 @@ pub fn select_policy_virtual_sink<'a>(
         return None;
     }
 
-    let ordinary_sink_missing = requested_endpoint.is_empty()
-        || (requested_endpoint == "default"
-            && !endpoints.iter().any(|endpoint| endpoint.default_multimedia));
+    let ordinary_sink_missing = (requested_endpoint.is_empty() || requested_endpoint == "default")
+        && !endpoints.iter().any(|endpoint| endpoint.default_multimedia);
     if host_audio_enabled && !ordinary_sink_missing {
         return None;
     }
@@ -253,13 +252,15 @@ mod tests {
                 .id,
             "render.virtual"
         );
+        assert!(select_policy_virtual_sink(&endpoints, "", None, true).is_none());
+        assert!(select_policy_virtual_sink(&endpoints, "default", None, true).is_none());
+        endpoints[0].default_multimedia = false;
         assert_eq!(
             select_policy_virtual_sink(&endpoints, "", None, true)
                 .unwrap()
                 .id,
             "render.virtual"
         );
-        assert!(select_policy_virtual_sink(&endpoints, "default", None, true).is_none());
     }
 
     #[test]
