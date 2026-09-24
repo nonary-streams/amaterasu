@@ -22,7 +22,10 @@ fn active_session_is_recorded_once_with_bounded_metadata_and_ended_after_teardow
     let mut host = Harness::new();
     host.broker.history_available = true;
     host.broker.history_recording_disabled = true;
-    let session = prepare_and_start(&mut host);
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut start_request = start(session);
+    start_request["configuration"]["device_name"] = json!("Studio PC");
+    assert_eq!(host.response(2, start_request)["state"], "active");
 
     host.idle();
     host.idle();
@@ -33,7 +36,7 @@ fn active_session_is_recorded_once_with_bounded_metadata_and_ended_after_teardow
     assert!(begin["metadata"]["session_id"].as_str().unwrap().len() <= 128);
     assert_eq!(begin["metadata"]["protocol"], "sunshine-modern");
     assert_eq!(begin["metadata"]["client_name"], "owner");
-    assert_eq!(begin["metadata"]["device_name"], "monitor-one");
+    assert_eq!(begin["metadata"]["device_name"], "Studio PC");
     assert_eq!(begin["metadata"]["width"], 1280);
     assert_eq!(begin["metadata"]["height"], 720);
     assert_eq!(begin["metadata"]["target_fps"], 60);
@@ -71,6 +74,20 @@ fn active_session_is_recorded_once_with_bounded_metadata_and_ended_after_teardow
     assert!(begin_call < finish_call && finish_call < end_call);
     assert_eq!(host.broker.history_released, 2);
     assert!(host.broker.history_requests.is_empty());
+}
+
+#[test]
+fn history_uses_capture_output_for_legacy_starts_without_a_device_name() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let _session = prepare_and_start(&mut host);
+
+    host.idle();
+
+    assert_eq!(
+        host.broker.history_begins[0]["metadata"]["device_name"],
+        "monitor-one"
+    );
 }
 
 #[test]

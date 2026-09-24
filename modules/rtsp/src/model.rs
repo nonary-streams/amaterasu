@@ -386,6 +386,8 @@ impl Profile {
 pub struct Open {
     pub operation_id: String,
     pub peer_ip: IpAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     #[serde(default)]
     pub video_port: u16,
     #[serde(default)]
@@ -446,6 +448,13 @@ impl Open {
     }
 
     fn validate_capture(&self) -> Result<(), &'static str> {
+        if self
+            .device_name
+            .as_deref()
+            .is_some_and(|name| !valid_name(name))
+        {
+            return Err("invalid_device_name");
+        }
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
         }
@@ -526,6 +535,7 @@ impl Open {
                 "audio_endpoint": self.capture.audio_endpoint,
                 "capture_sink_without_routing": self.capture_sink_without_routing,
                 "back_button_timeout": self.back_button_timeout,
+                "device_name": self.device_name,
                 "configuration": {
                     "width": self.profile.width,
                     "height": self.profile.height,
@@ -560,7 +570,7 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
-    Open(Open),
+    Open(Box<Open>),
     NetworkConfigure {
         port: u16,
         #[serde(default)]
@@ -670,6 +680,22 @@ mod tests {
         invalid["ping_timeout_ms"] = json!(i32::MAX as u64 + 1);
         let invalid: Open = serde_json::from_value(invalid).unwrap();
         assert_eq!(invalid.validate(false), Err("invalid_ping_timeout"));
+    }
+
+    #[test]
+    fn configured_device_name_reaches_the_authenticated_session_start() {
+        let mut value = open_json();
+        value["device_name"] = json!("Studio PC");
+        let request: Open = serde_json::from_value(value).unwrap();
+        assert!(request.validate(false).is_ok());
+        assert_eq!(request.arm(51)["configuration"]["device_name"], "Studio PC");
+
+        for invalid in [String::new(), "x".repeat(129)] {
+            let mut value = open_json();
+            value["device_name"] = json!(invalid);
+            let request: Open = serde_json::from_value(value).unwrap();
+            assert_eq!(request.validate(false), Err("invalid_device_name"));
+        }
     }
 
     fn open_operation_json() -> Value {

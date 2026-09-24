@@ -287,6 +287,9 @@ pub struct StartConfig {
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    /// Moonlight's device name for the session; independent from capture output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,
@@ -296,6 +299,13 @@ impl StartConfig {
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
+        }
+        if self
+            .device_name
+            .as_deref()
+            .is_some_and(|name| !valid_name(name))
+        {
+            return Err("invalid_start_configuration");
         }
         if self.constant_rate && self.capture_provider != CaptureProvider::Wgc {
             return Err("constant_rate_requires_wgc");
@@ -693,7 +703,7 @@ mod tests {
                 Err("invalid_start_configuration")
             );
         }
-        for field in ["output", "audio_endpoint"] {
+        for field in ["output", "audio_endpoint", "device_name"] {
             let mut config = start_json();
             config[field] = json!("bad\nlabel");
             assert!(

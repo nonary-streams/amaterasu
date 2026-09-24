@@ -130,7 +130,8 @@ const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl Router {
-    pub fn new(config: RouterConfig, launches: LaunchController) -> Self {
+    pub fn new(config: RouterConfig, mut launches: LaunchController) -> Self {
+        launches.set_device_name(&config.hostname);
         Self {
             config,
             launches,
@@ -143,6 +144,7 @@ impl Router {
     }
 
     pub fn set_hostname(&mut self, hostname: String) {
+        self.launches.set_device_name(&hostname);
         self.config.hostname = hostname;
     }
 

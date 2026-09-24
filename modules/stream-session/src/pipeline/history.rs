@@ -98,7 +98,10 @@ impl SessionHistory {
                             "session_id": session_id,
                             "protocol": "sunshine-modern",
                             "client_name": bounded_text(owner, 128),
-                            "device_name": bounded_text(&start.output, 128),
+                            "device_name": bounded_text(
+                                start.device_name.as_deref().unwrap_or(&start.output),
+                                128,
+                            ),
                             "app_name": "",
                             "width": metadata.width,
                             "height": metadata.height,

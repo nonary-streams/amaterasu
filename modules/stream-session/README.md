@@ -86,6 +86,9 @@ identify provider, constant-rate mode, and output, not a canonical physical disp
 across providers. Both are shared read leases. Display mutation, topology
 restoration and application launch integration remain separate work. The optional
 `constant_rate` start field is accepted only with WGC and defaults to false.
+The optional `device_name` start field supplies session-history display metadata;
+it is independent from the `output` capture source. Older callers that omit it
+continue to record the capture output as the device name.
 
 ## Current limits
 

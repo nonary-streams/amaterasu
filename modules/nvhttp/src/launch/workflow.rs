@@ -168,6 +168,7 @@ impl Controller {
                         "action": "open",
                         "operation_id": record.rtsp_operation,
                         "peer_ip": record.peer.remote,
+                        "device_name": record.device_name.as_str(),
                         "discover_peers": true,
                         "key_hex": key_hex(&record.request.remote_input_key),
                         "key_id": record.request.key_id,

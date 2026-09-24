@@ -114,6 +114,7 @@ fn request(key: u8) -> LaunchRequest {
         width: 1280,
         height: 720,
         fps: 60,
+        device_name: None,
         remote_input_key: [key; 16],
         key_id: 17,
     }
@@ -237,6 +238,44 @@ fn selected_or_default_output_is_snapshotted_into_rtsp_open() {
             })
             .expect("RTSP open request");
         assert_eq!(rtsp_open["capture"]["output"], expected);
+    }
+}
+
+#[test]
+fn configured_device_name_and_moonlight_override_are_snapshotted_separately_from_output() {
+    for (override_name, configured, expected) in [
+        (None, "Studio PC", "Studio PC"),
+        (Some(""), "Studio PC", "Studio PC"),
+        (Some("Moonlight Desk"), "Studio PC", "Moonlight Desk"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_device_name(configured);
+        let mut launch_request = request(1);
+        launch_request.device_name = override_name.map(str::to_owned);
+        assert!(
+            controller
+                .launch(10, launch_request, peer(1), now)
+                .is_none()
+        );
+
+        // The active launch keeps its resolved name after later setting changes.
+        controller.set_device_name("Changed after launch");
+        let mut broker = Broker::default();
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+
+        assert_eq!(rtsp_open["device_name"], expected);
+        assert_eq!(rtsp_open["capture"]["output"], "display-one");
     }
 }
 

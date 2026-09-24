@@ -263,6 +263,45 @@ fn xml_escapes_metadata_and_advertises_configured_streaming_honestly() {
 }
 
 #[test]
+fn hostname_updates_change_the_default_launch_device_name() {
+    let mut router = streaming_router();
+    router.set_hostname("Studio PC".into());
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    let target = concat!(
+        "/launch?appid=7&mode=1280x720x60&",
+        "rikey=00112233445566778899aabbccddeeff&rikeyid=17"
+    );
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(target),
+                peer("127.0.0.1", true, Some(vec![1, 2, 3]), true),
+                now,
+                &mut |command| broker.send(command),
+            )
+            .is_none()
+    );
+
+    let mut replies = Vec::new();
+    for _ in 0..16 {
+        replies.extend(poll(&mut router, &mut broker, now));
+        if !replies.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].1.status, 200);
+    let rtsp_open = broker
+        .accepted
+        .iter()
+        .find(|payload| payload["action"] == "open")
+        .expect("RTSP open request");
+    assert_eq!(rtsp_open["device_name"], "Studio PC");
+}
+
+#[test]
 fn configured_streaming_advertises_modern_version_without_fake_codec_support() {
     let response = xml::server_info(&router().config, "host-id", true, 0, true, true);
     let text = String::from_utf8(response.body).unwrap();
@@ -315,7 +354,8 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     let now = Instant::now();
     let target = concat!(
         "/launch?appid=7&mode=1280x720x60&",
-        "rikey=00112233445566778899aabbccddeeff&rikeyid=17&uniqueid=forged-client"
+        "rikey=00112233445566778899aabbccddeeff&rikeyid=17&uniqueid=forged-client",
+        "&clientName=Moonlight+Desk"
     );
     assert!(
         router
@@ -363,6 +403,7 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["stream_audio"], false);
     assert_eq!(rtsp_open["capture"]["audio_endpoint"], "endpoint.client");
     assert_eq!(rtsp_open["capture_sink_without_routing"], true);
+    assert_eq!(rtsp_open["device_name"], "Moonlight Desk");
     // The authenticated certificate-scoped explicit disable wins over the app.
     assert_eq!(rtsp_open["back_button_timeout"], -1);
 }

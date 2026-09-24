@@ -36,6 +36,8 @@ pub struct LaunchRequest {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Moonlight's optional per-launch device-name override (`clientName`).
+    pub device_name: Option<String>,
     pub remote_input_key: [u8; 16],
     pub key_id: u32,
 }
@@ -301,6 +303,7 @@ pub struct Controller {
     global_max_bitrate_kbps: Option<u32>,
     global_minimum_fps_target: f64,
     global_wgc_pacing_smoothing: bool,
+    device_name: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -328,6 +331,7 @@ impl Controller {
             global_max_bitrate_kbps: None,
             global_minimum_fps_target: 20.0,
             global_wgc_pacing_smoothing: true,
+            device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
             job: None,
             nonce,
@@ -384,6 +388,10 @@ impl Controller {
         self.global_wgc_pacing_smoothing = enabled;
     }
 
+    pub fn set_device_name(&mut self, device_name: &str) {
+        self.device_name = device_name.to_owned();
+    }
+
     pub fn busy(&self) -> bool {
         self.records.values().any(|record| !record.state.terminal())
     }
@@ -416,9 +424,19 @@ impl Controller {
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
             || !config.profile.accepts(&request)
+            || request
+                .device_name
+                .as_deref()
+                .is_some_and(|name| !valid_device_name(name))
         {
             return Some(private_error(400, "unsupported streaming request"));
         }
+        let device_name = request
+            .device_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.device_name)
+            .to_owned();
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
@@ -481,6 +499,7 @@ impl Controller {
             id,
             peer,
             request,
+            device_name,
             operation_id(&self.nonce, id, "application"),
             operation_id(&self.nonce, id, "rtsp"),
             connect_data,
@@ -690,6 +709,10 @@ fn cancel_reply() -> Reply {
 
 fn valid_label(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn valid_device_name(value: &str) -> bool {
+    value.is_empty() || valid_label(value, 128)
 }
 
 fn invalid_peer(address: IpAddr) -> bool {

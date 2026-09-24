@@ -14,8 +14,10 @@ match the ticket's peer address. Keys never appear in replies or events.
 
 The control actions are `open`, `close {ticket}`, `status {ticket?}` and
 `lookup {operation_id}`. Open takes `operation_id`, `peer_ip`, `video_port`,
-`audio_port`, `key_hex`, `key_id`, `connect_data`, `capture`, optional `profile`,
-and optional `discover_peers` (default false). Fixed mode requires both ports.
+`audio_port`, `key_hex`, `key_id`, `connect_data`, `capture`, optional
+`device_name`, `profile`, and `discover_peers` (default false). `device_name` is
+Moonlight's bounded session label; it is passed separately from capture `output`.
+Fixed mode requires both ports.
 Discovery mode requires them to be omitted or zero so caller-supplied ports cannot
 silently override discovery.
 Capture contains `capture_provider` (`dxgi` or `wgc`), optional `constant_rate`

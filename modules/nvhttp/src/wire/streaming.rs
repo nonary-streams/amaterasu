@@ -4,6 +4,7 @@ use crate::launch::LaunchRequest;
 const LAUNCH_FIELDS: &[&str] = &[
     "appid",
     "mode",
+    "clientName",
     "rikey",
     "rikeyid",
     "uniqueid",
@@ -36,11 +37,18 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         .try_into()
         .map_err(|_| "remote input key must contain 16 bytes")?;
     let key_id = key_id(query.required("rikeyid")?)?;
+    let device_name = query.get("clientName").unwrap_or_default();
+    if !device_name.is_empty()
+        && (device_name.len() > 128 || device_name.chars().any(char::is_control))
+    {
+        return Err("invalid device name");
+    }
     Ok(LaunchRequest {
         app_id,
         width,
         height,
         fps,
+        device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
         remote_input_key,
         key_id,
     })
@@ -219,6 +227,28 @@ mod tests {
             );
             assert!(parse(&fields).is_err(), "accepted {value:?}");
         }
+    }
+
+    #[test]
+    fn preserves_a_bounded_moonlight_client_name_as_the_device_override() {
+        let request = parse(concat!(
+            "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000",
+            "&rikeyid=1&clientName=Living+Room"
+        ))
+        .unwrap();
+        assert_eq!(request.device_name.as_deref(), Some("Living Room"));
+
+        let defaulted = parse(
+            "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1&clientName=",
+        )
+        .unwrap();
+        assert_eq!(defaulted.device_name, None);
+
+        let too_long = format!(
+            "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1&clientName={}",
+            "x".repeat(129)
+        );
+        assert!(matches!(parse(&too_long), Err("invalid device name")));
     }
 
     #[test]

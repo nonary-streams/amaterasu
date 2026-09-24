@@ -42,7 +42,7 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         match operation {
-            Operation::Open(config) => self.open(request, caller, config, now, remaining, runtime),
+            Operation::Open(config) => self.open(request, caller, *config, now, remaining, runtime),
             Operation::NetworkConfigure {
                 port,
                 address_family,

@@ -54,6 +54,13 @@ When a write result is
 ambiguous, NVHTTP reads the product document again and returns
 `settings_outcome_unknown`; it never reports success based only on the requested
 hostname. The readback still updates server-info to the hostname currently stored.
+The effective name also becomes the default device name for new stream sessions.
+Moonlight's optional `clientName` query value overrides the name for that launch;
+existing sessions retain the name resolved when they started. Capture output stays
+separate and continues to identify the display source.
+The standalone virtual-display service has no launch/session lifecycle binding, so
+its caller-supplied driver names are not changed by this setting. Platform discovery
+continues to use the operating system hostname.
 While configuration is unavailable, the bootstrap hostname remains active,
 settings reads and writes fail with a configuration error, and NVHTTP retries the
 load with backoff. A missing product document uses the bootstrap hostname and
@@ -356,7 +363,7 @@ encoding for this ticket, but do not claim that the host changed its display mod
 representation, preserving the bit pattern.
 
 The bounded normal metadata allowlist is `uniqueid`, `uuid`, `additionalStates`,
-`sops`, the `clientHdrCap*` fields, `hdrMode`, `localAudioPlayMode`,
+`clientName`, `sops`, the `clientHdrCap*` fields, `hdrMode`, `localAudioPlayMode`,
 `surroundAudioInfo`, `remoteControllersBitmap`, `gcmap`, `gcpersist`, and
 `corever`. Unknown fields are rejected, including executable, path, arguments,
 environment, or catalog-owner overrides. The current profile accepts SDR,
