@@ -67,6 +67,56 @@ pub enum ProviderState {
     CleanupFailed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationState {
+    Preparing,
+    Ready,
+    Cleaning,
+    PreparationFailed,
+    CleanupFailed,
+    Complete,
+}
+
+pub fn preparation<'a>(
+    payload: &'a Value,
+    record: &Record,
+) -> Result<(&'a Value, PreparationState), &'static str> {
+    let object = payload
+        .as_object()
+        .filter(|object| object.len() == 2 && object.contains_key("ok"))
+        .ok_or("invalid_preparation_response")?;
+    if payload["ok"] != true || object.get("preparation").is_none() {
+        return Err("invalid_preparation_response");
+    }
+    let preparation = &payload["preparation"];
+    let lease = preparation
+        .as_object()
+        .filter(|lease| {
+            lease.len() == 4
+                && lease.contains_key("operation_id")
+                && lease.contains_key("state")
+                && lease.contains_key("preparation")
+                && lease.contains_key("cleanup")
+        })
+        .ok_or("invalid_preparation_response")?;
+    if lease["operation_id"] != record.preparation_operation
+        || !lease["preparation"].is_object()
+        || !lease["cleanup"].is_object()
+    {
+        return Err("invalid_preparation_response");
+    }
+    let state = match lease["state"].as_str() {
+        Some("preparing") => PreparationState::Preparing,
+        Some("ready") => PreparationState::Ready,
+        Some("cleaning") => PreparationState::Cleaning,
+        Some("preparation_failed") => PreparationState::PreparationFailed,
+        Some("cleanup_failed") => PreparationState::CleanupFailed,
+        Some("complete") => PreparationState::Complete,
+        _ => return Err("invalid_preparation_response"),
+    };
+    Ok((preparation, state))
+}
+
 pub struct ProviderLaunch {
     pub ticket: String,
     pub state: ProviderState,

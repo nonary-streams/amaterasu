@@ -20,6 +20,12 @@ struct TestProcess {
     stopping_statuses: usize,
     fail_stopping_cleanup_once: bool,
 }
+struct TestPreparation {
+    operation: String,
+    plan: Value,
+    state: &'static str,
+    preparing_statuses: usize,
+}
 struct TestProviderLaunch {
     operation: String,
     game_id: String,
@@ -33,6 +39,7 @@ struct Harness {
     output: Option<Value>,
     sessions: Vec<TestSession>,
     processes: Vec<TestProcess>,
+    preparations: Vec<TestPreparation>,
     root_active: bool,
     cancel_after_spawn: bool,
     cancel_after_session: bool,
@@ -73,6 +80,9 @@ struct Harness {
     application_stopping_statuses: usize,
     fail_application_cleanup_once: bool,
     fail_automatic_cleanup_once: bool,
+    global_preparation_statuses: usize,
+    fail_global_preparation: bool,
+    fail_global_preparation_cleanup_once: bool,
 }
 impl Harness {
     fn new() -> Self {
@@ -82,6 +92,7 @@ impl Harness {
             output: None,
             sessions: Vec::new(),
             processes: Vec::new(),
+            preparations: Vec::new(),
             root_active: true,
             cancel_after_spawn: false,
             cancel_after_session: false,
@@ -122,6 +133,9 @@ impl Harness {
             application_stopping_statuses: 0,
             fail_application_cleanup_once: false,
             fail_automatic_cleanup_once: false,
+            global_preparation_statuses: 0,
+            fail_global_preparation: false,
+            fail_global_preparation_cleanup_once: false,
         }
     }
     fn session_reply(session: &TestSession) -> Value {
@@ -197,6 +211,12 @@ impl Harness {
     }
     fn application(&mut self, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap();
+        if matches!(
+            action,
+            "prepare" | "preparation_status" | "preparation_stop" | "preparation_retry"
+        ) {
+            return self.preparation(payload);
+        }
         if action == "launch" {
             if let Some(process) = self
                 .processes
@@ -307,6 +327,78 @@ impl Harness {
             _ => panic!("unexpected application action"),
         }
         Self::process_reply(process)
+    }
+    fn preparation(&mut self, payload: &Value) -> Value {
+        let action = payload["action"].as_str().unwrap();
+        let operation = payload["operation_id"].as_str().unwrap();
+        if action == "prepare" {
+            if let Some(existing) = self
+                .preparations
+                .iter()
+                .find(|lease| lease.operation == operation)
+            {
+                if existing.plan != payload["preparation"] {
+                    return json!({"ok":false,"code":"operation_conflict"});
+                }
+                return Self::preparation_reply(existing);
+            }
+            let state = if self.fail_global_preparation {
+                "preparation_failed"
+            } else if self.global_preparation_statuses > 0 {
+                "preparing"
+            } else {
+                "ready"
+            };
+            self.preparations.push(TestPreparation {
+                operation: operation.into(),
+                plan: payload["preparation"].clone(),
+                state,
+                preparing_statuses: self.global_preparation_statuses,
+            });
+            return Self::preparation_reply(self.preparations.last().unwrap());
+        }
+        let Some(lease) = self
+            .preparations
+            .iter_mut()
+            .find(|lease| lease.operation == operation)
+        else {
+            return json!({"ok":false,"code":"preparation_not_found"});
+        };
+        match action {
+            "preparation_status" if lease.state == "preparing" => {
+                if lease.preparing_statuses > 0 {
+                    lease.preparing_statuses -= 1;
+                } else {
+                    lease.state = "ready";
+                }
+            }
+            "preparation_stop" | "preparation_retry" => {
+                if self.fail_global_preparation_cleanup_once {
+                    self.fail_global_preparation_cleanup_once = false;
+                    lease.state = "cleanup_failed";
+                } else {
+                    lease.state = if lease.state == "preparation_failed" {
+                        "preparation_failed"
+                    } else {
+                        "complete"
+                    };
+                }
+            }
+            "preparation_status" => {}
+            _ => panic!("unexpected preparation action"),
+        }
+        Self::preparation_reply(lease)
+    }
+    fn preparation_reply(lease: &TestPreparation) -> Value {
+        json!({
+            "ok":true,
+            "preparation":{
+                "operation_id":lease.operation,
+                "state":lease.state,
+                "preparation":{"completed":1},
+                "cleanup":{"state":if lease.state == "complete" {"complete"} else {"pending"}},
+            }
+        })
     }
     fn playnite(&mut self, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap();
@@ -1543,6 +1635,231 @@ fn typed_playnite_launch_uses_provider_ticket_and_holds_lease_until_stop_confirm
         })
         .unwrap();
     assert_eq!(stop_request.1["exit_timeout_seconds"], 300);
+}
+
+#[test]
+fn global_preparation_gates_playnite_and_undo_follows_provider_stop() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.global_preparation_statuses = 2;
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-global-preparation");
+    request["global_preparation"] = json!([{
+        "run":{"executable":command},
+        "undo":{"executable":command},
+    }]);
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "alice", request);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let provider_start = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::PLAYNITE && payload["action"] == "launch_start"
+        })
+        .unwrap();
+    let prep_start = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+        })
+        .unwrap();
+    let prep_polls = harness
+        .commands
+        .iter()
+        .filter(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "preparation_status"
+        })
+        .count();
+    assert!(prep_start < provider_start);
+    assert_eq!(
+        prep_polls, 3,
+        "Playnite started before global preparation was ready"
+    );
+
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    let cleanup_actions: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(_, _, parent)| parent.is_none())
+        .map(|(service, payload, _)| (service.as_str(), payload["action"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        cleanup_actions,
+        vec![
+            (crate::workflow::PLAYNITE, "launch_stop"),
+            (crate::workflow::APPLICATION, "preparation_stop"),
+            (crate::workflow::SESSION, "stop"),
+            (crate::workflow::SESSION, "finish_stop"),
+        ]
+    );
+    assert!(harness.sessions[0].lease.is_none());
+}
+
+#[test]
+fn playnite_global_preparation_failure_prevents_provider_start_and_releases_lease() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.fail_global_preparation = true;
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-global-preparation-failure");
+    request["global_preparation"] = json!([{"run":{"executable":command}}]);
+    let mut first_pipeline = pipeline();
+    let failed = harness.request(&mut first_pipeline, "alice", request);
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    assert_eq!(failed["launch"]["failure"], "global_preparation_failed");
+    assert!(harness.sessions[0].lease.is_none());
+    assert!(harness.provider_launches.is_empty());
+    assert!(!harness.commands.iter().any(|(_, payload, _)| {
+        matches!(
+            payload["action"].as_str(),
+            Some("launch_start" | "fullscreen_start")
+        )
+    }));
+    let cleanup_actions: Vec<_> = harness
+        .commands
+        .iter()
+        .filter(|(_, _, parent)| parent.is_none())
+        .map(|(_, payload, _)| payload["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(cleanup_actions, ["preparation_stop", "stop", "fail"]);
+}
+
+#[test]
+fn playnite_exclusion_skips_global_preparation_but_still_starts_the_provider() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.catalog_exclude_global_prep_cmd = Some(true);
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-excludes-global-preparation");
+    request["global_preparation"] = json!([{"run":{"executable":command}}]);
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "alice", request);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert!(harness.preparations.is_empty());
+    assert!(!harness.commands.iter().any(|(service, payload, _)| {
+        service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+    }));
+    assert!(harness.commands.iter().any(|(service, payload, _)| {
+        service == crate::workflow::PLAYNITE && payload["action"] == "launch_start"
+    }));
+}
+
+#[test]
+fn failed_global_preparation_undo_holds_playnite_session_until_stop_retry() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.fail_global_preparation_cleanup_once = true;
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-global-preparation-undo-retry");
+    request["global_preparation"] = json!([{"run":{"executable":command}}]);
+    let mut pipeline = pipeline();
+    let started = harness.request(&mut pipeline, "alice", request);
+    let blocked = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(blocked["launch"]["state"], "cleanup_failed", "{blocked}");
+    assert_eq!(
+        blocked["launch"]["cleanup_error"],
+        "global_preparation_cleanup_failed"
+    );
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| { payload["action"] == "finish_stop" })
+    );
+
+    let recovered = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(recovered["launch"]["state"], "stopped", "{recovered}");
+    assert!(harness.sessions[0].lease.is_none());
+}
+
+#[test]
+fn provider_start_and_stop_uncertainty_keep_global_preparation_owned_until_provider_stops() {
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.drop_provider_start_result = true;
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-preparation-provider-uncertainty");
+    request["global_preparation"] = json!([{"run":{"executable":command}}]);
+    let mut first_pipeline = pipeline();
+    let failed = harness.request(&mut first_pipeline, "alice", request);
+    assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+    let actions: Vec<_> = harness
+        .commands
+        .iter()
+        .map(|(_, payload, _)| payload["action"].as_str().unwrap())
+        .collect();
+    assert!(
+        actions
+            .iter()
+            .position(|action| *action == "launch_lookup")
+            .unwrap()
+            < actions
+                .iter()
+                .position(|action| *action == "preparation_stop")
+                .unwrap()
+    );
+    assert!(
+        actions
+            .iter()
+            .position(|action| *action == "launch_stop")
+            .unwrap()
+            < actions
+                .iter()
+                .position(|action| *action == "preparation_stop")
+                .unwrap()
+    );
+    assert!(harness.sessions[0].lease.is_none());
+
+    let mut harness = playnite_catalog("a1b2c3d4-1234-5678-9abc-0123456789ab", 10);
+    harness.provider_stop_failure_once = true;
+    let command = std::env::current_exe().unwrap();
+    let mut request = launch("playnite-preparation-stop-uncertainty");
+    request["global_preparation"] = json!([{"run":{"executable":command}}]);
+    let mut second_pipeline = pipeline();
+    let started = harness.request(&mut second_pipeline, "alice", request);
+    let blocked = harness.request(
+        &mut second_pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(blocked["launch"]["state"], "cleanup_failed", "{blocked}");
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| { payload["action"] == "preparation_stop" })
+    );
+
+    let recovered = harness.request(
+        &mut second_pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(recovered["launch"]["state"], "stopped", "{recovered}");
+    let stop_index = harness
+        .commands
+        .iter()
+        .rposition(|(_, payload, _)| payload["action"] == "launch_stop")
+        .unwrap();
+    let preparation_stop_index = harness
+        .commands
+        .iter()
+        .position(|(_, payload, _)| payload["action"] == "preparation_stop")
+        .unwrap();
+    assert!(stop_index < preparation_stop_index);
+    assert!(harness.sessions[0].lease.is_none());
 }
 
 #[test]

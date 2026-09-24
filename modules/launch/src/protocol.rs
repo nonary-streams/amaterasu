@@ -157,9 +157,11 @@ pub enum LaunchTarget {
     Playnite {
         game_id: String,
         exit_timeout_seconds: u64,
+        preparation: Vec<PreparationStep>,
     },
     PlayniteFullscreen {
         exit_timeout_seconds: u64,
+        preparation: Vec<PreparationStep>,
     },
 }
 
@@ -206,16 +208,6 @@ impl LaunchTarget {
                 executable.steam_install_dir = steam_install_dir;
                 Ok(Self::Executable(executable))
             }
-            Self::Playnite { .. }
-                if !exclude_global_preparation && !global_preparation.is_empty() =>
-            {
-                Err("global_preparation_unsupported_target")
-            }
-            Self::PlayniteFullscreen { .. }
-                if !exclude_global_preparation && !global_preparation.is_empty() =>
-            {
-                Err("global_preparation_unsupported_target")
-            }
             Self::Playnite { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
                 Err("invalid_catalog_response")
             }
@@ -224,7 +216,30 @@ impl LaunchTarget {
             {
                 Err("invalid_catalog_response")
             }
-            playnite => Ok(playnite),
+            Self::Playnite {
+                game_id,
+                exit_timeout_seconds,
+                ..
+            } => Ok(Self::Playnite {
+                game_id,
+                exit_timeout_seconds,
+                preparation: if exclude_global_preparation {
+                    Vec::new()
+                } else {
+                    global_preparation.to_vec()
+                },
+            }),
+            Self::PlayniteFullscreen {
+                exit_timeout_seconds,
+                ..
+            } => Ok(Self::PlayniteFullscreen {
+                exit_timeout_seconds,
+                preparation: if exclude_global_preparation {
+                    Vec::new()
+                } else {
+                    global_preparation.to_vec()
+                },
+            }),
         }
     }
 
@@ -247,6 +262,7 @@ impl LaunchTarget {
                 Ok(Self::Playnite {
                     game_id: game_id.to_ascii_lowercase(),
                     exit_timeout_seconds,
+                    preparation: Vec::new(),
                 })
             }
             CatalogLaunch::PlayniteFullscreen {
@@ -257,6 +273,7 @@ impl LaunchTarget {
                 }
                 Ok(Self::PlayniteFullscreen {
                     exit_timeout_seconds,
+                    preparation: Vec::new(),
                 })
             }
             CatalogLaunch::Application { .. } => Err("unsupported_launch_kind"),
@@ -861,7 +878,8 @@ mod tests {
         assert!(matches!(
             fullscreen,
             LaunchTarget::PlayniteFullscreen {
-                exit_timeout_seconds: 10
+                exit_timeout_seconds: 10,
+                ..
             }
         ));
         assert!(matches!(
@@ -871,7 +889,8 @@ mod tests {
             }))
             .unwrap(),
             LaunchTarget::PlayniteFullscreen {
-                exit_timeout_seconds: 0
+                exit_timeout_seconds: 0,
+                ..
             }
         ));
         assert!(matches!(
@@ -881,7 +900,8 @@ mod tests {
             }))
             .unwrap(),
             LaunchTarget::PlayniteFullscreen {
-                exit_timeout_seconds: 300
+                exit_timeout_seconds: 300,
+                ..
             }
         ));
         assert_eq!(
@@ -1036,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn global_preparation_for_playnite_requires_explicit_exclusion_until_supported() {
+    fn global_preparation_runs_for_playnite_targets_unless_excluded() {
         let executable = std::env::current_exe()
             .unwrap()
             .to_string_lossy()
@@ -1045,17 +1065,28 @@ mod tests {
         let playnite = json!({
             "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
         });
-        assert_eq!(
-            LaunchTarget::from_catalog_entry(&playnite, std::slice::from_ref(&global)).unwrap_err(),
-            "global_preparation_unsupported_target"
-        );
+        let prepared =
+            LaunchTarget::from_catalog_entry(&playnite, std::slice::from_ref(&global)).unwrap();
+        assert!(matches!(
+            prepared,
+            LaunchTarget::Playnite { preparation, .. } if preparation == [global.clone()]
+        ));
+        let fullscreen = json!({
+            "launch":{"kind":"playnite_fullscreen"}
+        });
+        let prepared_fullscreen =
+            LaunchTarget::from_catalog_entry(&fullscreen, std::slice::from_ref(&global)).unwrap();
+        assert!(matches!(
+            prepared_fullscreen,
+            LaunchTarget::PlayniteFullscreen { preparation, .. } if preparation == [global.clone()]
+        ));
         let excluded = json!({
             "exclude_global_prep_cmd":true,
             "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}
         });
         assert!(matches!(
             LaunchTarget::from_catalog_entry(&excluded, std::slice::from_ref(&global)),
-            Ok(LaunchTarget::Playnite { .. })
+            Ok(LaunchTarget::Playnite { preparation, .. }) if preparation.is_empty()
         ));
     }
 

@@ -2,7 +2,7 @@ use crate::commands::parse_detached_commands;
 use crate::containment::ContainedChild;
 use crate::lifecycle::ApplicationLifecycle;
 use crate::protocol::{
-    Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, ProcessState, TerminalOutcome,
+    Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
 };
 use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker};
 use serde::Serialize;
@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_PREPARATION_SHUTDOWN: Duration = Duration::from_secs(8 * 2 * 30);
 
 #[derive(Clone)]
 enum Completion {
@@ -566,10 +567,93 @@ impl ProcessRecord {
     }
 }
 
+struct PreparationLease {
+    operation_id: String,
+    owner: String,
+    spec: PreparationSpec,
+    lifecycle: ApplicationLifecycle,
+    stopping: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationAction {
+    Status,
+    Stop,
+    Retry,
+}
+
+impl PreparationLease {
+    fn new(caller: &str, operation_id: String, spec: PreparationSpec) -> Self {
+        let lifecycle = ApplicationLifecycle::new(spec.preparation.clone())
+            .expect("validated preparation lease is nonempty");
+        Self {
+            operation_id,
+            owner: caller.into(),
+            spec,
+            lifecycle,
+            stopping: false,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.lifecycle.tick(Instant::now());
+    }
+
+    fn begin_stop(&mut self) {
+        self.stopping = true;
+        self.lifecycle.begin_cleanup();
+        self.advance();
+    }
+
+    fn retry_cleanup(&mut self) {
+        self.lifecycle.retry_cleanup();
+        self.advance();
+    }
+
+    fn state(&self) -> &'static str {
+        if self.lifecycle.cleanup_failed() {
+            "cleanup_failed"
+        } else if self.lifecycle.is_cleanup_complete() {
+            if self.lifecycle.preparation_failed() {
+                "preparation_failed"
+            } else {
+                "complete"
+            }
+        } else if self.lifecycle.is_ready() {
+            "ready"
+        } else if self.stopping || self.lifecycle.preparation_failed() {
+            "cleaning"
+        } else {
+            "preparing"
+        }
+    }
+
+    fn response(&self) -> Value {
+        json!({
+            "ok":true,
+            "preparation": {
+                "operation_id":self.operation_id,
+                "state":self.state(),
+                "preparation":self.lifecycle.preparation,
+                "cleanup":self.lifecycle.cleanup,
+            }
+        })
+    }
+
+    fn settled_for_shutdown(&self) -> bool {
+        self.lifecycle.is_cleanup_complete() || self.lifecycle.cleanup_failed()
+    }
+
+    fn prepare_shutdown(&mut self) {
+        self.begin_stop();
+    }
+}
+
 /// Owns application process trees and lifetime-scoped idempotency records.
 #[derive(Default)]
 pub struct ProcessManager {
     records: BTreeMap<u64, ProcessRecord>,
+    preparations: BTreeMap<(String, String), PreparationLease>,
     next_id: u64,
 }
 
@@ -633,6 +717,26 @@ impl ProcessManager {
                 record.advance()?;
                 Ok(json!({"ok":true,"process":record}))
             }
+            Action::Prepare {
+                operation_id,
+                preparation,
+            } => {
+                let spec = PreparationSpec {
+                    preparation: preparation.into_vec(),
+                };
+                spec.validate(&operation_id)
+                    .map_err(|_| "invalid_preparation")?;
+                self.prepare(caller, operation_id, spec)
+            }
+            Action::PreparationStatus { operation_id } => {
+                self.preparation_action(caller, &operation_id, PreparationAction::Status)
+            }
+            Action::PreparationStop { operation_id } => {
+                self.preparation_action(caller, &operation_id, PreparationAction::Stop)
+            }
+            Action::PreparationRetry { operation_id } => {
+                self.preparation_action(caller, &operation_id, PreparationAction::Retry)
+            }
             Action::Status { process_id } | Action::Terminate { process_id } => {
                 let record = self
                     .records
@@ -656,6 +760,12 @@ impl ProcessManager {
         operation_id: String,
         spec: LaunchSpec,
     ) -> Result<Value, &'static str> {
+        if self
+            .preparations
+            .contains_key(&(caller.to_owned(), operation_id.clone()))
+        {
+            return Err("operation_conflict");
+        }
         if let Some(record) = self
             .records
             .values_mut()
@@ -683,6 +793,73 @@ impl ProcessManager {
         self.records.insert(process_id, record);
         self.next_id = process_id;
         Ok(response)
+    }
+
+    fn prepare(
+        &mut self,
+        caller: &str,
+        operation_id: String,
+        spec: PreparationSpec,
+    ) -> Result<Value, &'static str> {
+        let key = (caller.to_owned(), operation_id.clone());
+        if let Some(lease) = self.preparations.get_mut(&key) {
+            if lease.spec != spec {
+                return Err("operation_conflict");
+            }
+            lease.advance();
+            return Ok(lease.response());
+        }
+        if self
+            .records
+            .values()
+            .any(|record| record.owner == caller && record.operation_id == operation_id)
+        {
+            return Err("operation_conflict");
+        }
+        if self.records.len() + self.preparations.len() >= 128
+            || self
+                .records
+                .values()
+                .filter(|record| record.owner == caller)
+                .count()
+                + self
+                    .preparations
+                    .values()
+                    .filter(|lease| lease.owner == caller)
+                    .count()
+                >= 32
+        {
+            return Err("process_limit");
+        }
+        let mut lease = PreparationLease::new(caller, operation_id, spec);
+        lease.advance();
+        let response = lease.response();
+        self.preparations.insert(key, lease);
+        Ok(response)
+    }
+
+    fn preparation_action(
+        &mut self,
+        caller: &str,
+        operation_id: &str,
+        action: PreparationAction,
+    ) -> Result<Value, &'static str> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err("invalid_request");
+        }
+        let lease = self
+            .preparations
+            .get_mut(&(caller.to_owned(), operation_id.to_owned()))
+            .ok_or("preparation_not_found")?;
+        match action {
+            PreparationAction::Status => lease.advance(),
+            PreparationAction::Stop => lease.begin_stop(),
+            PreparationAction::Retry => lease.retry_cleanup(),
+        }
+        Ok(lease.response())
     }
 
     fn list(&mut self, caller: &str, offset: usize, limit: usize) -> Result<Value, &'static str> {
@@ -715,6 +892,9 @@ impl ProcessManager {
                 failure = Some(error);
             }
         }
+        for lease in self.preparations.values_mut() {
+            lease.advance();
+        }
         failure.map_or(Ok(()), Err)
     }
 
@@ -732,15 +912,26 @@ impl ProcessManager {
                     failure = Some(error);
                 }
             }
+            for lease in self.preparations.values_mut() {
+                lease.prepare_shutdown();
+            }
             if self
                 .records
                 .values()
                 .all(ProcessRecord::settled_for_shutdown)
+                && self
+                    .preparations
+                    .values()
+                    .all(PreparationLease::settled_for_shutdown)
             {
                 let cleanup_failed = self
                     .records
                     .values()
-                    .any(|record| matches!(record.state, ProcessState::CleanupFailed { .. }));
+                    .any(|record| matches!(record.state, ProcessState::CleanupFailed { .. }))
+                    || self
+                        .preparations
+                        .values()
+                        .any(|lease| lease.lifecycle.cleanup_failed());
                 return if cleanup_failed {
                     Err(failure.unwrap_or("process_cleanup_failed"))
                 } else {
@@ -765,10 +956,19 @@ impl ProcessManager {
                 record.abort_active_lifecycle_command();
                 let _ = record.advance();
             }
+            for lease in self.preparations.values_mut() {
+                lease.prepare_shutdown();
+                lease.lifecycle.abort_active_command();
+                lease.advance();
+            }
             if self
                 .records
                 .values()
                 .all(ProcessRecord::settled_for_shutdown)
+                && self
+                    .preparations
+                    .values()
+                    .all(PreparationLease::settled_for_shutdown)
                 || Instant::now() >= deadline
             {
                 return;
@@ -785,7 +985,7 @@ impl ProcessManager {
             .max()
             .unwrap_or_default()
             .min(MAX_EXIT_TIMEOUT_SECONDS);
-        Duration::from_secs(longest_grace) + REAP_TIMEOUT
+        (Duration::from_secs(longest_grace) + REAP_TIMEOUT).max(MAX_PREPARATION_SHUTDOWN)
     }
 }
 

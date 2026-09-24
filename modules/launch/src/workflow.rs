@@ -14,6 +14,8 @@ pub enum Step {
     Acquire,
     Spawn,
     AwaitApplication,
+    PreparePlaynite,
+    AwaitPreparation,
     StartPlaynite,
     AwaitPlayniteStart,
     MonitorPlaynite,
@@ -22,6 +24,8 @@ pub enum Step {
     FindSession,
     FindProcess,
     FindPlaynite,
+    StopPreparation,
+    AwaitPreparationStop,
     RecoverPlayniteStop,
     StopSession,
     Terminate,
@@ -87,6 +91,7 @@ impl Workflow {
                 }) => exit_timeout_seconds.saturating_add(21).min(321),
             Some(LaunchTarget::PlayniteFullscreen {
                 exit_timeout_seconds,
+                ..
             }) => exit_timeout_seconds.saturating_add(21).min(321),
             _ => 20,
         };
@@ -135,6 +140,29 @@ impl Workflow {
                 ),
                 _ => return Err("invalid_workflow"),
             },
+            Step::PreparePlaynite => {
+                let preparation = match record.target.as_ref() {
+                    Some(LaunchTarget::Playnite { preparation, .. })
+                    | Some(LaunchTarget::PlayniteFullscreen { preparation, .. }) => preparation,
+                    _ => return Err("invalid_workflow"),
+                };
+                (
+                    APPLICATION,
+                    json!({"action":"prepare","operation_id":record.preparation_operation,"preparation":preparation}),
+                )
+            }
+            Step::AwaitPreparation => (
+                APPLICATION,
+                json!({"action":"preparation_status","operation_id":record.preparation_operation}),
+            ),
+            Step::StopPreparation => (
+                APPLICATION,
+                json!({"action":"preparation_stop","operation_id":record.preparation_operation}),
+            ),
+            Step::AwaitPreparationStop => (
+                APPLICATION,
+                json!({"action":"preparation_status","operation_id":record.preparation_operation}),
+            ),
             Step::FindPlaynite => match record.target.as_ref() {
                 Some(LaunchTarget::Playnite { .. }) => (
                     PLAYNITE,
@@ -150,12 +178,14 @@ impl Workflow {
                 Some(LaunchTarget::Playnite {
                     game_id,
                     exit_timeout_seconds,
+                    ..
                 }) => (
                     PLAYNITE,
                     json!({"action":"launch_recover_stop","operation_id":record.process_operation,"game_id":game_id,"exit_timeout_seconds":exit_timeout_seconds}),
                 ),
                 Some(LaunchTarget::PlayniteFullscreen {
                     exit_timeout_seconds,
+                    ..
                 }) => (
                     PLAYNITE,
                     json!({"action":"fullscreen_recover_stop","operation_id":record.process_operation,"exit_timeout_seconds":exit_timeout_seconds}),
@@ -176,6 +206,7 @@ impl Workflow {
                     ),
                     Some(LaunchTarget::PlayniteFullscreen {
                         exit_timeout_seconds,
+                        ..
                     }) => (
                         PLAYNITE,
                         json!({"action":"fullscreen_stop","ticket":ticket,"exit_timeout_seconds":exit_timeout_seconds}),
@@ -234,6 +265,8 @@ pub fn first_cleanup_step(record: &Record) -> Step {
         Step::FindPlaynite
     } else if record.provider_ticket.is_some() && !record.provider_stopped {
         Step::StopPlaynite
+    } else if record.preparation_requested && !record.preparation_stopped {
+        Step::StopPreparation
     } else if record.process_requested && record.process_id.is_none() {
         Step::FindProcess
     } else if record.session_id.is_some() {
@@ -268,6 +301,7 @@ mod tests {
         record.target = Some(LaunchTarget::Playnite {
             game_id: "a1b2c3d4-1234-5678-9abc-0123456789ab".into(),
             exit_timeout_seconds: 300,
+            preparation: Vec::new(),
         });
         record.provider_launch_requested = true;
         let mut workflow = Workflow::launch(launch_id, 1, 30_000);

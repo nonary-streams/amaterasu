@@ -304,6 +304,9 @@ impl Pipeline {
         if job.step == Step::Spawn {
             record.process_requested = true;
         }
+        if job.step == Step::PreparePlaynite {
+            record.preparation_requested = true;
+        }
         if job.step == Step::StartPlaynite {
             record.provider_launch_requested = true;
         }
@@ -423,11 +426,46 @@ impl Pipeline {
                 }
                 job.step = match record.target.as_ref() {
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
+                    Some(LaunchTarget::Playnite { preparation, .. })
+                    | Some(LaunchTarget::PlayniteFullscreen { preparation, .. })
+                        if !preparation.is_empty() =>
+                    {
+                        Step::PreparePlaynite
+                    }
                     Some(
                         LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. },
                     ) => Step::StartPlaynite,
                     None => return self.dependency_failed(job, "invalid_catalog_response", send),
                 };
+            }
+            Step::PreparePlaynite | Step::AwaitPreparation => {
+                let (_, state) = match responses::preparation(&payload, record) {
+                    Ok(preparation) => preparation,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                match state {
+                    responses::PreparationState::Preparing
+                    | responses::PreparationState::Cleaning => {
+                        job.step = Step::AwaitPreparation;
+                    }
+                    responses::PreparationState::Ready => job.step = Step::StartPlaynite,
+                    responses::PreparationState::PreparationFailed => job.begin_cleanup(
+                        record,
+                        Outcome::Failed,
+                        Some("global_preparation_failed"),
+                    ),
+                    responses::PreparationState::CleanupFailed => {
+                        job.begin_cleanup(
+                            record,
+                            Outcome::Failed,
+                            Some("global_preparation_failed"),
+                        );
+                        return self.cleanup_failed(job, "global_preparation_cleanup_failed", send);
+                    }
+                    responses::PreparationState::Complete => {
+                        return self.dependency_failed(job, "invalid_preparation_response", send);
+                    }
+                }
             }
             Step::Spawn | Step::AwaitApplication => {
                 let (process, state) = match responses::process(&payload, record) {
@@ -617,6 +655,37 @@ impl Pipeline {
                     job.step = Step::RecoverPlayniteStop;
                 } else {
                     return self.cleanup_failed(job, "playnite_lookup_failed", send);
+                }
+            }
+            Step::StopPreparation | Step::AwaitPreparationStop => {
+                if payload["ok"] == false && payload["code"] == "preparation_not_found" {
+                    record.preparation_stopped = true;
+                    job.step = first_cleanup_step(record);
+                    return self.retain(job);
+                }
+                let (_, state) = match responses::preparation(&payload, record) {
+                    Ok(preparation) => preparation,
+                    Err(code) => return self.cleanup_failed(job, code, send),
+                };
+                match state {
+                    responses::PreparationState::Cleaning => {
+                        job.step = Step::AwaitPreparationStop;
+                    }
+                    responses::PreparationState::Complete
+                    | responses::PreparationState::PreparationFailed => {
+                        record.preparation_stopped = true;
+                        job.step = first_cleanup_step(record);
+                    }
+                    responses::PreparationState::CleanupFailed => {
+                        return self.cleanup_failed(job, "global_preparation_cleanup_failed", send);
+                    }
+                    responses::PreparationState::Preparing | responses::PreparationState::Ready => {
+                        return self.cleanup_failed(
+                            job,
+                            "global_preparation_stop_unconfirmed",
+                            send,
+                        );
+                    }
                 }
             }
             Step::RecoverPlayniteStop => {

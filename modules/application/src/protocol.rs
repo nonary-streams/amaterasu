@@ -33,6 +33,20 @@ pub(crate) enum Action {
     Lookup {
         operation_id: String,
     },
+    Prepare {
+        operation_id: String,
+        #[serde(default)]
+        preparation: Box<[PreparationStep]>,
+    },
+    PreparationStatus {
+        operation_id: String,
+    },
+    PreparationStop {
+        operation_id: String,
+    },
+    PreparationRetry {
+        operation_id: String,
+    },
     Status {
         process_id: u64,
     },
@@ -45,6 +59,27 @@ pub(crate) enum Action {
         #[serde(default = "list_limit")]
         limit: usize,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparationSpec {
+    pub preparation: Vec<PreparationStep>,
+}
+
+impl PreparationSpec {
+    pub fn validate(&self, operation_id: &str) -> Result<(), &'static str> {
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err("invalid operation id");
+        }
+        if self.preparation.is_empty() {
+            return Err("preparation must contain at least one step");
+        }
+        PreparationStep::validate_all(&self.preparation)
+    }
 }
 
 fn list_limit() -> usize {

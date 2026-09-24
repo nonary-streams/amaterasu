@@ -17,6 +17,30 @@ fn status(manager: &mut ProcessManager, caller: &str, id: u64) -> Value {
     manager.handle(caller, json!({"action":"status","process_id":id}))
 }
 
+fn wait_for_preparation_state(
+    manager: &mut ProcessManager,
+    caller: &str,
+    operation_id: &str,
+    state: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = manager.handle(
+            caller,
+            json!({"action":"preparation_status","operation_id":operation_id}),
+        );
+        if response["preparation"]["state"] == state {
+            return response;
+        }
+        assert_ne!(response["ok"], false, "{response}");
+        assert!(
+            Instant::now() < deadline,
+            "preparation did not reach {state}: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 #[ignore = "subprocess entry point invoked by process lifecycle tests"]
 fn controlled_child() {
@@ -888,6 +912,168 @@ fn preparation_runs_in_order_and_undo_runs_once_in_reverse() {
     );
     std::fs::remove_dir_all(directory).unwrap();
     std::fs::remove_dir_all(undo_directory).unwrap();
+}
+
+#[test]
+fn prepare_only_lease_is_idempotent_and_undoes_in_reverse_without_launching_a_process() {
+    let directory = test_directory("prepare-only-lease");
+    let trace = directory.join("events");
+    let steps = json!([
+        {
+            "run":lifecycle_command(&trace, "global-one", "trace"),
+            "undo":lifecycle_command(&trace, "undo-one", "trace"),
+        },
+        {
+            "run":lifecycle_command(&trace, "global-two", "trace"),
+            "undo":lifecycle_command(&trace, "undo-two", "trace"),
+        },
+    ]);
+    let request = json!({
+        "action":"prepare",
+        "operation_id":"playnite-preparation",
+        "preparation":steps,
+    });
+    let mut manager = ProcessManager::default();
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["ok"], true, "{started}");
+    assert_eq!(started["preparation"]["state"], "preparing");
+    assert_eq!(
+        manager.handle("alice", json!({"action":"list"}))["processes"],
+        json!([]),
+        "prepare-only created an application process record"
+    );
+
+    let ready = wait_for_preparation_state(&mut manager, "alice", "playnite-preparation", "ready");
+    assert_eq!(ready["preparation"]["preparation"]["completed"], 2);
+    assert_eq!(trace_events(&trace), ["global-one", "global-two"]);
+    assert_eq!(manager.handle("alice", request.clone()), ready);
+
+    let mut changed_plan = request.clone();
+    changed_plan["preparation"][0]["run"] = lifecycle_command(&trace, "different-step", "trace");
+    assert_eq!(
+        manager.handle("alice", changed_plan)["code"],
+        "operation_conflict"
+    );
+
+    let stopping = manager.handle(
+        "alice",
+        json!({"action":"preparation_stop","operation_id":"playnite-preparation"}),
+    );
+    assert_eq!(stopping["preparation"]["state"], "cleaning", "{stopping}");
+    let complete =
+        wait_for_preparation_state(&mut manager, "alice", "playnite-preparation", "complete");
+    assert_eq!(complete["preparation"]["cleanup"]["state"], "complete");
+    assert_eq!(
+        trace_events(&trace),
+        ["global-one", "global-two", "undo-two", "undo-one"]
+    );
+    assert_eq!(manager.handle("alice", request.clone()), complete);
+    assert_eq!(
+        manager.handle(
+            "alice",
+            json!({"action":"preparation_stop","operation_id":"playnite-preparation"}),
+        ),
+        complete
+    );
+    assert_eq!(
+        manager.handle(
+            "bob",
+            json!({"action":"preparation_status","operation_id":"playnite-preparation"}),
+        )["code"],
+        "preparation_not_found"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn prepare_only_failure_rolls_back_started_steps_and_cleanup_can_be_retried() {
+    let directory = test_directory("prepare-only-failure");
+    let trace = directory.join("events");
+    let mut manager = ProcessManager::default();
+    let response = manager.handle(
+        "alice",
+        json!({
+            "action":"prepare",
+            "operation_id":"playnite-prepare-failure",
+            "preparation":[
+                {
+                    "run":lifecycle_command(&trace, "prepare-one", "trace"),
+                    "undo":lifecycle_command(&trace, "undo-one", "trace"),
+                },
+                {
+                    "run":lifecycle_command(&trace, "prepare-fail", "trace_fail"),
+                    "undo":lifecycle_command(&trace, "undo-failed-step", "trace"),
+                },
+            ],
+        }),
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    let failed = wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "playnite-prepare-failure",
+        "preparation_failed",
+    );
+    assert_eq!(failed["preparation"]["preparation"]["failure"]["step"], 1);
+    assert_eq!(
+        trace_events(&trace),
+        [
+            "prepare-one",
+            "prepare-fail",
+            "undo-failed-step",
+            "undo-one"
+        ]
+    );
+
+    let retry_directory = test_directory("prepare-only-retry");
+    let retry_trace = retry_directory.join("events");
+    let mut retry = ProcessManager::default();
+    let started = retry.handle(
+        "alice",
+        json!({
+            "action":"prepare",
+            "operation_id":"playnite-prepare-retry",
+            "preparation":[{
+                "run":lifecycle_command(&retry_trace, "prepare", "trace"),
+                "undo":lifecycle_command(&retry_trace, "undo-attempt", "trace_fail_once"),
+            }],
+        }),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    wait_for_preparation_state(&mut retry, "alice", "playnite-prepare-retry", "ready");
+    let stopping = retry.handle(
+        "alice",
+        json!({"action":"preparation_stop","operation_id":"playnite-prepare-retry"}),
+    );
+    assert_eq!(stopping["preparation"]["state"], "cleaning", "{stopping}");
+    let failed_undo = wait_for_preparation_state(
+        &mut retry,
+        "alice",
+        "playnite-prepare-retry",
+        "cleanup_failed",
+    );
+    assert_eq!(
+        failed_undo["preparation"]["state"], "cleanup_failed",
+        "{failed_undo}"
+    );
+    assert_eq!(
+        failed_undo["preparation"]["cleanup"]["failures"][0]["phase"],
+        "undo"
+    );
+    let retried = retry.handle(
+        "alice",
+        json!({"action":"preparation_retry","operation_id":"playnite-prepare-retry"}),
+    );
+    assert_eq!(retried["preparation"]["state"], "cleaning", "{retried}");
+    let complete =
+        wait_for_preparation_state(&mut retry, "alice", "playnite-prepare-retry", "complete");
+    assert_eq!(complete["preparation"]["cleanup"]["state"], "complete");
+    assert_eq!(
+        trace_events(&retry_trace),
+        ["prepare", "undo-attempt", "undo-attempt"]
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(retry_directory).unwrap();
 }
 
 #[test]

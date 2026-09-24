@@ -33,6 +33,8 @@ pub struct Record {
     #[serde(skip)]
     pub process_operation: String,
     #[serde(skip)]
+    pub preparation_operation: String,
+    #[serde(skip)]
     pub resource: Option<String>,
     #[serde(skip)]
     pub target: Option<LaunchTarget>,
@@ -47,6 +49,10 @@ pub struct Record {
     pub session_requested: bool,
     #[serde(skip)]
     pub process_requested: bool,
+    #[serde(skip)]
+    pub preparation_requested: bool,
+    #[serde(skip)]
+    pub preparation_stopped: bool,
     #[serde(skip)]
     pub provider_launch_requested: bool,
     #[serde(skip)]
@@ -144,7 +150,8 @@ impl Records {
                 catalog_selection,
                 catalog_initiator: initiator.into(),
                 session_key: key.clone(),
-                process_operation: key,
+                process_operation: key.clone(),
+                preparation_operation: format!("{key}.preparation"),
                 resource,
                 target: None,
                 global_preparation,
@@ -152,6 +159,8 @@ impl Records {
                 config_overrides: None,
                 session_requested: false,
                 process_requested: false,
+                preparation_requested: false,
+                preparation_stopped: false,
                 provider_launch_requested: false,
                 provider_stopped: false,
                 cleanup_outcome: Outcome::Completed,
