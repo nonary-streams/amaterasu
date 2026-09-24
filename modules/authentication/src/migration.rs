@@ -476,7 +476,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(namespace_path(&state)).unwrap()).unwrap();
         let document: Document =
             serde_json::from_value(namespace.values[STATE_KEY].clone()).unwrap();
-        assert!(document.credential.unwrap().legacy_salt.is_some());
+        assert!(document.credential.as_ref().unwrap().legacy_salt.is_some());
+        assert!(namespace.values[STATE_KEY].get("sessions").is_none());
         let reimported = import_legacy_authentication(&source).unwrap();
         assert_eq!(
             seed_authentication_state(&state, &reimported).unwrap(),

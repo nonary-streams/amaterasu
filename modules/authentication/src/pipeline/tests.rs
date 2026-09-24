@@ -20,6 +20,8 @@ fn settings_with_ttls(session_ttl: u64, remembered_refresh_ttl: u64) -> Settings
 struct StateHarness {
     stored: Option<Value>,
     revision: u64,
+    session_stored: Option<Value>,
+    session_revision: u64,
     state_response: Option<Response>,
     product_response: Option<Response>,
     incoming: Option<Response>,
@@ -31,6 +33,7 @@ struct StateHarness {
     released_results: usize,
     release_failures_remaining: usize,
     fail_write: bool,
+    fail_session_write: bool,
     cancelled: bool,
 }
 impl StateHarness {
@@ -38,6 +41,8 @@ impl StateHarness {
         Self {
             stored: None,
             revision: 0,
+            session_stored: None,
+            session_revision: 0,
             state_response: None,
             product_response: None,
             incoming: None,
@@ -49,6 +54,7 @@ impl StateHarness {
             released_results: 0,
             release_failures_remaining: 0,
             fail_write: false,
+            fail_session_write: false,
             cancelled: false,
         }
     }
@@ -63,18 +69,37 @@ impl StateHarness {
             } => {
                 assert_eq!(parent, Some(7));
                 if service == STATE_SERVICE {
-                    assert_eq!(payload["key"], STATE_KEY);
-                    let response = if payload["action"] == "get" {
-                        json!({"ok":true,"revision":self.revision,"found":self.stored.is_some(),"value":self.stored})
-                    } else {
-                        assert_eq!(payload["expected_revision"], self.revision);
-                        self.writes += 1;
-                        if self.fail_write {
-                            json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                    let key = payload["key"].as_str().unwrap();
+                    let response = if key == STATE_KEY {
+                        if payload["action"] == "get" {
+                            json!({"ok":true,"revision":self.revision,"found":self.stored.is_some(),"value":self.stored})
                         } else {
-                            self.stored = Some(payload["value"].clone());
-                            self.revision += 1;
-                            json!({"ok":true,"revision":self.revision})
+                            assert_eq!(payload["action"], "set");
+                            assert_eq!(payload["expected_revision"], self.revision);
+                            self.writes += 1;
+                            if self.fail_write {
+                                json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                            } else {
+                                self.stored = Some(payload["value"].clone());
+                                self.revision += 1;
+                                json!({"ok":true,"revision":self.revision})
+                            }
+                        }
+                    } else {
+                        assert_eq!(key, SESSION_STATE_KEY);
+                        if payload["action"] == "get" {
+                            json!({"ok":true,"revision":self.session_revision,"found":self.session_stored.is_some(),"value":self.session_stored})
+                        } else {
+                            assert_eq!(payload["action"], "set");
+                            assert_eq!(payload["expected_revision"], self.session_revision);
+                            self.writes += 1;
+                            if self.fail_write || self.fail_session_write {
+                                json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
+                            } else {
+                                self.session_stored = Some(payload["value"].clone());
+                                self.session_revision += 1;
+                                json!({"ok":true,"revision":self.session_revision})
+                            }
                         }
                     };
                     self.state_response = Some(Response::Result { payload: response });
@@ -673,6 +698,275 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
 }
 
 #[test]
+fn administrator_session_and_refresh_rotation_survive_restart() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings_with_ttls(120, 400));
+    state.setup(&mut pipeline);
+
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        100,
+    );
+    assert_eq!(login["ok"], true);
+    assert_eq!(
+        state.revision, 1,
+        "login must not rewrite the legacy document"
+    );
+    assert_eq!(state.session_revision, 1);
+    let stored = state.session_stored.as_ref().unwrap();
+    assert_eq!(stored["sessions"].as_array().unwrap().len(), 1);
+    assert!(state.stored.as_ref().unwrap().get("sessions").is_none());
+    assert_eq!(stored["version"], SESSION_DOCUMENT_VERSION);
+    assert!(
+        !stored
+            .to_string()
+            .contains(login["bearer"].as_str().unwrap())
+    );
+    assert!(
+        !stored
+            .to_string()
+            .contains(login["refresh_token"].as_str().unwrap())
+    );
+
+    let mut restarted = Pipeline::new(settings_with_ttls(120, 400));
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
+            101,
+        )["ok"],
+        true
+    );
+
+    let rotated = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        220,
+    );
+    assert_eq!(rotated["ok"], true);
+    assert_eq!(rotated["refresh_expires_at"], 500);
+    assert_eq!(
+        state.revision, 1,
+        "rotation only changes the session sidecar"
+    );
+    assert_eq!(state.session_revision, 2);
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["session_id"],
+        crate::crypto::token_digest(rotated["bearer"].as_str().unwrap())
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["refresh_token_digest"],
+        crate::crypto::token_digest(rotated["refresh_token"].as_str().unwrap())
+    );
+
+    let mut restarted_again = Pipeline::new(settings_with_ttls(120, 400));
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":["catalog.read"]}),
+            221,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
+            221,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+            221,
+        )["code"],
+        "unauthorized"
+    );
+
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"logout","refresh_token":rotated["refresh_token"]}),
+            222,
+        )["ok"],
+        true
+    );
+    assert!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .map_or(true, |sessions| sessions.is_empty())
+    );
+    let mut after_logout = Pipeline::new(settings_with_ttls(120, 400));
+    assert_eq!(
+        state.request(
+            &mut after_logout,
+            "frontend",
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":[]}),
+            223,
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn scope_digest_mismatch_invalidates_hydrated_sessions() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    assert_eq!(session["ok"], true);
+
+    let changed_settings = Settings {
+        allowed_scopes: BTreeSet::from(["catalog.read".into()]),
+        ..settings()
+    };
+    let mut restarted = Pipeline::new(changed_settings);
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":["catalog.read"]}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "console",
+            json!({"action":"list_sessions"}),
+            101,
+        )["sessions"],
+        json!([])
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "mismatched persisted records are ignored until a later session write"
+    );
+}
+
+#[test]
+fn failed_login_and_refresh_commits_never_return_uncommitted_token_pairs() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+
+    state.fail_write = true;
+    let failed_login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        100,
+    );
+    assert_eq!(failed_login, error("state_unavailable"));
+    assert!(state.session_stored.is_none());
+
+    state.fail_write = false;
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        101,
+    );
+    assert_eq!(login["ok"], true);
+
+    state.fail_write = true;
+    let failed_refresh = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        102,
+    );
+    assert_eq!(failed_refresh, error("state_unavailable"));
+
+    state.fail_write = false;
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
+            103,
+        )["ok"],
+        true
+    );
+    let retried_refresh = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        103,
+    );
+    assert_eq!(retried_refresh["ok"], true);
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["session_id"],
+        crate::crypto::token_digest(retried_refresh["bearer"].as_str().unwrap())
+    );
+}
+
+#[test]
+fn legacy_login_waits_for_session_sidecar_commit_after_credential_upgrade() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let salt = "AbCdEfGhIjKlMnOp";
+    let password = "correct horse battery staple";
+    state.stored = Some(json!({
+        "credential": {
+            "username": "Admin",
+            "password_hash": crate::crypto::token_digest(&format!("{password}{salt}")),
+            "legacy_salt": salt,
+            "case_insensitive_username": true
+        },
+        "tokens": []
+    }));
+    state.revision = 1;
+    state.fail_session_write = true;
+
+    let failed_login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password}),
+        100,
+    );
+    assert_eq!(failed_login, error("state_unavailable"));
+    assert!(failed_login.get("bearer").is_none());
+    assert!(
+        state.stored.as_ref().unwrap()["credential"]
+            .get("legacy_salt")
+            .is_none()
+    );
+    assert!(state.session_stored.is_none());
+
+    state.fail_session_write = false;
+    let committed_login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password}),
+        101,
+    );
+    assert_eq!(committed_login["ok"], true);
+    assert!(state.session_stored.is_some());
+}
+
+#[test]
 fn default_refresh_lifetime_and_logout_revoke_the_entire_token_pair() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());
@@ -945,7 +1239,7 @@ fn cancelled_state_read_does_not_hash_or_issue_and_releases_pending_request() {
 }
 
 #[test]
-fn logout_and_restart_invalidate_sessions_without_changing_credential() {
+fn logout_revokes_persistently_and_active_sessions_survive_restart() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());
     state.setup(&mut pipeline);
@@ -978,10 +1272,10 @@ fn logout_and_restart_invalidate_sessions_without_changing_credential() {
             "frontend",
             json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
             102
-        )["code"],
-        "unauthorized"
+        )["ok"],
+        true
     );
-    assert_eq!(state.writes, 1);
+    assert_eq!(state.writes, 4);
 }
 
 #[test]
@@ -1021,6 +1315,9 @@ fn password_rotation_waits_for_commit_and_cancelled_commit_invalidates_old_sessi
         remaining_ms: 30_000,
         payload: rotate,
     });
+    pipeline
+        .tick_at(100, |command| state.send(command))
+        .unwrap();
     pipeline
         .tick_at(100, |command| state.send(command))
         .unwrap();
@@ -1149,5 +1446,29 @@ fn administrator_session_metadata_is_not_a_bearer_and_revocation_works() {
             100
         )["ok"],
         true
+    );
+    assert!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .map_or(true, |sessions| sessions.is_empty())
+    );
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"refresh","refresh_token":session["refresh_token"]}),
+            101,
+        )["code"],
+        "unauthorized"
     );
 }

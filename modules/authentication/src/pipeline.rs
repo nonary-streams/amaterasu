@@ -1,12 +1,13 @@
 use crate::engine::{Change, Engine};
 use crate::product_settings::{CONFIGURATION_SERVICE, TokenLifetimes};
-use crate::protocol::{Document, Operation, Settings, error};
+use crate::protocol::{Document, Operation, SessionDocument, Settings, error};
 use crate::{SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATE_KEY: &str = "authentication/v1";
+const SESSION_STATE_KEY: &str = "authentication/sessions/v1";
 
 type Transport = ModuleResult<Response>;
 
@@ -29,11 +30,24 @@ enum ChildOutcome {
     Payload(Value),
     Failure { code: String },
 }
+struct StateMutation {
+    key: &'static str,
+    expected_revision: u64,
+    value: Value,
+    operation_id_suffix: &'static str,
+}
 enum Stage {
     Loading(Operation),
+    LoadingSessions {
+        operation: Operation,
+        document: Document,
+        document_revision: u64,
+    },
     Saving {
         response: Value,
         invalidate_sessions: bool,
+        followup: Option<StateMutation>,
+        expected_revision: u64,
     },
     LoadingProductSettings(Operation),
     SavingProductSettings {
@@ -193,6 +207,36 @@ impl Pipeline {
         }
     }
 
+    fn submit_state_mutation(
+        &mut self,
+        request: Request,
+        mutation: StateMutation,
+        response: Value,
+        invalidate_sessions: bool,
+        followup: Option<StateMutation>,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let payload = json!({
+            "action":"set",
+            "key":mutation.key,
+            "expected_revision":mutation.expected_revision,
+            "value":mutation.value
+        });
+        self.submit(
+            request,
+            Stage::Saving {
+                response,
+                invalidate_sessions,
+                followup,
+                expected_revision: mutation.expected_revision,
+            },
+            STATE_SERVICE,
+            mutation.operation_id_suffix,
+            payload,
+            send,
+        )
+    }
+
     fn advance(
         &mut self,
         mut pending: Pending,
@@ -273,9 +317,22 @@ impl Pipeline {
             Stage::Saving {
                 response,
                 invalidate_sessions,
+                followup,
+                expected_revision,
             } => {
-                if payload["ok"] != true || payload["revision"].as_u64().is_none() {
+                let committed_revision = expected_revision.checked_add(1);
+                if payload["ok"] != true || payload["revision"].as_u64() != committed_revision {
                     return complete(send, pending.request.id, error("state_unavailable"));
+                }
+                if let Some(followup) = followup {
+                    return self.submit_state_mutation(
+                        pending.request,
+                        followup,
+                        response,
+                        invalidate_sessions,
+                        None,
+                        send,
+                    );
                 }
                 if invalidate_sessions {
                     self.engine.clear_sessions();
@@ -286,25 +343,93 @@ impl Pipeline {
                 if Instant::now() >= pending.request.deadline {
                     return complete(send, pending.request.id, error("deadline_exceeded"));
                 }
-                let document = match read_document(&payload) {
+                let (document, document_revision) = match read_document(&payload) {
                     Ok(document) => document,
                     Err(code) => return complete(send, pending.request.id, error(code)),
                 };
-                match self.engine.apply(&pending.request.caller, operation, document, now) {
+                self.submit(
+                    pending.request,
+                    Stage::LoadingSessions {
+                        operation,
+                        document,
+                        document_revision,
+                    },
+                    STATE_SERVICE,
+                    "load-sessions",
+                    json!({"action":"get","key":SESSION_STATE_KEY}),
+                    send,
+                )
+            }
+            Stage::LoadingSessions {
+                operation,
+                document,
+                document_revision,
+            } => {
+                if Instant::now() >= pending.request.deadline {
+                    return complete(send, pending.request.id, error("deadline_exceeded"));
+                }
+                let (session_document, session_revision) = match read_session_document(&payload) {
+                    Ok(document) => document,
+                    Err(code) => return complete(send, pending.request.id, error(code)),
+                };
+                match self.engine.apply(
+                    &pending.request.caller,
+                    operation,
+                    document,
+                    session_document,
+                    now,
+                ) {
                     Ok(Change::Read(response)) => complete(send, pending.request.id, response),
-                    Ok(Change::Write {
+                    Ok(Change::WriteDocument {
                         document,
                         response,
                         invalidate_sessions,
-                    }) => self.submit(
+                    }) => self.submit_state_mutation(
                         pending.request,
-                        Stage::Saving {
-                            response,
-                            invalidate_sessions,
+                        StateMutation {
+                            key: STATE_KEY,
+                            expected_revision: document_revision,
+                            value: json!(document),
+                            operation_id_suffix: "save",
                         },
-                        STATE_SERVICE,
-                        "save",
-                        json!({"action":"set","key":STATE_KEY,"expected_revision":payload["revision"],"value":document}),
+                        response,
+                        invalidate_sessions,
+                        None,
+                        send,
+                    ),
+                    Ok(Change::WriteSessions { document, response }) => self.submit_state_mutation(
+                        pending.request,
+                        StateMutation {
+                            key: SESSION_STATE_KEY,
+                            expected_revision: session_revision,
+                            value: json!(document),
+                            operation_id_suffix: "save-sessions",
+                        },
+                        response,
+                        false,
+                        None,
+                        send,
+                    ),
+                    Ok(Change::WriteBoth {
+                        document,
+                        sessions,
+                        response,
+                    }) => self.submit_state_mutation(
+                        pending.request,
+                        StateMutation {
+                            key: STATE_KEY,
+                            expected_revision: document_revision,
+                            value: json!(document),
+                            operation_id_suffix: "save",
+                        },
+                        response,
+                        false,
+                        Some(StateMutation {
+                            key: SESSION_STATE_KEY,
+                            expected_revision: session_revision,
+                            value: json!(sessions),
+                            operation_id_suffix: "save-sessions",
+                        }),
                         send,
                     ),
                     Err(code) => complete(send, pending.request.id, error(code)),
@@ -421,18 +546,41 @@ fn normalized_product_error(payload: &Value) -> Option<Value> {
 fn failure_for_stage(stage: &Stage, code: &str) -> Value {
     match stage {
         Stage::LoadingProductSettings(_) | Stage::SavingProductSettings { .. } => error(code),
-        Stage::Loading(_) | Stage::Saving { .. } => error("state_unavailable"),
+        Stage::Loading(_) | Stage::LoadingSessions { .. } | Stage::Saving { .. } => {
+            error("state_unavailable")
+        }
     }
 }
 
-fn read_document(payload: &Value) -> Result<Document, &'static str> {
+fn read_document(payload: &Value) -> Result<(Document, u64), &'static str> {
+    let revision = payload["revision"].as_u64().ok_or("invalid_state")?;
     match payload["found"].as_bool() {
-        Some(false) => Ok(Document::default()),
+        Some(false) => Ok((Document::default(), revision)),
         Some(true) => {
             let document: Document =
                 serde_json::from_value(payload["value"].clone()).map_err(|_| "invalid_state")?;
             document.validate()?;
-            Ok(document)
+            if revision == 0 {
+                return Err("invalid_state");
+            }
+            Ok((document, revision))
+        }
+        None => Err("invalid_state"),
+    }
+}
+
+fn read_session_document(payload: &Value) -> Result<(SessionDocument, u64), &'static str> {
+    let revision = payload["revision"].as_u64().ok_or("invalid_state")?;
+    match payload["found"].as_bool() {
+        Some(false) => Ok((SessionDocument::default(), revision)),
+        Some(true) => {
+            let document: SessionDocument =
+                serde_json::from_value(payload["value"].clone()).map_err(|_| "invalid_state")?;
+            document.validate()?;
+            if revision == 0 {
+                return Err("invalid_state");
+            }
+            Ok((document, revision))
         }
         None => Err("invalid_state"),
     }

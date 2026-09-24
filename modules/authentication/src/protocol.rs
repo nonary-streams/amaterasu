@@ -3,6 +3,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 pub const MAX_TOKENS: usize = 32;
+pub const MAX_SESSIONS: usize = 16;
+pub const MAX_SESSION_DOCUMENT_BYTES: usize = 12_000;
+pub const SESSION_DOCUMENT_VERSION: u32 = 1;
 pub const MAX_SCOPES: usize = 64;
 pub const DEFAULT_SESSION_TOKEN_TTL_SECONDS: u64 = 7200;
 pub const DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS: u64 = 604800;
@@ -187,6 +190,63 @@ pub struct Document {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SessionDocument {
+    pub version: u32,
+    pub sessions: Vec<SessionRecord>,
+}
+
+impl Default for SessionDocument {
+    fn default() -> Self {
+        Self {
+            version: SESSION_DOCUMENT_VERSION,
+            sessions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub credential_digest: String,
+    pub scope_digest: String,
+    pub subject: String,
+    pub expires_at: u64,
+    pub refresh_expires_at: u64,
+    pub refresh_token_digest: String,
+    pub remember_me: bool,
+}
+
+impl SessionDocument {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.version != SESSION_DOCUMENT_VERSION
+            || self.sessions.len() > MAX_SESSIONS
+            || serde_json::to_vec(self)
+                .map_or(true, |bytes| bytes.len() > MAX_SESSION_DOCUMENT_BYTES)
+        {
+            return Err("invalid_state");
+        }
+        let mut session_ids = BTreeSet::new();
+        let mut refresh_token_digests = BTreeSet::new();
+        for session in &self.sessions {
+            if !valid_digest(&session.session_id)
+                || !session_ids.insert(&session.session_id)
+                || !valid_digest(&session.credential_digest)
+                || !valid_digest(&session.scope_digest)
+                || !identifier(&session.subject, 64)
+                || session.expires_at > session.refresh_expires_at
+                || !valid_digest(&session.refresh_token_digest)
+                || !refresh_token_digests.insert(&session.refresh_token_digest)
+            {
+                return Err("invalid_state");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Credential {
     pub username: String,
     pub password_hash: String,
@@ -304,6 +364,93 @@ mod scope_tests {
                 settings.remember_me_refresh_token_ttl_seconds = value.as_u64().unwrap();
             }
             assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_authentication_document_schema_remains_unchanged() {
+        let document: Document = serde_json::from_value(json!({
+            "credential": null,
+            "tokens": []
+        }))
+        .unwrap();
+        document.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(document).unwrap(),
+            json!({"credential":null,"tokens":[]})
+        );
+    }
+
+    #[test]
+    fn session_document_caps_maximal_records_with_large_scope_policy() {
+        let allowed_scopes: BTreeSet<String> = (0..MAX_SCOPES)
+            .map(|index| format!("s{index:063}"))
+            .collect();
+        let settings = Settings {
+            allowed_scopes: allowed_scopes.clone(),
+            ..Settings::default()
+        };
+        settings.validate().unwrap();
+        let scope_digest =
+            crate::crypto::token_digest(&serde_json::to_string(&allowed_scopes).unwrap());
+        let session_document = SessionDocument {
+            version: SESSION_DOCUMENT_VERSION,
+            sessions: (0..MAX_SESSIONS)
+                .map(|index| SessionRecord {
+                    session_id: format!("{index:064x}"),
+                    credential_digest: "b".repeat(64),
+                    scope_digest: scope_digest.clone(),
+                    subject: "s".repeat(64),
+                    expires_at: u64::MAX,
+                    refresh_expires_at: u64::MAX,
+                    refresh_token_digest: format!("{:064x}", index + MAX_SESSIONS + 1),
+                    remember_me: true,
+                })
+                .collect(),
+        };
+        session_document.validate().unwrap();
+        assert!(serde_json::to_vec(&session_document).unwrap().len() <= MAX_SESSION_DOCUMENT_BYTES);
+        assert_eq!(session_document.sessions[0].subject.len(), 64);
+        assert_eq!(allowed_scopes.len(), MAX_SCOPES);
+        assert!(allowed_scopes.iter().all(|scope| scope.len() == 64));
+
+        let mut over_capacity = session_document;
+        over_capacity.sessions.push(SessionRecord {
+            session_id: "f".repeat(64),
+            credential_digest: "b".repeat(64),
+            scope_digest,
+            subject: "s".repeat(64),
+            expires_at: u64::MAX,
+            refresh_expires_at: u64::MAX,
+            refresh_token_digest: "e".repeat(64),
+            remember_me: true,
+        });
+        assert!(over_capacity.validate().is_err());
+    }
+
+    #[test]
+    fn session_document_rejects_bad_versions_unknown_fields_and_digests() {
+        for malformed in [
+            json!({"version":2,"sessions":[]}),
+            json!({"version":1,"sessions":[],"legacy":true}),
+            json!({
+                "version":1,
+                "sessions":[{
+                    "session_id":"bad",
+                    "credential_digest":"b".repeat(64),
+                    "scope_digest":"c".repeat(64),
+                    "subject":"admin",
+                    "expires_at":120,
+                    "refresh_expires_at":500,
+                    "refresh_token_digest":"d".repeat(64),
+                    "remember_me":true
+                }]
+            }),
+        ] {
+            let Ok(document) = serde_json::from_value::<SessionDocument>(malformed) else {
+                continue;
+            };
+            assert!(document.validate().is_err());
         }
     }
 

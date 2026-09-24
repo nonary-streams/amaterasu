@@ -6,10 +6,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub enum Change {
     Read(Value),
-    Write {
+    WriteDocument {
         document: Document,
         response: Value,
         invalidate_sessions: bool,
+    },
+    WriteSessions {
+        document: SessionDocument,
+        response: Value,
+    },
+    WriteBoth {
+        document: Document,
+        sessions: SessionDocument,
+        response: Value,
     },
 }
 
@@ -111,20 +120,24 @@ impl Engine {
         caller: &str,
         operation: Operation,
         document: Document,
+        session_document: SessionDocument,
         now: u64,
     ) -> Result<Change, &'static str> {
         document.validate()?;
+        session_document.validate()?;
         let now = self.observe_time(now);
         let credential_digest = document
             .credential
             .as_ref()
             .map(|credential| crypto::token_digest(&credential.password_hash));
-        // Every loaded document checks credential binding, covering a rotation
-        // that committed even when cancellation hid its write acknowledgment.
-        self.sessions
-            .retain(|_, session| Some(&session.credential_digest) == credential_digest.as_ref());
-        self.refresh_index
-            .retain(|_, session_id| self.sessions.contains_key(session_id));
+        let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
+        // Both sidecar bindings must match the current credential and exact
+        // deterministic scope set before a session is trusted after restart.
+        self.restore_sessions(
+            &session_document,
+            credential_digest.as_deref(),
+            &scope_digest,
+        );
         match operation {
             Operation::Status {} => Ok(Change::Read(json!({
                 "ok": true,
@@ -135,15 +148,18 @@ impl Engine {
             Operation::ChangePassword { password } => Self::change_password(document, password),
             Operation::ListSessions { offset, limit } => self.list_sessions(offset, limit),
             Operation::RevokeSession { session_id } => {
-                self.remove_session(&session_id);
-                Ok(Change::Read(json!({"ok":true})))
+                if self.remove_session(&session_id) {
+                    self.write_sessions(json!({"ok":true}), &scope_digest)
+                } else {
+                    Ok(Change::Read(json!({"ok":true})))
+                }
             }
             Operation::Login {
                 username,
                 password,
                 remember_me,
-            } => self.login(document, username, password, remember_me, now),
-            Operation::Refresh { refresh_token } => self.refresh(refresh_token, now),
+            } => self.login(document, username, password, remember_me, now, scope_digest),
+            Operation::Refresh { refresh_token } => self.refresh(refresh_token, now, scope_digest),
             Operation::Verify {
                 bearer,
                 required_scopes,
@@ -152,15 +168,22 @@ impl Engine {
                 bearer,
                 refresh_token,
             } => {
-                if let Some(bearer) = bearer {
-                    self.remove_session(&crypto::token_digest(&bearer));
+                let removed = if let Some(bearer) = bearer {
+                    self.remove_session(&crypto::token_digest(&bearer))
                 } else if let Some(refresh_token) = refresh_token {
                     let refresh_digest = crypto::token_digest(&refresh_token);
-                    if let Some(session_id) = self.refresh_index.get(&refresh_digest).cloned() {
-                        self.remove_session(&session_id);
-                    }
+                    self.refresh_index
+                        .get(&refresh_digest)
+                        .cloned()
+                        .is_some_and(|session_id| self.remove_session(&session_id))
+                } else {
+                    false
+                };
+                if removed {
+                    self.write_sessions(json!({"ok":true}), &scope_digest)
+                } else {
+                    Ok(Change::Read(json!({"ok":true})))
                 }
-                Ok(Change::Read(json!({"ok":true})))
             }
             Operation::IssueToken {
                 scopes,
@@ -195,7 +218,7 @@ impl Engine {
         credential.password_hash = crypto::hash_password(&password)?;
         credential.legacy_salt = None;
         document.validate().map_err(|_| "resource_limit")?;
-        Ok(Change::Write {
+        Ok(Change::WriteDocument {
             document,
             response: json!({"ok":true}),
             invalidate_sessions: true,
@@ -219,6 +242,7 @@ impl Engine {
         password: String,
         remember_me: bool,
         now: u64,
+        scope_digest: String,
     ) -> Result<Change, &'static str> {
         let credential = document.credential.as_ref().ok_or("unauthorized")?;
         let valid_username = if credential.case_insensitive_username {
@@ -235,7 +259,7 @@ impl Engine {
         if !valid_password || !valid_username {
             return Err("unauthorized");
         }
-        if self.sessions.len() >= 128 {
+        if self.sessions.len() >= MAX_SESSIONS {
             return Err("session_limit");
         }
         let (bearer, digest) = crypto::issue_bearer()?;
@@ -266,10 +290,15 @@ impl Engine {
             .credential
             .as_ref()
             .expect("credential checked above");
+        let credential_digest = crypto::token_digest(&credential.password_hash);
+        self.sessions
+            .retain(|_, session| session.credential_digest == credential_digest);
+        self.refresh_index
+            .retain(|_, session_id| self.sessions.contains_key(session_id));
         self.sessions.insert(
             digest.clone(),
             Session {
-                credential_digest: crypto::token_digest(&credential.password_hash),
+                credential_digest,
                 subject: username,
                 scopes,
                 expires_at,
@@ -279,23 +308,28 @@ impl Engine {
             },
         );
         self.refresh_index.insert(refresh_digest, digest);
+        document.validate().map_err(|_| "resource_limit")?;
+        let sessions = self.build_session_document(&scope_digest)?;
         if upgraded {
-            document.validate().map_err(|_| "resource_limit")?;
-            Ok(Change::Write {
+            Ok(Change::WriteBoth {
                 document,
+                sessions,
                 response,
-                // A failed write completes with an error, so no bearer is
-                // returned. On the next loaded document, the session binding
-                // below removes this tentative session if the old verifier is
-                // still present. A committed conversion retains this session.
-                invalidate_sessions: false,
             })
         } else {
-            Ok(Change::Read(response))
+            Ok(Change::WriteSessions {
+                document: sessions,
+                response,
+            })
         }
     }
 
-    fn refresh(&mut self, refresh_token: String, now: u64) -> Result<Change, &'static str> {
+    fn refresh(
+        &mut self,
+        refresh_token: String,
+        now: u64,
+        scope_digest: String,
+    ) -> Result<Change, &'static str> {
         let refresh_digest = crypto::token_digest(&refresh_token);
         let session_id = self
             .refresh_index
@@ -328,7 +362,7 @@ impl Engine {
         self.refresh_index
             .insert(new_refresh_digest, new_session_id);
 
-        Ok(Change::Read(json!({
+        let response = json!({
             "ok": true,
             "bearer": bearer,
             "refresh_token": new_refresh_token,
@@ -338,13 +372,86 @@ impl Engine {
             "expires_at": session.expires_at,
             "refresh_expires_at": session.refresh_expires_at,
             "remember_me": session.remember_me
-        })))
+        });
+        self.write_sessions(response, &scope_digest)
     }
 
-    fn remove_session(&mut self, session_id: &str) {
+    fn remove_session(&mut self, session_id: &str) -> bool {
         if let Some(session) = self.sessions.remove(session_id) {
             self.refresh_index.remove(&session.refresh_token_digest);
+            true
+        } else {
+            false
         }
+    }
+
+    fn restore_sessions(
+        &mut self,
+        document: &SessionDocument,
+        credential_digest: Option<&str>,
+        scope_digest: &str,
+    ) {
+        self.sessions.clear();
+        self.refresh_index.clear();
+        for record in &document.sessions {
+            if Some(record.credential_digest.as_str()) != credential_digest
+                || record.scope_digest != scope_digest
+                || record.refresh_expires_at < self.latest_time
+            {
+                continue;
+            }
+            self.refresh_index.insert(
+                record.refresh_token_digest.clone(),
+                record.session_id.clone(),
+            );
+            self.sessions.insert(
+                record.session_id.clone(),
+                Session {
+                    credential_digest: record.credential_digest.clone(),
+                    subject: record.subject.clone(),
+                    scopes: self.settings.allowed_scopes.clone(),
+                    expires_at: record.expires_at,
+                    refresh_expires_at: record.refresh_expires_at,
+                    refresh_token_digest: record.refresh_token_digest.clone(),
+                    remember_me: record.remember_me,
+                },
+            );
+        }
+    }
+
+    fn build_session_document(&self, scope_digest: &str) -> Result<SessionDocument, &'static str> {
+        let document = SessionDocument {
+            version: SESSION_DOCUMENT_VERSION,
+            sessions: self
+                .sessions
+                .iter()
+                .map(|(session_id, session)| SessionRecord {
+                    session_id: session_id.clone(),
+                    credential_digest: session.credential_digest.clone(),
+                    scope_digest: scope_digest.to_owned(),
+                    subject: session.subject.clone(),
+                    expires_at: session.expires_at,
+                    refresh_expires_at: session.refresh_expires_at,
+                    refresh_token_digest: session.refresh_token_digest.clone(),
+                    remember_me: session.remember_me,
+                })
+                .collect(),
+        };
+        document.validate()?;
+        Ok(document)
+    }
+
+    fn write_sessions(&self, response: Value, scope_digest: &str) -> Result<Change, &'static str> {
+        Ok(Change::WriteSessions {
+            document: self.build_session_document(scope_digest)?,
+            response,
+        })
+    }
+
+    fn scope_digest(scopes: &BTreeSet<String>) -> String {
+        let canonical_scopes =
+            serde_json::to_string(scopes).expect("serializing authentication scopes cannot fail");
+        crypto::token_digest(&canonical_scopes)
     }
 
     fn verify(
@@ -445,7 +552,7 @@ impl Engine {
 
     fn write(document: Document, response: Value) -> Result<Change, &'static str> {
         document.validate().map_err(|_| "resource_limit")?;
-        Ok(Change::Write {
+        Ok(Change::WriteDocument {
             document,
             response,
             invalidate_sessions: false,
