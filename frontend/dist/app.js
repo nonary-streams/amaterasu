@@ -877,6 +877,14 @@ var Amaterasu;
         };
     }
     Amaterasu.parseNvhttpNetworkOverrides = parseNvhttpNetworkOverrides;
+    function parseOutputNameSelection(value) {
+        if (new TextEncoder().encode(value).length > 512 ||
+            value.trim() !== value ||
+            /[\u0000-\u001f\u007f-\u009f]/.test(value))
+            throw new Error("The capture output ID must have at most 512 UTF-8 bytes without surrounding whitespace or control characters.");
+        return value;
+    }
+    Amaterasu.parseOutputNameSelection = parseOutputNameSelection;
     function parseSteamExclusions(value) {
         let parsed;
         try {
@@ -1632,11 +1640,50 @@ var Amaterasu;
                 useStartupBindAddress.addEventListener("change", () => {
                     bindAddress.disabled = useStartupBindAddress.checked;
                 });
+                const outputName = Amaterasu.el("select");
+                outputName.name = "output_name";
+                const automaticOutput = Amaterasu.el("option", "", `Automatic (startup output: ${settings.effective_output_name ?? "none"})`);
+                automaticOutput.value = "";
+                outputName.append(automaticOutput);
+                let outputDiscoveryIssue = null;
+                if (settings.capture_provider && context.api.allows("media.read")) {
+                    try {
+                        const discovered = await context.api.post(`media/${settings.capture_provider}_outputs`);
+                        if (!context.content.isConnected)
+                            return;
+                        for (const output of discovered.outputs) {
+                            try {
+                                if (!output.attached || !output.id || parseOutputNameSelection(output.id) !== output.id)
+                                    continue;
+                                const option = Amaterasu.el("option", "", `${output.device_name} (${output.id})`);
+                                option.value = output.id;
+                                outputName.append(option);
+                            }
+                            catch {
+                            }
+                        }
+                    }
+                    catch {
+                        outputDiscoveryIssue = "Capture outputs could not be listed; the saved selection remains available.";
+                    }
+                }
+                else if (!settings.capture_provider) {
+                    outputDiscoveryIssue = "This host has no supported capture provider for output selection.";
+                }
+                else {
+                    outputDiscoveryIssue = "Listing capture outputs requires media.read.";
+                }
+                if (settings.configured_output_name && !Array.from(outputName.options).some((option) => option.value === settings.configured_output_name)) {
+                    const saved = Amaterasu.el("option", "", `Saved output: ${settings.configured_output_name}`);
+                    saved.value = settings.configured_output_name;
+                    outputName.append(saved);
+                }
+                outputName.value = settings.configured_output_name ?? "";
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -1645,6 +1692,7 @@ var Amaterasu;
                             hostname: hostname.value,
                             port: port.valueAsNumber,
                             ...network,
+                            output_name: parseOutputNameSelection(outputName.value),
                             expected_revision: settings.revision,
                         });
                         context.notify("Host settings saved.");

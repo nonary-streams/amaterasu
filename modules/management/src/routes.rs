@@ -614,6 +614,35 @@ mod tests {
         .unwrap();
         assert_eq!(explicit_empty["address_family"], "ipv4");
         assert_eq!(explicit_empty["bind_address"], "");
+        for output_name in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("DISPLAY1"),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "output_name":output_name,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_ok());
+        }
+        for output_name in [
+            serde_json::json!(" "),
+            serde_json::json!(" DISPLAY1"),
+            serde_json::json!("DISPLAY1 "),
+            serde_json::json!("bad\nname"),
+            serde_json::json!("é".repeat(257)),
+            serde_json::json!(true),
+        ] {
+            let request = serde_json::json!({
+                "hostname":"Living Room",
+                "port":47989,
+                "expected_revision":2,
+                "output_name":output_name,
+            });
+            assert!(payload(update, &serde_json::to_vec(&request).unwrap()).is_err());
+        }
         for rejected in [
             br#"{"hostname":"Living Room","port":47989}"#.as_slice(),
             br#"{"hostname":"Living Room","port":47989,"expected_revision":0,"owner":"other"}"#,

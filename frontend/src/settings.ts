@@ -146,6 +146,16 @@ namespace Amaterasu {
     };
   }
 
+  export function parseOutputNameSelection(value: string): string {
+    if (
+      new TextEncoder().encode(value).length > 512 ||
+      value.trim() !== value ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(value)
+    )
+      throw new Error("The capture output ID must have at most 512 UTF-8 bytes without surrounding whitespace or control characters.");
+    return value;
+  }
+
   export function parseSteamExclusions(value: string): SteamExclusion[] {
     let parsed: unknown;
     try {
@@ -1308,6 +1318,49 @@ namespace Amaterasu {
         useStartupBindAddress.addEventListener("change", () => {
           bindAddress.disabled = useStartupBindAddress.checked;
         });
+        const outputName = el("select");
+        outputName.name = "output_name";
+        const automaticOutput = el(
+          "option",
+          "",
+          `Automatic (startup output: ${settings.effective_output_name ?? "none"})`,
+        );
+        automaticOutput.value = "";
+        outputName.append(automaticOutput);
+        let outputDiscoveryIssue: string | null = null;
+        if (settings.capture_provider && context.api.allows("media.read")) {
+          try {
+            const discovered = await context.api.post<{
+              outputs: Array<{ id: string; device_name: string; attached: boolean }>;
+            }>(`media/${settings.capture_provider}_outputs`);
+            if (!context.content.isConnected) return;
+            for (const output of discovered.outputs) {
+              try {
+                if (!output.attached || !output.id || parseOutputNameSelection(output.id) !== output.id)
+                  continue;
+                const option = el("option", "", `${output.device_name} (${output.id})`);
+                option.value = output.id;
+                outputName.append(option);
+              } catch {
+                // A malformed discovery result is not an editable output ID.
+              }
+            }
+          } catch {
+            outputDiscoveryIssue = "Capture outputs could not be listed; the saved selection remains available.";
+          }
+        } else if (!settings.capture_provider) {
+          outputDiscoveryIssue = "This host has no supported capture provider for output selection.";
+        } else {
+          outputDiscoveryIssue = "Listing capture outputs requires media.read.";
+        }
+        if (settings.configured_output_name && !Array.from(outputName.options).some(
+          (option) => option.value === settings.configured_output_name,
+        )) {
+          const saved = el("option", "", `Saved output: ${settings.configured_output_name}`);
+          saved.value = settings.configured_output_name;
+          outputName.append(saved);
+        }
+        outputName.value = settings.configured_output_name ?? "";
         const status = el("div");
         const save = el("button", "button primary", "Save host settings");
         save.type = "submit";
@@ -1330,6 +1383,12 @@ namespace Amaterasu {
             bindAddress,
             "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior.",
           ),
+          field(
+            "Capture output",
+            outputName,
+            "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
+          ),
+          ...(outputDiscoveryIssue ? [el("p", "muted", outputDiscoveryIssue)] : []),
           el(
             "p",
             "muted",
@@ -1352,6 +1411,7 @@ namespace Amaterasu {
               hostname: hostname.value,
               port: port.valueAsNumber,
               ...network,
+              output_name: parseOutputNameSelection(outputName.value),
               expected_revision: settings.revision,
             });
             context.notify("Host settings saved.");

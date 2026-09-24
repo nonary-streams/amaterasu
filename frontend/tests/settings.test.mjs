@@ -208,6 +208,15 @@ test("NVHTTP network settings preserve startup null and explicit blank overrides
   }
 });
 
+test("capture output selection preserves exact IDs and automatic reset", () => {
+  const parse = context.Amaterasu.parseOutputNameSelection;
+  assert.equal(parse(""), "");
+  assert.equal(parse("DISPLAY1"), "DISPLAY1");
+  assert.equal(parse("é".repeat(256)), "é".repeat(256));
+  for (const invalid of [" ", " DISPLAY1", "DISPLAY1 ", "bad\nname", "é".repeat(257)])
+    assert.throws(() => parse(invalid));
+});
+
 test("Steam exclusions preserve valid ID and name objects without normalization", () => {
   const exclusions = [
     { id: "730", name: "Counter-Strike 2" },

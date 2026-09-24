@@ -80,6 +80,9 @@ namespace Amaterasu {
     bind_address: string;
     configured_address_family: "ipv4" | "both" | null;
     configured_bind_address: string | null;
+    configured_output_name: string | null;
+    effective_output_name: string | null;
+    capture_provider: "dxgi" | "wgc" | null;
     http_addresses: string[] | null;
     https_addresses: string[] | null;
     rtsp_addresses: string[] | null;

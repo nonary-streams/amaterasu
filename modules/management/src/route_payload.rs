@@ -784,7 +784,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(
                 object,
                 &["hostname", "port", "expected_revision"],
-                &["address_family", "bind_address"],
+                &["address_family", "bind_address", "output_name"],
             )?;
             let hostname = text(object, "hostname")?;
             let port = object.get("port").and_then(Value::as_u64);
@@ -817,6 +817,16 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                             return Err(INVALID);
                         }
                     }
+                    _ => return Err(INVALID),
+                }
+            }
+            if let Some(output_name) = object.get("output_name") {
+                match output_name {
+                    Value::Null => {}
+                    Value::String(value)
+                        if value.len() <= 512
+                            && value.trim() == value
+                            && !value.chars().any(char::is_control) => {}
                     _ => return Err(INVALID),
                 }
             }
