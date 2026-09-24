@@ -1,5 +1,8 @@
 use crate::STATE_SERVICE;
-use crate::protocol::{Change, Document, Operation, apply, error, success};
+use crate::protocol::{
+    Change, Document, Operation, ProductChange, ProductDocument, apply, apply_product, error,
+    product_success, success,
+};
 use crate::schema::{defaults, validate_values};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
@@ -31,11 +34,23 @@ struct Pending {
     deadline: Instant,
     state_request_id: u64,
     stage: Stage,
+    phase: PendingPhase,
+}
+
+enum PendingPhase {
+    Waiting,
+    Releasing(ChildOutcome),
+}
+
+enum ChildOutcome {
+    Payload(Value),
+    Failure { code: String, message: String },
 }
 
 enum Stage {
     Loading(Operation),
     Saving(Document),
+    SavingProduct(ProductDocument),
 }
 
 #[derive(Default)]
@@ -77,10 +92,16 @@ impl Pipeline {
                         return complete(send, id, error("invalid_request", failure.to_string()));
                     }
                 };
+                let key = match &operation {
+                    Operation::ProductGet {} | Operation::ProductUpdate { .. } => {
+                        format!("product/{caller}")
+                    }
+                    _ => format!("principal/{caller}"),
+                };
                 self.queued.push_back(Incoming {
                     request_id: id,
                     // This is an opaque state key, never a filesystem path. Identity comes from Poll.
-                    key: format!("principal/{caller}"),
+                    key,
                     operation,
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
                 });
@@ -110,6 +131,7 @@ impl Pipeline {
                     deadline: incoming.deadline,
                     state_request_id: id,
                     stage: Stage::Loading(incoming.operation),
+                    phase: PendingPhase::Waiting,
                 });
                 Ok(())
             }
@@ -119,18 +141,80 @@ impl Pipeline {
 
     fn advance(
         &mut self,
-        pending: Pending,
+        mut pending: Pending,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        match send(Command::TakeResult {
+        if matches!(&pending.phase, PendingPhase::Releasing(_)) {
+            return self.release_and_finish(pending, send);
+        }
+
+        let result = match send(Command::TakeResult {
             request: pending.state_request_id,
-        })? {
+        }) {
+            Ok(result) => result,
+            Err(failure) => {
+                self.pending = Some(pending);
+                return Err(failure);
+            }
+        };
+        match result {
             Response::Pending => {
                 self.pending = Some(pending);
                 Ok(())
             }
-            Response::Result { payload } => self.consume_state_result(pending, payload, send),
+            Response::Result { payload } => {
+                pending.phase = PendingPhase::Releasing(ChildOutcome::Payload(payload));
+                self.release_and_finish(pending, send)
+            }
+            Response::Error { code, message }
+                if code != "not_found" && code != "permission_denied" =>
+            {
+                pending.phase = PendingPhase::Releasing(ChildOutcome::Failure { code, message });
+                self.release_and_finish(pending, send)
+            }
             failure => complete(send, pending.request_id, runtime_failure(failure)),
+        }
+    }
+
+    fn release_and_finish(
+        &mut self,
+        mut pending: Pending,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let PendingPhase::Releasing(outcome) =
+            std::mem::replace(&mut pending.phase, PendingPhase::Waiting)
+        else {
+            unreachable!("release requires a preserved child result")
+        };
+
+        let released = match send(Command::ReleaseResult {
+            request: pending.state_request_id,
+        }) {
+            Ok(Response::Ok) => true,
+            // The broker may expire a retained result between TakeResult and release,
+            // or a retry may follow a release whose acknowledgement was lost.
+            Ok(Response::Error { code, .. }) if code == "not_found" => true,
+            Ok(_) => false,
+            Err(failure) => {
+                pending.phase = PendingPhase::Releasing(outcome);
+                self.pending = Some(pending);
+                return Err(failure);
+            }
+        };
+
+        if !released {
+            pending.phase = PendingPhase::Releasing(outcome);
+            self.pending = Some(pending);
+            return Ok(());
+        }
+
+        match outcome {
+            ChildOutcome::Payload(payload) => self.consume_state_result(pending, payload, send),
+            ChildOutcome::Failure { code, message } => complete(
+                send,
+                pending.request_id,
+                runtime_failure(Response::Error { code, message }),
+            ),
         }
     }
 
@@ -165,7 +249,36 @@ impl Pipeline {
                 publish_change(send, &pending.key, document.revision);
                 complete(send, pending.request_id, success(document))
             }
+            Stage::SavingProduct(document) => {
+                publish_product_change(send, &pending.key, document.revision);
+                complete(send, pending.request_id, product_success(Some(document)))
+            }
             Stage::Loading(operation) => {
+                if matches!(
+                    &operation,
+                    Operation::ProductGet {} | Operation::ProductUpdate { .. }
+                ) {
+                    let existing = match read_product_document(&payload) {
+                        Ok(document) => document,
+                        Err(failure) => return complete(send, pending.request_id, failure),
+                    };
+                    return match apply_product(operation, existing) {
+                        Ok(ProductChange::Read(document)) => {
+                            complete(send, pending.request_id, product_success(document))
+                        }
+                        Ok(ProductChange::Write(document)) => self.save_product(
+                            RequestContext {
+                                request_id: pending.request_id,
+                                key: pending.key,
+                                deadline: pending.deadline,
+                            },
+                            state_revision,
+                            document,
+                            send,
+                        ),
+                        Err(failure) => complete(send, pending.request_id, failure),
+                    };
+                }
                 let existing = match read_document(&payload) {
                     Ok(document) => document,
                     Err(failure) => return complete(send, pending.request_id, failure),
@@ -222,6 +335,47 @@ impl Pipeline {
                     deadline,
                     state_request_id: id,
                     stage: Stage::Saving(document),
+                    phase: PendingPhase::Waiting,
+                });
+                Ok(())
+            }
+            failure => complete(send, request_id, runtime_failure(failure)),
+        }
+    }
+
+    fn save_product(
+        &mut self,
+        context: RequestContext,
+        state_revision: u64,
+        document: ProductDocument,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let RequestContext {
+            request_id,
+            key,
+            deadline,
+        } = context;
+        if !product_document_fits(&document) {
+            return complete(
+                send,
+                request_id,
+                error(
+                    "resource_exhausted",
+                    "product settings exceed document size limit",
+                ),
+            );
+        }
+        let payload =
+            json!({"action":"set","key":key,"value":document,"expected_revision":state_revision});
+        match submit(send, request_id, deadline, "product_save", payload)? {
+            Response::Accepted { id } => {
+                self.pending = Some(Pending {
+                    request_id,
+                    key,
+                    deadline,
+                    state_request_id: id,
+                    stage: Stage::SavingProduct(document),
+                    phase: PendingPhase::Waiting,
                 });
                 Ok(())
             }
@@ -269,6 +423,20 @@ fn publish_change(send: &mut impl FnMut(Command) -> TransportResult, key: &str, 
     });
 }
 
+fn publish_product_change(
+    send: &mut impl FnMut(Command) -> TransportResult,
+    key: &str,
+    revision: u64,
+) {
+    let owner = key
+        .strip_prefix("product/")
+        .expect("product settings state key");
+    let _ = send(Command::Publish {
+        topic: crate::CHANGED_TOPIC.into(),
+        payload: json!({"owner": owner, "revision": revision, "kind":"product_settings"}),
+    });
+}
+
 fn complete(
     send: &mut impl FnMut(Command) -> TransportResult,
     request: u64,
@@ -295,6 +463,10 @@ fn document_fits(document: &Document) -> bool {
     serde_json::to_vec(document).is_ok_and(|bytes| bytes.len() <= MAX_DOCUMENT_BYTES)
 }
 
+fn product_document_fits(document: &ProductDocument) -> bool {
+    serde_json::to_vec(document).is_ok_and(|bytes| bytes.len() <= MAX_DOCUMENT_BYTES)
+}
+
 fn read_document(payload: &Value) -> Result<Option<Document>, Value> {
     match payload.get("found").and_then(Value::as_bool) {
         Some(false) => Ok(None),
@@ -315,6 +487,34 @@ fn read_document(payload: &Value) -> Result<Option<Document>, Value> {
                 return Err(error(
                     "invalid_state_response",
                     "persisted configuration violates its schema",
+                ));
+            }
+            Ok(Some(document))
+        }
+        None => Err(error(
+            "invalid_state_response",
+            "state lookup omitted found",
+        )),
+    }
+}
+
+fn read_product_document(payload: &Value) -> Result<Option<ProductDocument>, Value> {
+    match payload.get("found").and_then(Value::as_bool) {
+        Some(false) => Ok(None),
+        Some(true) => {
+            let document: ProductDocument =
+                serde_json::from_value(payload.get("value").cloned().unwrap_or(Value::Null))
+                    .map_err(|_| {
+                        error(
+                            "invalid_state_response",
+                            "persisted product settings are malformed",
+                        )
+                    })?;
+            if document.version == 0 || document.revision == 0 || !product_document_fits(&document)
+            {
+                return Err(error(
+                    "invalid_state_response",
+                    "persisted product settings violate their document bounds",
                 ));
             }
             Ok(Some(document))

@@ -1,6 +1,6 @@
 use crate::schema::{Fields, Values, defaults, validate_values};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -14,6 +14,12 @@ pub enum Operation {
         values: Values,
         expected_revision: Option<u64>,
     },
+    ProductGet {},
+    ProductUpdate {
+        version: u32,
+        values: Map<String, Value>,
+        expected_revision: u64,
+    },
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -24,9 +30,25 @@ pub struct Document {
     pub values: Values,
 }
 
+/// Opaque product-owned settings. The product module validates `values` and
+/// interprets `version`; configuration owns persistence and the CAS revision.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductDocument {
+    pub version: u32,
+    pub revision: u64,
+    pub values: Map<String, Value>,
+}
+
 pub enum Change {
     Read(Document),
     Write(Document),
+}
+
+#[derive(Debug)]
+pub enum ProductChange {
+    Read(Option<ProductDocument>),
+    Write(ProductDocument),
 }
 
 pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change, Value> {
@@ -74,11 +96,78 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
                 .ok_or_else(|| error("resource_exhausted", "revision exhausted"))?;
             Ok(Change::Write(document))
         }
+        Operation::ProductGet {} | Operation::ProductUpdate { .. } => Err(error(
+            "invalid_request",
+            "product settings require the product operation handler",
+        )),
+    }
+}
+
+pub fn apply_product(
+    operation: Operation,
+    existing: Option<ProductDocument>,
+) -> Result<ProductChange, Value> {
+    match operation {
+        Operation::ProductGet {} => Ok(ProductChange::Read(existing)),
+        Operation::ProductUpdate {
+            version,
+            values,
+            expected_revision,
+        } => {
+            if version == 0 {
+                return Err(error(
+                    "invalid_version",
+                    "product settings version must be greater than zero",
+                ));
+            }
+            let current_revision = existing.as_ref().map_or(0, |document| document.revision);
+            if expected_revision != current_revision {
+                return Err(json!({
+                    "ok": false,
+                    "error": {
+                        "code": "revision_conflict",
+                        "message": "product settings revision differs",
+                        "current_revision": current_revision,
+                    },
+                }));
+            }
+            let revision = current_revision
+                .checked_add(1)
+                .ok_or_else(|| error("resource_exhausted", "revision exhausted"))?;
+            Ok(ProductChange::Write(ProductDocument {
+                version,
+                revision,
+                values,
+            }))
+        }
+        _ => Err(error(
+            "invalid_request",
+            "generic configuration operation used for product settings",
+        )),
     }
 }
 
 pub fn success(document: Document) -> Value {
     json!({"ok":true,"revision":document.revision,"fields":document.fields,"values":document.values})
+}
+
+pub fn product_success(document: Option<ProductDocument>) -> Value {
+    match document {
+        Some(document) => json!({
+            "ok": true,
+            "found": true,
+            "version": document.version,
+            "revision": document.revision,
+            "values": document.values,
+        }),
+        None => json!({
+            "ok": true,
+            "found": false,
+            "version": null,
+            "revision": 0,
+            "values": {},
+        }),
+    }
 }
 
 pub fn error(code: &str, message: impl Into<String>) -> Value {
@@ -155,5 +244,65 @@ mod tests {
         assert!(
             serde_json::from_value::<Operation>(json!({"action":"get","caller":"other"})).is_err()
         );
+    }
+
+    #[test]
+    fn product_settings_are_full_document_cas_updates() {
+        let get: Operation = serde_json::from_value(json!({"action":"product_get"})).unwrap();
+        assert_eq!(
+            product_success(None),
+            json!({
+                "ok": true,
+                "found": false,
+                "version": null,
+                "revision": 0,
+                "values": {},
+            })
+        );
+        assert!(matches!(
+            apply_product(get, None),
+            Ok(ProductChange::Read(None))
+        ));
+
+        let update: Operation = serde_json::from_value(json!({
+            "action":"product_update",
+            "expected_revision":0,
+            "version":1,
+            "values":{"enabled":true,"nested":{"mode":"safe"}}
+        }))
+        .unwrap();
+        let ProductChange::Write(document) = apply_product(update, None).unwrap() else {
+            panic!("product update must create a document");
+        };
+        assert_eq!(document.version, 1);
+        assert_eq!(document.revision, 1);
+        assert_eq!(document.values["nested"]["mode"], "safe");
+
+        let conflict: Operation = serde_json::from_value(json!({
+            "action":"product_update",
+            "expected_revision":0,
+            "version":1,
+            "values":{"enabled":false}
+        }))
+        .unwrap();
+        let failure = apply_product(conflict, Some(document)).unwrap_err();
+        assert_eq!(failure["error"]["code"], "revision_conflict");
+        assert_eq!(failure["error"]["current_revision"], 1);
+    }
+
+    #[test]
+    fn product_settings_reject_invalid_versions_and_unknown_selectors() {
+        for payload in [
+            json!({"action":"product_update","expected_revision":0,"version":0,"values":{}}),
+            json!({"action":"product_update","expected_revision":0,"version":1,"values":[],"owner":"other"}),
+            json!({"action":"product_get","owner":"other"}),
+            json!({"action":"product_update","expected_revision":0,"version":1,"values":{},"owner":"other"}),
+        ] {
+            if let Ok(operation) = serde_json::from_value::<Operation>(payload) {
+                assert!(apply_product(operation, None).is_err());
+            } else {
+                // Strict serde rejects unknown owner selectors and non-object values.
+            }
+        }
     }
 }

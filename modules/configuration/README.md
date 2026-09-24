@@ -8,7 +8,7 @@ also need that grant because delegated requests preserve the parent's authority.
 Payloads use `action`:
 
 ```json
-{"action":"register","fields":{"enabled":{"type":"boolean","default":true},"count":{"type":"integer","default":2,"minimum":1,"maximum":10},"title":{"type":"string","default":"Hello","max_length":100}}}
+{"action":"register","fields":{"enabled":{"type":"boolean","default":true},"count":{"type":"integer","default":2,"minimum":1,"maximum":10},"title":{"type":"string","default":"Hello","max_length":100},"scale":{"type":"decimal","default":1.25,"minimum":0.5,"maximum":2.0},"quality":{"type":"enum","default":"balanced","options":["fast","balanced","quality"]},"tags":{"type":"list","default":["gaming"],"item":{"type":"string","default":"","max_length":64},"max_items":8},"display":{"type":"object","default":{"enabled":true},"fields":{"enabled":{"type":"boolean","default":true}}}}}
 {"action":"get"}
 {"action":"update","values":{"count":3},"expected_revision":1}
 ```
@@ -24,9 +24,20 @@ Registration persists defaults at revision 1. Re-registering an identical schema
 returns existing values without writing. Incompatible re-registration fails with
 `schema_conflict`. Updates merge only known, valid fields and advance the revision;
 `expected_revision` is optional. Integer fields accept signed 64-bit integers.
-String lengths count Unicode scalar values; the default maximum is 4096 and explicit
-bounds cannot exceed it. Schemas have at most 128 fields. Entire stored documents
-are limited to 12,000 serialized bytes, including escaping and schema defaults.
+Decimal fields accept finite JSON numbers and may set inclusive `minimum` and
+`maximum` bounds. Enum fields hold one string from a nonempty, unique `options`
+array. List fields hold arrays whose elements match the nested `item` definition;
+`min_items` defaults to zero and `max_items` defaults to 4096. Object fields hold a
+complete object matching their nested `fields`: all declared child fields are
+required and unknown child keys are rejected. The example shows each definition's
+required `default`.
+
+String lengths and enum option lengths count Unicode scalar values. String fields
+default to a maximum length of 4096, and explicit bounds cannot exceed it. Enum
+options and lists are limited to 4096 entries. Schemas have at most 128 fields
+across the full nested schema and at most 16 levels of nesting. Entire stored
+documents are limited to 12,000 serialized bytes, including escaping and schema
+defaults.
 
 Each tick advances one asynchronous state operation, polls at most one incoming
 request, and starts at most one queued operation. There are at most 32 queued
