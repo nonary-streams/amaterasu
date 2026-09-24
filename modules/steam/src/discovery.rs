@@ -1,3 +1,4 @@
+use crate::artwork;
 use crate::keyvalues::{self, Value};
 use crate::metadata::Scanner as MetadataScanner;
 use serde::Serialize;
@@ -24,6 +25,10 @@ pub struct Game {
     pub app_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_played: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork_revision: Option<String>,
+    #[serde(skip)]
+    pub artwork_source_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -39,12 +44,14 @@ pub struct Scan {
     pub appinfo_complete: bool,
     pub history_complete: bool,
     metadata: Option<MetadataScanner>,
+    artwork_roots: Vec<PathBuf>,
 }
 
 impl Scan {
     pub fn new(roots: &[PathBuf]) -> Self {
         let mut scan = Self {
             metadata: Some(MetadataScanner::new(roots)),
+            artwork_roots: roots.to_vec(),
             ..Self::default()
         };
         if roots.is_empty() {
@@ -109,7 +116,8 @@ impl Scan {
                 Some(Ok(entry)) => {
                     self.visited_entries += 1;
                     if let Some(app_id) = manifest_id(&entry.file_name().to_string_lossy()) {
-                        match read_game(&entry.path(), &library, app_id) {
+                        let artwork_roots = self.artwork_roots.clone();
+                        match read_game(&entry.path(), &library, app_id, &artwork_roots) {
                             Ok(game) => self.insert_game(game),
                             Err(_) => self.warn("invalid_or_unavailable_manifest"),
                         }
@@ -277,7 +285,12 @@ fn unsigned_field(document: &Value, name: &str, required: bool) -> Result<u64, S
     }
 }
 
-fn read_game(path: &Path, library: &Path, expected_id: u32) -> Result<Game, String> {
+fn read_game(
+    path: &Path,
+    library: &Path,
+    expected_id: u32,
+    artwork_roots: &[PathBuf],
+) -> Result<Game, String> {
     let document = read_document(path)?;
     let app = document.field("appstate")?;
     if unsigned_field(app, "appid", true)? != u64::from(expected_id) {
@@ -301,6 +314,7 @@ fn read_game(path: &Path, library: &Path, expected_id: u32) -> Result<Game, Stri
     let state_flags = unsigned_field(app, "stateflags", true)?;
     let install_directory = library.join("steamapps").join("common").join(directory);
     let installed = state_flags & 4 != 0 && install_directory.is_dir();
+    let artwork = artwork::discover(expected_id, library, artwork_roots);
     let game = Game {
         stable_id: format!("steam:{expected_id}"),
         app_id: expected_id,
@@ -318,6 +332,8 @@ fn read_game(path: &Path, library: &Path, expected_id: u32) -> Result<Game, Stri
             Err(_) => None,
         },
         last_played: None,
+        artwork_revision: artwork.revision,
+        artwork_source_path: artwork.source_path,
     };
     if serde_json::to_vec(&game)
         .map_err(|error| error.to_string())?

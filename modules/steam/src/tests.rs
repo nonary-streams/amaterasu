@@ -12,9 +12,90 @@ use std::ffi::c_void;
 
 #[test]
 fn product_settings_actions_require_the_management_principal() {
-    assert!(is_management_settings_caller("amaterasu.management"));
-    assert!(!is_management_settings_caller("amaterasu.console"));
-    assert!(!is_management_settings_caller("amaterasu.nvhttp"));
+    assert!(is_management_caller("amaterasu.management"));
+    assert!(!is_management_caller("amaterasu.console"));
+    assert!(!is_management_caller("amaterasu.nvhttp"));
+}
+
+#[test]
+fn artwork_reads_are_management_only_and_require_a_current_discovery_record() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings(true, 1));
+    host.queue_service_request(
+        10,
+        "amaterasu.console",
+        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+    );
+    host.queue_service_request(
+        11,
+        MANAGEMENT_CALLER,
+        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+    );
+    let mut module = start_test_module(&mut host);
+
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    assert_eq!(
+        host.completed[0],
+        (10, json!({"ok":false,"code":"forbidden"}))
+    );
+    assert_eq!(host.completed[1].0, 11);
+    assert_eq!(host.completed[1].1["ok"], false);
+    assert_eq!(host.completed[1].1["code"], "artwork_unavailable");
+}
+
+#[test]
+fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-steam-read-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(root.join("appcache/librarycache")).unwrap();
+    let image = root
+        .join("appcache/librarycache")
+        .join("42_library_600x900_2x.jpg");
+    let image_bytes = b"\xff\xd8\xffsteam portrait";
+    std::fs::write(&image, image_bytes).unwrap();
+    let root = root.canonicalize().unwrap();
+    let artwork = artwork::discover(42, &root, &[]);
+    let revision = artwork.revision.clone().unwrap();
+    let mut provider = Provider::new(vec![root.clone()]);
+    provider.games.insert(
+        42,
+        Game {
+            stable_id: "steam:42".into(),
+            app_id: 42,
+            name: "Example".into(),
+            install_directory: root.join("steamapps/common/example").display().to_string(),
+            library_directory: root.display().to_string(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
+            artwork_revision: artwork.revision,
+            artwork_source_path: artwork.source_path,
+        },
+    );
+
+    let payload = provider.read_artwork(42, &revision, 0);
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["app_id"], 42);
+    assert_eq!(payload["revision"], revision);
+    assert_eq!(payload["mime_type"], "image/jpeg");
+    assert_eq!(payload["total_bytes"], image_bytes.len() as u64);
+    assert_eq!(payload["next_offset"], Value::Null);
+    assert_eq!(payload["data"], "/9j/c3RlYW0gcG9ydHJhaXQ=");
+    assert!(payload.get("path").is_none());
+    assert_eq!(provider.read_artwork(42, "1", 0)["code"], "artwork_changed");
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -88,6 +169,8 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
             last_updated: 0,
             app_type: None,
             last_played: None,
+            artwork_revision: None,
+            artwork_source_path: None,
         },
     );
 
@@ -488,6 +571,8 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: None,
+            artwork_revision: None,
+            artwork_source_path: None,
         },
     );
     module.provider.games.insert(
@@ -503,6 +588,8 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: None,
+            artwork_revision: None,
+            artwork_source_path: None,
         },
     );
     module.provider.revision = 1;
@@ -569,6 +656,8 @@ fn catalog_cleanup_waits_for_appinfo_when_tool_filtering_is_active() {
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: None,
+            artwork_revision: None,
+            artwork_source_path: None,
         },
     );
     module.provider.revision = 1;
@@ -615,6 +704,8 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: None,
+            artwork_revision: None,
+            artwork_source_path: None,
         },
     );
     module.provider.revision = 1;

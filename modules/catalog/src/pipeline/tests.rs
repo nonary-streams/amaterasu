@@ -167,6 +167,73 @@ fn steam_importer() -> Pipeline {
     )
 }
 
+fn steam_artwork_importer() -> Pipeline {
+    Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([("amaterasu.steam".into(), "amaterasu.management".into())]),
+    )
+}
+
+fn steam_artwork_entry(name: &str, revision: Option<&str>) -> Value {
+    let mut result = entry(name);
+    if let Some(revision) = revision {
+        result["artwork"] = json!({"provider":"steam","app_id":42,"revision":revision});
+    }
+    result
+}
+
+fn run_steam_artwork_snapshot(
+    backend: &mut Backend,
+    pipeline: &mut Pipeline,
+    sync_id: &str,
+    source_revision: u64,
+    artwork_revision: Option<&str>,
+) {
+    let begin = backend.run_for(
+        pipeline,
+        snapshot_begin(sync_id, source_revision),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        pipeline,
+        snapshot_batch(
+            sync_id,
+            generation,
+            source_revision,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![(
+                "steam:42",
+                steam_artwork_entry("Provider game", artwork_revision),
+            )],
+        ),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let finish = backend.run_for(
+        pipeline,
+        snapshot_finish(
+            sync_id,
+            generation,
+            source_revision,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+}
+
 fn playnite_importer() -> Pipeline {
     Pipeline::new(
         BTreeSet::new(),
@@ -2744,6 +2811,106 @@ fn finish_policy_retains_then_cleans_only_unchanged_provider_entries_and_replays
             .entries
             .contains_key("~provider.entry:steam:steam:10")
     );
+}
+
+#[test]
+fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::new(),
+        BTreeMap::from([
+            ("amaterasu.steam".into(), "amaterasu.management".into()),
+            ("other.provider".into(), "amaterasu.management".into()),
+        ]),
+    );
+
+    let other_begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("other-artwork", 1),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let other_result = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "other-artwork",
+            other_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            0,
+            vec![("other:42", steam_artwork_entry("Other provider", Some("7")))],
+        ),
+        "other.provider",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(other_result["error"]["code"], "provider_artwork_required");
+
+    let steam_begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("wrong-source-artwork", 2),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let wrong_source = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "wrong-source-artwork",
+            steam_begin["generation"].as_u64().unwrap(),
+            2,
+            0,
+            0,
+            vec![("steam:43", steam_artwork_entry("Wrong source", Some("7")))],
+        ),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(wrong_source["error"]["code"], "provider_artwork_required");
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+}
+
+#[test]
+fn steam_artwork_refreshes_and_clears_for_attached_rows_but_not_detached_rows() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "artwork-1", 1, Some("101"));
+    let entry_id = "app-0000000000000001";
+    assert_eq!(backend.entries[entry_id]["artwork"]["provider"], "steam");
+    assert_eq!(backend.entries[entry_id]["artwork"]["app_id"], 42);
+    assert_eq!(backend.entries[entry_id]["artwork"]["revision"], "101");
+
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "artwork-2", 2, Some("202"));
+    assert_eq!(backend.entries[entry_id]["artwork"]["revision"], "202");
+
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "artwork-3", 3, None);
+    assert!(backend.entries[entry_id].get("artwork").is_none());
+    let marker_key = "~provider.entry:amaterasu.steam:steam:42";
+    assert_eq!(backend.entries[marker_key]["detached"], false);
+
+    let expected_revision = backend.metadata["revision"].as_u64().unwrap();
+    let manual = backend.run_for(
+        &mut pipeline,
+        json!({
+            "action":"update",
+            "id":entry_id,
+            "expected_revision":expected_revision,
+            "entry":steam_artwork_entry("User edited", None)
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "artwork-4", 4, Some("404"));
+    assert_eq!(backend.entries[entry_id]["name"], "User edited");
+    assert!(backend.entries[entry_id].get("artwork").is_none());
+    assert_eq!(backend.entries[marker_key]["detached"], true);
 }
 
 #[test]

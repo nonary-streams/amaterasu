@@ -551,7 +551,7 @@ fn catalog_records(
                 game.app_id
             ));
         }
-        let record = json!({
+        let mut record = json!({
             "source_id":stable_id,
             "entry":{
                 "name":game.name,
@@ -570,6 +570,20 @@ fn catalog_records(
                 }
             }
         });
+        if let Some(revision) = game.artwork_revision.as_deref() {
+            let parsed_revision = revision.parse::<u64>().ok();
+            if parsed_revision.is_none_or(|number| number.to_string() != revision) {
+                return Err(format!(
+                    "Steam game {} has an invalid artwork revision",
+                    game.app_id
+                ));
+            }
+            record["entry"]["artwork"] = json!({
+                "provider":"steam",
+                "app_id":game.app_id,
+                "revision":revision
+            });
+        }
         let entry_size = serde_json::to_vec(&record)
             .map_err(|error| format!("Steam catalog record serialization failed: {error}"))?
             .len();
@@ -707,6 +721,8 @@ mod tests {
             last_updated: 0,
             app_type: Some("game".into()),
             last_played: Some(2_000_000_000),
+            artwork_revision: None,
+            artwork_source_path: None,
         }
     }
 
@@ -741,6 +757,38 @@ mod tests {
             json!(["-applaunch", "10"])
         );
         assert_eq!(records[0]["entry"]["tags"], json!(["steam"]));
+    }
+
+    #[test]
+    fn catalog_records_carry_only_the_opaque_artwork_reference() {
+        let mut artwork_game = game(42, "Artwork game", true);
+        artwork_game.artwork_revision = Some("123456".into());
+        artwork_game.artwork_source_path = Some("C:/private/Steam/cache/42.png".into());
+        let games = [(42, artwork_game)].into_iter().collect();
+        let settings = ProductSettings {
+            sync_all_installed: true,
+            ..ProductSettings::default()
+        };
+        let executable = std::env::current_exe().unwrap();
+        let records = catalog_records(&games, &settings, &executable, 2_000_000_000).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["source_id"], "steam:42");
+        assert_eq!(
+            records[0]["entry"]["artwork"],
+            json!({"provider":"steam","app_id":42,"revision":"123456"})
+        );
+        assert!(
+            serde_json::to_string(&records[0])
+                .unwrap()
+                .find("C:/private/Steam/cache/42.png")
+                .is_none()
+        );
+
+        let mut invalid = game(42, "Invalid artwork game", true);
+        invalid.artwork_revision = Some("revision".into());
+        let invalid_games = [(42, invalid)].into_iter().collect();
+        assert!(catalog_records(&invalid_games, &settings, &executable, 2_000_000_000).is_err());
     }
 
     #[test]

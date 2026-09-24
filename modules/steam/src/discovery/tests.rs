@@ -69,6 +69,34 @@ fn steam_client_resolution_uses_the_configured_install_root_not_a_game_library()
     );
 }
 
+#[test]
+fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
+    let fixture = Libraries::new();
+    let library = fixture.library("steam-install");
+    fixture.manifest(&library, 42, "Example", 4);
+    let artwork_directory = library.join("appcache/librarycache");
+    fs::create_dir_all(&artwork_directory).unwrap();
+    let artwork_path = artwork_directory.join("42_library_600x900_2x.jpg");
+    fs::write(&artwork_path, b"\x89PNG\r\n\x1a\nfirst artwork").unwrap();
+
+    let mut scan = Scan::new(std::slice::from_ref(&library));
+    finish(&mut scan);
+    let first = scan.games.get(&42).unwrap();
+    assert_eq!(first.artwork_source_path.as_deref(), artwork_path.to_str());
+    let first_revision = first.artwork_revision.clone().unwrap();
+    let listed = serde_json::to_value(first).unwrap();
+    assert_eq!(listed["artwork_revision"], first_revision);
+    assert!(listed.get("artwork_source_path").is_none());
+
+    fs::write(&artwork_path, b"\x89PNG\r\n\x1a\nchanged artwork data").unwrap();
+    let mut refreshed = Scan::new(&[library]);
+    finish(&mut refreshed);
+    assert_ne!(
+        refreshed.games[&42].artwork_revision.as_deref(),
+        Some(first_revision.as_str())
+    );
+}
+
 fn finish(scan: &mut Scan) {
     for _ in 0..10_000 {
         scan.tick();
@@ -216,6 +244,8 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 last_updated: 0,
                 app_type: None,
                 last_played: None,
+                artwork_revision: None,
+                artwork_source_path: None,
             },
         );
     }

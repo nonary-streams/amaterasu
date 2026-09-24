@@ -159,6 +159,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             expected_revision,
         } => {
             check_revision(&document, expected_revision)?;
+            reject_provider_artwork(&entry)?;
             entry
                 .validate()
                 .map_err(|message| error("invalid_entry", message))?;
@@ -186,6 +187,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             expected_revision,
         } => {
             check_revision(&document, expected_revision)?;
+            reject_provider_artwork(&entry)?;
             let existing = find_entry(&document, &id)?;
             if matches!(&existing.launch, Launch::Playnite { .. }) {
                 return Err(error(
@@ -224,6 +226,16 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
     reply["ok"] = true.into();
     reply["revision"] = document.revision.into();
     Ok(Change::Write { document, reply })
+}
+
+fn reject_provider_artwork(entry: &Entry) -> Result<(), Value> {
+    if entry.artwork.is_some() {
+        return Err(error(
+            "provider_artwork_required",
+            "provider artwork can only be written by its authenticated provider",
+        ));
+    }
+    Ok(())
 }
 
 fn find_entry<'a>(document: &'a Document, id: &str) -> Result<&'a Entry, Value> {

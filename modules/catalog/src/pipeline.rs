@@ -1,5 +1,7 @@
 use crate::STATE_SERVICE;
-use crate::model::{ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text};
+use crate::model::{
+    ArtworkReference, ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text,
+};
 use crate::product::{
     CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, RemovalReason,
     STATE_PREFIX, SnapshotState, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
@@ -18,6 +20,7 @@ const PAGE_BYTES: usize = 12_000;
 const MAX_SCAN: usize = 256;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
+const STEAM_IMPORTER: &str = "amaterasu.steam";
 type TransportResult = ModuleResult<Response>;
 
 struct Incoming {
@@ -1076,6 +1079,22 @@ impl Pipeline {
             } = provider_entry;
             let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
                 && session.caller != PLAYNITE_IMPORTER;
+            let invalid_artwork_owner = match &entry.artwork {
+                Some(ArtworkReference::Steam { app_id, .. }) => {
+                    session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
+                }
+                None => false,
+            };
+            if invalid_artwork_owner {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "provider_artwork_required",
+                        "Steam artwork requires the authenticated Steam importer and matching app ID",
+                    ),
+                );
+            }
             if entry.validate().is_err() || invalid_launch_owner {
                 return complete(
                     send,

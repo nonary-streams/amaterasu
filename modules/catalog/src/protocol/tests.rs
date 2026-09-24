@@ -178,6 +178,41 @@ fn manual_mutations_cannot_forge_provider_owned_playnite_launch_targets() {
 }
 
 #[test]
+fn manual_mutations_cannot_forge_provider_owned_steam_artwork() {
+    let mut artwork_entry = entry("Steam artwork");
+    artwork_entry.artwork = Some(crate::model::ArtworkReference::Steam {
+        app_id: 42,
+        revision: "123".into(),
+    });
+
+    let create_error = apply(
+        Operation::Create {
+            entry: artwork_entry.clone(),
+            expected_revision: 0,
+        },
+        None,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(create_error["error"]["code"], "provider_artwork_required");
+
+    let document = create(Document::default(), "Ordinary game");
+    let update_error = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: artwork_entry,
+            expected_revision: 1,
+        },
+        Some(document.clone()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(update_error["error"]["code"], "provider_artwork_required");
+    assert_eq!(document.entries.len(), 1);
+    assert!(document.entries["app-0000000000000001"].artwork.is_none());
+}
+
+#[test]
 fn pagination_is_bounded_and_rejects_stale_or_cross_query_cursors() {
     let document = create(
         create(create(Document::default(), "Arcade One"), "Puzzle"),

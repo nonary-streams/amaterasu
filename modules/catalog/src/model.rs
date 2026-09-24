@@ -15,9 +15,38 @@ pub struct Entry {
     pub description: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkReference>,
     #[serde(default, skip_serializing_if = "ConfigOverrides::is_empty")]
     pub config_overrides: ConfigOverrides,
     pub launch: Launch,
+}
+
+/// An opaque provider-owned image reference. The source path is never stored in
+/// the catalog or exposed through the catalog API.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtworkReference {
+    Steam { app_id: u32, revision: String },
+}
+
+impl ArtworkReference {
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Steam { app_id, revision } => {
+                let parsed_revision = revision.parse::<u64>().ok();
+                if *app_id == 0
+                    || revision.is_empty()
+                    || revision.len() > 20
+                    || !revision.bytes().all(|byte| byte.is_ascii_digit())
+                    || parsed_revision.is_none_or(|number| number.to_string() != *revision)
+                {
+                    return Err("invalid Steam artwork reference");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -139,6 +168,9 @@ fn default_command_timeout_ms() -> u64 {
 
 impl Entry {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(artwork) = &self.artwork {
+            artwork.validate()?;
+        }
         self.config_overrides.validate()?;
         if !bounded_text(&self.name, 160) || self.name.trim().is_empty() {
             return Err("name must contain 1..160 bytes of printable text");
@@ -431,5 +463,45 @@ mod tests {
         }))
         .unwrap();
         assert!(entry.validate().is_err());
+    }
+
+    #[test]
+    fn steam_artwork_references_are_opaque_typed_and_bounded() {
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"Steam game",
+            "artwork":{"provider":"steam","app_id":42,"revision":"18446744073709551615"},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        entry.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(entry).unwrap()["artwork"],
+            json!({"provider":"steam","app_id":42,"revision":"18446744073709551615"})
+        );
+
+        for reference in [
+            json!({"provider":"steam","app_id":0,"revision":"1"}),
+            json!({"provider":"steam","app_id":42,"revision":""}),
+            json!({"provider":"steam","app_id":42,"revision":"01"}),
+            json!({"provider":"steam","app_id":42,"revision":"18446744073709551616"}),
+            json!({"provider":"steam","app_id":42,"revision":"12x"}),
+        ] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Invalid artwork",
+                "artwork":reference,
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .unwrap();
+            assert!(entry.validate().is_err(), "accepted artwork {reference}");
+        }
+
+        assert!(
+            serde_json::from_value::<Entry>(json!({
+                "name":"Unknown artwork provider",
+                "artwork":{"provider":"local_path","path":"C:/private/image.png"},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .is_err()
+        );
     }
 }

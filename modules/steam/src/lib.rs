@@ -1,4 +1,5 @@
 //! Read-only local Steam provider. Product policy and launching stay in other libraries.
+mod artwork;
 mod catalog_sync;
 mod configuration;
 mod discovery;
@@ -45,6 +46,11 @@ enum Action {
         revision: Option<u64>,
         after: Option<u32>,
         limit: Option<usize>,
+    },
+    ArtworkRead {
+        app_id: u32,
+        revision: String,
+        offset: u64,
     },
 }
 
@@ -173,6 +179,42 @@ impl Provider {
                 after.unwrap_or(0),
                 limit.unwrap_or(16),
             )),
+            Action::ArtworkRead {
+                app_id,
+                revision,
+                offset,
+            } => ActionResult::Immediate(self.read_artwork(app_id, &revision, offset)),
+        }
+    }
+
+    fn read_artwork(&self, app_id: u32, revision: &str, offset: u64) -> Value {
+        if app_id == 0 {
+            return json!({"ok":false,"code":"invalid_request"});
+        }
+        let Some(game) = self.games.get(&app_id) else {
+            return json!({"ok":false,"code":"artwork_unavailable"});
+        };
+        if game.artwork_revision.as_deref() != Some(revision) {
+            return json!({"ok":false,"code":"artwork_changed"});
+        }
+        let Some(source_path) = game.artwork_source_path.as_deref() else {
+            return json!({"ok":false,"code":"artwork_unavailable"});
+        };
+
+        let mut allowed_roots = vec![PathBuf::from(&game.library_directory)];
+        allowed_roots.extend(self.roots.iter().cloned());
+        match artwork::read_chunk(source_path, revision, &allowed_roots, offset) {
+            Ok(chunk) => json!({
+                "ok":true,
+                "app_id":app_id,
+                "revision":chunk.revision,
+                "offset":offset,
+                "next_offset":chunk.next_offset,
+                "total_bytes":chunk.total_bytes,
+                "mime_type":chunk.mime_type,
+                "data":chunk.data
+            }),
+            Err(code) => json!({"ok":false,"code":code}),
         }
     }
 
@@ -327,13 +369,17 @@ impl SteamModule {
             Ok(action) => action,
             Err(_) => return self.complete(id, json!({"ok":false,"code":"invalid_request"})),
         };
+        let is_management_action = matches!(
+            &action,
+            Action::SettingsGet {} | Action::SettingsUpdate { .. } | Action::ArtworkRead { .. }
+        );
+        if is_management_action && !is_management_caller(caller) {
+            return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+        }
         let is_settings_action = matches!(
             &action,
             Action::SettingsGet {} | Action::SettingsUpdate { .. }
         );
-        if is_settings_action && !is_management_settings_caller(caller) {
-            return self.complete(id, json!({"ok":false,"code":"forbidden"}));
-        }
         if self.configuration.is_busy() && is_settings_action {
             let code = if self.configuration.is_ready() {
                 "settings_busy"
@@ -412,7 +458,7 @@ impl Provider {
     }
 }
 
-fn is_management_settings_caller(caller: &str) -> bool {
+fn is_management_caller(caller: &str) -> bool {
     caller == MANAGEMENT_CALLER
 }
 
