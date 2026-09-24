@@ -186,33 +186,34 @@ fn macos_group_is_dead(group: u32) -> io::Result<bool> {
     let size =
         unsafe { libc::proc_listpgrppids(group as i32, members.as_mut_ptr().cast(), capacity) };
     if size <= 0 {
+        // The libproc wrapper converts syscall errors to zero, so an empty or
+        // failed scan cannot prove that the process group is dead.
         return Ok(false);
     }
     if size as usize >= members.len() {
         return Ok(false);
     }
-    for &pid in &members[..size as usize] {
-        if pid == 0 || pid == group as i32 {
-            continue;
-        }
-        // SAFETY: zero is valid initialization and proc_pidinfo receives the
-        // matching buffer size/flavor. This is inspection only, never PID signaling.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                std::mem::size_of_val(&info) as i32,
-            )
-        };
-        if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            continue;
-        }
-        if read as usize != std::mem::size_of_val(&info) || info.pbi_status != libc::SZOMB {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+
+    Ok(super::macos_members_are_dead(
+        &members[..size as usize],
+        |pid| {
+            // SAFETY: zero is valid initialization and proc_pidinfo receives the
+            // matching buffer size/flavor. This is inspection only, never PID signaling.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    std::mem::size_of_val(&info) as i32,
+                )
+            };
+            if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Some(true);
+            }
+            (read as usize == std::mem::size_of_val(&info))
+                .then_some(info.pbi_status == libc::SZOMB)
+        },
+    ))
 }
