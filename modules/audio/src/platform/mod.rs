@@ -1,7 +1,7 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Capture, enumerate};
+pub use windows::{Capture, enumerate, route_restore_pending};
 #[cfg(not(windows))]
 mod unsupported {
     use crate::model::{AudioResult, Endpoint, Format, Packet};
@@ -9,9 +9,13 @@ mod unsupported {
         Ok(Vec::new())
     }
 
+    pub fn route_restore_pending() -> bool {
+        false
+    }
+
     pub struct Capture;
     impl Capture {
-        pub fn open(_: &str) -> AudioResult<Self> {
+        pub fn open(_: &str, _: bool) -> AudioResult<Self> {
             Err("unsupported_platform")
         }
         pub fn format(&self) -> Format {
@@ -27,4 +31,4 @@ mod unsupported {
 }
 
 #[cfg(not(windows))]
-pub use unsupported::{Capture, enumerate};
+pub use unsupported::{Capture, enumerate, route_restore_pending};

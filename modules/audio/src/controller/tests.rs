@@ -15,7 +15,7 @@ use std::{
 };
 #[derive(Default)]
 struct Observed {
-    opens: Mutex<Vec<String>>,
+    opens: Mutex<Vec<(String, bool)>>,
     drops: AtomicUsize,
 }
 
@@ -32,8 +32,12 @@ impl Backend for FakeBackend {
         }])
     }
 
-    fn open(&self, endpoint: &str) -> AudioResult<Opened> {
-        self.observed.opens.lock().unwrap().push(endpoint.into());
+    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened> {
+        self.observed
+            .opens
+            .lock()
+            .unwrap()
+            .push((endpoint.into(), capture_sink_without_routing));
         if endpoint != "render.explicit" {
             return Err("endpoint_not_found");
         }
@@ -88,11 +92,12 @@ fn open() -> Operation {
     Operation::Open {
         endpoint: "render.explicit".into(),
         operation_id: Some("one".into()),
+        capture_sink_without_routing: false,
     }
 }
 
 #[test]
-fn selected_endpoint_open_is_caller_scoped_idempotent_and_never_selects_a_default() {
+fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
     let (mut controller, observed) = controller(true);
     let opened = controller.handle("alice", open()).unwrap();
     assert_eq!(opened.created, Some(1));
@@ -101,7 +106,10 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_and_never_selects_a_defaul
     let repeated = controller.handle("alice", open()).unwrap();
     assert!(repeated.created.is_none());
     assert_eq!(opened.payload, repeated.payload);
-    assert_eq!(*observed.opens.lock().unwrap(), ["render.explicit"]);
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [("render.explicit".into(), false)]
+    );
     assert_eq!(
         controller
             .handle(
@@ -132,7 +140,8 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_and_never_selects_a_defaul
                 "alice",
                 Operation::Open {
                     endpoint: "default".into(),
-                    operation_id: Some("one".into())
+                    operation_id: Some("one".into()),
+                    capture_sink_without_routing: false
                 }
             )
             .is_err()
@@ -143,7 +152,68 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_and_never_selects_a_defaul
         controller.handle("alice", open()).err(),
         Some("stream_closed")
     );
-    assert_eq!(*observed.opens.lock().unwrap(), ["render.explicit"]);
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [("render.explicit".into(), false)]
+    );
+}
+
+#[test]
+fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
+    let (mut controller, observed) = controller(true);
+    let operation = Operation::Open {
+        endpoint: "render.explicit".into(),
+        operation_id: Some("capture-only".into()),
+        capture_sink_without_routing: true,
+    };
+
+    let opened = controller.handle("alice", operation).unwrap();
+    assert_eq!(opened.payload["capture_sink_without_routing"], true);
+    assert_eq!(
+        controller
+            .handle("alice", Operation::Status { stream: Some(1) })
+            .unwrap()
+            .payload["streams"][0]["capture_sink_without_routing"],
+        true
+    );
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [("render.explicit".into(), true)]
+    );
+    assert_eq!(
+        controller
+            .handle(
+                "alice",
+                Operation::Open {
+                    endpoint: "render.explicit".into(),
+                    operation_id: Some("capture-only".into()),
+                    capture_sink_without_routing: false,
+                }
+            )
+            .err(),
+        Some("operation_conflict")
+    );
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [("render.explicit".into(), true)]
+    );
+}
+
+#[test]
+fn open_without_capture_only_field_defaults_to_routing_enabled() {
+    let operation: Operation = serde_json::from_value(json!({
+        "action":"open",
+        "endpoint":"render.explicit",
+        "operation_id":"legacy"
+    }))
+    .unwrap();
+    assert!(matches!(
+        operation,
+        Operation::Open {
+            capture_sink_without_routing: false,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -154,11 +224,15 @@ fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
         Operation::Open {
             endpoint: "render.missing".into(),
             operation_id: Some("missing-endpoint".into()),
+            capture_sink_without_routing: false,
         },
     );
 
     assert_eq!(result.err(), Some("endpoint_not_found"));
-    assert_eq!(*observed.opens.lock().unwrap(), ["render.missing"]);
+    assert_eq!(
+        *observed.opens.lock().unwrap(),
+        [("render.missing".into(), false)]
+    );
 }
 
 #[test]

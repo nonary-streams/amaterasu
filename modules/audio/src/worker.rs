@@ -28,7 +28,7 @@ pub struct Opened {
 
 pub trait Backend: Send {
     fn enumerate(&self) -> AudioResult<Vec<Endpoint>>;
-    fn open(&self, endpoint: &str) -> AudioResult<Opened>;
+    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened>;
 }
 
 pub struct NativeBackend;
@@ -37,8 +37,9 @@ impl Backend for NativeBackend {
         enumerate()
     }
 
-    fn open(&self, endpoint: &str) -> AudioResult<Opened> {
-        let (source, endpoint, format) = Worker::open(endpoint.to_owned())?;
+    fn open(&self, endpoint: &str, capture_sink_without_routing: bool) -> AudioResult<Opened> {
+        let (source, endpoint, format) =
+            Worker::open(endpoint.to_owned(), capture_sink_without_routing)?;
         Ok(Opened {
             source: Box::new(source),
             endpoint,
@@ -55,7 +56,10 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn open(endpoint: String) -> AudioResult<(Self, String, Format)> {
+    pub fn open(
+        endpoint: String,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<(Self, String, Format)> {
         let (sender, packets) = mpsc::sync_channel(QUEUE_PACKETS);
         let (ready, initialized) = mpsc::sync_channel(1);
         let health = Arc::new(Mutex::new(Health::default()));
@@ -65,13 +69,14 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-loopback".into())
             .spawn(move || {
-                let mut capture = match platform::Capture::open(&endpoint) {
-                    Ok(capture) => capture,
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
+                let mut capture =
+                    match platform::Capture::open(&endpoint, capture_sink_without_routing) {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                            return;
+                        }
+                    };
                 if ready
                     .send(Ok((capture.endpoint().to_owned(), capture.format())))
                     .is_err()

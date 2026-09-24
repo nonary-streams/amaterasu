@@ -1,5 +1,6 @@
 use crate::{
     model::*,
+    platform,
     worker::{Backend, NativeBackend, Source},
 };
 use amaterasu_media::{AudioFrame, AudioSink, MEDIA_BACKEND_ERROR, MEDIA_CLOSED, MEDIA_PENDING};
@@ -11,6 +12,7 @@ struct Stream {
     owner: String,
     requested_endpoint: String,
     endpoint: String,
+    capture_sink_without_routing: bool,
     format: Format,
     source: Box<dyn Source>,
     pending: Option<Packet>,
@@ -20,6 +22,7 @@ struct Stream {
 struct OperationRecord {
     stream: u64,
     endpoint: String,
+    capture_sink_without_routing: bool,
 }
 
 pub struct Controller {
@@ -68,7 +71,8 @@ impl Controller {
             Operation::Open {
                 endpoint,
                 operation_id,
-            } => self.open(owner, endpoint, operation_id)?,
+                capture_sink_without_routing,
+            } => self.open(owner, endpoint, operation_id, capture_sink_without_routing)?,
             Operation::Lookup { operation_id } => self.lookup(owner, &operation_id)?,
             Operation::Close { stream } => self.close(owner, stream)?,
             Operation::Status { stream } => self.status(owner, stream),
@@ -84,6 +88,7 @@ impl Controller {
         owner: &str,
         endpoint: String,
         operation: Option<String>,
+        capture_sink_without_routing: bool,
     ) -> AudioResult<Value> {
         if !self.enabled {
             return Err("disabled");
@@ -92,7 +97,9 @@ impl Controller {
         if let Some(operation) = &operation {
             validate_operation(operation)?;
             if let Some(record) = self.operations.get(&(owner.into(), operation.clone())) {
-                if record.endpoint != endpoint {
+                if record.endpoint != endpoint
+                    || record.capture_sink_without_routing != capture_sink_without_routing
+                {
                     return Err("operation_conflict");
                 }
                 let stream = self.streams.get(&record.stream).ok_or("stream_closed")?;
@@ -112,11 +119,12 @@ impl Controller {
         {
             return Err("stream_limit");
         }
-        let opened = self.backend.open(&endpoint)?;
+        let opened = self.backend.open(&endpoint, capture_sink_without_routing)?;
         let id = self.insert(
             owner,
             endpoint.clone(),
             opened.endpoint,
+            capture_sink_without_routing,
             opened.format,
             opened.source,
         )?;
@@ -126,6 +134,7 @@ impl Controller {
                 OperationRecord {
                     stream: id,
                     endpoint,
+                    capture_sink_without_routing,
                 },
             );
         }
@@ -137,6 +146,7 @@ impl Controller {
         owner: &str,
         requested_endpoint: String,
         endpoint: String,
+        capture_sink_without_routing: bool,
         format: Format,
         source: Box<dyn Source>,
     ) -> AudioResult<u64> {
@@ -147,6 +157,7 @@ impl Controller {
                 owner: owner.into(),
                 requested_endpoint,
                 endpoint,
+                capture_sink_without_routing,
                 format,
                 source,
                 pending: None,
@@ -183,9 +194,9 @@ impl Controller {
     fn status(&self, owner: &str, requested: Option<u64>) -> Value {
         let streams: Vec<_> = self.streams.iter().filter(|(id,stream)| stream.owner == owner && requested.is_none_or(|requested| requested == **id)).map(|(id,stream)| {
             let health = stream.source.health();
-            json!({"stream":id,"endpoint":stream.endpoint,"requested_endpoint":stream.requested_endpoint,"format":stream.format,"state":if health.failure.is_some() { "failed" } else { "capturing" },"failure":health.failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
+            json!({"stream":id,"endpoint":stream.endpoint,"requested_endpoint":stream.requested_endpoint,"capture_sink_without_routing":stream.capture_sink_without_routing,"format":stream.format,"state":if health.failure.is_some() { "failed" } else { "capturing" },"failure":health.failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
         }).collect();
-        json!({"ok":true,"enabled":self.enabled,"streams":streams})
+        json!({"ok":true,"enabled":self.enabled,"audio_route_restore_pending":platform::route_restore_pending(),"streams":streams})
     }
 
     pub fn shutdown(&mut self) {
@@ -235,7 +246,7 @@ impl Controller {
 }
 
 fn open_reply(id: u64, stream: &Stream) -> Value {
-    json!({"ok":true,"stream":id,"endpoint":stream.endpoint,"format":stream.format})
+    json!({"ok":true,"stream":id,"endpoint":stream.endpoint,"capture_sink_without_routing":stream.capture_sink_without_routing,"format":stream.format})
 }
 
 #[cfg(test)]

@@ -89,6 +89,8 @@ pub enum Operation {
         endpoint: String,
         #[serde(default)]
         operation_id: Option<String>,
+        #[serde(default)]
+        capture_sink_without_routing: bool,
     },
     Lookup {
         operation_id: String,

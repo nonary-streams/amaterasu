@@ -21,23 +21,44 @@ Enumeration returns `{ok:true,enabled,endpoints:[{id,name,default_multimedia}]}`
 for active render endpoints. Explicit endpoint IDs come from that list; `default`
 resolves the current multimedia render endpoint once when opened. The selected
 endpoint remains fixed for the session. Enumeration is limited to 64 endpoints
-and a 12,000-byte metadata reply. The provider never changes any endpoint default
-role, volume, mute state, visibility, or device configuration.
+and a 12,000-byte metadata reply. On Windows, opening an explicit endpoint with
+`capture_sink_without_routing` omitted or false temporarily assigns that endpoint
+as the Console, Multimedia, and Communications render default, unless it is
+already the Console default. Concurrent captures of the same endpoint share the
+assignment; a conflicting endpoint open fails. When the final capture closes,
+the provider restores only roles it assigned that still point to the selected
+endpoint, preserving role changes made elsewhere. If assignment fails, open
+fails and attempts to restore roles changed earlier in the same open. A failed
+restore blocks later routed opens, which retry cleanup first; there is no
+background retry. Opening `default`
+does not change default roles. The provider does not change volume, mute state,
+visibility, or device configuration.
 
-Open/lookup return `{ok:true,stream,endpoint,format}`. Format contains
+Set `capture_sink_without_routing:true` on an open to capture the selected
+endpoint without changing any render default role. The product resolver should
+set it only for Vibeshine's capture-only case: capture-only enabled, a configured
+sink present, no configured virtual sink, and the selected sink equal to that
+configured sink. The audio module receives this per-open policy snapshot; it does
+not derive eligibility from product settings.
+
+Open/lookup return `{ok:true,stream,endpoint,capture_sink_without_routing,format}`.
+An omitted policy field is accepted as false for older callers. Format contains
 `sample_rate`, `channels`, `channel_mask`, and `format:"f32"|"i16"`. Status returns
-`{ok:true,enabled,streams:[...]}` with only the caller's streams, optionally
-filtered by ID. Each stream includes its selected/requested endpoint, format,
+`{ok:true,enabled,audio_route_restore_pending,streams:[...]}` with only the
+caller's streams, optionally filtered by ID. The route flag reports a failed
+final restoration attempt until a later routed open retries cleanup. Each stream
+includes its selected/requested endpoint, format,
 `state:"capturing"|"failed"`, `failure`, `discontinuities`, and `dropped_packets`.
 Close returns `{ok:true}`. Missing/foreign lookup or close returns
 `{ok:false,code:"stream_not_found"}`; absent status returns an empty list.
 Driver error strings and PCM samples are never placed in control replies.
 
 The optional operation ID is 1–128 ASCII graphic bytes. Same-caller retry with
-that ID and the same requested endpoint reuses the original stream; selecting a
-different endpoint conflicts. After close, retry returns `stream_closed` and
-lookup returns `stream_not_found`. Up to 128 operation records remain in memory
-per module instance. There are at most four live streams, two per caller. Open
+that ID, requested endpoint, and routing policy reuses the original stream;
+changing either endpoint or policy conflicts. After close, retry returns
+`stream_closed` and lookup returns `stream_not_found`. Up to 128 operation
+records remain in memory per module instance. There are at most four live
+streams, two per caller. Open
 checks request liveness before dispatch and closes a newly created stream if its
 completion cannot be delivered. A cancelled lookup or retry does not close an
 existing stream. Callers reconciling uncertain opens must settle their original
@@ -52,7 +73,10 @@ rejection retains the packet for retry. Concurrent or reentrant calls return
 close/reopen. A provide/call grant for `amaterasu.audio/1` is required at the
 respective endpoint. These are trusted native modules, not a native-code sandbox.
 
-The Windows backend uses official `windows` crate COM bindings. Each stream has
+The Windows backend uses official `windows` crate COM bindings. Explicit routed
+opens use the undocumented Windows `IPolicyConfig::SetDefaultEndpoint` COM
+interface at a documented ABI boundary; inability to snapshot or switch roles
+fails the capture open. Each stream has
 a dedicated apartment thread that activates `IAudioClient`, validates its mix
 format, initializes shared-mode `AUDCLNT_STREAMFLAGS_LOOPBACK`, and starts
 `IAudioCaptureClient`. It copies complete WASAPI packets before releasing their
@@ -92,28 +116,32 @@ supervision; no hard teardown deadline or crash recovery is claimed.
 
 Vibeshine `src/audio.h` and the Windows audio policy/capture behavior were used as
 behavioral references without copying or translating source. The pinned
-selected-endpoint regression requires capturing the chosen endpoint without
-changing defaults; this implementation has no default-role mutation API.
+selected-endpoint capture-only case is represented by the per-open policy above.
 Opus encoding, configured speaker remapping, resampling, continuous silent audio,
 process-specific loopback, microphone capture, Linux/macOS backends, automatic
-endpoint switching, default-role mutation/recovery, and full streaming audio
-parity remain unimplemented.
+endpoint switching, and full streaming audio parity remain unimplemented.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
 for selection, ownership, idempotency, cancellation rollback, silent packets,
-discontinuities, timestamps, queue overflow, sink retry, and close/drop. They do
-not capture desktop audio. Windows and Linux target checks validate compilation;
-a Windows-only mix-format test additionally checks extensible channel layout.
-The ignored Windows hardware test requires controlled test audio on a selected
-render endpoint and checks all three default render roles before and after:
+discontinuities, timestamps, queue overflow, sink retry, and close/drop. Pure
+route-policy tests cover same-target leases, conflicting targets, partial
+assignment rollback, and preserving roles changed elsewhere. They do not call
+the Windows role-switch COM interface or capture desktop audio. Windows and
+Linux target checks validate compilation; a Windows-only mix-format test
+additionally checks extensible channel layout. The ignored Windows capture-only
+hardware test requires controlled test audio on a selected render endpoint and
+checks all three default render roles before and after:
 
 ```text
 cargo test -p amaterasu-audio explicit_endpoint_captures_without_changing_any_default_role -- --ignored
 ```
 
-That test has not been run on the development Mac. Real Windows qualification
-must also check waveform/channel correctness, device removal, silence, sustained
-backpressure, discontinuities, and cancellation while drivers initialize.
+That test has not been run on development hardware. Real Windows qualification
+of routed opens must exercise successful switching/restoration, each partial
+switch failure and rollback, role changes made by another application, device
+removal, and recovery after restoration failure. Waveform/channel correctness,
+silence, sustained backpressure, discontinuities, and cancellation while drivers
+initialize also need hardware coverage.
 
 Primary API references:
 

@@ -2,9 +2,16 @@
 use crate::{
     model::{AudioResult, Endpoint, Format, Packet},
     packet::{Timeline, copy_samples},
+    route_policy::{
+        AcquirePlan, DefaultEndpoints, DefaultRole, ReleasePlan, RoleAssignment, RoutePolicy,
+    },
 };
 use amaterasu_media::{
     AUDIO_DISCONTINUITY, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32, PCM_I16,
+};
+use std::{
+    ffi::c_void,
+    sync::{Mutex, OnceLock},
 };
 use windows::{
     Win32::{
@@ -15,8 +22,271 @@ use windows::{
         },
         System::Com::{StructuredStorage::PropVariantToStringAlloc, *},
     },
-    core::{Interface, PCWSTR, PWSTR},
+    core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR},
 };
+
+const POLICY_CONFIG_CLASS: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+const POLICY_CONFIG_INTERFACE: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
+const HRESULT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
+
+static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
+
+// IPolicyConfig is an undocumented Windows COM interface. The ten method
+// slots after IUnknown precede SetDefaultEndpoint in the pinned interface ABI.
+// Placeholder function pointers preserve the slot layout without calling those
+// methods. The pointer is queried from the COM class and released by PolicyConfig.
+#[repr(C)]
+struct PolicyConfigVtable {
+    base__: IUnknown_Vtbl,
+    preceding_methods: [unsafe extern "system" fn() -> HRESULT; 10],
+    set_default_endpoint: unsafe extern "system" fn(*mut c_void, PCWSTR, ERole) -> HRESULT,
+}
+
+struct PolicyConfig(*mut c_void);
+
+impl PolicyConfig {
+    fn new() -> AudioResult<Self> {
+        // SAFETY: the COM apartment is initialized on this worker thread. The
+        // returned IUnknown owns one reference; QueryInterface transfers a
+        // second reference for PolicyConfig, which this wrapper releases.
+        unsafe {
+            let unknown: IUnknown = CoCreateInstance::<_, IUnknown>(
+                &POLICY_CONFIG_CLASS,
+                None::<&IUnknown>,
+                CLSCTX_ALL,
+            )
+            .map_err(|_| "audio_route_unavailable")?;
+            let unknown_vtable = *(unknown.as_raw() as *mut *const IUnknown_Vtbl);
+            let mut interface = std::ptr::null_mut();
+            ((*unknown_vtable).QueryInterface)(
+                unknown.as_raw(),
+                &POLICY_CONFIG_INTERFACE,
+                &mut interface,
+            )
+            .ok()
+            .map_err(|_| "audio_route_unavailable")?;
+            if interface.is_null() {
+                return Err("audio_route_unavailable");
+            }
+            Ok(Self(interface))
+        }
+    }
+
+    fn set_default(&self, endpoint: &str, role: DefaultRole) -> AudioResult<()> {
+        let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
+        let role = match role {
+            DefaultRole::Console => eConsole,
+            DefaultRole::Multimedia => eMultimedia,
+            DefaultRole::Communications => eCommunications,
+        };
+        // SAFETY: this vtable slot is SetDefaultEndpoint at IPolicyConfig slot
+        // 13 (three IUnknown slots plus ten preceding interface methods). The
+        // UTF-16 endpoint remains alive for the synchronous COM call.
+        unsafe {
+            let vtable = &**(self.0 as *mut *const PolicyConfigVtable);
+            (vtable.set_default_endpoint)(self.0, PCWSTR(wide.as_ptr()), role)
+                .ok()
+                .map_err(|_| "audio_route_change_failed")
+        }
+    }
+}
+
+impl Drop for PolicyConfig {
+    fn drop(&mut self) {
+        // SAFETY: QueryInterface returned one owned COM reference. Its Release
+        // method is the first IUnknown vtable slot, and this wrapper drops on
+        // the apartment thread that created it.
+        unsafe {
+            let vtable = &**(self.0 as *mut *const PolicyConfigVtable);
+            (vtable.base__.Release)(self.0);
+        }
+    }
+}
+
+struct RouteLease {
+    endpoint: String,
+    active: bool,
+}
+
+impl RouteLease {
+    fn unchanged(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_owned(),
+            active: false,
+        }
+    }
+
+    fn acquire(
+        enumerator: &IMMDeviceEnumerator,
+        endpoint: &str,
+        capture_sink_without_routing: bool,
+    ) -> AudioResult<Self> {
+        if capture_sink_without_routing || endpoint == "default" {
+            return Ok(Self::unchanged(endpoint));
+        }
+
+        let mutex = ROUTE_POLICY.get_or_init(|| Mutex::new(RoutePolicy::new()));
+        let mut policy = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !restore_pending(enumerator, &mut policy).map_err(|_| "audio_route_restore_failed")? {
+            return Err("audio_route_restore_failed");
+        }
+        let original = default_endpoints(enumerator)?;
+        match policy.acquire(endpoint, &original)? {
+            AcquirePlan::Unchanged => Ok(Self::unchanged(endpoint)),
+            AcquirePlan::Shared => Ok(Self {
+                endpoint: endpoint.to_owned(),
+                active: true,
+            }),
+            AcquirePlan::Assign(assignments) => {
+                let result =
+                    assign_defaults(enumerator, &mut policy, endpoint, &original, &assignments);
+                if result.is_err() {
+                    policy.abort_acquire(endpoint)?;
+                    if !restore_pending(enumerator, &mut policy).unwrap_or(false) {
+                        return Err("audio_route_restore_failed");
+                    }
+                    return Err("audio_route_change_failed");
+                }
+                Ok(Self {
+                    endpoint: endpoint.to_owned(),
+                    active: true,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for RouteLease {
+    fn drop(&mut self) {
+        if self.active {
+            release_route(&self.endpoint);
+        }
+    }
+}
+
+fn default_endpoints(enumerator: &IMMDeviceEnumerator) -> AudioResult<DefaultEndpoints> {
+    let mut endpoints: DefaultEndpoints = std::array::from_fn(|_| None);
+    for role in DefaultRole::ALL {
+        endpoints[role.index()] = role_endpoint(enumerator, role)?;
+    }
+    Ok(endpoints)
+}
+
+fn role_endpoint(
+    enumerator: &IMMDeviceEnumerator,
+    role: DefaultRole,
+) -> AudioResult<Option<String>> {
+    let role = match role {
+        DefaultRole::Console => eConsole,
+        DefaultRole::Multimedia => eMultimedia,
+        DefaultRole::Communications => eCommunications,
+    };
+    // SAFETY: this is a read-only query in the caller's live COM apartment.
+    unsafe {
+        match enumerator.GetDefaultAudioEndpoint(eRender, role) {
+            Ok(device) => identifier(&device).map(Some),
+            Err(error) if error.code() == HRESULT_NOT_FOUND => Ok(None),
+            Err(_) => Err("audio_route_snapshot_failed"),
+        }
+    }
+}
+
+fn assign_defaults(
+    enumerator: &IMMDeviceEnumerator,
+    route_policy: &mut RoutePolicy,
+    endpoint: &str,
+    original: &DefaultEndpoints,
+    assignments: &[RoleAssignment],
+) -> AudioResult<()> {
+    let policy = PolicyConfig::new()?;
+    for assignment in assignments {
+        let current = role_endpoint(enumerator, assignment.role)?;
+        if current.as_deref() == Some(endpoint) {
+            continue;
+        }
+        if current != original[assignment.role.index()] {
+            // Another actor changed this role after our snapshot. Preserve it.
+            continue;
+        }
+        policy.set_default(endpoint, assignment.role)?;
+        route_policy.record_assignment(endpoint, assignment.role)?;
+    }
+
+    let current = default_endpoints(enumerator)?;
+    if assignments
+        .iter()
+        .any(|assignment| current[assignment.role.index()] == original[assignment.role.index()])
+    {
+        return Err("audio_route_change_failed");
+    }
+    Ok(())
+}
+
+fn restore_pending(
+    enumerator: &IMMDeviceEnumerator,
+    policy: &mut RoutePolicy,
+) -> AudioResult<bool> {
+    let Some(endpoint) = policy.endpoint_with_pending_restore().map(str::to_owned) else {
+        return Ok(true);
+    };
+    let current = default_endpoints(enumerator)?;
+    let assignments = policy
+        .pending_restore_assignments(&current)
+        .ok_or("audio_route_unavailable")?;
+    if !assignments.is_empty() {
+        let endpoint_policy = PolicyConfig::new()?;
+        for assignment in assignments {
+            if role_endpoint(enumerator, assignment.role)?.as_deref() == Some(endpoint.as_str()) {
+                // Keep trying the other roles after a failure. The final query
+                // decides whether any role still needs restoration.
+                let _ = endpoint_policy.set_default(&assignment.endpoint, assignment.role);
+            }
+        }
+    }
+
+    let current = default_endpoints(enumerator)?;
+    let restored = policy
+        .pending_restore_assignments(&current)
+        .is_some_and(|assignments| assignments.is_empty());
+    policy.complete_restore(restored);
+    Ok(restored)
+}
+
+fn release_route(endpoint: &str) {
+    let mutex = ROUTE_POLICY.get_or_init(|| Mutex::new(RoutePolicy::new()));
+    let mut policy = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(enumerator) = enumerator() else {
+        let _ = policy.release_without_snapshot(endpoint);
+        return;
+    };
+    let current = match default_endpoints(&enumerator) {
+        Ok(current) => current,
+        Err(_) => {
+            let _ = policy.release_without_snapshot(endpoint);
+            return;
+        }
+    };
+    match policy.release(endpoint, &current) {
+        Ok(ReleasePlan::Shared) => {}
+        Ok(ReleasePlan::Restore(_)) => {
+            let _ = restore_pending(&enumerator, &mut policy);
+        }
+        Err(_) => {}
+    }
+}
+
+pub fn route_restore_pending() -> bool {
+    ROUTE_POLICY.get().is_some_and(|mutex| {
+        let policy = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        policy.endpoint_with_pending_restore().is_some()
+    })
+}
 
 struct Apartment;
 impl Apartment {
@@ -198,11 +468,12 @@ pub struct Capture {
     endpoint: String,
     format: Format,
     timeline: Timeline,
+    _route_lease: RouteLease,
     _apartment: Apartment,
 }
 
 impl Capture {
-    pub fn open(requested: &str) -> AudioResult<Self> {
+    pub fn open(requested: &str, capture_sink_without_routing: bool) -> AudioResult<Self> {
         let apartment = Apartment::start()?;
         let enumerator = enumerator()?;
         // SAFETY: activation and capture interface references never leave this
@@ -224,6 +495,8 @@ impl Capture {
                 return Err("not_render_endpoint");
             }
             let endpoint = identifier(&device)?;
+            let route_lease =
+                RouteLease::acquire(&enumerator, &endpoint, capture_sink_without_routing)?;
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|_| "audio_activation_failed")?;
@@ -249,6 +522,7 @@ impl Capture {
                 endpoint,
                 format,
                 timeline: Timeline::new(),
+                _route_lease: route_lease,
                 _apartment: apartment,
             };
             Ok(capture)
@@ -413,7 +687,7 @@ mod tests {
             .or(devices.first())
             .expect("test needs an active render endpoint");
         let before = defaults();
-        let mut capture = Capture::open(&endpoint.id).unwrap();
+        let mut capture = Capture::open(&endpoint.id, true).unwrap();
         assert_eq!(capture.endpoint(), endpoint.id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut packets = 0;
