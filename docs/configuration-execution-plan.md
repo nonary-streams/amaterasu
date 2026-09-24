@@ -215,6 +215,10 @@ strings, an `elevated` flag, and `$()` environment expansion; Amaterasu's
 structured executable/arguments form does not yet implement those semantics.
 `global:global_prep_cmd` and `per_application:exclude-global-prep-cmd` therefore
 remain pending despite the working structured lifecycle.
+The launch default for an omitted per-application `exit-timeout` now matches
+Vibeshine's 10 seconds; an explicit zero remains distinct. Process parity still
+requires the reference's raw command and elevated launch semantics, environment
+substitution, bare-command lookup, and the source undo timeout behavior.
 
 The Windows global capture output can now be selected by exact provider ID
 and persists through host restart. A launch snapshots that output into RTSP
