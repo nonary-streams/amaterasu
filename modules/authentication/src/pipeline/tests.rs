@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::SESSION_DOCUMENT_VERSION;
 use std::collections::BTreeSet;
 
 fn settings() -> Settings {
