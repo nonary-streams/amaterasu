@@ -174,6 +174,7 @@ impl Controller {
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
                         "capture_sink_without_routing": record.capture_sink_without_routing,
+                        "back_button_timeout": record.scoped_back_button_timeout,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
                         "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
@@ -289,6 +290,10 @@ impl Controller {
                                     &record.audio_endpoint,
                                     None,
                                 );
+                                record.scoped_back_button_timeout = record
+                                    .peer
+                                    .client_back_button_timeout
+                                    .or(application_overrides.back_button_timeout);
                                 let mut profile = self
                                     .config
                                     .as_ref()
@@ -624,6 +629,7 @@ struct ApplicationConfigOverrides {
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
     audio_sink_capture_only: Option<bool>,
+    back_button_timeout: Option<i32>,
 }
 
 fn application_config_overrides(

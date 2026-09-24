@@ -285,6 +285,8 @@ pub struct StartConfig {
     pub wgc_pacing_smoothing: bool,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_button_timeout: Option<i32>,
     pub output: String,
     pub encoder: u32,
     pub configuration: VideoConfiguration,

@@ -27,6 +27,8 @@ pub enum Operation {
         #[serde(default)]
         operation_id: Option<String>,
         ttl_ms: Option<u64>,
+        #[serde(default)]
+        back_button_timeout: Option<i32>,
     },
     Lookup {
         operation_id: String,
@@ -494,6 +496,47 @@ pub fn validate_operation_id(operation_id: &str) -> InputResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquire_timeout_override_is_sparse_signed_and_strictly_bounded_by_i32() {
+        let inherited: Operation = serde_json::from_value(json!({
+            "action":"acquire",
+            "operation_id":"stream-one",
+            "ttl_ms":1000
+        }))
+        .unwrap();
+        assert!(matches!(
+            inherited,
+            Operation::Acquire {
+                back_button_timeout: None,
+                ..
+            }
+        ));
+
+        let disabled: Operation = serde_json::from_value(json!({
+            "action":"acquire",
+            "operation_id":"stream-two",
+            "back_button_timeout":-1
+        }))
+        .unwrap();
+        assert!(matches!(
+            disabled,
+            Operation::Acquire {
+                back_button_timeout: Some(-1),
+                ..
+            }
+        ));
+        for value in [
+            json!(2147483648i64),
+            json!(-2147483649i64),
+            json!(1.5),
+            json!("50"),
+        ] {
+            let mut payload = json!({"action":"acquire"});
+            payload["back_button_timeout"] = value;
+            assert!(serde_json::from_value::<Operation>(payload).is_err());
+        }
+    }
 
     #[test]
     fn right_alt_remapping_uses_left_windows_virtual_key() {

@@ -68,6 +68,24 @@ fn synthetic_repeat_modifiers_survive_the_stream_session_wire_projection() {
     );
 }
 
+#[test]
+fn stream_start_snapshots_scoped_back_timeout_into_input_acquire() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut start_request = start(id);
+    start_request["configuration"]["back_button_timeout"] = json!(-1);
+
+    assert_eq!(host.response(2, start_request)["state"], "active");
+    let acquire = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "acquire")
+        .expect("input lease acquisition");
+    assert_eq!(acquire.payload["back_button_timeout"], -1);
+}
+
 fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {
     let mut payload = vec![0, 0, 0, 30, 0x0c, 0, 0, 0];
     payload.extend_from_slice(&0x1au16.to_le_bytes());

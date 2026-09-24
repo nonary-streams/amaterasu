@@ -354,6 +354,8 @@ pub struct ApplicationConfigOverrides {
     pub audio_sink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink_capture_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_button_timeout: Option<i32>,
 }
 
 impl ApplicationConfigOverrides {
@@ -375,6 +377,7 @@ impl ApplicationConfigOverrides {
         self.fec_percentage.is_none()
             && self.audio_sink.is_none()
             && self.audio_sink_capture_only.is_none()
+            && self.back_button_timeout.is_none()
     }
 }
 
@@ -623,6 +626,33 @@ mod tests {
         assert!(
             serde_json::from_value::<ApplicationConfigOverrides>(json!({
                 "audio_sink_capture_only":"no"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn application_back_button_timeout_override_preserves_absence_and_disable() {
+        let inherited = ApplicationConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(inherited.back_button_timeout, None);
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        for timeout in [-1, 0, 1250] {
+            let selected: ApplicationConfigOverrides = serde_json::from_value(json!({
+                "back_button_timeout":timeout
+            }))
+            .unwrap();
+            selected.validate().unwrap();
+            assert_eq!(selected.back_button_timeout, Some(timeout));
+            assert_eq!(
+                serde_json::to_value(selected).unwrap(),
+                json!({"back_button_timeout":timeout})
+            );
+        }
+        assert!(
+            serde_json::from_value::<ApplicationConfigOverrides>(json!({
+                "back_button_timeout":2147483648i64
             }))
             .is_err()
         );

@@ -59,7 +59,8 @@ impl Broker {
                                 "fec_percentage": 49,
                                 "stream_audio": false,
                                 "audio_sink": "endpoint.client",
-                                "audio_sink_capture_only": true
+                                "audio_sink_capture_only": true,
+                                "back_button_timeout": -1
                             }
                         })
                     }
@@ -95,7 +96,8 @@ impl Broker {
                                 "fec_percentage": 37,
                                 "stream_audio": true,
                                 "audio_sink": "endpoint.app",
-                                "audio_sink_capture_only": false
+                                "audio_sink_capture_only": false,
+                                "back_button_timeout": 1200
                             }
                         }
                     }),
@@ -361,6 +363,8 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["stream_audio"], false);
     assert_eq!(rtsp_open["capture"]["audio_endpoint"], "endpoint.client");
     assert_eq!(rtsp_open["capture_sink_without_routing"], true);
+    // The authenticated certificate-scoped explicit disable wins over the app.
+    assert_eq!(rtsp_open["back_button_timeout"], -1);
 }
 
 #[test]

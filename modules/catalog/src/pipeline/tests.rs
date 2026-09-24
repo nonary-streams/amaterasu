@@ -2510,7 +2510,7 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
 
     let mut configured_entry = entry("Hand edited");
     configured_entry["config_overrides"] =
-        json!({"fec_percentage":37,"audio_sink_capture_only":false});
+        json!({"fec_percentage":37,"audio_sink_capture_only":false,"back_button_timeout":-1});
     let manual = backend.run_for(
         &mut pipeline,
         json!({"action":"update","id":"app-0000000000000001","expected_revision":1,"entry":configured_entry}),
@@ -2554,6 +2554,10 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
     assert_eq!(
         backend.entries["app-0000000000000001"]["config_overrides"]["audio_sink_capture_only"],
         false
+    );
+    assert_eq!(
+        backend.entries["app-0000000000000001"]["config_overrides"]["back_button_timeout"],
+        -1
     );
     let marker = backend.entries["~provider.entry:steam:steam:10"].clone();
     assert_eq!(marker["detached"], true);

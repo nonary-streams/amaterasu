@@ -637,6 +637,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         now,
         &mut || Ok(()),

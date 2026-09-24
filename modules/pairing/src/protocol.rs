@@ -218,6 +218,8 @@ pub struct ClientConfigOverrides {
     pub audio_sink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink_capture_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_button_timeout: Option<i32>,
 }
 
 impl ClientConfigOverrides {
@@ -243,6 +245,7 @@ impl ClientConfigOverrides {
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.audio_sink_capture_only.is_none()
+            && self.back_button_timeout.is_none()
     }
 }
 impl Document {
@@ -376,6 +379,33 @@ mod tests {
         assert!(
             serde_json::from_value::<ClientConfigOverrides>(json!({
                 "audio_sink_capture_only":0
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_back_button_timeout_preserves_absence_and_explicit_disable() {
+        let inherited = ClientConfigOverrides::default();
+        assert!(inherited.is_empty());
+        assert_eq!(inherited.back_button_timeout, None);
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        for timeout in [-1, 0, 1250] {
+            let override_value: ClientConfigOverrides = serde_json::from_value(json!({
+                "back_button_timeout":timeout
+            }))
+            .unwrap();
+            override_value.validate().unwrap();
+            assert_eq!(override_value.back_button_timeout, Some(timeout));
+            assert_eq!(
+                serde_json::to_value(override_value).unwrap(),
+                json!({"back_button_timeout":timeout})
+            );
+        }
+        assert!(
+            serde_json::from_value::<ClientConfigOverrides>(json!({
+                "back_button_timeout":"1250"
             }))
             .is_err()
         );

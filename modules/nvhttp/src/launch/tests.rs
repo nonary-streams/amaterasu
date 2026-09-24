@@ -61,10 +61,11 @@ fn peer_with_capture_options(
         .with_paired_identity(
             format!("client-{marker}"),
             fingerprint(&certificate),
-            None,
-            None,
-            audio_sink.map(str::to_owned),
-            audio_sink_capture_only,
+            ClientConfigOverrides {
+                audio_sink: audio_sink.map(str::to_owned),
+                audio_sink_capture_only,
+                ..Default::default()
+            },
         )
         .unwrap()
 }
@@ -82,10 +83,27 @@ fn peer_with_settings(
         .with_paired_identity(
             format!("client-{marker}"),
             certificate_id,
-            fec_percentage,
-            stream_audio,
-            audio_sink,
-            None,
+            ClientConfigOverrides {
+                fec_percentage,
+                stream_audio,
+                audio_sink,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+fn peer_with_back_button_timeout(marker: u8, timeout: Option<i32>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                back_button_timeout: timeout,
+                ..Default::default()
+            },
         )
         .unwrap()
 }
@@ -116,10 +134,7 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
         peer.with_paired_identity(
             "moonlight-id".into(),
             "00".repeat(32),
-            None,
-            None,
-            None,
-            None,
+            ClientConfigOverrides::default(),
         )
         .err()
         .unwrap(),
@@ -131,10 +146,10 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
             .with_paired_identity(
                 "moonlight-id".into(),
                 fingerprint(&certificate),
-                None,
-                None,
-                Some("bad\nendpoint".into()),
-                None,
+                ClientConfigOverrides {
+                    audio_sink: Some("bad\nendpoint".into()),
+                    ..Default::default()
+                },
             )
             .err()
             .unwrap(),
@@ -145,10 +160,11 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
         .with_paired_identity(
             "moonlight-id".into(),
             fingerprint(&certificate),
-            Some(37),
-            Some(false),
-            None,
-            None,
+            ClientConfigOverrides {
+                fec_percentage: Some(37),
+                stream_audio: Some(false),
+                ..Default::default()
+            },
         )
         .unwrap();
     assert_eq!(paired.paired_client_id(), Some("moonlight-id"));
@@ -424,6 +440,37 @@ fn audio_sink_capture_only_requires_an_explicit_resolved_sink_and_uses_client_ap
 }
 
 #[test]
+fn scoped_back_button_timeout_uses_client_then_application_and_preserves_disable() {
+    for (client, application, expected) in [
+        (Some(-1), Some(1200), Some(-1)),
+        (Some(250), Some(1200), Some(250)),
+        (None, Some(1200), Some(1200)),
+        (None, None, None),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let peer = peer_with_back_button_timeout(33, client);
+        let mut broker = Broker {
+            application_back_button_timeout: application,
+            ..Broker::default()
+        };
+        assert!(controller.launch(10, request(1), peer, now).is_none());
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+        let rtsp_open = broker
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+                _ => None,
+            })
+            .expect("RTSP open request");
+        assert_eq!(rtsp_open["back_button_timeout"], json!(expected));
+    }
+}
+
+#[test]
 fn unavailable_scoped_audio_sink_fails_without_falling_back_to_global() {
     let now = Instant::now();
     let selected = "endpoint.unavailable";
@@ -551,6 +598,7 @@ struct Broker {
     application_stream_audio: Option<bool>,
     application_audio_sink: Option<String>,
     application_audio_sink_capture_only: Option<bool>,
+    application_back_button_timeout: Option<i32>,
 }
 
 impl Default for Broker {
@@ -579,6 +627,7 @@ impl Default for Broker {
             application_stream_audio: None,
             application_audio_sink: None,
             application_audio_sink_capture_only: None,
+            application_back_button_timeout: None,
         }
     }
 }
@@ -692,6 +741,7 @@ impl Broker {
                 || self.application_stream_audio.is_some()
                 || self.application_audio_sink.is_some()
                 || self.application_audio_sink_capture_only.is_some()
+                || self.application_back_button_timeout.is_some()
             {
                 let mut config_overrides = json!({});
                 if let Some(fec_percentage) = self.application_fec_percentage {
@@ -705,6 +755,9 @@ impl Broker {
                 }
                 if let Some(capture_only) = self.application_audio_sink_capture_only {
                     config_overrides["audio_sink_capture_only"] = json!(capture_only);
+                }
+                if let Some(timeout) = self.application_back_button_timeout {
+                    config_overrides["back_button_timeout"] = json!(timeout);
                 }
                 launch["config_overrides"] = config_overrides;
             }

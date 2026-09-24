@@ -423,10 +423,7 @@ impl Router {
                 let peer = match peer.with_paired_identity(
                     client_id.into(),
                     certificate_id.into(),
-                    config_overrides.fec_percentage,
-                    config_overrides.stream_audio,
-                    config_overrides.audio_sink,
-                    config_overrides.audio_sink_capture_only,
+                    config_overrides,
                 ) {
                     Ok(peer) => peer,
                     Err(_) => {

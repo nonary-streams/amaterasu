@@ -622,6 +622,7 @@ mod tests {
             Operation::Acquire {
                 operation_id: None,
                 ttl_ms: Some(1000),
+                back_button_timeout: None,
             },
             now,
             &mut || Ok(()),

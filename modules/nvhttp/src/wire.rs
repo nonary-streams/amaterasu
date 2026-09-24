@@ -537,11 +537,12 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct ClientConfigOverrides {
-    fec_percentage: Option<u8>,
-    stream_audio: Option<bool>,
-    audio_sink: Option<String>,
-    audio_sink_capture_only: Option<bool>,
+pub(super) struct ClientConfigOverrides {
+    pub(super) fec_percentage: Option<u8>,
+    pub(super) stream_audio: Option<bool>,
+    pub(super) audio_sink: Option<String>,
+    pub(super) audio_sink_capture_only: Option<bool>,
+    pub(super) back_button_timeout: Option<i32>,
 }
 
 #[cfg(test)]

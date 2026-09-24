@@ -720,7 +720,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
             "action": "update_client_config_overrides",
             "certificate_id": certificate_id,
             "expected_revision": initial_revision,
-            "config_overrides": {"fec_percentage":47,"stream_audio":false,"audio_sink_capture_only":false}
+            "config_overrides": {"fec_percentage":47,"stream_audio":false,"audio_sink_capture_only":false,"back_button_timeout":-1}
         }),
         now(),
     );
@@ -744,6 +744,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         certificate_readback["config_overrides"]["audio_sink_capture_only"],
         false
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["back_button_timeout"],
+        -1
     );
     let duplicate_client_id_readback = state.request(
         &mut pipeline,
@@ -771,6 +775,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["audio_sink_capture_only"],
         false
+    );
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["back_button_timeout"],
+        -1
     );
 
     // A second administrator holding the same pre-write revision must reload
@@ -802,6 +810,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         unchanged["config_overrides"]["audio_sink_capture_only"],
         false
     );
+    assert_eq!(unchanged["config_overrides"]["back_button_timeout"], -1);
 }
 
 #[test]

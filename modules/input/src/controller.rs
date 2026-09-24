@@ -25,6 +25,8 @@ struct Lease {
     cleanup_required: bool,
     operation_id: Option<String>,
     requested_ttl_ms: Option<u64>,
+    requested_back_button_timeout: Option<i32>,
+    back_button_timeout_ms: i32,
     termination_reason: Option<&'static str>,
     key_encoding: Option<KeyEncoding>,
 }
@@ -33,6 +35,7 @@ struct TerminalAcquire {
     owner: String,
     operation_id: String,
     requested_ttl_ms: Option<u64>,
+    requested_back_button_timeout: Option<i32>,
     reason: &'static str,
     retained_until: Instant,
 }
@@ -97,7 +100,15 @@ impl<B: Backend> Controller<B> {
             Operation::Acquire {
                 operation_id,
                 ttl_ms,
-            } => self.acquire(caller, operation_id, ttl_ms, now, guard),
+                back_button_timeout,
+            } => self.acquire(
+                caller,
+                operation_id,
+                ttl_ms,
+                back_button_timeout,
+                now,
+                guard,
+            ),
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id, now),
             Operation::Renew { lease, ttl_ms } => self.renew(caller, &lease, ttl_ms, now, guard),
             Operation::Batch { lease, events } => return self.batch(caller, &lease, events, guard),
@@ -184,7 +195,9 @@ impl<B: Backend> Controller<B> {
 
     pub fn set_back_button_timeout_ms(&mut self, timeout_ms: i32) {
         self.back_button_timeout_ms = timeout_ms;
-        self.backend.set_back_button_timeout(timeout_ms);
+        if self.lease.is_none() {
+            self.backend.set_back_button_timeout(timeout_ms);
+        }
     }
 
     fn reset_scroll_remainders(&mut self) {
@@ -257,6 +270,7 @@ impl<B: Backend> Controller<B> {
         caller: &str,
         operation_id: Option<String>,
         ttl_ms: Option<u64>,
+        requested_back_button_timeout: Option<i32>,
         now: Instant,
         guard: &mut impl FnMut() -> InputResult<()>,
     ) -> InputResult<Value> {
@@ -265,7 +279,9 @@ impl<B: Backend> Controller<B> {
             if let Some(lease) = self.lease.as_ref().filter(|lease| {
                 lease.owner == caller && lease.operation_id.as_deref() == Some(operation_id)
             }) {
-                if lease.requested_ttl_ms != ttl_ms {
+                if lease.requested_ttl_ms != ttl_ms
+                    || lease.requested_back_button_timeout != requested_back_button_timeout
+                {
                     return Err(operation_conflict());
                 }
                 return Ok(active_lease(
@@ -281,7 +297,9 @@ impl<B: Backend> Controller<B> {
                 .iter()
                 .find(|terminal| terminal.owner == caller && terminal.operation_id == operation_id)
             {
-                if terminal.requested_ttl_ms != ttl_ms {
+                if terminal.requested_ttl_ms != ttl_ms
+                    || terminal.requested_back_button_timeout != requested_back_button_timeout
+                {
                     return Err(operation_conflict());
                 }
                 return Ok(terminal_acquire(terminal));
@@ -317,7 +335,14 @@ impl<B: Backend> Controller<B> {
             .map_err(|error| InputError::new("entropy_error", error.to_string()))?;
         let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         guard()?;
-        self.backend.start()?;
+        let back_button_timeout_ms =
+            requested_back_button_timeout.unwrap_or(self.back_button_timeout_ms);
+        self.backend.set_back_button_timeout(back_button_timeout_ms);
+        if let Err(error) = self.backend.start() {
+            self.backend
+                .set_back_button_timeout(self.back_button_timeout_ms);
+            return Err(error);
+        }
         self.reset_scroll_remainders();
         self.lease = Some(Lease {
             owner: caller.into(),
@@ -326,6 +351,8 @@ impl<B: Backend> Controller<B> {
             cleanup_required: false,
             operation_id,
             requested_ttl_ms: ttl_ms,
+            requested_back_button_timeout,
+            back_button_timeout_ms,
             termination_reason: None,
             key_encoding: None,
         });
@@ -733,6 +760,8 @@ impl<B: Backend> Controller<B> {
             self.retry_at = now + Duration::from_millis(100);
             return Err(InputError::new("release_failed", error.message));
         }
+        self.backend
+            .set_back_button_timeout(self.back_button_timeout_ms);
         let Some(lease) = self.lease.take() else {
             self.reset_scroll_remainders();
             self.retry_at = now;
@@ -744,6 +773,7 @@ impl<B: Backend> Controller<B> {
                 owner: lease.owner,
                 operation_id,
                 requested_ttl_ms: lease.requested_ttl_ms,
+                requested_back_button_timeout: lease.requested_back_button_timeout,
                 reason: lease.termination_reason.unwrap_or(reason),
                 retained_until: now + OPERATION_RETENTION,
             });
@@ -760,6 +790,7 @@ impl<B: Backend> Controller<B> {
                 "token":owned.then_some(&lease.token),
                 "expires_in_ms":lease.expires.saturating_duration_since(now).as_millis() as u64,
                 "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
+                "back_button_timeout":lease.back_button_timeout_ms,
             })
         });
         json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
@@ -798,6 +829,7 @@ fn active_lease(
         "operation_id": lease.operation_id,
         "lease": lease.token,
         "ttl_ms": lease.requested_ttl_ms.unwrap_or(5000),
+        "back_button_timeout": lease.back_button_timeout_ms,
         "expires_in_ms": lease.expires.saturating_duration_since(now).as_millis() as u64,
         "backend": backend,
         "absolute_pointer": absolute_pointer,

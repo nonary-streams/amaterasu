@@ -14,6 +14,7 @@ struct FakeBackend {
     fail_controller_input: bool,
     reject_absolute: bool,
     controller_input_supported: bool,
+    back_button_timeout_ms: i32,
 }
 impl Backend for FakeBackend {
     fn name(&self) -> &'static str {
@@ -62,6 +63,9 @@ impl Backend for FakeBackend {
         }
         Ok(())
     }
+    fn set_back_button_timeout(&mut self, timeout_ms: i32) {
+        self.back_button_timeout_ms = timeout_ms;
+    }
     fn stop(&mut self) -> InputResult<()> {
         self.stops += 1;
         if self.fail_stop {
@@ -100,12 +104,91 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
         Operation::Acquire {
             operation_id: None,
             ttl_ms: Some(1000),
+            back_button_timeout: None,
         },
         now,
         &mut || Ok(()),
     );
     assert_eq!(response["ok"], true);
     response["lease"].as_str().unwrap().into()
+}
+
+#[test]
+fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_release() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            back_button_timeout_ms: -1,
+            ..Default::default()
+        },
+        true,
+    );
+    controller.set_back_button_timeout_ms(80);
+    let now = Instant::now();
+    let acquired = controller.handle(
+        "client-one",
+        Operation::Acquire {
+            operation_id: Some("client-one-stream".into()),
+            ttl_ms: None,
+            back_button_timeout: Some(-1),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["back_button_timeout"], -1);
+    assert_eq!(controller.backend.back_button_timeout_ms, -1);
+
+    controller.set_back_button_timeout_ms(250);
+    assert_eq!(controller.backend.back_button_timeout_ms, -1);
+    controller.handle(
+        "client-one",
+        Operation::Release {
+            lease: acquired["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(controller.backend.back_button_timeout_ms, 250);
+
+    let next = controller.handle(
+        "client-two",
+        Operation::Acquire {
+            operation_id: Some("client-two-stream".into()),
+            ttl_ms: None,
+            back_button_timeout: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(next["back_button_timeout"], 250);
+    assert_eq!(controller.backend.back_button_timeout_ms, 250);
+}
+
+#[test]
+fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let first = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("timeout-retry".into()),
+            ttl_ms: Some(2000),
+            back_button_timeout: Some(400),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(first["ok"], true);
+    let retry = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: Some("timeout-retry".into()),
+            ttl_ms: Some(2000),
+            back_button_timeout: None,
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(retry["error"]["code"], "operation_conflict");
 }
 
 #[test]
@@ -123,6 +206,7 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
         Operation::Acquire {
             operation_id: Some("gamepad-capability".into()),
             ttl_ms: Some(1000),
+            back_button_timeout: None,
         },
         now,
         &mut || Ok(()),
@@ -408,6 +492,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         now,
         &mut || Ok(()),
@@ -478,6 +563,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -490,6 +576,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         Instant::now(),
         &mut || Err(InputError::new("cancelled", "ended")),
@@ -521,6 +608,7 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         Operation::Renew {
             lease: token.clone(),
@@ -558,6 +646,7 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
         Operation::Acquire {
             operation_id: None,
             ttl_ms: None,
+            back_button_timeout: None,
         },
         Instant::now(),
         &mut || Ok(()),
@@ -600,6 +689,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
     let acquire = || Operation::Acquire {
         operation_id: Some("session.input.7".into()),
         ttl_ms: Some(2000),
+        back_button_timeout: None,
     };
     let first = controller.handle("owner", acquire(), now, &mut || Ok(()));
     let token = first["lease"].as_str().unwrap().to_owned();
@@ -640,6 +730,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         Operation::Acquire {
             operation_id: Some("session.input.7".into()),
             ttl_ms: Some(3000),
+            back_button_timeout: None,
         },
         now,
         &mut || Ok(()),

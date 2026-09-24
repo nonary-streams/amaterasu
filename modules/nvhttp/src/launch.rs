@@ -10,7 +10,7 @@ mod workflow;
 #[cfg(test)]
 mod tests;
 
-use crate::wire::{Reply, xml};
+use crate::wire::{ClientConfigOverrides, Reply, xml};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,7 @@ pub struct PeerIdentity {
     client_stream_audio: Option<bool>,
     client_audio_sink: Option<String>,
     client_audio_sink_capture_only: Option<bool>,
+    client_back_button_timeout: Option<i32>,
 }
 
 impl PeerIdentity {
@@ -69,6 +70,7 @@ impl PeerIdentity {
             client_stream_audio: None,
             client_audio_sink: None,
             client_audio_sink_capture_only: None,
+            client_back_button_timeout: None,
         })
     }
 
@@ -76,11 +78,15 @@ impl PeerIdentity {
         mut self,
         client_id: String,
         certificate_id: String,
-        fec_percentage: Option<u8>,
-        stream_audio: Option<bool>,
-        audio_sink: Option<String>,
-        audio_sink_capture_only: Option<bool>,
+        config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
+        let ClientConfigOverrides {
+            fec_percentage,
+            stream_audio,
+            audio_sink,
+            audio_sink_capture_only,
+            back_button_timeout,
+        } = config_overrides;
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
             || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
@@ -97,6 +103,7 @@ impl PeerIdentity {
         self.client_stream_audio = stream_audio;
         self.client_audio_sink = audio_sink;
         self.client_audio_sink_capture_only = audio_sink_capture_only;
+        self.client_back_button_timeout = back_button_timeout;
         Ok(self)
     }
 

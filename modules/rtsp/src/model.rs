@@ -405,6 +405,8 @@ pub struct Open {
     pub wgc_pacing_smoothing: bool,
     #[serde(default)]
     pub capture_sink_without_routing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_button_timeout: Option<i32>,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -523,6 +525,7 @@ impl Open {
                 "encoder": self.capture.encoder,
                 "audio_endpoint": self.capture.audio_endpoint,
                 "capture_sink_without_routing": self.capture_sink_without_routing,
+                "back_button_timeout": self.back_button_timeout,
                 "configuration": {
                     "width": self.profile.width,
                     "height": self.profile.height,
@@ -1186,6 +1189,10 @@ mod tests {
             legacy.arm(40)["configuration"]["capture_sink_without_routing"],
             false
         );
+        assert_eq!(
+            legacy.arm(40)["configuration"]["back_button_timeout"],
+            Value::Null
+        );
 
         let mut value = open_json();
         value["capture_sink_without_routing"] = json!(true);
@@ -1194,6 +1201,13 @@ mod tests {
         assert_eq!(
             selected.arm(41)["configuration"]["capture_sink_without_routing"],
             true
+        );
+
+        let mut selected_timeout = open();
+        selected_timeout.back_button_timeout = Some(-1);
+        assert_eq!(
+            selected_timeout.arm(42)["configuration"]["back_button_timeout"],
+            -1
         );
     }
 

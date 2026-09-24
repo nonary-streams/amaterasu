@@ -98,9 +98,14 @@ timeout-driven state writes while retaining slot ownership. The global
 deadline per slot. On expiry, the module releases Back, pulses Guide for 100
 milliseconds after successful delivery, and suppresses Back until the client
 reports it released. Slot removal and lease teardown cancel pending timers.
-Windows currently reports controller input unsupported. Per-app and per-client
-`back_button_timeout` overrides are not yet resolved, and platform-qualified
-controller parity remains pending.
+Each input lease accepts an optional signed `back_button_timeout` in its acquire
+request. NVHTTP resolves the certificate-bound client value before the
+application value; when both are absent, input uses the durable global policy.
+Input captures the effective value when the lease starts, so a global settings
+change during a stream affects the next lease and does not change the current
+stream's controller behavior. Windows currently reports controller input
+unsupported. Linux runtime behavior has not been exercised on this Windows host,
+so platform-qualified controller parity remains pending.
 
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
 VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw

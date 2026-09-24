@@ -209,10 +209,16 @@ policy is true and the resolved configured sink is nonempty and matches the
 selected endpoint. An empty scoped sink selects the bootstrap endpoint and does
 not enable capture-only routing.
 
+Application and paired-client `config_overrides.back_button_timeout` values are
+sparse signed 32-bit millisecond overrides. The management API and editor expose
+the field for both scopes. NVHTTP snapshots the authenticated client's value
+before the application value and carries that winner through RTSP and
+stream-session to input lease acquisition. Explicit negative values, including
+`-1`, disable the Back timeout; an absent value lets input use its durable global
+policy and snapshot it when the lease starts.
+
 Amaterasu does not currently model `virtual_sink`, so it cannot apply Vibeshine's
-virtual-sink exclusion. The management HTTP route and editor still need to expose
-the setting and sparse app/client override controls before the complete product
-configuration surface is available.
+virtual-sink exclusion. That runtime condition remains incomplete.
 
 ## Global video batch allowance
 
