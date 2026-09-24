@@ -141,6 +141,10 @@ pub fn resolve(path: &str) -> Option<Route> {
             "settings_update",
             Some("configuration.write"),
         ),
+        ("history", action) => {
+            let (action, scope) = history_action(action)?;
+            ("amaterasu.session-history/1", action, Some(scope))
+        }
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "counters") => (
             "amaterasu.diagnostics/1",
@@ -191,6 +195,19 @@ fn media_discovery(action: &str) -> Option<(&'static str, &'static str)> {
         "encoders" => Some(("amaterasu.encode/1", "enumerate")),
         "audio_encoders" => Some(("amaterasu.audio-encode/1", "enumerate")),
         "video_status" => Some(("amaterasu.video/1", "status")),
+        _ => None,
+    }
+}
+
+fn history_action(action: &str) -> Option<(&'static str, &'static str)> {
+    match action {
+        "settings_get" => Some(("settings_get", "configuration.read")),
+        "settings_update" => Some(("settings_update", "configuration.write")),
+        "list_sessions" => Some(("list_sessions", "session.read")),
+        "session_detail" => Some(("session_detail", "session.read")),
+        "active_sessions" => Some(("active_sessions", "session.read")),
+        "history_status" => Some(("history_status", "session.read")),
+        "delete_session" => Some(("delete_session", "session.write")),
         _ => None,
     }
 }
@@ -262,6 +279,50 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_routes_expose_only_management_operations_with_bounded_fields() {
+        for (action, scope) in [
+            ("settings_get", "configuration.read"),
+            ("settings_update", "configuration.write"),
+            ("list_sessions", "session.read"),
+            ("session_detail", "session.read"),
+            ("active_sessions", "session.read"),
+            ("history_status", "session.read"),
+            ("delete_session", "session.write"),
+        ] {
+            let route = resolve(&format!("/v1/history/{action}")).unwrap();
+            assert_eq!(route.service, "amaterasu.session-history/1");
+            assert_eq!(route.scope, Some(scope));
+        }
+        for action in [
+            "session_begin",
+            "session_end",
+            "record_sample",
+            "record_event",
+        ] {
+            assert!(resolve(&format!("/v1/history/{action}")).is_none());
+        }
+
+        let update = resolve("/v1/history/settings_update").unwrap();
+        let valid = br#"{"settings":{"enabled":true,"ttl_days":0,"db_size_limit_mb":2147483647},"expected_revision":0}"#;
+        assert_eq!(payload(update, valid).unwrap()["action"], "settings_update");
+        for invalid in [
+            br#"{"settings":{"enabled":true,"ttl_days":-1,"db_size_limit_mb":0},"expected_revision":0}"#.as_slice(),
+            br#"{"settings":{"enabled":true,"ttl_days":2147483648,"db_size_limit_mb":0},"expected_revision":0}"#,
+            br#"{"settings":{"enabled":true,"ttl_days":0,"db_size_limit_mb":0,"extra":1},"expected_revision":0}"#,
+            br#"{"settings":{"enabled":true,"ttl_days":0,"db_size_limit_mb":0},"expected_revision":-1}"#,
+        ] {
+            assert!(payload(update, invalid).is_err());
+        }
+
+        let list = resolve("/v1/history/list_sessions").unwrap();
+        assert!(payload(list, br#"{"limit":25,"offset":0}"#).is_ok());
+        assert!(payload(list, br#"{"limit":26}"#).is_err());
+        let detail = resolve("/v1/history/session_detail").unwrap();
+        assert!(payload(detail, br#"{"session_id":"session-1"}"#).is_ok());
+        assert!(payload(detail, br#"{"session_id":""}"#).is_err());
+    }
 
     #[test]
     fn media_discovery_requires_its_scope_and_cannot_forward_native_commands() {

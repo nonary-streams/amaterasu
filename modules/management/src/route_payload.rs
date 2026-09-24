@@ -23,6 +23,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.lutris/1" => lutris(route.action, object),
         "amaterasu.playnite/1" => playnite(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
+        "amaterasu.session-history/1" => history(route.action, object),
         _ => Ok(()),
     }
 }
@@ -122,6 +123,69 @@ fn authentication_token(value: &str) -> Result<(), &'static str> {
         return Err(INVALID);
     }
     Ok(())
+}
+
+fn history(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "settings_get" | "history_status" => fields(object, &[], &[]),
+        "settings_update" => {
+            fields(object, &["settings", "expected_revision"], &[])?;
+            let settings = object
+                .get("settings")
+                .and_then(Value::as_object)
+                .ok_or(INVALID)?;
+            fields(settings, &["enabled", "ttl_days", "db_size_limit_mb"], &[])?;
+            if settings.get("enabled").and_then(Value::as_bool).is_none()
+                || ["ttl_days", "db_size_limit_mb"].iter().any(|field| {
+                    settings
+                        .get(*field)
+                        .and_then(Value::as_i64)
+                        .is_none_or(|value| !(0..=i64::from(i32::MAX)).contains(&value))
+                })
+                || object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "list_sessions" => {
+            fields(object, &[], &["limit", "offset"])?;
+            if object.get("limit").is_some_and(|value| {
+                !value
+                    .as_u64()
+                    .is_some_and(|limit| (1..=25).contains(&limit))
+            }) || object
+                .get("offset")
+                .is_some_and(|value| value.as_u64().is_none())
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "active_sessions" => {
+            fields(object, &[], &["limit"])?;
+            if object.get("limit").is_some_and(|value| {
+                !value
+                    .as_u64()
+                    .is_some_and(|limit| (1..=16).contains(&limit))
+            }) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "session_detail" | "delete_session" => {
+            fields(object, &["session_id"], &[])?;
+            let id = text(object, "session_id")?;
+            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
+    }
 }
 
 fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
