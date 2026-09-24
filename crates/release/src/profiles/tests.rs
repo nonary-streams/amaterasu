@@ -268,7 +268,9 @@ fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_relo
 #[test]
 fn input_policy_can_load_durable_settings_and_management_can_edit_them() {
     assert!(INPUT.calls.contains(&"amaterasu.configuration/1"));
+    assert!(INPUT.calls.contains(&"amaterasu.state/1"));
     assert!(INPUT.dependencies.contains(&CONFIGURATION.id));
+    assert!(INPUT.dependencies.contains(&STATE.id));
     assert!(MANAGEMENT.calls.contains(&"amaterasu.input/1"));
     assert!(MANAGEMENT.dependencies.contains(&INPUT.id));
 
@@ -287,6 +289,11 @@ fn input_policy_can_load_durable_settings_and_management_can_edit_them() {
             policy.principals[INPUT.id]
                 .call
                 .contains("amaterasu.configuration/1")
+        );
+        assert!(
+            policy.principals[INPUT.id]
+                .call
+                .contains("amaterasu.state/1")
         );
         assert!(
             policy.principals[MANAGEMENT.id]

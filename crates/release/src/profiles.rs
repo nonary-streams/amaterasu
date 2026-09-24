@@ -242,11 +242,11 @@ const INPUT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.input",
     library: "amaterasu_input",
     provides: &["amaterasu.input/1"],
-    calls: &["amaterasu.configuration/1"],
+    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.configuration"],
+    dependencies: &[RUNTIME_ID, "amaterasu.configuration", "amaterasu.state"],
 };
 
 const INPUT_PROBE: ComponentDefinition = ComponentDefinition {
