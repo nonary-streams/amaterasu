@@ -23,6 +23,25 @@ pub(crate) struct Marker {
     pub(crate) detached: bool,
     #[serde(default)]
     pub(crate) remove_generation: Option<u64>,
+    /// First time this provider imported the source row. Existing markers that
+    /// predate timestamps stay unknown so TTL cleanup fails closed.
+    #[serde(default)]
+    pub(crate) added_at_unix: Option<i64>,
+    /// Provider-defined source selection flags, kept outside the editable Entry.
+    #[serde(default)]
+    pub(crate) source_flags: u32,
+    /// Reason for a complete-snapshot removal intent. `None` with a generation
+    /// is the legacy explicit-uninstalled marker format.
+    #[serde(default)]
+    pub(crate) remove_reason: Option<RemovalReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemovalReason {
+    Uninstalled,
+    Expired,
+    Selection,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -41,6 +60,10 @@ pub(crate) struct SnapshotState {
     pub(crate) finish_remove_stale: bool,
     #[serde(default)]
     pub(crate) finish_remove_uninstalled: bool,
+    #[serde(default)]
+    pub(crate) finish_remove_expired: bool,
+    #[serde(default)]
+    pub(crate) finish_remove_selection: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -67,6 +90,8 @@ impl SnapshotState {
             finish_expected_revision: None,
             finish_remove_stale: true,
             finish_remove_uninstalled: false,
+            finish_remove_expired: false,
+            finish_remove_selection: false,
         }
     }
 
@@ -78,6 +103,12 @@ impl SnapshotState {
             && (!self.cleanup_pending || self.finished)
             && (self.finish_expected_revision.is_some() || !self.finished)
             && (!self.finish_remove_uninstalled || self.finished)
+            && (!self.finish_remove_expired || self.finished)
+            && (!self.finish_remove_selection || self.finished)
+            && (self.finished
+                || !(self.finish_remove_uninstalled
+                    || self.finish_remove_expired
+                    || self.finish_remove_selection))
             && self.last_batch.as_ref().is_none_or(|batch| {
                 batch.sequence.checked_add(1) == Some(batch.next_sequence)
                     && batch.next_sequence == self.next_sequence
@@ -124,6 +155,11 @@ pub(crate) fn validate_marker(marker: &Marker, caller: &str, source_id: &str) ->
         && marker
             .remove_generation
             .is_none_or(|generation| generation > 0)
+        && marker
+            .added_at_unix
+            .is_none_or(|timestamp| (0..=253_402_300_799).contains(&timestamp))
+        && (marker.remove_generation.is_some() || marker.remove_reason.is_none())
+        && (marker.remove_reason.is_none() || marker.remove_generation.is_some())
 }
 
 pub(crate) fn marker_value(marker: &Marker) -> Value {

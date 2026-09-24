@@ -2,8 +2,11 @@
 //! assigned to this provider by catalog startup policy.
 
 use crate::settings::ProductSettings;
-use crate::snapshot::{Game, Snapshot, playnite_launch, select_games};
+use crate::snapshot::{
+    Game, SOURCE_INSTALLED, SelectedGame, Snapshot, playnite_launch, select_game_sources,
+};
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,10 +16,14 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 const MAX_BATCH_ENTRIES: usize = 8;
 const MAX_BATCH_BYTES: usize = 12_000;
 const MAX_CONFLICT_RESTARTS: u8 = 3;
+const INVENTORY_PAGE_SIZE: usize = 32;
+const MAX_INVENTORY_ENTRIES: usize = 100_000;
+const SECONDS_PER_DAY: i64 = 86_400;
 static SYNC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
+    Inventory,
     Begin,
     Batch,
     Finish,
@@ -35,7 +42,23 @@ struct Transaction {
     launchable_game_ids: std::collections::BTreeSet<String>,
     entries: Vec<Vec<Value>>,
     remove_source_id_batches: Vec<Vec<String>>,
+    expire_source_id_batches: Vec<Vec<String>>,
+    selection_remove_source_id_batches: Vec<Vec<String>>,
     remove_uninstalled: bool,
+    remove_expired: bool,
+    remove_selection: bool,
+    autosync_delete_after_days: u32,
+    autosync_require_replacement: bool,
+    sync_all_installed: bool,
+    recent_mode: bool,
+    now_unix: i64,
+    uninstalled_game_ids: std::collections::BTreeSet<String>,
+    last_played_by_id: std::collections::BTreeMap<String, i64>,
+    selected_source_ids: std::collections::BTreeSet<String>,
+    inventory: Vec<InventoryEntry>,
+    inventory_total_count: Option<usize>,
+    inventory_after: Option<String>,
+    collection_revision: Option<u64>,
     generation: Option<u64>,
     revision: Option<u64>,
     sequence: u64,
@@ -46,13 +69,29 @@ struct Transaction {
     operation_sequence: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryEntry {
+    source_id: String,
+    added_at_unix: Option<i64>,
+    source_flags: u32,
+    attached: bool,
+}
+
 impl Transaction {
     fn payload(&self) -> Value {
         match self.stage {
+            Stage::Inventory => json!({
+                "action":"provider_snapshot_inventory",
+                "after":self.inventory_after,
+                "expected_collection_revision":self.collection_revision,
+                "limit":INVENTORY_PAGE_SIZE
+            }),
             Stage::Begin => json!({
                 "action":"provider_snapshot_begin",
                 "sync_id":self.sync_id,
-                "source_revision":self.source_revision
+                "source_revision":self.source_revision,
+                "expected_collection_revision":self.collection_revision
             }),
             Stage::Batch => json!({
                 "action":"provider_snapshot_batch",
@@ -62,7 +101,9 @@ impl Transaction {
                 "sequence":self.sequence,
                 "expected_revision":self.revision.expect("begin provides revision"),
                 "entries":self.entries.get(self.batch_index).cloned().unwrap_or_default(),
-                "remove_source_ids":self.remove_source_ids_for_batch()
+                "remove_source_ids":self.uninstalled_ids_for_batch(),
+                "expire_source_ids":self.expired_ids_for_batch(),
+                "selection_remove_source_ids":self.selection_ids_for_batch()
             }),
             Stage::Finish => json!({
                 "action":"provider_snapshot_finish",
@@ -73,20 +114,47 @@ impl Transaction {
                 "next_sequence":self.sequence,
                 "complete":true,
                 "remove_stale":false,
-                "remove_uninstalled":self.remove_uninstalled
+                "remove_uninstalled":self.remove_uninstalled,
+                "remove_expired":self.remove_expired,
+                "remove_selection":self.remove_selection
             }),
         }
     }
 
     fn batch_count(&self) -> usize {
-        self.entries.len() + self.remove_source_id_batches.len()
+        self.entries.len()
+            + self.remove_source_id_batches.len()
+            + self.expire_source_id_batches.len()
+            + self.selection_remove_source_id_batches.len()
     }
 
-    fn remove_source_ids_for_batch(&self) -> Vec<String> {
+    fn uninstalled_ids_for_batch(&self) -> Vec<String> {
         let Some(index) = self.batch_index.checked_sub(self.entries.len()) else {
             return Vec::new();
         };
         self.remove_source_id_batches
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn expired_ids_for_batch(&self) -> Vec<String> {
+        let index = self
+            .batch_index
+            .saturating_sub(self.entries.len() + self.remove_source_id_batches.len());
+        self.expire_source_id_batches
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn selection_ids_for_batch(&self) -> Vec<String> {
+        let index = self.batch_index.saturating_sub(
+            self.entries.len()
+                + self.remove_source_id_batches.len()
+                + self.expire_source_id_batches.len(),
+        );
+        self.selection_remove_source_id_batches
             .get(index)
             .cloned()
             .unwrap_or_default()
@@ -106,7 +174,14 @@ impl Transaction {
         self.revision = None;
         self.sequence = 0;
         self.batch_index = 0;
-        self.stage = Stage::Begin;
+        self.stage = Stage::Inventory;
+        self.inventory.clear();
+        self.inventory_total_count = None;
+        self.inventory_after = None;
+        self.collection_revision = None;
+        self.remove_source_id_batches.clear();
+        self.expire_source_id_batches.clear();
+        self.selection_remove_source_id_batches.clear();
         self.call = Call::Submit {
             operation_id: self.next_operation_id(),
         };
@@ -133,6 +208,9 @@ impl Transaction {
             }
             return Err(format!("{code}: {message}"));
         }
+        if self.stage == Stage::Inventory {
+            return self.consume_inventory_page(payload);
+        }
         let revision = payload
             .get("revision")
             .and_then(Value::as_u64)
@@ -142,6 +220,7 @@ impl Transaction {
             .and_then(Value::as_u64)
             .ok_or("catalog response omitted generation")?;
         match self.stage {
+            Stage::Inventory => unreachable!("inventory responses are handled before this match"),
             Stage::Begin => {
                 let next = payload
                     .get("next_sequence")
@@ -186,6 +265,10 @@ impl Transaction {
                     || payload.get("remove_stale").and_then(Value::as_bool) != Some(false)
                     || payload.get("remove_uninstalled").and_then(Value::as_bool)
                         != Some(self.remove_uninstalled)
+                    || payload.get("remove_expired").and_then(Value::as_bool)
+                        != Some(self.remove_expired)
+                    || payload.get("remove_selection").and_then(Value::as_bool)
+                        != Some(self.remove_selection)
                 {
                     return Err("catalog finish response was inconsistent".into());
                 }
@@ -198,6 +281,205 @@ impl Transaction {
         };
         Ok(false)
     }
+
+    fn consume_inventory_page(&mut self, payload: Value) -> Result<bool, String> {
+        let collection_revision = payload
+            .get("collection_revision")
+            .and_then(Value::as_u64)
+            .ok_or("catalog inventory omitted collection_revision")?;
+        if self
+            .collection_revision
+            .is_some_and(|revision| revision != collection_revision)
+        {
+            return self.restart_after_conflict();
+        }
+        let total_count = payload
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count <= MAX_INVENTORY_ENTRIES)
+            .ok_or("catalog inventory total_count is invalid")?;
+        if self
+            .inventory_total_count
+            .is_some_and(|previous| previous != total_count)
+        {
+            return self.restart_after_conflict();
+        }
+        let entries = payload
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or("catalog inventory omitted entries")?;
+        if entries.len() > INVENTORY_PAGE_SIZE
+            || self.inventory.len().saturating_add(entries.len()) > total_count
+        {
+            return Err("catalog inventory page exceeded its declared bounds".into());
+        }
+        let mut previous = self.inventory_after.clone().unwrap_or_default();
+        for entry in entries {
+            let parsed: InventoryEntry = serde_json::from_value(entry.clone())
+                .map_err(|_| "catalog inventory entry is malformed")?;
+            if !crate::snapshot::valid_playnite_id(&parsed.source_id)
+                || parsed.source_id <= previous
+                || parsed
+                    .added_at_unix
+                    .is_some_and(|timestamp| !(0..=253_402_300_799).contains(&timestamp))
+            {
+                return Err("catalog inventory entry is invalid or unsorted".into());
+            }
+            previous = parsed.source_id.clone();
+            self.inventory.push(parsed);
+        }
+        self.collection_revision = Some(collection_revision);
+        self.inventory_total_count = Some(total_count);
+        let next_after = payload
+            .get("next_after")
+            .ok_or("catalog inventory omitted next_after")?;
+        if let Some(next_after) = next_after.as_str() {
+            if entries.len() != INVENTORY_PAGE_SIZE
+                || entries
+                    .last()
+                    .and_then(|entry| entry.get("source_id"))
+                    .and_then(Value::as_str)
+                    != Some(next_after)
+                || self.inventory.len() >= total_count
+            {
+                return Err("catalog inventory continuation is inconsistent".into());
+            }
+            self.inventory_after = Some(next_after.to_owned());
+        } else if next_after.is_null() {
+            if self.inventory.len() != total_count {
+                return Err("catalog inventory ended before total_count".into());
+            }
+            self.prepare_removals();
+            self.stage = Stage::Begin;
+            self.inventory_after = None;
+        } else {
+            return Err("catalog inventory next_after is malformed".into());
+        }
+        self.call = Call::Submit {
+            operation_id: self.next_operation_id(),
+        };
+        Ok(false)
+    }
+
+    fn restart_after_conflict(&mut self) -> Result<bool, String> {
+        if self.conflicts >= MAX_CONFLICT_RESTARTS {
+            return Err("catalog inventory revision kept changing".into());
+        }
+        self.conflicts += 1;
+        self.restart();
+        Ok(false)
+    }
+
+    fn prepare_removals(&mut self) {
+        let existing_ids: std::collections::BTreeSet<_> = self
+            .inventory
+            .iter()
+            .map(|entry| entry.source_id.to_ascii_lowercase())
+            .collect();
+        let replacements = if self.recent_mode && self.autosync_require_replacement {
+            self.selected_source_ids
+                .iter()
+                .filter(|source_id| !existing_ids.contains(*source_id))
+                .count()
+        } else {
+            0
+        };
+        let mut uninstalled = Vec::new();
+        let mut expired = Vec::new();
+        let mut selection = Vec::new();
+
+        for marker in &self.inventory {
+            if !marker.attached {
+                continue;
+            }
+            let normalized_source_id = marker.source_id.to_ascii_lowercase();
+            if self.remove_uninstalled && self.uninstalled_game_ids.contains(&normalized_source_id)
+            {
+                uninstalled.push(marker.source_id.clone());
+                continue;
+            }
+            if self.remove_expired
+                && should_expire(
+                    marker,
+                    self.autosync_delete_after_days,
+                    self.now_unix,
+                    &self.last_played_by_id,
+                )
+            {
+                expired.push(marker.source_id.clone());
+                continue;
+            }
+            if self.remove_selection
+                && !self.sync_all_installed
+                && marker.source_flags & SOURCE_INSTALLED != 0
+                && !self.selected_source_ids.contains(&normalized_source_id)
+            {
+                selection.push(marker.source_id.clone());
+            }
+        }
+
+        if replacements > 0 {
+            let already_marked: std::collections::BTreeSet<_> = uninstalled
+                .iter()
+                .chain(expired.iter())
+                .chain(selection.iter())
+                .cloned()
+                .collect();
+            let mut remaining = replacements;
+            for marker in &self.inventory {
+                if remaining == 0 {
+                    break;
+                }
+                if marker.attached
+                    && !self
+                        .selected_source_ids
+                        .contains(&marker.source_id.to_ascii_lowercase())
+                    && !already_marked.contains(&marker.source_id)
+                {
+                    selection.push(marker.source_id.clone());
+                    remaining -= 1;
+                }
+            }
+        }
+
+        self.remove_source_id_batches = uninstalled
+            .chunks(MAX_BATCH_ENTRIES)
+            .map(<[String]>::to_vec)
+            .collect();
+        self.expire_source_id_batches = expired
+            .chunks(MAX_BATCH_ENTRIES)
+            .map(<[String]>::to_vec)
+            .collect();
+        self.selection_remove_source_id_batches = selection
+            .chunks(MAX_BATCH_ENTRIES)
+            .map(<[String]>::to_vec)
+            .collect();
+    }
+}
+
+fn should_expire(
+    marker: &InventoryEntry,
+    delete_after_days: u32,
+    now_unix: i64,
+    last_played_by_id: &std::collections::BTreeMap<String, i64>,
+) -> bool {
+    if delete_after_days == 0 {
+        return false;
+    }
+    let Some(added_at) = marker.added_at_unix else {
+        return false;
+    };
+    let Some(deadline) = i64::from(delete_after_days)
+        .checked_mul(SECONDS_PER_DAY)
+        .and_then(|age| added_at.checked_add(age))
+    else {
+        return false;
+    };
+    now_unix >= deadline
+        && last_played_by_id
+            .get(&marker.source_id.to_ascii_lowercase())
+            .is_none_or(|last_played| *last_played < added_at)
 }
 
 #[derive(Default)]
@@ -220,10 +502,24 @@ impl CatalogSync {
         if self.transaction.is_some() {
             return Err("catalog_sync_busy".into());
         }
-        let selected = select_games(snapshot, settings, now_unix);
-        let (entries, skipped) = prepare_entries(&selected)?;
+        let selected = select_game_sources(snapshot, settings, now_unix);
+        let (entries, skipped) = prepare_selected_entries(&selected)?;
         let remove_uninstalled = settings.auto_sync && settings.autosync_remove_uninstalled;
-        let remove_source_ids = if remove_uninstalled {
+        let remove_expired = settings.auto_sync && settings.autosync_delete_after_days > 0;
+        let remove_selection = settings.auto_sync;
+        let launchable_game_ids = entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry["source_id"].as_str())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let selected_source_ids = entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry["source_id"].as_str())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let uninstalled_game_ids = if remove_uninstalled {
             snapshot
                 .games
                 .iter()
@@ -232,21 +528,20 @@ impl CatalogSync {
                         && crate::snapshot::valid_playnite_id(&game.id)
                 })
                 .map(|game| game.id.to_ascii_lowercase())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
+                .collect()
         } else {
-            Vec::new()
+            Default::default()
         };
-        let remove_source_id_batches = remove_source_ids
-            .chunks(MAX_BATCH_ENTRIES)
-            .map(<[String]>::to_vec)
-            .collect();
-        let launchable_game_ids = entries
+        let last_played_by_id = snapshot
+            .games
             .iter()
-            .flatten()
-            .filter_map(|entry| entry["source_id"].as_str())
-            .map(str::to_ascii_lowercase)
+            .filter(|game| game.is_installed() == Some(true))
+            .filter_map(|game| {
+                crate::snapshot::valid_playnite_id(&game.id)
+                    .then(|| crate::snapshot::parse_iso8601_unix(&game.last_played))
+                    .flatten()
+                    .map(|played| (game.id.to_ascii_lowercase(), played))
+            })
             .collect();
         self.skipped_launches = skipped;
         self.source_revision = self
@@ -259,13 +554,29 @@ impl CatalogSync {
             settings_epoch,
             launchable_game_ids,
             entries,
-            remove_source_id_batches,
+            remove_source_id_batches: Vec::new(),
+            expire_source_id_batches: Vec::new(),
+            selection_remove_source_id_batches: Vec::new(),
             remove_uninstalled,
+            remove_expired,
+            remove_selection,
+            autosync_delete_after_days: settings.autosync_delete_after_days,
+            autosync_require_replacement: settings.autosync_require_replacement,
+            sync_all_installed: settings.sync_all_installed,
+            recent_mode: settings.recent_games > 0,
+            now_unix,
+            uninstalled_game_ids,
+            last_played_by_id,
+            selected_source_ids,
+            inventory: Vec::new(),
+            inventory_total_count: None,
+            inventory_after: None,
+            collection_revision: None,
             generation: None,
             revision: None,
             sequence: 0,
             batch_index: 0,
-            stage: Stage::Begin,
+            stage: Stage::Inventory,
             call: Call::Submit {
                 operation_id: String::new(),
             },
@@ -394,11 +705,24 @@ impl CatalogSync {
     }
 }
 
+#[cfg(test)]
 fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
+    let selected: Vec<_> = games
+        .iter()
+        .cloned()
+        .map(|game| SelectedGame {
+            game,
+            source_flags: 0,
+        })
+        .collect();
+    prepare_selected_entries(&selected)
+}
+
+fn prepare_selected_entries(games: &[SelectedGame]) -> Result<(Vec<Vec<Value>>, u64), String> {
     let mut prepared = Vec::new();
     let mut skipped = 0u64;
-    for game in games {
-        let Some(value) = provider_entry(game) else {
+    for selected in games {
+        let Some(value) = provider_entry_with_flags(&selected.game, selected.source_flags) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
@@ -438,7 +762,12 @@ fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
     Ok((batches, skipped))
 }
 
+#[cfg(test)]
 fn provider_entry(game: &Game) -> Option<Value> {
+    provider_entry_with_flags(game, 0)
+}
+
+fn provider_entry_with_flags(game: &Game, source_flags: u32) -> Option<Value> {
     if !crate::snapshot::valid_playnite_id(&game.id)
         || game.name.trim().is_empty()
         || game.name.len() > 160
@@ -449,7 +778,8 @@ fn provider_entry(game: &Game) -> Option<Value> {
     let launch = playnite_launch(game)?;
     Some(json!({
         "source_id":game.id.to_ascii_lowercase(),
-        "entry":{"name":game.name,"description":"","tags":[],"launch":launch}
+        "entry":{"name":game.name,"description":"","tags":[],"launch":launch},
+        "source_flags":source_flags
     }))
 }
 
@@ -484,6 +814,37 @@ mod tests {
             installed: Some(true),
             is_installed: None,
         }
+    }
+
+    fn inventory_entry(
+        source_id: &str,
+        added_at_unix: Option<i64>,
+        source_flags: u32,
+        attached: bool,
+    ) -> InventoryEntry {
+        InventoryEntry {
+            source_id: source_id.into(),
+            added_at_unix,
+            source_flags,
+            attached,
+        }
+    }
+
+    fn finish_inventory(
+        transaction: &mut Transaction,
+        entries: Vec<InventoryEntry>,
+        revision: u64,
+    ) {
+        let total_count = entries.len();
+        transaction
+            .consume_inventory_page(json!({
+                "ok":true,
+                "collection_revision":revision,
+                "total_count":total_count,
+                "entries":entries,
+                "next_after":null
+            }))
+            .unwrap();
     }
 
     #[test]
@@ -551,7 +912,10 @@ mod tests {
         )
         .unwrap();
         let transaction = sync.transaction.as_ref().unwrap();
-        assert_eq!(transaction.payload()["action"], "provider_snapshot_begin");
+        assert_eq!(
+            transaction.payload()["action"],
+            "provider_snapshot_inventory"
+        );
         let mut transaction = sync.transaction.take().unwrap();
         transaction.stage = Stage::Finish;
         transaction.generation = Some(1);
@@ -559,6 +923,8 @@ mod tests {
         assert_eq!(transaction.payload()["remove_stale"], false);
         assert_eq!(transaction.payload()["complete"], true);
         assert_eq!(transaction.payload()["remove_uninstalled"], true);
+        assert_eq!(transaction.payload()["remove_expired"], true);
+        assert_eq!(transaction.payload()["remove_selection"], true);
         assert!(transaction.remove_source_id_batches.is_empty());
     }
 
@@ -599,6 +965,17 @@ mod tests {
         let transaction = sync.transaction.as_mut().unwrap();
         assert!(transaction.remove_uninstalled);
         assert_eq!(transaction.entries.len(), 1);
+        let inventory = (0..9)
+            .map(|index| {
+                inventory_entry(
+                    &format!("{index:08x}-1234-5678-9abc-0123456789ab"),
+                    None,
+                    0,
+                    true,
+                )
+            })
+            .collect();
+        finish_inventory(transaction, inventory, 4);
         assert_eq!(transaction.remove_source_id_batches.len(), 2);
         assert_eq!(
             transaction.remove_source_id_batches[0].len(),
@@ -641,9 +1018,267 @@ mod tests {
         manual_refresh
             .start(&snapshot, &manual_settings, 2, 0)
             .unwrap();
-        let manual_transaction = manual_refresh.transaction.as_ref().unwrap();
+        let manual_transaction = manual_refresh.transaction.as_mut().unwrap();
+        let inventory = (0..9)
+            .map(|index| {
+                inventory_entry(
+                    &format!("{index:08x}-1234-5678-9abc-0123456789ab"),
+                    None,
+                    0,
+                    true,
+                )
+            })
+            .collect();
+        finish_inventory(manual_transaction, inventory, 4);
         assert!(!manual_transaction.remove_uninstalled);
         assert!(manual_transaction.remove_source_id_batches.is_empty());
+    }
+
+    #[test]
+    fn ttl_cleanup_needs_a_trusted_timestamp_and_no_play_after_import() {
+        let old_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let played_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let unknown_id = "c1b2c3d4-1234-5678-9abc-0123456789ab";
+        let future_id = "d1b2c3d4-1234-5678-9abc-0123456789ab";
+        let now = crate::snapshot::parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap();
+        let snapshot = Snapshot {
+            games: vec![
+                game(old_id, "Old", ""),
+                Game {
+                    last_played: "2026-09-20T00:00:00Z".into(),
+                    ..game(played_id, "Played since import", "")
+                },
+                game(unknown_id, "Unknown timestamp", ""),
+                game(future_id, "Future import", ""),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            autosync_require_replacement: false,
+            ..ProductSettings::default()
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot, &settings, 1, now).unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        finish_inventory(
+            transaction,
+            vec![
+                inventory_entry(old_id, Some(now - 15 * SECONDS_PER_DAY), 0, true),
+                inventory_entry(played_id, Some(now - 20 * SECONDS_PER_DAY), 0, true),
+                inventory_entry(unknown_id, None, 0, true),
+                inventory_entry(future_id, Some(now + SECONDS_PER_DAY), 0, true),
+            ],
+            3,
+        );
+        assert_eq!(transaction.expire_source_id_batches.concat(), vec![old_id]);
+        assert!(transaction.remove_source_id_batches.is_empty());
+        assert!(transaction.selection_remove_source_id_batches.is_empty());
+
+        for settings in [
+            ProductSettings {
+                autosync_delete_after_days: 0,
+                autosync_require_replacement: false,
+                ..ProductSettings::default()
+            },
+            ProductSettings {
+                auto_sync: false,
+                autosync_require_replacement: false,
+                ..ProductSettings::default()
+            },
+        ] {
+            let mut sync = CatalogSync::default();
+            sync.start(&snapshot, &settings, 2, now).unwrap();
+            let transaction = sync.transaction.as_mut().unwrap();
+            finish_inventory(
+                transaction,
+                vec![inventory_entry(
+                    old_id,
+                    Some(now - 15 * SECONDS_PER_DAY),
+                    0,
+                    true,
+                )],
+                4,
+            );
+            assert!(transaction.expire_source_id_batches.is_empty());
+        }
+    }
+
+    #[test]
+    fn replacement_policy_only_removes_attached_unselected_rows_when_required() {
+        let selected_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let previous_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let now = crate::snapshot::parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap();
+        let snapshot = Snapshot {
+            games: vec![Game {
+                last_played: "2026-09-23T00:00:00Z".into(),
+                ..game(selected_id, "New recent", "")
+            }],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let inventory = vec![inventory_entry(
+            previous_id,
+            Some(now - SECONDS_PER_DAY),
+            crate::snapshot::SOURCE_RECENT,
+            true,
+        )];
+
+        let mut required = CatalogSync::default();
+        required
+            .start(
+                &snapshot,
+                &ProductSettings {
+                    autosync_require_replacement: true,
+                    ..ProductSettings::default()
+                },
+                1,
+                now,
+            )
+            .unwrap();
+        let transaction = required.transaction.as_mut().unwrap();
+        finish_inventory(transaction, inventory.clone(), 5);
+        assert_eq!(
+            transaction.selection_remove_source_id_batches.concat(),
+            vec![previous_id]
+        );
+
+        let mut optional = CatalogSync::default();
+        optional
+            .start(
+                &snapshot,
+                &ProductSettings {
+                    autosync_require_replacement: false,
+                    ..ProductSettings::default()
+                },
+                2,
+                now,
+            )
+            .unwrap();
+        let transaction = optional.transaction.as_mut().unwrap();
+        finish_inventory(transaction, inventory, 5);
+        assert!(transaction.selection_remove_source_id_batches.is_empty());
+
+        let installed_inventory = vec![inventory_entry(
+            previous_id,
+            Some(now - SECONDS_PER_DAY),
+            SOURCE_INSTALLED,
+            true,
+        )];
+        let mut installed_source = CatalogSync::default();
+        installed_source
+            .start(
+                &snapshot,
+                &ProductSettings {
+                    autosync_require_replacement: false,
+                    sync_all_installed: false,
+                    ..ProductSettings::default()
+                },
+                3,
+                now,
+            )
+            .unwrap();
+        let transaction = installed_source.transaction.as_mut().unwrap();
+        finish_inventory(transaction, installed_inventory, 5);
+        assert_eq!(
+            transaction.selection_remove_source_id_batches.concat(),
+            vec![previous_id]
+        );
+    }
+
+    #[test]
+    fn inventory_revision_drift_restarts_before_snapshot_begin() {
+        let mut sync = CatalogSync::default();
+        sync.start(
+            &Snapshot {
+                games: Vec::new(),
+                categories: Vec::new(),
+                plugins: Vec::new(),
+            },
+            &ProductSettings::default(),
+            1,
+            0,
+        )
+        .unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        assert_eq!(
+            transaction.payload()["action"],
+            "provider_snapshot_inventory"
+        );
+        let first_page: Vec<_> = (0..INVENTORY_PAGE_SIZE)
+            .map(|index| {
+                inventory_entry(
+                    &format!("{index:08x}-1234-5678-9abc-0123456789ab"),
+                    None,
+                    0,
+                    true,
+                )
+            })
+            .collect();
+        let last_source_id = "0000001f-1234-5678-9abc-0123456789ab";
+        assert!(
+            transaction
+                .consume_inventory_page(json!({
+                    "ok":true,
+                    "collection_revision":5,
+                    "total_count":33,
+                    "entries":first_page,
+                    "next_after":last_source_id
+                }))
+                .is_ok()
+        );
+        assert_eq!(transaction.payload()["expected_collection_revision"], 5);
+        assert_eq!(transaction.payload()["after"], last_source_id);
+
+        assert!(
+            !transaction
+                .consume(json!({
+                    "ok":false,
+                    "error":{"code":"revision_conflict","message":"changed"}
+                }))
+                .unwrap()
+        );
+        assert_eq!(transaction.stage, Stage::Inventory);
+        assert!(transaction.inventory.is_empty());
+        assert!(transaction.collection_revision.is_none());
+        assert!(transaction.inventory_after.is_none());
+        assert_eq!(transaction.conflicts, 1);
+        assert_eq!(
+            transaction.payload()["expected_collection_revision"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn truncated_inventory_cannot_advance_to_begin() {
+        let mut sync = CatalogSync::default();
+        sync.start(
+            &Snapshot {
+                games: Vec::new(),
+                categories: Vec::new(),
+                plugins: Vec::new(),
+            },
+            &ProductSettings::default(),
+            1,
+            0,
+        )
+        .unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        assert!(
+            transaction
+                .consume_inventory_page(json!({
+                    "ok":true,
+                    "collection_revision":5,
+                    "total_count":2,
+                    "entries":[inventory_entry("a1b2c3d4-1234-5678-9abc-0123456789ab",None,0,true)],
+                    "next_after":null
+                }))
+                .is_err()
+        );
+        assert_eq!(transaction.stage, Stage::Inventory);
+        assert!(transaction.remove_source_id_batches.is_empty());
+        assert!(transaction.expire_source_id_batches.is_empty());
+        assert!(transaction.selection_remove_source_id_batches.is_empty());
     }
 
     #[test]
@@ -679,7 +1314,9 @@ mod tests {
                 "complete":true,
                 "cleanup_pending":false,
                 "remove_stale":false,
-                "remove_uninstalled":true
+                "remove_uninstalled":true,
+                "remove_expired":true,
+                "remove_selection":true
             }),
         );
         assert_eq!(

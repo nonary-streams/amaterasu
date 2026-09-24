@@ -1,10 +1,12 @@
 use super::*;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CleanupPolicy {
     remove_stale: bool,
     remove_uninstalled: bool,
+    remove_expired: bool,
+    remove_selection: bool,
 }
 
 #[derive(Default)]
@@ -188,6 +190,32 @@ fn snapshot_begin(sync_id: &str, source_revision: u64) -> Value {
     })
 }
 
+fn snapshot_begin_at(
+    sync_id: &str,
+    source_revision: u64,
+    expected_collection_revision: u64,
+) -> Value {
+    json!({
+        "action":"provider_snapshot_begin",
+        "sync_id":sync_id,
+        "source_revision":source_revision,
+        "expected_collection_revision":expected_collection_revision,
+    })
+}
+
+fn snapshot_inventory(
+    after: Option<&str>,
+    expected_collection_revision: Option<u64>,
+    limit: usize,
+) -> Value {
+    json!({
+        "action":"provider_snapshot_inventory",
+        "after":after,
+        "expected_collection_revision":expected_collection_revision,
+        "limit":limit,
+    })
+}
+
 fn snapshot_batch(
     sync_id: &str,
     generation: u64,
@@ -216,6 +244,30 @@ fn snapshot_batch_with_removals(
     items: Vec<(&str, Value)>,
     remove_source_ids: Vec<&str>,
 ) -> Value {
+    snapshot_batch_with_intents(
+        sync_id,
+        generation,
+        source_revision,
+        sequence,
+        expected_revision,
+        items,
+        (remove_source_ids, Vec::new(), Vec::new()),
+    )
+}
+
+fn snapshot_batch_with_intents(
+    sync_id: &str,
+    generation: u64,
+    source_revision: u64,
+    sequence: u64,
+    expected_revision: u64,
+    items: Vec<(&str, Value)>,
+    (remove_source_ids, expire_source_ids, selection_remove_source_ids): (
+        Vec<&str>,
+        Vec<&str>,
+        Vec<&str>,
+    ),
+) -> Value {
     json!({
         "action":"provider_snapshot_batch",
         "sync_id":sync_id,
@@ -225,6 +277,8 @@ fn snapshot_batch_with_removals(
         "expected_revision":expected_revision,
         "entries":items.into_iter().map(|(source_id,entry)| json!({"source_id":source_id,"entry":entry})).collect::<Vec<_>>(),
         "remove_source_ids":remove_source_ids,
+        "expire_source_ids":expire_source_ids,
+        "selection_remove_source_ids":selection_remove_source_ids,
     })
 }
 
@@ -266,6 +320,7 @@ fn snapshot_finish_policy(
         CleanupPolicy {
             remove_stale,
             remove_uninstalled: false,
+            ..CleanupPolicy::default()
         },
     )
 }
@@ -289,6 +344,8 @@ fn snapshot_finish_with_policies(
         "complete":complete,
         "remove_stale":cleanup_policy.remove_stale,
         "remove_uninstalled":cleanup_policy.remove_uninstalled,
+        "remove_expired":cleanup_policy.remove_expired,
+        "remove_selection":cleanup_policy.remove_selection,
     })
 }
 
@@ -375,9 +432,19 @@ fn update_provider_overrides(id: &str, expected_revision: u64, fec_percentage: V
 fn old_provider_snapshot_state_defaults_to_legacy_cleanup_policy() {
     let mut value = serde_json::to_value(SnapshotState::initial()).unwrap();
     value.as_object_mut().unwrap().remove("finish_remove_stale");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("finish_remove_expired");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("finish_remove_selection");
     let restored: SnapshotState = serde_json::from_value(value).unwrap();
     assert!(restored.finish_remove_stale);
     assert!(!restored.finish_remove_uninstalled);
+    assert!(!restored.finish_remove_expired);
+    assert!(!restored.finish_remove_selection);
 }
 
 #[test]
@@ -394,6 +461,9 @@ fn old_provider_markers_default_to_no_uninstalled_tombstone() {
     .unwrap();
 
     assert_eq!(marker.remove_generation, None);
+    assert_eq!(marker.added_at_unix, None);
+    assert_eq!(marker.source_flags, 0);
+    assert_eq!(marker.remove_reason, None);
     assert!(marker.config_overrides.validate().is_ok());
 }
 
@@ -414,6 +484,8 @@ fn snapshot_finish_policy_is_boolean_and_defaults_to_legacy_removal() {
         Operation::ProviderSnapshotFinish {
             remove_stale: true,
             remove_uninstalled: false,
+            remove_expired: false,
+            remove_selection: false,
             ..
         }
     ));
@@ -436,6 +508,20 @@ fn snapshot_finish_policy_is_boolean_and_defaults_to_legacy_removal() {
         Operation::ProviderSnapshotFinish {
             remove_stale: false,
             remove_uninstalled: true,
+            remove_expired: false,
+            remove_selection: false,
+            ..
+        }
+    ));
+
+    request["remove_expired"] = json!(true);
+    request["remove_selection"] = json!(true);
+    assert!(matches!(
+        serde_json::from_value::<Operation>(request.clone()).unwrap(),
+        Operation::ProviderSnapshotFinish {
+            remove_uninstalled: true,
+            remove_expired: true,
+            remove_selection: true,
             ..
         }
     ));
@@ -1259,6 +1345,356 @@ fn provider_uninstalled_tombstones_are_authorized_bounded_and_unique() {
 }
 
 #[test]
+fn provider_inventory_is_fixed_owner_paginated_and_collection_revision_bound() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let imported = import_playnite_entries(
+        &mut backend,
+        &mut playnite,
+        "inventory-seed",
+        1,
+        0,
+        vec![("playnite:10", "First"), ("playnite:11", "Second")],
+    );
+    assert_eq!(imported["ok"], true);
+
+    let mut steam = steam_importer();
+    let steam_begin = backend.run_for(
+        &mut steam,
+        snapshot_begin("inventory-steam", 1),
+        "steam",
+        "management",
+        "management",
+    );
+    let steam_batch = backend.run_for(
+        &mut steam,
+        snapshot_batch(
+            "inventory-steam",
+            steam_begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            1,
+            vec![("steam:42", entry("Steam row"))],
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(steam_batch["ok"], true);
+    let steam_finish = backend.run_for(
+        &mut steam,
+        snapshot_finish(
+            "inventory-steam",
+            steam_begin["generation"].as_u64().unwrap(),
+            1,
+            steam_batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "steam",
+        "management",
+        "management",
+    );
+    assert_eq!(steam_finish["ok"], true);
+
+    let denied = backend.run_for(
+        &mut playnite,
+        snapshot_inventory(None, None, 1),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let mut retargeted = snapshot_inventory(None, None, 1);
+    retargeted["owner"] = json!("principal/victim");
+    let rejected = backend.run_for(
+        &mut playnite,
+        retargeted,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(rejected["error"]["code"], "invalid_request");
+
+    let first = backend.run_for(
+        &mut playnite,
+        snapshot_inventory(None, None, 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["total_count"], 2);
+    assert_eq!(first["entries"][0]["source_id"], "playnite:10");
+    assert_eq!(first["entries"][0]["attached"], true);
+    assert!(first["entries"][0]["added_at_unix"].as_i64().unwrap() > 0);
+    assert!(first["next_after"].is_string());
+    let collection_revision = first["collection_revision"].as_u64().unwrap();
+
+    let second = backend.run_for(
+        &mut playnite,
+        snapshot_inventory(first["next_after"].as_str(), Some(collection_revision), 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["entries"][0]["source_id"], "playnite:11");
+    assert!(second["next_after"].is_null());
+
+    let manual = backend.run_for(
+        &mut Pipeline::default(),
+        json!({
+            "action":"create",
+            "expected_revision":2,
+            "entry":{"name":"Manual","launch":{"kind":"application","path":"/Applications/Manual.app"}}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true);
+
+    let stale_page = backend.run_for(
+        &mut playnite,
+        snapshot_inventory(first["next_after"].as_str(), Some(collection_revision), 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(stale_page["error"]["code"], "revision_conflict");
+    assert!(
+        stale_page["error"]["current_collection_revision"]
+            .as_u64()
+            .unwrap()
+            > collection_revision
+    );
+
+    let stale_begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin_at("stale-inventory", 2, collection_revision),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(stale_begin["error"]["code"], "revision_conflict");
+}
+
+#[test]
+fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let mut begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("marker-time-1", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let mut batch = snapshot_batch(
+        "marker-time-1",
+        generation,
+        1,
+        0,
+        0,
+        vec![("playnite:10", playnite_entry("Persistent metadata"))],
+    );
+    batch["entries"][0]["source_flags"] = json!(8);
+    let imported = backend.run_for(
+        &mut playnite,
+        batch,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(imported["ok"], true);
+    let first_marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
+    let first_marker = backend.entries[first_marker_key].clone();
+    let first_added_at = first_marker["added_at_unix"].as_i64().unwrap();
+    assert_eq!(first_marker["source_flags"], 8);
+
+    begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("marker-time-2", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    // Simulate an older importer that does not yet send source_flags.
+    let refresh = backend.run_for(
+        &mut playnite,
+        snapshot_batch(
+            "marker-time-2",
+            generation,
+            2,
+            0,
+            1,
+            vec![("playnite:10", playnite_entry("Persistent metadata"))],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(refresh["ok"], true);
+    let refreshed_marker = &backend.entries[first_marker_key];
+    assert_eq!(refreshed_marker["added_at_unix"], first_added_at);
+    assert_eq!(refreshed_marker["source_flags"], 8);
+}
+
+#[test]
+fn provider_removal_reasons_are_gated_and_bound_to_finish_replay() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let imported = import_playnite_entries(
+        &mut backend,
+        &mut playnite,
+        "cleanup-seed",
+        1,
+        0,
+        vec![
+            ("playnite:10", "Uninstalled"),
+            ("playnite:11", "Expired"),
+            ("playnite:12", "Selection"),
+        ],
+    );
+    assert_eq!(imported["ok"], true);
+    let uninstalled_marker = "~provider.entry:amaterasu.playnite:playnite:10";
+    let expired_marker = "~provider.entry:amaterasu.playnite:playnite:11";
+    let selection_marker = "~provider.entry:amaterasu.playnite:playnite:12";
+    backend.entries.get_mut(uninstalled_marker).unwrap()["source_flags"] = json!(8);
+    backend.entries.get_mut(expired_marker).unwrap()["source_flags"] = json!(1);
+    backend.entries.get_mut(selection_marker).unwrap()["source_flags"] = json!(8);
+    backend.entries.get_mut(expired_marker).unwrap()["added_at_unix"] = json!(1_700_000_000);
+    backend.revision += 1;
+
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("cleanup-policy", 2),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_intents(
+            "cleanup-policy",
+            generation,
+            2,
+            0,
+            1,
+            Vec::new(),
+            (
+                vec!["playnite:10"],
+                vec!["playnite:11"],
+                vec!["playnite:12"],
+            ),
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+
+    let finish = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "cleanup-policy",
+            generation,
+            2,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: true,
+                remove_expired: true,
+                remove_selection: false,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    assert!(!backend.entries.contains_key("app-0000000000000001"));
+    assert!(!backend.entries.contains_key("app-0000000000000002"));
+    assert!(backend.entries.contains_key("app-0000000000000003"));
+    assert!(backend.entries.contains_key(selection_marker));
+
+    let flipped_retry = backend.run_for(
+        &mut playnite,
+        snapshot_finish_with_policies(
+            "cleanup-policy",
+            generation,
+            2,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+            CleanupPolicy {
+                remove_stale: false,
+                remove_uninstalled: true,
+                remove_expired: true,
+                remove_selection: true,
+            },
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(flipped_retry["error"]["code"], "snapshot_conflict");
+}
+
+#[test]
+fn provider_batches_reject_cross_reason_duplicates_and_malformed_lists() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("invalid-intents", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let duplicate = backend.run_for(
+        &mut playnite,
+        snapshot_batch_with_intents(
+            "invalid-intents",
+            generation,
+            1,
+            0,
+            0,
+            Vec::new(),
+            (Vec::new(), vec!["playnite:10"], vec!["playnite:10"]),
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(duplicate["error"]["code"], "invalid_request");
+
+    let mut malformed = snapshot_batch("invalid-intents", generation, 1, 0, 0, Vec::new());
+    malformed["expire_source_ids"] = json!("playnite:10");
+    let malformed = backend.run_for(
+        &mut playnite,
+        malformed,
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(malformed["error"]["code"], "invalid_request");
+    assert_eq!(
+        backend.entries.len(),
+        1,
+        "only provider state was committed"
+    );
+}
+
+#[test]
 fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows() {
     let mut backend = Backend::default();
     let mut playnite = playnite_importer();
@@ -1319,6 +1755,7 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: false,
+                ..CleanupPolicy::default()
             },
         ),
         "steam",
@@ -1382,6 +1819,7 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: false,
+                ..CleanupPolicy::default()
             },
         ),
         "amaterasu.playnite",
@@ -1436,6 +1874,7 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: true,
+                ..CleanupPolicy::default()
             },
         ),
         "amaterasu.playnite",
@@ -1455,6 +1894,7 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
         CleanupPolicy {
             remove_stale: false,
             remove_uninstalled: true,
+            ..CleanupPolicy::default()
         },
     );
     backend.lose_commit_ack_once = true;
@@ -1503,6 +1943,7 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: false,
+                ..CleanupPolicy::default()
             },
         ),
         "amaterasu.playnite",
@@ -1580,6 +2021,7 @@ fn playnite_tombstone_cleanup_conflict_does_not_delete_an_entry() {
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: true,
+                ..CleanupPolicy::default()
             },
         ),
         "amaterasu.playnite",
@@ -1643,6 +2085,7 @@ fn empty_or_rejected_playnite_snapshot_has_no_cleanup_effect() {
             CleanupPolicy {
                 remove_stale: false,
                 remove_uninstalled: true,
+                ..CleanupPolicy::default()
             },
         ),
         "amaterasu.playnite",
@@ -2032,6 +2475,9 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
         config_overrides: ConfigOverrides::default(),
         detached: false,
         remove_generation: None,
+        added_at_unix: Some(1_700_000_000),
+        source_flags: 8,
+        remove_reason: None,
     };
     let playnite_state = SnapshotState {
         version: 1,
@@ -2045,6 +2491,8 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
         finish_expected_revision: Some(1),
         finish_remove_stale: true,
         finish_remove_uninstalled: false,
+        finish_remove_expired: false,
+        finish_remove_selection: false,
     };
     let mut backend = Backend {
         revision: 1,

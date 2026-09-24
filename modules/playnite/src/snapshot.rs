@@ -6,6 +6,16 @@ pub const MAX_GAMES: usize = 50_000;
 pub const MAX_CATEGORIES: usize = 4_096;
 pub const MAX_PLUGINS: usize = 4_096;
 pub const MAX_LINE_BYTES: usize = 1_048_576;
+pub const SOURCE_RECENT: u32 = 1 << 0;
+pub const SOURCE_CATEGORY: u32 = 1 << 1;
+pub const SOURCE_PLUGIN: u32 = 1 << 2;
+pub const SOURCE_INSTALLED: u32 = 1 << 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedGame {
+    pub game: Game,
+    pub source_flags: u32,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Game {
@@ -242,7 +252,19 @@ impl SnapshotAssembler {
     }
 }
 
+#[cfg(test)]
 pub fn select_games(snapshot: &Snapshot, settings: &ProductSettings, now_unix: i64) -> Vec<Game> {
+    select_game_sources(snapshot, settings, now_unix)
+        .into_iter()
+        .map(|selected| selected.game)
+        .collect()
+}
+
+pub fn select_game_sources(
+    snapshot: &Snapshot,
+    settings: &ProductSettings,
+    now_unix: i64,
+) -> Vec<SelectedGame> {
     let mut installed: Vec<&Game> = snapshot
         .games
         .iter()
@@ -255,7 +277,7 @@ pub fn select_games(snapshot: &Snapshot, settings: &ProductSettings, now_unix: i
     let included_plugins = lower_set(&settings.sync_plugins);
     let excluded_plugins = lower_set(&settings.exclude_plugins);
     let excluded_games = lower_set(&settings.exclude_games);
-    let mut selected = BTreeMap::<String, &Game>::new();
+    let mut selected = BTreeMap::<String, (&Game, u32)>::new();
 
     if settings.recent_games > 0 {
         let cutoff = i64::from(settings.recent_max_age_days)
@@ -278,7 +300,10 @@ pub fn select_games(snapshot: &Snapshot, settings: &ProductSettings, now_unix: i
             {
                 continue;
             }
-            selected.insert(game.id.to_lowercase(), game);
+            selected
+                .entry(game.id.to_lowercase())
+                .and_modify(|(_, source_flags)| *source_flags |= SOURCE_RECENT)
+                .or_insert((game, SOURCE_RECENT));
             recent_count += 1;
             if recent_count == settings.recent_games as usize {
                 break;
@@ -295,18 +320,35 @@ pub fn select_games(snapshot: &Snapshot, settings: &ProductSettings, now_unix: i
         ) {
             continue;
         }
-        if settings.sync_all_installed
-            || game
-                .categories
-                .iter()
-                .any(|category| included_categories.contains(&category.to_lowercase()))
-            || included_plugins.contains(&game.plugin_id.to_lowercase())
+        let mut source_flags = 0;
+        if settings.sync_all_installed {
+            source_flags |= SOURCE_INSTALLED;
+        }
+        if game
+            .categories
+            .iter()
+            .any(|category| included_categories.contains(&category.to_lowercase()))
         {
-            selected.insert(game.id.to_lowercase(), game);
+            source_flags |= SOURCE_CATEGORY;
+        }
+        if included_plugins.contains(&game.plugin_id.to_lowercase()) {
+            source_flags |= SOURCE_PLUGIN;
+        }
+        if source_flags != 0 {
+            selected
+                .entry(game.id.to_lowercase())
+                .and_modify(|(_, selected_flags)| *selected_flags |= source_flags)
+                .or_insert((game, source_flags));
         }
     }
 
-    selected.into_values().cloned().collect()
+    selected
+        .into_values()
+        .map(|(game, source_flags)| SelectedGame {
+            game: game.clone(),
+            source_flags,
+        })
+        .collect()
 }
 
 fn is_excluded(
@@ -536,6 +578,52 @@ mod tests {
         );
         let ids: BTreeSet<_> = selected.iter().map(|game| game.id.as_str()).collect();
         assert_eq!(ids, BTreeSet::from(["category", "plugin", "recent"]));
+    }
+
+    #[test]
+    fn selected_games_retain_reference_source_membership_bits() {
+        let snapshot = Snapshot {
+            games: vec![
+                game("all", &["Arcade"], "p1", "2026-09-23T00:00:00Z"),
+                game("recent", &[], "p2", "2026-09-22T00:00:00Z"),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            sync_categories: vec!["arcade".into()],
+            sync_plugins: vec!["p1".into()],
+            ..ProductSettings::default()
+        };
+        let selected = select_game_sources(
+            &snapshot,
+            &settings,
+            parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap(),
+        );
+        let flags: std::collections::BTreeMap<_, _> = selected
+            .iter()
+            .map(|item| (item.game.id.as_str(), item.source_flags))
+            .collect();
+        assert_eq!(
+            flags.get("all"),
+            Some(&(SOURCE_RECENT | SOURCE_CATEGORY | SOURCE_PLUGIN))
+        );
+        assert_eq!(flags.get("recent"), Some(&SOURCE_RECENT));
+
+        let installed = select_game_sources(
+            &snapshot,
+            &ProductSettings {
+                recent_games: 0,
+                sync_all_installed: true,
+                ..ProductSettings::default()
+            },
+            0,
+        );
+        assert!(
+            installed
+                .iter()
+                .all(|item| item.source_flags == SOURCE_INSTALLED)
+        );
     }
 
     #[test]

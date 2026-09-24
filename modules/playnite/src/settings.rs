@@ -18,6 +18,10 @@ pub struct ProductSettings {
     pub sync_all_installed: bool,
     #[serde(default = "default_autosync_remove_uninstalled")]
     pub autosync_remove_uninstalled: bool,
+    #[serde(default = "default_autosync_delete_after_days")]
+    pub autosync_delete_after_days: u32,
+    #[serde(default = "default_autosync_require_replacement")]
+    pub autosync_require_replacement: bool,
     #[serde(default = "default_recent_games")]
     pub recent_games: u32,
     #[serde(default = "default_recent_max_age_days")]
@@ -46,6 +50,14 @@ fn default_autosync_remove_uninstalled() -> bool {
     true
 }
 
+fn default_autosync_delete_after_days() -> u32 {
+    14
+}
+
+fn default_autosync_require_replacement() -> bool {
+    true
+}
+
 fn default_recent_games() -> u32 {
     10
 }
@@ -61,6 +73,8 @@ impl Default for ProductSettings {
             auto_sync: default_auto_sync(),
             sync_all_installed: false,
             autosync_remove_uninstalled: default_autosync_remove_uninstalled(),
+            autosync_delete_after_days: default_autosync_delete_after_days(),
+            autosync_require_replacement: default_autosync_require_replacement(),
             recent_games: default_recent_games(),
             recent_max_age_days: default_recent_max_age_days(),
             sync_categories: Vec::new(),
@@ -74,8 +88,11 @@ impl Default for ProductSettings {
 
 impl ProductSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.recent_games > 10_000 || self.recent_max_age_days > 36_500 {
-            return Err("Playnite recent filters exceed their supported bounds");
+        if self.recent_games > 10_000
+            || self.recent_max_age_days > 36_500
+            || self.autosync_delete_after_days > i32::MAX as u32
+        {
+            return Err("Playnite recent or cleanup settings exceed their supported bounds");
         }
         validate_filter_values(&self.sync_categories, "category")?;
         validate_filter_values(&self.exclude_categories, "category")?;
@@ -188,6 +205,8 @@ mod tests {
         assert!(settings.autosync_remove_uninstalled);
         assert_eq!(settings.recent_games, 10);
         assert_eq!(settings.recent_max_age_days, 30);
+        assert_eq!(settings.autosync_delete_after_days, 14);
+        assert!(settings.autosync_require_replacement);
     }
 
     #[test]
@@ -210,15 +229,31 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("autosync_remove_uninstalled");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("autosync_delete_after_days");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("autosync_require_replacement");
         assert!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":true,"version":1,"revision":6,
-                "values":legacy_values
+                "values":legacy_values.clone()
             }))
             .unwrap()
             .0
             .autosync_remove_uninstalled
         );
+        let old_settings = ProductSettings::from_product_document(&json!({
+            "ok":true,"found":true,"version":1,"revision":6,
+            "values":legacy_values
+        }))
+        .unwrap()
+        .0;
+        assert_eq!(old_settings.autosync_delete_after_days, 14);
+        assert!(old_settings.autosync_require_replacement);
         assert_eq!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":false,"version":null,"revision":0,"values":{}
@@ -243,6 +278,34 @@ mod tests {
         assert_eq!(
             settings.product_update_payload(3),
             json!({"action":"product_update","expected_revision":3,"version":1,"values":settings})
+        );
+    }
+
+    #[test]
+    fn ttl_bounds_match_the_nonnegative_host_integer_range() {
+        assert!(
+            ProductSettings {
+                autosync_delete_after_days: 0,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                autosync_delete_after_days: i32::MAX as u32,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                autosync_delete_after_days: i32::MAX as u32 + 1,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
         );
     }
 

@@ -248,10 +248,33 @@ Begin a source snapshot and retain the returned generation and catalog revision:
 {"ok":true,"revision":0,"generation":1,"next_sequence":0}
 ```
 
+Providers may first enumerate their existing ownership markers with
+`provider_snapshot_inventory`. The importer is fixed by the authenticated Poll
+caller, and the operation rejects any other principal. Request the first page
+with both `after` and `expected_collection_revision` null, then pass the returned
+revision and last `source_id` on each later page:
+
+```json
+{"action":"provider_snapshot_inventory","after":null,"expected_collection_revision":null,"limit":32}
+```
+
+The response includes `collection_revision`, `total_count`, sorted marker rows,
+and `next_after`. Every page is checked against that collection revision.
+Providers should require the final row count to match `total_count` before
+beginning cleanup and pass the same revision to `provider_snapshot_begin`;
+revision drift returns `revision_conflict`. Marker rows include the stable
+`source_id`, nullable trusted `added_at_unix`, provider `source_flags`, and
+`attached`, which is false after the entry was manually edited. Unknown import
+timestamps remain null so consumers can fail closed on age-based policies.
+
 Send batches with stable source IDs and validated catalog entries. Each batch
-contains 1–8 combined entries and removal IDs, at most 12,000 encoded bytes.
+contains 1–8 combined entries and removal intents, at most 12,000 encoded bytes.
 Source IDs cannot repeat or overlap within a batch or across batches in one
-generation. `expected_revision` is the public
+generation. A batch may carry explicit `remove_source_ids` (uninstalled),
+`expire_source_ids` (age policy), and `selection_remove_source_ids` (replacement
+or selection policy). An ID may have only one intent in a batch. These
+reason-tagged intents are accepted only from the fixed provider importer;
+generic catalog management cannot forge them. `expected_revision` is the public
 catalog revision returned by the previous batch; `sequence` must equal
 `next_sequence`:
 
@@ -279,24 +302,24 @@ set also detects edits by ordinary catalog clients; reload/retry after a
 
 Finish only after the provider has completed its full source scan. `remove_stale`
 is an optional boolean that defaults to `true` for existing clients. The separate
-`remove_uninstalled` flag defaults to `false` and enables cleanup for explicit
-tombstones:
+`remove_uninstalled`, `remove_expired`, and `remove_selection` flags default to
+`false` and enable cleanup for their matching reason-tagged intents:
 
 ```json
-{"action":"provider_snapshot_finish","sync_id":"playnite-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true,"remove_stale":false,"remove_uninstalled":true}
+{"action":"provider_snapshot_finish","sync_id":"playnite-scan-42","generation":1,"source_revision":42,"expected_revision":1,"next_sequence":1,"complete":true,"remove_stale":false,"remove_uninstalled":true,"remove_expired":true,"remove_selection":true}
 ```
 
 Success returns `ok`, `revision`, `generation`, `complete:true`,
-`cleanup_pending:false`, and both resolved cleanup policies. An incomplete scan
+`cleanup_pending:false`, and the resolved cleanup policies. An incomplete scan
 is rejected and never removes anything. When `remove_stale` is false, old
-provider markers and entries are retained for a later complete scan. When
-`remove_uninstalled` is true, only markers explicitly tombstoned in this
-generation are eligible for cleanup. Cleanup removes an entry only if it remains
-unchanged and attached to this provider; a detached or edited entry is retained
-and its marker is cleared. Other providers' and manual entries are unaffected.
-Both choices are persisted with the finished generation, so retries after an
-ambiguous timeout must repeat the same choices. Removal is committed in bounded
-chunks and can be reconciled by repeating that finish. Begin retries with the
+provider markers and entries are retained for a later complete scan. Each
+cleanup flag applies only to intents with that reason in this generation.
+Cleanup removes an entry only if it remains unchanged and attached to this
+provider; a detached or edited entry is retained and its marker is cleared.
+Other providers' and manual entries are unaffected. All cleanup choices are
+persisted with the finished generation, so retries after an ambiguous timeout
+must repeat the same choices. Removal is committed in bounded chunks and can be
+reconciled by repeating that finish. Begin retries with the
 same `sync_id` resume that generation; a new or restarted source scan must use a
 fresh ID so partial data from the old generation cannot be mistaken for a
 complete snapshot.
@@ -305,8 +328,9 @@ Playnite uses explicit `installed:false` records as tombstones only when both
 `auto_sync` and `autosync_remove_uninstalled` are enabled. A manual refresh with
 `auto_sync` disabled does not apply membership cleanup. Selection exclusions and
 missing IDs do not imply uninstallation, and are never tombstoned by the
-provider. TTL cleanup and replacement of stale recent-mode selections are
-separate product policies and are not implemented by this catalog contract.
+provider. Playnite age and replacement cleanup use the separate
+`expire_source_ids` and `selection_remove_source_ids` intents; imported markers
+without trusted timestamps are ineligible for age cleanup.
 
 The catalog API provides durable snapshot mechanics, not source discovery or
 product policy. Providers remain responsible for validating their domain data,

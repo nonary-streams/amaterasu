@@ -1,8 +1,8 @@
 use crate::STATE_SERVICE;
 use crate::model::{ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text};
 use crate::product::{
-    CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, STATE_PREFIX,
-    SnapshotState, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
+    CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, RemovalReason,
+    STATE_PREFIX, SnapshotState, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
     provider_entry_fingerprint, state_key, valid_source_id, valid_sync_id, validate_marker,
 };
 use crate::protocol::{
@@ -11,7 +11,7 @@ use crate::protocol::{
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_QUEUED: usize = 32;
 const PAGE_BYTES: usize = 12_000;
@@ -48,6 +48,10 @@ enum Stage {
     Paging(Scan),
     Saving(Value),
     ProviderLoading(Operation),
+    ProviderInventoryCheck {
+        operation: Operation,
+        session: ProviderSession,
+    },
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
     ProviderOverrideEntry(ProviderOverrideEntry),
@@ -105,6 +109,8 @@ struct ProviderBatch {
     fingerprint: String,
     entries: Vec<ProviderEntry>,
     remove_source_ids: Vec<String>,
+    expire_source_ids: Vec<String>,
+    selection_remove_source_ids: Vec<String>,
 }
 struct ProviderFinish {
     sync_id: String,
@@ -115,6 +121,8 @@ struct ProviderFinish {
     source_complete: bool,
     remove_stale: bool,
     remove_uninstalled: bool,
+    remove_expired: bool,
+    remove_selection: bool,
 }
 struct Scan {
     export: bool,
@@ -157,8 +165,17 @@ impl Pipeline {
         initiator: &str,
         operation: Operation,
     ) -> Result<(String, Option<String>, Operation), Value> {
+        if matches!(operation, Operation::ProviderSnapshotInventory { .. })
+            && caller != PLAYNITE_IMPORTER
+        {
+            return Err(error(
+                "permission_denied",
+                "provider inventory is reserved for the fixed Playnite importer",
+            ));
+        }
         match operation {
             operation @ (Operation::ProviderSnapshotBegin { .. }
+            | Operation::ProviderSnapshotInventory { .. }
             | Operation::ProviderSnapshotBatch { .. }
             | Operation::ProviderSnapshotFinish { .. }) => {
                 let owner = self.import_principals.get(caller).ok_or_else(|| {
@@ -237,6 +254,7 @@ impl Pipeline {
                 catalog_owner: incoming.catalog_owner,
                 importer: match &incoming.operation {
                     Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. } => Some(incoming.caller.clone()),
                     Operation::UpdateProviderOverrides { .. } => Some(PLAYNITE_IMPORTER.into()),
@@ -251,6 +269,7 @@ impl Pipeline {
             if matches!(
                 incoming.operation,
                 Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. }
                     | Operation::UpdateProviderOverrides { .. }
@@ -331,6 +350,19 @@ impl Pipeline {
             );
         };
         if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
+            && let Operation::ProviderSnapshotInventory { after: Some(_), .. } = &operation
+            && let Some(session) = self.provider_sessions.get(caller).cloned()
+        {
+            let payload = json!({"action":"collection_get","collection":context.key,"key":null});
+            return self.submit(
+                context,
+                payload,
+                Stage::ProviderInventoryCheck { operation, session },
+                send,
+            );
+        }
+        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
+            && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
             return self.apply_provider_operation(context, operation, session, send);
@@ -392,6 +424,86 @@ impl Pipeline {
         self.apply_provider_operation(context, scan.operation, session, send)
     }
 
+    fn provider_inventory_page(
+        &mut self,
+        context: Context,
+        session: ProviderSession,
+        after: Option<String>,
+        expected_collection_revision: Option<u64>,
+        limit: usize,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if session.caller != PLAYNITE_IMPORTER {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "permission_denied",
+                    "inventory is only available to Playnite",
+                ),
+            );
+        }
+        if !(1..=32).contains(&limit)
+            || after.as_ref().is_some_and(|value| !valid_source_id(value))
+            || after.is_some() != expected_collection_revision.is_some()
+        {
+            return complete(
+                send,
+                context.request_id,
+                error("invalid_request", "provider inventory cursor is invalid"),
+            );
+        }
+        if let Some(expected) = expected_collection_revision
+            && expected != session.collection_revision
+        {
+            return complete(
+                send,
+                context.request_id,
+                json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog changed between inventory pages","current_collection_revision":session.collection_revision}}),
+            );
+        }
+
+        let after = after.as_deref().unwrap_or_default();
+        let mut markers: Vec<_> = session
+            .markers
+            .values()
+            .filter(|marker| marker.caller == session.caller && marker.source_id.as_str() > after)
+            .collect();
+        markers.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+        let total_count = markers.len();
+        let has_more = markers.len() > limit;
+        let entries: Vec<_> = markers
+            .iter()
+            .take(limit)
+            .map(|marker| {
+                json!({
+                    "source_id":marker.source_id,
+                    "added_at_unix":marker.added_at_unix,
+                    "source_flags":marker.source_flags,
+                    "attached":!marker.detached && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint),
+                })
+            })
+            .collect();
+        let next_after = if has_more {
+            entries.last().and_then(|entry| entry["source_id"].as_str())
+        } else {
+            None
+        };
+        self.provider_sessions
+            .insert(session.caller.clone(), session.clone());
+        complete(
+            send,
+            context.request_id,
+            json!({
+                "ok":true,
+                "collection_revision":session.collection_revision,
+                "total_count":total_count,
+                "entries":entries,
+                "next_after":next_after,
+            }),
+        )
+    }
+
     fn apply_provider_operation(
         &mut self,
         context: Context,
@@ -403,7 +515,27 @@ impl Pipeline {
             Operation::ProviderSnapshotBegin {
                 sync_id,
                 source_revision,
-            } => self.begin_snapshot(context, session, sync_id, source_revision, send),
+                expected_collection_revision,
+            } => self.begin_snapshot(
+                context,
+                session,
+                sync_id,
+                source_revision,
+                expected_collection_revision,
+                send,
+            ),
+            Operation::ProviderSnapshotInventory {
+                after,
+                expected_collection_revision,
+                limit,
+            } => self.provider_inventory_page(
+                context,
+                session,
+                after,
+                expected_collection_revision,
+                limit.unwrap_or(32),
+                send,
+            ),
             Operation::ProviderSnapshotBatch {
                 sync_id,
                 generation,
@@ -412,10 +544,14 @@ impl Pipeline {
                 expected_revision,
                 entries,
                 remove_source_ids,
+                expire_source_ids,
+                selection_remove_source_ids,
             } => {
                 let batch_payload = json!({
                     "entries":&entries,
                     "remove_source_ids":&remove_source_ids,
+                    "expire_source_ids":&expire_source_ids,
+                    "selection_remove_source_ids":&selection_remove_source_ids,
                 });
                 let encoded =
                     serde_json::to_vec(&batch_payload).map_or(usize::MAX, |bytes| bytes.len());
@@ -425,10 +561,21 @@ impl Pipeline {
                     .all(|entry| batch_source_ids.insert(entry.source_id.as_str()))
                     && remove_source_ids
                         .iter()
+                        .all(|source_id| batch_source_ids.insert(source_id.as_str()))
+                    && expire_source_ids
+                        .iter()
+                        .all(|source_id| batch_source_ids.insert(source_id.as_str()))
+                    && selection_remove_source_ids
+                        .iter()
                         .all(|source_id| batch_source_ids.insert(source_id.as_str()));
+                let intent_count = entries
+                    .len()
+                    .saturating_add(remove_source_ids.len())
+                    .saturating_add(expire_source_ids.len())
+                    .saturating_add(selection_remove_source_ids.len());
                 if !valid_sync_id(&sync_id)
-                    || (entries.is_empty() && remove_source_ids.is_empty())
-                    || entries.len().saturating_add(remove_source_ids.len()) > MAX_BATCH_ENTRIES
+                    || intent_count == 0
+                    || intent_count > MAX_BATCH_ENTRIES
                     || encoded > MAX_BATCH_BYTES
                     || !unique_sources
                 {
@@ -496,6 +643,8 @@ impl Pipeline {
                         fingerprint: batch_fingerprint,
                         entries,
                         remove_source_ids,
+                        expire_source_ids,
+                        selection_remove_source_ids,
                     },
                     send,
                 )
@@ -509,6 +658,8 @@ impl Pipeline {
                 complete: source_complete,
                 remove_stale,
                 remove_uninstalled,
+                remove_expired,
+                remove_selection,
             } => self.finish_snapshot(
                 context,
                 session,
@@ -521,6 +672,8 @@ impl Pipeline {
                     source_complete,
                     remove_stale,
                     remove_uninstalled,
+                    remove_expired,
+                    remove_selection,
                 },
                 send,
             ),
@@ -788,8 +941,18 @@ impl Pipeline {
         mut session: ProviderSession,
         sync_id: String,
         source_revision: u64,
+        expected_collection_revision: Option<u64>,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
+        if expected_collection_revision
+            .is_some_and(|revision| revision != session.collection_revision)
+        {
+            return complete(
+                send,
+                context.request_id,
+                json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog changed after provider inventory","current_collection_revision":session.collection_revision}}),
+            );
+        }
         if !valid_sync_id(&sync_id) {
             return complete(
                 send,
@@ -839,6 +1002,8 @@ impl Pipeline {
             finish_expected_revision: None,
             finish_remove_stale: true,
             finish_remove_uninstalled: false,
+            finish_remove_expired: false,
+            finish_remove_selection: false,
         };
         session.seen_source_ids.clear();
         let key = state_key(&session.caller);
@@ -876,12 +1041,16 @@ impl Pipeline {
             fingerprint: batch_fingerprint,
             entries,
             remove_source_ids,
+            expire_source_ids,
+            selection_remove_source_ids,
         } = batch;
         let mut source_ids = BTreeSet::new();
         for source_id in entries
             .iter()
             .map(|entry| entry.source_id.as_str())
             .chain(remove_source_ids.iter().map(String::as_str))
+            .chain(expire_source_ids.iter().map(String::as_str))
+            .chain(selection_remove_source_ids.iter().map(String::as_str))
         {
             if !valid_source_id(source_id)
                 || session.seen_source_ids.contains(source_id)
@@ -900,8 +1069,11 @@ impl Pipeline {
         let mut edits = Vec::new();
         let mut entries_changed = false;
         for provider_entry in entries {
-            let source_id = provider_entry.source_id;
-            let mut entry = provider_entry.entry;
+            let ProviderEntry {
+                source_id,
+                mut entry,
+                source_flags,
+            } = provider_entry;
             let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
                 && session.caller != PLAYNITE_IMPORTER;
             if entry.validate().is_err() || invalid_launch_owner {
@@ -916,7 +1088,14 @@ impl Pipeline {
             }
             let key = entry_key(&session.caller, &source_id);
             let existing = session.markers.get(&key).cloned();
-            let (entry_id, detached, config_overrides) = if let Some(marker) = existing {
+            let source_flags = source_flags
+                .or_else(|| existing.as_ref().map(|marker| marker.source_flags))
+                .unwrap_or_default();
+            let added_at_unix = match existing.as_ref() {
+                Some(marker) => marker.added_at_unix,
+                None => unix_timestamp(),
+            };
+            let (entry_id, detached, config_overrides) = if let Some(marker) = existing.clone() {
                 if !validate_marker(&marker, &session.caller, &source_id) {
                     return complete(send, context.request_id, malformed());
                 }
@@ -979,6 +1158,9 @@ impl Pipeline {
                 config_overrides,
                 detached,
                 remove_generation: None,
+                added_at_unix,
+                source_flags,
+                remove_reason: None,
             };
             if detached {
                 // A changed or deleted Entry has become user-owned. Keep it and
@@ -1005,13 +1187,27 @@ impl Pipeline {
             session.seen_source_ids.insert(source_id);
             edits.push(json!({"key":key,"value":marker_value(&marker)}));
         }
-        for source_id in remove_source_ids {
+        for (source_id, reason) in remove_source_ids
+            .into_iter()
+            .map(|source_id| (source_id, RemovalReason::Uninstalled))
+            .chain(
+                expire_source_ids
+                    .into_iter()
+                    .map(|source_id| (source_id, RemovalReason::Expired)),
+            )
+            .chain(
+                selection_remove_source_ids
+                    .into_iter()
+                    .map(|source_id| (source_id, RemovalReason::Selection)),
+            )
+        {
             let key = entry_key(&session.caller, &source_id);
             if let Some(mut marker) = session.markers.get(&key).cloned() {
                 if !validate_marker(&marker, &session.caller, &source_id) {
                     return complete(send, context.request_id, malformed());
                 }
                 marker.remove_generation = Some(session.state.generation);
+                marker.remove_reason = Some(reason);
                 session.markers.insert(key.clone(), marker.clone());
                 edits.push(json!({"key":key,"value":marker_value(&marker)}));
             }
@@ -1042,6 +1238,8 @@ impl Pipeline {
         session.state.finish_expected_revision = None;
         session.state.finish_remove_stale = true;
         session.state.finish_remove_uninstalled = false;
+        session.state.finish_remove_expired = false;
+        session.state.finish_remove_selection = false;
         session.state.last_batch = Some(CommittedBatch {
             sequence,
             expected_revision,
@@ -1085,6 +1283,8 @@ impl Pipeline {
             source_complete,
             remove_stale,
             remove_uninstalled,
+            remove_expired,
+            remove_selection,
         } = finish;
         if !source_complete {
             return complete(
@@ -1112,6 +1312,8 @@ impl Pipeline {
             if session.state.finish_expected_revision != Some(expected_revision)
                 || session.state.finish_remove_stale != remove_stale
                 || session.state.finish_remove_uninstalled != remove_uninstalled
+                || session.state.finish_remove_expired != remove_expired
+                || session.state.finish_remove_selection != remove_selection
             {
                 return complete(
                     send,
@@ -1123,7 +1325,7 @@ impl Pipeline {
                 return complete(
                     send,
                     context.request_id,
-                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled}),
+                    json!({"ok":true,"revision":session.document_revision,"generation":generation,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled,"remove_expired":remove_expired,"remove_selection":remove_selection}),
                 );
             }
         } else {
@@ -1138,12 +1340,22 @@ impl Pipeline {
             session.state.finish_expected_revision = Some(expected_revision);
             session.state.finish_remove_stale = remove_stale;
             session.state.finish_remove_uninstalled = remove_uninstalled;
+            session.state.finish_remove_expired = remove_expired;
+            session.state.finish_remove_selection = remove_selection;
         }
         let mut stale_by_key = BTreeMap::new();
         for marker in session.markers.values().filter(|marker| {
             marker.caller == session.caller
                 && ((remove_stale && marker.generation < generation)
-                    || (remove_uninstalled && marker.remove_generation == Some(generation)))
+                    || (marker.remove_generation == Some(generation)
+                        && match marker.remove_reason {
+                            Some(RemovalReason::Uninstalled) => remove_uninstalled,
+                            Some(RemovalReason::Expired) => remove_expired,
+                            Some(RemovalReason::Selection) => remove_selection,
+                            // Existing generations written before removal reasons
+                            // represented explicit-uninstalled tombstones only.
+                            None => remove_uninstalled,
+                        }))
         }) {
             stale_by_key.insert(
                 entry_key(&session.caller, &marker.source_id),
@@ -1197,7 +1409,7 @@ impl Pipeline {
             "value":session.state.clone(),
         }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale,"remove_uninstalled":session.state.finish_remove_uninstalled});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"complete":true,"cleanup_pending":!remaining.is_empty(),"remove_stale":session.state.finish_remove_stale,"remove_uninstalled":session.state.finish_remove_uninstalled,"remove_expired":session.state.finish_remove_expired,"remove_selection":session.state.finish_remove_selection});
         self.submit(
             context,
             payload,
@@ -1320,6 +1532,16 @@ impl Pipeline {
             }
             Stage::ProviderOverrideEntry(update) => {
                 self.finish_provider_override(context, state_revision, payload, update, send)
+            }
+            Stage::ProviderInventoryCheck { operation, session } => {
+                if state_revision != session.collection_revision {
+                    return complete(
+                        send,
+                        context.request_id,
+                        json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog changed between inventory pages","current_collection_revision":state_revision}}),
+                    );
+                }
+                self.apply_provider_operation(context, operation, session, send)
             }
             Stage::ProviderLoading(operation) => {
                 let found = payload["found"] == true;
@@ -1800,6 +2022,14 @@ fn snapshot_matches(
 
 fn revision_conflict(current_revision: u64) -> Value {
     json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog revision differs","current_revision":current_revision}})
+}
+
+fn unix_timestamp() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .filter(|timestamp| *timestamp <= 253_402_300_799)
 }
 
 fn valid_collection_cursor(value: &str) -> bool {

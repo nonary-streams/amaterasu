@@ -50,6 +50,15 @@ pub enum Operation {
     ProviderSnapshotBegin {
         sync_id: String,
         source_revision: u64,
+        #[serde(default)]
+        expected_collection_revision: Option<u64>,
+    },
+    /// Reads the authorized importer's provenance without exposing an owner
+    /// selector. Each page is pinned to the state collection revision.
+    ProviderSnapshotInventory {
+        after: Option<String>,
+        expected_collection_revision: Option<u64>,
+        limit: Option<usize>,
     },
     ProviderSnapshotBatch {
         sync_id: String,
@@ -60,6 +69,10 @@ pub enum Operation {
         entries: Vec<ProviderEntry>,
         #[serde(default)]
         remove_source_ids: Vec<String>,
+        #[serde(default)]
+        expire_source_ids: Vec<String>,
+        #[serde(default)]
+        selection_remove_source_ids: Vec<String>,
     },
     ProviderSnapshotFinish {
         sync_id: String,
@@ -72,6 +85,10 @@ pub enum Operation {
         remove_stale: bool,
         #[serde(default)]
         remove_uninstalled: bool,
+        #[serde(default)]
+        remove_expired: bool,
+        #[serde(default)]
+        remove_selection: bool,
     },
 }
 
@@ -84,6 +101,8 @@ fn default_remove_stale() -> bool {
 pub struct ProviderEntry {
     pub source_id: String,
     pub entry: Entry,
+    #[serde(default)]
+    pub source_flags: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -126,6 +145,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             return page(&document, &query.to_lowercase(), cursor, limit, false);
         }
         Operation::ProviderSnapshotBegin { .. }
+        | Operation::ProviderSnapshotInventory { .. }
         | Operation::ProviderSnapshotBatch { .. }
         | Operation::ProviderSnapshotFinish { .. }
         | Operation::UpdateProviderOverrides { .. } => {

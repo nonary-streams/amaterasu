@@ -37,6 +37,10 @@ enum Action {
         #[serde(default)]
         autosync_remove_uninstalled: Option<bool>,
         #[serde(default)]
+        autosync_delete_after_days: Option<u32>,
+        #[serde(default)]
+        autosync_require_replacement: Option<bool>,
+        #[serde(default)]
         recent_games: Option<u32>,
         #[serde(default)]
         recent_max_age_days: Option<u32>,
@@ -374,6 +378,8 @@ impl PlayniteModule {
                 auto_sync,
                 sync_all_installed,
                 autosync_remove_uninstalled,
+                autosync_delete_after_days,
+                autosync_require_replacement,
                 recent_games,
                 recent_max_age_days,
                 sync_categories,
@@ -390,6 +396,10 @@ impl PlayniteModule {
                     sync_all_installed: sync_all_installed.unwrap_or(current.sync_all_installed),
                     autosync_remove_uninstalled: autosync_remove_uninstalled
                         .unwrap_or(current.autosync_remove_uninstalled),
+                    autosync_delete_after_days: autosync_delete_after_days
+                        .unwrap_or(current.autosync_delete_after_days),
+                    autosync_require_replacement: autosync_require_replacement
+                        .unwrap_or(current.autosync_require_replacement),
                     recent_games: recent_games.unwrap_or(current.recent_games),
                     recent_max_age_days: recent_max_age_days.unwrap_or(current.recent_max_age_days),
                     sync_categories: sync_categories
