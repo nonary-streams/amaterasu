@@ -46,6 +46,7 @@ struct Lease {
     requested_controller: Option<bool>,
     requested_gamepad: Option<GamepadProfile>,
     requested_ds4_back_as_touchpad_click: Option<bool>,
+    ds4_back_as_touchpad_click: bool,
     requested_keyboard: Option<bool>,
     requested_mouse: Option<bool>,
     requested_high_resolution_scrolling: Option<bool>,
@@ -258,7 +259,7 @@ impl<B: Backend> Controller<B> {
     fn effective_ds4_back_as_touchpad_click(&self) -> bool {
         self.lease
             .as_ref()
-            .and_then(|lease| lease.requested_ds4_back_as_touchpad_click)
+            .map(|lease| lease.ds4_back_as_touchpad_click)
             .unwrap_or(self.ds4_back_as_touchpad_click)
     }
 

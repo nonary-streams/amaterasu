@@ -272,6 +272,9 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
     );
     assert_eq!(acquired["ok"], true);
     assert_eq!(acquired["ds4_back_as_touchpad_click"], false);
+    let lease = controller.lease.as_ref().unwrap();
+    assert_eq!(lease.requested_ds4_back_as_touchpad_click, Some(false));
+    assert!(!lease.ds4_back_as_touchpad_click);
     assert!(!controller.backend.ds4_back_as_touchpad_click);
 
     controller.set_ds4_back_as_touchpad_click(false);
@@ -287,6 +290,59 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
         &mut || Ok(()),
     );
     assert!(controller.backend.ds4_back_as_touchpad_click);
+}
+
+#[test]
+fn unscoped_ds4_back_mapping_is_snapshotted_from_the_v9_default() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquire = |ds4_back_as_touchpad_click| Operation::Acquire {
+        operation_id: Some("ds4-back-default-retry".into()),
+        ttl_ms: None,
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click,
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: None,
+        key_repeat_frequency: None,
+    };
+
+    let acquired = controller.handle("owner", acquire(None), now, &mut || Ok(()));
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["ds4_back_as_touchpad_click"], true);
+    let lease = controller.lease.as_ref().unwrap();
+    assert_eq!(lease.requested_ds4_back_as_touchpad_click, None);
+    assert!(lease.ds4_back_as_touchpad_click);
+
+    controller.set_ds4_back_as_touchpad_click(false);
+    assert!(!controller.ds4_back_as_touchpad_click());
+    assert!(controller.effective_ds4_back_as_touchpad_click());
+    assert!(controller.backend.ds4_back_as_touchpad_click);
+    assert_eq!(
+        controller.status("owner", now)["lease"]["ds4_back_as_touchpad_click"],
+        true
+    );
+
+    let retry = controller.handle("owner", acquire(None), now, &mut || Ok(()));
+    assert_eq!(retry["ok"], true);
+    assert_eq!(retry["ds4_back_as_touchpad_click"], true);
+    let changed_retry = controller.handle("owner", acquire(Some(false)), now, &mut || Ok(()));
+    assert_eq!(changed_retry["error"]["code"], "operation_conflict");
+
+    controller.handle(
+        "owner",
+        Operation::Release {
+            lease: acquired["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert!(!controller.backend.ds4_back_as_touchpad_click);
 }
 
 #[test]
