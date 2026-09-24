@@ -36,6 +36,10 @@ pub struct Scan {
 impl Scan {
     pub fn new(roots: &[PathBuf]) -> Self {
         let mut scan = Self::default();
+        if roots.is_empty() {
+            scan.warn("no_library_roots");
+            return scan;
+        }
         for root in roots {
             scan.enqueue(root.clone());
         }
@@ -149,6 +153,57 @@ impl Scan {
             self.games.insert(game.app_id, game);
         }
     }
+}
+
+/// Finds a Steam client executable for catalog-backed `-applaunch` records.
+/// Configured roots are checked first so secondary library roots never become
+/// launch executables by accident; platform defaults and PATH are fallbacks.
+pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for configured_root in roots {
+        let root = if configured_root
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
+        {
+            configured_root.parent().unwrap_or(configured_root)
+        } else {
+            configured_root
+        };
+        candidates.extend([
+            root.join("steam.exe"),
+            root.join("steam.sh"),
+            root.join("steam"),
+            root.join("steam_osx"),
+            root.join("Steam.app/Contents/MacOS/steam_osx"),
+            root.join("Contents/MacOS/steam_osx"),
+        ]);
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(program_files) = std::env::var_os("ProgramFiles(x86)") {
+        candidates.push(PathBuf::from(program_files).join("Steam/steam.exe"));
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("steam")));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from(
+            "/Applications/Steam.app/Contents/MacOS/steam_osx",
+        ));
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates
+                .push(PathBuf::from(home).join("Applications/Steam.app/Contents/MacOS/steam_osx"));
+        }
+    }
+
+    candidates.into_iter().find_map(|candidate| {
+        let canonical = candidate.canonicalize().ok()?;
+        canonical.is_file().then_some(canonical)
+    })
 }
 
 fn read_document(path: &Path) -> Result<Value, String> {

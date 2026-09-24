@@ -1,7 +1,7 @@
 # Local Steam discovery
 
-`amaterasu.steam/1` is a read-only provider, built as a separate Rust library.
-It reads explicitly configured Steam installation roots (or `steamapps`
+`amaterasu.steam/1` is a separate Rust library. It reads explicitly configured
+Steam installation roots (or `steamapps`
 directories), follows modern and legacy `libraryfolders.vdf` entries, and parses
 `appmanifest_<appid>.acf`. Set startup settings for principal `amaterasu.steam`:
 
@@ -34,10 +34,40 @@ result is ambiguous and the first durable readback fails, management receives an
 unknown-outcome error while Steam retries the readback with capped backoff; other
 Steam requests continue to be served during those retries.
 
-`steam_auto_sync` is not implemented. Vibeshine's option performs a 30-second
-catalog reconciliation, including installed game entries and artwork. This
-provider currently only discovers local manifests and has no catalog or artwork
-reconciliation service, so periodic discovery would not provide that behavior.
+The product document also contains `auto_sync` (default `false`) and
+`exclude_games` (default `[]`). `settings_update` accepts
+`{enabled,auto_sync,exclude_games,expected_revision}`. Exclusions are bounded to
+256 records of the form `{"id":"730","name":"Counter-Strike 2"}`; either a
+canonical decimal Steam app ID or printable name is required. When an ID is
+provided, matching uses the ID; a name-only exclusion matches exact names
+without case sensitivity. Existing version 1 documents that only contain
+`enabled` load with auto-sync off and no exclusions.
+
+With `auto_sync` enabled, Steam starts discovery when settings are applied and
+then requests another scan every 30 seconds. It imports a scan only when every
+configured library and manifest was read without warnings and a Steam client
+executable was resolved. Catalog entries use stable source IDs `steam:<appid>`
+and launch the resolved Steam client with `-applaunch <appid>`. Exclusions affect
+catalog imports only; the Steam provider's `list` action continues to show all
+discovered games. The provider uses the fixed catalog import mapping from
+`amaterasu.steam` to the management catalog and accepts no caller-supplied owner
+selector.
+
+The snapshot protocol writes bounded batches and declares completion only after
+a successful full scan. Catalog ownership markers preserve manually changed or
+deleted entries, and stale Steam-managed entries are removed only by a complete
+scan. A scan with no configured roots, any discovery warning, or no resolved
+Steam client leaves the catalog unchanged. If settings or discovery revision
+changes during an import, Steam stops before submitting another step; a catalog
+finish already in flight may still complete, after which a later complete scan
+reconciles current settings. Status and list requests continue during catalog
+retries.
+
+This is installed-manifest reconciliation, not complete Vibeshine Steam sync
+parity. The current manifests do not expose local play history, Steam app type,
+or artwork, so recent-game selection and tool classification remain pending.
+Auto-sync imports installed manifests, and the `steam_autosync_remove_uninstalled`
+policy is not configurable yet.
 
 ```json
 {"action":"refresh"}
@@ -63,11 +93,13 @@ path separators in `installdir`. This does not classify games versus tools/DLC o
 resolve executable paths. Duplicate IDs prefer installed copies, then lexical
 library path, independent of directory order. Results sort by numeric App ID.
 
-Completed scans atomically replace the in-memory snapshot, including empty scans.
-Invalid/unavailable manifests or libraries produce warnings; `complete:false`
-means consumers must not interpret missing entries as uninstallations. During
-refresh the previous snapshot remains visible. There is no durable snapshot or
-epoch across module restarts; clients must discard old cursors after restart.
+Completed scans atomically replace the in-memory snapshot, including empty scans
+when at least one configured root was successfully scanned. Invalid/unavailable
+manifests or libraries produce warnings; `complete:false` means consumers must
+not interpret missing entries as uninstallations. No configured roots are also
+reported incomplete. During refresh the previous snapshot remains visible. There
+is no durable discovery snapshot or cursor epoch across module restarts; clients
+must discard old cursors after restart.
 
 The parser supports quoted/unquoted text, braces, line comments, UTF-8 names,
 escaped quotes/backslashes and common whitespace escapes. It rejects duplicates,
@@ -81,7 +113,7 @@ Individual filesystem operations can still block on unavailable storage.
 
 Behavior reference: sibling Vibeshine `src/steam_integration.h`; source was not
 copied or translated. Other missing parity includes automatic per-session root
-discovery, catalog reconciliation, artwork and conversion, uninstalled owned
-games, app type filtering, launch options/Proton resolution, launch/process
+discovery, artwork and conversion, uninstalled owned games, app type filtering,
+play-history selection, launch options/Proton resolution, launch/process
 tracking, watchers, and Steam broker environment handling. This provider neither
-launches Steam nor modifies Steam files or the application catalog.
+modifies Steam files.

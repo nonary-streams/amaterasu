@@ -1,4 +1,5 @@
 //! Read-only local Steam provider. Product policy and launching stay in other libraries.
+mod catalog_sync;
 mod configuration;
 mod discovery;
 mod keyvalues;
@@ -9,7 +10,7 @@ use configuration::ProductConfiguration;
 use discovery::{Game, Scan};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use settings::StartupSettings;
+use settings::{Exclusion, ProductSettings, StartupSettings};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -24,6 +25,10 @@ enum Action {
     SettingsGet {},
     SettingsUpdate {
         enabled: bool,
+        #[serde(default)]
+        auto_sync: bool,
+        #[serde(default)]
+        exclude_games: Vec<Exclusion>,
         expected_revision: u64,
     },
     List {
@@ -37,17 +42,21 @@ enum Action {
 struct Provider {
     enabled: bool,
     roots: Vec<PathBuf>,
+    steam_executable: Option<PathBuf>,
     scan: Option<Scan>,
     games: BTreeMap<u32, Game>,
     revision: u64,
+    snapshot_complete: bool,
     warnings: Vec<String>,
     warning_count: u64,
 }
 
 impl Provider {
     fn new(roots: Vec<PathBuf>) -> Self {
+        let steam_executable = discovery::find_steam_executable(&roots);
         Self {
             roots,
+            steam_executable,
             ..Self::default()
         }
     }
@@ -63,7 +72,24 @@ impl Provider {
             self.warnings.clear();
             self.warning_count = 0;
             self.revision = self.revision.saturating_add(1);
+            self.snapshot_complete = false;
         }
+    }
+
+    fn start_scan(&mut self) -> bool {
+        if !self.enabled || self.scan.is_some() || self.revision == u64::MAX {
+            return false;
+        }
+        self.scan = Some(Scan::new(&self.roots));
+        true
+    }
+
+    fn has_complete_snapshot(&self) -> bool {
+        self.revision > 0 && self.snapshot_complete
+    }
+
+    fn scan_in_progress(&self) -> bool {
+        self.scan.is_some()
     }
 
     fn tick(&mut self) {
@@ -78,7 +104,8 @@ impl Provider {
             self.games = scan.games;
             self.warnings = scan.warnings;
             self.warning_count = scan.warning_count;
-            self.revision += 1;
+            self.snapshot_complete = scan.warning_count == 0;
+            self.revision = self.revision.saturating_add(1);
         }
     }
 
@@ -88,23 +115,27 @@ impl Provider {
                 if !self.enabled {
                     return ActionResult::Immediate(json!({"ok":false,"code":"steam_disabled"}));
                 }
-                if self.scan.is_none() {
-                    if self.revision == u64::MAX {
-                        return ActionResult::Immediate(
-                            json!({"ok":false,"code":"revision_exhausted"}),
-                        );
-                    }
-                    self.scan = Some(Scan::new(&self.roots));
+                if self.revision == u64::MAX && self.scan.is_none() {
+                    return ActionResult::Immediate(
+                        json!({"ok":false,"code":"revision_exhausted"}),
+                    );
                 }
+                self.start_scan();
                 ActionResult::Immediate(self.status())
             }
             Action::Status {} => ActionResult::Immediate(self.status()),
             Action::SettingsGet {} => ActionResult::SettingsGet,
             Action::SettingsUpdate {
                 enabled,
+                auto_sync,
+                exclude_games,
                 expected_revision,
             } => ActionResult::SettingsUpdate {
-                enabled,
+                settings: ProductSettings {
+                    enabled,
+                    auto_sync,
+                    exclude_games,
+                },
                 expected_revision,
             },
             Action::List {
@@ -122,7 +153,7 @@ impl Provider {
     fn status(&self) -> Value {
         json!({"ok":true,"enabled":self.enabled,"scanning":self.scan.is_some(),"revision":self.revision,
             "game_count":self.games.len(),"warning_count":self.warning_count,"warnings":self.warnings,
-            "complete":self.revision > 0 && self.warning_count == 0,
+            "complete":self.has_complete_snapshot(),
             "visited_entries":self.scan.as_ref().map_or(0, |scan| scan.visited_entries)})
     }
 
@@ -155,7 +186,7 @@ impl Provider {
             None
         };
         json!({"ok":true,"enabled":self.enabled,"revision":self.revision,"games":games,"next_after":next_after,
-            "scanning":self.scan.is_some(),"complete":self.revision > 0 && self.warning_count == 0})
+            "scanning":self.scan.is_some(),"complete":self.has_complete_snapshot()})
     }
 }
 
@@ -163,7 +194,7 @@ enum ActionResult {
     Immediate(Value),
     SettingsGet,
     SettingsUpdate {
-        enabled: bool,
+        settings: ProductSettings,
         expected_revision: u64,
     },
 }
@@ -172,6 +203,7 @@ struct SteamModule {
     runtime: RuntimeClient,
     provider: Provider,
     configuration: ProductConfiguration,
+    catalog_sync: catalog_sync::CatalogSync,
 }
 
 impl ManagedModule for SteamModule {
@@ -191,10 +223,11 @@ impl ManagedModule for SteamModule {
             runtime,
             provider: {
                 let mut provider = Provider::new(settings.roots);
-                provider.set_enabled(configuration.enabled());
+                provider.set_enabled(configuration.settings().enabled);
                 provider
             },
             configuration,
+            catalog_sync: catalog_sync::CatalogSync::new(),
         })
     }
 
@@ -202,6 +235,11 @@ impl ManagedModule for SteamModule {
         self.provider.tick();
         self.configuration
             .advance(&self.runtime, &mut self.provider)?;
+        self.catalog_sync.tick(
+            &self.runtime,
+            &mut self.provider,
+            self.configuration.settings(),
+        )?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -249,18 +287,21 @@ impl SteamModule {
         match self.provider.handle_action(action) {
             ActionResult::Immediate(payload) => self.complete(
                 id,
-                with_settings_ready(payload, self.configuration.is_ready()),
+                with_catalog_sync_status(
+                    with_settings_ready(payload, self.configuration.is_ready()),
+                    self.catalog_sync.status(),
+                ),
             ),
             ActionResult::SettingsGet => {
                 self.complete(id, self.configuration.management_response())
             }
             ActionResult::SettingsUpdate {
-                enabled,
+                settings,
                 expected_revision,
             } => {
                 match self
                     .configuration
-                    .begin_update(id, enabled, expected_revision, remaining_ms)
+                    .begin_update(id, settings, expected_revision, remaining_ms)
                 {
                     Ok(()) => Ok(()),
                     Err(response) => self.complete(id, response),
@@ -283,6 +324,13 @@ impl SteamModule {
 fn with_settings_ready(mut payload: Value, settings_ready: bool) -> Value {
     if let Some(object) = payload.as_object_mut() {
         object.insert("settings_ready".into(), json!(settings_ready));
+    }
+    payload
+}
+
+fn with_catalog_sync_status(mut payload: Value, status: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("catalog_sync".into(), status);
     }
     payload
 }

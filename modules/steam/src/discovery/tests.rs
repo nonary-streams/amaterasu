@@ -47,6 +47,28 @@ impl Drop for Libraries {
     }
 }
 
+#[test]
+fn no_configured_roots_are_incomplete_and_do_not_imply_uninstallations() {
+    let mut scan = Scan::new(&[]);
+    finish(&mut scan);
+    assert_eq!(scan.warning_count, 1);
+    assert_eq!(scan.warnings, vec!["no_library_roots"]);
+    assert!(!scan.finished || scan.warning_count != 0);
+}
+
+#[test]
+fn steam_client_resolution_uses_the_configured_install_root_not_a_game_library() {
+    let fixture = Libraries::new();
+    let install = fixture.library("steam-install");
+    let client = install.join("steam.exe");
+    fs::write(&client, "fixture executable path").unwrap();
+
+    assert_eq!(
+        find_steam_executable(&[install.join("steamapps")]),
+        Some(client.canonicalize().unwrap())
+    );
+}
+
 fn finish(scan: &mut Scan) {
     for _ in 0..10_000 {
         scan.tick();

@@ -1,6 +1,6 @@
 use super::*;
 use crate::configuration::CONFIGURATION_TIMEOUT_MS;
-use crate::settings::ProductSettings;
+use crate::settings::{Exclusion, ProductSettings};
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT,
     STATUS_OK,
@@ -79,10 +79,10 @@ fn enabling_steam_allows_explicit_refresh_of_configured_roots() {
 }
 
 #[test]
-fn unsupported_automatic_sync_cannot_be_smuggled_into_product_settings() {
+fn unsupported_tool_classification_cannot_be_smuggled_into_product_settings() {
     let parsed = serde_json::from_value::<ProductSettings>(json!({
         "enabled": true,
-        "auto_sync": true
+        "include_tools": true
     }));
     assert!(parsed.is_err());
 }
@@ -97,6 +97,10 @@ struct FakeHost {
     completed: Vec<(u64, Value)>,
     released: Vec<u64>,
     configuration_actions: Vec<String>,
+    catalog_requests: Vec<Value>,
+    catalog_revision: u64,
+    catalog_generation: u64,
+    catalog_next_sequence: u64,
 }
 
 impl FakeHost {
@@ -117,21 +121,62 @@ impl FakeHost {
                 payload: json!({"roots":[]}),
             },
             Command::Register { .. } => Response::Ok,
-            Command::Request { payload, .. } => {
+            Command::Request {
+                service, payload, ..
+            } => {
                 self.next_child += 1;
                 let request = self.next_child;
                 let action = payload["action"].as_str().unwrap_or_default();
-                self.configuration_actions.push(action.to_owned());
-                let result = match action {
-                    "product_get" => self
-                        .product_get_results
-                        .pop_front()
-                        .unwrap_or(Response::Pending),
-                    "product_update" => self
-                        .product_update_results
-                        .pop_front()
-                        .unwrap_or(Response::Pending),
-                    _ => Response::error("invalid_request", "unexpected configuration action"),
+                let result = if service == "amaterasu.configuration/1" {
+                    self.configuration_actions.push(action.to_owned());
+                    match action {
+                        "product_get" => self
+                            .product_get_results
+                            .pop_front()
+                            .unwrap_or(Response::Pending),
+                        "product_update" => self
+                            .product_update_results
+                            .pop_front()
+                            .unwrap_or(Response::Pending),
+                        _ => Response::error("invalid_request", "unexpected configuration action"),
+                    }
+                } else if service == "amaterasu.catalog/1" {
+                    self.catalog_requests.push(payload.clone());
+                    let result = match action {
+                        "provider_snapshot_begin" => {
+                            self.catalog_generation += 1;
+                            self.catalog_next_sequence = 0;
+                            json!({
+                                "ok":true,
+                                "revision":self.catalog_revision,
+                                "generation":self.catalog_generation,
+                                "next_sequence":0
+                            })
+                        }
+                        "provider_snapshot_batch" => {
+                            self.catalog_revision += 1;
+                            self.catalog_next_sequence += 1;
+                            json!({
+                                "ok":true,
+                                "revision":self.catalog_revision,
+                                "generation":self.catalog_generation,
+                                "next_sequence":self.catalog_next_sequence
+                            })
+                        }
+                        "provider_snapshot_finish" => json!({
+                            "ok":true,
+                            "revision":self.catalog_revision,
+                            "generation":self.catalog_generation,
+                            "complete":true,
+                            "cleanup_pending":false
+                        }),
+                        _ => {
+                            json!({"ok":false,"error":{"code":"invalid_request","message":"unexpected action"}})
+                        }
+                    };
+                    Response::Result { payload: result }
+                } else {
+                    Response::error("service_unavailable", "unexpected target service")
                 };
                 self.child_results.insert(request, result);
                 Response::Accepted { id: request }
@@ -204,6 +249,18 @@ fn persisted_settings(enabled: bool, revision: u64) -> Response {
             "version":1,
             "revision":revision,
             "values":{"enabled":enabled}
+        }),
+    }
+}
+
+fn persisted_settings_with_auto_sync(exclusions: Value, revision: u64) -> Response {
+    Response::Result {
+        payload: json!({
+            "ok":true,
+            "found":true,
+            "version":1,
+            "revision":revision,
+            "values":{"enabled":true,"auto_sync":true,"exclude_games":exclusions}
         }),
     }
 }
@@ -332,4 +389,127 @@ fn cancelled_update_releases_results_reads_back_state_and_never_claims_success()
     assert_eq!(host.released.len(), 4);
     assert!(!module.provider.enabled);
     assert_eq!(module.configuration.revision(), 4);
+}
+
+#[test]
+fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_auto_sync(
+            json!([{"id":"20","name":"Excluded game"}]),
+            2,
+        ));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module.provider.scan = None;
+    module.provider.steam_executable = Some(std::env::current_exe().unwrap());
+    module.provider.games.insert(
+        10,
+        Game {
+            stable_id: "steam:10".into(),
+            app_id: 10,
+            name: "Included game".into(),
+            install_directory: "/Steam/steamapps/common/Included".into(),
+            library_directory: "/Steam".into(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+        },
+    );
+    module.provider.games.insert(
+        20,
+        Game {
+            stable_id: "steam:20".into(),
+            app_id: 20,
+            name: "Excluded game".into(),
+            install_directory: "/Steam/steamapps/common/Excluded".into(),
+            library_directory: "/Steam".into(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+        },
+    );
+    module.provider.revision = 1;
+    module.provider.snapshot_complete = true;
+
+    for _ in 0..8 {
+        module.tick().unwrap();
+    }
+
+    assert_eq!(
+        host.catalog_requests
+            .iter()
+            .map(|request| request["action"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "provider_snapshot_begin",
+            "provider_snapshot_batch",
+            "provider_snapshot_finish"
+        ]
+    );
+    let batch = &host.catalog_requests[1];
+    assert_eq!(batch["source_revision"], 1);
+    assert_eq!(batch["sequence"], 0);
+    assert_eq!(batch["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(batch["entries"][0]["source_id"], "steam:10");
+    assert_eq!(
+        batch["entries"][0]["entry"]["launch"]["arguments"],
+        json!(["-applaunch", "10"])
+    );
+    assert_eq!(host.catalog_requests[2]["complete"], true);
+    assert_eq!(host.released.len(), 4);
+}
+
+#[test]
+fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_auto_sync(json!([]), 2));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module.provider.scan = None;
+    module.provider.steam_executable = Some(std::env::current_exe().unwrap());
+    module.provider.games.insert(
+        10,
+        Game {
+            stable_id: "steam:10".into(),
+            app_id: 10,
+            name: "Included game".into(),
+            install_directory: "/Steam/steamapps/common/Included".into(),
+            library_directory: "/Steam".into(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+        },
+    );
+    module.provider.revision = 1;
+    module.provider.snapshot_complete = true;
+
+    module.tick().unwrap();
+    assert_eq!(host.catalog_requests.len(), 1);
+    assert_eq!(
+        host.catalog_requests[0]["action"],
+        "provider_snapshot_begin"
+    );
+
+    let changed_settings = ProductSettings {
+        enabled: true,
+        auto_sync: true,
+        exclude_games: vec![Exclusion {
+            id: Some("20".into()),
+            name: None,
+        }],
+    };
+    module.provider.revision = 2;
+    module
+        .catalog_sync
+        .tick(&module.runtime, &mut module.provider, &changed_settings)
+        .unwrap();
+
+    assert_eq!(host.catalog_requests.len(), 1);
+    assert_eq!(module.catalog_sync.status()["syncing"], false);
 }

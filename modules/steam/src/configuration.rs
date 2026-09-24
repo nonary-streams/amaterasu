@@ -82,8 +82,8 @@ impl ProductConfiguration {
         self.ready
     }
 
-    pub(super) fn enabled(&self) -> bool {
-        self.settings.enabled
+    pub(super) fn settings(&self) -> &ProductSettings {
+        &self.settings
     }
 
     #[cfg(test)]
@@ -98,7 +98,7 @@ impl ProductConfiguration {
     pub(super) fn begin_update(
         &mut self,
         management_request: u64,
-        enabled: bool,
+        settings: ProductSettings,
         expected_revision: u64,
         remaining_ms: u64,
     ) -> Result<(), Value> {
@@ -112,7 +112,10 @@ impl ProductConfiguration {
             return Err(json!({"ok":false,"code":"settings_busy"}));
         }
 
-        let settings = ProductSettings::for_host(enabled);
+        settings.validate().map_err(
+            |message| json!({"ok":false,"error":{"code":"invalid_request","message":message}}),
+        )?;
+        let settings = ProductSettings::for_host(settings);
         self.pending = Some(PendingConfiguration {
             call: PendingConfigurationCall::Submit {
                 payload: settings.product_update_payload(expected_revision),
@@ -482,10 +485,10 @@ impl ProductConfiguration {
         settings: ProductSettings,
         revision: u64,
     ) {
+        provider.set_enabled(settings.enabled);
         self.settings = settings;
         self.revision = revision;
         self.ready = true;
-        provider.set_enabled(settings.enabled);
     }
 }
 

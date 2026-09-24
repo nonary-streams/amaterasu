@@ -1,12 +1,57 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 pub const PRODUCT_SETTINGS_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+const MAX_EXCLUSIONS: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exclusion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Exclusion {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.id.is_none() && self.name.is_none() {
+            return Err("an exclusion requires an app ID or name");
+        }
+        if let Some(id) = &self.id {
+            let parsed = id.parse::<u32>().map_err(|_| "invalid Steam app ID")?;
+            if parsed == 0 || parsed.to_string() != *id {
+                return Err("Steam app IDs must be canonical nonzero decimal values");
+            }
+        }
+        if let Some(name) = &self.name
+            && (name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control))
+        {
+            return Err("exclusion names must contain 1..512 printable bytes");
+        }
+        Ok(())
+    }
+
+    pub fn matches(&self, app_id: u32, game_name: &str) -> bool {
+        if let Some(id) = &self.id {
+            return id == &app_id.to_string();
+        }
+        self.name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase() == game_name.to_lowercase())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductSettings {
     pub enabled: bool,
+    #[serde(default)]
+    pub auto_sync: bool,
+    #[serde(default)]
+    pub exclude_games: Vec<Exclusion>,
 }
 
 #[allow(clippy::derivable_impls)] // The default follows Vibeshine's Linux policy.
@@ -14,19 +59,41 @@ impl Default for ProductSettings {
     fn default() -> Self {
         Self {
             enabled: cfg!(target_os = "linux"),
+            auto_sync: false,
+            exclude_games: Vec::new(),
         }
     }
 }
 
 impl ProductSettings {
-    pub fn for_host(enabled: bool) -> Self {
-        Self {
-            enabled: if cfg!(target_os = "linux") {
-                true
-            } else {
-                enabled
-            },
+    pub fn for_host(mut settings: Self) -> Self {
+        if cfg!(target_os = "linux") {
+            settings.enabled = true;
         }
+        settings
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.exclude_games.len() > MAX_EXCLUSIONS {
+            return Err("at most 256 excluded Steam games are allowed");
+        }
+        let mut ids = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for exclusion in &self.exclude_games {
+            exclusion.validate()?;
+            if let Some(id) = &exclusion.id
+                && !ids.insert(id.clone())
+            {
+                return Err("duplicate Steam app ID exclusion");
+            }
+            if exclusion.id.is_none()
+                && let Some(name) = &exclusion.name
+                && !names.insert(name.to_lowercase())
+            {
+                return Err("duplicate Steam name exclusion");
+            }
+        }
+        Ok(())
     }
 
     pub fn from_product_document(payload: &Value) -> Result<(Self, u64), String> {
@@ -69,27 +136,28 @@ impl ProductSettings {
                         .ok_or("product settings values are missing")?,
                 )
                 .map_err(|_| "product settings values are malformed")?;
-                Ok((Self::for_host(settings.enabled), revision))
+                settings.validate().map_err(str::to_owned)?;
+                Ok((Self::for_host(settings), revision))
             }
             None => Err("product settings service omitted found".into()),
         }
     }
 
-    pub fn product_update_payload(self, expected_revision: u64) -> Value {
-        let settings = Self::for_host(self.enabled);
+    pub fn product_update_payload(&self, expected_revision: u64) -> Value {
+        let settings = Self::for_host(self.clone());
         json!({
             "action": "product_update",
             "expected_revision": expected_revision,
             "version": PRODUCT_SETTINGS_VERSION,
-            "values": {"enabled": settings.enabled},
+            "values": settings,
         })
     }
 
-    pub fn management_response(self, revision: u64) -> Value {
+    pub fn management_response(&self, revision: u64) -> Value {
         json!({
             "ok": true,
             "revision": revision,
-            "values": {"enabled": self.enabled},
+            "values": self,
         })
     }
 }
@@ -123,13 +191,15 @@ mod tests {
     fn defaults_disabled_and_generates_a_versioned_product_update() {
         let settings = ProductSettings::default();
         assert_eq!(settings.enabled, cfg!(target_os = "linux"));
+        assert!(!settings.auto_sync);
+        assert!(settings.exclude_games.is_empty());
         assert_eq!(
             settings.product_update_payload(0),
             json!({
                 "action":"product_update",
                 "expected_revision":0,
                 "version":1,
-                "values":{"enabled":cfg!(target_os = "linux")}
+                "values":{"enabled":cfg!(target_os = "linux"),"auto_sync":false,"exclude_games":[]}
             })
         );
     }
@@ -148,7 +218,14 @@ mod tests {
                 "ok":true,"found":true,"version":1,"revision":4,"values":{"enabled":true}
             }))
             .unwrap(),
-            (ProductSettings { enabled: true }, 4)
+            (
+                ProductSettings {
+                    enabled: true,
+                    auto_sync: false,
+                    exclude_games: Vec::new(),
+                },
+                4
+            )
         );
         for payload in [
             json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"enabled":true}}),
@@ -168,8 +245,94 @@ mod tests {
     #[test]
     fn product_settings_management_response_omits_storage_version() {
         assert_eq!(
-            ProductSettings { enabled: true }.management_response(8),
-            json!({"ok":true,"revision":8,"values":{"enabled":true}})
+            ProductSettings {
+                enabled: true,
+                auto_sync: true,
+                exclude_games: vec![Exclusion {
+                    id: Some("730".into()),
+                    name: Some("Counter-Strike 2".into()),
+                }],
+            }
+            .management_response(8),
+            json!({"ok":true,"revision":8,"values":{"enabled":true,"auto_sync":true,"exclude_games":[{"id":"730","name":"Counter-Strike 2"}]}})
+        );
+    }
+
+    #[test]
+    fn exclusions_are_bounded_validated_and_match_by_id_or_name_fallback() {
+        let by_id = Exclusion {
+            id: Some("730".into()),
+            name: Some("Renamed display label".into()),
+        };
+        assert!(by_id.matches(730, "Counter-Strike 2"));
+        assert!(!by_id.matches(731, "Renamed display label"));
+        let by_name = Exclusion {
+            id: None,
+            name: Some("Example Game".into()),
+        };
+        assert!(by_name.matches(12, "example game"));
+
+        for exclusions in [
+            vec![Exclusion {
+                id: None,
+                name: None,
+            }],
+            vec![Exclusion {
+                id: Some("0".into()),
+                name: None,
+            }],
+            vec![Exclusion {
+                id: Some("0730".into()),
+                name: None,
+            }],
+            vec![Exclusion {
+                id: None,
+                name: Some("  ".into()),
+            }],
+            vec![
+                Exclusion {
+                    id: Some("730".into()),
+                    name: None,
+                },
+                Exclusion {
+                    id: Some("730".into()),
+                    name: Some("Game".into()),
+                },
+            ],
+            vec![
+                Exclusion {
+                    id: None,
+                    name: Some("Game".into()),
+                },
+                Exclusion {
+                    id: None,
+                    name: Some("game".into()),
+                },
+            ],
+        ] {
+            assert!(
+                ProductSettings {
+                    exclude_games: exclusions,
+                    ..ProductSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let too_many = vec![
+            Exclusion {
+                id: None,
+                name: Some("Game".into())
+            };
+            MAX_EXCLUSIONS + 1
+        ];
+        assert!(
+            ProductSettings {
+                exclude_games: too_many,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
         );
     }
 }
