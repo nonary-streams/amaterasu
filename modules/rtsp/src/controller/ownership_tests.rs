@@ -322,6 +322,24 @@ fn successful_prepare_and_exact_retry_share_one_owned_allocation() {
 }
 
 #[test]
+fn ready_ticket_uses_configured_ping_timeout_after_preparation() {
+    for timeout in [250, 10_000] {
+        let mut endpoint = Endpoint::default();
+        let mut request = open("timeout-operation");
+        request["ping_timeout_ms"] = json!(timeout);
+        endpoint.enqueue(1, "owner", request);
+        let runtime = runtime(&mut endpoint);
+        let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+
+        finish_prepare(&mut controller, &runtime);
+
+        let record = controller.records.values().next().expect("prepared ticket");
+        assert!(record.state == State::Ready);
+        assert!((timeout..=timeout + 2).contains(&record.expires));
+    }
+}
+
+#[test]
 fn discovery_tokens_are_fresh_per_ticket_stable_on_retry_and_never_public() {
     let mut endpoint = Endpoint::default();
     endpoint.enqueue(1, "owner", discovery_open("discovery-one"));

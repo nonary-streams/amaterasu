@@ -258,6 +258,7 @@ impl Record {
                     config.stream_audio && config.permit_legacy_audio_iv_wrap;
                 let mut payload = json!({"action":"open","peer_ip":config.peer_ip,
                     "video_bind":config.video_bind,"audio_bind":config.audio_bind,"video":config.video,
+                    "ping_timeout_ms":config.ping_timeout_ms,
                     "stream_audio":config.stream_audio,
                     "audio":{"packet_ms":config.audio.packet_ms,"channels":2,"wire_payload_bytes":self.wire_audio_bytes},
                     "encryption":if config.encrypt_video || audio_encrypted {
@@ -274,7 +275,8 @@ impl Record {
             }
             Resource::Control => {
                 json!({"action":"open","peer_ip":config.peer_ip,"local_bind":config.control_bind,
-                "connect_data":config.connect_data,"key_hex":config.key_hex})
+                "connect_data":config.connect_data,"key_hex":config.key_hex,
+                "ping_timeout_ms":config.ping_timeout_ms})
             }
             Resource::Video => {
                 let start = self.start.as_ref().expect("validated start workflow");

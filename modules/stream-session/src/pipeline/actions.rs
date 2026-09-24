@@ -128,7 +128,7 @@ impl Pipeline {
             id,
             Some(request),
             Step::Open(Resource::Session),
-            now + remaining.min(15000),
+            now.saturating_add(remaining.min(self.settings.prepare_timeout_ms)),
         ));
     }
 

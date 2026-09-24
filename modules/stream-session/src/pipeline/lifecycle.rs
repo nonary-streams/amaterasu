@@ -352,7 +352,8 @@ impl Pipeline {
             Resource::Control => {
                 record.control_local = Some(local_address(payload, "local")?);
                 record.state = State::Prepared;
-                record.prepared_until = now + self.settings.prepare_timeout_ms;
+                record.prepared_until =
+                    now.saturating_add(u64::from(record.config.ping_timeout_ms));
                 return Ok(self.deliver_success(record, job, now, send));
             }
             Resource::Video => {

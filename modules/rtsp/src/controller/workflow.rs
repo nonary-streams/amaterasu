@@ -144,6 +144,7 @@ impl Controller {
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());
             record.state = State::Ready;
+            record.expires = now.saturating_add(u64::from(record.config.ping_timeout_ms));
             Ok(())
         })();
         if let Err(code) = prepared {

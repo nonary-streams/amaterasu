@@ -18,6 +18,25 @@ fn fixed_media_response_without_readiness_fields_remains_compatible() {
 }
 
 #[test]
+fn configured_ping_timeout_reaches_media_discovery_and_control() {
+    for selected in [0, 250, i32::MAX as u32] {
+        let mut host = Harness::new();
+        let mut request = prepare_discovery();
+        request["ping_timeout_ms"] = json!(selected);
+        assert_eq!(host.response(1, request)["state"], "prepared");
+        for resource in [Resource::Media, Resource::Control] {
+            let open = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| call.service == resource.service() && call.payload["action"] == "open")
+                .expect("component open");
+            assert_eq!(open.payload["ping_timeout_ms"], selected);
+        }
+    }
+}
+
+#[test]
 fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());
@@ -320,7 +339,9 @@ fn unauthenticated_start_is_retryable_without_hardware_or_new_allocations() {
 fn prepared_deadline_runs_cleanup_under_continuous_status_traffic() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
-    host.now += 6000;
+    let deadline = host.pipeline.records[&id].prepared_until;
+    assert_eq!(deadline - host.now, 10_000);
+    host.now = deadline;
     for request in 2..50 {
         host.broker
             .enqueue(request, "owner", json!({"action":"status","session":id}));

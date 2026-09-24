@@ -115,6 +115,8 @@ pub struct PrepareConfig {
     pub key_hex: String,
     pub key_id: u32,
     pub connect_data: u32,
+    #[serde(default = "default_ping_timeout_ms")]
+    pub ping_timeout_ms: u32,
     #[serde(default)]
     pub video: VideoWire,
     #[serde(default)]
@@ -131,6 +133,9 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if self.ping_timeout_ms > i32::MAX as u32 {
+            return Err("invalid_ping_timeout");
+        }
         self.validate_destination(allow_remote)?;
         self.validate_bindings(allow_remote)?;
         self.validate_identity()?;
@@ -355,6 +360,9 @@ pub enum Operation {
 fn yes() -> bool {
     true
 }
+fn default_ping_timeout_ms() -> u32 {
+    10_000
+}
 pub fn valid_name(value: &str) -> bool {
     valid_label(value, 128)
 }
@@ -397,6 +405,7 @@ mod tests {
         );
         assert!(settings.validate().is_ok());
         let config = prepare();
+        assert_eq!(config.ping_timeout_ms, 10_000);
         assert!(config.validate(false).is_ok());
         assert!(
             config.encrypt_audio && config.encrypt_video && !config.permit_legacy_audio_iv_wrap
@@ -424,6 +433,21 @@ mod tests {
             serde_json::to_value(&strict).unwrap()["max_reference_frames"],
             1
         );
+    }
+
+    #[test]
+    fn ping_timeout_accepts_zero_and_reference_maximum_but_rejects_overflow() {
+        for selected in [0, 250, i32::MAX as u32] {
+            let mut value = prepare_json();
+            value["ping_timeout_ms"] = json!(selected);
+            let config: PrepareConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config.ping_timeout_ms, selected);
+            assert!(config.validate(false).is_ok());
+        }
+        let mut value = prepare_json();
+        value["ping_timeout_ms"] = json!(i32::MAX as u64 + 1);
+        let config: PrepareConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.validate(false), Err("invalid_ping_timeout"));
     }
 
     #[test]

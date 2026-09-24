@@ -395,6 +395,8 @@ pub struct Open {
     pub key_hex: String,
     pub key_id: u32,
     pub connect_data: u32,
+    #[serde(default = "default_ping_timeout_ms")]
+    pub ping_timeout_ms: u32,
     #[serde(default = "default_stream_audio")]
     pub stream_audio: bool,
     #[serde(default = "default_minimum_fps_target")]
@@ -407,6 +409,9 @@ pub struct Open {
 }
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if self.ping_timeout_ms > i32::MAX as u32 {
+            return Err("invalid_ping_timeout");
+        }
         self.validate_operation_id()?;
         self.validate_destination(allow_remote)?;
         self.validate_capture()?;
@@ -469,6 +474,7 @@ impl Open {
             "key_hex": self.key_hex,
             "key_id": self.key_id,
             "connect_data": self.connect_data,
+            "ping_timeout_ms": self.ping_timeout_ms,
             "stream_audio": self.stream_audio,
             "video": {
                 "packet_size": self.profile.packet_size,
@@ -528,6 +534,9 @@ impl Open {
 
 fn default_stream_audio() -> bool {
     true
+}
+fn default_ping_timeout_ms() -> u32 {
+    10_000
 }
 
 fn default_minimum_fps_target() -> f64 {
@@ -630,6 +639,31 @@ mod tests {
 
     fn open() -> Open {
         serde_json::from_value(open_json()).unwrap()
+    }
+
+    #[test]
+    fn ping_timeout_reaches_stream_preparation_with_reference_bounds() {
+        let defaulted = open();
+        assert_eq!(defaulted.ping_timeout_ms, 10_000);
+        assert_eq!(
+            defaulted.prepare("default", None)["ping_timeout_ms"],
+            10_000
+        );
+
+        for selected in [0, 250, i32::MAX as u32] {
+            let mut value = open_json();
+            value["ping_timeout_ms"] = json!(selected);
+            let request: Open = serde_json::from_value(value).unwrap();
+            assert!(request.validate(false).is_ok());
+            assert_eq!(
+                request.prepare("selected", None)["ping_timeout_ms"],
+                selected
+            );
+        }
+        let mut invalid = open_json();
+        invalid["ping_timeout_ms"] = json!(i32::MAX as u64 + 1);
+        let invalid: Open = serde_json::from_value(invalid).unwrap();
+        assert_eq!(invalid.validate(false), Err("invalid_ping_timeout"));
     }
 
     fn open_operation_json() -> Value {
