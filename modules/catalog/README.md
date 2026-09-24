@@ -336,3 +336,24 @@ The catalog API provides durable snapshot mechanics, not source discovery or
 product policy. Providers remain responsible for validating their domain data,
 constructing `Entry` values, and declaring a scan complete only when every source
 page was read successfully.
+
+## Playnite Fullscreen launch entries
+
+Manual entries may use the typed launch value below. It contains no executable
+path, URI, or Playnite game ID; the fixed Playnite provider resolves its
+installation and owns the correlated launch ticket. `exit_timeout_seconds`
+defaults to 10 and is bounded to 0..=300.
+
+```json
+{"action":"create","expected_revision":0,"entry":{"name":"Fullscreen","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":10}}}
+```
+
+The Playnite provider also reconciles one reserved `Playnite (Fullscreen)` row
+through the internal `provider_playnite_fullscreen_entry` action. The authenticated
+Poll caller must be the fixed Playnite importer. The generated source ID is
+`fullscreen-entry`; no caller-supplied owner or source selector is accepted.
+The provider uses this row only when Playnite is enabled, on Windows, and
+`fullscreen_entry_enabled` is true. Generic catalog updates and deletes reject
+the generated row with `provider_entry_managed`. The action and reserved row
+are independent of Playnite library snapshots, so incomplete scans cannot
+create or remove them. Snapshot cleanup explicitly excludes this source ID.

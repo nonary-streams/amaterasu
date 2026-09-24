@@ -258,6 +258,200 @@ fn playnite_entry(name: &str) -> Value {
     })
 }
 
+#[test]
+fn playnite_fullscreen_synthetic_entry_is_fixed_cas_owned_and_survives_snapshots() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let created = backend.run_for(
+        &mut playnite,
+        json!({"action":"provider_playnite_fullscreen_entry","enabled":true}),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    assert_eq!(created["enabled"], true);
+    assert_eq!(created["changed"], true);
+    assert_eq!(created["revision"], 1);
+    let source_key = "~provider.entry:amaterasu.playnite:fullscreen-entry";
+    let entry_id = backend.entries[source_key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        backend.entries[&entry_id],
+        json!({
+            "name":"Playnite (Fullscreen)",
+            "description":"",
+            "tags":[],
+            "launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":10}
+        })
+    );
+    assert_eq!(backend.entries[source_key]["source_id"], "fullscreen-entry");
+
+    let replay = backend.run_for(
+        &mut playnite,
+        json!({"action":"provider_playnite_fullscreen_entry","enabled":true}),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["changed"], false);
+    assert_eq!(backend.metadata["revision"], 1);
+
+    let mut manual = Pipeline::default();
+    for action in ["update", "delete"] {
+        let payload = if action == "update" {
+            json!({
+                "action":"update",
+                "id":entry_id,
+                "expected_revision":1,
+                "entry":{"name":"Overwrite","launch":{"kind":"playnite_fullscreen"}}
+            })
+        } else {
+            json!({"action":"delete","id":entry_id,"expected_revision":1})
+        };
+        let rejected = backend.run_for(
+            &mut manual,
+            payload,
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(rejected["error"]["code"], "provider_entry_managed");
+        assert_eq!(backend.entries[&entry_id]["name"], "Playnite (Fullscreen)");
+    }
+
+    let unauthorized = backend.run_for(
+        &mut manual,
+        json!({"action":"provider_playnite_fullscreen_entry","enabled":false}),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(unauthorized["error"]["code"], "permission_denied");
+    assert!(
+        serde_json::from_value::<Operation>(json!({
+            "action":"provider_playnite_fullscreen_entry",
+            "enabled":true,
+            "owner":"amaterasu.steam"
+        }))
+        .is_err()
+    );
+
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("ordinary-refresh", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    let finished = backend.run_for(
+        &mut playnite,
+        snapshot_finish(
+            "ordinary-refresh",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            begin["revision"].as_u64().unwrap(),
+            0,
+            true,
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(backend.entries.contains_key(source_key));
+    assert!(backend.entries.contains_key(&entry_id));
+
+    let removed = backend.run_for(
+        &mut playnite,
+        json!({"action":"provider_playnite_fullscreen_entry","enabled":false}),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["enabled"], false);
+    assert_eq!(removed["changed"], true);
+    assert!(!backend.entries.contains_key(source_key));
+    assert!(!backend.entries.contains_key(&entry_id));
+
+    let manual_fullscreen = backend.run_for(
+        &mut manual,
+        json!({
+            "action":"create",
+            "expected_revision":removed["revision"],
+            "entry":{"name":"Manual Fullscreen","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":0}}
+        }),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual_fullscreen["ok"], true, "{manual_fullscreen}");
+    assert_eq!(
+        backend.entries[manual_fullscreen["id"].as_str().unwrap()]["launch"]["kind"],
+        "playnite_fullscreen"
+    );
+}
+
+#[test]
+fn playnite_snapshot_cannot_claim_the_reserved_fullscreen_source_or_launch_kind() {
+    let mut backend = Backend::default();
+    let mut playnite = playnite_importer();
+    let begin = backend.run_for(
+        &mut playnite,
+        snapshot_begin("forged-fullscreen", 1),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let forged_source = backend.run_for(
+        &mut playnite,
+        snapshot_batch(
+            "forged-fullscreen",
+            generation,
+            1,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![(
+                "fullscreen-entry",
+                json!({"name":"Forged","launch":{"kind":"playnite_fullscreen"}}),
+            )],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(forged_source["ok"], false);
+    assert_eq!(forged_source["error"]["code"], "duplicate_source_id");
+
+    let forged_kind = backend.run_for(
+        &mut playnite,
+        snapshot_batch(
+            "forged-fullscreen",
+            generation,
+            1,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![(
+                "playnite:manual",
+                json!({"name":"Forged","launch":{"kind":"playnite_fullscreen"}}),
+            )],
+        ),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(forged_kind["ok"], false);
+    assert_eq!(forged_kind["error"]["code"], "invalid_entry");
+    assert_eq!(backend.metadata["revision"], 0);
+    assert_eq!(backend.entries.len(), 1, "only provider state may exist");
+}
+
 fn snapshot_begin(sync_id: &str, source_revision: u64) -> Value {
     json!({
         "action":"provider_snapshot_begin",

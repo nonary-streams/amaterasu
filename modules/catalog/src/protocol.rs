@@ -90,6 +90,12 @@ pub enum Operation {
         #[serde(default)]
         remove_selection: bool,
     },
+    /// Reconcile Playnite's one reserved synthetic Fullscreen entry. The
+    /// importer identity and catalog owner come from the Poll caller and the
+    /// fixed startup import map; callers cannot choose either value.
+    ProviderPlayniteFullscreenEntry {
+        enabled: bool,
+    },
 }
 
 fn default_remove_stale() -> bool {
@@ -148,6 +154,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         | Operation::ProviderSnapshotInventory { .. }
         | Operation::ProviderSnapshotBatch { .. }
         | Operation::ProviderSnapshotFinish { .. }
+        | Operation::ProviderPlayniteFullscreenEntry { .. }
         | Operation::UpdateProviderOverrides { .. } => {
             return Err(error(
                 "invalid_request",

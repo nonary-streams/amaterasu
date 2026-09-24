@@ -121,9 +121,20 @@ pub enum Launch {
         #[serde(default = "default_playnite_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
     },
+    /// A manual Playnite Fullscreen launch. The authenticated Playnite provider
+    /// resolves the installation and process; catalog callers cannot supply a
+    /// path, URI, or game identifier.
+    PlayniteFullscreen {
+        #[serde(default = "default_playnite_fullscreen_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+    },
 }
 
 fn default_playnite_exit_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_playnite_fullscreen_exit_timeout_seconds() -> u64 {
     10
 }
 
@@ -186,6 +197,13 @@ impl Entry {
             validate_steam_install_directory(install_directory)?;
         }
         self.config_overrides.validate()?;
+        if matches!(&self.launch, Launch::PlayniteFullscreen { .. })
+            && (self.artwork.is_some()
+                || self.steam_id.is_some()
+                || self.steam_install_dir.is_some())
+        {
+            return Err("Playnite Fullscreen entries cannot contain Steam metadata");
+        }
         if !bounded_text(&self.name, 160) || self.name.trim().is_empty() {
             return Err("name must contain 1..160 bytes of printable text");
         }
@@ -242,6 +260,12 @@ impl Entry {
                     return Err("invalid Playnite exit timeout");
                 }
             }
+            Launch::PlayniteFullscreen {
+                exit_timeout_seconds,
+            } if *exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS => {
+                return Err("invalid Playnite Fullscreen exit timeout");
+            }
+            Launch::PlayniteFullscreen { .. } => {}
         }
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > 11_950) {
             return Err("encoded entry exceeds 11950 bytes");
@@ -516,6 +540,51 @@ mod tests {
         }))
         .unwrap();
         assert!(entry.validate().is_err());
+    }
+
+    #[test]
+    fn manual_fullscreen_target_is_typed_bounded_and_carries_no_provider_identity() {
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"Fullscreen",
+            "launch":{"kind":"playnite_fullscreen"}
+        }))
+        .unwrap();
+        entry.validate().unwrap();
+        assert!(matches!(
+            entry.launch,
+            Launch::PlayniteFullscreen {
+                exit_timeout_seconds: 10
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(entry).unwrap()["launch"],
+            json!({"kind":"playnite_fullscreen","exit_timeout_seconds":10})
+        );
+
+        for timeout in [0, 300] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Fullscreen",
+                "launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":timeout}
+            }))
+            .unwrap();
+            entry.validate().unwrap();
+        }
+        let invalid: Entry = serde_json::from_value(json!({
+            "name":"Fullscreen",
+            "launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":301}
+        }))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        for forged in [
+            json!({"name":"Fullscreen","launch":{"kind":"playnite_fullscreen","path":"C:/evil.exe"}}),
+            json!({"name":"Fullscreen","launch":{"kind":"playnite_fullscreen","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}}),
+            json!({"name":"Fullscreen","steam_id":"42","launch":{"kind":"playnite_fullscreen"}}),
+        ] {
+            if let Ok(entry) = serde_json::from_value::<Entry>(forged.clone()) {
+                assert!(entry.validate().is_err(), "accepted {forged}");
+            }
+        }
     }
 
     #[test]

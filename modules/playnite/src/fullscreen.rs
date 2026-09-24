@@ -13,6 +13,7 @@ const CLOSE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_RETENTION: Duration = Duration::from_secs(300);
 const MAX_SESSIONS: usize = 32;
 const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
+const ZERO_TIMEOUT_CLOSE_GRACE: Duration = Duration::from_secs(20);
 const MAX_TICKET_BYTES: usize = 48;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +292,23 @@ impl FullscreenSessions {
         processes: &[ProcessImage],
         request_close: impl FnOnce(&Installation, &[ProcessImage]) -> Result<usize, &'static str>,
     ) -> Value {
+        self.stop_with_at(
+            ticket,
+            exit_timeout_seconds,
+            processes,
+            Instant::now(),
+            request_close,
+        )
+    }
+
+    fn stop_with_at(
+        &mut self,
+        ticket: &str,
+        exit_timeout_seconds: u64,
+        processes: &[ProcessImage],
+        now: Instant,
+        request_close: impl FnOnce(&Installation, &[ProcessImage]) -> Result<usize, &'static str>,
+    ) -> Value {
         self.prune(Instant::now());
         if !valid_ticket(ticket) || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
             return error("invalid_request");
@@ -298,11 +316,15 @@ impl FullscreenSessions {
         let Some(session) = self.by_ticket.get_mut(ticket) else {
             return error("launch_not_found");
         };
-        let now = Instant::now();
         if !session.state.terminal() && session.state != State::Stopping {
             session.transition(State::Stopping, now);
             session.stop_requested_at = Some(now);
-            session.stop_deadline = now.checked_add(Duration::from_secs(exit_timeout_seconds));
+            let timeout = if exit_timeout_seconds == 0 {
+                ZERO_TIMEOUT_CLOSE_GRACE
+            } else {
+                Duration::from_secs(exit_timeout_seconds)
+            };
+            session.stop_deadline = now.checked_add(timeout);
         }
         if session.state == State::Stopping {
             if request_close(&session.installation, processes).is_err() {
@@ -563,8 +585,10 @@ mod tests {
             "fullscreen_session_limit"
         );
 
-        sessions.stop_with(&ticket, 1, &launcher, |_, _| Ok(0));
+        sessions.stop_with_at(&ticket, 0, &launcher, now + START_TIMEOUT, |_, _| Ok(0));
         sessions.advance(now + START_TIMEOUT + Duration::from_secs(2), &launcher);
+        assert_eq!(sessions.status(&ticket)["state"], "stopping");
+        sessions.advance(now + START_TIMEOUT + Duration::from_secs(21), &launcher);
         assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
         assert_eq!(sessions.active_count(), 1);
 

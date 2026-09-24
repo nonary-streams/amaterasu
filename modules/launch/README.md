@@ -43,6 +43,15 @@ catalog values reach the application provider. Typed Playnite catalog targets de
 to a separate 10-second exit timeout. The application runs preparation before the
 main executable and owes reverse-order undo for every run command it started.
 
+Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
+(default 10 seconds, maximum 300); they contain no request-controlled path or
+game ID. Launch delegates `fullscreen_start`, then polls the returned opaque
+ticket and activates the coordination session only after the provider reports
+`running`. Stop and ambiguous-start recovery use the same ticket/operation ID;
+the lease remains held until the provider confirms cleanup. A zero fullscreen
+timeout posts a safe close request and uses the provider's fixed 20-second
+recovery grace, rather than waiting indefinitely.
+
 Catalog lookup uses `resolve_launch` with the original runtime parent. Catalog
 accepts this action only from configured launch principals and selects the
 immutable runtime initiating principal's namespace. No supplied owner string is

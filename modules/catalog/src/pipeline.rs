@@ -21,6 +21,8 @@ const MAX_SCAN: usize = 256;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
 const STEAM_IMPORTER: &str = "amaterasu.steam";
+const PLAYNITE_FULLSCREEN_SOURCE_ID: &str = "fullscreen-entry";
+const PLAYNITE_FULLSCREEN_NAME: &str = "Playnite (Fullscreen)";
 type TransportResult = ModuleResult<Response>;
 
 struct Incoming {
@@ -55,6 +57,13 @@ enum Stage {
         operation: Operation,
         session: ProviderSession,
     },
+    ProviderFullscreenEntryRow(ProviderFullscreenEntry),
+    ProviderMarkerCheck {
+        operation: Operation,
+        state_revision: u64,
+        document: Document,
+        id: String,
+    },
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
     ProviderOverrideEntry(ProviderOverrideEntry),
@@ -65,6 +74,13 @@ struct ProviderOverrideEntry {
     id: String,
     expected_revision: u64,
     config_overrides: ConfigOverrides,
+    marker_key: String,
+    marker: Marker,
+}
+
+struct ProviderFullscreenEntry {
+    session: ProviderSession,
+    enabled: bool,
     marker_key: String,
     marker: Marker,
 }
@@ -176,11 +192,20 @@ impl Pipeline {
                 "provider inventory is reserved for the fixed Playnite importer",
             ));
         }
+        if matches!(operation, Operation::ProviderPlayniteFullscreenEntry { .. })
+            && caller != PLAYNITE_IMPORTER
+        {
+            return Err(error(
+                "permission_denied",
+                "Playnite Fullscreen entry is reserved for the fixed Playnite importer",
+            ));
+        }
         match operation {
             operation @ (Operation::ProviderSnapshotBegin { .. }
             | Operation::ProviderSnapshotInventory { .. }
             | Operation::ProviderSnapshotBatch { .. }
-            | Operation::ProviderSnapshotFinish { .. }) => {
+            | Operation::ProviderSnapshotFinish { .. }
+            | Operation::ProviderPlayniteFullscreenEntry { .. }) => {
                 let owner = self.import_principals.get(caller).ok_or_else(|| {
                     error(
                         "permission_denied",
@@ -260,6 +285,9 @@ impl Pipeline {
                     | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. } => Some(incoming.caller.clone()),
+                    Operation::ProviderPlayniteFullscreenEntry { .. } => {
+                        Some(incoming.caller.clone())
+                    }
                     Operation::UpdateProviderOverrides { .. } => Some(PLAYNITE_IMPORTER.into()),
                     _ => None,
                 },
@@ -275,6 +303,7 @@ impl Pipeline {
                     | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
                     | Operation::ProviderSnapshotFinish { .. }
+                    | Operation::ProviderPlayniteFullscreenEntry { .. }
                     | Operation::UpdateProviderOverrides { .. }
             ) {
                 self.start_provider(context, incoming.operation, &mut send)?;
@@ -354,6 +383,19 @@ impl Pipeline {
         };
         if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
             && let Operation::ProviderSnapshotInventory { after: Some(_), .. } = &operation
+            && let Some(session) = self.provider_sessions.get(caller).cloned()
+        {
+            let payload = json!({"action":"collection_get","collection":context.key,"key":null});
+            return self.submit(
+                context,
+                payload,
+                Stage::ProviderInventoryCheck { operation, session },
+                send,
+            );
+        }
+        if !matches!(operation, Operation::ProviderSnapshotBegin { .. })
+            && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
+            && matches!(operation, Operation::ProviderPlayniteFullscreenEntry { .. })
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
             let payload = json!({"action":"collection_get","collection":context.key,"key":null});
@@ -692,6 +734,9 @@ impl Pipeline {
                 config_overrides,
                 send,
             ),
+            Operation::ProviderPlayniteFullscreenEntry { enabled } => {
+                self.reconcile_playnite_fullscreen_entry(context, session, enabled, send)
+            }
             _ => complete(
                 send,
                 context.request_id,
@@ -938,6 +983,348 @@ impl Pipeline {
         )
     }
 
+    fn reconcile_playnite_fullscreen_entry(
+        &mut self,
+        context: Context,
+        session: ProviderSession,
+        enabled: bool,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if session.caller != PLAYNITE_IMPORTER {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "permission_denied",
+                    "only the fixed Playnite importer can reconcile its Fullscreen entry",
+                ),
+            );
+        }
+        let marker_key = entry_key(PLAYNITE_IMPORTER, PLAYNITE_FULLSCREEN_SOURCE_ID);
+        let Some(marker) = session.markers.get(&marker_key).cloned() else {
+            if !enabled {
+                return complete(
+                    send,
+                    context.request_id,
+                    json!({
+                        "ok":true,
+                        "enabled":false,
+                        "changed":false,
+                        "revision":session.document_revision,
+                    }),
+                );
+            }
+            return self.create_playnite_fullscreen_entry(context, session, send);
+        };
+        if !validate_marker(&marker, PLAYNITE_IMPORTER, PLAYNITE_FULLSCREEN_SOURCE_ID)
+            || session.markers.values().any(|other| {
+                other.entry_id == marker.entry_id && other.source_id != marker.source_id
+            })
+        {
+            return complete(send, context.request_id, malformed());
+        }
+        let payload = json!({
+            "action":"collection_get",
+            "collection":session.key,
+            "key":marker.entry_id,
+        });
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderFullscreenEntryRow(ProviderFullscreenEntry {
+                session,
+                enabled,
+                marker_key,
+                marker,
+            }),
+            send,
+        )
+    }
+
+    fn create_playnite_fullscreen_entry(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if session.entry_ids.len() >= MAX_ENTRIES || session.next_id == 0 {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "catalog entry limit reached"),
+            );
+        }
+        let entry_id = format!("app-{:016x}", session.next_id);
+        if session.entry_ids.contains(&entry_id)
+            || session
+                .markers
+                .values()
+                .any(|marker| marker.entry_id == entry_id)
+        {
+            return complete(
+                send,
+                context.request_id,
+                error("entry_conflict", "next catalog ID is already owned"),
+            );
+        }
+        let Some(next_id) = session.next_id.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "catalog ID space exhausted"),
+            );
+        };
+        let Some(document_revision) = session.document_revision.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "catalog revision exhausted"),
+            );
+        };
+        if session.state.generation == 0 {
+            // Markers require a generation. Seed provider state so the next
+            // complete snapshot advances normally instead of treating this
+            // fixed provider row as a future-generation marker.
+            session.state.generation = 1;
+            session.state.sync_id = "playnite-fullscreen-bootstrap".into();
+            session.provider_count = session.provider_count.saturating_add(1);
+        }
+        let entry = playnite_fullscreen_entry(ConfigOverrides::default());
+        let marker = Marker {
+            version: 1,
+            caller: PLAYNITE_IMPORTER.into(),
+            source_id: PLAYNITE_FULLSCREEN_SOURCE_ID.into(),
+            entry_id: entry_id.clone(),
+            generation: session.state.generation,
+            fingerprint: provider_entry_fingerprint(PLAYNITE_IMPORTER, &entry),
+            config_overrides: ConfigOverrides::default(),
+            detached: false,
+            remove_generation: None,
+            added_at_unix: unix_timestamp(),
+            source_flags: 0,
+            remove_reason: None,
+        };
+        let marker_key = entry_key(PLAYNITE_IMPORTER, PLAYNITE_FULLSCREEN_SOURCE_ID);
+        session.next_id = next_id;
+        session.document_revision = document_revision;
+        session.provider_count = session.provider_count.saturating_add(1);
+        session.entry_ids.insert(entry_id.clone());
+        session
+            .fingerprints
+            .insert(entry_id.clone(), marker.fingerprint.clone());
+        session.markers.insert(marker_key.clone(), marker.clone());
+        let reply = json!({
+            "ok":true,
+            "enabled":true,
+            "changed":true,
+            "revision":document_revision,
+        });
+        let request = collection_commit(
+            &session,
+            vec![
+                json!({"key":entry_id,"value":entry}),
+                json!({"key":marker_key,"value":marker_value(&marker)}),
+                json!({"key":state_key(PLAYNITE_IMPORTER),"value":session.state.clone()}),
+            ],
+        );
+        self.submit(
+            context,
+            request,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn finish_playnite_fullscreen_entry(
+        &mut self,
+        context: Context,
+        state_revision: u64,
+        payload: Value,
+        mut update: ProviderFullscreenEntry,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let Some(current_document_revision) = payload["metadata"]["revision"].as_u64() else {
+            return complete(send, context.request_id, malformed());
+        };
+        if state_revision != update.session.collection_revision
+            || current_document_revision != update.session.document_revision
+            || payload["metadata"]["next_id"].as_u64() != Some(update.session.next_id)
+            || payload["metadata"]["provider_count"].as_u64() != Some(update.session.provider_count)
+        {
+            self.provider_sessions.remove(PLAYNITE_IMPORTER);
+            return complete(
+                send,
+                context.request_id,
+                revision_conflict(current_document_revision),
+            );
+        }
+        let Some(found) = payload["found"].as_bool() else {
+            return complete(send, context.request_id, malformed());
+        };
+        let current_value = payload.get("value").filter(|value| !value.is_null());
+        if !found && current_value.is_some() {
+            return complete(send, context.request_id, malformed());
+        }
+        let current_entry = match current_value {
+            Some(value) => match serde_json::from_value::<Entry>(value.clone()) {
+                Ok(entry) if entry.validate().is_ok() => Some(entry),
+                _ => return complete(send, context.request_id, malformed()),
+            },
+            None => None,
+        };
+        let expected_entry = playnite_fullscreen_entry(update.marker.config_overrides.clone());
+        let entry_is_owned = current_entry.as_ref().is_some_and(|entry| {
+            entry.name == PLAYNITE_FULLSCREEN_NAME
+                && matches!(
+                    entry.launch,
+                    Launch::PlayniteFullscreen {
+                        exit_timeout_seconds: 10
+                    }
+                )
+                && entry.config_overrides == update.marker.config_overrides
+                && provider_entry_fingerprint(PLAYNITE_IMPORTER, entry) == update.marker.fingerprint
+                && provider_entry_fingerprint(PLAYNITE_IMPORTER, &expected_entry)
+                    == update.marker.fingerprint
+        });
+        if update.enabled {
+            if !found {
+                // A deleted storage row with a surviving fixed marker can be
+                // safely restored to its original ID and provider identity.
+                return self.restore_playnite_fullscreen_entry(
+                    context,
+                    update,
+                    current_document_revision,
+                    send,
+                );
+            }
+            if update.marker.detached || !entry_is_owned {
+                return complete(
+                    send,
+                    context.request_id,
+                    error(
+                        "provider_entry_changed",
+                        "reserved Playnite Fullscreen entry no longer matches its provider identity",
+                    ),
+                );
+            }
+            return complete(
+                send,
+                context.request_id,
+                json!({
+                    "ok":true,
+                    "enabled":true,
+                    "changed":false,
+                    "revision":current_document_revision,
+                }),
+            );
+        }
+
+        let delete_entry = !update.marker.detached && entry_is_owned;
+        let Some(provider_count) = update.session.provider_count.checked_sub(1) else {
+            return complete(send, context.request_id, malformed());
+        };
+        if delete_entry {
+            let Some(revision) = current_document_revision.checked_add(1) else {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("resource_exhausted", "catalog revision exhausted"),
+                );
+            };
+            update.session.document_revision = revision;
+            update.session.entry_ids.remove(&update.marker.entry_id);
+            update.session.fingerprints.remove(&update.marker.entry_id);
+        }
+        update.session.provider_count = provider_count;
+        update.session.markers.remove(&update.marker_key);
+        let mut edits = vec![json!({"key":update.marker_key,"value":null})];
+        if delete_entry {
+            edits.push(json!({"key":update.marker.entry_id,"value":null}));
+        }
+        let reply = json!({
+            "ok":true,
+            "enabled":false,
+            "changed":true,
+            "revision":update.session.document_revision,
+        });
+        let request = collection_commit(&update.session, edits);
+        self.submit(
+            context,
+            request,
+            Stage::ProviderSaving(ProviderSave {
+                session: update.session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn restore_playnite_fullscreen_entry(
+        &mut self,
+        context: Context,
+        mut update: ProviderFullscreenEntry,
+        current_document_revision: u64,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if update.marker.detached
+            || !session_entry_id_available(&update.session, &update.marker.entry_id)
+        {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "provider_entry_changed",
+                    "reserved Playnite Fullscreen entry cannot be safely restored",
+                ),
+            );
+        }
+        let entry = playnite_fullscreen_entry(update.marker.config_overrides.clone());
+        update.marker.fingerprint = provider_entry_fingerprint(PLAYNITE_IMPORTER, &entry);
+        let Some(revision) = current_document_revision.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "catalog revision exhausted"),
+            );
+        };
+        update.session.document_revision = revision;
+        update.session.fingerprints.insert(
+            update.marker.entry_id.clone(),
+            update.marker.fingerprint.clone(),
+        );
+        let reply = json!({
+            "ok":true,
+            "enabled":true,
+            "changed":true,
+            "revision":revision,
+        });
+        let request = collection_commit(
+            &update.session,
+            vec![
+                json!({"key":update.marker.entry_id,"value":entry}),
+                json!({"key":update.marker_key,"value":marker_value(&update.marker)}),
+            ],
+        );
+        self.submit(
+            context,
+            request,
+            Stage::ProviderSaving(ProviderSave {
+                session: update.session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
     fn begin_snapshot(
         &mut self,
         context: Context,
@@ -1056,6 +1443,8 @@ impl Pipeline {
             .chain(selection_remove_source_ids.iter().map(String::as_str))
         {
             if !valid_source_id(source_id)
+                || (session.caller == PLAYNITE_IMPORTER
+                    && source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
                 || session.seen_source_ids.contains(source_id)
                 || !source_ids.insert(source_id.to_owned())
             {
@@ -1077,8 +1466,12 @@ impl Pipeline {
                 mut entry,
                 source_flags,
             } = provider_entry;
-            let invalid_launch_owner = matches!(&entry.launch, Launch::Playnite { .. })
-                && session.caller != PLAYNITE_IMPORTER;
+            let invalid_launch_owner = matches!(
+                &entry.launch,
+                Launch::Playnite { .. } | Launch::PlayniteFullscreen { .. }
+            ) && session.caller != PLAYNITE_IMPORTER;
+            let invalid_fullscreen_import =
+                matches!(&entry.launch, Launch::PlayniteFullscreen { .. });
             let invalid_artwork_owner = match &entry.artwork {
                 Some(ArtworkReference::Steam { app_id, .. }) => {
                     session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
@@ -1110,7 +1503,7 @@ impl Pipeline {
                     ),
                 );
             }
-            if entry.validate().is_err() || invalid_launch_owner {
+            if entry.validate().is_err() || invalid_launch_owner || invalid_fullscreen_import {
                 return complete(
                     send,
                     context.request_id,
@@ -1380,6 +1773,8 @@ impl Pipeline {
         let mut stale_by_key = BTreeMap::new();
         for marker in session.markers.values().filter(|marker| {
             marker.caller == session.caller
+                && !(session.caller == PLAYNITE_IMPORTER
+                    && marker.source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
                 && ((remove_stale && marker.generation < generation)
                     || (marker.remove_generation == Some(generation)
                         && match marker.remove_reason {
@@ -1566,6 +1961,48 @@ impl Pipeline {
             }
             Stage::ProviderOverrideEntry(update) => {
                 self.finish_provider_override(context, state_revision, payload, update, send)
+            }
+            Stage::ProviderFullscreenEntryRow(update) => self.finish_playnite_fullscreen_entry(
+                context,
+                state_revision,
+                payload,
+                update,
+                send,
+            ),
+            Stage::ProviderMarkerCheck {
+                operation,
+                state_revision,
+                document,
+                id,
+            } => {
+                if payload["found"] != true && payload["found"] != false {
+                    return complete(send, context.request_id, malformed());
+                }
+                if let Some(value) = payload.get("value").filter(|value| !value.is_null()) {
+                    let marker: Marker = match serde_json::from_value(value.clone()) {
+                        Ok(marker)
+                            if validate_marker(
+                                &marker,
+                                PLAYNITE_IMPORTER,
+                                PLAYNITE_FULLSCREEN_SOURCE_ID,
+                            ) =>
+                        {
+                            marker
+                        }
+                        _ => return complete(send, context.request_id, malformed()),
+                    };
+                    if marker.entry_id == id && !marker.detached {
+                        return complete(
+                            send,
+                            context.request_id,
+                            error(
+                                "provider_entry_managed",
+                                "reserved Playnite Fullscreen entries can only be changed through provider settings",
+                            ),
+                        );
+                    }
+                }
+                self.operate(context, operation, state_revision, document, send)
             }
             Stage::ProviderInventoryCheck { operation, session } => {
                 if state_revision != session.collection_revision {
@@ -1769,6 +2206,25 @@ impl Pipeline {
                     }
                 }
                 context.provider_count = provider_count;
+                if let Operation::Update { id, .. } | Operation::Delete { id, .. } = &operation {
+                    let id = id.clone();
+                    let payload = json!({
+                        "action":"collection_get",
+                        "collection":context.key,
+                        "key":entry_key(PLAYNITE_IMPORTER, PLAYNITE_FULLSCREEN_SOURCE_ID),
+                    });
+                    return self.submit(
+                        context,
+                        payload,
+                        Stage::ProviderMarkerCheck {
+                            operation,
+                            state_revision,
+                            document,
+                            id,
+                        },
+                        send,
+                    );
+                }
                 let public_count = count.saturating_sub(context.provider_count);
                 if matches!(operation, Operation::Create { .. })
                     && public_count >= MAX_ENTRIES as u64
@@ -2041,6 +2497,29 @@ fn collection_commit(session: &ProviderSession, edits: Vec<Value>) -> Value {
         },
         "edits":edits,
     })
+}
+
+fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
+    Entry {
+        name: PLAYNITE_FULLSCREEN_NAME.into(),
+        description: String::new(),
+        tags: Vec::new(),
+        artwork: None,
+        steam_id: None,
+        steam_install_dir: None,
+        config_overrides,
+        launch: Launch::PlayniteFullscreen {
+            exit_timeout_seconds: 10,
+        },
+    }
+}
+
+fn session_entry_id_available(session: &ProviderSession, entry_id: &str) -> bool {
+    crate::model::parse_id(entry_id).is_some_and(|number| number < session.next_id)
+        && !session.markers.iter().any(|(key, marker)| {
+            marker.entry_id == entry_id
+                && key != &entry_key(PLAYNITE_IMPORTER, PLAYNITE_FULLSCREEN_SOURCE_ID)
+        })
 }
 
 fn snapshot_matches(

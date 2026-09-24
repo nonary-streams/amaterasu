@@ -5,6 +5,7 @@ mod connector;
 mod discovery;
 mod focus;
 mod fullscreen;
+mod fullscreen_entry;
 mod installation;
 mod launch;
 mod settings;
@@ -185,6 +186,7 @@ struct PlayniteModule {
     eligible_launch_ids: std::collections::BTreeSet<String>,
     launches: launch::Launches,
     fullscreen_launches: fullscreen::FullscreenSessions,
+    fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync,
     next_discovery: Instant,
 }
 
@@ -207,6 +209,7 @@ impl ManagedModule for PlayniteModule {
             eligible_launch_ids: std::collections::BTreeSet::new(),
             launches: launch::Launches::default(),
             fullscreen_launches: fullscreen::FullscreenSessions::default(),
+            fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync::default(),
             next_discovery: Instant::now(),
         })
     }
@@ -224,6 +227,7 @@ impl ManagedModule for PlayniteModule {
         self.catalog
             .advance(&self.runtime, self.settings_epoch)
             .map_err(|error| format!("Playnite catalog import failed: {error}"))?;
+        self.fullscreen_entry_sync.advance(&self.runtime)?;
         if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids() {
             self.eligible_launch_ids = launchable_game_ids;
         }
@@ -248,6 +252,8 @@ impl PlayniteModule {
         self.observed_settings_epoch = self.settings_epoch;
         self.eligible_launch_ids.clear();
         let settings = self.configuration.settings();
+        self.fullscreen_entry_sync
+            .set_desired(cfg!(windows) && settings.enabled && settings.fullscreen_entry_enabled);
         self.next_auto_sync = if settings.enabled && settings.auto_sync {
             Some(Instant::now())
         } else {
@@ -427,10 +433,6 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, launch::not_started_error("playnite_disabled"));
                 }
-                if !self.configuration.settings().fullscreen_entry_enabled {
-                    return self
-                        .complete(id, launch::not_started_error("fullscreen_entry_disabled"));
-                }
                 self.refresh_discovery_for_stop();
                 let installation = installation::Installation::discover_associated();
                 let response = self.fullscreen_launches.start(
@@ -580,6 +582,7 @@ impl PlayniteModule {
             "launchable_game_count":self.eligible_launch_ids.len(),
             "active_provider_launches":self.launches.active_count(),
             "active_fullscreen_sessions":self.fullscreen_launches.active_count(),
+            "fullscreen_entry_sync":self.fullscreen_entry_sync.status(),
             "catalog_sync":self.catalog.status(),
             "last_error":self.last_error,
             "revision":self.configuration.revision()

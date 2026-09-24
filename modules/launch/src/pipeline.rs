@@ -246,7 +246,10 @@ impl Pipeline {
         if let Some(record) = next {
             self.ingress_since_monitor = 0;
             self.monitor_after = record.launch_id;
-            let playnite = matches!(record.target, Some(LaunchTarget::Playnite { .. }));
+            let playnite = matches!(
+                record.target,
+                Some(LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. })
+            );
             self.job = Some(Workflow::monitor(record.launch_id, playnite));
         }
     }
@@ -413,7 +416,9 @@ impl Pipeline {
                 }
                 job.step = match record.target.as_ref() {
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
-                    Some(LaunchTarget::Playnite { .. }) => Step::StartPlaynite,
+                    Some(
+                        LaunchTarget::Playnite { .. } | LaunchTarget::PlayniteFullscreen { .. },
+                    ) => Step::StartPlaynite,
                     None => return self.dependency_failed(job, "invalid_catalog_response", send),
                 };
             }
@@ -579,6 +584,10 @@ impl Pipeline {
                 job.step = first_cleanup_step(record);
             }
             Step::FindPlaynite => {
+                if responses::provider_lookup_not_found(&payload, record) {
+                    job.step = Step::RecoverPlayniteStop;
+                    return self.retain(job);
+                }
                 if payload["ok"] == true {
                     let provider = match responses::provider_launch(&payload, record) {
                         Ok(provider) => provider,
@@ -604,6 +613,9 @@ impl Pipeline {
                 }
             }
             Step::RecoverPlayniteStop => {
+                if payload["ok"] == false && payload["code"] == "launch_not_found" {
+                    return self.cleanup_failed(job, "playnite_stop_unconfirmed", send);
+                }
                 record.provider_ticket = None;
                 let provider = match responses::provider_launch(&payload, record) {
                     Ok(provider) => provider,

@@ -94,6 +94,10 @@ pub enum CatalogLaunch {
         #[serde(default = "default_playnite_exit_timeout_seconds")]
         exit_timeout_seconds: u64,
     },
+    PlayniteFullscreen {
+        #[serde(default = "default_playnite_exit_timeout_seconds")]
+        exit_timeout_seconds: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -147,6 +151,9 @@ pub enum LaunchTarget {
         game_id: String,
         exit_timeout_seconds: u64,
     },
+    PlayniteFullscreen {
+        exit_timeout_seconds: u64,
+    },
 }
 
 fn default_playnite_exit_timeout_seconds() -> u64 {
@@ -176,6 +183,11 @@ impl LaunchTarget {
             Self::Playnite { .. } if steam_id.is_some() || steam_install_dir.is_some() => {
                 Err("invalid_catalog_response")
             }
+            Self::PlayniteFullscreen { .. }
+                if steam_id.is_some() || steam_install_dir.is_some() =>
+            {
+                Err("invalid_catalog_response")
+            }
             playnite => Ok(playnite),
         }
     }
@@ -198,6 +210,16 @@ impl LaunchTarget {
                 }
                 Ok(Self::Playnite {
                     game_id: game_id.to_ascii_lowercase(),
+                    exit_timeout_seconds,
+                })
+            }
+            CatalogLaunch::PlayniteFullscreen {
+                exit_timeout_seconds,
+            } => {
+                if exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
+                    return Err("invalid_catalog_response");
+                }
+                Ok(Self::PlayniteFullscreen {
                     exit_timeout_seconds,
                 })
             }
@@ -318,6 +340,7 @@ impl Executable {
                 Err("unsupported_launch_kind")
             }
             CatalogLaunch::Playnite { .. } => Err("unsupported_launch_kind"),
+            CatalogLaunch::PlayniteFullscreen { .. } => Err("unsupported_launch_kind"),
         }
     }
 }
@@ -639,6 +662,53 @@ mod tests {
                 ..
             }
         ));
+
+        let fullscreen = LaunchTarget::from_catalog(&json!({
+            "kind":"playnite_fullscreen",
+        }))
+        .unwrap();
+        assert!(matches!(
+            fullscreen,
+            LaunchTarget::PlayniteFullscreen {
+                exit_timeout_seconds: 10
+            }
+        ));
+        assert!(matches!(
+            LaunchTarget::from_catalog(&json!({
+                "kind":"playnite_fullscreen",
+                "exit_timeout_seconds":0
+            }))
+            .unwrap(),
+            LaunchTarget::PlayniteFullscreen {
+                exit_timeout_seconds: 0
+            }
+        ));
+        assert!(matches!(
+            LaunchTarget::from_catalog(&json!({
+                "kind":"playnite_fullscreen",
+                "exit_timeout_seconds":300
+            }))
+            .unwrap(),
+            LaunchTarget::PlayniteFullscreen {
+                exit_timeout_seconds: 300
+            }
+        ));
+        assert_eq!(
+            LaunchTarget::from_catalog(&json!({
+                "kind":"playnite_fullscreen",
+                "exit_timeout_seconds":301
+            }))
+            .unwrap_err(),
+            "invalid_catalog_response"
+        );
+        assert_eq!(
+            LaunchTarget::from_catalog(&json!({
+                "kind":"playnite_fullscreen",
+                "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"
+            }))
+            .unwrap_err(),
+            "invalid_catalog_response"
+        );
     }
 
     #[test]

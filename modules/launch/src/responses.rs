@@ -87,13 +87,29 @@ pub fn provider_start_not_started(payload: &Value) -> bool {
         && payload["launch_state"] == "not_started"
 }
 
+pub fn provider_lookup_not_found(payload: &Value, record: &Record) -> bool {
+    if !matches!(
+        record.target.as_ref(),
+        Some(LaunchTarget::PlayniteFullscreen { .. })
+    ) {
+        return false;
+    }
+    let Some(object) = payload.as_object() else {
+        return false;
+    };
+    object.len() == 2
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "ok" | "found"))
+        && payload["ok"] == true
+        && payload["found"] == false
+}
+
 pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunch, &'static str> {
     if payload["ok"] != true {
         return Err("invalid_provider_response");
     }
-    let Some(LaunchTarget::Playnite { game_id, .. }) = record.target.as_ref() else {
-        return Err("invalid_provider_response");
-    };
+    let target = record.target.as_ref().ok_or("invalid_provider_response")?;
     let ticket = payload["ticket"]
         .as_str()
         .filter(|ticket| {
@@ -103,11 +119,21 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
         .ok_or("invalid_provider_response")?;
-    let response_game_id = payload["game_id"]
-        .as_str()
-        .filter(|value| value.eq_ignore_ascii_case(game_id))
-        .ok_or("invalid_provider_response")?;
-    if response_game_id.to_ascii_lowercase() != *game_id
+    let identity_matches = match target {
+        LaunchTarget::Playnite { game_id, .. } => {
+            let response_game_id = payload["game_id"]
+                .as_str()
+                .filter(|value| value.eq_ignore_ascii_case(game_id))
+                .ok_or("invalid_provider_response")?;
+            response_game_id.to_ascii_lowercase() == *game_id
+        }
+        LaunchTarget::PlayniteFullscreen { .. } => {
+            (payload["started"] == true && payload.get("found").is_none())
+                || (payload["found"] == true && payload.get("started").is_none())
+        }
+        LaunchTarget::Executable(_) => false,
+    };
+    if !identity_matches
         || record
             .provider_ticket
             .as_deref()
@@ -125,10 +151,18 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
         _ => return Err("invalid_provider_response"),
     };
     let object = payload.as_object().ok_or("invalid_provider_response")?;
-    if object.len() != 4
+    let expected_keys: &[&str] = match target {
+        LaunchTarget::Playnite { .. } => &["ok", "ticket", "game_id", "state"],
+        LaunchTarget::PlayniteFullscreen { .. } if payload.get("started").is_some() => {
+            &["ok", "started", "ticket", "state"]
+        }
+        LaunchTarget::PlayniteFullscreen { .. } => &["ok", "found", "ticket", "state"],
+        LaunchTarget::Executable(_) => return Err("invalid_provider_response"),
+    };
+    if object.len() != expected_keys.len()
         || object
             .keys()
-            .any(|key| !matches!(key.as_str(), "ok" | "ticket" | "game_id" | "state"))
+            .any(|key| !expected_keys.contains(&key.as_str()))
     {
         return Err("invalid_provider_response");
     }

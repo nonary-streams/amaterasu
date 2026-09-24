@@ -34,8 +34,13 @@ The typed GUID launch route uses the bounded extension connection and ticket
 protocol. Fullscreen entry is a separate Windows-only launch action, authorized
 only to `amaterasu.launch`; management can read or update the persisted
 `fullscreen_entry_enabled` setting. It defaults to false, is preserved by older
-settings updates that omit it, and must be enabled before the launch action is
-accepted. Discovery resolves the current `playnite://` executable association,
+settings updates that omit it. The setting controls the generated catalog row;
+manual `playnite_fullscreen` catalog entries remain launchable when it is false.
+Both launch paths still require the provider's `enabled` setting. On Windows,
+the provider reconciles the fixed `Playnite (Fullscreen)` row on startup and
+settings changes, independent of auto-sync or library snapshots. The row is
+provider-owned and cannot be modified or deleted through generic catalog CRUD.
+Discovery resolves the current `playnite://` executable association,
 requires an existing canonical DesktopApp/FullscreenApp pair in one install
 directory, and never accepts a path from the request. A Desktop-only install is
 rejected before process creation, avoiding an untrackable session. Start returns
@@ -48,11 +53,18 @@ unexpected empty process scan leaves the ticket occupying the single-session
 slot; only a correlated stop that confirms the launcher and FullscreenApp have
 exited releases it.
 
-This does not yet create the synthetic catalog entry or implement the helper's
-active-game watchdog, return-to-fullscreen behavior, relaunch after game exit,
-or full extension focus/cleanup behavior. Playnite selection and age settings
-have Amaterasu-specific bounds, so this does not claim every reference input
-edge is identical.
+Manual `playnite_fullscreen` entries use only a typed launch kind and bounded
+`exit_timeout_seconds` (0..=300); callers cannot provide a path or game GUID.
+Zero still posts the safe close request and uses a fixed 20-second recovery
+grace rather than an unbounded wait. This is intentionally bounded and differs
+from ordinary executable timeout semantics.
+
+Remaining fullscreen parity includes the reference helper's active-game
+watchdog, return-to-fullscreen behavior, relaunch after game exit, and full
+extension-driven focus/cleanup behavior. Current focus retries are based on
+authenticated process paths but do not establish those missing lifecycle
+guarantees. Playnite selection and age settings have Amaterasu-specific bounds,
+so this does not claim every reference input edge is identical.
 
 Focus settings default to 3 confirmed focus attempts, a 15-second timeout, and
 `focus_exit_on_first=false`. Zero attempts or zero timeout disables focus;

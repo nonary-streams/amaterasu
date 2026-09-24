@@ -178,6 +178,57 @@ fn manual_mutations_cannot_forge_provider_owned_playnite_launch_targets() {
 }
 
 #[test]
+fn manual_fullscreen_launch_targets_are_editable_but_cannot_claim_provider_metadata() {
+    let fullscreen: Entry = serde_json::from_value(json!({
+        "name":"Playnite Fullscreen",
+        "launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":0}
+    }))
+    .unwrap();
+    let Change::Write { document, reply } = apply(
+        Operation::Create {
+            entry: fullscreen,
+            expected_revision: 0,
+        },
+        None,
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(reply["id"], "app-0000000000000001");
+    assert_eq!(reply["entry"]["launch"]["kind"], "playnite_fullscreen");
+
+    let edited: Entry = serde_json::from_value(json!({
+        "name":"Fullscreen with timeout",
+        "launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":300}
+    }))
+    .unwrap();
+    let Change::Write { document, .. } = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: edited,
+            expected_revision: document.revision,
+        },
+        Some(document),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        document.entries["app-0000000000000001"].name,
+        "Fullscreen with timeout"
+    );
+    assert!(document.validate().is_ok());
+
+    assert!(serde_json::from_value::<Operation>(json!({
+        "action":"create",
+        "expected_revision":0,
+        "source_id":"fullscreen-entry",
+        "entry":{"name":"Forged","provider_source":"amaterasu.playnite","launch":{"kind":"playnite_fullscreen"}}
+    }))
+    .is_err());
+}
+
+#[test]
 fn manual_mutations_cannot_forge_provider_owned_steam_artwork() {
     let mut artwork_entry = entry("Steam artwork");
     artwork_entry.artwork = Some(crate::model::ArtworkReference::Steam {

@@ -83,7 +83,10 @@ impl Workflow {
                 exit_timeout_seconds,
                 ..
             // The provider may spend up to two 8-second authenticated pipe
-            // connections before its bounded stop wait, plus one poll interval.
+                // connections before its bounded stop wait, plus one poll interval.
+                }) => exit_timeout_seconds.saturating_add(21).min(321),
+            Some(LaunchTarget::PlayniteFullscreen {
+                exit_timeout_seconds,
             }) => exit_timeout_seconds.saturating_add(21).min(321),
             _ => 20,
         };
@@ -121,52 +124,81 @@ impl Workflow {
                     json!({"action":"launch","operation_id":record.process_operation,"executable":executable.program,"args":executable.arguments,"cwd":executable.working_directory,"auto_detach":executable.auto_detach,"wait_all":executable.wait_all,"exit_timeout_seconds":executable.exit_timeout_seconds,"steam_id":executable.steam_id,"steam_install_dir":executable.steam_install_dir,"detached":executable.detached,"environment":environment,"preparation":executable.preparation}),
                 )
             }
-            Step::StartPlaynite => {
-                let Some(LaunchTarget::Playnite { game_id, .. }) = record.target.as_ref() else {
-                    return Err("invalid_workflow");
-                };
-                (
+            Step::StartPlaynite => match record.target.as_ref() {
+                Some(LaunchTarget::Playnite { game_id, .. }) => (
                     PLAYNITE,
                     json!({"action":"launch_start","operation_id":record.process_operation,"game_id":game_id}),
-                )
-            }
-            Step::FindPlaynite => (
-                PLAYNITE,
-                json!({"action":"launch_lookup","operation_id":record.process_operation}),
-            ),
-            Step::RecoverPlayniteStop => {
-                let Some(LaunchTarget::Playnite {
+                ),
+                Some(LaunchTarget::PlayniteFullscreen { .. }) => (
+                    PLAYNITE,
+                    json!({"action":"fullscreen_start","operation_id":record.process_operation}),
+                ),
+                _ => return Err("invalid_workflow"),
+            },
+            Step::FindPlaynite => match record.target.as_ref() {
+                Some(LaunchTarget::Playnite { .. }) => (
+                    PLAYNITE,
+                    json!({"action":"launch_lookup","operation_id":record.process_operation}),
+                ),
+                Some(LaunchTarget::PlayniteFullscreen { .. }) => (
+                    PLAYNITE,
+                    json!({"action":"fullscreen_lookup","operation_id":record.process_operation}),
+                ),
+                _ => return Err("invalid_workflow"),
+            },
+            Step::RecoverPlayniteStop => match record.target.as_ref() {
+                Some(LaunchTarget::Playnite {
                     game_id,
                     exit_timeout_seconds,
-                }) = record.target.as_ref()
-                else {
-                    return Err("invalid_workflow");
-                };
-                (
+                }) => (
                     PLAYNITE,
                     json!({"action":"launch_recover_stop","operation_id":record.process_operation,"game_id":game_id,"exit_timeout_seconds":exit_timeout_seconds}),
-                )
-            }
+                ),
+                Some(LaunchTarget::PlayniteFullscreen {
+                    exit_timeout_seconds,
+                }) => (
+                    PLAYNITE,
+                    json!({"action":"fullscreen_recover_stop","operation_id":record.process_operation,"exit_timeout_seconds":exit_timeout_seconds}),
+                ),
+                _ => return Err("invalid_workflow"),
+            },
             Step::StopPlaynite => {
-                let (
+                let Some(ticket) = record.provider_ticket.as_deref() else {
+                    return Err("invalid_workflow");
+                };
+                match record.target.as_ref() {
                     Some(LaunchTarget::Playnite {
                         exit_timeout_seconds,
                         ..
-                    }),
-                    Some(ticket),
-                ) = (record.target.as_ref(), record.provider_ticket.as_deref())
-                else {
-                    return Err("invalid_workflow");
-                };
-                (
-                    PLAYNITE,
-                    json!({"action":"launch_stop","ticket":ticket,"exit_timeout_seconds":exit_timeout_seconds}),
-                )
+                    }) => (
+                        PLAYNITE,
+                        json!({"action":"launch_stop","ticket":ticket,"exit_timeout_seconds":exit_timeout_seconds}),
+                    ),
+                    Some(LaunchTarget::PlayniteFullscreen {
+                        exit_timeout_seconds,
+                    }) => (
+                        PLAYNITE,
+                        json!({"action":"fullscreen_stop","ticket":ticket,"exit_timeout_seconds":exit_timeout_seconds}),
+                    ),
+                    _ => return Err("invalid_workflow"),
+                }
             }
-            Step::AwaitPlayniteStart | Step::MonitorPlaynite | Step::AwaitPlayniteStop => (
-                PLAYNITE,
-                json!({"action":"launch_status","ticket":record.provider_ticket.as_deref().ok_or("invalid_workflow")?}),
-            ),
+            Step::AwaitPlayniteStart | Step::MonitorPlaynite | Step::AwaitPlayniteStop => {
+                let ticket = record
+                    .provider_ticket
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                match record.target.as_ref() {
+                    Some(LaunchTarget::Playnite { .. }) => {
+                        (PLAYNITE, json!({"action":"launch_status","ticket":ticket}))
+                    }
+                    Some(LaunchTarget::PlayniteFullscreen { .. }) => (
+                        PLAYNITE,
+                        json!({"action":"fullscreen_status","ticket":ticket}),
+                    ),
+                    _ => return Err("invalid_workflow"),
+                }
+            }
             Step::Activate => (
                 SESSION,
                 json!({"action":"activate","session_id":session.ok_or("invalid_workflow")?}),
