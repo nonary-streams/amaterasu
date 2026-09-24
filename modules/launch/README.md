@@ -27,12 +27,22 @@ Catalog entries with `launch.kind:"executable"` use the application provider's
 native process path. Fixed-owner Playnite entries use the typed `launch.kind:"playnite"`
 target and a validated Playnite GUID; launch sends that ID to the Playnite extension
 and never turns it into an executable or URI. Bundle/URI `application` entries,
-detached launchers, and streaming startup remain unsupported. Executable paths must
-be absolute on the current native host and fit application limits (1024-byte program/cwd,
-64 arguments, 1024 bytes each, 8192 total argument bytes); a catalog entry valid as
-cross-platform metadata may still be unsupported on this host. The application provider
-enforces its remaining native launch constraints, including rejection of implicit
-batch executables.
+detached launchers, and streaming startup remain unsupported. A catalog executable
+may be an absolute native path or a bare command resolved through `PATH`; relative
+paths containing a directory component are rejected. Lookup uses absolute `PATH`
+entries only, is capped at 128 entries and 16 KiB, and on Windows considers `.com`
+and `.exe` for extensionless names. Implicit `.bat` and `.cmd` executables remain
+rejected. Executable and working-directory values support bounded `$()` references
+to configured launch environment values, then host environment values; an unset
+reference expands to empty, malformed references fail admission, and `$$` produces
+a literal dollar. Matching outer single or double quotes are trimmed from these two
+path fields. Expansion does not interpret shell syntax and does not apply to
+arguments, detached commands, preparation commands, or Steam metadata. Resolved
+program/cwd paths must fit application limits (1024 bytes); arguments remain limited
+to 64 values, 1024 bytes each, and 8192 total bytes. A catalog entry valid as
+cross-platform metadata may still be unsupported on this host. The application
+provider enforces its remaining native launch constraints, including rejection of
+implicit batch executables.
 
 A preparation plan contains at most eight ordered `run` commands with optional
 paired `undo` commands. Global steps are prepended to catalog steps unless the
@@ -56,10 +66,11 @@ has stopped before running reverse-order undo, and retains the session lease if
 undo fails so the caller can retry. Executable launches merge global steps before
 catalog steps, and owe reverse-order undo for every run command they started.
 
-This payload does not implement Vibeshine's raw `do`/`undo` command strings,
-per-command `elevated`, or `$()` environment interpolation. A settings bridge must
-map configured commands to this explicit executable/argv model; these semantics
-remain a parity gap.
+This payload does not implement Vibeshine's raw `do`/`undo` command strings or
+per-command `elevated`. A settings bridge must map configured commands to this
+explicit executable/argv model; these semantics remain a parity gap. Application
+launch arguments, detached commands, and preparation command fields also do not
+receive Vibeshine's general `$()` expansion.
 
 Typed `playnite_fullscreen` catalog targets carry only a bounded exit timeout
 (default 10 seconds, maximum 300); they contain no request-controlled path or

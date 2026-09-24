@@ -384,9 +384,10 @@ impl Pipeline {
                     }
                     CatalogSelection::Initiator => {}
                 }
-                match LaunchTarget::from_catalog_entry(
+                match LaunchTarget::from_catalog_entry_with_environment(
                     &payload["entry"],
                     &record.global_preparation,
+                    &self.environment,
                 ) {
                     Ok(target) => record.target = Some(target),
                     Err(code) => return self.dependency_failed(job, code, send),

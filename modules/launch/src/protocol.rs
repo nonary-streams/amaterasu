@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 const MAX_PREPARATION_STEPS: usize = 8;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
@@ -10,6 +11,8 @@ const DEFAULT_AUTO_DETACH: bool = true;
 const DEFAULT_WAIT_ALL: bool = true;
 const DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_PLAYNITE_EXIT_TIMEOUT_SECONDS: u64 = 10;
+const MAX_SEARCH_PATH_BYTES: usize = 16_384;
+const MAX_SEARCH_PATH_ENTRIES: usize = 128;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -170,9 +173,18 @@ fn default_playnite_exit_timeout_seconds() -> u64 {
 }
 
 impl LaunchTarget {
+    #[cfg(test)]
     pub fn from_catalog_entry(
         entry: &Value,
         global_preparation: &[PreparationStep],
+    ) -> Result<Self, &'static str> {
+        Self::from_catalog_entry_with_environment(entry, global_preparation, &BTreeMap::new())
+    }
+
+    pub fn from_catalog_entry_with_environment(
+        entry: &Value,
+        global_preparation: &[PreparationStep],
+        environment: &BTreeMap<String, String>,
     ) -> Result<Self, &'static str> {
         let launch = entry.get("launch").ok_or("invalid_catalog_response")?;
         let exclude_global_preparation = catalog_excludes_global_preparation(entry)?;
@@ -187,7 +199,8 @@ impl LaunchTarget {
         {
             return Err("invalid_catalog_response");
         }
-        match Self::from_catalog(launch)? {
+        let application_working_directory = catalog_working_directory(launch, environment)?;
+        match Self::from_catalog_with_environment(launch, environment)? {
             Self::Executable(mut executable) => {
                 if !exclude_global_preparation {
                     if global_preparation.len() + executable.preparation.len()
@@ -195,7 +208,6 @@ impl LaunchTarget {
                     {
                         return Err("preparation_limit_exceeded");
                     }
-                    let application_working_directory = catalog_working_directory(launch)?;
                     let mut preparation = global_preparation.to_vec();
                     apply_preparation_working_directories(
                         &mut preparation,
@@ -243,12 +255,20 @@ impl LaunchTarget {
         }
     }
 
+    #[cfg(test)]
     pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
+        Self::from_catalog_with_environment(value, &BTreeMap::new())
+    }
+
+    fn from_catalog_with_environment(
+        value: &Value,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Self, &'static str> {
         let launch: CatalogLaunch =
             serde_json::from_value(value.clone()).map_err(|_| "invalid_catalog_response")?;
         match launch {
             CatalogLaunch::Executable { .. } => {
-                Executable::from_catalog(value).map(Self::Executable)
+                Executable::from_catalog_with_environment(value, environment).map(Self::Executable)
             }
             CatalogLaunch::Playnite {
                 game_id,
@@ -294,7 +314,10 @@ fn catalog_excludes_global_preparation(entry: &Value) -> Result<bool, &'static s
     value.as_bool().ok_or("invalid_catalog_response")
 }
 
-fn catalog_working_directory(launch: &Value) -> Result<Option<String>, &'static str> {
+fn catalog_working_directory(
+    launch: &Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<String>, &'static str> {
     let canonical = launch.get("working_directory");
     let compatibility = launch.get("working-dir");
     let value = match (canonical, compatibility) {
@@ -304,7 +327,7 @@ fn catalog_working_directory(launch: &Value) -> Result<Option<String>, &'static 
     };
     match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(directory)) => Ok(Some(directory.clone())),
+        Some(Value::String(directory)) => resolve_working_directory(directory, environment),
         Some(_) => Err("invalid_catalog_response"),
     }
 }
@@ -314,6 +337,226 @@ fn optional_catalog_string(entry: &Value, key: &str) -> Result<Option<String>, &
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err("invalid_catalog_response"),
+    }
+}
+
+fn resolve_executable(
+    configured_value: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, &'static str> {
+    let expanded = expand_environment_references(configured_value, environment)?;
+    let executable = trim_path_quotes(&expanded);
+    if executable.is_empty() || executable.len() > 1_024 || executable.chars().any(char::is_control)
+    {
+        return Err("unsupported_launch_spec");
+    }
+
+    let executable_path = Path::new(executable);
+    let resolved = if executable_path.is_absolute() {
+        executable.to_owned()
+    } else if is_bare_command(executable) {
+        find_path_executable(executable, environment)
+            .and_then(|path| path.to_str().map(str::to_owned))
+            .ok_or("unsupported_launch_spec")?
+    } else {
+        return Err("unsupported_launch_spec");
+    };
+    if !valid_native_path(&resolved) || resolved.chars().any(char::is_control) {
+        return Err("unsupported_launch_spec");
+    }
+    Ok(resolved)
+}
+
+fn resolve_working_directory(
+    configured_value: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<String>, &'static str> {
+    let expanded = expand_environment_references(configured_value, environment)?;
+    let directory = trim_path_quotes(&expanded);
+    if directory.is_empty() {
+        return Ok(None);
+    }
+    if !valid_native_path(directory) || directory.chars().any(char::is_control) {
+        return Err("unsupported_launch_spec");
+    }
+    Ok(Some(directory.to_owned()))
+}
+
+fn expand_environment_references(
+    value: &str,
+    configured_environment: &BTreeMap<String, String>,
+) -> Result<String, &'static str> {
+    let mut expanded = String::new();
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '$' {
+            let mut buffer = [0; 4];
+            append_bounded(&mut expanded, character.encode_utf8(&mut buffer))?;
+            continue;
+        }
+
+        match characters.peek() {
+            Some('(') => {
+                characters.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for character in characters.by_ref() {
+                    match character {
+                        ')' => {
+                            closed = true;
+                            break;
+                        }
+                        '(' => return Err("unsupported_launch_spec"),
+                        _ => {
+                            name.push(character);
+                            if name.len() > 128 {
+                                return Err("unsupported_launch_spec");
+                            }
+                        }
+                    }
+                }
+                if !closed
+                    || name.is_empty()
+                    || name.len() > 128
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Err("unsupported_launch_spec");
+                }
+                let value = environment_value(&name, configured_environment).unwrap_or_default();
+                append_bounded(&mut expanded, &value)?;
+            }
+            Some('$') => {
+                characters.next();
+                append_bounded(&mut expanded, "$")?;
+            }
+            _ => append_bounded(&mut expanded, "$")?,
+        }
+    }
+    Ok(expanded)
+}
+
+fn append_bounded(output: &mut String, value: &str) -> Result<(), &'static str> {
+    if output.len().saturating_add(value.len()) > 1_024 {
+        return Err("unsupported_launch_spec");
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn environment_value(
+    name: &str,
+    configured_environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    #[cfg(windows)]
+    let configured = configured_environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone());
+    #[cfg(not(windows))]
+    let configured = configured_environment.get(name).cloned();
+
+    configured.or_else(|| std::env::var(name).ok())
+}
+
+fn path_environment_value(configured_environment: &BTreeMap<String, String>) -> Option<OsString> {
+    #[cfg(windows)]
+    let configured = configured_environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| OsString::from(value));
+    #[cfg(not(windows))]
+    let configured = configured_environment.get("PATH").map(OsString::from);
+
+    configured.or_else(|| std::env::var_os("PATH"))
+}
+
+fn find_path_executable(
+    executable: &str,
+    configured_environment: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    let search_path = path_environment_value(configured_environment)?;
+    if search_path.len() > MAX_SEARCH_PATH_BYTES {
+        return None;
+    }
+    let directories = std::env::split_paths(&search_path)
+        .take(MAX_SEARCH_PATH_ENTRIES + 1)
+        .collect::<Vec<_>>();
+    if directories.len() > MAX_SEARCH_PATH_ENTRIES {
+        return None;
+    }
+    let candidates = path_executable_names(executable);
+
+    directories.into_iter().find_map(|directory| {
+        // Relative PATH entries include the current directory implicitly and
+        // can select a different executable when the service's cwd changes.
+        if !directory.is_absolute() {
+            return None;
+        }
+        candidates.iter().find_map(|name| {
+            let candidate = directory.join(name);
+            if is_executable_file(&candidate) {
+                if candidate.to_str().is_some_and(|path| path.len() <= 1_024) {
+                    return Some(candidate);
+                }
+                None
+            } else {
+                None
+            }
+        })
+    })
+}
+
+#[cfg(windows)]
+fn path_executable_names(executable: &str) -> Vec<OsString> {
+    if Path::new(executable).extension().is_some() {
+        vec![OsString::from(executable)]
+    } else {
+        [".com", ".exe"]
+            .into_iter()
+            .map(|extension| OsString::from(format!("{executable}{extension}")))
+            .collect()
+    }
+}
+
+#[cfg(not(windows))]
+fn path_executable_names(executable: &str) -> Vec<OsString> {
+    vec![OsString::from(executable)]
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn is_bare_command(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains(':')
+}
+
+fn trim_path_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'"' | b'\'') && bytes.last() == Some(&bytes[0]) {
+        &value[1..value.len() - 1]
+    } else {
+        value
     }
 }
 
@@ -358,7 +601,15 @@ fn valid_guid(value: &str) -> bool {
 }
 
 impl Executable {
+    #[cfg(test)]
     pub fn from_catalog(value: &Value) -> Result<Self, &'static str> {
+        Self::from_catalog_with_environment(value, &BTreeMap::new())
+    }
+
+    fn from_catalog_with_environment(
+        value: &Value,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Self, &'static str> {
         let launch: CatalogLaunch =
             serde_json::from_value(value.clone()).map_err(|_| "invalid_catalog_response")?;
         match launch {
@@ -376,7 +627,12 @@ impl Executable {
                 let wait_all = wait_all.unwrap_or(DEFAULT_WAIT_ALL);
                 let exit_timeout_seconds =
                     exit_timeout_seconds.unwrap_or(DEFAULT_EXECUTABLE_EXIT_TIMEOUT_SECONDS);
-                let working_directory = working_directory.filter(|directory| !directory.is_empty());
+                let program = resolve_executable(&program, environment)?;
+                let working_directory = working_directory
+                    .as_deref()
+                    .map(|directory| resolve_working_directory(directory, environment))
+                    .transpose()?
+                    .flatten();
                 if !valid_native_path(&program)
                     || !valid_arguments(&arguments)
                     || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS
@@ -687,6 +943,18 @@ fn valid_configured_command(command: &ConfiguredCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("{label}-{}-{timestamp}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
 
     fn catalog_launch(preparation: Value) -> Value {
         json!({
@@ -1115,6 +1383,130 @@ mod tests {
                 .as_deref(),
             Some(undo_directory.to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn executable_and_working_directory_expand_environment_and_trim_wrapping_quotes() {
+        let source_executable = std::env::current_exe().unwrap();
+        let directory = unique_test_directory("amaterasu path expansion test");
+        let executable = directory.join(source_executable.file_name().unwrap());
+        std::fs::copy(source_executable, &executable).unwrap();
+        let filename = executable.file_name().unwrap().to_str().unwrap();
+        let configured_program = format!(
+            "\"$(AMATERASU_TEST_EXECUTABLE_DIR){}{}\"",
+            std::path::MAIN_SEPARATOR,
+            filename
+        );
+        let configured_directory = "\"$(AMATERASU_TEST_EXECUTABLE_DIR)\"";
+        let environment = BTreeMap::from([(
+            "AMATERASU_TEST_EXECUTABLE_DIR".to_owned(),
+            directory.to_string_lossy().into_owned(),
+        )]);
+        let launch = json!({
+            "kind":"executable",
+            "program":configured_program,
+            "arguments":["$(AMATERASU_TEST_EXECUTABLE_DIR)","$$(LITERAL)"],
+            "working_directory":configured_directory,
+        });
+
+        let parsed = Executable::from_catalog_with_environment(&launch, &environment).unwrap();
+        assert_eq!(parsed.program, executable.to_string_lossy());
+        assert_eq!(parsed.working_directory.as_deref(), directory.to_str());
+        assert_eq!(
+            parsed.arguments,
+            ["$(AMATERASU_TEST_EXECUTABLE_DIR)", "$$(LITERAL)"]
+        );
+
+        let global = preparation_step(executable.to_str().unwrap(), "global");
+        let entry = json!({"launch":launch});
+        let LaunchTarget::Executable(merged) = LaunchTarget::from_catalog_entry_with_environment(
+            &entry,
+            std::slice::from_ref(&global),
+            &environment,
+        )
+        .unwrap() else {
+            panic!("expected executable target");
+        };
+        assert_eq!(merged.preparation[0].run.cwd.as_deref(), directory.to_str());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unset_and_malformed_environment_references_fail_or_expand_without_shelling() {
+        let environment = BTreeMap::from([("ROOT".to_owned(), "/safe/game folder".to_owned())]);
+        assert_eq!(
+            expand_environment_references("prefix-$(AMATERASU_MISSING_92831)-suffix", &environment)
+                .unwrap(),
+            "prefix--suffix"
+        );
+        assert_eq!(
+            expand_environment_references("$$(ROOT);$(ROOT)", &environment).unwrap(),
+            "$(ROOT);/safe/game folder"
+        );
+        assert_eq!(
+            expand_environment_references("$(ROOT);touch should-not-run", &environment).unwrap(),
+            "/safe/game folder;touch should-not-run"
+        );
+        assert_eq!(
+            resolve_executable("$(AMATERASU_MISSING_92831)", &environment),
+            Err("unsupported_launch_spec")
+        );
+        assert_eq!(
+            resolve_working_directory("$(AMATERASU_MISSING_92831)", &environment),
+            Ok(None)
+        );
+        for malformed in ["$(ROOT", "$(ROOT(NESTED))", "$()"] {
+            assert_eq!(
+                expand_environment_references(malformed, &environment),
+                Err("unsupported_launch_spec")
+            );
+        }
+        let oversized_environment = BTreeMap::from([("ROOT".to_owned(), "x".repeat(1_025))]);
+        assert_eq!(
+            expand_environment_references("$(ROOT)", &oversized_environment),
+            Err("unsupported_launch_spec")
+        );
+    }
+
+    #[test]
+    fn bare_executable_lookup_uses_configured_absolute_path_and_rejects_relative_inputs() {
+        let directory = unique_test_directory("amaterasu-launch-path-test");
+        let executable_name = if cfg!(windows) {
+            "amaterasu-path-probe.exe"
+        } else {
+            "amaterasu-path-probe"
+        };
+        let executable = directory.join(executable_name);
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let path_name = if cfg!(windows) {
+            "amaterasu-path-probe"
+        } else {
+            executable_name
+        };
+        let environment =
+            BTreeMap::from([("PATH".to_owned(), directory.to_string_lossy().into_owned())]);
+
+        let resolved = resolve_executable(path_name, &environment).unwrap();
+        assert_eq!(Path::new(&resolved), executable);
+        assert_eq!(
+            inferred_working_directory(&resolved).as_deref(),
+            directory.to_str()
+        );
+        assert_eq!(
+            resolve_executable("subfolder/amaterasu-path-probe", &environment),
+            Err("unsupported_launch_spec")
+        );
+        let relative_path_environment = BTreeMap::from([("PATH".to_owned(), ".".to_owned())]);
+        assert_eq!(
+            resolve_executable(path_name, &relative_path_environment),
+            Err("unsupported_launch_spec")
+        );
+
+        assert!(path_executable_names("untrusted")
+            .iter()
+            .all(|name| !matches!(name.to_str(), Some(value) if value.ends_with(".bat") || value.ends_with(".cmd"))));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
