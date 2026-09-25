@@ -53,6 +53,7 @@ impl Pipeline {
         Self::with_identity(settings, Arc::new(Shared::default()))
     }
 
+    #[cfg(test)]
     pub fn with_identity(settings: Settings, identity: Arc<Shared>) -> Self {
         Self::with_host_configuration(settings, identity, false)
     }
@@ -412,31 +413,78 @@ impl Pipeline {
         let include_revision = matches!(&operation, Operation::ListClients {});
         let initialize = matches!(&operation, Operation::Initialize {});
         let persisted_identity = document.identity.clone();
+        let mut initialized_document = None;
+        let mut engine_now = now;
         let engine_document = match self.configured_identity() {
+            Some(configured_identity) if initialize && persisted_identity.is_none() => {
+                let generated_identity = match crate::crypto::generate_identity() {
+                    Ok(identity) => identity,
+                    Err(code) => {
+                        self.publish_identity(revision, loaded)?;
+                        return complete(send, request.id, error(code));
+                    }
+                };
+                engine_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(current_time) => now.max(current_time.as_secs()),
+                    Err(_) => {
+                        self.publish_identity(revision, loaded)?;
+                        return complete(send, request.id, error("clock_failure"));
+                    }
+                };
+                let durable_document = Document {
+                    identity: Some(generated_identity),
+                    clients: document.clients,
+                };
+                if let Err(code) = durable_document.validate(engine_now) {
+                    self.publish_identity(revision, loaded)?;
+                    return complete(send, request.id, error(code));
+                }
+                let engine_document = overlay_document(&durable_document, configured_identity);
+                initialized_document = Some(durable_document);
+                engine_document
+            }
             Some(configured_identity) => overlay_document(&document, configured_identity),
             None => document,
         };
         match self
             .engine
-            .apply(&request.caller, operation, engine_document, now)
+            .apply(&request.caller, operation, engine_document, engine_now)
         {
             Ok(Change::Read(mut response)) => {
                 if include_revision {
                     response["revision"] = revision.into();
+                }
+                if let Some(document) = initialized_document {
+                    self.identity.invalidate();
+                    let snapshot = match self.prepare_snapshot(&document, engine_now) {
+                        Ok(snapshot) => snapshot,
+                        Err(code) => {
+                            return complete(send, request.id, error(code));
+                        }
+                    };
+                    return self.submit(
+                        request,
+                        Stage::Saving { response, snapshot },
+                        json!({
+                            "action":"set",
+                            "key":STATE_KEY,
+                            "expected_revision":revision,
+                            "value":document
+                        }),
+                        send,
+                    );
                 }
                 self.publish_identity(revision, loaded)?;
                 complete(send, request.id, response)
             }
             Ok(Change::Write {
                 mut document,
-                mut response,
+                response,
             }) => {
                 if let Some(identity) = persisted_identity {
                     // Engine used the configured identity in memory, but the
                     // durable pairing document keeps its original host PEMs.
                     document.identity = Some(identity);
-                } else if initialize && let Some(configured_identity) = self.configured_identity() {
-                    replace_initialized_certificate(&mut response, configured_identity)?;
                 }
                 self.identity.invalidate();
                 let snapshot = match self.prepare_snapshot(&document, now) {
@@ -542,16 +590,6 @@ fn overlay_document(document: &Document, configured_identity: &ConfiguredIdentit
         identity.private_key_pem = configured_identity.private_key_pem.clone();
     }
     overlay
-}
-
-fn replace_initialized_certificate(
-    response: &mut Value,
-    configured_identity: &ConfiguredIdentity,
-) -> Result<(), &'static str> {
-    let certificate = crate::crypto::parse_certificate(&configured_identity.certificate_pem, None)?;
-    response["certificate_pem"] = configured_identity.certificate_pem.clone().into();
-    response["certificate_id"] = certificate.fingerprint.into();
-    Ok(())
 }
 
 fn complete(

@@ -11,6 +11,16 @@ use x509_cert::der::Encode;
 const HOST_CERT: &str = include_str!("../../tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../tests/fixtures/host-key.pem");
 const CLIENT_CERT: &str = include_str!("../../tests/fixtures/client-cert.pem");
+const CLIENT_KEY: &str = include_str!("../../tests/fixtures/client-key.pem");
+
+fn crypto_certificate_der(pem: &str) -> Vec<u8> {
+    crypto::parse_certificate(pem, None)
+        .unwrap()
+        .certificate
+        .to_der()
+        .unwrap()
+}
+
 fn document() -> Document {
     let peer = crypto::parse_certificate(CLIENT_CERT, None).unwrap();
     Document {

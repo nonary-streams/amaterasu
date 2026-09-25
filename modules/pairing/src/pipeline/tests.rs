@@ -1254,14 +1254,18 @@ fn generated_configured_files() -> (std::path::PathBuf, Value, crate::protocol::
 }
 
 fn paired_fixture_client() -> Value {
-    let certificate_id = crate::crypto::parse_certificate(CLIENT_CERT, None)
+    paired_fixture_client_for(CLIENT_CERT)
+}
+
+fn paired_fixture_client_for(certificate_pem: &str) -> Value {
+    let certificate_id = crate::crypto::parse_certificate(certificate_pem, None)
         .unwrap()
         .fingerprint;
     json!([{
         "certificate_id":certificate_id,
         "client_id":"existing-client",
         "name":"Existing client",
-        "certificate_pem":CLIENT_CERT,
+        "certificate_pem":certificate_pem,
         "paired_at":1
     }])
 }
@@ -1321,15 +1325,18 @@ fn configured_pipeline_calls_readiness_then_get_once_before_pairing_state() {
 
 #[test]
 fn provider_missing_or_unready_fails_closed_without_reading_pairing_state() {
-    for missing_provider in [true, false] {
+    for (missing_provider, ready) in [(true, false), (false, false)] {
         let mut harness = HostConfigurationHarness::new(json!({}));
         harness.missing_provider = missing_provider;
-        harness.ready = !missing_provider;
+        harness.ready = ready;
         harness.enqueue_identity();
         let mut pipeline =
             Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
 
         for _ in 0..2 {
+            if harness.output.is_some() {
+                break;
+            }
             pipeline
                 .tick_at(now(), |command| harness.send(command))
                 .unwrap();
@@ -1370,7 +1377,7 @@ fn configured_provider_missing_effective_key_or_certificate_fails_closed() {
 fn configured_identity_and_pairing_transcript_use_the_effective_pair() {
     let (directory, effective, configured) = generated_configured_files();
     let old_host_id = "00000000-0000-4000-8000-000000000001";
-    let durable = stored_document_with_fixture_identity(paired_fixture_client());
+    let durable = stored_document_with_fixture_identity(paired_fixture_client_for(HOST_CERT));
     let mut harness = HostConfigurationHarness::new(effective);
     harness.state_document = Some(durable.clone());
     let mut pipeline =
@@ -1478,7 +1485,7 @@ fn configured_initialize_persists_only_generated_identity_and_returns_effective_
     );
     assert_eq!(harness.state_writes, 1);
     assert_eq!(
-        pipeline.identity.get(time).unwrap().certificate(),
+        pipeline.identity.get(now()).unwrap().certificate(),
         crypto_certificate_der(&configured.certificate_pem)
     );
     fs::remove_dir_all(directory).unwrap();

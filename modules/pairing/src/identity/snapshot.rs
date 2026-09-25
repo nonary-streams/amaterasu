@@ -9,7 +9,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rsa::{Pkcs1v15Sign, Pss, RsaPrivateKey, pkcs8::DecodePrivateKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Take};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -246,6 +246,7 @@ impl Shared {
             *snapshot = None;
         }
     }
+    #[cfg(test)]
     pub fn publish(
         &self,
         revision: u64,
@@ -333,19 +334,40 @@ fn read_identity_file(path_value: &str) -> Result<String, &'static str> {
 }
 
 fn open_identity_file(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
     #[cfg(windows)]
     {
+        use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
+
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.open(path)
     }
-    #[cfg(unix)]
-    {
-        #[cfg(any(
+    #[cfg(all(
+        unix,
+        any(
             target_os = "linux",
             target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )
+    ))]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        #[cfg(any(
             target_os = "macos",
             target_os = "ios",
             target_os = "freebsd",
@@ -353,22 +375,13 @@ fn open_identity_file(path: &Path) -> std::io::Result<File> {
             target_os = "netbsd",
             target_os = "dragonfly"
         ))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            const O_NOFOLLOW: i32 = 0x0002_0000;
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "dragonfly"
-            ))]
-            const O_NOFOLLOW: i32 = 0x0000_0100;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        #[cfg(not(any(
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        options.custom_flags(O_NOFOLLOW);
+        options.open(path)
+    }
+    #[cfg(all(
+        unix,
+        not(any(
             target_os = "linux",
             target_os = "android",
             target_os = "macos",
@@ -377,15 +390,23 @@ fn open_identity_file(path: &Path) -> std::io::Result<File> {
             target_os = "openbsd",
             target_os = "netbsd",
             target_os = "dragonfly"
-        )))]
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "final-component no-follow is unsupported on this Unix target",
-            ));
-        }
+        ))
+    ))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "final-component no-follow is unsupported on this Unix target",
+        ))
     }
-    options.open(path)
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no-follow identity opens are unsupported on this platform",
+        ))
+    }
 }
 
 fn validate_identity_file_path(path: &Path) -> Result<(), &'static str> {
@@ -406,6 +427,9 @@ fn validate_identity_file_path(path: &Path) -> Result<(), &'static str> {
             Component::RootDir => current.push(component.as_os_str()),
             Component::Normal(name) => current.push(name),
             Component::CurDir | Component::ParentDir => return Err("unsafe_identity_path"),
+        }
+        if matches!(component, Component::Prefix(_)) {
+            continue;
         }
         let metadata = fs::symlink_metadata(&current).map_err(|_| "identity_file_unavailable")?;
         if is_reparse_or_symlink(&metadata) {
