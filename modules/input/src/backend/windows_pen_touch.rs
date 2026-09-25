@@ -421,11 +421,18 @@ impl VirtualDesktop {
 
     fn map(&self, x: u16, y: u16) -> InputResult<(i32, i32)> {
         Ok((
+            map_normalized_coordinate(x, self.width)?,
+            map_normalized_coordinate(y, self.height)?,
+        ))
+    }
+
+    fn screen_position(&self, x: i32, y: i32) -> InputResult<(i32, i32)> {
+        Ok((
             self.left
-                .checked_add(map_normalized_coordinate(x, self.width)?)
+                .checked_add(x)
                 .ok_or_else(coordinate_overflow_error)?,
             self.top
-                .checked_add(map_normalized_coordinate(y, self.height)?)
+                .checked_add(y)
                 .ok_or_else(coordinate_overflow_error)?,
         ))
     }
@@ -489,6 +496,7 @@ fn pointer_info_for_contact(
     virtual_desktop: VirtualDesktop,
 ) -> InputResult<POINTER_TYPE_INFO> {
     let (x, y) = virtual_desktop.map(contact.x, contact.y)?;
+    let (screen_x, screen_y) = virtual_desktop.screen_position(x, y)?;
     let pointer_flags = match phase {
         PenTouchPhase::Down => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
         PenTouchPhase::Move => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
@@ -553,10 +561,10 @@ fn pointer_info_for_contact(
             touch_info.pointerInfo.ptPixelLocation.y = y;
             touch_info.touchMask = TOUCH_MASK_NONE;
             touch_info.rcContact = RECT {
-                left: x,
-                top: y,
-                right: x,
-                bottom: y,
+                left: screen_x,
+                top: screen_y,
+                right: screen_x,
+                bottom: screen_y,
             };
             touch_info.rcContactRaw = touch_info.rcContact;
             touch_info.pressure = 512;
@@ -569,8 +577,8 @@ fn pointer_info_for_contact(
             if let Some((major, minor)) = contact.contact_area_major.zip(contact.contact_area_minor)
             {
                 let bounds = contact_rectangle(
-                    x,
-                    y,
+                    screen_x,
+                    screen_y,
                     major,
                     minor,
                     contact.rotation_degrees,
@@ -716,8 +724,8 @@ impl SyntheticPointerApi for NativeSyntheticPointerApi {
     }
 
     fn virtual_desktop(&self) -> InputResult<VirtualDesktop> {
-        // Pointer positions and contact rectangles include the virtual screen
-        // origin, which can be negative when a monitor sits left/above primary.
+        // Pointer positions are virtual-screen-relative. Touch contact
+        // rectangles use screen coordinates and need the possibly negative origin.
         let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
         let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
         let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -1713,14 +1721,18 @@ mod tests {
     }
 
     #[test]
-    fn normalized_coordinates_include_negative_virtual_desktop_origin() {
+    fn normalized_coordinates_are_relative_to_virtual_desktop_top_left() {
         let virtual_desktop = VirtualDesktop::new(-1920, -1080, 3840, 2160).unwrap();
-        assert_eq!(virtual_desktop.map(0, 0).unwrap(), (-1920, -1080));
+        assert_eq!(virtual_desktop.map(0, 0).unwrap(), (0, 0));
         assert_eq!(
             virtual_desktop.map(u16::MAX, u16::MAX).unwrap(),
-            (1919, 1079)
+            (3839, 2159)
         );
-        assert_eq!(virtual_desktop.map(32768, 32768).unwrap(), (0, 0));
+        assert_eq!(virtual_desktop.map(32768, 32768).unwrap(), (1920, 1080));
+        assert_eq!(
+            virtual_desktop.screen_position(0, 0).unwrap(),
+            (-1920, -1080)
+        );
         assert!(VirtualDesktop::new(0, 0, 0, 1080).is_err());
         assert!(VirtualDesktop::new(i32::MAX, 0, 1, 1).is_err());
         assert!(map_normalized_coordinate(0, 0).is_err());
@@ -1746,8 +1758,8 @@ mod tests {
 
         let frames = &state.borrow().frames;
         let touch = touch_info(&frames[0].1[0]);
-        assert_eq!(touch.pointerInfo.ptPixelLocation.x, -1920);
-        assert_eq!(touch.pointerInfo.ptPixelLocation.y, -1080);
+        assert_eq!(touch.pointerInfo.ptPixelLocation.x, 0);
+        assert_eq!(touch.pointerInfo.ptPixelLocation.y, 0);
         assert_eq!(touch.rcContact.left, -1920);
         assert_eq!(touch.rcContact.top, -1080);
         assert!(touch.rcContact.right > touch.rcContact.left);
