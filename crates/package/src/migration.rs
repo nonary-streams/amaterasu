@@ -594,7 +594,7 @@ fn analyze_settings(
     let contents = String::from_utf8(read_configuration_file(path)?)
         .map_err(|_| "predecessor configuration contains a non-text settings file".to_owned())?;
     for line in contents.lines() {
-        let line = line.trim();
+        let line = strip_unquoted_comment(line).trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }

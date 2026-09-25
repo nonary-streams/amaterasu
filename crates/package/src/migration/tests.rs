@@ -917,6 +917,25 @@ fn plan_maps_safe_settings_and_exact_executable_applications() {
 }
 
 #[test]
+fn plan_strips_unquoted_inline_setting_comments() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"fps = 60 # the default frame rate\nencoder = \"nvenc#quality\" # retain quoted hash\n",
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).unwrap();
+
+    assert_eq!(plan.settings["stream.default_fps"], "60");
+    assert_eq!(
+        plan.settings["video.encoder_preference"],
+        "\"nvenc#quality\""
+    );
+}
+
+#[test]
 fn repeat_import_is_idempotent_and_merges_products() {
     let fixture = TemporaryDirectory::new();
     let sunshine = fixture.path().join("Sunshine");
