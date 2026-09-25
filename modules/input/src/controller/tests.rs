@@ -309,6 +309,7 @@ fn unscoped_ds4_back_mapping_is_snapshotted_from_the_v9_default() {
         ds4_back_as_touchpad_click,
         keyboard: None,
         mouse: None,
+        native_pen_touch: None,
         high_resolution_scrolling: None,
         always_send_scancodes: None,
         key_rightalt_to_key_win: None,
