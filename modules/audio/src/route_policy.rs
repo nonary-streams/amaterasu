@@ -482,4 +482,62 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn pending_restore_retries_owned_roles_and_releases_user_changed_roles() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        policy.acquire("render.selected", &original).unwrap();
+        for role in DefaultRole::ALL {
+            policy.record_assignment("render.selected", role).unwrap();
+        }
+        policy.abort_acquire("render.selected").unwrap();
+
+        let still_owned = endpoints("render.selected", "render.selected", "render.selected");
+        assert_eq!(
+            policy.pending_restore_assignments(&still_owned),
+            Some(vec![
+                RoleAssignment {
+                    role: DefaultRole::Console,
+                    endpoint: "render.console".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Multimedia,
+                    endpoint: "render.multimedia".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Communications,
+                    endpoint: "render.comms".into(),
+                },
+            ])
+        );
+        policy.complete_restore(false);
+        assert_eq!(
+            policy.endpoint_with_pending_restore(),
+            Some("render.selected")
+        );
+
+        let user_changed = endpoints("render.user-choice", "render.selected", "render.selected");
+        assert_eq!(
+            policy.pending_restore_assignments(&user_changed),
+            Some(vec![
+                RoleAssignment {
+                    role: DefaultRole::Multimedia,
+                    endpoint: "render.multimedia".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Communications,
+                    endpoint: "render.comms".into(),
+                },
+            ])
+        );
+
+        let no_longer_owned = endpoints("render.user-choice", "render.multimedia", "render.comms");
+        assert_eq!(
+            policy.pending_restore_assignments(&no_longer_owned),
+            Some(Vec::new())
+        );
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
 }

@@ -114,9 +114,12 @@ impl ManagedModule for AudioModule {
 
 impl Drop for AudioModule {
     fn drop(&mut self) {
-        if let Ok(mut controller) = self.controller.lock() {
-            controller.shutdown();
+        {
+            if let Ok(mut controller) = self.controller.lock() {
+                controller.shutdown();
+            }
         }
+        platform::shutdown();
     }
 }
 

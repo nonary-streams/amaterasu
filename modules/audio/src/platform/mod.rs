@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+pub use windows::shutdown;
+#[cfg(windows)]
 pub use windows::{Capture, enumerate, route_restore_pending};
 
 #[derive(Clone, Debug)]
@@ -96,3 +98,6 @@ mod unsupported {
 
 #[cfg(not(windows))]
 pub use unsupported::{Capture, enumerate, route_restore_pending};
+
+#[cfg(not(windows))]
+pub fn shutdown() {}

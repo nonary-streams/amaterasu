@@ -16,7 +16,11 @@ use amaterasu_media::{
 };
 use std::{
     ffi::c_void,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 use windows::{
@@ -37,8 +41,11 @@ const POLICY_CONFIG_CLASS: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63d
 const POLICY_CONFIG_INTERFACE: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 const HRESULT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
 const DEFAULT_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ROUTE_RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
+static ROUTE_RESTORE_WORKER: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
+static ROUTE_RESTORE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 // IPolicyConfig is an undocumented Windows COM interface. The ten method
 // slots after IUnknown precede SetDefaultEndpoint in the pinned interface ABI.
@@ -171,7 +178,9 @@ impl RouteLease {
         let mut policy = mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !restore_pending(enumerator, &mut policy).map_err(|_| "audio_route_restore_failed")? {
+        if !matches!(restore_pending(enumerator, &mut policy), Ok(true)) {
+            drop(policy);
+            schedule_route_restore_retry_if_pending();
             return Err("audio_route_restore_failed");
         }
         let original = default_endpoints(enumerator)?;
@@ -186,7 +195,9 @@ impl RouteLease {
                     assign_defaults(enumerator, &mut policy, endpoint, &original, &assignments);
                 if result.is_err() {
                     policy.abort_acquire(endpoint)?;
-                    if !restore_pending(enumerator, &mut policy).unwrap_or(false) {
+                    if !matches!(restore_pending(enumerator, &mut policy), Ok(true)) {
+                        drop(policy);
+                        schedule_route_restore_retry_if_pending();
                         return Err("audio_route_restore_failed");
                     }
                     return Err("audio_route_change_failed");
@@ -303,12 +314,16 @@ fn release_route(endpoint: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Ok(enumerator) = enumerator() else {
         let _ = policy.release_without_snapshot(endpoint);
+        drop(policy);
+        schedule_route_restore_retry_if_pending();
         return;
     };
     let current = match default_endpoints(&enumerator) {
         Ok(current) => current,
         Err(_) => {
             let _ = policy.release_without_snapshot(endpoint);
+            drop(policy);
+            schedule_route_restore_retry_if_pending();
             return;
         }
     };
@@ -319,6 +334,110 @@ fn release_route(endpoint: &str) {
         }
         Err(_) => {}
     }
+    drop(policy);
+    schedule_route_restore_retry_if_pending();
+}
+
+fn schedule_route_restore_retry_if_pending() {
+    if !route_restore_pending() || ROUTE_RESTORE_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
+
+    let worker_state = ROUTE_RESTORE_WORKER.get_or_init(|| Mutex::new(None));
+    let mut worker = worker_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ROUTE_RESTORE_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
+
+    if worker.as_ref().is_some_and(thread::JoinHandle::is_finished) {
+        let finished_worker = worker.take().expect("finished retry worker is present");
+        drop(worker);
+        let _ = finished_worker.join();
+        schedule_route_restore_retry_if_pending();
+        return;
+    }
+
+    if let Some(worker) = worker.as_ref() {
+        worker.thread().unpark();
+        return;
+    }
+
+    if let Ok(worker_handle) = thread::Builder::new()
+        .name("audio-route-restore".to_owned())
+        .spawn(route_restore_retry_worker)
+    {
+        worker_handle.thread().unpark();
+        *worker = Some(worker_handle);
+    }
+}
+
+fn route_restore_retry_worker() {
+    loop {
+        if ROUTE_RESTORE_SHUTTING_DOWN.load(Ordering::Acquire) {
+            return;
+        }
+
+        if retry_pending_route_restore_once() {
+            if ROUTE_RESTORE_SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
+            thread::park_timeout(ROUTE_RESTORE_RETRY_INTERVAL);
+        } else {
+            if ROUTE_RESTORE_SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
+            thread::park();
+        }
+    }
+}
+
+fn stop_and_join_route_restore_worker(worker: thread::JoinHandle<()>) {
+    worker.thread().unpark();
+    let _ = worker.join();
+}
+
+pub fn shutdown() {
+    ROUTE_RESTORE_SHUTTING_DOWN.store(true, Ordering::Release);
+    let worker = ROUTE_RESTORE_WORKER.get().and_then(|worker_state| {
+        worker_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    });
+
+    if let Some(worker) = worker {
+        // Do not hold either policy state or worker state while waiting for
+        // the worker to leave its COM apartment and terminate.
+        stop_and_join_route_restore_worker(worker);
+    }
+}
+
+fn retry_pending_route_restore_once() -> bool {
+    if !route_restore_pending() {
+        return false;
+    }
+
+    // Each attempt owns its apartment and endpoint enumerator on this worker
+    // thread; COM references never cross from a capture thread or iteration.
+    let Ok(_apartment) = Apartment::start() else {
+        return true;
+    };
+    let Ok(enumerator) = enumerator() else {
+        return true;
+    };
+    let Some(mutex) = ROUTE_POLICY.get() else {
+        return false;
+    };
+    let mut policy = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if policy.endpoint_with_pending_restore().is_none() {
+        return false;
+    }
+
+    !restore_pending(&enumerator, &mut policy).unwrap_or(false)
 }
 
 pub fn route_restore_pending() -> bool {
@@ -1010,6 +1129,20 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_restore_shutdown_unparks_and_joins_waiting_worker() {
+        let (exited_sender, exited_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread::park();
+            let _ = exited_sender.send(());
+        });
+
+        stop_and_join_route_restore_worker(worker);
+
+        assert!(exited_receiver.try_recv().is_ok());
+    }
+
     #[test]
     fn mix_format_preserves_channel_mask_and_rejects_unsupported_container_bits() {
         let mut mix = WAVEFORMATEXTENSIBLE {

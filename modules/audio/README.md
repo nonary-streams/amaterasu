@@ -32,8 +32,14 @@ Concurrent captures of the same endpoint share the assignment; a conflicting
 endpoint open fails. When the final capture closes, the provider restores only
 roles it assigned that still point to the selected endpoint, preserving role
 changes made elsewhere. If assignment fails, open fails and attempts to restore
-roles changed earlier in the same open. A failed restore blocks later routed
-opens, which retry cleanup first; there is no background retry. Opening
+roles changed earlier in the same open. A failed restore remains pending and
+blocks later routed opens, which retry cleanup first. A Windows background
+worker also retries pending restoration once per second. It stops after all
+owned roles are restored or after they move away from the selected endpoint;
+each attempt checks role ownership again before writing, preserving newer user
+defaults. Shared leases still restore only after the final capture closes. The
+worker is stopped, unparked, and joined during module shutdown before its
+library can unload; a blocked Windows policy COM call can delay unload. Opening
 `default` does not change default roles. The provider does not change volume or
 mute state.
 
@@ -92,8 +98,9 @@ fallback was available. An omitted policy field defaults to false for existing
 callers. Format contains
 `sample_rate`, `channels`, `channel_mask`, and `format:"f32"|"i16"`. Status returns
 `{ok:true,enabled,audio_route_restore_pending,streams:[...]}` with only the
-caller's streams, optionally filtered by ID. The route flag reports a failed
-final restoration attempt until a later routed open retries cleanup. Each stream
+caller's streams, optionally filtered by ID. The route flag reports pending
+cleanup while Windows retries restoration; it clears after restoration or when
+the roles no longer point to the selected endpoint. Each stream
 includes its selected/requested endpoint, format,
 `state:"capturing"|"recovering"|"failed"`, `failure`, `discontinuities`, and
 `dropped_packets`. After WASAPI reports device loss, the worker reports
