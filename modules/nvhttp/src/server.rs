@@ -1164,6 +1164,46 @@ mod tests {
     }
 
     #[test]
+    fn failed_overlapping_wildcard_expansion_restores_both_listener_sets() {
+        let _lock = FIXED_PORT_LOCK.lock().unwrap();
+        let (_occupied_ipv6, startup, mut server) = (0..100)
+            .find_map(|_| {
+                let occupied_ipv6 = bind_listener(
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+                    "IPv6 rollback blocker",
+                )
+                .ok()?;
+                let http_port = occupied_ipv6.local_addr().ok()?.port();
+                let https_port = http_port.checked_sub(crate::settings::HTTPS_PORT_OFFSET)?;
+                if crate::settings::validate_port(http_port).is_err()
+                    || crate::settings::validate_port(https_port).is_err()
+                {
+                    return None;
+                }
+
+                let startup = Settings {
+                    enabled: true,
+                    http_bind: SocketAddr::from(([127, 0, 0, 1], http_port)),
+                    https_bind: SocketAddr::from(([127, 0, 0, 1], https_port)),
+                    ..Settings::default()
+                };
+                let server = Server::bind(&startup).ok()?;
+                Some((occupied_ipv6, startup, server))
+            })
+            .expect("find an IPv6-blocked port pair for the rollback test");
+        let old_http = server.http_addresses();
+        let old_https = server.https_addresses();
+        let mut target = startup;
+        target.allow_remote = true;
+        target.address_family = Some(crate::settings::AddressFamily::Both);
+        target.bind_address = Some(String::new());
+
+        assert!(server.rebind_settings(&target).is_err());
+        assert_eq!(server.http_addresses(), old_http);
+        assert_eq!(server.https_addresses(), old_https);
+    }
+
+    #[test]
     fn unrelated_occupied_target_port_does_not_drop_current_listeners() {
         let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let startup = Settings {
