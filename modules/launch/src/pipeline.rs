@@ -146,26 +146,31 @@ impl Pipeline {
                 app_id,
                 global_preparation,
                 legacy_global_preparation,
-                frame_limiter_settings: _,
-                client_frame_limiter_overrides: _,
-            } => match self.records.start(
-                caller,
-                initiator,
-                operation_id,
-                app_id,
-                CatalogSelection::Exported,
-                GlobalPreparation {
-                    structured_steps: global_preparation,
-                    legacy_commands: legacy_global_preparation,
-                },
-            ) {
-                Ok((id, true)) => {
-                    self.job = Some(Workflow::launch(id, request, remaining_ms));
-                    Ok(())
+                frame_limiter_settings,
+                client_frame_limiter_overrides,
+            } => {
+                drop(frame_limiter_settings);
+                drop(client_frame_limiter_overrides);
+
+                match self.records.start(
+                    caller,
+                    initiator,
+                    operation_id,
+                    app_id,
+                    CatalogSelection::Exported,
+                    GlobalPreparation {
+                        structured_steps: global_preparation,
+                        legacy_commands: legacy_global_preparation,
+                    },
+                ) {
+                    Ok((id, true)) => {
+                        self.job = Some(Workflow::launch(id, request, remaining_ms));
+                        Ok(())
+                    }
+                    Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
+                    Err(code) => complete(send, request, error(code)),
                 }
-                Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
-                Err(code) => complete(send, request, error(code)),
-            },
+            }
             Operation::Lookup { operation_id } => {
                 let response = self
                     .records
