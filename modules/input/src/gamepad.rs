@@ -251,6 +251,7 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
     ) -> InputResult<()> {
         let back_was_pressed = self.client_state.buttons & BACK_BUTTON_MASK != 0;
         let back_is_pressed = state.buttons & BACK_BUTTON_MASK != 0;
+        let defer_zero_timeout = !back_was_pressed && back_is_pressed && timeout_ms == 0;
         if !back_is_pressed {
             self.back_deadline = None;
             self.suppress_back = false;
@@ -260,20 +261,20 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
             self.back_deadline = now.checked_add(Duration::from_millis(timeout_ms as u64));
         }
         self.client_state = state;
-        self.expire(now);
+        self.expire(now, !defer_zero_timeout);
         self.write_effective_state(now)
     }
 
     fn advance(&mut self, now: Instant) -> InputResult<()> {
-        self.expire(now);
+        self.expire(now, true);
         if self.dirty {
             self.write_effective_state(now)?;
         }
         Ok(())
     }
 
-    fn expire(&mut self, now: Instant) {
-        if self.back_deadline.is_some_and(|deadline| now >= deadline) {
+    fn expire(&mut self, now: Instant, expire_back_deadline: bool) {
+        if expire_back_deadline && self.back_deadline.is_some_and(|deadline| now >= deadline) {
             self.back_deadline = None;
             if self.client_state.buttons & BACK_BUTTON_MASK != 0 {
                 self.suppress_back = true;
@@ -1165,6 +1166,63 @@ mod tests {
     }
 
     #[test]
+    fn zero_timeout_delivers_back_before_same_time_timer_advance_and_suppresses_until_release() {
+        let trace = Rc::new(RefCell::new(Trace::default()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+
+        apply_state(&mut slots, &trace, 0, 1, BACK_BUTTON_MASK, 0, start);
+        let initiating_state = trace.borrow().updates[0].1;
+        assert!(has_button(initiating_state, BACK_BUTTON_MASK));
+        assert!(!has_button(initiating_state, GUIDE_BUTTON_MASK));
+
+        slots.advance(start).unwrap();
+        let guide_pulse = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(guide_pulse, BACK_BUTTON_MASK));
+        assert!(has_button(guide_pulse, GUIDE_BUTTON_MASK));
+
+        slots.advance(start + Duration::from_millis(100)).unwrap();
+        let pulse_end = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(pulse_end, BACK_BUTTON_MASK));
+        assert!(!has_button(pulse_end, GUIDE_BUTTON_MASK));
+
+        apply_state(
+            &mut slots,
+            &trace,
+            0,
+            1,
+            BACK_BUTTON_MASK,
+            0,
+            start + Duration::from_millis(101),
+        );
+        let held_state = trace.borrow().updates.last().unwrap().1;
+        assert!(!has_button(held_state, BACK_BUTTON_MASK));
+        assert!(!has_button(held_state, GUIDE_BUTTON_MASK));
+
+        apply_state(
+            &mut slots,
+            &trace,
+            0,
+            1,
+            0,
+            0,
+            start + Duration::from_millis(102),
+        );
+        apply_state(
+            &mut slots,
+            &trace,
+            0,
+            1,
+            BACK_BUTTON_MASK,
+            0,
+            start + Duration::from_millis(103),
+        );
+        let repressed_state = trace.borrow().updates.last().unwrap().1;
+        assert!(has_button(repressed_state, BACK_BUTTON_MASK));
+        assert!(!has_button(repressed_state, GUIDE_BUTTON_MASK));
+    }
+
+    #[test]
     fn failed_timeout_write_retries_and_starts_guide_pulse_after_delivery() {
         struct FlakyDevice {
             fail_next: std::rc::Rc<std::cell::Cell<bool>>,
@@ -1206,8 +1264,10 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err().code, "injection_failed");
-        assert!(has_button(updates.borrow()[0], GUIDE_BUTTON_MASK));
+        assert!(has_button(updates.borrow()[0], BACK_BUTTON_MASK));
+        assert!(!has_button(updates.borrow()[0], GUIDE_BUTTON_MASK));
         slots.advance(start + Duration::from_millis(50)).unwrap();
+        assert!(!has_button(updates.borrow()[1], BACK_BUTTON_MASK));
         assert!(has_button(updates.borrow()[1], GUIDE_BUTTON_MASK));
         slots.advance(start + Duration::from_millis(149)).unwrap();
         assert_eq!(updates.borrow().len(), 2);
