@@ -1,6 +1,18 @@
 # Luna-04: audio and input configuration parity
 
-## Current bounded slice: active endpoint in audio status
+## Current bounded slice: active endpoint test correction
+
+- Lane code correction: `088818e502af98622f7793cbc8bf35df73f1aef4`; isolated worker commit: `f7ba78911b348a2698c9625b1b89c8a509df106a`; worker/lane base: `77076c16bf582d65bff4130e312102c05b2c6d50`.
+- Main candidate under correction: `5479dda5fe2f357ebd9ae0dce8aeb893487d4b1a`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`; branch: `config-parity/audio-input`.
+- Stable ID: `global:audio_sink`, still pending. The test-only correction does not close any stable ID.
+- Worker session `01a0d516-8713-7b83-87f1-d35c0828ae10`, thread `01a0d605-4aee-7e83-b3f2-a2e0bf957e06`, verified `gpt-6-luna`/`xhigh` from the live thread row. Isolated worktree `D:/sources/worktrees/amaterasu-active-endpoint-test-correction-xhigh`, branch `codex/luna04-active-endpoint-test-correction-xhigh`, clean at the required base before edits.
+- Only `modules/audio/src/worker.rs` changed, and only test assertions: pinned `device_loss_retries_open_and_preserves_packet_clock` expects `render.fixed`; `console_default_change_reopens_new_endpoint_without_breaking_packet_clock` expects `render.console-new`. Production behavior and both assertions are preserved. Lead review confirmed the exact path and required plan trailers before cherry-pick.
+- Worker and lane `rustfmt --edition 2024 --check modules/audio/src/worker.rs` and `git diff --check` passed. No Cargo tests/build/Clippy ran in the lightweight lane.
+- Coordinator validation of main `5479dda5`: formatting passed; Windows-target audio tests had one failure in the pinned device-loss test because its assertion expected `render.console-new` while active endpoint correctly remained `render.fixed`. All other tests passed and one hardware test was ignored. Strict Clippy has not been run. After direct-to-main landing of the correction, coordinator will rerun formatting, Windows-target audio tests, and strict Clippy.
+- The coordinator approved the outbox 017 status contract: status reports the currently active capture endpoint, while open and lookup retain the immutable initial endpoint for replay and lease identity. The inspected stream-session consumer uses open and does not call audio status; no management status consumer was found.
+- Persistence/default migration, scoped settings, management authority, complete stream evidence, and platform qualification remain incomplete. Keep all audio IDs pending.
+
+## Previous bounded slice: active endpoint in audio status
 
 - Lane code commit: `f753d95f002476f2275a972944827725b2c0a4be`; isolated worker source commit: `7041b6545df4c405ef4709375f8528a2b1690e6b`; worker and lane base: `b8f3a1596e215dbd4ae54cb00381a619072033ba`.
 - Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
@@ -10,8 +22,8 @@
 - Internal worker health now tracks the active capture endpoint in a serde-skipped field, sets it from the initial capture, and updates it only after a Console-default-follow reopen passes endpoint/format acceptance. Status uses that value through its existing `endpoint` field, falling back to the opening snapshot before worker initialization. Open and lookup continue to return the immutable initial endpoint and original `requested_endpoint`; the response shape is unchanged.
 - Regression coverage updates the followed-default recovery worker test to assert the reopened endpoint and adds controller coverage showing status moves to the new endpoint while repeated open and lookup retain the initial endpoint. Explicit endpoint IDs stay pinned; explicit/automatic virtual sink and capture-only routing policy code is unchanged.
 - Worker and lane checks: `cargo fmt --all -- --check` and `git diff --check` passed. No Cargo tests, build, or Clippy ran in the lightweight lane. Windows endpoint switching/hardware qualification was not performed.
-- Cross-lane status-semantics request is recorded in outbox `017-audio-active-endpoint-status-contract.json`. No response from the coordinator/L02/L06 was present when this handoff was updated; acknowledge the proposed distinction between active status and immutable open/lookup identity before coordinator direct-to-main landing.
-- Remaining parity: persistence/default migration, scoped client/application resolution, management edit authority, full stream integration and Windows hardware qualification remain open. Keep all audio IDs pending. The next slice should first record any outbox 017 contract response, then inspect an owned capture-only or virtual-sink runtime gap without editing L02/L05/L06 paths.
+- Cross-lane status-semantics request was recorded in outbox `017-audio-active-endpoint-status-contract.json`. The coordinator has since approved the distinction between active status and immutable open/lookup identity and confirmed the inspected stream-session path uses open, not audio status.
+- Remaining parity: persistence/default migration, scoped client/application resolution, management edit authority, full stream integration and Windows hardware qualification remain open. The status contract is approved; next, inspect an owned capture-only or virtual-sink gap without editing L02/L05/L06 paths. Keep all audio IDs pending.
 
 ## Current bounded slice: open_selected Clippy correction
 
