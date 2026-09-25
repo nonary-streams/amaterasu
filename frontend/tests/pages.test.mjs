@@ -58,6 +58,9 @@ for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts
     }),
     pageTestContext,
   );
+  if (source === "src/ui.ts") {
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", pageTestContext);
+  }
 }
 
 function createPageContext() {
@@ -256,7 +259,9 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
     "the rendered second Steam list page",
   );
   assert.deepEqual(
-    harness.calls.filter((call) => call.route === "steam/list")[1].payload,
+    {
+      ...harness.calls.filter((call) => call.route === "steam/list")[1].payload,
+    },
     { revision: 3, after: 42, limit: 16 },
   );
 
@@ -271,11 +276,12 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
   const listCallsAfterAcceptance = harness.calls.filter(
     (call) => call.route === "steam/list",
   );
-  assert.deepEqual(listCallsAfterAcceptance[2].payload, { limit: 16 });
+  assert.deepEqual({ ...listCallsAfterAcceptance[2].payload }, { limit: 16 });
   const forceCall = harness.calls.find(
     (call) => call.route === "steam/force_sync",
   );
-  assert.deepEqual(forceCall, { route: "steam/force_sync", payload: {} });
+  assert.equal(forceCall.route, "steam/force_sync");
+  assert.deepEqual({ ...forceCall.payload }, {});
   const [timerId, timer] = harness.timers.entries().next().value;
   assert.equal(timer.delay, 1000);
   harness.timers.delete(timerId);
@@ -295,7 +301,7 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
   const listCallsAfterSync = harness.calls.filter(
     (call) => call.route === "steam/list",
   );
-  assert.deepEqual(listCallsAfterSync[3].payload, { limit: 16 });
+  assert.deepEqual({ ...listCallsAfterSync[3].payload }, { limit: 16 });
   assert.equal(harness.timers.size, 0);
   assert.equal(
     harness.calls.filter((call) => call.route === "steam/status").length,
