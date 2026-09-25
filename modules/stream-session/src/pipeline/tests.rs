@@ -67,6 +67,7 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
         })
         .expect("audio capture open");
     assert_eq!(audio_open.payload["host_audio_enabled"], false);
+    assert!(audio_open.payload.get("continuous_audio").is_none());
     assert_eq!(
         record.audio_endpoint.as_deref(),
         Some("resolved-canonical-endpoint")
@@ -129,6 +130,55 @@ fn host_audio_policy_snapshot_reaches_audio_capture_open() {
         })
         .expect("audio capture open");
     assert_eq!(audio_open.payload["host_audio_enabled"], true);
+}
+
+#[test]
+fn continuous_audio_open_is_opt_in_and_uses_the_prepared_packet_duration() {
+    for packet_ms in [5, 10] {
+        let mut host = Harness::new();
+        let mut prepare_request = prepare();
+        prepare_request["audio"] = json!({"packet_ms": packet_ms});
+        let prepared = host.response(1, prepare_request);
+        let id = prepared["session"].as_u64().unwrap();
+        let mut request = start(id);
+        request["configuration"]["continuous_audio"] = json!(true);
+
+        assert_eq!(host.response(2, request)["state"], "active");
+        let audio_open = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+            })
+            .expect("continuous audio capture open");
+        assert_eq!(
+            audio_open.payload["continuous_audio"]["packet_ms"],
+            packet_ms
+        );
+    }
+}
+
+#[test]
+fn continuous_audio_is_rejected_when_prepared_stream_audio_is_disabled() {
+    let mut host = Harness::new();
+    let mut prepare_request = prepare();
+    prepare_request["stream_audio"] = json!(false);
+    let prepared = host.response(1, prepare_request);
+    let id = prepared["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["continuous_audio"] = json!(true);
+
+    assert_eq!(
+        host.response(2, request)["code"],
+        "continuous_audio_requires_stream_audio"
+    );
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .all(|call| call.service != Resource::AudioCapture.service())
+    );
 }
 
 #[test]

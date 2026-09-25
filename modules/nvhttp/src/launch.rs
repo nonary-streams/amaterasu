@@ -39,6 +39,8 @@ pub struct LaunchRequest {
     pub fps: u32,
     /// Moonlight's localAudioPlayMode bit selecting ordinary host audio.
     pub host_audio_enabled: bool,
+    /// Immutable Moonlight continuousAudio request for this session.
+    pub continuous_audio: bool,
     /// Moonlight's optional per-launch device-name override (`clientName`).
     pub device_name: Option<String>,
     pub remote_input_key: [u8; 16],

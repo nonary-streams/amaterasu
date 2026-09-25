@@ -131,7 +131,7 @@ impl Controller {
         if record.application_reconcile == Some(phase) {
             record.application_reconcile = None;
         }
-        let (service, payload, timeout_ms) = match phase {
+        let (service, mut payload, timeout_ms) = match phase {
             Phase::LaunchApplication => {
                 record.application_requested = true;
                 (
@@ -242,6 +242,12 @@ impl Controller {
                 15_000,
             ),
         };
+        if matches!(phase, Phase::OpenRtsp)
+            && record.request.continuous_audio
+            && record.effective_stream_audio
+        {
+            payload["continuous_audio"] = json!(true);
+        }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)
     }

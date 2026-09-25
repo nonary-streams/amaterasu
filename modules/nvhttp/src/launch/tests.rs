@@ -191,6 +191,7 @@ fn request(key: u8) -> LaunchRequest {
         height: 720,
         fps: 60,
         host_audio_enabled: false,
+        continuous_audio: false,
         device_name: None,
         remote_input_key: [key; 16],
         key_id: 17,
@@ -1232,6 +1233,44 @@ fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
             })
             .expect("RTSP open request");
         assert_eq!(rtsp_open["stream_audio"], expected);
+    }
+}
+
+#[test]
+fn continuous_audio_is_snapshotted_and_gated_by_effective_audio_precedence() {
+    for (global, app, client, expected_stream_audio) in [
+        (true, None, None, true),
+        (false, None, None, false),
+        (false, Some(true), None, true),
+        (true, Some(false), None, false),
+        (true, Some(false), Some(true), true),
+        (false, Some(true), Some(false), false),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_stream_audio(global);
+        let mut broker = Broker {
+            application_stream_audio: app,
+            ..Default::default()
+        };
+        let mut launch = request(1);
+        launch.continuous_audio = true;
+
+        assert!(
+            controller
+                .launch(10, launch, peer_with_overrides(1, None, client), now)
+                .is_none()
+        );
+        controller.set_global_stream_audio(!global);
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = opened_rtsp_payload(&broker);
+        assert_eq!(rtsp_open["stream_audio"], expected_stream_audio);
+        if expected_stream_audio {
+            assert_eq!(rtsp_open["continuous_audio"], true);
+        } else {
+            assert!(rtsp_open.get("continuous_audio").is_none());
+        }
     }
 }
 

@@ -433,6 +433,8 @@ pub struct Open {
     pub ping_timeout_ms: u32,
     #[serde(default = "default_stream_audio")]
     pub stream_audio: bool,
+    #[serde(default)]
+    pub continuous_audio: bool,
     #[serde(default = "default_minimum_fps_target")]
     pub minimum_fps_target: f64,
     #[serde(default = "default_wgc_pacing_smoothing")]
@@ -465,6 +467,9 @@ impl Open {
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
+        }
+        if self.continuous_audio && !self.stream_audio {
+            return Err("continuous_audio_requires_stream_audio");
         }
         self.validate_operation_id()?;
         self.validate_destination(allow_remote)?;
@@ -619,7 +624,7 @@ impl Open {
     }
 
     pub fn arm(&self, session: u64) -> serde_json::Value {
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "action": "start_when_authenticated",
             "session": session,
             "configuration": {
@@ -649,7 +654,11 @@ impl Open {
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
-        })
+        });
+        if self.continuous_audio && self.stream_audio {
+            payload["configuration"]["continuous_audio"] = serde_json::json!(true);
+        }
+        payload
     }
 
     pub(crate) fn arm_with_encryption(
@@ -812,6 +821,45 @@ mod tests {
             let request: Open = serde_json::from_value(value).unwrap();
             assert_eq!(request.validate(false), Err("invalid_device_name"));
         }
+    }
+
+    #[test]
+    fn continuous_audio_is_session_only_and_requires_stream_audio() {
+        let defaulted = open();
+        assert!(!defaulted.continuous_audio);
+        assert!(defaulted.validate(false).is_ok());
+        assert!(
+            defaulted.arm(51)["configuration"]
+                .get("continuous_audio")
+                .is_none()
+        );
+        assert!(
+            defaulted
+                .prepare("default", None)
+                .get("continuous_audio")
+                .is_none()
+        );
+
+        let mut enabled = open_json();
+        enabled["continuous_audio"] = json!(true);
+        let enabled: Open = serde_json::from_value(enabled).unwrap();
+        assert!(enabled.validate(false).is_ok());
+        assert_eq!(enabled.arm(52)["configuration"]["continuous_audio"], true);
+        assert!(
+            enabled
+                .prepare("enabled", None)
+                .get("continuous_audio")
+                .is_none()
+        );
+
+        let mut disabled_audio = open_json();
+        disabled_audio["stream_audio"] = json!(false);
+        disabled_audio["continuous_audio"] = json!(true);
+        let disabled_audio: Open = serde_json::from_value(disabled_audio).unwrap();
+        assert_eq!(
+            disabled_audio.validate(false),
+            Err("continuous_audio_requires_stream_audio")
+        );
     }
 
     fn open_operation_json() -> Value {

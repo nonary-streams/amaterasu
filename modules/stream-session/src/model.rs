@@ -324,6 +324,8 @@ pub struct StartConfig {
     pub audio_endpoint: String,
     #[serde(default)]
     pub host_audio_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub continuous_audio: bool,
 }
 impl StartConfig {
     pub fn matches_prepared_encryption(&self, prepared: &PrepareConfig) -> bool {
@@ -335,6 +337,9 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        if self.continuous_audio && !stream_audio {
+            return Err("continuous_audio_requires_stream_audio");
+        }
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");
         }
@@ -473,6 +478,9 @@ pub enum Operation {
 fn yes() -> bool {
     true
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
 fn default_ping_timeout_ms() -> u32 {
     10_000
 }
@@ -566,6 +574,37 @@ mod tests {
             serde_json::to_value(&start).unwrap()["host_audio_enabled"],
             true
         );
+    }
+
+    #[test]
+    fn continuous_audio_is_opt_in_and_requires_prepared_audio() {
+        let defaulted: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert!(!defaulted.continuous_audio);
+        assert!(
+            serde_json::to_value(&defaulted)
+                .unwrap()
+                .get("continuous_audio")
+                .is_none()
+        );
+
+        let mut enabled_json = start_json();
+        enabled_json["continuous_audio"] = json!(true);
+        let enabled: StartConfig = serde_json::from_value(enabled_json).unwrap();
+        assert!(enabled.continuous_audio);
+        assert!(enabled.validate(true).is_ok());
+        assert_eq!(
+            serde_json::to_value(&enabled).unwrap()["continuous_audio"],
+            true
+        );
+        assert_eq!(
+            enabled.validate(false),
+            Err("continuous_audio_requires_stream_audio")
+        );
+
+        let mut disabled_json = start_json();
+        disabled_json["continuous_audio"] = json!(false);
+        let disabled: StartConfig = serde_json::from_value(disabled_json).unwrap();
+        assert!(disabled.validate(false).is_ok());
     }
 
     #[test]
