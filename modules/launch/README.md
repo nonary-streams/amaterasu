@@ -131,6 +131,12 @@ Accepted workflows and status/stop replies return:
 {"ok":true,"launch":{"launch_id":1,"operation_id":"living-room-1","app_id":"app-0000000000000001","state":"active","session_id":1,"process_id":1,"failure":null,"cleanup_error":null}}
 ```
 
+Application catalog entries may set `config_overrides.amd_av1_latency_mode` to
+exactly `auto`, `none`, `power_saving`, `realtime`, or `lowest` (case-sensitive).
+Missing or null values inherit; explicit `auto` remains present in the application
+snapshot. Launch preserves the catalog value in launch and status records without
+resolving global or client precedence.
+
 `ok:true` acknowledges a retained lifecycle record, not necessarily a successful
 launch. Inspect `state`: `starting`, `active`, `stopping`, `stopped`, `cancelled`,
 `failed`, or `cleanup_failed`. A normal launch completes its response after

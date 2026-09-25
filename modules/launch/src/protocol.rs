@@ -707,6 +707,8 @@ pub struct ApplicationConfigOverrides {
     pub audio_sink_capture_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd_av1_latency_mode: Option<String>,
 }
 
 impl ApplicationConfigOverrides {
@@ -721,6 +723,14 @@ impl ApplicationConfigOverrides {
         {
             return Err("invalid_catalog_response");
         }
+        if self.amd_av1_latency_mode.as_deref().is_some_and(|mode| {
+            !matches!(
+                mode,
+                "auto" | "none" | "power_saving" | "realtime" | "lowest"
+            )
+        }) {
+            return Err("invalid_catalog_response");
+        }
         Ok(())
     }
 
@@ -729,6 +739,7 @@ impl ApplicationConfigOverrides {
             && self.audio_sink.is_none()
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
+            && self.amd_av1_latency_mode.is_none()
     }
 }
 
@@ -1077,6 +1088,61 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn application_amd_av1_latency_mode_preserves_sparse_exact_tokens() {
+        let missing = ApplicationConfigOverrides::default();
+        let null: ApplicationConfigOverrides =
+            serde_json::from_value(json!({"amd_av1_latency_mode":null})).unwrap();
+        assert!(missing.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(missing.amd_av1_latency_mode, None);
+        assert_eq!(null.amd_av1_latency_mode, None);
+        assert_eq!(serde_json::to_value(missing).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        for mode in ["auto", "none", "power_saving", "realtime", "lowest"] {
+            let configured: ApplicationConfigOverrides = serde_json::from_value(json!({
+                "amd_av1_latency_mode":mode
+            }))
+            .unwrap();
+            configured.validate().unwrap();
+            assert_eq!(configured.amd_av1_latency_mode.as_deref(), Some(mode));
+            assert!(!configured.is_empty());
+            assert_eq!(
+                serde_json::to_value(configured).unwrap(),
+                json!({"amd_av1_latency_mode":mode})
+            );
+        }
+
+        let explicit_auto: ApplicationConfigOverrides =
+            serde_json::from_value(json!({"amd_av1_latency_mode":"auto"})).unwrap();
+        assert_eq!(explicit_auto.amd_av1_latency_mode.as_deref(), Some("auto"));
+        assert!(!explicit_auto.is_empty());
+
+        for invalid in [
+            "AUTO",
+            "Power_saving",
+            "power_Saving",
+            "power_saving ",
+            "unknown",
+        ] {
+            let configured: ApplicationConfigOverrides = serde_json::from_value(json!({
+                "amd_av1_latency_mode":invalid
+            }))
+            .unwrap();
+            assert_eq!(configured.validate(), Err("invalid_catalog_response"));
+        }
+        for invalid in [json!(1), json!(true), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ApplicationConfigOverrides>(json!({
+                    "amd_av1_latency_mode":invalid
+                }))
+                .is_err(),
+                "accepted non-string mode {invalid}"
+            );
+        }
     }
 
     #[test]

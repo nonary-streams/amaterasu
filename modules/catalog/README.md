@@ -34,6 +34,17 @@ Create a manual entry:
 {"action":"create","expected_revision":0,"entry":{"name":"Example Game","description":"Local game","tags":["arcade"],"launch":{"kind":"executable","program":"/opt/games/example","arguments":["--fullscreen"],"working_directory":"/opt/games"}}}
 ```
 
+Entries may include sparse application `config_overrides`. The optional
+`amd_av1_latency_mode` string accepts exactly `auto`, `none`, `power_saving`,
+`realtime`, or `lowest` (case-sensitive). Omit it or set it to null to inherit;
+an explicit `auto` remains an application override. Catalog validates, stores,
+and returns this token unchanged; it does not resolve global or client policy.
+Existing entries omit the field, so no catalog migration is needed.
+
+```json
+{"action":"create","expected_revision":0,"entry":{"name":"AV1 tuned game","config_overrides":{"amd_av1_latency_mode":"power_saving"},"launch":{"kind":"application","path":"/games/example"}}}
+```
+
 Executable entries can include ordered preparation and paired undo commands:
 
 ```json

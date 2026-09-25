@@ -980,6 +980,79 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
 }
 
 #[test]
+fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
+    for (index, mode) in ["auto", "none", "power_saving", "realtime", "lowest"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"amd_av1_latency_mode":mode}));
+        let mut pipeline = pipeline();
+        let operation_id = format!("av1-latency-{index}");
+
+        let started = harness.request(&mut pipeline, "alice", launch(&operation_id));
+        assert_eq!(started["launch"]["state"], "active", "{started}");
+        let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
+        assert_eq!(
+            started["launch"]["config_overrides"]["amd_av1_latency_mode"],
+            mode
+        );
+
+        let changed_catalog_mode = if mode == "lowest" { "auto" } else { "lowest" };
+        harness.catalog_config_overrides =
+            Some(json!({"amd_av1_latency_mode":changed_catalog_mode}));
+        let retry = harness.request(&mut pipeline, "alice", launch(&operation_id));
+        assert_eq!(
+            retry["launch"]["config_overrides"]["amd_av1_latency_mode"],
+            mode
+        );
+
+        let status = harness.request(
+            &mut pipeline,
+            "alice",
+            json!({"action":"status","launch_id":launch_id}),
+        );
+        assert_eq!(
+            status["launch"]["config_overrides"]["amd_av1_latency_mode"],
+            mode
+        );
+    }
+}
+
+#[test]
+fn invalid_amd_av1_latency_mode_fails_before_session_creation() {
+    for (index, invalid) in [
+        json!("AUTO"),
+        json!("Power_saving"),
+        json!("unknown"),
+        json!(true),
+        json!(42),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"amd_av1_latency_mode":invalid}));
+        let mut pipeline = pipeline();
+
+        let failed = harness.request(
+            &mut pipeline,
+            "alice",
+            launch(&format!("invalid-av1-latency-{index}")),
+        );
+        assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+        assert_eq!(
+            failed["launch"]["failure"], "invalid_catalog_response",
+            "{failed}"
+        );
+        assert!(harness.sessions.is_empty());
+        assert!(!harness.commands.iter().any(|(service, payload, _)| {
+            service == crate::workflow::SESSION && payload["action"] == "create"
+        }));
+    }
+}
+
+#[test]
 fn persisted_process_lifecycle_policy_reaches_application_launch() {
     let mut harness = Harness::new();
     harness.catalog_wait_all = Some(false);

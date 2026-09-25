@@ -88,6 +88,8 @@ pub struct ConfigOverrides {
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd_av1_latency_mode: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -119,6 +121,14 @@ impl ConfigOverrides {
         {
             return Err("gamepad must be a recognized profile for this platform");
         }
+        if self.amd_av1_latency_mode.as_deref().is_some_and(|mode| {
+            !matches!(
+                mode,
+                "auto" | "none" | "power_saving" | "realtime" | "lowest"
+            )
+        }) {
+            return Err("amd_av1_latency_mode has an invalid mode");
+        }
         Ok(())
     }
 
@@ -133,6 +143,7 @@ impl ConfigOverrides {
             && self.gamepad.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
+            && self.amd_av1_latency_mode.is_none()
     }
 }
 
@@ -597,6 +608,66 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":37,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn amd_av1_latency_mode_is_sparse_exact_and_roundtrips_through_catalog_entries() {
+        let absent = ConfigOverrides::default();
+        let null: ConfigOverrides =
+            serde_json::from_value(json!({"amd_av1_latency_mode":null})).unwrap();
+        assert_eq!(absent.amd_av1_latency_mode, None);
+        assert_eq!(null.amd_av1_latency_mode, None);
+        assert!(absent.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        let modes = ["auto", "none", "power_saving", "realtime", "lowest"];
+        for mode in modes {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"AV1 latency mode",
+                "config_overrides":{"amd_av1_latency_mode":mode},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .unwrap();
+            entry.validate().unwrap();
+            assert_eq!(
+                entry.config_overrides.amd_av1_latency_mode.as_deref(),
+                Some(mode)
+            );
+            assert_eq!(
+                serde_json::to_value(&entry).unwrap()["config_overrides"],
+                json!({"amd_av1_latency_mode":mode})
+            );
+        }
+
+        let explicit_auto: ConfigOverrides =
+            serde_json::from_value(json!({"amd_av1_latency_mode":"auto"})).unwrap();
+        assert_eq!(explicit_auto.amd_av1_latency_mode.as_deref(), Some("auto"));
+        assert!(!explicit_auto.is_empty());
+
+        for invalid in [
+            "AUTO",
+            "Power_saving",
+            "power_Saving",
+            "power_saving ",
+            "unknown",
+        ] {
+            let overrides: ConfigOverrides = serde_json::from_value(json!({
+                "amd_av1_latency_mode":invalid
+            }))
+            .unwrap();
+            assert!(overrides.validate().is_err(), "accepted mode {invalid:?}");
+        }
+        for invalid in [json!(1), json!(true), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(json!({
+                    "amd_av1_latency_mode":invalid
+                }))
+                .is_err(),
+                "accepted non-string mode {invalid}"
+            );
+        }
     }
 
     #[test]

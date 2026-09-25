@@ -2693,6 +2693,50 @@ fn empty_or_rejected_playnite_snapshot_has_no_cleanup_effect() {
 }
 
 #[test]
+fn resolve_launch_preserves_exact_amd_av1_latency_mode_tokens() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+
+    for (index, mode) in ["auto", "none", "power_saving", "realtime", "lowest"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut catalog_entry = entry(&format!("AV1 {mode}"));
+        catalog_entry["config_overrides"] = json!({"amd_av1_latency_mode":mode});
+        let created = backend.run_for(
+            &mut pipeline,
+            json!({
+                "action":"create",
+                "expected_revision":index,
+                "entry":catalog_entry
+            }),
+            "owner",
+            "owner",
+            "owner",
+        );
+        assert_eq!(created["ok"], true, "{created}");
+
+        let resolved = backend.run_for(
+            &mut pipeline,
+            json!({"action":"resolve_launch","id":created["id"]}),
+            "launch",
+            "owner",
+            "owner",
+        );
+        assert_eq!(resolved["ok"], true, "{resolved}");
+        assert_eq!(
+            resolved["entry"]["config_overrides"],
+            json!({"amd_av1_latency_mode":mode})
+        );
+    }
+}
+
+#[test]
 fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();
