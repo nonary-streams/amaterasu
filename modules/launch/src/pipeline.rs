@@ -7,9 +7,223 @@ use crate::{
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::Value;
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 type Transport = ModuleResult<Response>;
+
+fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
+    let Some(settings) = snapshot.get("settings").and_then(Value::as_object) else {
+        return false;
+    };
+    if snapshot.get("version").and_then(Value::as_u64) != Some(1)
+        || snapshot
+            .get("requested_stream_fps_millihz")
+            .and_then(Value::as_u64)
+            .is_none_or(|rate| rate == 0 || rate > 1_000_000)
+        || snapshot.len() != 9
+        || settings.len() != 11
+    {
+        return false;
+    }
+    for key in [
+        "client_display_mode_override_millihz",
+        "lossless_scaling_limit_millihz",
+    ] {
+        if !snapshot.get(key).is_some_and(|value| {
+            value.is_null() || value.as_u64().is_some_and(|rate| rate <= 1_000_000)
+        }) {
+            return false;
+        }
+    }
+    for key in ["virtual_display_active", "physical_framegen_capture"] {
+        if !snapshot
+            .get(key)
+            .is_some_and(|value| value.is_null() || value.is_boolean())
+        {
+            return false;
+        }
+    }
+    if !snapshot
+        .get("game_frame_generation_mode")
+        .is_some_and(|value| value.is_null() || value.as_str().is_some_and(|mode| mode.len() <= 64))
+        || snapshot.get("rtss_frame_limit_type_explicit_override") != Some(&Value::Null)
+    {
+        return false;
+    }
+    for key in [
+        "frame_limiter_enable",
+        "frame_limiter_disable_vsync",
+        "rtss_allow_virtual_display_override",
+        "mangohud_always_show_graph",
+    ] {
+        if !settings.get(key).is_some_and(Value::is_boolean) {
+            return false;
+        }
+    }
+    if settings
+        .get("frame_limiter_fps_limit_millihz")
+        .and_then(Value::as_u64)
+        .is_none_or(|rate| rate > 1_000_000)
+    {
+        return false;
+    }
+    let string = |key| settings.get(key).and_then(Value::as_str);
+    string("frame_limiter_provider").is_some_and(|provider| {
+        matches!(
+            provider,
+            "auto"
+                | "none"
+                | "rtss"
+                | "nvidia-control-panel"
+                | "mangohud"
+                | "proton"
+                | "mangohud-proton"
+        )
+    }) && string("frame_limiter_auto_virtual_framegen")
+        .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
+        && string("rtss_frame_limit_type").is_some_and(|mode| {
+            matches!(
+                mode,
+                "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+            )
+        })
+        && string("rtss_install_path").is_some_and(|path| path.len() <= 4096)
+        && string("mangohud_limiter_method")
+            .is_some_and(|method| matches!(method, "early" | "late"))
+        && string("mangohud_preset")
+            .is_some_and(|preset| matches!(preset, "custom" | "1" | "2" | "3" | "4"))
+}
+
+fn valid_client_frame_limiter_overrides(overrides: &BTreeMap<String, Value>) -> bool {
+    overrides.iter().all(|(key, value)| {
+        if !matches!(
+            key.as_str(),
+            "frame_limiter_enable"
+                | "frame_limiter_disable_vsync"
+                | "rtss_allow_virtual_display_override"
+                | "mangohud_always_show_graph"
+                | "frame_limiter_fps_limit"
+                | "frame_limiter_provider"
+                | "frame_limiter_auto_virtual_framegen"
+                | "rtss_frame_limit_type"
+                | "rtss_install_path"
+                | "mangohud_limiter_method"
+                | "mangohud_preset"
+        ) {
+            return false;
+        }
+        if value.is_null() {
+            return true;
+        }
+        match key.as_str() {
+            "frame_limiter_enable"
+            | "frame_limiter_disable_vsync"
+            | "rtss_allow_virtual_display_override"
+            | "mangohud_always_show_graph" => value.is_boolean(),
+            "frame_limiter_fps_limit" => value.as_f64().is_some_and(|fps| {
+                fps.is_finite()
+                    && (0.0..=1000.0).contains(&fps)
+                    && ((fps * 1000.0) - (fps * 1000.0).round()).abs() < 0.000_001
+            }),
+            "frame_limiter_provider" => value.as_str().is_some_and(|provider| {
+                matches!(
+                    provider,
+                    "auto"
+                        | "none"
+                        | "rtss"
+                        | "nvidia-control-panel"
+                        | "mangohud"
+                        | "proton"
+                        | "mangohud-proton"
+                )
+            }),
+            "frame_limiter_auto_virtual_framegen" => value
+                .as_str()
+                .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled")),
+            "rtss_frame_limit_type" => value.as_str().is_some_and(|mode| {
+                matches!(
+                    mode,
+                    "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                )
+            }),
+            "rtss_install_path" => value
+                .as_str()
+                .is_some_and(|path| path.len() <= 4096 && !path.chars().any(char::is_control)),
+            "mangohud_limiter_method" => value
+                .as_str()
+                .is_some_and(|method| matches!(method, "early" | "late")),
+            "mangohud_preset" => value
+                .as_str()
+                .is_some_and(|preset| matches!(preset, "custom" | "1" | "2" | "3" | "4")),
+            _ => false,
+        }
+    })
+}
+
+fn snapshot_matches_application_policy(
+    record: &crate::records::Record,
+    snapshot: &BTreeMap<String, Value>,
+    client: Option<&BTreeMap<String, Value>>,
+) -> bool {
+    let Some(settings) = snapshot.get("settings").and_then(Value::as_object) else {
+        return false;
+    };
+    let application = record
+        .config_overrides
+        .as_ref()
+        .map(|overrides| serde_json::to_value(overrides).expect("serializable overrides"))
+        .unwrap_or_else(|| serde_json::json!({}));
+    for (key, effective_key) in [
+        ("frame_limiter_enable", "frame_limiter_enable"),
+        ("frame_limiter_provider", "frame_limiter_provider"),
+        ("frame_limiter_disable_vsync", "frame_limiter_disable_vsync"),
+        (
+            "frame_limiter_auto_virtual_framegen",
+            "frame_limiter_auto_virtual_framegen",
+        ),
+        ("rtss_frame_limit_type", "rtss_frame_limit_type"),
+        (
+            "rtss_allow_virtual_display_override",
+            "rtss_allow_virtual_display_override",
+        ),
+        ("rtss_install_path", "rtss_install_path"),
+        ("mangohud_limiter_method", "mangohud_limiter_method"),
+        ("mangohud_preset", "mangohud_preset"),
+        ("mangohud_always_show_graph", "mangohud_always_show_graph"),
+    ] {
+        let expected = client
+            .and_then(|overrides| overrides.get(key))
+            .filter(|value| !value.is_null())
+            .or_else(|| application.get(key));
+        if let Some(expected) = expected
+            && settings.get(effective_key) != Some(expected)
+        {
+            return false;
+        }
+    }
+    let fps = client
+        .and_then(|overrides| overrides.get("frame_limiter_fps_limit"))
+        .filter(|value| !value.is_null())
+        .or_else(|| application.get("frame_limiter_fps_limit"));
+    if let Some(fps) = fps {
+        let Some(hertz) = fps.as_f64() else {
+            return false;
+        };
+        if !hertz.is_finite()
+            || !(0.0..=1000.0).contains(&hertz)
+            || settings
+                .get("frame_limiter_fps_limit_millihz")
+                .and_then(Value::as_u64)
+                != Some((hertz * 1000.0).round() as u64)
+        {
+            return false;
+        }
+    }
+    true
+}
 pub struct Pipeline {
     records: Records,
     job: Option<Workflow>,
@@ -118,6 +332,35 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         match operation {
+            Operation::PreflightExport {
+                operation_id,
+                app_id,
+                global_preparation,
+                legacy_global_preparation,
+            } => match self.records.start(
+                caller,
+                initiator,
+                operation_id,
+                app_id,
+                CatalogSelection::Exported,
+                GlobalPreparation {
+                    structured_steps: global_preparation,
+                    legacy_commands: legacy_global_preparation,
+                },
+            ) {
+                Ok((id, true)) => {
+                    let record = self.records.values.get_mut(&id).expect("preflight record");
+                    record.preflight_token = Some(record.session_key.clone());
+                    record.preflight_deadline = Some(Instant::now() + Duration::from_secs(120));
+                    self.job = Some(Workflow::launch(id, request, remaining_ms));
+                    Ok(())
+                }
+                Ok((id, false)) if self.records.values[&id].preflight_ready => {
+                    complete(send, request, self.records.values[&id].preflight_response())
+                }
+                Ok(_) => complete(send, request, error("preflight_unavailable")),
+                Err(code) => complete(send, request, error(code)),
+            },
             Operation::Launch {
                 operation_id,
                 app_id,
@@ -146,12 +389,31 @@ impl Pipeline {
                 app_id,
                 global_preparation,
                 legacy_global_preparation,
+                preflight_token,
                 frame_limiter_settings,
                 client_frame_limiter_overrides,
             } => {
-                drop(frame_limiter_settings);
-                drop(client_frame_limiter_overrides);
-
+                if frame_limiter_settings.is_some() && preflight_token.is_none() {
+                    return complete(send, request, error("preflight_required"));
+                }
+                if preflight_token.is_some() && frame_limiter_settings.is_none() {
+                    return complete(send, request, error("invalid_frame_limiter_snapshot"));
+                }
+                if let Some(settings) = &frame_limiter_settings
+                    && !valid_frame_limiter_snapshot(settings)
+                {
+                    return complete(send, request, error("invalid_frame_limiter_snapshot"));
+                }
+                if client_frame_limiter_overrides
+                    .as_ref()
+                    .is_some_and(|overrides| !valid_client_frame_limiter_overrides(overrides))
+                {
+                    return complete(
+                        send,
+                        request,
+                        error("invalid_client_frame_limiter_overrides"),
+                    );
+                }
                 match self.records.start(
                     caller,
                     initiator,
@@ -164,10 +426,51 @@ impl Pipeline {
                     },
                 ) {
                     Ok((id, true)) => {
+                        if preflight_token.is_some() {
+                            self.records.values.remove(&id);
+                            return complete(send, request, error("preflight_not_found"));
+                        }
+                        self.records
+                            .values
+                            .get_mut(&id)
+                            .expect("launch record")
+                            .launch_started = true;
                         self.job = Some(Workflow::launch(id, request, remaining_ms));
                         Ok(())
                     }
-                    Ok((id, false)) => complete(send, request, self.records.values[&id].response()),
+                    Ok((id, false)) => {
+                        let record = self.records.values.get_mut(&id).expect("launch record");
+                        if record.preflight_token.as_deref() != preflight_token.as_deref()
+                            || (record.preflight_token.is_some() && !record.preflight_ready)
+                        {
+                            return complete(send, request, error("preflight_mismatch"));
+                        }
+                        if let Some(settings) = &frame_limiter_settings
+                            && !snapshot_matches_application_policy(
+                                record,
+                                settings,
+                                client_frame_limiter_overrides.as_ref(),
+                            )
+                        {
+                            return complete(send, request, error("frame_limiter_policy_mismatch"));
+                        }
+                        if record.launch_started {
+                            if record.frame_limiter_settings != frame_limiter_settings
+                                || record.client_frame_limiter_overrides
+                                    != client_frame_limiter_overrides
+                            {
+                                return complete(send, request, error("operation_conflict"));
+                            }
+                            return complete(send, request, record.response());
+                        }
+                        record.frame_limiter_settings = frame_limiter_settings;
+                        record.client_frame_limiter_overrides = client_frame_limiter_overrides;
+                        record.launch_started = true;
+                        let mut workflow = Workflow::launch(id, request, remaining_ms);
+                        workflow.step = Step::CreateSession;
+                        self.job = Some(workflow);
+                        Ok(())
+                    }
                     Err(code) => complete(send, request, error(code)),
                 }
             }
@@ -405,7 +708,15 @@ impl Pipeline {
                     &record.legacy_global_preparation,
                     &self.environment,
                 ) {
-                    Ok(target) => record.target = Some(target),
+                    Ok(target) => {
+                        record.executable_path = match &target {
+                            LaunchTarget::Executable(executable) => {
+                                Some(executable.program.clone())
+                            }
+                            _ => None,
+                        };
+                        record.target = Some(target);
+                    }
                     Err(code) => return self.dependency_failed(job, code, send),
                 }
                 let config_overrides = match payload["entry"].get("config_overrides") {
@@ -420,6 +731,15 @@ impl Pipeline {
                 };
                 record.config_overrides =
                     (!config_overrides.is_empty()).then_some(config_overrides);
+                let Some(revision) = payload.get("revision").and_then(Value::as_u64) else {
+                    return self.dependency_failed(job, "invalid_catalog_response", send);
+                };
+                record.catalog_revision = Some(revision);
+                if record.preflight_token.is_some() {
+                    record.preflight_ready = true;
+                    let response = record.preflight_response();
+                    return complete(send, job.request.expect("preflight request"), response);
+                }
                 job.step = Step::CreateSession;
             }
             Step::CreateSession => {
@@ -925,10 +1245,15 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         if let Some(request) = job.request {
+            let record = &self.records.values[&job.launch_id];
             complete(
                 send,
                 request,
-                self.records.values[&job.launch_id].response(),
+                if record.preflight_token.is_some() && !record.launch_started {
+                    error(record.failure.unwrap_or("preflight_unavailable"))
+                } else {
+                    record.response()
+                },
             )
         } else {
             Ok(())

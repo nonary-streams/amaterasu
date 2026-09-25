@@ -5,7 +5,7 @@ use crate::protocol::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CatalogSelection {
@@ -56,6 +56,22 @@ pub struct Record {
     pub provider_ticket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_limiter_settings: Option<BTreeMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
+    #[serde(skip)]
+    pub preflight_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_revision: Option<u64>,
+    #[serde(skip)]
+    pub preflight_ready: bool,
+    #[serde(skip)]
+    pub preflight_deadline: Option<Instant>,
+    #[serde(skip)]
+    pub launch_started: bool,
     #[serde(skip)]
     pub session_requested: bool,
     #[serde(skip)]
@@ -77,6 +93,9 @@ pub struct Record {
 impl Record {
     pub fn response(&self) -> Value {
         json!({"ok":true,"launch":self})
+    }
+    pub fn preflight_response(&self) -> Value {
+        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"executable_path":self.executable_path})
     }
 }
 pub struct Records {
@@ -103,6 +122,14 @@ impl Records {
         catalog_selection: CatalogSelection,
         global_preparation: GlobalPreparation,
     ) -> Result<(u64, bool), &'static str> {
+        self.values.retain(|_, record| {
+            record.launch_started
+                || record.preflight_token.is_none()
+                || (record.state == State::Starting
+                    && record
+                        .preflight_deadline
+                        .is_some_and(|deadline| Instant::now() < deadline))
+        });
         let GlobalPreparation {
             structured_steps: global_preparation,
             legacy_commands: legacy_global_preparation,
@@ -174,6 +201,14 @@ impl Records {
                 legacy_global_preparation,
                 provider_ticket: None,
                 config_overrides: None,
+                executable_path: None,
+                frame_limiter_settings: None,
+                client_frame_limiter_overrides: None,
+                preflight_token: None,
+                catalog_revision: None,
+                preflight_ready: false,
+                preflight_deadline: None,
+                launch_started: false,
                 session_requested: false,
                 process_requested: false,
                 preparation_requested: false,

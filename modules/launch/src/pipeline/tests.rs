@@ -566,7 +566,7 @@ impl Harness {
                             || json!({"kind":"executable","program":std::env::current_exe().unwrap(),"arguments":["--exact",fixture,"--ignored"],"working_directory":null}),
                             |game_id| json!({"kind":"playnite","game_id":game_id,"exit_timeout_seconds":self.catalog_playnite_exit_timeout_seconds}),
                         );
-                        let mut reply = json!({"ok":true,"id":payload["id"],"entry":{"name":"Test executable","launch":launch}});
+                        let mut reply = json!({"ok":true,"revision":1,"id":payload["id"],"entry":{"name":"Test executable","launch":launch}});
                         let mut overrides = serde_json::Map::new();
                         if let Some(fec_percentage) = self.catalog_fec_percentage {
                             overrides.insert("fec_percentage".into(), json!(fec_percentage));
@@ -843,23 +843,208 @@ fn launch_export_accepts_only_object_shaped_frame_limiter_compatibility_fields()
     assert!(serde_json::from_value::<Operation>(unknown_field).is_err());
 }
 
+fn frame_limiter_snapshot() -> Value {
+    json!({
+        "version":1,
+        "settings":{
+            "frame_limiter_enable":true,
+            "frame_limiter_fps_limit_millihz":120000,
+            "frame_limiter_provider":"auto",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":"enabled",
+            "rtss_frame_limit_type":"async",
+            "rtss_allow_virtual_display_override":false,
+            "rtss_install_path":"",
+            "mangohud_limiter_method":"late",
+            "mangohud_preset":"custom",
+            "mangohud_always_show_graph":false
+        },
+        "requested_stream_fps_millihz":60000,
+        "client_display_mode_override_millihz":null,
+        "lossless_scaling_limit_millihz":null,
+        "virtual_display_active":null,
+        "physical_framegen_capture":null,
+        "game_frame_generation_mode":null,
+        "rtss_frame_limit_type_explicit_override":null
+    })
+}
+
 #[test]
-fn launch_export_drops_frame_limiter_compatibility_fields_without_changing_response() {
+fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() {
+    let mut harness = Harness::new();
+    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":true}));
+    let mut pipeline = pipeline();
+    let operation_id = "frozen-frame-policy";
+    let preflight_request = json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"});
+    let preflight = harness.request(&mut pipeline, "nvhttp", preflight_request.clone());
+    assert_eq!(preflight["catalog_revision"], 1);
+    assert_eq!(
+        preflight["config_overrides"],
+        json!({"frame_limiter_enable":true})
+    );
+    assert_eq!(preflight["app_id"], "app-0000000000000001");
+    assert!(preflight["executable_path"].is_string());
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", preflight_request),
+        preflight
+    );
+
+    let mut request = launch_export(operation_id);
+    request["preflight_token"] = preflight["preflight_token"].clone();
+    request["frame_limiter_settings"] = frame_limiter_snapshot();
+    request["client_frame_limiter_overrides"] = json!({});
+    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
+    let started = harness.request(&mut pipeline, "nvhttp", request.clone());
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(
+        started["launch"]["config_overrides"],
+        preflight["config_overrides"]
+    );
+    assert_eq!(
+        started["launch"]["executable_path"],
+        preflight["executable_path"]
+    );
+    assert_eq!(
+        started["launch"]["frame_limiter_settings"],
+        frame_limiter_snapshot()
+    );
+    assert_eq!(harness.request(&mut pipeline, "nvhttp", request), started);
+    let mut changed_retry = launch_export(operation_id);
+    changed_retry["preflight_token"] = preflight["preflight_token"].clone();
+    changed_retry["frame_limiter_settings"] = frame_limiter_snapshot();
+    changed_retry["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
+    changed_retry["client_frame_limiter_overrides"] = json!({});
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", changed_retry)["code"],
+        "operation_conflict"
+    );
+    let launch_id = started["launch"]["launch_id"].clone();
+    for query in [
+        json!({"action":"status","launch_id":launch_id}),
+        json!({"action":"lookup","operation_id":operation_id}),
+    ] {
+        let readback = harness.request(&mut pipeline, "nvhttp", query);
+        assert_eq!(
+            readback["launch"]["frame_limiter_settings"],
+            frame_limiter_snapshot()
+        );
+        assert_eq!(
+            readback["launch"]["config_overrides"],
+            preflight["config_overrides"]
+        );
+    }
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, _, _)| service == crate::workflow::CATALOG)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
-    let mut request = launch_export("compatibility-fields-dropped");
-    request["frame_limiter_settings"] = json!({"enabled":true});
-    request["client_frame_limiter_overrides"] = json!({"fps_limit":120});
+    let preflight = harness.request_as(
+        &mut pipeline,
+        "nvhttp",
+        "paired-client",
+        json!({"action":"preflight_export","operation_id":"bound-token","app_id":"app-0000000000000001"}),
+    );
+    let mut launch = launch_export("bound-token");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
 
-    let started = harness.request(&mut pipeline, "nvhttp", request);
-    assert_eq!(started["launch"]["state"], "active", "{started}");
-    assert!(started.get("frame_limiter_settings").is_none());
-    assert!(started.get("client_frame_limiter_overrides").is_none());
-    assert!(started["launch"].get("frame_limiter_settings").is_none());
-    assert!(
-        started["launch"]
-            .get("client_frame_limiter_overrides")
-            .is_none()
+    for (caller, initiator, expected) in [
+        ("other-service", "paired-client", "preflight_not_found"),
+        ("nvhttp", "other-client", "operation_conflict"),
+    ] {
+        let rejected = harness.request_as(&mut pipeline, caller, initiator, launch.clone());
+        assert_eq!(rejected["code"], expected, "{rejected}");
+    }
+    let mut wrong_operation = launch.clone();
+    wrong_operation["operation_id"] = json!("other-operation");
+    assert_eq!(
+        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_operation)["code"],
+        "preflight_not_found"
+    );
+    let mut wrong_application = launch.clone();
+    wrong_application["app_id"] = json!("app-0000000000000002");
+    assert_eq!(
+        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_application)["code"],
+        "operation_conflict"
+    );
+    let mut wrong_token = launch.clone();
+    wrong_token["preflight_token"] = json!("wrong-token");
+    assert_eq!(
+        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_token)["code"],
+        "preflight_mismatch"
+    );
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+    assert_eq!(
+        harness.request_as(&mut pipeline, "nvhttp", "paired-client", launch)["launch"]["state"],
+        "active"
+    );
+}
+
+#[test]
+fn preflight_rejects_invalid_catalog_policy_and_export_rejects_snapshot_mismatch() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    harness.catalog_config_overrides = Some(json!({"rtss_frame_limit_type":17}));
+    let rejected = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"preflight_export","operation_id":"invalid-catalog","app_id":"app-0000000000000001"}),
+    );
+    assert_eq!(rejected["code"], "invalid_catalog_response");
+    assert!(harness.sessions.is_empty());
+
+    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
+    let preflight = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"preflight_export","operation_id":"validate-snapshot","app_id":"app-0000000000000001"}),
+    );
+    let mut launch = launch_export("validate-snapshot");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        "frame_limiter_policy_mismatch"
+    );
+    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
+    launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!("60hz");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        "invalid_frame_limiter_snapshot"
+    );
+    launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(60000);
+    launch["client_frame_limiter_overrides"] = json!({"unrecognized":null});
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        "invalid_client_frame_limiter_overrides"
+    );
+    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_fps_limit":"120"});
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        "invalid_client_frame_limiter_overrides"
+    );
+    launch["client_frame_limiter_overrides"] = json!({});
+    launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!("async");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        "invalid_frame_limiter_snapshot"
+    );
+    launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = Value::Null;
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", launch)["launch"]["state"],
+        "active"
     );
 }
 

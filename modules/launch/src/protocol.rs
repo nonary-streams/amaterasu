@@ -18,6 +18,14 @@ const MAX_SEARCH_PATH_ENTRIES: usize = 128;
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    PreflightExport {
+        operation_id: String,
+        app_id: String,
+        #[serde(default)]
+        global_preparation: Vec<PreparationStep>,
+        #[serde(default)]
+        legacy_global_preparation: Vec<LegacyPreparationCommand>,
+    },
     Launch {
         operation_id: String,
         app_id: String,
@@ -29,6 +37,8 @@ pub enum Operation {
     LaunchExport {
         operation_id: String,
         app_id: String,
+        #[serde(default)]
+        preflight_token: Option<String>,
         #[serde(default)]
         global_preparation: Vec<PreparationStep>,
         #[serde(default)]
@@ -60,7 +70,13 @@ fn page_limit() -> usize {
 impl Operation {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Launch {
+            Self::PreflightExport {
+                operation_id,
+                app_id,
+                global_preparation,
+                legacy_global_preparation,
+            }
+            | Self::Launch {
                 operation_id,
                 app_id,
                 global_preparation,

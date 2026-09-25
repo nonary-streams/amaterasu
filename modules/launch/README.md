@@ -173,6 +173,21 @@ The launch record snapshots these settings from the catalog revision used to
 start the application. Consumer behavior for frame limiter and DS4 settings is
 provided by their runtime modules.
 
+Exported launches can call `preflight_export` with the same `operation_id`,
+`app_id`, and global preparation lists used by the later `launch_export`. The
+authenticated runtime initiator selects the exported Catalog owner. Preflight
+resolves and validates one Catalog row without creating a session or starting an
+application. It returns a short-lived opaque `preflight_token`,
+`catalog_revision`, sparse `config_overrides`, and the executable path when the
+selected target is executable. `launch_export` supplies that token plus the
+effective `frame_limiter_settings` and sparse
+`client_frame_limiter_overrides`. Launch validates the snapshot against the
+frozen application and client policy, then starts the target captured during
+preflight. Later Catalog edits cannot change that in-flight launch. The launch
+record, status, lookup, and identical retries retain the effective snapshot,
+Catalog revision, sparse overrides, and executable path. Tokenless legacy
+`launch_export` requests remain supported when no effective snapshot is supplied.
+
 `ok:true` acknowledges a retained lifecycle record, not necessarily a successful
 launch. Inspect `state`: `starting`, `active`, `stopping`, `stopped`, `cancelled`,
 `failed`, or `cleanup_failed`. A normal launch completes its response after
