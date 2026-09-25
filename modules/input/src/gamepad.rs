@@ -1599,4 +1599,93 @@ mod tests {
         release_owned_device(&mut device, |_| Ok(()), |_| Ok(())).unwrap();
         assert_eq!(device, None);
     }
+
+    #[test]
+    fn failed_uinput_write_and_detach_force_recovery_on_unchanged_tick() {
+        struct FakeUinput {
+            state: ControllerSnapshot,
+            recovery_required: bool,
+            fail_emit: bool,
+            fail_detach: Rc<std::cell::Cell<bool>>,
+            trace: Rc<RefCell<Vec<&'static str>>>,
+        }
+        impl GamepadDevice for FakeUinput {
+            fn update(&mut self, desired: ControllerSnapshot) -> InputResult<()> {
+                if self.recovery_required {
+                    self.trace.borrow_mut().push("blocked stale write");
+                    return Err(InputError::new(
+                        "controller_unavailable",
+                        "recovery required",
+                    ));
+                }
+                if controller_state_events(self.state, desired).is_empty() {
+                    return Ok(());
+                }
+                self.state = possible_controller_state_after_write_failure(self.state, desired);
+                self.recovery_required = true;
+                self.trace.borrow_mut().push("emit");
+                if std::mem::take(&mut self.fail_emit) {
+                    return Err(InputError::new("injection_failed", "partial write"));
+                }
+                self.state = desired;
+                self.recovery_required = false;
+                Ok(())
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                self.trace.borrow_mut().push("detach");
+                if self.fail_detach.get() {
+                    return Err(InputError::new("release_failed", "destroy failed"));
+                }
+                self.state = ControllerSnapshot::default();
+                self.recovery_required = false;
+                self.trace.borrow_mut().push("allocate");
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                self.trace.borrow_mut().push("release");
+                Ok(())
+            }
+        }
+
+        let fail_detach = Rc::new(std::cell::Cell::new(true));
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut slots = GamepadSlots::new();
+        let now = Instant::now();
+        assert!(
+            slots
+                .apply(
+                    0,
+                    1,
+                    ControllerSnapshot {
+                        buttons: BACK_BUTTON_MASK,
+                        ..ControllerSnapshot::default()
+                    },
+                    -1,
+                    now,
+                    |_| {
+                        Ok(FakeUinput {
+                            state: ControllerSnapshot::default(),
+                            recovery_required: false,
+                            fail_emit: true,
+                            fail_detach: fail_detach.clone(),
+                            trace: trace.clone(),
+                        })
+                    },
+                )
+                .is_err()
+        );
+        assert!(slots.advance(now + Duration::from_millis(100)).is_err());
+        assert_eq!(
+            &*trace.borrow(),
+            &["emit", "detach", "blocked stale write", "detach"]
+        );
+        fail_detach.set(false);
+        slots.advance(now + Duration::from_millis(200)).unwrap();
+        assert_eq!(trace.borrow().last(), Some(&"emit"));
+        assert!(trace.borrow().contains(&"allocate"));
+        slots.stop().unwrap();
+        assert_eq!(trace.borrow().last(), Some(&"release"));
+    }
 }

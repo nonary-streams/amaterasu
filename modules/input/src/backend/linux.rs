@@ -187,6 +187,7 @@ struct UinputGamepad {
     path: String,
     controller_number: u8,
     state: ControllerSnapshot,
+    recovery_required: bool,
 }
 
 impl UinputGamepad {
@@ -196,12 +197,19 @@ impl UinputGamepad {
             path: path.to_owned(),
             controller_number,
             state: ControllerSnapshot::default(),
+            recovery_required: false,
         })
     }
 }
 
 impl GamepadDevice for UinputGamepad {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+        if self.recovery_required {
+            return Err(InputError::new(
+                "controller_unavailable",
+                "uinput gamepad must detach after a failed report",
+            ));
+        }
         let device = self.device.as_ref().ok_or_else(|| {
             InputError::new("controller_unavailable", "uinput gamepad is reacquiring")
         })?;
@@ -210,6 +218,7 @@ impl GamepadDevice for UinputGamepad {
             // A failed frame write may have reached the kernel partially. Keep
             // every possibly-held value so lease cleanup emits its neutral form.
             self.state = possible_controller_state_after_write_failure(self.state, state);
+            self.recovery_required = true;
             let native_events = events
                 .iter()
                 .map(|event: &NativeGamepadEvent| (event.event_type, event.code, event.value))
@@ -217,6 +226,7 @@ impl GamepadDevice for UinputGamepad {
             device.emit(&native_events)?;
         }
         self.state = state;
+        self.recovery_required = false;
         Ok(())
     }
 
@@ -243,6 +253,7 @@ impl GamepadDevice for UinputGamepad {
         );
         if result.is_ok() {
             self.state = ControllerSnapshot::default();
+            self.recovery_required = false;
         }
         result
     }
@@ -252,6 +263,7 @@ impl GamepadDevice for UinputGamepad {
             Device::create_gamepad(&self.path, self.controller_number)
         })?;
         self.state = ControllerSnapshot::default();
+        self.recovery_required = false;
         Ok(())
     }
 }
