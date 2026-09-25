@@ -1,4 +1,5 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
+mod frame_limiter;
 mod launch;
 mod network_settings;
 mod preparation;
@@ -11,7 +12,11 @@ mod wire;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use launch::CaptureMode;
 use network_settings::NetworkSettings;
-use product_settings::{AdminAction, FieldUpdate, NetworkTarget, ProductSettings};
+use preparation::LegacyPreparationStep;
+use product_settings::{
+    AdminAction, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate, NetworkTarget,
+    ProductSettings,
+};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use settings::Settings;
@@ -110,6 +115,36 @@ enum Operation {
         ping_timeout_ms: FieldUpdate<i32>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         global_preparation: FieldUpdate<Vec<preparation::PreparationStep>>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        frame_limiter_enable: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        frame_limiter_fps_limit: FieldUpdate<f64>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        frame_limiter_provider: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        frame_limiter_disable_vsync: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        frame_limiter_auto_virtual_framegen: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        rtss_frame_limit_type: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        rtss_allow_virtual_display_override: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        rtss_install_path: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        mangohud_limiter_method: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        mangohud_preset: FieldUpdate<String>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        mangohud_always_show_graph: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        rtss_disable_vsync_ullm: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        lan_encryption_mode: FieldUpdate<i64>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
+        wan_encryption_mode: FieldUpdate<i64>,
         expected_revision: u64,
     },
 }
@@ -501,6 +536,21 @@ impl NvhttpModule {
                                 wgc_pacing_smoothing,
                                 ping_timeout_ms,
                                 global_preparation,
+                                legacy_global_preparation,
+                                frame_limiter_enable,
+                                frame_limiter_fps_limit,
+                                frame_limiter_provider,
+                                frame_limiter_disable_vsync,
+                                frame_limiter_auto_virtual_framegen,
+                                rtss_frame_limit_type,
+                                rtss_allow_virtual_display_override,
+                                rtss_install_path,
+                                mangohud_limiter_method,
+                                mangohud_preset,
+                                mangohud_always_show_graph,
+                                rtss_disable_vsync_ullm,
+                                lan_encryption_mode,
+                                wan_encryption_mode,
                                 expected_revision,
                             } => {
                                 if settings::validate_configured_hostname(&hostname).is_err() {
@@ -535,6 +585,25 @@ impl NvhttpModule {
                                     wgc_pacing_smoothing,
                                     ping_timeout_ms,
                                     global_preparation,
+                                    legacy_global_preparation,
+                                    frame_limiter: FrameLimiterUpdate {
+                                        frame_limiter_enable,
+                                        frame_limiter_fps_limit,
+                                        frame_limiter_provider,
+                                        frame_limiter_disable_vsync,
+                                        frame_limiter_auto_virtual_framegen,
+                                        rtss_frame_limit_type,
+                                        rtss_allow_virtual_display_override,
+                                        rtss_install_path,
+                                        mangohud_limiter_method,
+                                        mangohud_preset,
+                                        mangohud_always_show_graph,
+                                        rtss_disable_vsync_ullm,
+                                    },
+                                    encryption_modes: EncryptionModeUpdate {
+                                        lan_encryption_mode,
+                                        wan_encryption_mode,
+                                    },
                                     expected_revision,
                                     require_listener_apply: self.server.is_some(),
                                 }
@@ -713,6 +782,8 @@ mod tests {
             minimum_fps_target: omitted_minimum_fps,
             wgc_pacing_smoothing: omitted_wgc_pacing,
             ping_timeout_ms: omitted_ping_timeout,
+            lan_encryption_mode: omitted_lan_encryption,
+            wan_encryption_mode: omitted_wan_encryption,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -732,6 +803,8 @@ mod tests {
         assert_eq!(omitted_minimum_fps, FieldUpdate::Omitted);
         assert_eq!(omitted_wgc_pacing, FieldUpdate::Omitted);
         assert_eq!(omitted_ping_timeout, FieldUpdate::Omitted);
+        assert_eq!(omitted_lan_encryption, FieldUpdate::Omitted);
+        assert_eq!(omitted_wan_encryption, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -745,11 +818,14 @@ mod tests {
             minimum_fps_target: null_minimum_fps,
             wgc_pacing_smoothing: null_wgc_pacing,
             ping_timeout_ms: null_ping_timeout,
+            lan_encryption_mode: null_lan_encryption,
+            wan_encryption_mode: null_wan_encryption,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"audio_sink":null,"stream_audio":null,"capture":null,
-            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null
+            "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,
+            "lan_encryption_mode":null,"wan_encryption_mode":null
         }))
         .unwrap()
         else {
@@ -766,6 +842,8 @@ mod tests {
         assert_eq!(null_minimum_fps, FieldUpdate::Null);
         assert_eq!(null_wgc_pacing, FieldUpdate::Null);
         assert_eq!(null_ping_timeout, FieldUpdate::Null);
+        assert_eq!(null_lan_encryption, FieldUpdate::Null);
+        assert_eq!(null_wan_encryption, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -779,11 +857,14 @@ mod tests {
             minimum_fps_target,
             wgc_pacing_smoothing,
             ping_timeout_ms,
+            lan_encryption_mode,
+            wan_encryption_mode,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","audio_sink":"render.selected","stream_audio":false,"capture":"wgcc",
-            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false,"ping_timeout_ms":-1
+            "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false,"ping_timeout_ms":-1,
+            "lan_encryption_mode":2,"wan_encryption_mode":0
         }))
         .unwrap()
         else {
@@ -800,6 +881,8 @@ mod tests {
         assert_eq!(minimum_fps_target, FieldUpdate::Value(23.5));
         assert_eq!(wgc_pacing_smoothing, FieldUpdate::Value(false));
         assert_eq!(ping_timeout_ms, FieldUpdate::Value(-1));
+        assert_eq!(lan_encryption_mode, FieldUpdate::Value(2));
+        assert_eq!(wan_encryption_mode, FieldUpdate::Value(0));
 
         assert!(
             serde_json::from_value::<Operation>(json!({
@@ -808,6 +891,60 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn frame_limiter_settings_update_preserves_nullable_false_zero_and_legacy_alias() {
+        let Operation::SettingsUpdate {
+            frame_limiter_enable: omitted_enable,
+            frame_limiter_fps_limit: omitted_fps_limit,
+            frame_limiter_disable_vsync: omitted_disable_vsync,
+            rtss_disable_vsync_ullm: omitted_alias,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(omitted_enable, FieldUpdate::Omitted);
+        assert_eq!(omitted_fps_limit, FieldUpdate::Omitted);
+        assert_eq!(omitted_disable_vsync, FieldUpdate::Omitted);
+        assert_eq!(omitted_alias, FieldUpdate::Omitted);
+
+        let Operation::SettingsUpdate {
+            frame_limiter_enable: explicit_false,
+            frame_limiter_fps_limit: explicit_zero,
+            rtss_disable_vsync_ullm: legacy_alias,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
+            "frame_limiter_enable":false,"frame_limiter_fps_limit":0.0,
+            "rtss_disable_vsync_ullm":false
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(explicit_false, FieldUpdate::Value(false));
+        assert_eq!(explicit_zero, FieldUpdate::Value(0));
+        assert_eq!(legacy_alias, FieldUpdate::Value(false));
+
+        let Operation::SettingsUpdate {
+            frame_limiter_enable: reset,
+            frame_limiter_fps_limit: null_limit,
+            ..
+        } = serde_json::from_value(json!({
+            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
+            "frame_limiter_enable":null,"frame_limiter_fps_limit":null
+        }))
+        .unwrap()
+        else {
+            panic!("settings update expected");
+        };
+        assert_eq!(reset, FieldUpdate::Null);
+        assert_eq!(null_limit, FieldUpdate::Null);
     }
 
     #[test]
