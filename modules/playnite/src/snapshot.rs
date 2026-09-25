@@ -584,6 +584,29 @@ mod tests {
     }
 
     #[test]
+    fn recent_max_age_cutoff_includes_boundary_and_excludes_one_second_older() {
+        let snapshot = Snapshot {
+            games: vec![
+                game("boundary", &[], "p1", "2026-08-25T00:00:00Z"),
+                game("too-old", &[], "p1", "2026-08-24T23:59:59Z"),
+            ],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 10,
+            recent_max_age_days: 30,
+            ..ProductSettings::default()
+        };
+        let now = parse_iso8601_unix("2026-09-24T00:00:00Z").unwrap();
+
+        let selected = select_games(&snapshot, &settings, now);
+        let selected_ids: BTreeSet<_> = selected.iter().map(|game| game.id.as_str()).collect();
+
+        assert_eq!(selected_ids, BTreeSet::from(["boundary"]));
+    }
+
+    #[test]
     fn selected_games_retain_reference_source_membership_bits() {
         let snapshot = Snapshot {
             games: vec![
