@@ -110,6 +110,21 @@ impl VideoEncryptionMode {
     pub const fn requires_video_encryption(self) -> bool {
         matches!(self, Self::Mandatory)
     }
+
+    /// Returns whether this policy accepts the client's announced video-encryption choice.
+    ///
+    /// `client_announced_video_encryption_choice` is the parsed boolean choice carried by the
+    /// client's ANNOUNCE for this session, not a probe of the client's general capabilities.
+    pub const fn accepts_client_announced_video_encryption_choice(
+        self,
+        client_announced_video_encryption_choice: bool,
+    ) -> bool {
+        match self {
+            Self::Never => !client_announced_video_encryption_choice,
+            Self::Opportunistic => true,
+            Self::Mandatory => client_announced_video_encryption_choice,
+        }
+    }
 }
 
 /// Global LAN and WAN video encryption settings.
@@ -290,5 +305,25 @@ mod tests {
         assert!(!VideoEncryptionMode::Opportunistic.requires_video_encryption());
         assert!(VideoEncryptionMode::Mandatory.supports_video_encryption());
         assert!(VideoEncryptionMode::Mandatory.requires_video_encryption());
+    }
+
+    #[test]
+    fn accepts_only_announced_video_encryption_choices_allowed_by_policy() {
+        let cases = [
+            (VideoEncryptionMode::Never, false, true),
+            (VideoEncryptionMode::Never, true, false),
+            (VideoEncryptionMode::Opportunistic, false, true),
+            (VideoEncryptionMode::Opportunistic, true, true),
+            (VideoEncryptionMode::Mandatory, false, false),
+            (VideoEncryptionMode::Mandatory, true, true),
+        ];
+
+        for (mode, client_announced_choice, expected) in cases {
+            assert_eq!(
+                mode.accepts_client_announced_video_encryption_choice(client_announced_choice),
+                expected,
+                "mode {mode:?}, client announced choice {client_announced_choice}"
+            );
+        }
     }
 }
