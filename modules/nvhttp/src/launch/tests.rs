@@ -897,6 +897,8 @@ struct Broker {
     application_audio_sink_capture_only: Option<bool>,
     application_back_button_timeout: Option<i32>,
     application_input_overrides: Option<Value>,
+    application_snapshot: Option<Value>,
+    application_executable_path: Option<String>,
 }
 
 impl Default for Broker {
@@ -931,6 +933,8 @@ impl Default for Broker {
             application_audio_sink_capture_only: None,
             application_back_button_timeout: None,
             application_input_overrides: None,
+            application_snapshot: None,
+            application_executable_path: None,
         }
     }
 }
@@ -1011,12 +1015,23 @@ impl Broker {
             return json!({"ok":false,"code":"ticket_not_found"});
         }
         if service == "amaterasu.launch/1" {
+            if action == "preflight_export" {
+                return json!({
+                    "ok":true,
+                    "preflight_token":"fixture-preflight-token",
+                    "app_id":payload["app_id"],
+                    "catalog_revision":1,
+                    "config_overrides":self.application_input_overrides.clone().unwrap_or_else(|| json!({})),
+                    "executable_path":self.application_executable_path,
+                });
+            }
             if action == "launch_export" {
                 self.application_operation = payload["operation_id"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
                 self.application_id = payload["app_id"].as_str().unwrap_or_default().to_owned();
+                self.application_snapshot = payload.get("frame_limiter_settings").cloned();
             }
             let operation = self.application_operation.as_str();
             let app = self.application_id.as_str();
@@ -1040,6 +1055,9 @@ impl Broker {
                     Value::Null
                 },
             });
+            launch["frame_limiter_settings"] =
+                self.application_snapshot.clone().unwrap_or(Value::Null);
+            launch["executable_path"] = json!(self.application_executable_path);
             if self.application_fec_percentage.is_some()
                 || self.application_max_bitrate.is_some()
                 || self.application_minimum_fps_target.is_some()
@@ -1793,8 +1811,9 @@ fn success_requires_active_application_and_ready_rtsp_then_retries_same_url() {
     assert_eq!(retry.status, 200);
     controller.reply_delivered(11, now);
     assert_eq!(
-        broker.actions()[..2],
+        broker.actions()[..3],
         [
+            ("amaterasu.launch/1", "preflight_export"),
             ("amaterasu.launch/1", "launch_export"),
             ("amaterasu.rtsp/1", "open")
         ]
@@ -2282,6 +2301,7 @@ fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
         application_input_overrides: Some(json!({
             "rtss_frame_limit_type":"back edge sync"
         })),
+        application_executable_path: Some("C:\\Games\\Example.exe".into()),
         ..Broker::default()
     };
 
@@ -2297,7 +2317,40 @@ fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
             .as_deref(),
         Some("back edge sync")
     );
-    // LaunchExport is sent before its response returns the application overrides.
+    let actions = broker.actions();
+    assert!(
+        actions
+            .iter()
+            .position(|(_, action)| *action == "preflight_export")
+            < actions
+                .iter()
+                .position(|(_, action)| *action == "launch_export")
+    );
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(launch_payload["preflight_token"], "fixture-preflight-token");
+    assert_eq!(
+        launch_payload["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"],
+        "back edge sync"
+    );
+    assert_eq!(
+        opened_rtsp_payload(&broker)["frame_limiter_settings"],
+        launch_payload["frame_limiter_settings"]
+    );
+    assert_eq!(
+        opened_rtsp_payload(&broker)["frame_limiter_executable_path"],
+        "C:\\Games\\Example.exe"
+    );
     let resolved = super::workflow::resolve_frame_limiter_settings(
         &global_settings,
         &record.application_frame_limiter_settings,
@@ -2306,6 +2359,29 @@ fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
     assert_eq!(
         resolved.rtss_frame_limit_type.as_deref(),
         Some("back edge sync")
+    );
+}
+
+#[test]
+fn malformed_preflight_override_fails_before_application_launch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"frame_limiter_enable":"false"})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(
+        broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "preflight_export"))
+    );
+    assert!(
+        !broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "launch_export"))
     );
 }
 

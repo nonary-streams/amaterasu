@@ -426,6 +426,10 @@ pub struct Open {
     pub operation_id: String,
     pub peer_ip: IpAddr,
     #[serde(default)]
+    pub frame_limiter_settings: Option<serde_json::Value>,
+    #[serde(default)]
+    pub frame_limiter_executable_path: Option<String>,
+    #[serde(default)]
     pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
@@ -486,6 +490,28 @@ pub struct Open {
 }
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if let Some(snapshot) = &self.frame_limiter_settings {
+            let requested_fps = self
+                .profile
+                .fps
+                .checked_mul(1_000)
+                .ok_or("invalid_frame_limiter_snapshot")?;
+            if snapshot["version"] != 1
+                || !snapshot["settings"].is_object()
+                || snapshot["requested_stream_fps_millihz"] != requested_fps
+            {
+                return Err("invalid_frame_limiter_snapshot");
+            }
+        }
+        if self
+            .frame_limiter_executable_path
+            .as_deref()
+            .is_some_and(|path| {
+                path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid_executable_path");
+        }
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
@@ -646,6 +672,12 @@ impl Open {
                 "lan_mode": policy.lan_mode,
                 "wan_mode": policy.wan_mode,
             });
+        }
+        if let Some(snapshot) = &self.frame_limiter_settings {
+            payload["frame_limiter_settings"] = snapshot.clone();
+        }
+        if let Some(path) = &self.frame_limiter_executable_path {
+            payload["frame_limiter_executable_path"] = serde_json::json!(path);
         }
         payload
     }
@@ -857,6 +889,35 @@ mod tests {
 
         let legacy = open().prepare("legacy", None);
         assert!(legacy.get("video_encryption_policy").is_none());
+    }
+
+    #[test]
+    fn frozen_frame_limiter_snapshot_reaches_stream_preparation() {
+        let mut value = open_json();
+        value["frame_limiter_settings"] = json!({
+            "version":1,
+            "settings":{"rtss_frame_limit_type":"back edge sync"},
+            "requested_stream_fps_millihz":60000
+        });
+        value["frame_limiter_executable_path"] = json!("C:\\Games\\Example.exe");
+        let request: Open = serde_json::from_value(value.clone()).unwrap();
+        assert!(request.validate(false).is_ok());
+        let prepare = request.prepare("frozen", None);
+        assert_eq!(
+            prepare["frame_limiter_settings"],
+            value["frame_limiter_settings"]
+        );
+        assert_eq!(
+            prepare["frame_limiter_executable_path"],
+            value["frame_limiter_executable_path"]
+        );
+
+        value["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
+        let mismatched: Open = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            mismatched.validate(false),
+            Err("invalid_frame_limiter_snapshot")
+        );
     }
 
     #[test]

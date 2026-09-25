@@ -87,6 +87,23 @@ impl Broker {
                         json!({"ok":true,"paired":1,"certificate_id":"00".repeat(32)})
                     }
                     (PAIRING_SERVICE, "cancel") => json!({"ok":true}),
+                    ("amaterasu.launch/1", "preflight_export") => json!({
+                        "ok":true,
+                        "preflight_token":"fixture-preflight-token",
+                        "app_id":payload["app_id"],
+                        "catalog_revision":0,
+                        "config_overrides":{
+                            "fec_percentage":37,
+                            "stream_audio":true,
+                            "audio_sink":"endpoint.app",
+                            "audio_sink_capture_only":false,
+                            "back_button_timeout":1200,
+                            "controller":true,
+                            "gamepad":"auto",
+                            "keyboard":true,
+                            "mouse":false
+                        }
+                    }),
                     ("amaterasu.launch/1", "launch_export") => json!({
                         "ok": true,
                         "launch": {
@@ -96,6 +113,7 @@ impl Broker {
                             "state": "active",
                             "failure": null,
                             "cleanup_error": null,
+                            "frame_limiter_settings":payload["frame_limiter_settings"],
                             "config_overrides": {
                                 "fec_percentage": 37,
                                 "stream_audio": true,

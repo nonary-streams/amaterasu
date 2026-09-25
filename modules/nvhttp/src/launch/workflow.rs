@@ -16,6 +16,7 @@ const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    PreflightApplication,
     LaunchApplication,
     LookupApplication,
     OpenRtsp,
@@ -109,6 +110,7 @@ impl Controller {
                     | Phase::LookupApplication => {
                         record.application_cleanup_blocked = true;
                     }
+                    Phase::PreflightApplication => {}
                     Phase::MonitorApplication | Phase::MonitorRtsp => {}
                     Phase::VerifyRtspStopped => record.rtsp_cleanup_blocked = true,
                     Phase::VerifyApplicationStopped => {
@@ -133,6 +135,17 @@ impl Controller {
             record.application_reconcile = None;
         }
         let (service, mut payload, timeout_ms) = match phase {
+            Phase::PreflightApplication => (
+                LAUNCH_SERVICE,
+                json!({
+                    "action": "preflight_export",
+                    "operation_id": record.application_operation,
+                    "app_id": app_id(record.request.app_id),
+                    "global_preparation": record.global_preparation,
+                    "legacy_global_preparation": record.legacy_global_preparation,
+                }),
+                10_000,
+            ),
             Phase::LaunchApplication => {
                 record.application_requested = true;
                 (
@@ -143,7 +156,8 @@ impl Controller {
                         "app_id": app_id(record.request.app_id),
                         "global_preparation": record.global_preparation,
                         "legacy_global_preparation": record.legacy_global_preparation,
-                        "frame_limiter_settings": frame_limiter_launch_snapshot(record),
+                        "preflight_token": record.application_preflight_token,
+                        "frame_limiter_settings": record.frame_limiter_snapshot,
                         "client_frame_limiter_overrides":
                             client_frame_limiter_overrides(record),
                     }),
@@ -220,6 +234,8 @@ impl Controller {
                         "max_bitrate_kbps": record.effective_max_bitrate_kbps,
                         "minimum_fps_target": record.effective_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
+                        "frame_limiter_settings": record.frame_limiter_snapshot,
+                        "frame_limiter_executable_path": record.executable_path,
                         "capture": capture,
                         "profile": profile,
                     }),
@@ -273,6 +289,20 @@ impl Controller {
     ) {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         match job.phase {
+            Phase::PreflightApplication => match application_preflight_response(record, &payload) {
+                Ok((token, application_overrides, executable_path))
+                    if record.state == State::Starting =>
+                {
+                    record.application_preflight_token = Some(token);
+                    record.executable_path = executable_path;
+                    record.application_frame_limiter_settings =
+                        application_overrides.frame_limiter_settings();
+                    record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
+                    record.stage = Stage::LaunchApplication;
+                }
+                Ok(_) => fail_record(record, "application_preflight_unavailable", now),
+                Err(code) => fail_record(record, code, now),
+            },
             Phase::LaunchApplication | Phase::LookupApplication => {
                 match application_response(record, &payload) {
                     Ok((launch_id, "active", true)) if record.state == State::Starting => {
@@ -281,6 +311,20 @@ impl Controller {
                             Ok(application_overrides) => {
                                 record.application_frame_limiter_settings =
                                     application_overrides.frame_limiter_settings();
+                                if record.frame_limiter_snapshot.as_ref()
+                                    != payload["launch"].get("frame_limiter_settings")
+                                {
+                                    fail_record(record, "application_snapshot_mismatch", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
+                                if record.executable_path.as_deref()
+                                    != payload["launch"]["executable_path"].as_str()
+                                {
+                                    fail_record(record, "application_target_mismatch", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
                                 record.scoped_ds4_back_as_touchpad_click =
                                     application_overrides.ds4_back_as_touchpad_click;
                                 let application_fec_percentage =
@@ -536,6 +580,9 @@ impl Controller {
                 record.application_requested = false;
                 fail_record(record, "application_launch_rejected", now);
             }
+            Phase::PreflightApplication => {
+                fail_record(record, "application_preflight_rejected", now);
+            }
             Phase::OpenRtsp => {
                 record.rtsp_requested = false;
                 fail_record(record, "rtsp_launch_rejected", now);
@@ -548,6 +595,12 @@ impl Controller {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         record.stage = Stage::Cleanup;
         match job.phase {
+            Phase::PreflightApplication => {
+                record.request_cleanup(
+                    Some("application_preflight_unavailable"),
+                    now + CLEANUP_DEADLINE,
+                );
+            }
             Phase::LaunchApplication => {
                 record.application_cleanup_blocked = false;
                 record.application_reconcile = Some(Phase::LookupApplication);
@@ -614,6 +667,7 @@ impl Controller {
 impl Phase {
     fn name(self) -> &'static str {
         match self {
+            Self::PreflightApplication => "preflight-launch",
             Self::LaunchApplication => "launch",
             Self::LookupApplication => "find-launch",
             Self::OpenRtsp => "open-rtsp",
@@ -635,8 +689,10 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     if record.retrying_uncertainty {
         return true;
     }
-    matches!(record.stage, Stage::LaunchApplication | Stage::OpenRtsp)
-        || (record.stage == Stage::Live && now >= record.next_monitor)
+    matches!(
+        record.stage,
+        Stage::PreflightApplication | Stage::LaunchApplication | Stage::OpenRtsp
+    ) || (record.stage == Stage::Live && now >= record.next_monitor)
         || matches!(
             record.stage,
             Stage::Cleanup | Stage::VerifyRtspCleanup | Stage::VerifyApplicationCleanup
@@ -651,6 +707,7 @@ fn next_phase(record: &Record) -> Phase {
         return phase;
     }
     match record.stage {
+        Stage::PreflightApplication => Phase::PreflightApplication,
         Stage::LaunchApplication => Phase::LaunchApplication,
         Stage::OpenRtsp => Phase::OpenRtsp,
         Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
@@ -788,7 +845,44 @@ pub(super) fn application_config_overrides(
         .get("launch")
         .filter(|value| value.is_object())
         .ok_or("invalid_application_response")?;
-    let config_overrides = match launch.get("config_overrides") {
+    parse_application_config_overrides(launch.get("config_overrides"))
+}
+
+fn application_preflight_response(
+    record: &Record,
+    payload: &Value,
+) -> Result<(String, ApplicationConfigOverrides, Option<String>), &'static str> {
+    if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
+        return Err("invalid_application_preflight_response");
+    }
+    let token = payload["preflight_token"]
+        .as_str()
+        .filter(|token| {
+            !token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control)
+        })
+        .ok_or("invalid_application_preflight_response")?;
+    payload["catalog_revision"]
+        .as_u64()
+        .ok_or("invalid_application_preflight_response")?;
+    let overrides = parse_application_config_overrides(payload.get("config_overrides"))
+        .map_err(|_| "invalid_application_preflight_response")?;
+    let executable_path = payload["executable_path"].as_str().map(str::to_owned);
+    if payload
+        .get("executable_path")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+        || executable_path.as_deref().is_some_and(|path| {
+            path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+        })
+    {
+        return Err("invalid_application_preflight_response");
+    }
+    Ok((token.to_owned(), overrides, executable_path))
+}
+
+fn parse_application_config_overrides(
+    value: Option<&Value>,
+) -> Result<ApplicationConfigOverrides, &'static str> {
+    let config_overrides = match value {
         None | Some(Value::Null) => ApplicationConfigOverrides::default(),
         Some(value) => {
             serde_json::from_value(value.clone()).map_err(|_| "invalid_application_response")?

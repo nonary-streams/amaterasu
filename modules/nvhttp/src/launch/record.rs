@@ -2,6 +2,7 @@ use super::{CaptureProvider, LaunchRequest, PeerIdentity, VideoEncryptionPolicyS
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
+use serde_json::Value;
 use std::{collections::VecDeque, time::Instant};
 
 use super::{call::Call, workflow::Phase};
@@ -25,6 +26,7 @@ impl State {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    PreflightApplication,
     LaunchApplication,
     OpenRtsp,
     AwaitingDelivery,
@@ -54,6 +56,9 @@ pub struct Record {
     pub global_frame_limiter_settings: FrameLimiterSettings,
     pub client_frame_limiter_settings: FrameLimiterSettings,
     pub application_frame_limiter_settings: FrameLimiterSettings,
+    pub application_preflight_token: Option<String>,
+    pub frame_limiter_snapshot: Option<Value>,
+    pub executable_path: Option<String>,
     pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
     /// Sparse client-over-application timeout override captured for this launch.
@@ -165,6 +170,9 @@ impl Record {
             global_frame_limiter_settings,
             client_frame_limiter_settings,
             application_frame_limiter_settings: FrameLimiterSettings::default(),
+            application_preflight_token: None,
+            frame_limiter_snapshot: None,
+            executable_path: None,
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,
             scoped_back_button_timeout: None,
@@ -204,7 +212,7 @@ impl Record {
             rtsp_cleanup_blocked: false,
             application_cleanup_blocked: false,
             state: State::Starting,
-            stage: Stage::LaunchApplication,
+            stage: Stage::PreflightApplication,
             adopted: false,
             revoked: false,
             launch_connection: Some(connection),
