@@ -434,8 +434,7 @@ The zero, null, missing, and validated nonzero rate handling from Slice 9 remain
 
 All 12 frame-limiter IDs remain pending for product persistence/defaults, the single v16-to-v17 migration, host registration, management edit authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification. The service remains policy-only. L02 owns the sole v17 migration and NVHTTP projection; L03 did not modify those paths.
 
-Next action: continue independent L03-owned encoder/video parity. Keep the frame-limiter IDs pending until product persistence/defaults and the v17 migration, host registration, management authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification are complete. The package gate is green on main; the policy-only runtime and its platform effects remain incomplete.
-
+Follow-on encoder work is recorded in Slice 11 below. Keep the frame-limiter IDs pending until product persistence/defaults and the v17 migration, host registration, management authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification are complete. The package gate is green on main; the policy-only runtime and its platform effects remain incomplete.
 
 ## Slice 11: NVENC preset request boundary
 
@@ -507,4 +506,131 @@ L02 owns the canonical product-wide field/default, the existing v16-to-v17 persi
 
 ### Remaining parity gaps and next slice
 
-The stable ID remains pending until L02 persistence/projection, L06 management authority/UI, a native NVENC provider effect, and hardware qualification are complete. The next independent L03 slice is automatic capture-provider fallback for canonical `capture=auto`/empty mode: the current request adapter preserves its bootstrap provider but the video pipeline does not try another configured provider after an availability failure. This work stays in L03-owned video/capture paths and does not depend on L02 persistence or L06 UI.
+The stable ID remains pending until L02 persistence/projection, L06 management authority/UI, a native NVENC provider effect, and hardware qualification are complete. The next independent L03 slice proposed here, automatic capture-provider fallback for canonical `capture=auto`/empty mode, is now recorded in Slice 13. It stays in L03-owned video/capture paths and does not depend on L02 persistence or L06 UI.
+
+## Slice 13: Automatic capture-provider fallback
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Lane base SHA: `8f1923bb3ee7ad6c97d9f37e883b6cba5ecb32b7`
+- Worker source commit: `c2b9971a81b113e8366724381c3a37ea8fab2b9b`
+- Lane code commit: `367a15ce82e85de4749056395110cfc4ee9e28dd`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Worker session: `01a0d65b-24ad-7ea1-952f-c2c560c6e808` (`gpt-6-luna`, `xhigh`, verified before edits)
+- Stable ID: `global:capture` (remains `pending`)
+
+### Scope and behavior
+
+Canonical empty and `auto` capture modes preserve the bootstrap-selected provider as the first choice. After a clean lower `unsupported_platform` reply or clean broker admission `unavailable`, the video pipeline may try the other provider only when it is in the configured provider allowlist. Explicit `ddx`, `wgc`, and `wgcc` modes and legacy requests that only specify `capture_provider` remain pinned. Constant-rate semantics are not changed.
+
+The fallback enumerates only the allowed alternate provider. It derives the Windows device-name component from the source provider's output ID, then requires exactly one attached alternate output with the same exact device name and a valid alternate-provider ID shape. Missing, malformed, or ambiguous candidates retain the original provider error and are never opened. Each capture attempt has a fresh provider operation ID. The stream status preserves the requested output ID and reports the provider that actually opened it. Confirmed pre-open failures settle the parent and remove the stream without looking up resources that were never created; uncertain admission still follows the existing cancellation and settlement path.
+
+### Changed paths
+
+- `modules/video/README.md`
+- `modules/video/src/model.rs`
+- `modules/video/src/pipeline.rs`
+- `modules/video/src/pipeline/lifecycle.rs`
+- `modules/video/src/pipeline/tests.rs`
+- `modules/video/src/rpc.rs`
+
+### Review and validation
+
+- Implementation worker `/root/auto_capture_fallback` used isolated worktree `D:/sources/worktrees/amaterasu-auto-capture-fallback-xhigh`, branch `codex/luna03-auto-capture-fallback-xhigh`, based on the clean lane SHA above. Its actual `gpt-6-luna` / `xhigh` session attribution was verified before edits. The worker committed only the six listed paths as `c2b9971a81b113e8366724381c3a37ea8fab2b9b` using the configured Nonary identity and required orchestration/planning trailers.
+- Parent reviewed the exact source diff, verified its parent, path list, commit trailers, and clean worker state, then cherry-picked it as `367a15ce82e85de4749056395110cfc4ee9e28dd`. Worker and lane commits have the same tree (`b393a351e8c5300c1cade155b94202a57981fbdc`).
+- Focused regression tests were added for both provider-ID translations, unique-output matching, operation-ID separation, clean unsupported/unavailable fallback, non-retryable errors, allowlist enforcement, uncertain admission, explicit modes, and ambiguous candidate rejection. Tests were added but not run in this lightweight worktree.
+- Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true` for all five changed Rust files, `git diff --check`, and `git show --check`.
+- Cargo tests/build/Clippy were not run here. Coordinator validation can use `cargo fmt --check -p amaterasu-video`, `cargo test -p amaterasu-video`, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings` in the clean source checkout.
+- No Windows DXGI/WGC runtime or hardware/platform qualification was performed.
+
+### Remaining parity gaps
+
+This module-side fallback is only one piece of `global:capture`; the ID remains pending. Product global persistence/defaults and the existing v16-to-v17 migration remain with L02. Management edit authority/readback remains with L06. Per-application/per-client projection and override behavior, host registration/integration, provider runtime qualification, and Windows DXGI/WGC effects remain open. Do not report global capture parity as complete until those product and platform paths are reviewed.
+
+## Slice 14: Auto-capture fallback test type correction
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Lane base SHA: `c25f209f5afa14dd78bf04daeb2d05e3e3bd4932`
+- Worker source commit: `cbc272ef021a3afb95ad44d814c965de52d1030f`
+- Lane code commit: `138756a33adf5e6c87c25696a1a112df14553455`
+- Stable ID and scope: `global:capture`; compile-only annotations for the two provider-set fixtures added in Slice 13
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+
+### Coordinator finding and correction
+
+The coordinator reported that `cargo test -p amaterasu-video` failed to compile at `pipeline/tests.rs:1201` and `:1270` on main tip `abfc8a98`. Both cloned arrays used `.into()` without a concrete target type. The correction annotates each declaration as `BTreeSet<CaptureProvider>`, matching `setup_with_providers`' parameter type. This changes no runtime behavior.
+
+### Review and validation
+
+- Worker `/root/capture_typefix` ran with verified `gpt-6-luna` / `xhigh` settings in isolated worktree `D:/sources/worktrees/amaterasu-auto-capture-typefix-xhigh`, based on the clean lane base above. Its session was `01a0d685-0da2-7f71-85a9-8c5e7ab340b4`.
+- The worker changed only `modules/video/src/pipeline/tests.rs`, committed as `cbc272ef021a3afb95ad44d814c965de52d1030f` with the required plan trailers. Parent review confirmed the exact two annotations, parent SHA, path scope, clean worker state, and commit trailers. Cherry-pick `138756a33adf5e6c87c25696a1a112df14553455` has the same tree `51e311a2e418c28e492d2b7bbd58abc163718f8a`.
+- Passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/pipeline/tests.rs`, `git diff --check HEAD^ HEAD`, and `git show --check HEAD` in the lane.
+- Cargo format, tests, build, and Clippy were not run in this lightweight lane. The coordinator will rerun video formatting, package tests, and strict Clippy after direct integration to main.
+- No Windows DXGI/WGC runtime or platform qualification was run.
+
+### Remaining mismatches and next slice
+
+This compile correction does not close `global:capture`. Product persistence/defaults and the v16-to-v17 migration, management edit authority/readback, scoped launch projection, host integration, provider runtime behavior, and Windows qualification remain pending. Next, coordinate the frame-limiter module registration and complete settings contract with L01, including the global-only MangoHUD fields; then continue a separate owned video/display parity slice when no cross-lane contract blocks it.
+
+## Slice 15: Frame-limiter host registration contract
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Contract evidence SHA: `ae2e3bb1667b57ce2dd030a6df0644db799d0479`; service gate correction on main: `aa0511cb`
+- Current lane handoff base: `0950afb8798b28f40f7eb6614718c4748d632092`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Owner: L01 owns root workspace/host/package registration; L03 owns `modules/frame-limiter/**`.
+
+### Complete settings contract
+
+The service carries all 12 assigned stable IDs: `global:frame_limiter_enable`, `global:frame_limiter_provider`, `global:frame_limiter_fps_limit`, `global:frame_limiter_disable_vsync`, `global:frame_limiter_auto_virtual_framegen`, `global:rtss_frame_limit_type`, `global:rtss_install_path`, `global:rtss_allow_virtual_display_override`, `global:mangohud_preset`, `global:mangohud_always_show_graph`, `global:mangohud_limiter_method`, and alias `alias:global:rtss_disable_vsync_ullm`.
+
+Six fields are client/application/global scoped with client-over-application-over-global precedence: `frame_limiter_enable`, `frame_limiter_provider`, `frame_limiter_fps_limit_millihz`, `frame_limiter_disable_vsync`, `frame_limiter_auto_virtual_framegen`, and `rtss_frame_limit_type`. `rtss_install_path`, `rtss_allow_virtual_display_override`, and all three MangoHUD fields are global-only. The legacy `rtss_disable_vsync_ullm` input normalizes to `frame_limiter_disable_vsync` and is never persisted as a second field.
+
+The MangoHUD stable IDs are Linux-oriented global settings: `global:mangohud_limiter_method` defaults to `late` and accepts `early|late`; `global:mangohud_preset` defaults to `custom` and accepts `custom|1|2|3|4`; `global:mangohud_always_show_graph` defaults to `false`. None has an application or client override. These remain present in the immutable service settings object; provider effects are only relevant when a Linux MangoHUD backend is selected and available.
+
+The v1 settings object contains all eleven canonical fields. Defaults are `frame_limiter_enable=false`, `frame_limiter_provider=auto`, `frame_limiter_fps_limit_millihz=0`, `frame_limiter_disable_vsync=false`, `frame_limiter_auto_virtual_framegen=enabled`, `rtss_frame_limit_type=async`, `rtss_install_path=""`, `rtss_allow_virtual_display_override=false`, `mangohud_preset=custom`, `mangohud_always_show_graph=false`, and `mangohud_limiter_method=late`. Rates use unsigned exact millihertz, including explicit zero. The one product-settings v16-to-v17 migration remains owned by L02; this module allocates no additional version or migration.
+
+### Module and host interface sent to L01
+
+- Component ID/principal: `amaterasu.frame-limiter`; Cargo package `amaterasu-frame-limiter`; library target `amaterasu_frame_limiter` (`amaterasu_frame_limiter.dll` on Windows, `libamaterasu_frame_limiter.so` on Linux, and `libamaterasu_frame_limiter.dylib` on macOS). The release packager supplies manifest file hash and size from the target artifact.
+- Component manifest: use the current `amaterasu_abi::ABI_MAJOR`, `runtime=false`, empty `requires` (no service/component dependency), and `requested.provide=["amaterasu.frame-limiter/1"]`. `requested.call`, native grants, and other grants are empty for this policy-only module. The package principal for the provider must receive only the matching service registration grant.
+- Consumer principal: L05's accepted lifecycle envelope says the `amaterasu.application` component invokes `apply` before process spawn. Grant that principal only `call=["amaterasu.frame-limiter/1"]`; do not grant `amaterasu.launch` or broad default callers unless L05 later changes the actual call site and updates this contract.
+- Service and lifecycle: `amaterasu.frame-limiter/1`, payload version 1. `FrameLimiterModule::start` immediately registers the service and has no external-service or platform-provider readiness dependency. `tick` polls, checks request activity, handles one strict JSON payload, and completes the request. `request_ended` and `not_found` are tolerated for check/completion. A missing provider service grant causes startup registration failure.
+- Requests: strict tagged `apply|status|restore` objects with `version:1`; unknown fields/versions fail. Apply requires `session_id`, resolved absolute `executable_path`, and the complete settings object above. Optional context is `requested_stream_fps_millihz`, `client_display_mode_override_millihz`, `lossless_scaling_limit_millihz`, `virtual_display_active`, `physical_framegen_capture`, `game_frame_generation_mode`, and `rtss_frame_limit_type_explicit_override`. Missing/null context means unknown; explicit rate zero remains a known no-rate value. The caller principal comes from broker metadata, not JSON. Status accepts optional `session_id`; restore requires exactly one of `session_id` or `lease`.
+- Response and unsupported platforms: apply is currently policy-only (`applied=false`, `state=policy_only`, `provider_availability=unknown`, no lease or provider candidates). Status/restore return `runtime_unavailable` and claim no provider state or restoration. Unsupported provider/platform combinations are policy diagnostics, not module-start failures; the service performs no native or OS effects on any target. Validation errors use `{ok:false,applied:false,error:{code,message}}` with codes `invalid_json`, `invalid_operation`, `unsupported_version`, `invalid_identifier`, `invalid_executable_path`, `invalid_settings`, `invalid_millihertz`, and `invalid_restore_target`.
+- Package profile integration: include this optional component only in explicitly selected signed profiles and preserve existing packages that omit it. Component/profile ordering follows the manifest dependency graph; no host loader branch or host ABI/schema bump is needed. The release-profile source paths `crates/release/src/profiles.rs*` are unassigned, so the coordinator must assign their owner and confirm the target package profiles before anyone edits them.
+
+### Required integration evidence and remaining blockers
+
+L01's package/host validation should accept the exact provider declaration and least-privilege grants, load/tick/health-check the module through the generic managed-module path, authorize `amaterasu.application` and reject ungranted callers, and preserve behavior for signed packages without the optional component. Run package/host/frame-limiter tests, strict Clippy, and signed profile validation in the reserved clean source checkout. This is a contract handoff only; no L01 paths or Cargo gates were changed here. All 12 settings IDs remain pending for product persistence/defaults, the v17 projection, management authority, scoped launch resolution, provider effects, lifecycle restore, and Windows/Linux qualification.
+
+## Slice 16: Canonical auto-capture mode mapping correction
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Lane base SHA: `2b473921bc68132c3ec05f253323dd1697d032cf`
+- Worker source commit: `562c10c614c75ec5b97d27b59e3b24418f821fbb`
+- Lane code commit: `f1a1d792264fcce581d4fd7e0be7953acabc3499`
+- Worker/lane tree: `068dcd159d36e3c50ee1fc783cdb832aef99c39d`
+- Coordinator failure SHA: `0729e6a7300373a0131a1867dc524880581c9502`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Stable ID and scope: `global:capture`; correct canonical capture-mode flags in the video request model. The ID remains `pending`.
+
+### Coordinator finding and correction
+
+The coordinator reported that `cargo test -p amaterasu-video` compiled but failed 8 of 80 tests on main commit `0729e6a7300373a0131a1867dc524880581c9502`: `model::tests::canonical_auto_defaults_to_dxgi_when_no_bootstrap_provider_is_supplied`, `model::tests::canonical_capture_modes_map_to_existing_provider_and_rate_fields`, `pipeline::tests::ambiguous_candidate_output_keeps_the_original_provider_error`, `pipeline::tests::auto_retry_requires_clean_provider_rejection_and_allowlisted_candidate`, `pipeline::tests::canonical_auto_maps_wgc_device_name_to_unique_dxgi_identity`, `pipeline::tests::canonical_auto_falls_back_to_the_same_output_with_fresh_operation_ids`, `pipeline::tests::clean_unavailable_admission_retries_but_uncertain_admission_does_not`, and `pipeline::tests::explicit_capture_mode_remains_pinned_after_unsupported_provider_reply`. `CaptureMode::selection` returned the `auto_capture` and `constant_rate` booleans in the wrong combinations: `wgcc` must map to `(Wgc, false, true)`, while empty/`auto` must preserve the bootstrap provider (defaulting to DXGI), with `(provider, true, false)`. The correction changes only those production tuples; existing test expectations and other modes remain unchanged.
+
+### Review and validation
+
+- Worker `/root/amd_av1_latency_slice` used isolated worktree `D:/sources/worktrees/amaterasu-amd-av1-latency-xhigh`, based on the clean lane SHA above. Its actual session attribution was verified as `gpt-6-luna` / `xhigh` before edits. It changed only `modules/video/src/model.rs` and committed `562c10c614c75ec5b97d27b59e3b24418f821fbb` with the required plan trailers and configured Nonary identity.
+- Parent review caught an initial inversion in the modified table expectations. The worker restored the existing intended expectations before the final commit. The reviewed final diff contains only the two production tuple changes. Parent verified the worker parent SHA, exact path list, commit trailers, attribution, and clean worker status, then cherry-picked the commit as `f1a1d792264fcce581d4fd7e0be7953acabc3499`; worker and lane trees match.
+- Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/model.rs`; worker and lane `git diff --check` and `git show --check` passed.
+- Cargo tests, build, and strict Clippy were not run in the lightweight lane. The coordinator should cherry-pick the lane code commit directly to main and rerun `cargo fmt --check -p amaterasu-video`, `cargo test -p amaterasu-video`, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings`.
+
+### Remaining parity gaps
+
+This correction restores the intended request-mode semantics but does not complete `global:capture`. Coordinator validation of the corrected main candidate, L02 persistence/defaults and the sole v16-to-v17 migration, L06 management authority/readback, scoped launch projection, host integration, provider runtime effects, and Windows DXGI/WGC qualification remain pending.
