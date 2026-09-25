@@ -2920,7 +2920,7 @@ fn native_pen_touch_override_is_sparse_strict_and_round_trips_through_catalog() 
         revision = created["revision"].as_u64().unwrap();
 
         let id = created["id"].as_str().unwrap();
-        let stored_entry = &backend.entries[id];
+        let stored_entry = backend.entries[id].clone();
         let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get","id":id}));
         assert_eq!(reloaded["ok"], true, "{reloaded}");
 
