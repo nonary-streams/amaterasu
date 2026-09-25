@@ -523,29 +523,38 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             && disabled == lease.before.limiter_disabled)
     }
 
-    fn rollback_unleased(
-        &mut self,
-        profile: &str,
-        before: ProviderSnapshot,
-    ) -> Result<(), ProviderError> {
-        if before.profile_exists {
-            self.provider
-                .write_profile_verified(profile, before.profile)?;
-        } else if self.provider.profile_exists(profile)? {
-            let current_profile = self.provider.read_profile(profile)?;
-            self.provider
-                .delete_profile_verified(profile, current_profile)?;
+    fn rollback_unleased(&mut self, lease: &LeaseRecord) -> Result<(), ProviderError> {
+        self.provider
+            .select_installation(&lease.rtss_install_path)?;
+        let current = self.read_provider_snapshot(&lease.profile)?;
+        if current == lease.before {
+            return Ok(());
         }
-        let profile_after = self.provider.read_profile(profile)?;
-        let profile_exists_after = self.provider.profile_exists(profile)?;
-        let disabled_after = self.provider.limiter_disabled()?;
-        if profile_after != before.profile
-            || profile_exists_after != before.profile_exists
-            || disabled_after != before.limiter_disabled
-        {
+        if current != lease.applied {
+            return Err(ProviderError::VerifyFailed(
+                "provider_state_changed_before_rollback",
+            ));
+        }
+
+        if lease.before.profile_exists {
+            self.provider
+                .write_profile_verified(&lease.profile, lease.before.profile)?;
+        } else {
+            self.provider
+                .delete_profile_verified(&lease.profile, lease.applied.profile)?;
+        }
+        if self.read_provider_snapshot(&lease.profile)? != lease.before {
             return Err(ProviderError::VerifyFailed("rollback_verification_failed"));
         }
         Ok(())
+    }
+
+    fn read_provider_snapshot(&mut self, profile: &str) -> Result<ProviderSnapshot, ProviderError> {
+        Ok(ProviderSnapshot {
+            profile: self.provider.read_profile(profile)?,
+            profile_exists: self.provider.profile_exists(profile)?,
+            limiter_disabled: self.provider.limiter_disabled()?,
+        })
     }
 
     fn rollback_after_unverified_apply(&mut self, lease: LeaseRecord) -> ApplyOutcome {
@@ -557,7 +566,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         lease: LeaseRecord,
         code: &'static str,
     ) -> ApplyOutcome {
-        let result = self.rollback_unleased(&lease.profile, lease.before);
+        let result = self.rollback_unleased(&lease);
         match result {
             Err(error) => ApplyOutcome::RestoreFailed {
                 code,
@@ -579,7 +588,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
     }
 
     fn rollback_pending_apply(&mut self, lease: LeaseRecord, code: &'static str) -> ApplyOutcome {
-        match self.rollback_unleased(&lease.profile, lease.before) {
+        match self.rollback_unleased(&lease) {
             Err(error) => ApplyOutcome::RestoreFailed {
                 code,
                 rollback_code: error.diagnostic(),
@@ -1409,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_settings_are_rolled_back_without_issuing_a_lease() {
+    fn unverified_provider_state_is_retained_for_safe_recovery_without_a_lease() {
         let mut provider = FakeProvider::new();
         provider.mismatch_writeback = true;
         let mut manager = LeaseManager::in_memory(provider);
@@ -1419,6 +1428,13 @@ mod tests {
         ));
         assert_eq!(manager.records().len(), 1);
         assert_eq!(manager.records()[0].phase, LeasePhase::Pending);
+        assert_eq!(
+            manager.provider.profiles["game.exe"],
+            ProfileValues {
+                frame_limit: TARGET.frame_limit - 1,
+                ..TARGET
+            }
+        );
     }
 
     #[test]
@@ -1526,7 +1542,7 @@ mod tests {
     #[test]
     fn apply_rollback_failure_returns_the_retained_session_cleanup_lease() {
         let mut provider = FakeProvider::new();
-        provider.fail_writes = true;
+        provider.mismatch_writeback = true;
         let mut manager = LeaseManager::in_memory(provider);
         let response = handle_runtime_operation(
             "caller.a",
