@@ -263,3 +263,175 @@ Video pacing consumes the separate acquisition timestamp only for a fresh WGC fr
 ### Remaining mismatches and next slice
 
 Global product persistence, management editing, and launch projection for `global:wgc_pacing_smoothing` are in foreign-owned paths and need integration-owner confirmation; the ID is global-only in the assigned inventory. Providers limited to v1.0-v1.2 cannot supply a separate acquisition timestamp and retain the prior compatible fallback. Tests and Windows qualification remain outstanding. No additional self-contained video/encode setting candidate emerged without the pending capture/encoder snapshot and provider contracts; continue only when those interfaces or another video-owned runtime gap is confirmed. Keep the `global:encoder` contract request pending with Luna 02.
+
+## Slice 7: frame-limiter managed service boundary
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `5790c4ab4b38196d83cf419bc52f236e477ca165`
+- Candidate code SHA: `ae2e3bb1667b57ce2dd030a6df0644db799d0479`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This slice covers the 12 frame-limiter IDs listed in Slice 2: six application/client-overridable settings, five global-only settings, and the legacy global VSync alias. The crate now exposes a strict v1 request boundary and managed-module service for the accepted name `amaterasu.frame-limiter/1`. Product persistence, scope resolution/projection, management edit authority, provider effects, and platform qualification are still missing; all 12 IDs remain `pending`.
+
+### Changed paths
+
+- `modules/frame-limiter/Cargo.toml`
+- `modules/frame-limiter/README.md`
+- `modules/frame-limiter/src/lib.rs`
+- `modules/frame-limiter/src/model.rs`
+- `modules/frame-limiter/src/policy.rs`
+- `modules/frame-limiter/src/runtime.rs`
+- `modules/frame-limiter/src/service.rs`
+- `modules/frame-limiter/src/tests.rs`
+
+### v1 request and response contract
+
+Requests are strict objects with an `action` discriminator and `version: 1`; unknown fields and unsupported versions are rejected. `apply` requires a broker-owned non-empty `caller`, a caller-owned `session_id`, a resolved absolute `executable_path` with a file leaf, and the complete immutable effective settings object. The broker caller string is origin validation; it is not the session ID. FPS and runtime rates are unsigned exact millihertz in the model's 0..1,000,000 range. The setting values and six-field scope/precedence contract are unchanged from Slice 2.
+
+The optional apply context is `requested_stream_fps_millihz`, `client_display_mode_override_millihz`, `lossless_scaling_limit_millihz`, `virtual_display_active`, `physical_framegen_capture`, `game_frame_generation_mode`, and `rtss_frame_limit_type_explicit_override`. Omitted or null values mean unknown. For rate fields, explicit zero is known to mean no rate/follow stream. `client_display_mode_override_millihz` is a rate-only value sourced from an explicit client display-mode override; it must never be derived from stream dimensions. The launch adapter may supply `requested_stream_fps_millihz` from the admitted `LaunchRequest.fps`. Other context without an authoritative owner remains null/omitted.
+
+`status` accepts an optional session ID; absent/null means no session filter. `restore` requires exactly one of `session_id` or `lease`. Successful policy-only apply responses carry `state: "policy_only"`, `applied: false`, `provider_availability: "unknown"`, no lease, and no provider candidates. Unknown apply decisions and unknown higher-priority rates serialize as null; RTSS decisions remain unknown without hardware/provider facts. Status and restore currently return `state: "runtime_unavailable"`, do not report provider state or restoration, and `apply` creates no lease. Invalid requests return `{ok:false, applied:false, error:{code,message}}`.
+
+The module exports `FrameLimiterModule` through the module SDK. `start` registers `amaterasu.frame-limiter/1`; each `tick` polls one SDK request, confirms it is active with `CheckRequest`, handles its JSON payload, and completes it. Luna 01 owns workspace/catalog registration and startup integration. Luna 02 owns the single reserved v16-to-v17 persistence migration, immutable launch settings/context projection, and scope resolution. Luna 05 owns invocation timing and teardown/restore integration. Luna 06 owns management edit authority and UI. The code candidate does not write those paths.
+
+### Behavior and review evidence
+
+The implementation builds a policy-only response and never claims provider application, restoration, an active lease, or detected hardware. RTSS install paths reject non-empty values off Windows; Windows accepts absolute or relative Windows paths, with relative path resolution still assigned to a future provider runtime. Frame-generation safety policy now activates on explicit physical capture or inferred GameProvided/NVIDIA Smooth Motion modes; scoped RTSS overrides retain priority, and GameProvided Reflex is not disabled by the global virtual-display override.
+
+- Implementation worker: `/root/encode_inventory`, `gpt-6-luna` / `xhigh`; implemented only `modules/frame-limiter/**`.
+- Independent reviewer: `/root/review_virtual_display`, `gpt-6-luna` / `xhigh`; re-reviewed the final candidate and confirmed prior policy, null-context, validation, and response-certainty findings were corrected. One low-severity caveat remains: the exported raw-string parser deserializes through `serde_json::Value`, so duplicate raw JSON keys become last-value-wins. The live SDK already supplies a `Value`, so duplicate keys collapsed upstream cannot be recovered by this service.
+- Parent reviewed the module diff and integration boundary.
+- Passed `rustfmt --edition 2024 --check` on the six Rust source files and `git diff --check` after final edits; the staged diff also passed `git diff --cached --check`.
+- Service and policy unit tests were added but not run. Cargo build/tests, Clippy, and native provider qualification were not run because the lane worktree is restricted to source-only work.
+
+### Remaining mismatches and next slice
+
+The registered service is a request boundary, not the eventual apply/restore runtime. It does not detect or invoke RTSS, NVIDIA Control Panel, Proton, or MangoHUD, does not persist provider state or leases, and cannot restore OS state. Luna 01 still needs to register the module in the host catalog/startup paths. Luna 02 must supply the immutable effective settings and authoritative nullable context from product settings/launch. Luna 05 must define apply and idempotent restore lifecycle for spawn failure, cancellation, disconnect, stream end, and teardown. Luna 06 must provide management access under the confirmed scopes. The raw-string duplicate-key caveat is limited to `parse_operation`; the broker payload already arrives as `Value`.
+
+Next slice: integrate only after Luna 01/02/05/06 confirm their owned interfaces. Add provider/runtime work only when OS state capture, session ownership, and restoration contracts are established. Keep all IDs pending until persistence/defaults, validation/migration, management authority, scoped launch projection, apply/restore behavior, tests, and platform qualification are reviewed together.
+
+## Slice 8: WGC constant-rate v1.3 pacing regression
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `ccc97bcfa862085e4d6ba403f39801e4b1a1ab37`
+- Worker source commit: `25d3b2215c1c9f939e0a2bcebfa30b19fb5150d9`
+- Lane cherry-pick SHA: `70addda4d5ab369e83843d57b9d8ca6de4226d37`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This bounded slice covers the constant-rate WGC acquisition-timestamp and cached-reuse behavior for `global:wgc_pacing_smoothing`. The stable ID remains `pending`; this commit adds regression evidence and corrects its video-module documentation but does not supply product settings persistence, management edit authority, or launch projection.
+
+### Changed paths
+
+- `modules/video/src/pipeline/tests.rs`
+- `modules/video/README.md`
+
+### Behavior and evidence
+
+The new pipeline test provides a distinct v1.3 acquisition timestamp and callback observation time, carries a pending re-anchor across cached reuse, and checks that the following fresh frame schedules from acquisition time. Existing `modules/video/src/plane.rs` tests exercise the native v1.3 callback and verify its separate pacing timestamp; this slice's pipeline regression uses `FakePlane` rather than a live native provider.
+
+The README now documents that constant-rate WGC arrival pacing needs v1.2 freshness metadata or newer, v1.2 maps frame timestamps, v1.3 uses its separate WGC acquisition timestamp, cached reuse advances the established grid without creating a fresh arrival, and older tables retain configured read cadence without arrival-based re-anchoring. The pinned Vibeshine display loop uses `capture_pacing_timestamp` with a frame-timestamp fallback; its constant-rate cached-frame path stamps pacing time with the local steady clock. Amaterasu's WGC v1.3 callback carries the acquisition timestamp independently from callback observation.
+
+### Review and validation
+
+- Implementation worker: `/root/wgc_constant_rate_xhigh`, verified `gpt-6-luna` / `xhigh`; edited only the two paths listed above and committed `25d3b2215c1c9f939e0a2bcebfa30b19fb5150d9` from an isolated worktree whose parent was this lane base.
+- Independent reviewer: `/root/review_wgc_v13_slice`; found no concrete findings in the timestamp assertion, cached-reuse test state, or README version/fallback claims. The reviewer context reported GPT-6 but did not expose a separate effort label.
+- Parent reviewed the worker diff and cherry-picked it as `70addda4d5ab369e83843d57b9d8ca6de4226d37`.
+- Passed `rustfmt --edition 2024 --check modules/video/src/pipeline/tests.rs`, `git show --check --oneline 25d3b2215c1c9f939e0a2bcebfa30b19fb5150d9`, and `git show --check --oneline 70addda4`.
+- Cargo tests, build, and Clippy were not run in this lightweight worktree. Coordinator direct-to-main validation passed on `73df71733df51c63ba805e984fce406facaa207c`: format check passed, `cargo test -p amaterasu-video` passed 74/74, and strict Clippy passed.
+- Windows WGC runtime qualification was not run.
+
+### Remaining mismatches and next slice
+
+`global:wgc_pacing_smoothing` remains pending until product defaults/persistence, management editing, global launch projection, and Windows WGC runtime behavior are reviewed. Coordinator Cargo validation is green. This setting has global scope only; no per-application or per-client override is assigned. Product-level `capture = wgcc` routing through NVHTTP, RTSP, and stream-session also remains pending as a separate capture-mode integration.
+
+Next slice: continue a lane-owned encoder setting under `modules/encode/**` (candidate `global:nvenc_preset`), while sending any persistence, management, or launch-projection requirements to their owning lanes. Keep the frame-limiter module untouched until L01's workspace-membership gate is complete.
+
+## Slice 9: frame-limiter policy context exhaustiveness correction
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `cb2971044c30b912fee4048aa02db08187b98b6d`
+- Worker source commit: `6e0ec0753194ab2371c76c42a7e4b263bc47c5ee`
+- Lane cherry-pick SHA: `31ddf95dd8ff9a71b4a80e7404616f795e21c517`
+- Workspace membership main SHA: `f8fbd2fdd8222af07410ce2fcc1648618704d1d3`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This is a compile-only correction inside L03's assigned `modules/frame-limiter/**` scope. It preserves the existing `policy_context` behavior for exact millihertz context values and does not change settings, defaults, policy precedence, or stable-ID status. The service and policy candidate remain pending full product integration and qualification.
+
+### Changed paths
+
+- `modules/frame-limiter/src/service.rs`
+
+### Behavior and evidence
+
+`ApplyRequest::validate` validates requested-stream and client-display-mode millihertz values before `policy_context` conversion. Each conversion now handles `Presence::Value(0)` explicitly as `None`, then handles the exhaustive nonzero `Presence::Value(rate)` as `Some(FpsLimit)`. `Presence::Missing` and `Presence::Null` remain `None`; the validated nonzero value is no longer hidden behind a pattern guard Rust cannot treat as exhaustive.
+
+The coordinator's priority inbox assigned this exact correction after L01's workspace-membership commit made `cargo test -p amaterasu-frame-limiter` available on main. The worker was based on the clean lane SHA above; the coordinator will cherry-pick the independent lane code commit onto main and run package tests and strict Clippy.
+
+### Review and validation
+
+- Implementation worker: `/root/frame_limiter_exhaustive_arms`, verified `gpt-6-luna` / `xhigh`; isolated worktree parent was `cb2971044c30b912fee4048aa02db08187b98b6d`; changed only `modules/frame-limiter/src/service.rs` and committed `6e0ec0753194ab2371c76c42a7e4b263bc47c5ee`.
+- Parent reviewed the two match changes and cherry-picked them as `31ddf95dd8ff9a71b4a80e7404616f795e21c517`.
+- Passed `rustfmt --edition 2024 --check modules/frame-limiter/src/service.rs` and `git diff --check` in the isolated child; parent reran rustfmt and `git show --check` on the lane commit.
+- Cargo tests, build, and Clippy were not run in this lightweight worktree. The coordinator will run `cargo test -p amaterasu-frame-limiter` and `cargo clippy -p amaterasu-frame-limiter --all-targets -- -D warnings` on main.
+- No native provider or platform qualification was run; this change only restores exhaustive type-level matching.
+
+### Remaining mismatches and next slice
+
+The module still exposes a policy-only service with no detected or applied provider, no leases or OS restoration, and `status`/`restore` remain runtime-unavailable. Product defaults/persistence, the single v16-to-v17 migration, settings projection, management edit authority, invocation/restore lifecycle, host integration, package validation, and Windows/Linux provider qualification remain pending with their assigned owners. L02 owns `modules/nvhttp/**` and the one combined v17 migration; L03 does not edit those paths.
+
+Follow-up completed in outbox messages 0024–0027: the settings/projection contract was sent to L02, lifecycle and management requirements were sent to L05/L06, and the separately requested read-only XHigh review of L02 candidate `be11030282ae9b067c3511819c65037719161b2a` reported no findings. The later package-gate correction is recorded in Slice 10 below.
+
+## Slice 10: frame-limiter package-gate corrections
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `609e08e64d9e646452c425056691743c6b248a23`
+- Worker source commit: `780ceffc6500474f9ab6e1f1e262f97be60fc828`
+- Lane code commit: `1cd6c1e6c8a6bda4d775392216cd13dab5c9e924`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### IDs and scope
+
+This is a behavior-preserving package-gate correction in the shared `amaterasu.frame-limiter/1` apply request path, across the 12 IDs in Slice 2: `global:frame_limiter_enable`, `global:frame_limiter_provider`, `global:frame_limiter_fps_limit`, `global:frame_limiter_disable_vsync`, `global:frame_limiter_auto_virtual_framegen`, `global:rtss_frame_limit_type`, `global:rtss_install_path`, `global:rtss_allow_virtual_display_override`, `global:mangohud_preset`, `global:mangohud_always_show_graph`, `global:mangohud_limiter_method`, and `alias:global:rtss_disable_vsync_ullm`. It changes neither setting values nor runtime behavior; all IDs remain `pending`.
+
+### Changed paths
+
+- `modules/frame-limiter/src/service.rs`
+
+### Coordinator gate findings and corrections
+
+- `strict_apply_parser_preserves_null_and_absent_fields` asserted `Missing` while `virtual_display_active` and `physical_framegen_capture` were still explicit nulls in the fixture. The test retains its explicit-null assertions and removes both keys before the missing-field assertions.
+- Strict Clippy requested deriving `Default` for `Presence<T>` and marking `Missing` as the default variant. The derived default remains `Missing`.
+- Strict Clippy requested avoiding field reassignment after `PolicyContext::default()`. The context now uses a struct literal plus `..PolicyContext::default()`, preserving every prior explicit field mapping and default.
+
+The zero, null, missing, and validated nonzero rate handling from Slice 9 remains unchanged. This correction does not suppress lints or alter policy semantics.
+
+### Review and validation
+
+- Implementation worker: `/root/frame_limiter_gate_corrections`, verified `gpt-6-luna` / `xhigh` using the session attribution script. Its isolated worktree was based on the clean lane SHA above and changed only `modules/frame-limiter/src/service.rs`; source commit `780ceffc6500474f9ab6e1f1e262f97be60fc828` uses the configured Nonary identity and required orchestration/planning provenance lines.
+- Parent reviewed the worker diff and cherry-picked it into the lane as `1cd6c1e6c8a6bda4d775392216cd13dab5c9e924`.
+- Worker passed `rustfmt --edition 2024 --check modules/frame-limiter/src/service.rs` and `git diff --check`; parent reran rustfmt and `git diff --check` in the lane and checked the lane commit with `git show --check`.
+- Cargo format, package tests, and strict Clippy were not run in this lightweight worktree. Coordinator direct-to-main validation passed on `aa0511cb8b4cfbd57928b56ad4eec2d7b6ade763`: `cargo fmt --check -p amaterasu-frame-limiter` passed, `cargo test -p amaterasu-frame-limiter` passed 24/24, and `cargo clippy -p amaterasu-frame-limiter --all-targets -- -D warnings` passed.
+- No Windows/Linux provider runtime or platform qualification was run; this correction only addresses request parsing defaults and equivalent `PolicyContext` initialization.
+
+### Remaining mismatches and next slice
+
+All 12 frame-limiter IDs remain pending for product persistence/defaults, the single v16-to-v17 migration, host registration, management edit authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification. The service remains policy-only. L02 owns the sole v17 migration and NVHTTP projection; L03 did not modify those paths.
+
+Next action: continue independent L03-owned encoder/video parity. Keep the frame-limiter IDs pending until product persistence/defaults and the v17 migration, host registration, management authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification are complete. The package gate is green on main; the policy-only runtime and its platform effects remain incomplete.
