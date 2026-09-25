@@ -636,7 +636,7 @@ mod tests {
         }
 
         let _session = SessionLog::new(Path::new("capture"), &state_root).unwrap();
-        let session_count = fs::read_dir(root)
+        let session_count = fs::read_dir(&root)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
