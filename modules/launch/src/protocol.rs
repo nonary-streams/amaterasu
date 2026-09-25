@@ -902,6 +902,8 @@ pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_pen_touch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gamepad: Option<String>,
@@ -1026,6 +1028,7 @@ impl ApplicationConfigOverrides {
             && self.back_button_timeout.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.native_pen_touch.is_none()
             && self.controller.is_none()
             && self.gamepad.is_none()
             && self.keyboard.is_none()

@@ -1287,6 +1287,108 @@ fn nvenc_spatial_aq_is_retained_across_launch_retry_and_status() {
 }
 
 #[test]
+fn native_pen_touch_is_retained_across_launch_response_retry_and_status() {
+    let cases = [
+        (
+            "absent",
+            None,
+            Some(json!({"native_pen_touch":true})),
+            json!({}),
+        ),
+        (
+            "null",
+            Some(json!({"native_pen_touch":null})),
+            Some(json!({"native_pen_touch":false})),
+            json!({}),
+        ),
+        (
+            "true",
+            Some(json!({"native_pen_touch":true})),
+            Some(json!({"native_pen_touch":false})),
+            json!({"native_pen_touch":true}),
+        ),
+        (
+            "false",
+            Some(json!({"native_pen_touch":false})),
+            Some(json!({"native_pen_touch":true})),
+            json!({"native_pen_touch":false}),
+        ),
+    ];
+
+    for (case, initial_config_overrides, changed_config_overrides, expected_snapshot) in cases {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = initial_config_overrides;
+        let mut pipeline = pipeline();
+        let operation_id = format!("native-pen-touch-{case}");
+
+        let started = harness.request(&mut pipeline, "nvhttp", launch_export(&operation_id));
+        assert_eq!(started["launch"]["state"], "active", "{case}: {started}");
+        assert_eq!(
+            started["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {started}"
+        );
+        let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
+
+        // Catalog edits do not replace the configuration captured by this launch.
+        harness.catalog_config_overrides = changed_config_overrides;
+        let retry = harness.request(&mut pipeline, "nvhttp", launch_export(&operation_id));
+        assert_eq!(
+            retry["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {retry}"
+        );
+
+        let status = harness.request(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"status","launch_id":launch_id}),
+        );
+        assert_eq!(
+            status["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {status}"
+        );
+    }
+}
+
+#[test]
+fn invalid_native_pen_touch_fails_before_session_creation() {
+    for (index, invalid) in [json!("false"), json!(0), json!([]), json!({})]
+        .into_iter()
+        .enumerate()
+    {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"native_pen_touch":invalid}));
+        let mut pipeline = pipeline();
+
+        let failed = harness.request(
+            &mut pipeline,
+            "nvhttp",
+            launch_export(&format!("invalid-native-pen-touch-{index}")),
+        );
+        assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+        assert_eq!(
+            failed["launch"]["failure"], "invalid_catalog_response",
+            "{failed}"
+        );
+        assert!(harness.sessions.is_empty());
+        assert!(!harness.commands.iter().any(|(service, payload, _)| {
+            service == crate::workflow::SESSION && payload["action"] == "create"
+        }));
+    }
+}
+
+#[test]
 fn invalid_nvenc_spatial_aq_fails_before_session_creation() {
     for (index, invalid) in [json!("false"), json!(0), json!([]), json!({})]
         .into_iter()
