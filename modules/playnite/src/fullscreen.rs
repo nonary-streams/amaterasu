@@ -178,6 +178,15 @@ impl FullscreenSessions {
                     }
                 }
                 State::Playing => {
+                    if session.fullscreen_process.is_none()
+                        && let Some(fullscreen_process) =
+                            new_fullscreen_candidate(session, processes)
+                    {
+                        // A handoff may precede discovery. Track the ticket's
+                        // post-baseline process for later stop, without focusing
+                        // the UI over the active game.
+                        session.fullscreen_process = Some(fullscreen_process);
+                    }
                     if session.playnite_exiting {
                         if !tracked_fullscreen_process_is_running(session, processes) {
                             session.transition(State::Stopped, now);
@@ -210,6 +219,12 @@ impl FullscreenSessions {
                 }
                 State::Stopping => {
                     session.focus_retry.cancel();
+                    if session.fullscreen_process.is_none()
+                        && let Some(fullscreen_process) =
+                            new_fullscreen_candidate(session, processes)
+                    {
+                        session.fullscreen_process = Some(fullscreen_process);
+                    }
                     let tracked_processes = session
                         .fullscreen_process
                         .as_ref()
@@ -445,6 +460,11 @@ impl FullscreenSessions {
             return error("launch_not_found");
         };
         if !session.state.terminal() && session.state != State::Stopping {
+            if session.fullscreen_process.is_none()
+                && let Some(fullscreen_process) = new_fullscreen_candidate(session, processes)
+            {
+                session.fullscreen_process = Some(fullscreen_process);
+            }
             session.transition(State::Stopping, now);
             session.return_allowed = false;
             session.active_game = None;
@@ -1250,6 +1270,70 @@ mod tests {
             sessions.by_ticket[&ticket].fullscreen_process,
             Some(fullscreen_process(95))
         );
+    }
+
+    #[test]
+    fn status_before_discovery_still_stops_the_ticket_owned_fullscreen_process() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = sessions.start_with(
+            "status-before-discovery-stop",
+            Some(installation()),
+            &[],
+            FocusPolicy::disabled(),
+            now,
+            |_| Ok(launch_process(77)),
+        )["ticket"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let extension = extension_process(31, 310);
+        queue_status(
+            &sessions,
+            &ticket,
+            status(
+                FullscreenStatusKind::GameStarted,
+                Some("a1b2c3d4-1234-5678-9abc-0123456789ab"),
+            ),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(1),
+            std::slice::from_ref(&extension),
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("game start must not launch another fullscreen process"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
+
+        let discovered_fullscreen = fullscreen_process(95);
+        let discovered_processes = [discovered_fullscreen.clone(), extension.clone()];
+        assert_eq!(
+            sessions.stop_with_at(
+                &ticket,
+                10,
+                &discovered_processes,
+                now + Duration::from_secs(2),
+                |_, owned| {
+                    assert_eq!(owned, std::slice::from_ref(&discovered_fullscreen));
+                    Ok(1)
+                }
+            )["state"],
+            "stopping"
+        );
+        assert_eq!(
+            sessions.by_ticket[&ticket].fullscreen_process,
+            Some(discovered_fullscreen)
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(4),
+            &[extension],
+            Some(&[]),
+            |_| true,
+            |_| panic!("stopped tickets cannot relaunch"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "stopped");
     }
 
     #[test]
