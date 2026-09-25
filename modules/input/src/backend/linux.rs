@@ -27,13 +27,19 @@ const ABS_Y: u16 = 0x01;
 const ABS_PRESSURE: u16 = 0x18;
 const ABS_TILT_X: u16 = 0x1a;
 const ABS_TILT_Y: u16 = 0x1b;
+const ABS_MT_TOUCH_MAJOR: u16 = 0x30;
+const ABS_MT_TOUCH_MINOR: u16 = 0x31;
+const ABS_MT_ORIENTATION: u16 = 0x34;
 const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_MT_PRESSURE: u16 = 0x3a;
 const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_TOOL_RUBBER: u16 = 0x141;
 const BTN_TOUCH: u16 = 0x14a;
+const BTN_STYLUS: u16 = 0x14b;
+const BTN_STYLUS2: u16 = 0x14c;
 const MAX_TOUCH_SLOTS: u8 = 10;
 const INPUT_PROP_DIRECT: u32 = 1;
 const REL_X: u16 = 0;
@@ -96,8 +102,15 @@ impl Device {
         let file = open_uinput(path)?;
         let fd = file.as_raw_fd();
         set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
-        set_bit(fd, UI_SET_KEYBIT, u32::from(BTN_TOOL_PEN))?;
-        set_bit(fd, UI_SET_KEYBIT, u32::from(BTN_TOUCH))?;
+        for code in [
+            BTN_TOOL_PEN,
+            BTN_TOOL_RUBBER,
+            BTN_TOUCH,
+            BTN_STYLUS,
+            BTN_STYLUS2,
+        ] {
+            set_bit(fd, UI_SET_KEYBIT, u32::from(code))?;
+        }
         set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS))?;
         for (code, minimum, maximum) in [
             (ABS_X, 0, i32::from(u16::MAX)),
@@ -124,6 +137,9 @@ impl Device {
             (ABS_MT_TRACKING_ID, 0, i32::MAX),
             (ABS_MT_POSITION_X, 0, i32::from(u16::MAX)),
             (ABS_MT_POSITION_Y, 0, i32::from(u16::MAX)),
+            (ABS_MT_TOUCH_MAJOR, 0, i32::from(u16::MAX)),
+            (ABS_MT_TOUCH_MINOR, 0, i32::from(u16::MAX)),
+            (ABS_MT_ORIENTATION, -90, 90),
             (ABS_MT_PRESSURE, 0, i32::from(u16::MAX)),
         ] {
             set_absolute_axis(fd, code, minimum, maximum)?;
@@ -982,6 +998,12 @@ fn not_started() -> InputError {
 
 #[cfg(target_arch = "x86_64")]
 const _: () = {
+    assert!(ABS_MT_TOUCH_MAJOR == 0x30);
+    assert!(ABS_MT_TOUCH_MINOR == 0x31);
+    assert!(ABS_MT_ORIENTATION == 0x34);
+    assert!(BTN_TOOL_RUBBER == 0x141);
+    assert!(BTN_STYLUS == 0x14b);
+    assert!(BTN_STYLUS2 == 0x14c);
     assert!(std::mem::size_of::<libc::uinput_setup>() == 92);
     assert!(std::mem::size_of::<libc::input_event>() == 24);
     assert!(UI_DEV_SETUP == 0x405c_5503);
