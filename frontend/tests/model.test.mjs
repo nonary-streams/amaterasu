@@ -162,6 +162,30 @@ test("application editor saves sparse FEC and executable lifecycle fields", () =
   assert.equal(model.entryFromForm(form).exclude_global_prep_cmd, false);
 });
 
+test("application refresh rate option keeps exact values and sparse inheritance", () => {
+  const parse = model.parseRefreshRateOptionOverride;
+  assert.equal(parse(""), null);
+  for (const value of ["auto", "disabled", "manual", "prefer_highest"])
+    assert.equal(parse(value), value);
+  for (const value of ["AUTO", " auto", "unknown", "60", "null"])
+    assert.throws(() => parse(value), /Refresh rate option/);
+
+  const form = new FormData();
+  form.set("name", "Refresh policy");
+  form.set("kind", "application");
+  form.set("path", "/opt/refresh-policy");
+  assert.equal(Object.hasOwn(ordinary(model.entryFromForm(form)), "config_overrides"), false);
+
+  form.set("dd_refresh_rate_option", "auto");
+  assert.deepEqual(ordinary(model.entryFromForm(form)).config_overrides, {
+    dd_refresh_rate_option: "auto",
+  });
+  form.set("dd_refresh_rate_option", "manual");
+  assert.deepEqual(ordinary(model.entryFromForm(form)).config_overrides, {
+    dd_refresh_rate_option: "manual",
+  });
+});
+
 test("blank FEC and timeout retain sparse inheritance and explicit bounds", () => {
   assert.equal(model.parseFecOverride("  "), null);
   assert.deepEqual(ordinary(model.providerConfigOverrides("")), {

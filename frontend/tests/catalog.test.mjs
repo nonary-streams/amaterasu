@@ -5,14 +5,39 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const context = vm.createContext({ atob, Blob, Error });
-vm.runInContext(
-  ts.transpile(readFileSync("src/catalog.ts", "utf8"), {
-    target: ts.ScriptTarget.ES2022,
-  }),
-  context,
-);
+for (const source of ["src/model.ts", "src/catalog.ts"]) {
+  vm.runInContext(
+    ts.transpile(readFileSync(source, "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }),
+    context,
+  );
+}
 const readSteamArtwork = context.Amaterasu.readSteamArtwork;
 const reference = { provider: "steam", app_id: 730, revision: "42" };
+
+test("application refresh rate option editor reads back and writes sparse exact tokens", () => {
+  const parse = context.Amaterasu.parseCatalogRefreshRateOptionOverride;
+  const fields = new FormData();
+  assert.equal(parse(fields), null);
+  fields.set("dd_refresh_rate_option", "");
+  assert.equal(parse(fields), null);
+  for (const value of ["auto", "disabled", "manual", "prefer_highest"]) {
+    fields.set("dd_refresh_rate_option", value);
+    assert.equal(parse(fields), value);
+    assert.equal(context.Amaterasu.catalogRefreshRateOptionText(value), value);
+  }
+  for (const value of ["AUTO", "auto ", "unknown", "60"]) {
+    fields.set("dd_refresh_rate_option", value);
+    assert.throws(() => parse(fields), /Refresh rate option/);
+  }
+
+  assert.equal(context.Amaterasu.catalogRefreshRateOptionText(null), "");
+  assert.equal(context.Amaterasu.catalogRefreshRateOptionText(undefined), "");
+  assert.equal(context.Amaterasu.catalogManualRefreshRateCompanionVisible("manual"), true);
+  for (const value of [null, undefined, "auto", "disabled", "prefer_highest"])
+    assert.equal(context.Amaterasu.catalogManualRefreshRateCompanionVisible(value), false);
+});
 
 test("Steam artwork chunks assemble into the expected image without a local path", async () => {
   const source = Buffer.alloc(8195, 0x5a);

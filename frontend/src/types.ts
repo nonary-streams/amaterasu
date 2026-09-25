@@ -61,8 +61,10 @@ namespace Amaterasu {
       gamepad?: string;
       keyboard?: boolean;
       mouse?: boolean;
+      dd_refresh_rate_option?: RefreshRateOption | null;
     };
   }
+  export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";
   export interface CatalogRow {
     id: string;
     entry: Entry;

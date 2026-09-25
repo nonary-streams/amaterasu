@@ -1,4 +1,17 @@
 namespace Amaterasu {
+  const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
+
+  export function parseRefreshRateOptionOverride(value: string): RefreshRateOption | null {
+    if (value === "") return null;
+    if (refreshRateOptionValues.includes(value as RefreshRateOption))
+      return value as RefreshRateOption;
+    throw new Error("Refresh rate option must be auto, disabled, manual, or prefer_highest.");
+  }
+
+  export function usesManualRefreshRateCompanion(value: string | null | undefined): boolean {
+    return value === "manual";
+  }
+
   export function parseArguments(value: string): string[] {
     const parsed: unknown = JSON.parse(value || "[]");
     if (
@@ -310,10 +323,23 @@ namespace Amaterasu {
     const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
     const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
     const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
+    const refreshRateOption = parseRefreshRateOptionOverride(
+      String(data.get("dd_refresh_rate_option") ?? ""),
+    );
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
-      fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null && controller === null && gamepad === null && keyboard === null && mouse === null
+      fecPercentage === null &&
+      streamAudio === null &&
+      audioSink === null &&
+      virtualSink === null &&
+      audioSinkCaptureOnly === null &&
+      backButtonTimeout === null &&
+      controller === null &&
+      gamepad === null &&
+      keyboard === null &&
+      mouse === null &&
+      refreshRateOption === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
@@ -326,6 +352,7 @@ namespace Amaterasu {
             ...(gamepad === null ? {} : { gamepad }),
             ...(keyboard === null ? {} : { keyboard }),
             ...(mouse === null ? {} : { mouse }),
+            ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

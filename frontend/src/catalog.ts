@@ -77,6 +77,78 @@ namespace Amaterasu {
     return select;
   }
 
+  const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
+
+  function catalogEnumOverrideSelect(
+    name: string,
+    current: string | null | undefined,
+    values: readonly string[],
+  ): HTMLSelectElement {
+    const select = el("select");
+    select.name = name;
+    const inherit = el("option", "", "Inherit");
+    inherit.value = "";
+    select.append(inherit);
+    for (const value of values) {
+      const option = el("option", "", value);
+      option.value = value;
+      select.append(option);
+    }
+    if (current != null && !values.includes(current)) {
+      const saved = el("option", "", `Saved value: ${current}`);
+      saved.value = current;
+      select.append(saved);
+    }
+    select.value = current ?? "";
+    return select;
+  }
+
+  export function catalogRefreshRateOptionText(
+    value: RefreshRateOption | null | undefined,
+  ): string {
+    return value ?? "";
+  }
+
+  export function parseCatalogRefreshRateOptionOverride(data: FormData): RefreshRateOption | null {
+    return Amaterasu.parseRefreshRateOptionOverride(
+      String(data.get("dd_refresh_rate_option") ?? ""),
+    );
+  }
+
+  export function catalogManualRefreshRateCompanionVisible(
+    value: string | null | undefined,
+  ): boolean {
+    return Amaterasu.usesManualRefreshRateCompanion(value);
+  }
+
+  function catalogRefreshRateOptionFields(
+    current: RefreshRateOption | null | undefined,
+  ): HTMLElement[] {
+    const option = catalogEnumOverrideSelect(
+      "dd_refresh_rate_option",
+      catalogRefreshRateOptionText(current),
+      refreshRateOptionValues,
+    );
+    const manualCompanionNotice = el(
+      "p",
+      "muted",
+      "Manual mode uses the separate dd_manual_refresh_rate setting.",
+    );
+    const updateManualCompanionNotice = () => {
+      manualCompanionNotice.hidden = !catalogManualRefreshRateCompanionVisible(option.value);
+    };
+    option.addEventListener("change", updateManualCompanionNotice);
+    updateManualCompanionNotice();
+    return [
+      field(
+        "Refresh rate option",
+        option,
+        "Blank inherits the next scope. Choose auto, disabled, manual, or prefer_highest.",
+      ),
+      manualCompanionNotice,
+    ];
+  }
+
   function inputGamepadOverrideSelect(
     name: string,
     current: string | undefined,
@@ -413,6 +485,9 @@ namespace Amaterasu {
       const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
       const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
       const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
+      const refreshRateOptionFields = catalogRefreshRateOptionFields(
+        row.entry.config_overrides?.dd_refresh_rate_option,
+      );
       const form = el(
         "form",
         "editor-form",
@@ -421,6 +496,7 @@ namespace Amaterasu {
           fec,
           "Leave blank to inherit the global setting. Supported values are 1–255.",
         ),
+        ...refreshRateOptionFields,
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
         virtualSink.controls,
@@ -440,12 +516,15 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
-          const config_overrides = providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles);
+          const config_overrides = {
+            ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
+            dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
+          };
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number; controller?: boolean; gamepad?: string; keyboard?: boolean; mouse?: boolean };
+              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number; controller?: boolean; gamepad?: string; keyboard?: boolean; mouse?: boolean; dd_refresh_rate_option?: RefreshRateOption | null };
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -640,6 +719,9 @@ namespace Amaterasu {
     const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
     const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
     const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
+    const refreshRateOptionFields = catalogRefreshRateOptionFields(
+      entry?.config_overrides?.dd_refresh_rate_option,
+    );
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -702,6 +784,7 @@ namespace Amaterasu {
       ),
       pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
+      ...refreshRateOptionFields,
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       audioSink.controls,
       virtualSink.controls,
