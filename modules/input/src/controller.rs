@@ -925,6 +925,20 @@ impl<B: Backend> Controller<B> {
                                 "pen/touch down duplicates a pointer already owned by this lease",
                             ));
                         }
+                        let device_contacts = pen_touch_contacts
+                            .iter()
+                            .filter(|(held_device, _)| held_device == device)
+                            .count();
+                        let device_limit = self
+                            .backend
+                            .pen_touch_max_contacts(*device)
+                            .unwrap_or(MAX_PEN_TOUCH_CONTACTS);
+                        if device_contacts >= device_limit {
+                            return Err(InputError::new(
+                                "resource_exhausted",
+                                "backend pen/touch contact capacity is full",
+                            ));
+                        }
                         if pen_touch_contacts.len() >= MAX_PEN_TOUCH_CONTACTS {
                             return Err(InputError::new(
                                 "resource_exhausted",

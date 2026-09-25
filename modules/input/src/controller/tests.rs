@@ -15,6 +15,8 @@ struct FakeBackend {
     fail_controller_input: bool,
     reject_absolute: bool,
     supports_pen_touch: bool,
+    max_pen_contacts: Option<usize>,
+    max_touch_contacts: Option<usize>,
     failed_pen_touch_events: Vec<(u32, PenTouchPhase)>,
     controller_input_supported: bool,
     effective_gamepad_profile: Option<&'static str>,
@@ -40,6 +42,12 @@ impl Backend for FakeBackend {
     }
     fn pen_touch_supported(&self) -> bool {
         self.supports_pen_touch
+    }
+    fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
+        match device {
+            PenTouchDevice::Pen => self.max_pen_contacts,
+            PenTouchDevice::Touch => self.max_touch_contacts,
+        }
     }
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
@@ -3022,6 +3030,58 @@ fn pen_touch_limit_is_enforced_and_capability_is_reported_separately_from_policy
         unsupported.status("owner", Instant::now())["pen_touch_supported"],
         false
     );
+}
+
+#[test]
+fn pen_touch_backend_capacity_rejects_an_overfull_batch_before_injection() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            supports_pen_touch: true,
+            max_pen_contacts: Some(1),
+            max_touch_contacts: Some(2),
+            ..Default::default()
+        },
+        true,
+    );
+    let token = acquire(&mut controller, Instant::now());
+    let overfull_batch = [
+        pen_touch(1, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 10),
+        pen_touch(2, PenTouchDevice::Touch, PenTouchPhase::Down, 20, 20),
+        pen_touch(3, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 30),
+    ];
+
+    assert_eq!(
+        batch(&mut controller, &token, overfull_batch.to_vec())["error"]["code"],
+        "resource_exhausted"
+    );
+    assert!(controller.backend.trace.borrow().is_empty());
+    assert!(controller.pen_touch_contacts.is_empty());
+
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![
+                pen_touch(1, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 10),
+                pen_touch(2, PenTouchDevice::Touch, PenTouchPhase::Down, 20, 20),
+                pen_touch(1, PenTouchDevice::Pen, PenTouchPhase::Down, 30, 30),
+            ]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.backend.trace.borrow().len(), 3);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &token,
+            vec![
+                pen_touch(2, PenTouchDevice::Pen, PenTouchPhase::Down, 40, 40),
+                pen_touch(3, PenTouchDevice::Pen, PenTouchPhase::Down, 50, 50),
+            ]
+        )["error"]["code"],
+        "resource_exhausted"
+    );
+    assert_eq!(controller.backend.trace.borrow().len(), 3);
 }
 
 #[test]

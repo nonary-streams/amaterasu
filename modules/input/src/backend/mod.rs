@@ -1,5 +1,5 @@
 use crate::gamepad_profile::GamepadProfile;
-use crate::model::{Event, InputResult};
+use crate::model::{Event, InputResult, PenTouchDevice};
 use std::time::Instant;
 
 pub trait Backend {
@@ -8,6 +8,10 @@ pub trait Backend {
     fn absolute_pointer(&self) -> bool;
     fn pen_touch_supported(&self) -> bool {
         false
+    }
+    /// Returns a native limit for one device type; `None` uses the common lease limit.
+    fn pen_touch_max_contacts(&self, _device: PenTouchDevice) -> Option<usize> {
+        None
     }
     fn controller_input_supported(&self) -> bool {
         false
