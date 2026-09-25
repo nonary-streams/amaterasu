@@ -505,6 +505,106 @@ fn network_policy_update_activates_requested_family_and_empty_bind_address() {
 }
 
 #[test]
+fn network_policy_update_defers_family_and_bind_address_until_stream_is_terminal() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let port = free_base_port();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        address_family: Some(crate::model::AddressFamily::Ipv4),
+        bind_address: Some("127.0.0.1".into()),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("IPv4 loopback listener");
+    let initial = controller
+        .configure_network_policy(
+            port,
+            Some(crate::model::AddressFamily::Ipv4),
+            Some("127.0.0.1".into()),
+            1,
+        )
+        .expect("initial IPv4 policy applies");
+    assert_eq!(initial["active"], true);
+    assert_eq!(initial["active_address_family"], "ipv4");
+    assert_eq!(initial["active_bind_address"], "127.0.0.1");
+
+    let old_listener = controller.local.expect("bound IPv4 listener");
+    assert_eq!(old_listener.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(old_listener.port(), port + 21);
+    assert!(TcpStream::connect(old_listener).is_ok());
+
+    controller.records.insert(5, record(State::Playing));
+    let pending = controller
+        .configure_network_policy(
+            port,
+            Some(crate::model::AddressFamily::Both),
+            Some(String::new()),
+            2,
+        )
+        .expect("desired policy is accepted");
+
+    assert_eq!(pending["ok"], true);
+    assert_eq!(pending["active"], false);
+    assert_eq!(pending["pending"], true);
+    assert_eq!(pending["udp_binds_preflighted"], false);
+    assert_eq!(pending["desired_port"], port);
+    assert_eq!(pending["desired_address_family"], "both");
+    assert_eq!(pending["desired_bind_address"], "");
+    assert_eq!(pending["active_base_port"], port);
+    assert_eq!(pending["active_address_family"], "ipv4");
+    assert_eq!(pending["active_bind_address"], "127.0.0.1");
+    assert_eq!(pending["rtsp_addresses"], json!([old_listener.to_string()]));
+    assert_eq!(controller.local, Some(old_listener));
+    assert_eq!(controller.locals, vec![old_listener]);
+    assert!(TcpStream::connect(old_listener).is_ok());
+
+    let old_media_binds = controller
+        .media_binds_for_open(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .expect("old IPv4 media binds remain active");
+    assert_eq!(
+        old_media_binds.video,
+        SocketAddr::new(old_listener.ip(), port + 9)
+    );
+    assert_eq!(
+        old_media_binds.control,
+        SocketAddr::new(old_listener.ip(), port + 10)
+    );
+    assert_eq!(
+        old_media_binds.audio,
+        SocketAddr::new(old_listener.ip(), port + 11)
+    );
+
+    controller.records.get_mut(&5).unwrap().state = State::Closed;
+    controller.reconcile_network_port(3);
+
+    assert_eq!(controller.locals.len(), 2);
+    let v4_listener = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port + 21);
+    let v6_listener = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port + 21);
+    assert!(controller.locals.contains(&v4_listener));
+    assert!(controller.locals.contains(&v6_listener));
+    assert!(TcpStream::connect(v4_listener).is_ok());
+    assert!(TcpStream::connect(v6_listener).is_ok());
+    assert_eq!(controller.active_network_base_port, Some(port));
+    assert_eq!(
+        controller.active_address_family,
+        Some(crate::model::AddressFamily::Both)
+    );
+    assert_eq!(controller.active_bind_address.as_deref(), Some(""));
+
+    for peer in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        let media_binds = controller
+            .media_binds_for_open(peer)
+            .expect("family-matched media binds after reconciliation");
+        assert_eq!(media_binds.video, SocketAddr::new(peer, port + 9));
+        assert_eq!(media_binds.control, SocketAddr::new(peer, port + 10));
+        assert_eq!(media_binds.audio, SocketAddr::new(peer, port + 11));
+    }
+}
+
+#[test]
 fn null_network_overrides_confirm_rtsp_startup_policy_without_fabricating_overrides() {
     let _guard = NETWORK_TEST_LOCK.lock().unwrap();
     let base = free_base_port();
