@@ -29,6 +29,31 @@ highest refresh rate for the selected resolution, respectively.
 This model does not persist settings, project scoped values into a runtime
 request, or perform provider/native display effects.
 
+## Display configuration option model
+
+The library exposes `DisplayConfigurationOption` as a reusable typed
+configuration model. Its default is `VerifyOnly`, and its exact serialized
+tokens are `disabled`, `verify_only`, `ensure_active`, `ensure_primary`, and
+`ensure_only_display`. The legacy token parser maps unknown values to
+`Disabled`. The pinned meanings are:
+
+- `disabled` performs no additional display configuration and disables the
+  other `dd_` display options.
+- `verify_only` requires the selected display to be active without changing
+  display state.
+- `ensure_active` activates the selected display if it is inactive.
+- `ensure_primary` activates the selected display if it is inactive and makes
+  it primary.
+- `ensure_only_display` activates the selected display if it is inactive and
+  disables other displays.
+
+The pinned reference covers Windows and Linux private displays managed through
+KScreen. It does not specify a Moonlight gate for this option; the Moonlight
+"Optimize game settings" prerequisite belongs to `dd_resolution_option`. The
+public enum itself has no persistence, scoped-value projection, runtime or
+provider display effects, management UI readback, or platform qualification.
+macOS behavior remains unqualified.
+
 ## Resolution option model
 
 The library exposes `ResolutionOption` as a reusable typed configuration model.
