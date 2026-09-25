@@ -398,13 +398,16 @@ fn stop_and_join_route_restore_worker(worker: thread::JoinHandle<()>) {
 
 fn stop_worker_then_restore_once(
     worker: Option<thread::JoinHandle<()>>,
+    has_pending_restore: impl FnOnce() -> bool,
     restore_once: impl FnOnce(),
 ) {
     if let Some(worker) = worker {
         // Finish any in-flight COM operation before the final restore attempt.
         stop_and_join_route_restore_worker(worker);
     }
-    restore_once();
+    if has_pending_restore() {
+        restore_once();
+    }
 }
 
 pub fn shutdown() {
@@ -419,16 +422,14 @@ pub fn shutdown() {
     // Do not hold either policy state or worker state while joining. Shutdown
     // needs a final attempt because the retry worker exits when its stop flag
     // is set, potentially before it next examines pending route restoration.
-    stop_worker_then_restore_once(worker, || {
-        if route_restore_pending() {
-            // Shutdown may run on a caller's incompatible COM apartment.
-            // Open a fresh STA for the final, bounded restoration attempt.
-            if let Ok(final_worker) = thread::Builder::new()
-                .name("audio-route-final-restore".to_owned())
-                .spawn(retry_pending_route_restore_once)
-            {
-                let _ = final_worker.join();
-            }
+    stop_worker_then_restore_once(worker, route_restore_pending, || {
+        // Shutdown may run on a caller's incompatible COM apartment.
+        // Open a fresh STA for the final, bounded restoration attempt.
+        if let Ok(final_worker) = thread::Builder::new()
+            .name("audio-route-final-restore".to_owned())
+            .spawn(retry_pending_route_restore_once)
+        {
+            let _ = final_worker.join();
         }
     });
 }
@@ -1190,17 +1191,56 @@ mod tests {
 
     #[test]
     fn shutdown_restores_after_retry_worker_exits_even_without_a_worker() {
+        let original = [
+            Some("render.console".into()),
+            Some("render.multimedia".into()),
+            Some("render.communications".into()),
+        ];
+        let mut policy = RoutePolicy::new();
+        assert!(matches!(
+            policy.acquire("render.selected", &original).unwrap(),
+            AcquirePlan::Assign(_)
+        ));
+        policy
+            .record_assignment("render.selected", DefaultRole::Console)
+            .unwrap();
+        let routed = [
+            Some("render.selected".into()),
+            Some("render.multimedia".into()),
+            Some("render.communications".into()),
+        ];
+        assert!(matches!(
+            policy.release("render.selected", &routed).unwrap(),
+            ReleasePlan::Restore(_)
+        ));
         let (exited_sender, exited_receiver) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             thread::park();
             let _ = exited_sender.send(());
         });
         let mut attempts = 0;
-        stop_worker_then_restore_once(Some(worker), || {
-            assert!(exited_receiver.try_recv().is_ok());
-            attempts += 1;
-        });
-        stop_worker_then_restore_once(None, || attempts += 1);
+        stop_worker_then_restore_once(
+            Some(worker),
+            || {
+                assert!(exited_receiver.try_recv().is_ok());
+                policy.endpoint_with_pending_restore().is_some()
+            },
+            || {
+                attempts += 1;
+            },
+        );
+        stop_worker_then_restore_once(
+            None,
+            || policy.endpoint_with_pending_restore().is_some(),
+            || attempts += 1,
+        );
+        assert_eq!(attempts, 2);
+        policy.complete_restore(true);
+        stop_worker_then_restore_once(
+            None,
+            || policy.endpoint_with_pending_restore().is_some(),
+            || attempts += 1,
+        );
         assert_eq!(attempts, 2);
     }
 
