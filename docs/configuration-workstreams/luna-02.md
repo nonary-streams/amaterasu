@@ -373,3 +373,15 @@ reservation and the existing dirty launch changes can be integrated safely.
   owning NVHTTP path and coordinator reruns of formatting, package tests, and
   strict Clippy. Preserve the existing flat readback fields, revision behavior,
   defaults, and omitted-versus-null update semantics during that correction.
+
+## UPnP cleanup retry tests (2026-09-25)
+
+- Worker source commit: `f41ed04198a75993f0e915fec08c146f8a6985e7`, based on lane handoff `5997e5b1e5a722a93dbd7bbda2e6f11dd4230590`. Worker session `01a0d6f9-8841-7c31-ae58-1ee867472a3d` was verified as `gpt-6-luna/xhigh`; exact path: `modules/upnp/src/tests.rs`. Reviewed lane commit: `5649771939532989ad6a28b9839fd0e17f1341b0`.
+- Two deterministic tests cover stale-mapping cleanup failure followed by successful reconcile retry, and shutdown failure followed by successful cleanup retry. They assert failed mappings remain tracked as owned and desired mappings remain active. The fake gateway gained only a removal-failure setter; the UPnP crate has nine deterministic fake-gateway tests total.
+- The lightweight worker ran edition-2024 rustfmt and `git diff --check`; Cargo tests/build/Clippy and router/platform qualification were not run there. Its handoff was written before root registration and coordinator package validation.
+
+## Coordinator validation update: UPnP workspace and package gates
+
+- L02 package commit `16ce924f22f3a942e4cd0a7ec21d4d961cae745c` landed as `fcf72de1`; cleanup retry tests `5649771939532989ad6a28b9839fd0e17f1341b0` landed as `ea1729a5`. L01 registration candidate `7472c8e67fa30ab5056bcf238887aa7f52b7438d` landed as `b8703e0b` with only root workspace membership and lockfile resolution; `igd-next` is pinned at 0.17.1 with default features only.
+- Main gates passed: `cargo fmt --check -p amaterasu-upnp`, `cargo test -p amaterasu-upnp` (9/9), and `cargo clippy -p amaterasu-upnp --all-targets -- -D warnings`.
+- `global:upnp` remains pending product-settings migration, management authority/editor integration, listener lifecycle wiring, lease refresh, router testing, and platform qualification.
