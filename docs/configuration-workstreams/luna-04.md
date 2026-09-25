@@ -1,6 +1,16 @@
 # Luna-04: audio and input configuration parity
 
-## Current bounded slice: Console-role virtual-sink fallback
+## Current bounded slice: capture-only Console virtual-sink correction
+
+- Path reservation: inbox `032-capture-only-auto-fallback-path-reservation.json`; request ID `luna04-capture-only-auto-fallback-reservation-032`. Lane base: `00e0d08a61b30ae9820fa454b7ef8736d49727c0`. Worker source commit: `7a5373906ebbd01191c7134b28279043d9640c5e`; reviewed lane code commit: `716531484415165b9b1aac107500a976a34b8714`.
+- Stable IDs in scope: `global:audio_sink_capture_only` and `global:virtual_sink`; both remain pending. The only code path changed is `modules/audio/src/virtual_sink.rs`, disjoint from the unpicked continuous-capture candidate paths below.
+- Worker thread `01a0d6e6-1788-7130-9c14-8d0e0b083dcc` was verified from `state_5.sqlite` as `gpt-6-luna`/`xhigh` before edits. Isolated worktree: `D:/sources/worktrees/amaterasu-audio-capture-only-auto-fallback-xhigh`, branch `codex/luna04-audio-capture-only-auto-fallback-xhigh`, clean at the exact lane base. The worker commit changes only the reserved path and includes the required plan trailers; lead review confirmed its parent, behavior, path scope, and commit metadata.
+- For `host_audio_enabled=true`, an empty/default regular selector with `capture_sink_without_routing=true` no longer selects an automatic Steam virtual sink. `Capture.open` therefore uses its pinned Console endpoint or reports it unavailable. The correction prevents an automatic virtual choice from converting this capture-only open into routed playback. Host-audio-disabled fallback, explicit ordinary selectors, and explicit virtual selectors including `Some("")` retain their behavior. No schema, persistence, management, or foreign-owned path changed.
+- Pure regressions cover both Console/Multimedia default disagreement directions, host-audio-disabled automatic fallback, explicit ordinary selection, and explicit virtual `Some("")`. Worker and lane `rustfmt --edition 2024` and `git diff --check` passed. Cargo tests/build/Clippy were not run in this lightweight lane; the authored policy tests remain unexecuted.
+- Coordinator validation of the preceding Console-role virtual-sink code (`928c3d963727c6ad8100ee9a920ea00aae6a589d`, main code `f4ed86b8`) passed audio formatting, 54 audio tests with one controlled-hardware test ignored, and strict Clippy at main tip `4bfd71194a32460d17794cbe934e696dcbd58136`. This follow-up correction is a lane candidate and has not received those package gates.
+- Windows COM role lookup, Console absence behavior, real endpoint switching, and controlled hardware remain unqualified. Durable settings/default migration, scoped client/application resolution, management authority/UI, and end-to-end audio evidence remain open. No stable ID is closed; all 23 assigned IDs remain pending. The coordinator owns direct-main cherry-picking and validation.
+
+## Previous bounded slice: Console-role virtual-sink fallback
 
 - Path reservation: inbox `031-virtual-sink-console-fallback-path-reservation.json`; request ID `luna04-virtual-sink-console-fallback-reservation-031`. Lane base: `b46286ad3f4217ddb8f12cda2ed4fd7765fccfa2`.
 - Stable ID in scope: `global:virtual_sink`; it remains pending. Exact code paths: `modules/audio/src/virtual_sink.rs` and `modules/audio/src/platform/windows.rs`. These do not overlap the held continuous-capture candidate paths listed below.
