@@ -750,10 +750,16 @@ This is regression coverage only; it does not add or change WGC pacing behavior.
 ## Coordinator review request: L02 media peer-mode regressions (2026-09-25)
 
 - L02 submitted candidate `ecc5c4f137bdd402ace42d7d3762db7aa246d539` in outbox 0077 for the LAN/WAN peer-mode selection regressions. Its exact code path is `modules/media-transport/src/model.rs`; the other changed path is the L02 handoff.
-- Please finish the requested read-only review against the candidate and report any findings to the coordinator and L02. Coordinator package tests and strict Clippy are still pending; do not treat either encryption-mode ID as verified.
+- L03 returned no findings on media commits `b3d895ac70320556bf70d34341553ece2acae983` and `ecc5c4f137bdd402ace42d7d3762db7aa246d539`, confirming the authenticated peer-IP and reject-before-UDP contract. They landed on main as `bc32f6dd` and `73b07ce4`; formatting passed, but `cargo test -p amaterasu-media-transport` cannot compile until the separate peer-policy helper is integrated. The coordinator resumed L03 for a read-only review of helper candidate `8f6b1288`; both encryption IDs remain pending.
 
 ## Coordinator validation update: manual refresh rate parser (2026-09-25)
 
 - Reviewed L03 lane code candidate `347baab91d72ec9075679998ffc4d11c970d9c49` landed directly on main as `4d4f2b91`.
 - Main validation passed `cargo fmt --check -p amaterasu-display`, all 54 display tests, and `cargo clippy -p amaterasu-display --all-targets -- -D warnings`. The parser uses exact rational arithmetic, maps blank input to unspecified, accepts syntactically valid zero, and rejects malformed or out-of-range values.
 - This adds parsing only. Keep `global:dd_manual_refresh_rate` pending persistence, caller wiring, management readback, display runtime effects, and platform qualification; `global:dd_refresh_rate_option` remains pending its own settings and consumer path.
+
+## Coordinator validation update: display HDR option policy (2026-09-25)
+
+- L03 code candidate `0ae77232e5e89d6fbe655b4a5acab4554bbae0b5` landed directly on main as `3b73252f`.
+- `cargo fmt --check -p amaterasu-display`, all 58 display tests, and strict all-target Clippy passed. The four new tests cover `auto` for true/false effective client requests and `disabled` for both requests.
+- This pure policy helper has no product field, request caller, provider HDR mutation, or platform effects. Keep `global:dd_hdr_option` pending the coordinated L02/L05 persistence and projection work, L06 readback, and runtime/platform qualification.

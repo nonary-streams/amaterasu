@@ -485,3 +485,9 @@
 - L05 lane commit `f45c0598904f98ee6a6281c2547d05a2316a65af` landed directly on main as `62aad945c63a91d8fb0800e0e590ad1cca9c33ee`. The README now documents that primary and detached children share the launch-level elevation flag, Unix ignores it, raw preparation has a per-step flag, and structured preparation uses false.
 - Main's README also contained a verified host-process environment expansion correction. The stale-base conflict was resolved by preserving that current wording while applying the reserved elevation documentation. The final change touches only `modules/application/README.md`; `git diff --check` and `git show --check` passed.
 - This documentation correction does not qualify runtime behavior. `per_application:elevated` remains pending management readback and Windows/Unix runtime evidence.
+
+## Coordinator validation update: per-application native pen/touch storage (2026-09-25)
+
+- Reviewed L05 code candidate `c7cc165f6407172f55e5a1e92eb9fa6679703338` (with preceding lane code commit `dc5a8df4`) landed directly on main as `b512069` and `7629d908`. The mainline conflict in `ConfigOverrides` was resolved by retaining the newer HDR/SDR fields and adding only `native_pen_touch`; the test correction clones stored JSON before mutable reload.
+- Main `cargo fmt --check -p amaterasu-catalog`, all 81 Catalog tests, and `cargo clippy -p amaterasu-catalog --all-targets -- -D warnings` passed. The lightweight lane's formatter check reported pre-existing unrelated drift, so its broad reflow was discarded; main package formatting passes.
+- Catalog storage only is implemented. Keep `global:native_pen_touch` pending L02 client/application/global resolution and launch projection, L06 management/readback, L04 effective input behavior, native event transport, and Windows qualification.

@@ -339,3 +339,9 @@ The child passed `rustfmt --edition 2024 --check crates/package/src/migration.rs
 - Main validation initially found invalid legacy salts and strict Clippy range-loop warnings. Coordinator follow-up `dcebf41` uses valid 16-byte salts and iterator-based pair enumeration.
 - `cargo fmt --check -p amaterasu-authentication`, `git diff --check`, all 52 authentication tests, and `cargo clippy -p amaterasu-authentication --all-targets -- -D warnings` passed after the correction.
 - The precedence and conflict cases ran on Windows; the Unix symlink-alias branch did not run here. `global:credentials_file` remains pending full migration, management, consumer, and platform evidence.
+
+## Coordinator validation update: strict administrator-session expiry (2026-09-25)
+
+- L01 code candidate `eee5e61686d8ff3ac778f4cbb48451101b2f26f4` landed directly on main as `93db5468`. Main tests caught a test-order mistake: the fake clock advanced to the exact expiry before the test attempted a refresh one second earlier. Coordinator follow-up `1db36f8` moves that before-deadline refresh before the equality check; engine behavior is unchanged by the correction.
+- `cargo fmt --check -p amaterasu-authentication`, all 53 authentication tests, and `cargo clippy -p amaterasu-authentication --all-targets -- -D warnings` passed.
+- Access and refresh deadlines now reject at equality while preserving response shape, persisted fields/schema versions, rotation, and API-token behavior. Both TTL IDs remain pending management readback and browser/restart/platform qualification.

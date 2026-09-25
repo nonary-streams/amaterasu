@@ -482,3 +482,10 @@ the coordinator-owned coverage ledger.
 - L06 test candidate `b035a1c5bbb26e39d4dbf355bd7f16ab31676222` landed on main as `416450d3`. Its tests cover missing-document registration, schema migration preserving unrelated values, revision-bound updates followed by authoritative GET readback, and nonfatal service/scope failures.
 - Coordinator commit `820a14e` corrected the fake API's cross-realm payload comparison and replaced a fixed promise-turn count with an event-loop turn. `npm --prefix frontend test` passed typecheck and all 68 tests.
 - Live signed-request integration and real-browser/platform qualification remain pending. `global:locale` is not verified.
+
+## Coordinator validation update: global native pen/touch editor (2026-09-25)
+
+- L06 candidate `9aebf81912ad49e8cc08c46ca705f8173309a756` landed directly on main as `4cb7383`, and the validated production bundle landed as `1193934`. The stale lane-base conflict was resolved by adding only `native_pen_touch` to the current global input editor/validator/type; unrelated DS4 editor changes from the old branch were left out.
+- The existing settings readback supplies the configured boolean; the existing write route preserves `expected_revision`, accepts true/false, and rejects null and other non-boolean values. The editor explicitly says saving the setting does not activate native events or imply platform support.
+- Main validation passed `cargo fmt --check -p amaterasu-management`, all 50 management tests, strict all-target management Clippy, `npm --prefix frontend test` (typecheck and all 68 tests), and `npm --prefix frontend run build`.
+- The setting remains a saved policy value only. Native pen/touch event transport, live signed-route/browser evidence, and platform qualification remain incomplete; `global:native_pen_touch` is not verified.
