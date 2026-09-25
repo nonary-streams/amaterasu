@@ -444,7 +444,8 @@ fn analyze_source_file(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let is_state_document = is_configured_state_file || filename.ends_with("_state.json");
+    let is_state_document = is_configured_state_file
+        || (!is_configured_authentication_file && filename.ends_with("_state.json"));
     if is_state_document {
         plan.critical_items.push(PlanItem {
             product,

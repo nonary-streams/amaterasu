@@ -312,9 +312,12 @@ fn configured_credentials_file_is_authentication_input_not_pairing_credentials()
     let credentials = b"authentication credentials\x00with exact bytes\xff";
     write(
         &predecessor.join("sunshine.conf"),
-        b"credentials_file = \"credentials/custom.json\"\n",
+        b"credentials_file = \"credentials/custom_state.json\"\n",
     );
-    write(&predecessor.join("credentials/custom.json"), credentials);
+    write(
+        &predecessor.join("credentials/custom_state.json"),
+        credentials,
+    );
 
     let legacy_source = source(LegacyProduct::Sunshine, &predecessor);
     let analyzed = analyze_legacy_configuration(std::slice::from_ref(&legacy_source)).unwrap();
@@ -330,6 +333,12 @@ fn configured_credentials_file_is_authentication_input_not_pairing_credentials()
             .critical_items
             .iter()
             .any(|item| item.item == "pairing_credentials")
+    );
+    assert!(
+        !analyzed
+            .critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
     );
 
     let validated = [ValidatedSensitiveSource {
@@ -350,20 +359,41 @@ fn configured_credentials_file_is_authentication_input_not_pairing_credentials()
         &validated,
     )
     .unwrap();
-    assert!(
-        receipt
-            .imported_files
-            .iter()
-            .any(|imported| { imported.path.ends_with("sunshine/credentials/custom.json") })
-    );
+    assert!(receipt.imported_files.iter().any(|imported| {
+        imported
+            .path
+            .ends_with("sunshine/credentials/custom_state.json")
+    }));
     assert_eq!(
         fs::read(
             destination
                 .join(LEGACY_IMPORT_DIRECTORY)
-                .join("sunshine/credentials/custom.json")
+                .join("sunshine/credentials/custom_state.json")
         )
         .unwrap(),
         credentials
+    );
+
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"credentials_file = \"credentials/custom_state.json\"\n\
+file_state = credentials/custom_state.json\n",
+    );
+    let explicit_state_source = source(LegacyProduct::Sunshine, &predecessor);
+    let explicit_state_plan =
+        analyze_legacy_configuration(std::slice::from_ref(&explicit_state_source)).unwrap();
+    assert!(
+        explicit_state_plan
+            .critical_items
+            .iter()
+            .any(|item| item.item == "pairing_identity_state")
+    );
+    assert!(
+        preflight_legacy_configuration_with_sensitive_sources(
+            &[explicit_state_source],
+            &validated,
+        )
+        .is_err()
     );
 }
 
