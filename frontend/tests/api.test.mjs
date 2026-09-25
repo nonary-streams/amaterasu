@@ -391,6 +391,45 @@ test("restore proactively rotates a remembered session near access expiry", asyn
   assert.equal(saved.refreshing, false);
 });
 
+test("restore rotates an expired bearer while its refresh token is still valid", async () => {
+  const oldBearer = secret("4");
+  const oldRefresh = secret("5");
+  const newBearer = secret("6");
+  const newRefresh = secret("7");
+  const refreshExpiresAt = future(600);
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(oldBearer, oldRefresh, future(-10), refreshExpiresAt, {
+            remember_me: true,
+          })
+        : url.endsWith("/auth/refresh")
+          ? sessionReply(newBearer, newRefresh, future(300), refreshExpiresAt, {
+              remember_me: true,
+            })
+          : { ok: true },
+    );
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("admin", "password", true);
+  const reloaded = apiHarness(responder, { storage, locks });
+
+  assert.equal(await reloaded.api.restoreSession(), true);
+  assert.equal(reloaded.calls.length, 1);
+  assert.equal(reloaded.calls[0].url, "http://127.0.0.1:5000/v1/auth/refresh");
+  assert.deepEqual(JSON.parse(reloaded.calls[0].options.body), {
+    refresh_token: oldRefresh,
+  });
+  const saved = JSON.parse(
+    storage.getItem("amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000"),
+  );
+  assert.equal(saved.bearer, newBearer);
+  assert.equal(saved.refresh_token, newRefresh);
+  assert.equal(saved.expires_at > Math.floor(Date.now() / 1000), true);
+  assert.equal(saved.refresh_expires_at, refreshExpiresAt);
+});
+
 test("two API instances serialize refresh and adopt the rotated pair", async () => {
   const oldBearer = secret("3");
   const oldRefresh = secret("4");
