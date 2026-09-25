@@ -385,3 +385,15 @@ reservation and the existing dirty launch changes can be integrated safely.
 - L02 package commit `16ce924f22f3a942e4cd0a7ec21d4d961cae745c` landed as `fcf72de1`; cleanup retry tests `5649771939532989ad6a28b9839fd0e17f1341b0` landed as `ea1729a5`. L01 registration candidate `7472c8e67fa30ab5056bcf238887aa7f52b7438d` landed as `b8703e0b` with only root workspace membership and lockfile resolution; `igd-next` is pinned at 0.17.1 with default features only.
 - Main gates passed: `cargo fmt --check -p amaterasu-upnp`, `cargo test -p amaterasu-upnp` (9/9), and `cargo clippy -p amaterasu-upnp --all-targets -- -D warnings`.
 - `global:upnp` remains pending product-settings migration, management authority/editor integration, listener lifecycle wiring, lease refresh, router testing, and platform qualification.
+
+## UPnP caller-driven lease refresh and IGDv2 countdown fix (2026-09-25)
+
+- Isolated XHigh worker final source commit: `9d2ff0bbe1652198cf83cd23aeac41aa0b684a57`, based on lane `372b1675ced025863d1681ceaf36c72d8dc6705c`; it supersedes the worker's initial `5028f346` commit, which was not integrated. Worker session `01a0d702-cec9-7411-abfe-68a32d2920d3` persisted `gpt-6-luna/xhigh`, verified from the session JSONL before edits. Reviewed lane commit: `755a51352dc9211426c4215c7a85ef56e6f87de9`.
+- Exact paths: `modules/upnp/src/lib.rs`, `modules/upnp/src/igd.rs`, `modules/upnp/src/tests.rs`, and `modules/upnp/README.md`. `MappingManager::refresh_owned` refreshes currently owned entries; missing/changed entries are relinquished and refresh errors retain ownership for retry. The adapter checks stable attributes before refreshing the recorded tuple; the IGD check-then-act race remains documented. The caller should use the exposed 30-minute recommended interval; this crate has no timer/runtime dependency.
+- IGDv2 returns remaining lease seconds, which count down. Stable identity comparison ignores only that dynamic field and still compares ports, protocol, target address/port, remote host, enabled flag, and owner description. The regression covers the countdown across reconcile, refresh, and shutdown. A zero lease request is IGDv2's maximum 604,800 seconds (one week), so refresh must occur before expiry. The package now has 13 deterministic fake-gateway tests.
+- The lightweight worker passed Rust 2024 rustfmt, `git diff --check`, and committed-diff checks; it did not run Cargo tests/build/Clippy, router behavior, or platform qualification.
+
+## Coordinator validation update: UPnP lease refresh
+
+- Source commit `755a51352dc9211426c4215c7a85ef56e6f87de9` landed on main as `ad0f72bb`. Main formatting passed, package tests passed 13/13, and strict Clippy passed.
+- `global:upnp` remains pending listener refresh scheduling, product-settings migration, management authority/editor integration, router testing, and platform qualification. The package exposes refresh but does not add a timer.
