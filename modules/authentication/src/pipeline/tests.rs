@@ -946,8 +946,104 @@ fn scope_digest_mismatch_invalidates_hydrated_sessions() {
             .as_array()
             .unwrap()
             .len(),
-        1,
-        "mismatched persisted records are ignored until a later session write"
+        0,
+        "observed policy mismatch must be durably pruned"
+    );
+    let mut restored_policy = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restored_policy,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":["catalog.read"]}),
+            102,
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn failed_prune_write_blocks_request_until_policy_mismatch_is_persisted() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    let changed_settings = Settings {
+        allowed_scopes: BTreeSet::from(["catalog.read".into()]),
+        ..settings()
+    };
+    let mut changed_policy = Pipeline::new(changed_settings);
+    state.fail_session_write = true;
+    assert_eq!(
+        state.request(
+            &mut changed_policy,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
+            101,
+        ),
+        error("state_unavailable")
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    state.fail_session_write = false;
+    assert_eq!(
+        state.request(
+            &mut changed_policy,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
+            102,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn observed_refresh_expiry_cannot_revive_after_restart_with_earlier_clock() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings_with_ttls(10, 20));
+    state.setup(&mut pipeline);
+    let session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        100,
+    );
+    let mut expired = Pipeline::new(settings_with_ttls(10, 20));
+    assert_eq!(
+        state.request(
+            &mut expired,
+            "console",
+            json!({"action":"list_sessions"}),
+            120
+        )["sessions"],
+        json!([])
+    );
+    let mut earlier_clock = Pipeline::new(settings_with_ttls(10, 20));
+    assert_eq!(
+        state.request(
+            &mut earlier_clock,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
+            101,
+        )["code"],
+        "unauthorized"
     );
 }
 

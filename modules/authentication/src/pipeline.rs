@@ -38,10 +38,16 @@ struct StateMutation {
 }
 enum Stage {
     Loading(Operation),
+    LoadingAfterPrune(Operation),
     LoadingSessions {
         operation: Operation,
         document: Document,
         document_revision: u64,
+        after_prune: bool,
+    },
+    PruningSessions {
+        operation: Operation,
+        expected_revision: u64,
     },
     Saving {
         response: Value,
@@ -313,6 +319,7 @@ impl Pipeline {
             }
         };
 
+        let after_prune_load = matches!(&pending.stage, Stage::LoadingAfterPrune(_));
         match pending.stage {
             Stage::Saving {
                 response,
@@ -344,10 +351,11 @@ impl Pipeline {
                 }
                 complete(send, pending.request.id, response)
             }
-            Stage::Loading(operation) => {
+            Stage::Loading(operation) | Stage::LoadingAfterPrune(operation) => {
                 if Instant::now() >= pending.request.deadline {
                     return complete(send, pending.request.id, error("deadline_exceeded"));
                 }
+                let after_prune = after_prune_load;
                 let (document, document_revision) = match read_document(&payload) {
                     Ok(document) => document,
                     Err(code) => return complete(send, pending.request.id, error(code)),
@@ -358,9 +366,14 @@ impl Pipeline {
                         operation,
                         document,
                         document_revision,
+                        after_prune,
                     },
                     STATE_SERVICE,
-                    "load-sessions",
+                    if after_prune {
+                        "load-sessions-after-prune"
+                    } else {
+                        "load-sessions"
+                    },
                     json!({"action":"get","key":SESSION_STATE_KEY}),
                     send,
                 )
@@ -369,6 +382,7 @@ impl Pipeline {
                 operation,
                 document,
                 document_revision,
+                after_prune,
             } => {
                 if Instant::now() >= pending.request.deadline {
                     return complete(send, pending.request.id, error("deadline_exceeded"));
@@ -377,6 +391,24 @@ impl Pipeline {
                     Ok(document) => document,
                     Err(code) => return complete(send, pending.request.id, error(code)),
                 };
+                let (session_document, removed) =
+                    self.engine.prune_sessions(&document, session_document, now);
+                if removed {
+                    if after_prune {
+                        return complete(send, pending.request.id, error("state_unavailable"));
+                    }
+                    return self.submit(
+                        pending.request,
+                        Stage::PruningSessions {
+                            operation,
+                            expected_revision: session_revision,
+                        },
+                        STATE_SERVICE,
+                        "prune-sessions",
+                        json!({"action":"set","key":SESSION_STATE_KEY,"expected_revision":session_revision,"value":session_document}),
+                        send,
+                    );
+                }
                 match self.engine.apply(
                     &pending.request.caller,
                     operation,
@@ -439,6 +471,24 @@ impl Pipeline {
                     ),
                     Err(code) => complete(send, pending.request.id, error(code)),
                 }
+            }
+            Stage::PruningSessions {
+                operation,
+                expected_revision,
+            } => {
+                if payload["ok"] != true
+                    || payload["revision"].as_u64() != expected_revision.checked_add(1)
+                {
+                    return complete(send, pending.request.id, error("state_unavailable"));
+                }
+                self.submit(
+                    pending.request,
+                    Stage::LoadingAfterPrune(operation),
+                    STATE_SERVICE,
+                    "load-after-prune",
+                    json!({"action":"get","key":STATE_KEY}),
+                    send,
+                )
             }
             Stage::LoadingProductSettings(operation) => {
                 if let Some(failure) = normalized_product_error(&payload) {
@@ -551,9 +601,11 @@ fn normalized_product_error(payload: &Value) -> Option<Value> {
 fn failure_for_stage(stage: &Stage, code: &str) -> Value {
     match stage {
         Stage::LoadingProductSettings(_) | Stage::SavingProductSettings { .. } => error(code),
-        Stage::Loading(_) | Stage::LoadingSessions { .. } | Stage::Saving { .. } => {
-            error("state_unavailable")
-        }
+        Stage::Loading(_)
+        | Stage::LoadingAfterPrune(_)
+        | Stage::LoadingSessions { .. }
+        | Stage::PruningSessions { .. }
+        | Stage::Saving { .. } => error("state_unavailable"),
     }
 }
 

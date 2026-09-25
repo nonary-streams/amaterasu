@@ -196,6 +196,29 @@ impl Engine {
         }
     }
 
+    /// Remove records that cannot be trusted under the currently observed
+    /// credential, scope policy, or time before a request uses the sidecar.
+    pub fn prune_sessions(
+        &self,
+        credential_document: &Document,
+        mut session_document: SessionDocument,
+        now: u64,
+    ) -> (SessionDocument, bool) {
+        let credential_digest = credential_document
+            .credential
+            .as_ref()
+            .map(|credential| crypto::token_digest(&credential.password_hash));
+        let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
+        let original_len = session_document.sessions.len();
+        session_document.sessions.retain(|session| {
+            Some(session.credential_digest.as_str()) == credential_digest.as_deref()
+                && session.scope_digest == scope_digest
+                && session.refresh_expires_at > now.max(self.latest_time)
+        });
+        let removed = session_document.sessions.len() != original_len;
+        (session_document, removed)
+    }
+
     fn setup(
         mut document: Document,
         username: String,
