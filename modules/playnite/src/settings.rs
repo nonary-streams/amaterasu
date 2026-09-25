@@ -198,7 +198,7 @@ fn validate_filter_values(values: &[String], label: &'static str) -> Result<(), 
     }
     let mut unique = BTreeSet::new();
     for value in values {
-        let normalized = value.to_lowercase();
+        let normalized = value.to_ascii_lowercase();
         if value.trim().is_empty()
             || value.len() > MAX_FILTER_BYTES
             || value.chars().any(char::is_control)
@@ -425,6 +425,22 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn distinct_non_ascii_filter_values_do_not_collide_with_ascii_case_folds() {
+        assert!(
+            ProductSettings {
+                sync_categories: vec!["k".into(), "K".into()],
+                exclude_categories: vec!["k".into(), "K".into()],
+                sync_plugins: vec!["k".into(), "K".into()],
+                exclude_plugins: vec!["k".into(), "K".into()],
+                exclude_games: vec!["k".into(), "K".into()],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
         );
     }
 }

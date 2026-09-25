@@ -207,7 +207,7 @@ impl SnapshotAssembler {
             return None;
         }
         for game in games {
-            let id = game.id.to_lowercase();
+            let id = game.id.to_ascii_lowercase();
             if game.id.trim().is_empty()
                 || game.id.len() > 512
                 || game.id.chars().any(char::is_control)
@@ -274,9 +274,9 @@ pub fn select_game_sources(
 
     let included_categories = ascii_lower_set(&settings.sync_categories);
     let excluded_categories = ascii_lower_set(&settings.exclude_categories);
-    let included_plugins = lower_set(&settings.sync_plugins);
-    let excluded_plugins = lower_set(&settings.exclude_plugins);
-    let excluded_games = lower_set(&settings.exclude_games);
+    let included_plugins = ascii_lower_set(&settings.sync_plugins);
+    let excluded_plugins = ascii_lower_set(&settings.exclude_plugins);
+    let excluded_games = ascii_lower_set(&settings.exclude_games);
     let mut selected = BTreeMap::<String, (&Game, u32)>::new();
 
     if settings.recent_games > 0 {
@@ -301,7 +301,7 @@ pub fn select_game_sources(
                 continue;
             }
             selected
-                .entry(game.id.to_lowercase())
+                .entry(game.id.to_ascii_lowercase())
                 .and_modify(|(_, source_flags)| *source_flags |= SOURCE_RECENT)
                 .or_insert((game, SOURCE_RECENT));
             recent_count += 1;
@@ -331,12 +331,12 @@ pub fn select_game_sources(
         {
             source_flags |= SOURCE_CATEGORY;
         }
-        if included_plugins.contains(&game.plugin_id.to_lowercase()) {
+        if included_plugins.contains(&game.plugin_id.to_ascii_lowercase()) {
             source_flags |= SOURCE_PLUGIN;
         }
         if source_flags != 0 {
             selected
-                .entry(game.id.to_lowercase())
+                .entry(game.id.to_ascii_lowercase())
                 .and_modify(|(_, selected_flags)| *selected_flags |= source_flags)
                 .or_insert((game, source_flags));
         }
@@ -357,8 +357,8 @@ fn is_excluded(
     excluded_categories: &BTreeSet<String>,
     excluded_plugins: &BTreeSet<String>,
 ) -> bool {
-    excluded_games.contains(&game.id.to_lowercase())
-        || excluded_plugins.contains(&game.plugin_id.to_lowercase())
+    excluded_games.contains(&game.id.to_ascii_lowercase())
+        || excluded_plugins.contains(&game.plugin_id.to_ascii_lowercase())
         || game
             .categories
             .iter()
@@ -370,10 +370,6 @@ fn ascii_lower_set(values: &[String]) -> BTreeSet<String> {
         .iter()
         .map(|value| value.to_ascii_lowercase())
         .collect()
-}
-
-fn lower_set(values: &[String]) -> BTreeSet<String> {
-    values.iter().map(|value| value.to_lowercase()).collect()
 }
 
 pub fn parse_iso8601_unix(value: &str) -> Option<i64> {
@@ -663,6 +659,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_ids_do_not_unicode_case_fold() {
+        let mut assembler = SnapshotAssembler::default();
+        assembler.receive_line(br#"{"type":"snapshotStart"}"#);
+        assembler.receive_line(br#"{"type":"plugins","payload":[]}"#);
+        assembler.receive_line(br#"{"type":"categories","payload":[]}"#);
+        assembler.receive_line(
+            br#"{"type":"games","payload":[{"id":"k","name":"ASCII","installed":true},{"id":"\u212a","name":"Kelvin","installed":true}]}"#,
+        );
+
+        assert!(matches!(
+            assembler.receive_line(br#"{"type":"snapshotComplete","games":2}"#),
+            Some(Ok(snapshot)) if snapshot.games.len() == 2
+        ));
+    }
+
+    #[test]
     fn included_categories_use_ascii_case_insensitive_matching() {
         let snapshot = Snapshot {
             games: vec![
@@ -686,6 +698,156 @@ mod tests {
                 .map(|game| game.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["ascii-match"]
+        );
+    }
+
+    #[test]
+    fn included_plugins_use_ascii_case_insensitive_matching() {
+        let snapshot = Snapshot {
+            games: vec![game("ascii-match", &[], "P3", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 0,
+            sync_plugins: vec!["p3".into()],
+            ..ProductSettings::default()
+        };
+
+        let selected = select_games(&snapshot, &settings, 0);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ascii-match"]
+        );
+    }
+
+    #[test]
+    fn plugin_inclusion_does_not_unicode_case_fold() {
+        let kelvin_plugin = Snapshot {
+            games: vec![game("kelvin", &[], "K", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let ascii_setting = ProductSettings {
+            recent_games: 0,
+            sync_plugins: vec!["k".into()],
+            ..ProductSettings::default()
+        };
+        assert!(select_games(&kelvin_plugin, &ascii_setting, 0).is_empty());
+
+        let ascii_plugin = Snapshot {
+            games: vec![game("ascii", &[], "k", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let unicode_setting = ProductSettings {
+            recent_games: 0,
+            sync_plugins: vec!["K".into()],
+            ..ProductSettings::default()
+        };
+        assert!(select_games(&ascii_plugin, &unicode_setting, 0).is_empty());
+    }
+
+    #[test]
+    fn excluded_plugins_use_ascii_case_insensitive_matching() {
+        let snapshot = Snapshot {
+            games: vec![game("ascii-match", &[], "STEAM", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let settings = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_plugins: vec!["steam".into()],
+            ..ProductSettings::default()
+        };
+
+        assert!(select_games(&snapshot, &settings, 0).is_empty());
+    }
+
+    #[test]
+    fn plugin_exclusion_does_not_unicode_case_fold() {
+        let kelvin_plugin = Snapshot {
+            games: vec![game("kelvin", &[], "K", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let ascii_setting = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_plugins: vec!["k".into()],
+            ..ProductSettings::default()
+        };
+        assert_eq!(
+            select_games(&kelvin_plugin, &ascii_setting, 0)
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kelvin"]
+        );
+
+        let ascii_plugin = Snapshot {
+            games: vec![game("ascii", &[], "k", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let unicode_setting = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_plugins: vec!["K".into()],
+            ..ProductSettings::default()
+        };
+        assert_eq!(
+            select_games(&ascii_plugin, &unicode_setting, 0)
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ascii"]
+        );
+    }
+
+    #[test]
+    fn game_id_exclusions_do_not_unicode_case_fold() {
+        let kelvin_id = Snapshot {
+            games: vec![game("K", &[], "other", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let ascii_setting = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_games: vec!["k".into()],
+            ..ProductSettings::default()
+        };
+        assert_eq!(
+            select_games(&kelvin_id, &ascii_setting, 0)
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["K"]
+        );
+
+        let ascii_id = Snapshot {
+            games: vec![game("k", &[], "other", "")],
+            categories: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let unicode_setting = ProductSettings {
+            recent_games: 0,
+            sync_all_installed: true,
+            exclude_games: vec!["K".into()],
+            ..ProductSettings::default()
+        };
+        assert_eq!(
+            select_games(&ascii_id, &unicode_setting, 0)
+                .iter()
+                .map(|game| game.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k"]
         );
     }
 
