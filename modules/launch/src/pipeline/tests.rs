@@ -1068,8 +1068,16 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     harness.catalog_back_button_timeout = Some(-1);
     let mut pipeline = pipeline();
 
-    let started = harness.request(&mut pipeline, "nvhttp", launch_export("fec-snapshot"));
+    let operation_id = "fec-snapshot";
+    let started = harness.request(&mut pipeline, "nvhttp", launch_export(operation_id));
     assert_eq!(started["launch"]["state"], "active", "{started}");
+    let original_launch_id = started["launch"]["launch_id"].clone();
+    let original_config_overrides = started["launch"]["config_overrides"].clone();
+    assert!(
+        !original_config_overrides["ds4_back_as_touchpad_click"]
+            .as_bool()
+            .unwrap()
+    );
     assert_eq!(started["launch"]["config_overrides"]["fec_percentage"], 37);
     assert_eq!(started["launch"]["config_overrides"]["max_bitrate"], 0);
     assert_eq!(
@@ -1119,6 +1127,12 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         "frame_limiter_auto_virtual_framegen":"disabled",
         "ds4_back_as_touchpad_click":true,
     }));
+    let replayed = harness.request(&mut pipeline, "nvhttp", launch_export(operation_id));
+    assert_eq!(replayed["launch"]["launch_id"], original_launch_id);
+    assert_eq!(
+        replayed["launch"]["config_overrides"],
+        original_config_overrides
+    );
     let status = harness.request(
         &mut pipeline,
         "nvhttp",
