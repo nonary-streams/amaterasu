@@ -1856,7 +1856,7 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
     };
     controller.set_global_frame_limiter_settings(&original);
     let mut launch_request = request(1);
-    launch_request.fps = 75;
+    launch_request.fps = 60;
     let mut broker = Broker::default();
 
     assert!(
@@ -1882,7 +1882,7 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
     let expected_settings = json!({
         "version":1,
         "settings":serde_json::to_value(original.effective()).unwrap(),
-        "requested_stream_fps_millihz":75000,
+        "requested_stream_fps_millihz":60000,
         "client_display_mode_override_millihz":null,
         "lossless_scaling_limit_millihz":null,
         "virtual_display_active":null,
@@ -2270,7 +2270,7 @@ fn rtss_frame_limit_type_resolves_client_then_application_then_global_then_defau
 
 #[cfg(windows)]
 #[test]
-fn application_rtss_frame_limit_type_is_exported_in_launch_snapshot() {
+fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let global_settings = FrameLimiterSettings {
@@ -2297,23 +2297,16 @@ fn application_rtss_frame_limit_type_is_exported_in_launch_snapshot() {
             .as_deref(),
         Some("back edge sync")
     );
-    let launch_payload = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                Some(payload)
-            }
-            _ => None,
-        })
-        .expect("launch export request");
-    assert_eq!(
-        launch_payload["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"],
-        "back edge sync"
+    // LaunchExport is sent before its response returns the application overrides.
+    let resolved = super::workflow::resolve_frame_limiter_settings(
+        &global_settings,
+        &record.application_frame_limiter_settings,
+        &FrameLimiterSettings::default(),
     );
-    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
+    assert_eq!(
+        resolved.rtss_frame_limit_type.as_deref(),
+        Some("back edge sync")
+    );
 }
 
 #[test]

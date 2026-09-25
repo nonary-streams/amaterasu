@@ -651,7 +651,7 @@ impl Open {
     }
 
     pub fn arm(&self, session: u64) -> serde_json::Value {
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "action": "start_when_authenticated",
             "session": session,
             "configuration": {
@@ -687,7 +687,11 @@ impl Open {
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
-        })
+        });
+        if let Some(continuous_audio) = self.continuous_audio {
+            payload["configuration"]["continuous_audio"] = serde_json::json!(continuous_audio);
+        }
+        payload
     }
 
     pub(crate) fn arm_with_encryption(
@@ -934,7 +938,7 @@ mod tests {
             assert!(request.validate(false).is_ok());
             assert_eq!(
                 request.arm(51)["configuration"]["continuous_audio"],
-                enabled
+                json!(enabled)
             );
             assert!(
                 request
@@ -943,6 +947,13 @@ mod tests {
                     .is_none()
             );
         }
+
+        let legacy_start = open().arm(51);
+        assert!(
+            legacy_start["configuration"]
+                .get("continuous_audio")
+                .is_none()
+        );
 
         let mut disabled_audio = open();
         disabled_audio.stream_audio = false;
