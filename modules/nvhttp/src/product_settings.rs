@@ -2747,16 +2747,16 @@ mod tests {
             .as_object_mut()
             .expect("update confirmation values are an object");
         values
-            .entry("legacy_global_preparation".into())
+            .entry("legacy_global_preparation")
             .or_insert_with(|| json!([]));
         for name in frame_limiter_value_names() {
             values.entry((*name).to_owned()).or_insert(Value::Null);
         }
         values
-            .entry("lan_encryption_mode".into())
+            .entry("lan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_LAN_ENCRYPTION_MODE));
         values
-            .entry("wan_encryption_mode".into())
+            .entry("wan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_WAN_ENCRYPTION_MODE));
         payload
     }
@@ -3582,7 +3582,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_sink_capture_only_defaults_false_then_persists_with_revisioned_v15_write() {
+    fn audio_sink_capture_only_defaults_false_then_persists_with_revisioned_v17_write() {
         let legacy = json!({
             "ok":true,"found":true,"version":13,"revision":11,
             "values":{
@@ -3629,14 +3629,14 @@ mod tests {
             )
             .unwrap();
         product.start_next();
-        let pending = product.pending.take().expect("v15 product update");
+        let pending = product.pending.take().expect("v17 product update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 11);
         assert_eq!(pending.payload["values"]["audio_sink_capture_only"], true);
-        let response = json!({
-            "ok":true,"found":true,"version":16,"revision":12,
+        let response = v17_update_confirmation(json!({
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":12,
             "values":pending.payload["values"].clone()
-        });
+        }));
         product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
         assert!(product.audio_sink_capture_only());
         assert_eq!(product.settings_payload()["audio_sink_capture_only"], true);
@@ -3858,13 +3858,13 @@ mod tests {
                 expected.map_or(Value::Null, |value| json!(value))
             );
 
-            let response = json!({
-                "ok":true,"found":true,"version":16,"revision":revision + 1,
+            let response = v17_update_confirmation(json!({
+                "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":revision + 1,
                 "values":{"hostname":"Host","port":47989,"address_family":null,
                     "bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,
                     "stream_audio":true,"capture":"auto",
                     "video_max_batch_size_kb":32,"max_bitrate":expected,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
-            });
+            }));
             product.finish_call(pending.purpose, CallOutcome::Payload(response.clone()));
             assert_eq!(product.configured_max_bitrate(), expected);
             assert_eq!(

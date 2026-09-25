@@ -1,4 +1,6 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
+#![recursion_limit = "256"]
+
 mod frame_limiter;
 mod launch;
 mod network_settings;
@@ -928,7 +930,7 @@ mod tests {
             panic!("settings update expected");
         };
         assert_eq!(explicit_false, FieldUpdate::Value(false));
-        assert_eq!(explicit_zero, FieldUpdate::Value(0));
+        assert_eq!(explicit_zero, FieldUpdate::Value(0.0));
         assert_eq!(legacy_alias, FieldUpdate::Value(false));
 
         let Operation::SettingsUpdate {
