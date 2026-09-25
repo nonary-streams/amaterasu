@@ -142,9 +142,19 @@ reports it released. Slot removal and lease teardown cancel pending timers.
 Each input lease accepts an optional signed `back_button_timeout` in its acquire
 request. NVHTTP resolves the certificate-bound client value before the
 application value; when both are absent, input uses the durable global policy.
+
 Input captures the effective value when the lease starts, so a global settings
 change during a stream affects the next lease and does not change the current
-stream's controller behavior. Windows uses ViGEm's Xbox 360 profile when a
+stream's controller behavior.
+
+After a failed Linux gamepad report write, the module destroys the possibly
+partially updated uinput device before recreating its slot and sending the
+current state. A failed destroy retains the old device for cleanup retry; a
+failed new allocation leaves the slot without a device until the next tick.
+This recovery has been checked with fake devices; Linux target compilation and
+native delivery still need qualification on a Linux build host with uinput.
+
+Windows uses ViGEm's Xbox 360 profile when a
 compatible ViGEmBus driver is installed and a vetted `ViGEmClient.dll` is
 deployed in an allowed load location. The lease-start probe connects to the bus
 independently of keyboard and mouse support; a missing DLL or driver leaves those

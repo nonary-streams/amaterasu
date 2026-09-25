@@ -2,6 +2,7 @@ use super::Backend;
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
+    release_owned_device, replace_failed_device,
 };
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
@@ -182,14 +183,18 @@ fn create_device(file: File, name: &[u8]) -> InputResult<Device> {
 }
 
 struct UinputGamepad {
-    device: Device,
+    device: Option<Device>,
+    path: String,
+    controller_number: u8,
     state: ControllerSnapshot,
 }
 
 impl UinputGamepad {
     fn create(path: &str, controller_number: u8) -> InputResult<Self> {
         Ok(Self {
-            device: Device::create_gamepad(path, controller_number)?,
+            device: Some(Device::create_gamepad(path, controller_number)?),
+            path: path.to_owned(),
+            controller_number,
             state: ControllerSnapshot::default(),
         })
     }
@@ -197,6 +202,9 @@ impl UinputGamepad {
 
 impl GamepadDevice for UinputGamepad {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+        let device = self.device.as_ref().ok_or_else(|| {
+            InputError::new("controller_unavailable", "uinput gamepad is reacquiring")
+        })?;
         let events = controller_state_events(self.state, state);
         if !events.is_empty() {
             // A failed frame write may have reached the kernel partially. Keep
@@ -206,15 +214,45 @@ impl GamepadDevice for UinputGamepad {
                 .iter()
                 .map(|event: &NativeGamepadEvent| (event.event_type, event.code, event.value))
                 .collect::<Vec<_>>();
-            self.device.emit(&native_events)?;
+            device.emit(&native_events)?;
         }
         self.state = state;
         Ok(())
     }
 
     fn release(&mut self) -> InputResult<()> {
-        self.update(ControllerSnapshot::default())?;
-        self.device.destroy()
+        let prior_state = self.state;
+        let result = release_owned_device(
+            &mut self.device,
+            |device| {
+                let events = controller_state_events(prior_state, ControllerSnapshot::default());
+                self.state = possible_controller_state_after_write_failure(
+                    prior_state,
+                    ControllerSnapshot::default(),
+                );
+                if events.is_empty() {
+                    return Ok(());
+                }
+                let native_events = events
+                    .iter()
+                    .map(|event| (event.event_type, event.code, event.value))
+                    .collect::<Vec<_>>();
+                device.emit(&native_events)
+            },
+            Device::destroy,
+        );
+        if result.is_ok() {
+            self.state = ControllerSnapshot::default();
+        }
+        result
+    }
+
+    fn recover_after_update_failure(&mut self, _error: InputError) -> InputResult<()> {
+        replace_failed_device(&mut self.device, Device::destroy, || {
+            Device::create_gamepad(&self.path, self.controller_number)
+        })?;
+        self.state = ControllerSnapshot::default();
+        Ok(())
     }
 }
 

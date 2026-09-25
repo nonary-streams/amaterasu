@@ -226,6 +226,39 @@ pub(crate) trait GamepadDevice {
     }
 }
 
+/// Replaces a native device only after its old instance is known detached.
+/// A failed detach retains ownership for cleanup; a failed new allocation
+/// leaves the slot empty so a later tick can retry without using a stale fd.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn replace_failed_device<Device>(
+    device: &mut Option<Device>,
+    mut detach: impl FnMut(&mut Device) -> InputResult<()>,
+    mut allocate: impl FnMut() -> InputResult<Device>,
+) -> InputResult<()> {
+    if let Some(existing) = device.as_mut() {
+        detach(existing)?;
+    }
+    *device = None;
+    *device = Some(allocate()?);
+    Ok(())
+}
+
+/// Neutral delivery is best effort during teardown. Detaching the device is
+/// the decisive cleanup step because it removes any partially applied state.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn release_owned_device<Device>(
+    device: &mut Option<Device>,
+    mut neutralize: impl FnMut(&mut Device) -> InputResult<()>,
+    mut detach: impl FnMut(&mut Device) -> InputResult<()>,
+) -> InputResult<()> {
+    if let Some(existing) = device.as_mut() {
+        let _ = neutralize(existing);
+        detach(existing)?;
+        *device = None;
+    }
+    Ok(())
+}
+
 struct GamepadSlot<Device> {
     device: Device,
     client_state: ControllerSnapshot,
@@ -1485,5 +1518,85 @@ mod tests {
         slots.stop().unwrap();
         assert_eq!(trace.borrow().last(), Some(&"release"));
         assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn failed_uinput_detach_retains_device_and_blocks_replacement() {
+        let mut device = Some(1_u8);
+        let mut allocations = 0;
+        let error = replace_failed_device(
+            &mut device,
+            |_| Err(InputError::new("release_failed", "detach failed")),
+            || {
+                allocations += 1;
+                Ok(2)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "release_failed");
+        assert_eq!(device, Some(1));
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn failed_uinput_allocation_leaves_no_old_device_and_allows_retry() {
+        let mut device = Some(1_u8);
+        let mut trace = Vec::new();
+        let error = replace_failed_device(
+            &mut device,
+            |old| {
+                trace.push(format!("detach {old}"));
+                Ok(())
+            },
+            || {
+                Err(InputError::new(
+                    "controller_unavailable",
+                    "allocation failed",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "controller_unavailable");
+        assert_eq!(device, None);
+        assert_eq!(trace, ["detach 1"]);
+
+        replace_failed_device(&mut device, |_| unreachable!(), || Ok(2)).unwrap();
+        assert_eq!(device, Some(2));
+    }
+
+    #[test]
+    fn failed_uinput_neutral_write_still_detaches_on_release() {
+        let mut device = Some(1_u8);
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let neutral_trace = trace.clone();
+        release_owned_device(
+            &mut device,
+            |_| {
+                neutral_trace.borrow_mut().push("neutral failed");
+                Err(InputError::new("injection_failed", "write failed"))
+            },
+            |_| {
+                trace.borrow_mut().push("detach");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*trace.borrow(), &["neutral failed", "detach"]);
+        assert_eq!(device, None);
+    }
+
+    #[test]
+    fn failed_uinput_detach_retains_device_for_release_retry() {
+        let mut device = Some(1_u8);
+        let error = release_owned_device(
+            &mut device,
+            |_| Err(InputError::new("injection_failed", "write failed")),
+            |_| Err(InputError::new("release_failed", "destroy failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "release_failed");
+        assert_eq!(device, Some(1));
+        release_owned_device(&mut device, |_| Ok(()), |_| Ok(())).unwrap();
+        assert_eq!(device, None);
     }
 }
