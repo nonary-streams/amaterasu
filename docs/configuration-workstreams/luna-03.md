@@ -707,3 +707,9 @@ The new test, `disabled_smoothing_keeps_raw_source_anchor_after_a_missed_slot`, 
 ### Remaining parity gaps
 
 This is regression coverage only; it does not add or change WGC pacing behavior. Keep `global:wgc_pacing_smoothing` pending until the new test executes in the coordinator checkout, Windows WGC runtime behavior is qualified, and L02 persistence/defaults plus L05 global launch projection and L06 management readback/editor behavior are complete. No stable ID is marked verified by this slice.
+
+## Coordinator validation update: NVENC H.264 CAVLC test compile fix
+
+- L03's reviewed lane candidate `42bd52e8978f65247d2ec81456cce895a5f7626a` landed directly as `90b1b320c347b660b763c2707d2deafc5ff722b4`. It replaces the test's `assert_eq!` with a boolean equality assertion, keeping the production `Configuration` type unchanged.
+- Main validation passed `cargo fmt --check -p amaterasu-encode`, `git diff --check`, 21 encode tests (one hardware test ignored), and strict Clippy.
+- `global:nvenc_h264_cavlc` remains pending settings/defaults and scoped projection, management readback/editor behavior, the actual provider effect, and Windows hardware qualification.
