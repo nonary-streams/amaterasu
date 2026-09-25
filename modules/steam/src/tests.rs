@@ -632,6 +632,20 @@ fn force_sync_coalesces_duplicates_and_reconciles_a_new_snapshot_with_auto_sync_
             .all(|request| request["source_revision"] == 8)
     );
     assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
+
+    host.queue_service_request(24, "amaterasu.console", json!({"action":"status"}));
+    module.tick().unwrap();
+    let status = host
+        .completed
+        .iter()
+        .find(|(id, _)| *id == 24)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(status["complete"], true);
+    assert_eq!(status["force_sync_pending"], false);
+    assert_eq!(status["catalog_sync"]["force_sync_pending"], false);
+    assert_eq!(status["catalog_sync"]["last_error"], Value::Null);
 }
 
 #[test]
@@ -657,6 +671,60 @@ fn incomplete_force_sync_discovery_clears_the_request_without_catalog_writes() {
     assert_eq!(module.provider.status()["complete"], false);
     assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
     assert!(host.catalog_requests.is_empty());
+
+    host.queue_service_request(31, "amaterasu.console", json!({"action":"status"}));
+    module.tick().unwrap();
+    let status = host.completed.last().unwrap().1.clone();
+    assert_eq!(host.completed.last().unwrap().0, 31);
+    assert_eq!(status["complete"], false);
+    assert_eq!(status["force_sync_pending"], false);
+    assert_eq!(status["catalog_sync"]["force_sync_pending"], false);
+    assert!(
+        status["catalog_sync"]["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+}
+
+#[test]
+fn force_sync_catalog_reconciliation_failure_clears_pending_status_with_error() {
+    let mut host = Box::new(FakeHost::default());
+    host.catalog_finish_failures_remaining = 1;
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    set_complete_test_snapshot(&mut module.provider, 7, "Before force sync");
+    module.tick().unwrap();
+
+    module
+        .handle_request(
+            50,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["accepted"], true);
+    set_complete_test_snapshot(&mut module.provider, 8, "Failed force sync");
+    for _ in 0..8 {
+        module.tick().unwrap();
+    }
+
+    assert_eq!(host.catalog_requests.len(), 3);
+    host.queue_service_request(51, "amaterasu.console", json!({"action":"status"}));
+    module.tick().unwrap();
+    let status = host.completed.last().unwrap().1.clone();
+    assert_eq!(host.completed.last().unwrap().0, 51);
+    assert_eq!(status["force_sync_pending"], false);
+    assert_eq!(status["catalog_sync"]["force_sync_pending"], false);
+    assert_eq!(status["catalog_sync"]["syncing"], false);
+    assert!(
+        status["catalog_sync"]["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
 }
 
 #[test]
