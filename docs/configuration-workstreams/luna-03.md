@@ -683,7 +683,6 @@ This is a lint-only correction and adds no persistence, defaults, validation, ma
 - Worker source commit: `8a01b6ec281a671cb03b53f33240864a1c77caf5`
 - Lane code commit: `bc9cf356dd8c285c59838b8849d07a1472d10756`
 - Worker/lane tree: `9cc463d7d0ebf3db147b6b56e4e534b1881b2e58`
-- Current main validation tip: `36c5ab9962f63fdd2a5cd1f231ff49bde63d55b7`
 - Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
 - Stable ID and scope: `global:wgc_pacing_smoothing`, global-only boolean, default `true`; the ID remains `pending`.
 - Path reservation: outbox `luna-03-0041-wgc-disabled-smoothing-regression-reservation.json`, published before worker startup. The slice changed only `modules/video/src/pipeline/pacing.rs`.
@@ -697,7 +696,13 @@ The new test, `disabled_smoothing_keeps_raw_source_anchor_after_a_missed_slot`, 
 - Worker `/root/wgc_disabled_smoothing_regression` used isolated worktree `D:/sources/worktrees/amaterasu-wgc-disabled-smoothing-xhigh`, branch `codex/luna03-wgc-disabled-smoothing-xhigh`, based on the clean lane base above. Its verified session attribution was `gpt-6-luna` / `xhigh`, session `01a0d6d4-ae3a-7143-9b2f-d8bf5004b7e6`. It committed only `modules/video/src/pipeline/pacing.rs` as `8a01b6ec281a671cb03b53f33240864a1c77caf5`, with the required plan trailers and configured Nonary identity.
 - Parent verified the exact worker parent, assigned path, commit trailers, model/effort, and clean worker worktree; reviewed the full test diff; and cherry-picked it into the lane as `bc9cf356dd8c285c59838b8849d07a1472d10756`. Worker and lane trees match.
 - Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/pipeline/pacing.rs`, `git diff --check`, and `git show --check`.
-- Cargo tests, builds, and Clippy were not run in the lightweight worktrees. Before this new test was added, the coordinator reported on main tip `36c5ab9962f63fdd2a5cd1f231ff49bde63d55b7` that `cargo fmt --check -p amaterasu-video` passed, `cargo test -p amaterasu-video` passed 80/80, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings` passed. The coordinator should rerun those three package gates after cherry-picking this regression.
+- Cargo tests, builds, and Clippy were not run in the lightweight worktrees. Before this test was added, the coordinator reported on main tip `36c5ab9962f63fdd2a5cd1f231ff49bde63d55b7` that formatting and strict Clippy passed and `cargo test -p amaterasu-video` passed 80/80. Those results predated this test; post-pick gates are recorded below.
+
+### Coordinator validation on main
+
+- Lane code commit `bc9cf356dd8c285c59838b8849d07a1472d10756` landed as `bb44a712`; handoff commit `05de5a156c04c2dc6b2542323d86fd690fde0130` landed as `2ec332b3`.
+- `cargo fmt --check -p amaterasu-video` passed; `cargo test -p amaterasu-video` passed 81/81, including the new disabled-smoothing regression; strict Clippy passed.
+- WGC runtime qualification and the persistence, launch projection, and management editor dependencies remain outstanding.
 
 ### Remaining parity gaps
 
