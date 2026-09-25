@@ -6,7 +6,7 @@
 - Branch: `config-parity/foundation`
 - Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
 - Lane starting/base commit: `30acd5de34ac5548ebf4d46086fc32ccad7b6913`
-- Latest code candidate: `44574af629eed41fb75cbc2a519e0b861c3a3cd6` (lane cherry-pick of package legacy-source discovery identity commit `eec8f2e65706d92f089c79613a7cdcbd1e41ed50`); this handoff/outbox update follows the code candidate.
+- Latest code candidate: `f99de6d565355156bc2d1f44d9d46ba5dde3862f` (lane cherry-pick of auth legacy-import `file_state` alias commit `1abdc4af38a4c2d9ffaa6002a3ffa6dd215ad77c`); this handoff/outbox update follows the code candidate.
 - Reference: Vibeshine `vibe-test` commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d`; used as behavioral evidence, not copied source.
 - Session: `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, `gpt-6-luna`, reasoning `max`.
 - Lane status: all seven assigned IDs remain `pending`. The coordinator owns the shared coverage ledger and decides when evidence is sufficient to close an ID.
@@ -25,6 +25,7 @@ At startup I verified the repository root, branch, starting HEAD, source baselin
 - `b5c3d5f81a3ed23e5e184aa8106b2ff17747eac4` — register the v1 host-configuration provider in the Platform release profile, grant diagnostics its provider service call and management its update-capable provider call, and add profile tests; this is the lane cherry-pick of child commit `6c71ac4230f6bbc6f289b91324134fb519ca5b8f`.
 - `b87dde93fa4a11cd08cd32ad4c01ea7c00b6988c` — declare diagnostics' initialization dependency on the host-configuration provider; this is the lane cherry-pick of child follow-up commit `0035a5bcc256219c0341f5c83e556bf889b02540`.
 - `c68378d23b48bcfd41f8a2d32e34516ca5cb8cff` — correct authentication documentation for persisted session metadata and TTL behavior; this is the lane cherry-pick of child commit `4d96e11fee4ccbbe458dfa4489e7da23b8a59647`.
+- `f99de6d565355156bc2d1f44d9d46ba5dde3862f` — deduplicate repeated primary `file_state` configuration aliases only when both existing spellings resolve to the same contained file; this is the lane cherry-pick of child commit `1abdc4af38a4c2d9ffaa6002a3ffa6dd215ad77c`.
 
 Each lane commit includes the required `Orchestrated By: GPT-6 Luna Max` and `Planned By: GPT-6 Astra High` lines.
 
@@ -119,7 +120,7 @@ The isolated child worktree was `D:/sources/worktrees/amaterasu-config-host-stat
 
 | Stable ID | Current evidence | Remaining work; keep pending |
 | --- | --- | --- |
-| `global:file_state` | Host provider stores and validates the path; default is `sunshine_state.json`. Package migration classifies configured contained state files, including sensitive-state gates, settings, and applications data. This path remains a legacy import input and does not redirect Amaterasu state storage. | Signed management editor and caller authorization, observable legacy importer use, complete migration behavior, and Windows/Unix qualification. |
+| `global:file_state` | Host provider stores and validates the path; default is `sunshine_state.json`. Package migration classifies configured contained state files. The authentication legacy importer now deduplicates repeated primary `file_state` spellings only when both existing paths canonicalize to the same contained file. | Signed management editor and caller authorization, complete migration behavior beyond authentication credential discovery, and Windows/Unix runtime qualification. |
 | `global:vibeshine_file_state` | Host provider stores and validates the auxiliary legacy import path; default is `vibeshine_state.json`. Package migration recognizes configured contained targets. | Signed management editor and caller authorization, observable Vibeshine importer use, complete migration behavior, and Windows/Unix qualification. |
 | `global:credentials_file` | Host provider treats an omitted or empty value as inheriting `file_state`; explicit paths override it. Package migration preserves configured contained identity/credential files under their configured archive names. | Luna-02 authentication/identity consumers, signed management editor and authorization, pairing parser comment compatibility, and platform qualification. |
 | `global:pkey` | Host provider validates the private-key path; default is `credentials/cakey.pem`. Package migration snapshots configured contained key files under the path referenced by the imported configuration. | Luna-02 pairing/TLS consumer integration, signed management editor and authorization, secret handling review, and platform qualification. |
@@ -237,3 +238,16 @@ The isolated worker was `/root/package_settings_comment_parser` (Sagan), thread 
 `rustfmt --edition 2024 --check crates/package/src/migration.rs crates/package/src/migration/tests.rs`, `git diff --check`, and `git show --check` passed in the child and lane. Cargo tests, builds, and Clippy were not run in lightweight worktrees. The coordinator should run package formatting/tests/strict Clippy on main for this slice and the separately reported credential-role Clippy correction. Windows/Unix runtime qualification remains pending. All seven assigned Luna-01 IDs remain pending.
 
 The exact-path ownership constraints are unchanged: L02 owns `modules/pairing/src/migration.rs`, and L05 temporarily owns `crates/release/src/profiles.rs` and `crates/release/src/profiles/tests.rs`. This package settings parser slice did not touch those paths.
+
+
+## Independent foundation slice: global:file_state alias resolution
+
+The lane selected `global:file_state` after checking the current assignment and cross-lane ownership. Reservation `outbox/luna-01/0041-global-file-state-reservation.json` reserves only `modules/authentication/src/migration.rs`; it does not touch the recently landed package migration files or foreign-lane paths.
+
+The legacy authentication importer previously treated any differently spelled duplicate `file_state` setting as ambiguous before resolving it. It now accepts the duplicate only if both existing paths canonicalize to the same contained regular file, and it records that source once. Missing aliases and paths to different files remain ambiguous. `vibeshine_file_state` keeps its prior exact-spelling conflict rule. Authentication and product settings schema versions are unchanged.
+
+The isolated lightweight child worktree was `D:/sources/worktrees/amaterasu-auth-file-state-alias` on branch `config-parity/auth-file-state-alias`, based on clean lane HEAD `389fa1188bd43acdff1a80521c1ee6c2f9302fd7`. Worker session `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, thread `01a0d6b4-caec-7b43-86d4-4e0c980b3231`, was verified from its turn-context session record as `gpt-6-luna/xhigh` before authorizing edits. The worker committed `1abdc4af38a4c2d9ffaa6002a3ffa6dd215ad77c` with the required trailers, changing only `modules/authentication/src/migration.rs`. The lane lead reviewed the exact diff and cherry-picked that commit to `config-parity/foundation` as `f99de6d565355156bc2d1f44d9d46ba5dde3862f`.
+
+Regression cases cover Windows case-insensitive existing-file aliases importing as one candidate, distinct case-sensitive Unix paths remaining conflicting, and differently spelled missing aliases remaining conflicting. Rustfmt and `rustfmt --edition 2024 --check modules/authentication/src/migration.rs`, `git diff --check`, and `git show --check` passed in the child and lane. No Cargo tests, builds, or Clippy ran in the lightweight worktrees. No Windows or Unix test execution is claimed; coordinator source-checkout validation is required.
+
+All seven assigned IDs remain `pending`; this slice does not close `global:file_state`. Remaining work includes the signed management editor and authorization, broader state migration/runtime behavior, platform execution, and integrated end-to-end validation. The next slice should use a separate pending L01-owned ID and exact paths after this candidate is reviewed by the coordinator, without touching current L06/L02-owned consumers or Luna05-reserved release profile files.
