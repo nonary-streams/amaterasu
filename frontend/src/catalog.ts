@@ -116,7 +116,9 @@ namespace Amaterasu {
   ): HTMLElement {
     const values = capabilities[name];
     const unsupportedCurrent = current != null && !values.includes(current);
-    const options = catalogFrameLimiterOverrideOptionValues(name, capabilities, current);
+    const savedValueToken = unsupportedCurrent
+      ? catalogSavedUnsupportedEnumValueToken(values)
+      : undefined;
     const select = el("select");
     select.name = name;
     const inherit = el("option", "", "Inherit");
@@ -127,12 +129,12 @@ namespace Amaterasu {
       option.value = value;
       select.append(option);
     }
-    if (unsupportedCurrent) {
+    if (savedValueToken !== undefined) {
       const saved = el("option", "", `Keep saved value: ${current} (unsupported on this host)`);
-      saved.value = options[options.length - 1];
+      saved.value = savedValueToken;
       select.append(saved);
     }
-    select.value = unsupportedCurrent ? options[options.length - 1] : current ?? "";
+    select.value = savedValueToken ?? current ?? "";
 
     if (!catalogFrameLimiterOverrideIsDisabled(name, capabilities)) return select;
 
@@ -140,7 +142,7 @@ namespace Amaterasu {
     select.removeAttribute("name");
     const preservedValue = input(
       name,
-      unsupportedCurrent ? options[options.length - 1] : "",
+      savedValueToken ?? "",
       "hidden",
     );
     const controls: HTMLElement[] = [
@@ -148,7 +150,7 @@ namespace Amaterasu {
       preservedValue,
       el("span", "muted", "Unsupported on this host."),
     ];
-    if (unsupportedCurrent) {
+    if (savedValueToken !== undefined) {
       const clear = button("Clear override", () => {
         preservedValue.value = "";
         select.value = "";
@@ -199,6 +201,22 @@ namespace Amaterasu {
     keyof CatalogFrameLimiterOverrides,
     string
   >;
+
+  function catalogFrameLimiterOverrideField(
+    label: string,
+    control: HTMLElement,
+    hint: string,
+  ): HTMLElement {
+    if (control instanceof HTMLSelectElement) return field(label, control, hint);
+    control.querySelector("select")?.setAttribute("aria-label", label);
+    return el(
+      "div",
+      "field",
+      el("span", "field-label", label),
+      control,
+      el("small", "muted", hint),
+    );
+  }
 
   export function catalogFrameLimiterOverrideFormValues(
     overrides: Entry["config_overrides"] | undefined,
@@ -260,14 +278,18 @@ namespace Amaterasu {
     return [
       field("Frame limiter", enable, "Blank inherits. Runtime application remains pending."),
       field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
-      field("Frame limiter provider", provider, "Choose a provider supported by this host; blank inherits."),
+      catalogFrameLimiterOverrideField(
+        "Frame limiter provider",
+        provider,
+        "Choose a provider supported by this host; blank inherits.",
+      ),
       field("Disable VSync for RTSS", disableVsync, "Blank inherits the next scope."),
       field(
         "Auto virtual frame generation mode",
         autoVirtualFramegen,
         "Blank inherits. Choose enabled, vrr, legacy, or disabled.",
       ),
-      field(
+      catalogFrameLimiterOverrideField(
         "RTSS frame limit type",
         rtssFrameLimitType,
         "Blank inherits. Available RTSS choices depend on host support.",
