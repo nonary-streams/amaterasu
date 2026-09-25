@@ -4542,13 +4542,10 @@ mod tests {
             parse_nvenc_spatial_aq_update(None).unwrap(),
             current
         ),);
-        assert_eq!(
-            apply_nvenc_spatial_aq_update(
-                parse_nvenc_spatial_aq_update(Some(&Value::Null)).unwrap(),
-                current,
-            ),
-            false
-        );
+        assert!(!apply_nvenc_spatial_aq_update(
+            parse_nvenc_spatial_aq_update(Some(&Value::Null)).unwrap(),
+            current,
+        ));
         for value in [json!(false), json!(true)] {
             let update = parse_nvenc_spatial_aq_update(Some(&value)).unwrap();
             assert_eq!(
