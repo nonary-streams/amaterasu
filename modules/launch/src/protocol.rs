@@ -33,6 +33,10 @@ pub enum Operation {
         global_preparation: Vec<PreparationStep>,
         #[serde(default)]
         legacy_global_preparation: Vec<LegacyPreparationCommand>,
+        #[serde(default)]
+        frame_limiter_settings: Option<BTreeMap<String, Value>>,
+        #[serde(default)]
+        client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
     },
     Lookup {
         operation_id: String,
@@ -67,6 +71,7 @@ impl Operation {
                 app_id,
                 global_preparation,
                 legacy_global_preparation,
+                ..
             } => {
                 if !valid_operation_id(operation_id) || !valid_app_id(app_id) {
                     return Err("invalid_request");

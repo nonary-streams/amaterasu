@@ -775,6 +775,95 @@ fn launch_export(operation: &str) -> Value {
 }
 
 #[test]
+fn launch_export_accepts_only_object_shaped_frame_limiter_compatibility_fields() {
+    let candidate: Operation = serde_json::from_value(json!({
+        "action":"launch_export",
+        "operation_id":"compatibility-objects",
+        "app_id":"app-0000000000000001",
+        "frame_limiter_settings":{"enabled":true,"provider":"auto"},
+        "client_frame_limiter_overrides":{"fps_limit":120},
+    }))
+    .unwrap();
+    candidate.validate().unwrap();
+    let Operation::LaunchExport {
+        frame_limiter_settings,
+        client_frame_limiter_overrides,
+        ..
+    } = candidate
+    else {
+        panic!("expected launch export operation");
+    };
+    assert_eq!(frame_limiter_settings.unwrap()["provider"], "auto");
+    assert_eq!(client_frame_limiter_overrides.unwrap()["fps_limit"], 120);
+
+    let legacy: Operation = serde_json::from_value(launch_export("legacy-omitted")).unwrap();
+    let Operation::LaunchExport {
+        frame_limiter_settings,
+        client_frame_limiter_overrides,
+        ..
+    } = legacy
+    else {
+        panic!("expected launch export operation");
+    };
+    assert_eq!(frame_limiter_settings, None);
+    assert_eq!(client_frame_limiter_overrides, None);
+
+    let null_compatibility: Operation = serde_json::from_value(json!({
+        "action":"launch_export",
+        "operation_id":"compatibility-null",
+        "app_id":"app-0000000000000001",
+        "frame_limiter_settings":null,
+        "client_frame_limiter_overrides":null,
+    }))
+    .unwrap();
+    let Operation::LaunchExport {
+        frame_limiter_settings,
+        client_frame_limiter_overrides,
+        ..
+    } = null_compatibility
+    else {
+        panic!("expected launch export operation");
+    };
+    assert_eq!(frame_limiter_settings, None);
+    assert_eq!(client_frame_limiter_overrides, None);
+
+    for field in ["frame_limiter_settings", "client_frame_limiter_overrides"] {
+        for invalid in [json!("settings"), json!(1), json!(false), json!([])] {
+            let mut request = launch_export("compatibility-invalid-type");
+            request[field] = invalid.clone();
+            assert!(
+                serde_json::from_value::<Operation>(request).is_err(),
+                "accepted non-object value {invalid} for {field}"
+            );
+        }
+    }
+
+    let mut unknown_field = launch_export("compatibility-unknown-field");
+    unknown_field["unrelated_top_level_field"] = json!(true);
+    assert!(serde_json::from_value::<Operation>(unknown_field).is_err());
+}
+
+#[test]
+fn launch_export_drops_frame_limiter_compatibility_fields_without_changing_response() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let mut request = launch_export("compatibility-fields-dropped");
+    request["frame_limiter_settings"] = json!({"enabled":true});
+    request["client_frame_limiter_overrides"] = json!({"fps_limit":120});
+
+    let started = harness.request(&mut pipeline, "nvhttp", request);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert!(started.get("frame_limiter_settings").is_none());
+    assert!(started.get("client_frame_limiter_overrides").is_none());
+    assert!(started["launch"].get("frame_limiter_settings").is_none());
+    assert!(
+        started["launch"]
+            .get("client_frame_limiter_overrides")
+            .is_none()
+    );
+}
+
+#[test]
 #[ignore = "test subprocess entrypoint"]
 fn controlled_process() {
     std::thread::sleep(Duration::from_secs(60));

@@ -146,6 +146,8 @@ impl Pipeline {
                 app_id,
                 global_preparation,
                 legacy_global_preparation,
+                frame_limiter_settings: _,
+                client_frame_limiter_overrides: _,
             } => match self.records.start(
                 caller,
                 initiator,
