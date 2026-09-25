@@ -3115,7 +3115,7 @@ fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override()
         true
     );
     scoped.set_native_pen_touch(false);
-    assert_eq!(scoped.native_pen_touch(), false);
+    assert!(!scoped.native_pen_touch());
     assert_eq!(scoped.pen_touch_contacts.len(), 1);
     assert_eq!(
         batch(
