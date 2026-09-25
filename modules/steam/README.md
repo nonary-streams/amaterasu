@@ -95,11 +95,12 @@ management catalog and accepts no caller-supplied owner selector.
 The snapshot protocol writes bounded batches and declares completion only after
 a successful full scan. Catalog ownership markers preserve manually changed or
 deleted entries. A scan with no configured roots, any discovery warning, or no
-resolved Steam client leaves the catalog unchanged. If settings or discovery revision
-changes during an import, Steam stops before submitting another step; a catalog
-finish already in flight may still complete, after which a later complete scan
-reconciles current settings. Status and list requests continue during catalog
-retries.
+resolved Steam client leaves the catalog unchanged. If discovery advances to a
+newer revision with the same source fingerprint and settings epoch, the import
+can continue. A changed fingerprint or settings epoch cancels stale work before
+another step is submitted; a catalog finish already in flight may still
+complete, after which a later complete scan reconciles current settings. Status
+and list requests continue during catalog retries.
 
 `autosync_remove_uninstalled` defaults to `true`. In `sync_all_installed` mode,
 `false` retains older Steam-owned catalog entries that are absent from a
