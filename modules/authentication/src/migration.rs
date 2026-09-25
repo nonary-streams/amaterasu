@@ -139,8 +139,8 @@ fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     }
     let configured_state = configured_state_paths(root)?;
     match &configured_state.primary_file_state {
-        ConfiguredPrimaryState::Configured(path) => return Ok(vec![path.clone()]),
-        ConfiguredPrimaryState::Missing => return Ok(Vec::new()),
+        ConfiguredPrimaryState::Configured(path) => Ok(vec![path.clone()]),
+        ConfiguredPrimaryState::Missing => Ok(Vec::new()),
         ConfiguredPrimaryState::NotConfigured => legacy_state_candidates(root, &configured_state),
     }
 }
@@ -1006,31 +1006,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_configured_credential_records_as_ambiguous() {
+    fn configured_primary_credentials_take_precedence_over_auxiliary_state() {
         let source = temporary_directory("ambiguous-configured-state");
-        let salt = "AbCdEfGhIjKlMnOp";
-        let hash = format!(
-            "{:x}",
-            Sha256::digest(format!("correct horse battery staple{salt}").as_bytes())
-        );
-        let credential = serde_json::json!({
-            "username": "Admin",
-            "password": hash,
-            "salt": salt
-        })
-        .to_string();
-        std::fs::write(source.join("primary.json"), &credential).unwrap();
-        std::fs::write(source.join("auxiliary.json"), credential).unwrap();
+        std::fs::write(
+            source.join("primary.json"),
+            credential_record("Primary", "primary password", "PrimarySalt12345"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("auxiliary.json"),
+            credential_record("Auxiliary", "auxiliary password", "AuxiliarySalt12"),
+        )
+        .unwrap();
         std::fs::write(
             source.join("sunshine.conf"),
             "file_state = primary.json\nvibeshine_file_state = auxiliary.json\n",
         )
         .unwrap();
 
-        assert!(matches!(
-            import_legacy_authentication(&source),
-            Err("legacy_authentication_credential_ambiguous")
-        ));
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Primary"
+        );
         let _ = std::fs::remove_dir_all(source);
     }
 
