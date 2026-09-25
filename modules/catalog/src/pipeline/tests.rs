@@ -701,13 +701,25 @@ fn import_playnite_entries(
     )
 }
 
-fn update_provider_overrides(id: &str, expected_revision: u64, fec_percentage: Value) -> Value {
+fn update_provider_config_overrides(
+    id: &str,
+    expected_revision: u64,
+    config_overrides: Value,
+) -> Value {
     json!({
         "action":"update_provider_overrides",
         "id":id,
         "expected_revision":expected_revision,
-        "config_overrides":{"fec_percentage":fec_percentage},
+        "config_overrides":config_overrides,
     })
+}
+
+fn update_provider_overrides(id: &str, expected_revision: u64, fec_percentage: Value) -> Value {
+    update_provider_config_overrides(
+        id,
+        expected_revision,
+        json!({"fec_percentage":fec_percentage}),
+    )
 }
 
 #[test]
@@ -2093,7 +2105,6 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
         vec![("playnite:10", playnite_entry("Persistent metadata"))],
     );
     batch["entries"][0]["source_flags"] = json!(8);
-    batch["entries"][0]["entry"]["config_overrides"] = json!({"nvenc_spatial_aq":false});
     let imported = backend.run_for(
         &mut playnite,
         batch,
@@ -2102,11 +2113,38 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
         "amaterasu.management",
     );
     assert_eq!(imported["ok"], true);
+    assert_eq!(imported["revision"], 1);
     let first_marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
     let first_marker = backend.entries[first_marker_key].clone();
     let first_added_at = first_marker["added_at_unix"].as_i64().unwrap();
     assert_eq!(first_marker["source_flags"], 8);
-    assert_eq!(first_marker["config_overrides"]["nvenc_spatial_aq"], false);
+    assert!(first_marker["config_overrides"]["nvenc_spatial_aq"].is_null());
+
+    let finished = backend.run_for(
+        &mut playnite,
+        snapshot_finish("marker-time-1", generation, 1, 1, 1, true),
+        "amaterasu.playnite",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finished["ok"], true);
+    let seeded = backend.run_for(
+        &mut playnite,
+        update_provider_config_overrides(
+            "app-0000000000000001",
+            finished["revision"].as_u64().unwrap(),
+            json!({"fec_percentage":37,"nvenc_spatial_aq":false}),
+        ),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(seeded["ok"], true);
+    assert_eq!(seeded["config_overrides"]["nvenc_spatial_aq"], false);
+    assert_eq!(
+        backend.entries[first_marker_key]["config_overrides"]["nvenc_spatial_aq"],
+        false
+    );
 
     begin = backend.run_for(
         &mut playnite,
@@ -2124,7 +2162,7 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
             generation,
             2,
             0,
-            1,
+            seeded["revision"].as_u64().unwrap(),
             vec![("playnite:10", playnite_entry("Persistent metadata"))],
         ),
         "amaterasu.playnite",

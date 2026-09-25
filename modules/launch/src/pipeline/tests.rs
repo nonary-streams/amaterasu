@@ -1025,35 +1025,77 @@ fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
 
 #[test]
 fn nvenc_spatial_aq_is_retained_across_launch_retry_and_status() {
-    let mut harness = Harness::new();
-    harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":false}));
-    let mut pipeline = pipeline();
+    let cases = [
+        (
+            "absent",
+            None,
+            Some(json!({"nvenc_spatial_aq":true})),
+            json!({}),
+        ),
+        (
+            "null",
+            Some(json!({"nvenc_spatial_aq":null})),
+            Some(json!({"nvenc_spatial_aq":false})),
+            json!({}),
+        ),
+        (
+            "true",
+            Some(json!({"nvenc_spatial_aq":true})),
+            Some(json!({"nvenc_spatial_aq":false})),
+            json!({"nvenc_spatial_aq":true}),
+        ),
+        (
+            "false",
+            Some(json!({"nvenc_spatial_aq":false})),
+            Some(json!({"nvenc_spatial_aq":true})),
+            json!({"nvenc_spatial_aq":false}),
+        ),
+    ];
 
-    let started = harness.request(&mut pipeline, "alice", launch("nvenc-spatial-aq"));
-    assert_eq!(started["launch"]["state"], "active", "{started}");
-    assert_eq!(
-        started["launch"]["config_overrides"],
-        json!({"nvenc_spatial_aq":false})
-    );
-    let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
+    for (case, initial_config_overrides, changed_config_overrides, expected_snapshot) in cases {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = initial_config_overrides;
+        let mut pipeline = pipeline();
+        let operation_id = format!("nvenc-spatial-aq-{case}");
 
-    // Catalog edits do not replace the settings captured by the launch.
-    harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":true}));
-    let retry = harness.request(&mut pipeline, "alice", launch("nvenc-spatial-aq"));
-    assert_eq!(
-        retry["launch"]["config_overrides"],
-        json!({"nvenc_spatial_aq":false})
-    );
+        let started = harness.request(&mut pipeline, "alice", launch(&operation_id));
+        assert_eq!(started["launch"]["state"], "active", "{case}: {started}");
+        assert_eq!(
+            started["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {started}"
+        );
+        let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
 
-    let status = harness.request(
-        &mut pipeline,
-        "alice",
-        json!({"action":"status","launch_id":launch_id}),
-    );
-    assert_eq!(
-        status["launch"]["config_overrides"],
-        json!({"nvenc_spatial_aq":false})
-    );
+        // Catalog edits do not replace the settings captured by the launch.
+        harness.catalog_config_overrides = changed_config_overrides;
+        let retry = harness.request(&mut pipeline, "alice", launch(&operation_id));
+        assert_eq!(
+            retry["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {retry}"
+        );
+
+        let status = harness.request(
+            &mut pipeline,
+            "alice",
+            json!({"action":"status","launch_id":launch_id}),
+        );
+        assert_eq!(
+            status["launch"]
+                .get("config_overrides")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            expected_snapshot,
+            "{case}: {status}"
+        );
+    }
 }
 
 #[test]
