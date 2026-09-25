@@ -427,6 +427,47 @@ fn tick_reaps_natural_exit_and_preserves_operation_record() {
 }
 
 #[test]
+fn detached_environment_retries_reuse_resolution_and_reject_changed_launch_fields() {
+    const HOST_VARIABLE: &str = "AMATERASU_TEST_DETACHED_RETRY_HOST_VALUE";
+
+    let mut manager = ProcessManager::default();
+    let mut request = launch("detached-host-retry", "sleep");
+    request["detached"] = json!([format!(
+        "amaterasu-missing-detached-command \"$({HOST_VARIABLE})\""
+    )]);
+
+    let first = manager.handle_with_environment_lookup("alice", request.clone(), &|name| {
+        (name == HOST_VARIABLE).then(|| "first host value".to_owned())
+    });
+    assert_eq!(first["process"]["state"], "running", "{first}");
+
+    let replay = manager.handle_with_environment_lookup("alice", request.clone(), &|name| {
+        (name == HOST_VARIABLE).then(|| "changed host value".to_owned())
+    });
+    assert_eq!(replay, first);
+
+    let mut changed_detached = request.clone();
+    changed_detached["detached"] = json!([format!(
+        "amaterasu-missing-detached-command \"$({HOST_VARIABLE})\" --changed"
+    )]);
+    assert_eq!(
+        manager.handle_with_environment_lookup("alice", changed_detached, &|name| {
+            (name == HOST_VARIABLE).then(|| "third host value".to_owned())
+        })["code"],
+        "operation_conflict"
+    );
+
+    let mut changed_arguments = request;
+    changed_arguments["args"] = json!(["changed launch argument"]);
+    assert_eq!(
+        manager.handle_with_environment_lookup("alice", changed_arguments, &|_| None)["code"],
+        "operation_conflict"
+    );
+
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn auto_detach_retains_a_quick_successful_launcher_until_explicit_stop() {
     let directory = test_directory("auto-detach");
     let marker = directory.join("launcher-exited");

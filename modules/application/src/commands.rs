@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(all(windows, test))]
 use std::path::Path;
 
@@ -15,20 +16,11 @@ pub(crate) struct DetachedCommand {
 pub(crate) fn parse_detached_commands(
     commands: Vec<String>,
 ) -> Result<Vec<DetachedCommand>, &'static str> {
-    if commands.len() > MAX_DETACHED_COMMANDS {
-        return Err("too many detached commands");
-    }
+    validate_detached_command_texts(&commands)?;
 
     commands
         .into_iter()
         .map(|command| {
-            if command.is_empty()
-                || command.len() > MAX_DETACHED_COMMAND_BYTES
-                || command.chars().any(char::is_control)
-            {
-                return Err("detached command exceeds bounds");
-            }
-
             let mut arguments = split_command_line(&command).ok_or("invalid detached command")?;
             if arguments.is_empty()
                 || arguments[0].is_empty()
@@ -46,6 +38,113 @@ pub(crate) fn parse_detached_commands(
             })
         })
         .collect()
+}
+
+pub(crate) fn validate_detached_command_texts(commands: &[String]) -> Result<(), &'static str> {
+    if commands.len() > MAX_DETACHED_COMMANDS {
+        return Err("too many detached commands");
+    }
+
+    if commands.iter().any(|command| {
+        command.is_empty()
+            || command.len() > MAX_DETACHED_COMMAND_BYTES
+            || command.chars().any(char::is_control)
+    }) {
+        return Err("detached command exceeds bounds");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn prepare_detached_commands(
+    command_texts: &[String],
+    environment: &BTreeMap<String, String>,
+    host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<DetachedCommand>, &'static str> {
+    validate_detached_command_texts(command_texts)?;
+
+    let expanded_commands = command_texts
+        .iter()
+        .map(|command| expand_environment_references(command, environment, host_environment_lookup))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    parse_detached_commands(expanded_commands)
+}
+
+fn expand_environment_references(
+    command: &str,
+    environment: &BTreeMap<String, String>,
+    host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, &'static str> {
+    let mut expanded = String::with_capacity(command.len().min(MAX_DETACHED_COMMAND_BYTES));
+    let mut cursor = 0;
+
+    while let Some(relative_dollar) = command[cursor..].find('$') {
+        let dollar = cursor + relative_dollar;
+        append_bounded(&mut expanded, &command[cursor..dollar])?;
+        let after_dollar = dollar + 1;
+
+        match command.as_bytes().get(after_dollar) {
+            Some(b'$') => {
+                append_bounded(&mut expanded, "$")?;
+                cursor = after_dollar + 1;
+            }
+            Some(b'(') => {
+                let mut depth = 0usize;
+                let mut closing_parenthesis = None;
+                for (offset, character) in command[after_dollar..].char_indices() {
+                    match character {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                closing_parenthesis = Some(after_dollar + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let closing_parenthesis = closing_parenthesis
+                    .ok_or("detached command environment reference is not closed")?;
+                let name = &command[after_dollar + 1..closing_parenthesis];
+                let value = environment_reference_value(name, environment, host_environment_lookup);
+                append_bounded(&mut expanded, value.as_deref().unwrap_or_default())?;
+                cursor = closing_parenthesis + 1;
+            }
+            _ => {
+                append_bounded(&mut expanded, "$")?;
+                cursor = after_dollar;
+            }
+        }
+    }
+
+    append_bounded(&mut expanded, &command[cursor..])?;
+    Ok(expanded)
+}
+
+fn append_bounded(output: &mut String, value: &str) -> Result<(), &'static str> {
+    if output.len().saturating_add(value.len()) > MAX_DETACHED_COMMAND_BYTES {
+        return Err("expanded detached command exceeds bounds");
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn environment_reference_value(
+    name: &str,
+    environment: &BTreeMap<String, String>,
+    host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    #[cfg(windows)]
+    let configured = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone());
+    #[cfg(not(windows))]
+    let configured = environment.get(name).cloned();
+
+    configured.or_else(|| host_environment_lookup(name))
 }
 
 #[cfg(not(windows))]
@@ -125,6 +224,49 @@ mod tests {
         assert_eq!(commands[0].executable, "display-tool");
         assert_eq!(commands[0].args, ["--layout", "Desk Mode"]);
         assert_eq!(commands[1].args, ["--literal=$HOME"]);
+    }
+
+    #[test]
+    fn expands_configured_and_host_environment_without_shell_interpretation() {
+        let environment = BTreeMap::from([("TITLE".to_owned(), "App Mode".to_owned())]);
+        let command_texts = vec![
+            "tool --title=\"$(TITLE)\" --host=\"$(HOST_ONLY)\" missing=$(MISSING) escaped=$$(TITLE) literal=$HOME"
+                .to_owned(),
+        ];
+
+        let commands =
+            prepare_detached_commands(&command_texts, &environment, &|name| match name {
+                "TITLE" => Some("host title".to_owned()),
+                "HOST_ONLY" => Some("host value".to_owned()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(commands[0].executable, "tool");
+        assert_eq!(
+            commands[0].args,
+            [
+                "--title=App Mode",
+                "--host=host value",
+                "missing=",
+                "escaped=$(TITLE)",
+                "literal=$HOME",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unclosed_and_oversized_environment_expansions() {
+        let environment = BTreeMap::from([("VALUE".to_owned(), "x".repeat(2_048))]);
+
+        assert!(
+            prepare_detached_commands(&["tool $(VALUE".to_owned()], &environment, &|_| None,)
+                .is_err()
+        );
+        assert!(
+            prepare_detached_commands(&["tool $(VALUE)".to_owned()], &environment, &|_| None,)
+                .is_err()
+        );
     }
 
     #[test]

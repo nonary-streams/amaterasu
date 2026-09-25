@@ -28,9 +28,14 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
-They do not support shell expansion, per-command environment overrides, output
-redirection, or elevation; a detached-command spawn failure does not fail the
-main launch.
+Before argv parsing, `$(NAME)` expands from the app environment and then the
+host process environment; `$$` produces a literal dollar sign, and absent names
+produce an empty string. Other dollar text remains literal, and an unclosed
+`$(...)` reference is invalid. Expansion is bounded and is not shell evaluation:
+the expanded string still goes through the host platform's argv parser and
+existing count, length, and argument limits. Detached commands do not support
+per-command environment overrides, output redirection,
+or elevation; a detached-command spawn failure does not fail the main launch.
 
 Launch may also contain up to eight ordered preparation steps:
 
@@ -191,9 +196,9 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Detached launchers are a bounded argv-only subset: environment expansion,
-output handling, and elevation remain parity gaps. Desktop pseudo-apps, URI
-launch, and launcher-specific behavior also remain unimplemented.
+Detached launchers are a bounded argv-only subset: output handling and elevation
+remain parity gaps. Desktop pseudo-apps, URI launch, and launcher-specific
+behavior also remain unimplemented.
 In particular, this module's omitted cwd inherits the host cwd rather than using
 the executable directory.
 

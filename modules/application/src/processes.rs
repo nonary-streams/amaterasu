@@ -1,4 +1,4 @@
-use crate::commands::parse_detached_commands;
+use crate::commands::prepare_detached_commands;
 use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
 use crate::protocol::{
@@ -62,6 +62,8 @@ struct ProcessRecord {
     #[serde(skip)]
     spec: LaunchSpec,
     #[serde(skip)]
+    detached_command_texts: Vec<String>,
+    #[serde(skip)]
     child: Option<ContainedChild>,
     #[serde(skip)]
     stop_deadline: Option<Instant>,
@@ -82,7 +84,13 @@ struct ProcessRecord {
 }
 
 impl ProcessRecord {
-    fn new(process_id: u64, caller: &str, operation_id: String, spec: LaunchSpec) -> Self {
+    fn new(
+        process_id: u64,
+        caller: &str,
+        operation_id: String,
+        spec: LaunchSpec,
+        detached_command_texts: Vec<String>,
+    ) -> Self {
         let lifecycle = ApplicationLifecycle::new(spec.preparation.clone());
         let mut record = Self {
             process_id,
@@ -92,6 +100,7 @@ impl ProcessRecord {
             lifecycle,
             owner: caller.into(),
             spec,
+            detached_command_texts,
             child: None,
             stop_deadline: None,
             completion: None,
@@ -659,6 +668,25 @@ pub struct ProcessManager {
 
 impl ProcessManager {
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {
+        self.handle_using_environment_lookup(caller, payload, &|name| std::env::var(name).ok())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_with_environment_lookup(
+        &mut self,
+        caller: &str,
+        payload: Value,
+        host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Value {
+        self.handle_using_environment_lookup(caller, payload, host_environment_lookup)
+    }
+
+    fn handle_using_environment_lookup(
+        &mut self,
+        caller: &str,
+        payload: Value,
+        host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Value {
         if caller.is_empty() || caller.len() > 256 {
             return error("invalid_caller");
         }
@@ -669,13 +697,18 @@ impl ProcessManager {
             Ok(action) => action,
             Err(_) => return error("invalid_request"),
         };
-        match self.execute(caller, action) {
+        match self.execute(caller, action, host_environment_lookup) {
             Ok(value) => value,
             Err(code) => error(code),
         }
     }
 
-    fn execute(&mut self, caller: &str, action: Action) -> Result<Value, &'static str> {
+    fn execute(
+        &mut self,
+        caller: &str,
+        action: Action,
+        host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Value, &'static str> {
         match action {
             Action::Launch {
                 operation_id,
@@ -692,7 +725,26 @@ impl ProcessManager {
                 detached,
                 preparation,
             } => {
-                let detached = parse_detached_commands(detached).map_err(|_| "invalid_launch")?;
+                let detached_command_texts = detached;
+                let cached_detached = self
+                    .records
+                    .values()
+                    .find(|record| {
+                        record.owner == caller
+                            && record.operation_id == operation_id
+                            && record.detached_command_texts.as_slice()
+                                == detached_command_texts.as_slice()
+                    })
+                    .map(|record| record.spec.detached.clone());
+                let detached = match cached_detached {
+                    Some(detached) => detached,
+                    None => prepare_detached_commands(
+                        &detached_command_texts,
+                        &environment,
+                        host_environment_lookup,
+                    )
+                    .map_err(|_| "invalid_launch")?,
+                };
                 let spec = LaunchSpec {
                     executable,
                     args,
@@ -708,7 +760,7 @@ impl ProcessManager {
                     preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
-                self.launch(caller, operation_id, spec)
+                self.launch(caller, operation_id, spec, detached_command_texts)
             }
             Action::Lookup { operation_id } => {
                 let record = self
@@ -761,6 +813,7 @@ impl ProcessManager {
         caller: &str,
         operation_id: String,
         spec: LaunchSpec,
+        detached_command_texts: Vec<String>,
     ) -> Result<Value, &'static str> {
         if self
             .preparations
@@ -790,7 +843,13 @@ impl ProcessManager {
             return Err("process_limit");
         }
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
-        let record = ProcessRecord::new(process_id, caller, operation_id, spec);
+        let record = ProcessRecord::new(
+            process_id,
+            caller,
+            operation_id,
+            spec,
+            detached_command_texts,
+        );
         let response = json!({"ok":true,"process":record});
         self.records.insert(process_id, record);
         self.next_id = process_id;
