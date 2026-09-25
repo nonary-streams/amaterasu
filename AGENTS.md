@@ -13,3 +13,13 @@
   line by line. Record unimplemented parity requirements honestly.
 - Keep dependencies small and justified; use vetted cryptographic implementations.
 - Native modules are trusted code. Never describe API grants as a native-code sandbox.
+
+## Configuration parity execution
+
+- For the active parity task, follow `docs/configuration-execution-plan.md`.
+- Use one coordinator and no more than three direct feature workers; no domain
+  lead hierarchy or nested delegation. Assign complete behavior across layers.
+- Workers use approved build-enabled worktrees and run focused tests, rustfmt,
+  and Clippy before handoff. Fix validation failures in the owning worker.
+- Commit coherent validated increments and integrate ready work promptly; do not
+  wait for a batch barrier or create status-only commits to imply progress.
