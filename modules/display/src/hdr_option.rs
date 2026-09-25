@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisplayHdrOption {
-    /// Let HDR selection follow the automatic policy.
+    /// Set display HDR to the client's requested state when the display supports it.
     #[default]
     Auto,
-    /// Prefer SDR output.
+    /// Perform no additional display HDR configuration.
     Disabled,
 }
 
