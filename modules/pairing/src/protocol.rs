@@ -517,18 +517,20 @@ mod tests {
                 minimum_fps_target: Some(f64::INFINITY),
                 ..ClientConfigOverrides::default()
             },
-            ClientConfigOverrides {
-                video_max_batch_size_kb: Some(65),
-                ..ClientConfigOverrides::default()
-            },
         ] {
             assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
         }
 
+        let oversized_batch_size: ClientConfigOverrides =
+            serde_json::from_value(json!({"video_max_batch_size_kb":65})).unwrap();
+        assert_eq!(
+            oversized_batch_size.validate(),
+            Err("invalid_config_overrides")
+        );
+
         for invalid in [
             json!({"max_bitrate":2147483648_u64}),
             json!({"minimum_fps_target":"60"}),
-            json!({"video_max_batch_size_kb":65}),
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }
