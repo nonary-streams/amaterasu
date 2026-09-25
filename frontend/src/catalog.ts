@@ -731,7 +731,7 @@ namespace Amaterasu {
     );
     const prefer10BitSdr = audioOverrideSelect(
       "prefer_10bit_sdr",
-      catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr),
+      catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr) ?? undefined,
     );
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
