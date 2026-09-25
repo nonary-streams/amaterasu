@@ -149,6 +149,7 @@ struct CapturedScan {
     snapshot: Snapshot,
     settings: ProductSettings,
     source_revision: u64,
+    settings_epoch: u64,
 }
 
 impl CapturedScan {
@@ -156,13 +157,18 @@ impl CapturedScan {
         self,
         catalog: &mut catalog_sync::CatalogSync,
         steam_app_ids: &BTreeSet<u32>,
-    ) -> Result<usize, String> {
-        catalog.start(
+    ) -> Result<(usize, SourceSignature, u64), String> {
+        let count = catalog.start(
             &self.snapshot,
             &self.settings,
             steam_app_ids,
             self.source_revision,
-        )
+        )?;
+        Ok((
+            count,
+            SourceSignature::from(&self.snapshot),
+            self.settings_epoch,
+        ))
     }
 }
 
@@ -270,10 +276,8 @@ impl LutrisModule {
                     self.schedule_next_auto_sync();
                     return;
                 }
-                self.pending_source = Some((signature, settings_epoch));
                 let Some(source_revision) = self.next_source_revision.checked_add(1) else {
                     self.last_error = Some("Lutris source revision exhausted".into());
-                    self.pending_source = None;
                     self.schedule_next_auto_sync();
                     return;
                 };
@@ -282,6 +286,7 @@ impl LutrisModule {
                     snapshot,
                     settings,
                     source_revision,
+                    settings_epoch,
                 };
                 if scan.settings.include_steam {
                     self.steam_read = Some(PendingSteamRead {
@@ -320,14 +325,17 @@ impl LutrisModule {
     }
 
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
-        if let Err(error) = scan.start_catalog(&mut self.catalog, steam_app_ids) {
-            self.last_error = Some(error);
-            self.pending_source = None;
-            self.last_reconciled_source = None;
-            self.last_reconciled_at = None;
-            self.schedule_next_auto_sync();
-        } else {
-            self.last_error = None;
+        match scan.start_catalog(&mut self.catalog, steam_app_ids) {
+            Ok((_, signature, settings_epoch)) => {
+                self.pending_source = Some((signature, settings_epoch));
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                self.last_reconciled_source = None;
+                self.last_reconciled_at = None;
+                self.schedule_next_auto_sync();
+            }
         }
     }
 
@@ -633,6 +641,65 @@ mod tests {
     }
 
     #[test]
+    fn steam_dedupe_does_not_record_source_before_catalog_finish() {
+        let mut source = snapshot();
+        source.games.clear();
+        let settings = ProductSettings {
+            include_steam: true,
+            ..ProductSettings::default()
+        };
+        let pending = PendingSteamRead {
+            scan: CapturedScan {
+                snapshot: source.clone(),
+                settings,
+                source_revision: 1,
+                settings_epoch: 7,
+            },
+            reader: SteamCatalogRead::new(),
+        };
+        let mut catalog = catalog_sync::CatalogSync::default();
+        assert!(!catalog.busy());
+        assert!(catalog.succeeded());
+
+        // The receipt is created only when the deduped scan starts a catalog transaction.
+        let (_, signature, epoch) = pending
+            .scan
+            .start_catalog(&mut catalog, &BTreeSet::new())
+            .unwrap();
+        assert_eq!(signature, SourceSignature::from(&source));
+        assert_eq!(epoch, 7);
+        assert!(catalog.busy());
+        assert!(!catalog.succeeded());
+        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        assert!(!catalog.succeeded());
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":1,"generation":2,"complete":true,
+            "cleanup_pending":false,"remove_stale":true,"remove_selection":true
+        }));
+        assert!(catalog.succeeded());
+
+        let failing_scan = CapturedScan {
+            snapshot: source,
+            settings: ProductSettings {
+                include_steam: true,
+                ..ProductSettings::default()
+            },
+            source_revision: 2,
+            settings_epoch: 7,
+        };
+        failing_scan
+            .start_catalog(&mut catalog, &BTreeSet::new())
+            .unwrap();
+        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":3,"next_sequence":0}));
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":2,"generation":3,"complete":false,
+            "cleanup_pending":false,"remove_stale":true,"remove_selection":true
+        }));
+        assert!(!catalog.busy());
+        assert!(!catalog.succeeded());
+    }
+
+    #[test]
     fn disable_during_scan_keeps_captured_settings_through_steam_dedupe() {
         let scan_start_settings = ProductSettings {
             enabled: true,
@@ -668,6 +735,7 @@ mod tests {
             snapshot: result.unwrap(),
             settings: captured_settings,
             source_revision: 1,
+            settings_epoch,
         };
         assert_eq!(scan.settings, scan_start_settings);
         assert!(scan.settings.include_steam);
@@ -680,7 +748,7 @@ mod tests {
         assert!(!disabled_settings.include_steam);
 
         let mut catalog = catalog_sync::CatalogSync::default();
-        let count = pending
+        let (count, _, _) = pending
             .scan
             .start_catalog(&mut catalog, &[9001].into())
             .unwrap();

@@ -516,6 +516,15 @@ impl CatalogSync {
         self.transaction.is_none() && self.last_error.is_none()
     }
 
+    #[cfg(test)]
+    pub(crate) fn respond_for_test(&mut self, payload: Value) {
+        let transaction = self
+            .transaction
+            .take()
+            .expect("catalog response requires an in-flight transaction");
+        self.consume_response(transaction, payload).unwrap();
+    }
+
     pub fn status(&self) -> Value {
         json!({
             "busy":self.busy(),
