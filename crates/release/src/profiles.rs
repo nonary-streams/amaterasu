@@ -15,6 +15,7 @@ pub enum PackageProfile {
     StreamProbe,
 }
 
+#[derive(Clone, Copy)]
 pub struct ComponentDefinition {
     pub id: &'static str,
     pub library: &'static str,
@@ -219,6 +220,16 @@ const PAIRING: ComponentDefinition = ComponentDefinition {
     native_provides: &["amaterasu.identity/1"],
     native_uses: &[],
     dependencies: &[RUNTIME_ID, "amaterasu.state"],
+};
+
+const PLATFORM_PAIRING: ComponentDefinition = ComponentDefinition {
+    calls: &["amaterasu.state/1", "amaterasu.host-configuration/1"],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.state",
+        "amaterasu.host-configuration",
+    ],
+    ..PAIRING
 };
 
 const NVHTTP: ComponentDefinition = ComponentDefinition {
@@ -667,7 +678,7 @@ impl PackageProfile {
                 LUTRIS,
                 AUTHENTICATION,
                 MANAGEMENT,
-                PAIRING,
+                PLATFORM_PAIRING,
                 NVHTTP,
                 DISPLAY,
                 LAUNCH,
@@ -886,6 +897,7 @@ pub fn installer_policy(
             json!({
                 "administrator_principals": ["amaterasu.management"],
                 "transport_principals": ["amaterasu.nvhttp"],
+                "host_configuration": true,
             }),
         ),
         ("amaterasu.input".into(), json!({"allow_injection": false})),

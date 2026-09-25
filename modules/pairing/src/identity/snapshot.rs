@@ -1,17 +1,58 @@
 //! Validated committed identity material. Never serialize this native cache.
-use crate::{crypto, protocol::Document};
+use crate::{
+    crypto,
+    protocol::{Document, Identity, MAX_CLIENTS, MAX_DOCUMENT_BYTES},
+};
 use amaterasu_identity::*;
 use amaterasu_module_sdk::abi::{STATUS_INTERNAL_ERROR, Status};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rsa::{Pkcs1v15Sign, Pss, RsaPrivateKey, pkcs8::DecodePrivateKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Take};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use x509_cert::{Certificate, der::Encode};
+
+const MAX_IDENTITY_PEM_BYTES: usize = 4096;
+
+/// File-backed TLS identity selected by host configuration.
+///
+/// The private key remains inside pairing and is used only by the native
+/// identity snapshot. It is never included in a response or persisted state.
+pub struct ConfiguredIdentity {
+    pub(crate) certificate_pem: String,
+    pub(crate) private_key_pem: String,
+    pub(crate) provider_revision: u64,
+}
+
+impl ConfiguredIdentity {
+    pub fn load(
+        certificate_path: &str,
+        private_key_path: &str,
+        provider_revision: u64,
+        now: u64,
+    ) -> Result<Self, &'static str> {
+        let certificate_pem = read_identity_file(certificate_path)?;
+        let private_key_pem = read_identity_file(private_key_path)?;
+        let validation_identity = Identity {
+            host_id: "00000000-0000-4000-8000-000000000000".into(),
+            certificate_pem: certificate_pem.clone(),
+            private_key_pem: private_key_pem.clone(),
+        };
+        crypto::validate_identity(&validation_identity, now).map_err(|_| "invalid_identity")?;
+        Ok(Self {
+            certificate_pem,
+            private_key_pem,
+            provider_revision,
+        })
+    }
+}
 
 struct CertificateRecord {
     der: Vec<u8>,
@@ -56,11 +97,61 @@ impl Snapshot {
         let Some(identity) = &document.identity else {
             return Ok(None);
         };
-        let host = CertificateRecord::parse(
-            &crypto::parse_certificate(&identity.certificate_pem, Some(now))?.certificate,
-        )?;
-        let key = RsaPrivateKey::from_pkcs8_pem(&identity.private_key_pem)
-            .map_err(|_| "invalid_state")?;
+        Self::prepare_material(
+            document,
+            &identity.certificate_pem,
+            &identity.private_key_pem,
+            now,
+        )
+        .map(Some)
+    }
+
+    pub fn prepare_with_configured_identity(
+        document: &Document,
+        now: u64,
+        configured_identity: &ConfiguredIdentity,
+    ) -> Result<Arc<Self>, &'static str> {
+        // Keep the durable pairing document as the source of host ID and paired
+        // clients. The configured pair replaces only the native TLS identity.
+        if document.clients.len() > MAX_CLIENTS
+            || serde_json::to_vec(document).map_or(true, |bytes| bytes.len() > MAX_DOCUMENT_BYTES)
+            || (document.identity.is_none() && !document.clients.is_empty())
+        {
+            return Err("invalid_state");
+        }
+        let validation_document = Document {
+            identity: Some(Identity {
+                host_id: document
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.host_id.clone())
+                    .unwrap_or_else(|| "00000000-0000-4000-8000-000000000000".into()),
+                certificate_pem: configured_identity.certificate_pem.clone(),
+                private_key_pem: configured_identity.private_key_pem.clone(),
+            }),
+            clients: document.clients.clone(),
+        };
+        validation_document.validate(now)?;
+        Self::prepare_material(
+            document,
+            &configured_identity.certificate_pem,
+            &configured_identity.private_key_pem,
+            now,
+        )
+    }
+
+    fn prepare_material(
+        document: &Document,
+        certificate_pem: &str,
+        private_key_pem: &str,
+        now: u64,
+    ) -> Result<Arc<Self>, &'static str> {
+        let parsed_host = crypto::parse_certificate(certificate_pem, Some(now))?;
+        let host = CertificateRecord::parse(&parsed_host.certificate)?;
+        let key = RsaPrivateKey::from_pkcs8_pem(private_key_pem).map_err(|_| "invalid_state")?;
+        if parsed_host.public_key != rsa::RsaPublicKey::from(&key) {
+            return Err("invalid_state");
+        }
         let clients = document
             .clients
             .iter()
@@ -70,7 +161,7 @@ impl Snapshot {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Arc::new(Self { host, key, clients })))
+        Ok(Arc::new(Self { host, key, clients }))
     }
 
     pub fn certificate(&self) -> &[u8] {
@@ -146,7 +237,7 @@ impl Snapshot {
 
 #[derive(Default)]
 pub struct Shared {
-    snapshot: RwLock<Option<(u64, Option<Arc<Snapshot>>)>>,
+    snapshot: RwLock<Option<((u64, u64), Option<Arc<Snapshot>>)>>,
     latest_time: AtomicU64,
 }
 impl Shared {
@@ -160,17 +251,25 @@ impl Shared {
         revision: u64,
         snapshot: Option<Arc<Snapshot>>,
     ) -> Result<(), &'static str> {
+        self.publish_with_configuration_revision(revision, 0, snapshot)
+    }
+    pub fn publish_with_configuration_revision(
+        &self,
+        pairing_revision: u64,
+        configuration_revision: u64,
+        snapshot: Option<Arc<Snapshot>>,
+    ) -> Result<(), &'static str> {
         let mut current = self
             .snapshot
             .write()
             .map_err(|_| "identity_cache_unavailable")?;
         if current
             .as_ref()
-            .is_some_and(|(previous, _)| *previous == revision)
+            .is_some_and(|(previous, _)| *previous == (pairing_revision, configuration_revision))
         {
             return Ok(());
         }
-        *current = Some((revision, snapshot));
+        *current = Some(((pairing_revision, configuration_revision), snapshot));
         Ok(())
     }
     pub fn now(&self) -> Result<u64, Status> {
@@ -203,5 +302,147 @@ impl Shared {
                     .and_then(|(_, current)| current.as_ref())
                     .is_some_and(|current| Arc::ptr_eq(current, snapshot))
             })
+    }
+}
+
+fn read_identity_file(path_value: &str) -> Result<String, &'static str> {
+    let path = Path::new(path_value);
+    validate_identity_file_path(path)?;
+
+    // Revalidate immediately before and after opening. Host configuration has
+    // already checked effective paths, but those paths may change before use.
+    validate_identity_file_path(path)?;
+    let mut file = open_identity_file(path).map_err(|_| "identity_file_unavailable")?;
+    validate_identity_file_path(path)?;
+    let metadata = file.metadata().map_err(|_| "identity_file_unavailable")?;
+    if is_reparse_or_symlink(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > MAX_IDENTITY_PEM_BYTES as u64
+    {
+        return Err("invalid_identity_file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bounded_file: Take<&mut File> = (&mut file).take((MAX_IDENTITY_PEM_BYTES + 1) as u64);
+    bounded_file
+        .read_to_end(&mut bytes)
+        .map_err(|_| "identity_file_unavailable")?;
+    if bytes.is_empty() || bytes.len() > MAX_IDENTITY_PEM_BYTES {
+        return Err("invalid_identity_file");
+    }
+    String::from_utf8(bytes).map_err(|_| "invalid_identity_file")
+}
+
+fn open_identity_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x0002_0000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        const O_NOFOLLOW: i32 = 0x0000_0100;
+        // The standard library has no portable no-follow flag for every Unix
+        // target. Component metadata is still revalidated around open; known
+        // Unix targets above use the native final-component no-follow flag.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
+        const O_NOFOLLOW: i32 = 0;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn validate_identity_file_path(path: &Path) -> Result<(), &'static str> {
+    if !path.is_absolute()
+        || path.as_os_str().to_string_lossy().len() > 4096
+        || path.to_string_lossy().chars().any(char::is_control)
+    {
+        return Err("unsafe_identity_path");
+    }
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty() {
+        return Err("unsafe_identity_path");
+    }
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(name) => current.push(name),
+            Component::CurDir | Component::ParentDir => return Err("unsafe_identity_path"),
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|_| "identity_file_unavailable")?;
+        if is_reparse_or_symlink(&metadata) {
+            return Err("unsafe_identity_path");
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err("unsafe_identity_path");
+        }
+        if index + 1 == components.len() && !metadata.is_file() {
+            return Err("invalid_identity_file");
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "identity_file_unavailable")?;
+    if !same_path(&canonical, path) {
+        return Err("unsafe_identity_path");
+    }
+    Ok(())
+}
+
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            let value = path.to_string_lossy();
+            value
+                .strip_prefix(r"\\?\")
+                .unwrap_or(value.as_ref())
+                .replace('/', "\\")
+        };
+        normalize(left).eq_ignore_ascii_case(&normalize(right))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
     }
 }

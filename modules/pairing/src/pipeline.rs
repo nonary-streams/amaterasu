@@ -1,5 +1,5 @@
 use crate::engine::{Change, Engine};
-use crate::identity::{Shared, Snapshot};
+use crate::identity::{ConfiguredIdentity, Shared, Snapshot};
 use crate::protocol::{Document, Operation, Settings, error};
 use crate::{SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATE_KEY: &str = "pairing/v1";
+const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
+const HOST_CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 
 type Transport = ModuleResult<Response>;
 
@@ -33,6 +35,16 @@ pub struct Pipeline {
     engine: Engine,
     pending: Option<Pending>,
     identity: Arc<Shared>,
+    host_configuration: HostConfigurationState,
+}
+
+enum HostConfigurationState {
+    Disabled,
+    Start,
+    WaitingReadiness(u64),
+    WaitingGet(u64),
+    Ready(Arc<ConfiguredIdentity>),
+    Failed,
 }
 
 impl Pipeline {
@@ -42,10 +54,24 @@ impl Pipeline {
     }
 
     pub fn with_identity(settings: Settings, identity: Arc<Shared>) -> Self {
+        Self::with_host_configuration(settings, identity, false)
+    }
+
+    pub fn with_host_configuration(
+        settings: Settings,
+        identity: Arc<Shared>,
+        enabled: bool,
+    ) -> Self {
+        let host_configuration = if enabled {
+            HostConfigurationState::Start
+        } else {
+            HostConfigurationState::Disabled
+        };
         Self {
             engine: Engine::new(settings),
             pending: None,
             identity,
+            host_configuration,
         }
     }
 
@@ -64,13 +90,115 @@ impl Pipeline {
     pub fn tick_at(
         &mut self,
         now: u64,
-        send: impl FnMut(Command) -> Transport,
+        mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let result = self.drive(now, send);
+        let result = match self.advance_host_configuration(now, &mut send) {
+            Ok(true) => self.drive(now, &mut send),
+            Ok(false) if matches!(&self.host_configuration, HostConfigurationState::Failed) => {
+                self.reject_unconfigured(&mut send)
+            }
+            Ok(false) => Ok(()),
+            Err(failure) => Err(failure),
+        };
         if result.is_err() {
             self.identity.invalidate();
         }
         result
+    }
+
+    fn advance_host_configuration(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        match &self.host_configuration {
+            HostConfigurationState::Disabled | HostConfigurationState::Ready(_) => return Ok(true),
+            HostConfigurationState::Failed
+            | HostConfigurationState::WaitingReadiness(_)
+            | HostConfigurationState::WaitingGet(_) => {}
+            HostConfigurationState::Start => {
+                self.host_configuration = match request_host_configuration("readiness", send) {
+                    Ok(Some(request)) => HostConfigurationState::WaitingReadiness(request),
+                    _ => HostConfigurationState::Failed,
+                };
+                return Ok(false);
+            }
+        }
+
+        let request = match &self.host_configuration {
+            HostConfigurationState::WaitingReadiness(request)
+            | HostConfigurationState::WaitingGet(request) => *request,
+            _ => return Ok(false),
+        };
+        let waiting_for_readiness = matches!(
+            &self.host_configuration,
+            HostConfigurationState::WaitingReadiness(_)
+        );
+        match send(Command::TakeResult { request }) {
+            Ok(Response::Pending) => Ok(false),
+            Ok(Response::Result { payload }) if waiting_for_readiness => {
+                if payload["ok"] != true || payload["ready"] != true {
+                    self.fail_host_configuration();
+                    return Ok(false);
+                }
+                self.host_configuration = match request_host_configuration("get", send) {
+                    Ok(Some(request)) => HostConfigurationState::WaitingGet(request),
+                    _ => HostConfigurationState::Failed,
+                };
+                Ok(false)
+            }
+            Ok(Response::Result { payload }) => {
+                let Some(revision) = payload["revision"].as_u64() else {
+                    self.fail_host_configuration();
+                    return Ok(false);
+                };
+                if payload["ok"] != true || payload["ready"] != true {
+                    self.fail_host_configuration();
+                    return Ok(false);
+                }
+                let Some(certificate_path) = payload["effective"]["cert"].as_str() else {
+                    self.fail_host_configuration();
+                    return Ok(false);
+                };
+                let Some(private_key_path) = payload["effective"]["pkey"].as_str() else {
+                    self.fail_host_configuration();
+                    return Ok(false);
+                };
+                match ConfiguredIdentity::load(certificate_path, private_key_path, revision, now) {
+                    Ok(identity) => {
+                        self.host_configuration = HostConfigurationState::Ready(Arc::new(identity));
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        self.fail_host_configuration();
+                        Ok(false)
+                    }
+                }
+            }
+            _ => {
+                self.fail_host_configuration();
+                Ok(false)
+            }
+        }
+    }
+
+    fn fail_host_configuration(&mut self) {
+        self.host_configuration = HostConfigurationState::Failed;
+        self.identity.invalidate();
+    }
+
+    fn reject_unconfigured(
+        &mut self,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        match send(Command::Poll {})? {
+            Response::Pending => Ok(()),
+            Response::Request { id, service, .. } if service == SERVICE => {
+                complete(send, id, error("host_configuration_unavailable"))
+            }
+            Response::Request { id, .. } => complete(send, id, error("invalid_service")),
+            _ => Err("pairing poll failure".into()),
+        }
     }
 
     fn drive(&mut self, now: u64, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
@@ -100,6 +228,15 @@ impl Pipeline {
                 };
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
+                }
+                if self.configured_identity().is_some()
+                    && matches!(&operation, Operation::ImportIdentity { .. })
+                {
+                    return complete(
+                        &mut send,
+                        id,
+                        error("identity_managed_by_host_configuration"),
+                    );
                 }
                 if operation.may_write() {
                     self.identity.invalidate();
@@ -178,8 +315,7 @@ impl Pipeline {
             {
                 match pending.stage {
                     Stage::Saving { response, snapshot } => {
-                        self.identity
-                            .publish(payload["revision"].as_u64().unwrap(), snapshot)?;
+                        self.publish_identity(payload["revision"].as_u64().unwrap(), snapshot)?;
                         complete(send, pending.request.id, response)
                     }
                     Stage::Loading(operation) => {
@@ -194,13 +330,15 @@ impl Pipeline {
                         ) {
                             return complete(send, pending.request.id, error("request_ended"));
                         }
-                        let document = match read_document(&payload, now) {
-                            Ok(document) => document,
-                            Err(code) => {
-                                self.identity.invalidate();
-                                return complete(send, pending.request.id, error(code));
-                            }
-                        };
+                        let configured_identity = self.configured_identity();
+                        let document =
+                            match read_document(&payload, now, configured_identity.is_none()) {
+                                Ok(document) => document,
+                                Err(code) => {
+                                    self.identity.invalidate();
+                                    return complete(send, pending.request.id, error(code));
+                                }
+                            };
                         self.apply_loaded(
                             pending.request,
                             operation,
@@ -245,13 +383,26 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let loaded = Snapshot::prepare(&document, now).map_err(str::to_owned)?;
+        let loaded = match self.prepare_snapshot(&document, now) {
+            Ok(snapshot) => snapshot,
+            Err(code) => {
+                self.identity.invalidate();
+                return complete(send, request.id, error(code));
+            }
+        };
+        if self.configured_identity().is_some()
+            && document.identity.is_none()
+            && !matches!(&operation, Operation::Initialize {})
+        {
+            self.publish_identity(revision, loaded)?;
+            return complete(send, request.id, error("not_initialized"));
+        }
         if let Operation::UpdateClientConfigOverrides {
             expected_revision, ..
         } = &operation
             && *expected_revision != revision
         {
-            self.identity.publish(revision, loaded)?;
+            self.publish_identity(revision, loaded)?;
             return complete(
                 send,
                 request.id,
@@ -259,38 +410,148 @@ impl Pipeline {
             );
         }
         let include_revision = matches!(&operation, Operation::ListClients {});
-        match self.engine.apply(&request.caller, operation, document, now) {
+        let initialize = matches!(&operation, Operation::Initialize {});
+        let persisted_identity = document.identity.clone();
+        let engine_document = match self.configured_identity() {
+            Some(configured_identity) => overlay_document(&document, configured_identity),
+            None => document,
+        };
+        match self
+            .engine
+            .apply(&request.caller, operation, engine_document, now)
+        {
             Ok(Change::Read(mut response)) => {
                 if include_revision {
                     response["revision"] = revision.into();
                 }
-                self.identity.publish(revision, loaded)?;
+                self.publish_identity(revision, loaded)?;
                 complete(send, request.id, response)
             }
-            Ok(Change::Write { document, response }) => {
+            Ok(Change::Write {
+                mut document,
+                mut response,
+            }) => {
+                if let Some(identity) = persisted_identity {
+                    // Engine used the configured identity in memory, but the
+                    // durable pairing document keeps its original host PEMs.
+                    document.identity = Some(identity);
+                } else if initialize && let Some(configured_identity) = self.configured_identity() {
+                    replace_initialized_certificate(&mut response, configured_identity)?;
+                }
                 self.identity.invalidate();
-                let snapshot = Snapshot::prepare(&document, now).map_err(str::to_owned)?;
+                let snapshot = match self.prepare_snapshot(&document, now) {
+                    Ok(snapshot) => snapshot,
+                    Err(code) => {
+                        return complete(send, request.id, error(code));
+                    }
+                };
                 self.submit(request,Stage::Saving {response,snapshot},json!({"action":"set","key":STATE_KEY,"expected_revision":revision,"value":document}),send)
             }
             Err(code) => {
-                self.identity.publish(revision, loaded)?;
+                self.publish_identity(revision, loaded)?;
                 complete(send, request.id, error(code))
             }
         }
     }
+
+    fn prepare_snapshot(
+        &self,
+        document: &Document,
+        now: u64,
+    ) -> Result<Option<Arc<Snapshot>>, &'static str> {
+        match &self.host_configuration {
+            HostConfigurationState::Ready(configured_identity) => {
+                Snapshot::prepare_with_configured_identity(document, now, configured_identity)
+                    .map(Some)
+            }
+            HostConfigurationState::Disabled => Snapshot::prepare(document, now),
+            _ => Err("host_configuration_unavailable"),
+        }
+    }
+
+    fn configured_identity(&self) -> Option<&ConfiguredIdentity> {
+        match &self.host_configuration {
+            HostConfigurationState::Ready(configured_identity) => Some(configured_identity),
+            _ => None,
+        }
+    }
+
+    fn publish_identity(
+        &self,
+        pairing_revision: u64,
+        snapshot: Option<Arc<Snapshot>>,
+    ) -> Result<(), &'static str> {
+        let configuration_revision = match &self.host_configuration {
+            HostConfigurationState::Ready(configured_identity) => {
+                configured_identity.provider_revision
+            }
+            HostConfigurationState::Disabled => 0,
+            _ => return Err("host_configuration_unavailable"),
+        };
+        self.identity.publish_with_configuration_revision(
+            pairing_revision,
+            configuration_revision,
+            snapshot,
+        )
+    }
 }
 
-fn read_document(payload: &Value, now: u64) -> Result<Document, &'static str> {
-    match payload["found"].as_bool() {
+fn request_host_configuration(
+    action: &str,
+    send: &mut impl FnMut(Command) -> Transport,
+) -> ModuleResult<Option<u64>> {
+    match send(Command::Request {
+        service: HOST_CONFIGURATION_SERVICE.into(),
+        payload: json!({"action": action}),
+        timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
+        operation_id: format!("pairing.host-configuration.{action}"),
+        parent: None,
+    })? {
+        Response::Accepted { id } => Ok(Some(id)),
+        _ => Ok(None),
+    }
+}
+
+fn read_document(
+    payload: &Value,
+    now: u64,
+    validate_stored_identity: bool,
+) -> Result<Document, &'static str> {
+    let document = match payload["found"].as_bool() {
         Some(false) => Ok(Document::default()),
         Some(true) => {
             let document: Document =
                 serde_json::from_value(payload["value"].clone()).map_err(|_| "invalid_state")?;
-            document.validate(now)?;
             Ok(document)
         }
         None => Err("invalid_state"),
+    }?;
+    if validate_stored_identity {
+        document.validate(now)?;
     }
+    Ok(document)
+}
+
+fn overlay_document(document: &Document, configured_identity: &ConfiguredIdentity) -> Document {
+    let mut overlay = Document {
+        identity: document.identity.clone(),
+        clients: document.clients.clone(),
+    };
+    if let Some(identity) = overlay.identity.as_mut() {
+        identity.certificate_pem = configured_identity.certificate_pem.clone();
+        identity.private_key_pem = configured_identity.private_key_pem.clone();
+    }
+    overlay
+}
+
+fn replace_initialized_certificate(
+    response: &mut Value,
+    configured_identity: &ConfiguredIdentity,
+) -> Result<(), &'static str> {
+    let certificate = crate::crypto::parse_certificate(&configured_identity.certificate_pem, None)?;
+    response["certificate_pem"] = configured_identity.certificate_pem.clone().into();
+    response["certificate_id"] = certificate.fingerprint.into();
+    Ok(())
 }
 
 fn complete(

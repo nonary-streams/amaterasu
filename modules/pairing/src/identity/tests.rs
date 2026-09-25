@@ -5,6 +5,8 @@ use crate::{
 };
 use rsa::{Pkcs1v15Sign, Pss, RsaPublicKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use std::fs;
+use std::path::PathBuf;
 use x509_cert::der::Encode;
 const HOST_CERT: &str = include_str!("../../tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../tests/fixtures/host-key.pem");
@@ -43,6 +45,36 @@ fn time() -> u64 {
         .max()
         .unwrap()
         + 1
+}
+fn current_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+fn temporary_identity_directory() -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("amaterasu-pairing-identity-{nonce}"));
+    fs::create_dir_all(&directory).unwrap();
+    directory.canonicalize().unwrap()
+}
+fn write_identity_files(
+    directory: &PathBuf,
+    label: &str,
+    certificate: &str,
+    key: &str,
+) -> (String, String) {
+    let certificate_path = directory.join(format!("{label}-certificate.pem"));
+    let key_path = directory.join(format!("{label}-key.pem"));
+    fs::write(&certificate_path, certificate).unwrap();
+    fs::write(&key_path, key).unwrap();
+    (
+        certificate_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+    )
 }
 unsafe extern "C" fn copy(context: *mut c_void, bytes: BorrowedBytes) {
     // SAFETY: test owns the vector and reply bytes are borrowed during the callback.
@@ -135,6 +167,150 @@ fn all_tls_schemes_sign_full_message_and_verify_with_paired_host_certificate() {
         snapshot.sign(0x0201, message).unwrap_err(),
         IDENTITY_UNSUPPORTED
     );
+}
+
+#[test]
+fn configured_identity_files_require_safe_paths_and_a_matching_valid_pair() {
+    let directory = temporary_identity_directory();
+    let (certificate_path, key_path) =
+        write_identity_files(&directory, "valid", HOST_CERT, HOST_KEY);
+    let configured = ConfiguredIdentity::load(&certificate_path, &key_path, 4, time()).unwrap();
+    assert_eq!(configured.provider_revision, 4);
+
+    let (_, mismatched_key_path) =
+        write_identity_files(&directory, "mismatched", HOST_CERT, CLIENT_KEY);
+    assert!(ConfiguredIdentity::load(&certificate_path, &mismatched_key_path, 5, time()).is_err());
+
+    let malformed_certificate_path = directory.join("malformed-certificate.pem");
+    fs::write(&malformed_certificate_path, b"not a certificate").unwrap();
+    assert!(
+        ConfiguredIdentity::load(
+            malformed_certificate_path.to_str().unwrap(),
+            &key_path,
+            6,
+            time()
+        )
+        .is_err()
+    );
+    assert!(
+        ConfiguredIdentity::load(
+            directory.join("missing-certificate.pem").to_str().unwrap(),
+            &key_path,
+            7,
+            time()
+        )
+        .is_err()
+    );
+    assert!(ConfiguredIdentity::load("relative/certificate.pem", &key_path, 8, time()).is_err());
+    let parent_escape = directory.join("..").join("valid-certificate.pem");
+    assert!(
+        ConfiguredIdentity::load(parent_escape.to_str().unwrap(), &key_path, 9, time()).is_err()
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_identity_open_rejects_a_symlinked_effective_file() {
+    use std::os::unix::fs::symlink;
+
+    let directory = temporary_identity_directory();
+    let (certificate_path, key_path) =
+        write_identity_files(&directory, "safe", HOST_CERT, HOST_KEY);
+    let link_path = directory.join("certificate-link.pem");
+    symlink(&certificate_path, &link_path).unwrap();
+    assert!(ConfiguredIdentity::load(link_path.to_str().unwrap(), &key_path, 8, time()).is_err());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn configured_tls_identity_refreshes_on_provider_revision_and_restart_without_pairing_writes() {
+    let directory = temporary_identity_directory();
+    let (first_certificate_path, first_key_path) =
+        write_identity_files(&directory, "first", HOST_CERT, HOST_KEY);
+    let first_configuration =
+        ConfiguredIdentity::load(&first_certificate_path, &first_key_path, 10, current_time())
+            .unwrap();
+
+    let mut persisted_document = document();
+    let persisted_host_id = persisted_document
+        .identity
+        .as_ref()
+        .unwrap()
+        .host_id
+        .clone();
+    let persisted_client_count = persisted_document.clients.len();
+    let first_snapshot = Snapshot::prepare_with_configured_identity(
+        &persisted_document,
+        current_time(),
+        &first_configuration,
+    )
+    .unwrap();
+    let paired_client = crypto_certificate_der(CLIENT_CERT);
+    assert!(first_snapshot.verify_client(&paired_client, current_time()));
+
+    let shared = Shared::default();
+    shared
+        .publish_with_configuration_revision(22, 10, Some(first_snapshot.clone()))
+        .unwrap();
+    let in_flight = shared.get(current_time()).unwrap();
+
+    let replacement_identity = crypto::generate_identity().unwrap();
+    let (second_certificate_path, second_key_path) = write_identity_files(
+        &directory,
+        "second",
+        &replacement_identity.certificate_pem,
+        &replacement_identity.private_key_pem,
+    );
+    let second_configuration = ConfiguredIdentity::load(
+        &second_certificate_path,
+        &second_key_path,
+        11,
+        current_time(),
+    )
+    .unwrap();
+    let second_snapshot = Snapshot::prepare_with_configured_identity(
+        &persisted_document,
+        current_time(),
+        &second_configuration,
+    )
+    .unwrap();
+    assert_ne!(first_snapshot.certificate(), second_snapshot.certificate());
+    assert!(second_snapshot.verify_client(&paired_client, current_time()));
+    shared
+        .publish_with_configuration_revision(22, 11, Some(second_snapshot.clone()))
+        .unwrap();
+    assert!(!shared.current(&in_flight, current_time()));
+    assert_eq!(
+        shared.get(current_time()).unwrap().certificate(),
+        second_snapshot.certificate()
+    );
+
+    // A fresh module instance reopens the configured paths and loads the new
+    // identity while the persisted pairing host ID and client records stay put.
+    let restarted_configuration = ConfiguredIdentity::load(
+        &second_certificate_path,
+        &second_key_path,
+        11,
+        current_time(),
+    )
+    .unwrap();
+    let restarted_snapshot = Snapshot::prepare_with_configured_identity(
+        &persisted_document,
+        current_time(),
+        &restarted_configuration,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted_snapshot.certificate(),
+        second_snapshot.certificate()
+    );
+    assert_eq!(
+        persisted_document.identity.as_ref().unwrap().host_id,
+        persisted_host_id
+    );
+    assert_eq!(persisted_document.clients.len(), persisted_client_count);
+    fs::remove_dir_all(directory).unwrap();
 }
 #[test]
 fn bound_api_keeps_private_material_internal_and_observes_revocation() {

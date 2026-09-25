@@ -23,9 +23,8 @@ impl ManagedModule for PairingModule {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("pairing settings unavailable".into());
         };
-        let settings: Settings =
-            serde_json::from_value(payload).map_err(|_| "invalid pairing settings")?;
-        settings.validate().map_err(str::to_owned)?;
+        let (settings, host_configuration_enabled) =
+            parse_settings(payload).map_err(str::to_owned)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -36,7 +35,11 @@ impl ManagedModule for PairingModule {
         unsafe { runtime.register_native(amaterasu_identity::SERVICE, &factory.api) }?;
         Ok(Self {
             runtime,
-            pipeline: Pipeline::with_identity(settings, shared),
+            pipeline: Pipeline::with_host_configuration(
+                settings,
+                shared,
+                host_configuration_enabled,
+            ),
             _identity_factory: factory,
         })
     }
@@ -52,3 +55,43 @@ impl Drop for PairingModule {
 }
 
 amaterasu_module_sdk::export_module!(PairingModule);
+
+fn parse_settings(mut payload: serde_json::Value) -> Result<(Settings, bool), &'static str> {
+    let host_configuration_enabled = match payload
+        .as_object_mut()
+        .and_then(|settings| settings.remove("host_configuration"))
+    {
+        None => false,
+        Some(serde_json::Value::Bool(enabled)) => enabled,
+        Some(_) => return Err("invalid pairing settings"),
+    };
+    let settings: Settings =
+        serde_json::from_value(payload).map_err(|_| "invalid pairing settings")?;
+    settings.validate()?;
+    Ok((settings, host_configuration_enabled))
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::parse_settings;
+    use serde_json::json;
+
+    #[test]
+    fn missing_host_configuration_marker_keeps_legacy_settings() {
+        let (settings, enabled) = parse_settings(json!({})).unwrap();
+        assert!(!enabled);
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn platform_host_configuration_marker_is_consumed_outside_protocol_settings() {
+        let (settings, enabled) = parse_settings(json!({"host_configuration":true})).unwrap();
+        assert!(enabled);
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn host_configuration_marker_must_be_boolean() {
+        assert!(parse_settings(json!({"host_configuration":"enabled"})).is_err());
+    }
+}

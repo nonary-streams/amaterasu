@@ -71,6 +71,28 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
     assert_eq!(provider.calls, &["amaterasu.state/1"]);
     assert!(provider.dependencies.contains(&RUNTIME_ID));
     assert!(provider.dependencies.contains(&STATE.id));
+    let pairing = platform
+        .iter()
+        .find(|component| component.id == PLATFORM_PAIRING.id)
+        .unwrap();
+    assert_eq!(
+        pairing.calls,
+        &["amaterasu.state/1", "amaterasu.host-configuration/1"]
+    );
+    assert_eq!(pairing.calls.len(), 2);
+    assert_eq!(pairing.dependencies.len(), 3);
+    assert!(pairing.dependencies.contains(&RUNTIME_ID));
+    assert!(pairing.dependencies.contains(&HOST_CONFIGURATION.id));
+    assert!(pairing.dependencies.contains(&STATE.id));
+    let provider_index = platform
+        .iter()
+        .position(|component| component.id == HOST_CONFIGURATION.id)
+        .unwrap();
+    let pairing_index = platform
+        .iter()
+        .position(|component| component.id == pairing.id)
+        .unwrap();
+    assert!(provider_index < pairing_index);
     assert!(
         !PackageProfile::Example
             .components()
@@ -83,12 +105,18 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
             .iter()
             .any(|component| component.id == HOST_CONFIGURATION.id)
     );
+    let stream_probe = PackageProfile::StreamProbe.components();
     assert!(
-        !PackageProfile::StreamProbe
-            .components()
+        !stream_probe
             .iter()
             .any(|component| component.id == HOST_CONFIGURATION.id)
     );
+    let legacy_pairing = stream_probe
+        .iter()
+        .find(|component| component.id == PAIRING.id)
+        .unwrap();
+    assert_eq!(legacy_pairing.calls, PAIRING.calls);
+    assert_eq!(legacy_pairing.dependencies, PAIRING.dependencies);
 }
 
 #[test]
@@ -129,6 +157,22 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
         );
         assert_eq!(host_configuration.call.len(), 1);
         assert!(host_configuration.call.contains("amaterasu.state/1"));
+        assert_eq!(policy.settings[PAIRING.id]["host_configuration"], true);
+        assert_eq!(
+            policy.principals[PAIRING.id].call.len(),
+            2,
+            "configured pairing may call state and read-only host configuration"
+        );
+        assert!(
+            policy.principals[PAIRING.id]
+                .call
+                .contains("amaterasu.state/1")
+        );
+        assert!(
+            policy.principals[PAIRING.id]
+                .call
+                .contains("amaterasu.host-configuration/1")
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 mod snapshot;
 use amaterasu_identity::*;
 use amaterasu_module_sdk::abi::*;
-pub use snapshot::{Shared, Snapshot};
+pub use snapshot::{ConfiguredIdentity, Shared, Snapshot};
 use std::{
     collections::BTreeSet,
     ffi::c_void,
