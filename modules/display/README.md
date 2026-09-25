@@ -29,6 +29,17 @@ highest refresh rate for the selected resolution, respectively.
 This model does not persist settings, project scoped values into a runtime
 request, or perform provider/native display effects.
 
+## Resolution option model
+
+The library exposes `ResolutionOption` as a reusable typed configuration model.
+Its default is `Auto`, and its serialized tokens are `auto`, `disabled`,
+and `manual`.
+The legacy token parser maps unknown values to `Disabled`. The `Manual` variant
+uses the separate `dd_manual_resolution` setting.
+
+This model does not persist settings, project scoped values into a runtime
+request, perform provider effects, or implement the `Moonlight` gate.
+
 ## API
 
 ```json
