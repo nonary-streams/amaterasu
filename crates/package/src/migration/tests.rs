@@ -196,7 +196,7 @@ fn preflight_refuses_sensitive_configuration_without_exposing_its_contents() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");
     let secret = b"pairing-private-key: never print this";
-    write(&predecessor.join("sunshine.conf"), b"port = 47990");
+    write(&predecessor.join("sunshine.conf"), b"fps = 60");
     write(&predecessor.join("credentials/client.pem"), secret);
     write(
         &predecessor.join("credentials/nested/token"),
@@ -207,11 +207,23 @@ fn preflight_refuses_sensitive_configuration_without_exposing_its_contents() {
     let plan =
         analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).unwrap();
 
-    assert!(!plan.critical_items.is_empty());
+    assert_eq!(plan.critical_items.len(), 1);
+    assert_eq!(plan.critical_items[0].item, "pairing_credentials");
     let encoded = serde_json::to_string(&plan).unwrap();
     assert!(!encoded.contains("pairing-private-key"));
     assert!(
         preflight_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).is_err()
+    );
+    assert!(
+        preflight_legacy_configuration_with_sensitive_sources(
+            &[source(LegacyProduct::Sunshine, &predecessor)],
+            &[ValidatedSensitiveSource {
+                product: LegacyProduct::Sunshine,
+                pairing: false,
+                authentication: true,
+            }],
+        )
+        .is_err()
     );
     assert!(
         import_legacy_configuration(&data_root, &[source(LegacyProduct::Sunshine, &predecessor)])
@@ -245,6 +257,17 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
         );
     }
     let legacy_source = source(LegacyProduct::Sunshine, &predecessor);
+    assert!(
+        preflight_legacy_configuration_with_sensitive_sources(
+            std::slice::from_ref(&legacy_source),
+            &[ValidatedSensitiveSource {
+                product: LegacyProduct::Sunshine,
+                pairing: false,
+                authentication: true,
+            }],
+        )
+        .is_err()
+    );
     let plan = preflight_legacy_configuration_with_sensitive_sources(
         std::slice::from_ref(&legacy_source),
         &[ValidatedSensitiveSource {
@@ -279,6 +302,68 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
     );
     assert!(
         analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).is_err()
+    );
+}
+
+#[test]
+fn configured_credentials_file_is_authentication_input_not_pairing_credentials() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let credentials = b"authentication credentials\x00with exact bytes\xff";
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"credentials_file = \"credentials/custom.json\"\n",
+    );
+    write(&predecessor.join("credentials/custom.json"), credentials);
+
+    let legacy_source = source(LegacyProduct::Sunshine, &predecessor);
+    let analyzed = analyze_legacy_configuration(std::slice::from_ref(&legacy_source)).unwrap();
+    assert_eq!(analyzed.schema, 1);
+    assert!(
+        analyzed
+            .critical_items
+            .iter()
+            .any(|item| item.item == "credentials_file")
+    );
+    assert!(
+        !analyzed
+            .critical_items
+            .iter()
+            .any(|item| item.item == "pairing_credentials")
+    );
+
+    let validated = [ValidatedSensitiveSource {
+        product: LegacyProduct::Sunshine,
+        pairing: false,
+        authentication: true,
+    }];
+    let plan =
+        preflight_legacy_configuration_with_sensitive_sources(&[legacy_source.clone()], &validated)
+            .unwrap();
+    assert_eq!(plan.schema, 1);
+    assert!(plan.critical_items.is_empty());
+
+    let destination = fixture.path().join("Amaterasu");
+    let receipt = import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[legacy_source],
+        &validated,
+    )
+    .unwrap();
+    assert!(
+        receipt
+            .imported_files
+            .iter()
+            .any(|imported| { imported.path.ends_with("sunshine/credentials/custom.json") })
+    );
+    assert_eq!(
+        fs::read(
+            destination
+                .join(LEGACY_IMPORT_DIRECTORY)
+                .join("sunshine/credentials/custom.json")
+        )
+        .unwrap(),
+        credentials
     );
 }
 

@@ -155,6 +155,7 @@ struct CollectedConfigurationFiles {
     files: Vec<PathBuf>,
     copy_sources: BTreeMap<PathBuf, PathBuf>,
     configured_state_files: BTreeSet<PathBuf>,
+    configured_authentication_files: BTreeSet<PathBuf>,
 }
 
 /// Non-secret evidence that a product-specific importer validated a sensitive
@@ -257,6 +258,7 @@ pub fn analyze_legacy_configuration(sources: &[LegacyConfigSource]) -> PackageRe
                 source.product,
                 &source.root.join(relative),
                 collected.configured_state_files.contains(relative),
+                collected.configured_authentication_files.contains(relative),
                 &mut plan,
             )?;
         }
@@ -435,6 +437,7 @@ fn analyze_source_file(
     product: LegacyProduct,
     path: &Path,
     is_configured_state_file: bool,
+    is_configured_authentication_file: bool,
     plan: &mut ImportPlan,
 ) -> PackageResult<()> {
     let filename = path
@@ -461,7 +464,11 @@ fn analyze_source_file(
     {
         plan.critical_items.push(PlanItem {
             product,
-            item: "pairing_credentials".into(),
+            item: if is_configured_authentication_file {
+                "credentials_file".into()
+            } else {
+                "pairing_credentials".into()
+            },
         });
     } else {
         plan.unsupported_items.push(PlanItem {
@@ -772,6 +779,7 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
     let mut files = Vec::new();
     let mut copy_sources = BTreeMap::new();
     let mut configured_state_files = BTreeSet::new();
+    let mut configured_authentication_files = BTreeSet::new();
     for name in CONFIGURATION_FILES {
         let path = root.join(name);
         if path.try_exists().map_err(io_error)? {
@@ -779,7 +787,12 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
             files.push(PathBuf::from(name));
         }
     }
-    collect_configured_sensitive_files(root, &mut files, &mut copy_sources)?;
+    collect_configured_sensitive_files(
+        root,
+        &mut files,
+        &mut configured_authentication_files,
+        &mut copy_sources,
+    )?;
     collect_configured_state_files(
         root,
         &mut files,
@@ -797,12 +810,14 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
         &mut files,
         &mut copy_sources,
         &mut configured_state_files,
+        &mut configured_authentication_files,
     )?;
     files.sort();
     Ok((!files.is_empty()).then_some(CollectedConfigurationFiles {
         files,
         copy_sources,
         configured_state_files,
+        configured_authentication_files,
     }))
 }
 
@@ -834,6 +849,7 @@ fn strip_unquoted_comment(line: &str) -> &str {
 fn collect_configured_sensitive_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
+    configured_authentication_files: &mut BTreeSet<PathBuf>,
     copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
 ) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
@@ -858,10 +874,8 @@ fn collect_configured_sensitive_files(
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if !matches!(
-                key.trim().to_ascii_lowercase().as_str(),
-                "pkey" | "cert" | "credentials_file"
-            ) {
+            let key = key.trim().to_ascii_lowercase();
+            if !matches!(key.as_str(), "pkey" | "cert" | "credentials_file") {
                 continue;
             }
             let relative = Path::new(value.trim().trim_matches('"'));
@@ -887,6 +901,9 @@ fn collect_configured_sensitive_files(
             validate_regular_file(&canonical)?;
             let copied = relative.to_path_buf();
             copy_sources.insert(copied.clone(), canonical);
+            if key == "credentials_file" {
+                configured_authentication_files.insert(copied.clone());
+            }
             if !files.contains(&copied) {
                 files.push(copied);
             }
@@ -1064,6 +1081,7 @@ fn deduplicate_collected_paths(
     files: &mut Vec<PathBuf>,
     copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
     configured_state_files: &mut BTreeSet<PathBuf>,
+    configured_authentication_files: &mut BTreeSet<PathBuf>,
 ) -> PackageResult<()> {
     let mut path_by_identity = BTreeMap::<PathBuf, PathBuf>::new();
     let mut unique_files = Vec::with_capacity(files.len());
@@ -1077,6 +1095,9 @@ fn deduplicate_collected_paths(
             }
             if configured_state_files.remove(&relative) {
                 configured_state_files.insert(existing_relative.clone());
+            }
+            if configured_authentication_files.remove(&relative) {
+                configured_authentication_files.insert(existing_relative.clone());
             }
         } else {
             path_by_identity.insert(identity, relative.clone());
