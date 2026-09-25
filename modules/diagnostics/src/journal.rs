@@ -19,13 +19,31 @@ struct CallerDiagnostics {
 }
 
 /// A bounded, volatile journal. The host supplies caller identity; payloads cannot.
-#[derive(Default)]
 pub struct Journal {
     callers: BTreeMap<String, CallerDiagnostics>,
     logger: SessionLogger,
+    ready: bool,
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        Self {
+            callers: BTreeMap::new(),
+            logger: SessionLogger::default(),
+            ready: true,
+        }
+    }
 }
 
 impl Journal {
+    pub(crate) fn unready() -> Self {
+        Self {
+            ready: false,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_logging(settings: LoggingSettings) -> (Self, Option<String>) {
         let mut journal = Self::default();
         let warning = journal.configure_logging(settings);
@@ -38,14 +56,28 @@ impl Journal {
         warning
     }
 
+    pub(crate) fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready
+    }
+
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {
         let result = serde_json::from_value(payload)
             .map_err(|_| "invalid_request")
             .and_then(|action| self.execute(caller, action));
-        match result {
+        let mut response = match result {
             Ok(response) => response,
             Err(code) => json!({"ok": false, "code": code}),
+        };
+        if !self.ready
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("ready".into(), json!(false));
         }
+        response
     }
 
     fn execute(&mut self, caller: &str, action: Action) -> Result<Value> {
@@ -68,6 +100,9 @@ impl Journal {
                 message,
                 fields,
             } => {
+                if !self.ready {
+                    return Err("not_ready");
+                }
                 let record = Record {
                     sequence: 0,
                     level,
@@ -86,6 +121,7 @@ impl Journal {
                 }
                 self.caller_mut(caller)?.increment(name, amount)
             }
+            Action::Status {} => Ok(json!({"ok":true,"ready":self.ready})),
         }
     }
 
@@ -168,6 +204,89 @@ impl CallerDiagnostics {
         let value = previous.checked_add(amount).ok_or("counter_overflow")?;
         self.counters.insert(name.clone(), value);
         Ok(json!({"ok":true,"name":name,"value":value}))
+    }
+}
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn records_are_rejected_until_logging_policy_is_ready() {
+        let mut journal = Journal::unready();
+
+        let response = journal.handle(
+            "capture",
+            json!({
+                "action":"record",
+                "level":"info",
+                "target":"capture",
+                "message":"early"
+            }),
+        );
+
+        assert_eq!(
+            response,
+            json!({"ok":false,"code":"not_ready","ready":false})
+        );
+        assert!(journal.callers.is_empty());
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"})),
+            json!({"ok":true,"ready":false})
+        );
+    }
+
+    #[test]
+    fn adopted_configuration_allows_records_and_reports_readiness() {
+        let mut journal = Journal::unready();
+        let settings = LoggingSettings::from_value(json!({})).unwrap();
+
+        journal.configure_logging(settings);
+        journal.set_ready(true);
+
+        assert!(journal.is_ready());
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"})),
+            json!({"ok":true,"ready":true})
+        );
+        assert_eq!(
+            journal.handle(
+                "capture",
+                json!({
+                    "action":"record",
+                    "level":"info",
+                    "target":"capture",
+                    "message":"ready"
+                }),
+            ),
+            json!({"ok":true,"sequence":1,"dropped_total":0})
+        );
+    }
+
+    #[test]
+    fn queries_and_counter_actions_remain_available_while_unready() {
+        let mut journal = Journal::unready();
+
+        assert_eq!(
+            journal.handle("capture", json!({"action":"query"}))["ready"],
+            false
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"counters"}))["ready"],
+            false
+        );
+        assert_eq!(
+            journal.handle(
+                "capture",
+                json!({"action":"increment","name":"frames","amount":1})
+            ),
+            json!({"ok":true,"name":"frames","value":1,"ready":false})
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"counters"})),
+            json!({"ok":true,"counters":{"frames":1},"ready":false})
+        );
     }
 }
 

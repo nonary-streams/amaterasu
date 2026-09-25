@@ -22,6 +22,7 @@ pub(crate) enum Action {
         amount: u64,
     },
     Counters {},
+    Status {},
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

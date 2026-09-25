@@ -12,6 +12,7 @@ Requests (unknown fields are rejected):
 {"action":"query","after":0,"limit":4}
 {"action":"increment","name":"frames","amount":1}
 {"action":"counters"}
+{"action":"status"}
 ```
 
 Record levels are `trace`, `debug`, `info`, `warn`, and `error`. `fields` defaults
@@ -45,8 +46,11 @@ unsigned 64-bit integers, including zero. Counter reads return
 values never wrap, and overflow leaves the previous value intact. Errors are
 `{"ok":false,"code":"..."}` with codes `invalid_request`, `invalid_record`,
 `record_too_large`, `invalid_name`, `invalid_limit`, `invalid_cursor`,
-`invalid_caller`, `caller_limit`, `counter_limit`, `counter_overflow`, or
-`sequence_exhausted`.
+`invalid_caller`, `caller_limit`, `counter_limit`, `counter_overflow`,
+`sequence_exhausted`, and `not_ready` while logging policy hydration is pending.
+The `status` action returns `{"ok":true,"ready":false}` until hydration
+completes. Query and counter responses remain available during hydration and
+include `ready:false`.
 
 At most 64 callers can create state, with caller identities bounded to 128 bytes.
 Reads do not allocate caller slots. Caller slots and counters persist until module
@@ -89,20 +93,39 @@ by this worker.
 
 This is a host diagnostics sink, not a capture of all host or native-library
 logs. Service supervisor messages on stderr and worker protocol lines on stdout
-remain outside this file sink. The host-provided logging policy opens an initial
-sink while the diagnostics module asynchronously reads the persisted
-`amaterasu.host-configuration/1` document. After startup, the reader releases
-and discards its first valid ready document, then schedules a fresh GET after
-the retry delay before any persisted settings can replace the bootstrap
-policy. This prevents a restarted reader from adopting an older completed GET
-retained under its stable operation ID. A fresh valid document with a positive
-revision replaces the bootstrap policy; later documents reconfigure the sink
-only when their positive revision exceeds the highest revision adopted by this
-worker. Revision zero, an unavailable provider, or an invalid response keeps
-the trusted bootstrap policy active and retries without blocking diagnostics
-requests. The module polls every 30 seconds after a valid read. The host
-release-profile grant and diagnostics dependency landed on main in commits
-`687f72a2` and `b084b0e7`, so the host-configuration service call is available.
+remain outside this file sink. Worker `READY` does not wait for persisted
+logging hydration. At startup, diagnostics asynchronously calls
+`amaterasu.host-configuration/1` with the read-only `get` action and does not
+read configuration state directly. The status action reports `ready:false`
+until a logging policy is selected. During this period, Record requests return
+`not_ready` and are not retained or written; query, counter, and status actions
+remain available. Query and counter responses report `ready:false` while
+hydration is pending.
+
+When the profile grants the provider call, diagnostics keeps readiness false
+until it fetches a ready v1 document with a positive revision. Before adopting
+it, diagnostics validates the configured log path, checks that the effective
+path matches the configured path under the trusted state root (or the same
+absolute path), validates the effective minimum level, and applies the logger's
+existing trusted path checks. Only then does it configure the persisted logger
+and accept records. If the provider is granted but unavailable, returns
+`ready:false`, or returns malformed or invalid data, diagnostics remains
+unready and retries; it does not enable the bootstrap sink as a fallback.
+
+Profiles without this provider grant keep the injected signed bootstrap
+logging settings. Diagnostics enables those settings only after the initial
+service Request is denied immediately with `permission_denied`. An
+`unavailable` response, a transport failure, or an asynchronous provider error
+does not identify a legacy profile and never enables bootstrap logging.
+
+The reader releases and discards its first valid ready document after startup,
+then schedules a fresh GET after the retry delay before it adopts a policy.
+This prevents a restarted reader from adopting an older completed GET retained
+under its stable operation ID. After a valid document is adopted, later
+documents reconfigure the sink only when their positive revision exceeds the
+highest revision successfully adopted by this worker. Invalid refresh results
+leave the current policy active. The module polls every 30 seconds after a
+successful read.
 
 The diagnostics reader uses the caller-scoped operation ID
 `diagnostics.host-configuration.logging.read` for each serialized GET cycle.

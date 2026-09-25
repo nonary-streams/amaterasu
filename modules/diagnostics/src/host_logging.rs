@@ -30,6 +30,8 @@ pub(crate) struct HostLoggingConfigurationReader {
     pending: Option<PendingPhase>,
     next_attempt: Option<Instant>,
     discard_first_ready_payload: bool,
+    provider_granted: bool,
+    legacy_bootstrap_authorized: bool,
     highest_adopted_revision: Option<u64>,
 }
 
@@ -39,6 +41,8 @@ impl Default for HostLoggingConfigurationReader {
             pending: None,
             next_attempt: None,
             discard_first_ready_payload: true,
+            provider_granted: false,
+            legacy_bootstrap_authorized: false,
             highest_adopted_revision: None,
         }
     }
@@ -107,6 +111,10 @@ impl HostLoggingConfigurationReader {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Option<Value> {
+        if self.legacy_bootstrap_authorized {
+            return None;
+        }
+
         if self
             .next_attempt
             .is_some_and(|next_attempt| now < next_attempt)
@@ -122,7 +130,16 @@ impl HostLoggingConfigurationReader {
             parent: None,
         }) {
             Ok(Response::Accepted { id }) => {
+                self.provider_granted = true;
                 self.pending = Some(PendingPhase::Waiting { request_id: id });
+                None
+            }
+            Ok(Response::Error { code, .. })
+                if code == "permission_denied" && !self.provider_granted =>
+            {
+                // Only an immediate Request denial identifies a profile that
+                // intentionally lacks this caller's service grant.
+                self.legacy_bootstrap_authorized = true;
                 None
             }
             Ok(_) => {
@@ -179,7 +196,7 @@ impl HostLoggingConfigurationReader {
 
         // The stable operation ID may reconnect a restarted reader to an old
         // completed GET. Release that result, then require a fresh GET before
-        // allowing persisted settings to replace the bootstrap policy.
+        // adopting any persisted logging policy.
         if self.discard_first_ready_payload {
             self.discard_first_ready_payload = false;
             self.schedule_retry(now);
@@ -187,16 +204,26 @@ impl HostLoggingConfigurationReader {
         }
 
         self.next_attempt = Some(now + REFRESH_INTERVAL);
-        if revision == 0
-            || self
-                .highest_adopted_revision
-                .is_some_and(|highest_adopted_revision| revision <= highest_adopted_revision)
+        if self
+            .highest_adopted_revision
+            .is_some_and(|highest_adopted_revision| revision <= highest_adopted_revision)
         {
             return None;
         }
 
-        self.highest_adopted_revision = Some(revision);
         Some(payload)
+    }
+
+    pub(crate) fn legacy_bootstrap_authorized(&self) -> bool {
+        self.legacy_bootstrap_authorized
+    }
+
+    pub(crate) fn adopt_configuration(&mut self, revision: u64) {
+        self.highest_adopted_revision = Some(revision);
+    }
+
+    pub(crate) fn reject_configuration(&mut self, now: Instant) {
+        self.schedule_retry(now);
     }
 
     fn schedule_retry(&mut self, now: Instant) {
@@ -214,6 +241,9 @@ fn ready_revision(payload: &Value) -> Option<u64> {
     }
 
     let revision = payload.get("revision").and_then(Value::as_u64)?;
+    if revision == 0 {
+        return None;
+    }
     let values = payload.get("values").and_then(Value::as_object)?;
     values.get("log_path").and_then(Value::as_str)?;
 
@@ -274,19 +304,28 @@ mod tests {
                 .is_none()
         );
 
-        reader.tick(started + Duration::from_secs(1), |command| match command {
-            Command::TakeResult { request } => {
-                assert_eq!(request, request_id);
-                Ok(Response::Result {
-                    payload: ready_configuration(revision),
-                })
-            }
-            Command::ReleaseResult { request } => {
-                assert_eq!(request, request_id);
-                Ok(Response::Ok)
-            }
-            unexpected => panic!("unexpected runtime command: {unexpected:?}"),
-        })
+        let configuration =
+            reader.tick(started + Duration::from_secs(1), |command| match command {
+                Command::TakeResult { request } => {
+                    assert_eq!(request, request_id);
+                    Ok(Response::Result {
+                        payload: ready_configuration(revision),
+                    })
+                }
+                Command::ReleaseResult { request } => {
+                    assert_eq!(request, request_id);
+                    Ok(Response::Ok)
+                }
+                unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+            });
+        if let Some(configuration) = &configuration {
+            reader.adopt_configuration(
+                configuration["revision"]
+                    .as_u64()
+                    .expect("adopted documents carry a revision"),
+            );
+        }
+        configuration
     }
 
     #[test]
@@ -332,6 +371,7 @@ mod tests {
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
 
         let loaded = reader.tick(started + Duration::from_secs(2), |command| match command {
             Command::TakeResult { request: 10 } => {
@@ -372,6 +412,7 @@ mod tests {
             unexpected => panic!("unexpected runtime command: {unexpected:?}"),
         });
         assert_eq!(loaded, Some(ready_configuration(1)));
+        reader.adopt_configuration(1);
 
         let refreshed = reader.tick(started + Duration::from_secs(38), |command| match command {
             Command::Request { .. } => Ok(Response::Accepted { id: 12 }),
@@ -446,6 +487,7 @@ mod tests {
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
 
         assert!(
             reader
@@ -463,10 +505,11 @@ mod tests {
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
     }
 
     #[test]
-    fn revision_zero_keeps_the_trusted_bootstrap_policy() {
+    fn revision_zero_is_unready_and_retried_without_legacy_fallback() {
         let started = Instant::now();
         let mut reader = HostLoggingConfigurationReader::default();
 
@@ -489,6 +532,7 @@ mod tests {
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
         assert!(
             reader
                 .tick(started + Duration::from_secs(6), |command| match command {
@@ -507,30 +551,52 @@ mod tests {
                     unexpected => panic!("unexpected runtime command: {unexpected:?}"),
                 })
                 .is_none(),
-            "revision zero must not replace the bootstrap policy"
+            "revision zero must not replace any logging policy"
         );
         assert!(
             reader
                 .tick(started + Duration::from_secs(8), |_| {
-                    panic!("revision zero should schedule the normal refresh interval")
+                    panic!("an unready document should schedule the retry delay")
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
 
         assert!(
             reader
-                .tick(started + Duration::from_secs(37), |command| match command {
+                .tick(started + Duration::from_secs(12), |command| match command {
                     Command::Request { .. } => Ok(Response::Accepted { id: 32 }),
                     unexpected => panic!("unexpected runtime command: {unexpected:?}"),
                 })
                 .is_none()
         );
+        assert!(!reader.legacy_bootstrap_authorized());
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(13), |command| match command {
+                    Command::TakeResult { request: 32 } => Ok(Response::Result {
+                        payload: ready_configuration(1),
+                    }),
+                    Command::ReleaseResult { request: 32 } => Ok(Response::Ok),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none(),
+            "the first ready document is discarded before adoption"
+        );
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(18), |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 33 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
         assert_eq!(
-            reader.tick(started + Duration::from_secs(38), |command| match command {
-                Command::TakeResult { request: 32 } => Ok(Response::Result {
+            reader.tick(started + Duration::from_secs(19), |command| match command {
+                Command::TakeResult { request: 33 } => Ok(Response::Result {
                     payload: ready_configuration(1),
                 }),
-                Command::ReleaseResult { request: 32 } => Ok(Response::Ok),
+                Command::ReleaseResult { request: 33 } => Ok(Response::Ok),
                 unexpected => panic!("unexpected runtime command: {unexpected:?}"),
             }),
             Some(ready_configuration(1))
@@ -565,6 +631,107 @@ mod tests {
             complete_configuration_read(&mut reader, started + Duration::from_secs(99), 44, 4),
             Some(ready_configuration(4))
         );
+    }
+
+    #[test]
+    fn missing_grant_authorizes_legacy_bootstrap_but_unavailable_does_not() {
+        use crate::journal::Journal;
+        use crate::logging::LoggingSettings;
+
+        let started = Instant::now();
+        let mut denied_reader = HostLoggingConfigurationReader::default();
+        assert!(
+            denied_reader
+                .tick(started, |command| match command {
+                    Command::Request {
+                        service, payload, ..
+                    } => {
+                        assert_eq!(service, HOST_CONFIGURATION_SERVICE);
+                        assert_eq!(payload, json!({"action":"get"}));
+                        Ok(Response::error(
+                            "permission_denied",
+                            "service grant missing",
+                        ))
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(denied_reader.legacy_bootstrap_authorized());
+        let mut legacy_journal = Journal::unready();
+        legacy_journal
+            .configure_logging(LoggingSettings::from_value(json!({"min_log_level":5})).unwrap());
+        legacy_journal.set_ready(true);
+        assert_eq!(
+            legacy_journal.handle("capture", json!({"action":"status"}))["ready"],
+            true
+        );
+        assert_eq!(
+            legacy_journal.handle(
+                "capture",
+                json!({
+                    "action":"record",
+                    "level":"info",
+                    "target":"capture",
+                    "message":"legacy bootstrap"
+                })
+            )["sequence"],
+            1
+        );
+        assert!(
+            denied_reader
+                .tick(started + Duration::from_secs(10), |_| {
+                    panic!("a confirmed legacy profile must stop provider polling")
+                })
+                .is_none()
+        );
+
+        let mut unavailable_reader = HostLoggingConfigurationReader::default();
+        assert!(
+            unavailable_reader
+                .tick(started, |command| match command {
+                    Command::Request { .. } => Ok(Response::error(
+                        "unavailable",
+                        "the granted provider is not registered",
+                    )),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(!unavailable_reader.legacy_bootstrap_authorized());
+        let mut unavailable_journal = Journal::unready();
+        assert_eq!(
+            unavailable_journal.handle("capture", json!({"action":"status"}))["ready"],
+            false
+        );
+        assert_eq!(
+            unavailable_journal.handle(
+                "capture",
+                json!({
+                    "action":"record",
+                    "level":"info",
+                    "target":"capture",
+                    "message":"provider unavailable"
+                })
+            )["code"],
+            "not_ready"
+        );
+        assert!(
+            unavailable_reader
+                .tick(started + Duration::from_secs(4), |_| {
+                    panic!("unavailable should be retried after the configured delay")
+                })
+                .is_none()
+        );
+        assert!(
+            unavailable_reader
+                .tick(started + Duration::from_secs(5), |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 90 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(!unavailable_reader.legacy_bootstrap_authorized());
     }
 
     #[test]
