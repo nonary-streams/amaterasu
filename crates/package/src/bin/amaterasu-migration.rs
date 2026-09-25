@@ -5,7 +5,7 @@ use amaterasu_package::handoff::{
 use amaterasu_package::importer::{materialize_import_plan, runtime_state_directory};
 use amaterasu_package::migration::{
     LegacyConfigSource, LegacyProduct, LegacySearchPaths, ValidatedSensitiveSource,
-    analyze_legacy_configuration, discover_legacy_sources,
+    analyze_legacy_configuration, canonical_existing_source_root, discover_legacy_sources,
     import_legacy_configuration_with_sensitive_sources,
     preflight_legacy_configuration_with_sensitive_sources,
 };
@@ -105,7 +105,7 @@ fn run() -> Result<(), String> {
     if let Some(program_files) = &program_files {
         sources.extend(discover_program_files_sources(program_files)?);
     }
-    deduplicate_sources(&mut sources);
+    deduplicate_sources(&mut sources)?;
 
     match command.as_str() {
         "preflight" => {
@@ -1238,14 +1238,26 @@ fn product_directory(product: LegacyProduct) -> &'static str {
     }
 }
 
-fn deduplicate_sources(sources: &mut Vec<LegacyConfigSource>) {
+fn deduplicate_sources(sources: &mut Vec<LegacyConfigSource>) -> Result<(), String> {
+    #[derive(Ord, PartialOrd, Eq, PartialEq)]
+    enum SourceRootIdentity {
+        Existing(PathBuf),
+        Missing(PathBuf),
+    }
+
     let mut seen = BTreeSet::new();
-    sources.retain(|source| {
-        seen.insert((
-            source.product,
-            source.root.to_string_lossy().to_ascii_lowercase(),
-        ))
-    });
+    let mut unique_sources = Vec::with_capacity(sources.len());
+    for source in sources.iter() {
+        let root_identity = match canonical_existing_source_root(&source.root)? {
+            Some(root) => SourceRootIdentity::Existing(root),
+            None => SourceRootIdentity::Missing(source.root.clone()),
+        };
+        if seen.insert((source.product, root_identity)) {
+            unique_sources.push(source.clone());
+        }
+    }
+    *sources = unique_sources;
+    Ok(())
 }
 
 fn empty_plan() -> amaterasu_package::migration::ImportPlan {
@@ -1280,6 +1292,75 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod handoff_cli_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn source_deduplication_keeps_case_distinct_existing_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-migration-cli-case-roots-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let lowercase_root = root.join("profiles");
+        let uppercase_root = root.join("Profiles");
+        fs::create_dir_all(&lowercase_root).unwrap();
+        match fs::create_dir(&uppercase_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            Err(error) => panic!("failed to create case-distinct source root: {error}"),
+        }
+
+        let mut sources = vec![
+            LegacyConfigSource {
+                product: LegacyProduct::Sunshine,
+                root: lowercase_root.clone(),
+            },
+            LegacyConfigSource {
+                product: LegacyProduct::Sunshine,
+                root: uppercase_root.clone(),
+            },
+        ];
+        deduplicate_sources(&mut sources).unwrap();
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].root, lowercase_root);
+        assert_eq!(sources[1].root, uppercase_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_deduplication_keeps_distinct_missing_roots_and_deduplicates_exact_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-migration-cli-missing-roots-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let first_missing_root = root.join("missing-first");
+        let second_missing_root = root.join("missing-second");
+        let first_source = LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: first_missing_root.clone(),
+        };
+        let mut sources = vec![
+            first_source.clone(),
+            LegacyConfigSource {
+                product: LegacyProduct::Sunshine,
+                root: second_missing_root.clone(),
+            },
+            first_source,
+        ];
+
+        deduplicate_sources(&mut sources).unwrap();
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].root, first_missing_root);
+        assert_eq!(sources[1].root, second_missing_root);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn finalization_is_idempotent_and_removes_only_valid_handoff_state() {

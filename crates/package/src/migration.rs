@@ -213,7 +213,9 @@ pub fn discover_legacy_sources(
     Ok(discovered)
 }
 
-fn canonical_existing_source_root(root: &Path) -> PackageResult<Option<PathBuf>> {
+/// Returns the filesystem identity for an existing predecessor configuration root.
+/// Missing roots return `None`; unsafe roots and other filesystem errors fail.
+pub fn canonical_existing_source_root(root: &Path) -> PackageResult<Option<PathBuf>> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
