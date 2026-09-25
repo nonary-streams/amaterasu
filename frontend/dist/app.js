@@ -434,6 +434,7 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const SESSION_STORAGE_VERSION = 1;
     class ApiError extends Error {
         code;
         status;
@@ -449,10 +450,14 @@ var Amaterasu;
         refreshToken = "";
         accessExpiresAt = 0;
         authGeneration = 0;
+        persistenceGeneration = 0;
         tokenGeneration = 0;
         refreshInFlight = null;
         requests = new Set();
         base;
+        storageKey;
+        refreshLockName;
+        remembered = false;
         onAuthenticationLost = null;
         subject = "";
         scopes = null;
@@ -465,11 +470,33 @@ var Amaterasu;
                 url.hash)
                 throw new Error("The API address must be an HTTP(S) origin.");
             this.base = url.origin;
+            this.storageKey = `amaterasu.session.${encodeURIComponent(this.base)}`;
+            this.refreshLockName = `amaterasu.session.refresh:${this.base}`;
+            if (typeof window !== "undefined" &&
+                typeof window.addEventListener === "function") {
+                window.addEventListener("storage", (event) => this.handleStorageChange(event));
+            }
         }
         async login(username, password, rememberMe = false) {
             const generation = this.authGeneration;
             const reply = await this.post("auth/login", { username, password, remember_me: rememberMe }, false);
-            this.installSession(reply, generation, true);
+            this.installSession(reply, generation, true, rememberMe);
+        }
+        async restoreSession() {
+            this.resetMemory(true);
+            const stored = this.readStoredSession();
+            if (!stored)
+                return false;
+            this.installStoredSession(stored);
+            const generation = this.authGeneration;
+            const token = this.refreshToken;
+            const persistenceGeneration = this.persistenceGeneration;
+            if (stored.expires_at - Date.now() / 1000 <= 60)
+                await this.refreshOrClear(generation, token, persistenceGeneration);
+            return generation === this.authGeneration && this.bearer !== "";
+        }
+        suspend() {
+            this.resetMemory(false);
         }
         useToken(token) {
             if (!/^ama_[a-f0-9]{64}$/.test(token))
@@ -481,32 +508,43 @@ var Amaterasu;
             this.tokenGeneration += 1;
         }
         async logout() {
-            const payload = this.refreshToken
-                ? { refresh_token: this.refreshToken }
-                : this.bearer
-                    ? { bearer: this.bearer }
-                    : null;
-            this.clear();
-            if (payload) {
+            const refreshTokens = new Set();
+            const bearerToken = this.refreshToken ? "" : this.bearer;
+            if (this.refreshToken)
+                refreshTokens.add(this.refreshToken);
+            const storedBeforeLogout = this.readStoredSessionForCleanup(refreshTokens);
+            this.resetMemory(true);
+            this.removeStoredSessionBestEffort();
+            const locks = this.webLocks();
+            if (locks) {
                 try {
-                    await this.post("auth/logout", payload, false);
+                    await locks.request(this.refreshLockName, { mode: "exclusive" }, () => {
+                        const latest = this.readStoredSessionForCleanup(new Set());
+                        if (latest &&
+                            storedBeforeLogout &&
+                            this.sameSessionIdentity(latest, storedBeforeLogout)) {
+                            refreshTokens.add(latest.refresh_token);
+                            this.removeStoredSessionBestEffort();
+                        }
+                    });
                 }
                 catch {
                 }
             }
+            for (const refreshToken of refreshTokens) {
+                await this.revokeSession({ refresh_token: refreshToken });
+            }
+            if (bearerToken)
+                await this.revokeSession({ bearer: bearerToken });
         }
         clear() {
-            this.authGeneration += 1;
-            this.tokenGeneration += 1;
-            this.bearer = "";
-            this.refreshToken = "";
-            this.accessExpiresAt = 0;
-            this.subject = "";
-            this.scopes = null;
-            this.refreshInFlight = null;
-            for (const request of this.requests)
-                request.abort();
-            this.requests.clear();
+            const staleRefreshTokens = new Set();
+            if (this.refreshToken)
+                staleRefreshTokens.add(this.refreshToken);
+            const storedBeforeClear = this.readStoredSessionForCleanup(staleRefreshTokens);
+            this.resetMemory(true);
+            this.removeStoredSessionBestEffort();
+            this.scheduleStoredSessionRemoval(staleRefreshTokens, storedBeforeClear);
         }
         allows(scope) {
             return this.scopes === null || this.scopes.includes(scope);
@@ -519,6 +557,8 @@ var Amaterasu;
                 this.accessExpiresAt - Date.now() / 1000 <= 60) {
                 await this.refreshOrClear();
             }
+            if (protectedRoute && !this.bearer)
+                throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const bearerUsed = this.bearer;
             const authGeneration = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
@@ -535,15 +575,20 @@ var Amaterasu;
                 }
                 if (tokenGeneration === this.tokenGeneration)
                     await this.refreshOrClear();
+                if (authGeneration !== this.authGeneration || !this.bearer)
+                    throw error;
                 return this.send(route, payload, true, this.bearer);
             }
         }
-        async refreshOrClear() {
+        async refreshOrClear(expectedGeneration = this.authGeneration, expectedToken = this.refreshToken, expectedPersistenceGeneration = this.persistenceGeneration) {
             try {
                 await this.refreshSession();
             }
             catch (error) {
-                if (this.refreshToken) {
+                if (this.refreshToken &&
+                    expectedGeneration === this.authGeneration &&
+                    expectedToken === this.refreshToken &&
+                    expectedPersistenceGeneration === this.persistenceGeneration) {
                     this.clear();
                     this.onAuthenticationLost?.();
                 }
@@ -556,13 +601,12 @@ var Amaterasu;
             if (!this.refreshToken)
                 throw new ApiError("Sign in again to continue.", "unauthorized", 401);
             const generation = this.authGeneration;
+            const persistenceGeneration = this.persistenceGeneration;
             const token = this.refreshToken;
-            const pending = (async () => {
-                const reply = await this.send("auth/refresh", { refresh_token: token }, false, "");
-                if (generation !== this.authGeneration || token !== this.refreshToken)
-                    throw new Error("The sign-in session was cleared.");
-                this.installSession(reply, generation, false);
-            })();
+            const suspendGeneration = this.authGeneration;
+            const pending = this.remembered
+                ? this.refreshRememberedSession(generation, persistenceGeneration, suspendGeneration, token)
+                : this.refreshMemorySession(generation, suspendGeneration, token);
             this.refreshInFlight = pending;
             try {
                 await pending;
@@ -572,9 +616,118 @@ var Amaterasu;
                     this.refreshInFlight = null;
             }
         }
-        installSession(reply, generation, newSession) {
+        async refreshMemorySession(generation, suspendGeneration, token) {
+            const reply = await this.send("auth/refresh", { refresh_token: token }, false, "");
+            const validated = this.validateSession(reply);
+            if (generation !== this.authGeneration || token !== this.refreshToken) {
+                void this.revokeSession({ refresh_token: validated.refresh_token });
+                return;
+            }
+            if (suspendGeneration !== this.authGeneration)
+                return;
+            this.applyValidatedSession(validated, false);
+        }
+        async refreshRememberedSession(generation, persistenceGeneration, suspendGeneration, token) {
+            const locks = this.webLocks();
+            if (!locks)
+                throw new ApiError("This browser cannot safely refresh a remembered session. Use a browser with Web Locks or sign in without Remember me.", "refresh_lock_unavailable", 503);
+            await locks.request(this.refreshLockName, { mode: "exclusive" }, async () => {
+                if (generation !== this.authGeneration ||
+                    persistenceGeneration !== this.persistenceGeneration)
+                    return;
+                const stored = this.readStoredSession();
+                if (!stored) {
+                    throw new ApiError("Sign in again to continue.", "unauthorized", 401);
+                }
+                if (stored.refresh_token !== token ||
+                    stored.bearer !== this.bearer) {
+                    this.installStoredSession(stored);
+                    return;
+                }
+                const refreshingRecord = {
+                    ...stored,
+                    refreshing: true,
+                };
+                this.writeStoredSession(refreshingRecord);
+                let reply;
+                try {
+                    reply = await this.send("auth/refresh", { refresh_token: token }, false, "");
+                }
+                catch (error) {
+                    throw error;
+                }
+                const validated = this.validateSession(reply);
+                const currentRaw = this.readStoredSessionRaw();
+                const expectedRaw = JSON.stringify(refreshingRecord);
+                if (currentRaw !== expectedRaw ||
+                    persistenceGeneration !== this.persistenceGeneration) {
+                    void this.revokeSession({ refresh_token: validated.refresh_token });
+                    const latest = currentRaw
+                        ? this.parseStoredSession(currentRaw, false)
+                        : null;
+                    if (latest &&
+                        generation === this.authGeneration &&
+                        persistenceGeneration === this.persistenceGeneration) {
+                        this.installStoredSession(latest);
+                        return;
+                    }
+                    if (generation === this.authGeneration) {
+                        throw new ApiError("Sign in again to continue.", "unauthorized", 401);
+                    }
+                    return;
+                }
+                const rotatedRecord = this.storedSession(validated, stored.session_id);
+                this.writeStoredSession(rotatedRecord);
+                if (generation === this.authGeneration &&
+                    suspendGeneration === this.authGeneration &&
+                    persistenceGeneration === this.persistenceGeneration) {
+                    this.applyValidatedSession(validated, true);
+                }
+            });
+        }
+        installSession(reply, generation, newSession, rememberRequested) {
             if (generation !== this.authGeneration)
                 throw new Error("The sign-in attempt was cancelled.");
+            const validated = this.validateSession(reply);
+            const shouldRemember = rememberRequested && validated.remember_me;
+            if (newSession) {
+                try {
+                    if (shouldRemember) {
+                        this.writeStoredSession(this.storedSession(validated));
+                    }
+                    else {
+                        try {
+                            const storage = this.storage(false);
+                            if (storage) {
+                                const staleRefreshTokens = new Set();
+                                const storedBeforeClear = this.readStoredSessionForCleanup(staleRefreshTokens);
+                                this.removeStoredSessionRequired();
+                                this.scheduleStoredSessionRemoval(staleRefreshTokens, storedBeforeClear);
+                            }
+                        }
+                        catch (error) {
+                            if (!(error instanceof ApiError) ||
+                                error.code !== "storage_access_unavailable")
+                                throw error;
+                        }
+                    }
+                }
+                catch (error) {
+                    this.clear();
+                    if (shouldRemember)
+                        void this.revokeSession({ refresh_token: validated.refresh_token });
+                    throw error;
+                }
+            }
+            if (generation !== this.authGeneration)
+                throw new Error("The sign-in attempt was cancelled.");
+            this.applyValidatedSession(validated, shouldRemember);
+            if (newSession) {
+                this.authGeneration += 1;
+                this.persistenceGeneration += 1;
+            }
+        }
+        validateSession(reply) {
             if (!/^ama_[a-f0-9]{64}$/.test(reply.bearer) ||
                 !/^ama_[a-f0-9]{64}$/.test(reply.refresh_token) ||
                 typeof reply.subject !== "string" ||
@@ -587,14 +740,279 @@ var Amaterasu;
                 typeof reply.remember_me !== "boolean") {
                 throw new ApiError("The host returned an invalid authentication response.", "invalid_response", 502);
             }
-            this.bearer = reply.bearer;
-            this.refreshToken = reply.refresh_token;
-            this.accessExpiresAt = reply.expires_at;
-            this.subject = reply.subject;
-            this.scopes = reply.scopes;
+            return {
+                bearer: reply.bearer,
+                refresh_token: reply.refresh_token,
+                subject: reply.subject,
+                scopes: [...reply.scopes],
+                expires_at: reply.expires_at,
+                refresh_expires_at: reply.refresh_expires_at,
+                remember_me: reply.remember_me,
+            };
+        }
+        applyValidatedSession(session, remembered) {
+            this.bearer = session.bearer;
+            this.refreshToken = session.refresh_token;
+            this.accessExpiresAt = session.expires_at;
+            this.subject = session.subject;
+            this.scopes = [...session.scopes];
+            this.remembered = remembered;
             this.tokenGeneration += 1;
-            if (newSession)
-                this.authGeneration += 1;
+        }
+        installStoredSession(session) {
+            this.applyValidatedSession(session, true);
+        }
+        storedSession(session, sessionId = this.newSessionId()) {
+            return {
+                ...session,
+                remember_me: true,
+                version: SESSION_STORAGE_VERSION,
+                base: this.base,
+                session_id: sessionId,
+                refreshing: false,
+            };
+        }
+        newSessionId() {
+            const bytes = crypto.getRandomValues(new Uint8Array(16));
+            bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+            bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+            const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+            return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        }
+        readStoredSession() {
+            const raw = this.readStoredSessionRaw();
+            if (raw === null)
+                return null;
+            const stored = this.parseStoredSession(raw, false);
+            if (stored)
+                return stored;
+            this.removeStoredSessionRequired();
+            return null;
+        }
+        readStoredSessionRaw() {
+            const storage = this.storage(false);
+            if (!storage)
+                return null;
+            try {
+                return storage.getItem(this.storageKey);
+            }
+            catch {
+                throw this.storageError();
+            }
+        }
+        parseStoredSession(raw, allowRefreshing) {
+            let value;
+            try {
+                value = JSON.parse(raw);
+            }
+            catch {
+                return null;
+            }
+            if (!value || typeof value !== "object")
+                return null;
+            const record = value;
+            if (record.version !== SESSION_STORAGE_VERSION ||
+                record.base !== this.base ||
+                typeof record.session_id !== "string" ||
+                !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(record.session_id) ||
+                record.remember_me !== true ||
+                (record.refreshing !== false &&
+                    !(allowRefreshing && record.refreshing === true)) ||
+                typeof record.bearer !== "string" ||
+                !/^ama_[a-f0-9]{64}$/.test(record.bearer) ||
+                typeof record.refresh_token !== "string" ||
+                !/^ama_[a-f0-9]{64}$/.test(record.refresh_token) ||
+                typeof record.subject !== "string" ||
+                !Array.isArray(record.scopes) ||
+                !record.scopes.every((scope) => typeof scope === "string") ||
+                !Number.isSafeInteger(record.expires_at) ||
+                !Number.isSafeInteger(record.refresh_expires_at) ||
+                record.expires_at <= 0 ||
+                record.refresh_expires_at <
+                    record.expires_at ||
+                record.refresh_expires_at <= Date.now() / 1000) {
+                return null;
+            }
+            return record;
+        }
+        writeStoredSession(session) {
+            const storage = this.storage(true);
+            if (!storage)
+                throw this.storageError();
+            try {
+                storage.setItem(this.storageKey, JSON.stringify(session));
+            }
+            catch {
+                throw this.storageError();
+            }
+        }
+        removeStoredSessionRequired() {
+            const storage = this.storage(false);
+            if (!storage)
+                return;
+            try {
+                storage.removeItem(this.storageKey);
+            }
+            catch {
+                try {
+                    storage.setItem(this.storageKey, "{}");
+                }
+                catch {
+                    throw this.storageError();
+                }
+            }
+        }
+        removeStoredSessionBestEffort() {
+            let storage;
+            try {
+                storage = this.storage(false);
+            }
+            catch {
+                return;
+            }
+            if (!storage)
+                return;
+            try {
+                storage.removeItem(this.storageKey);
+            }
+            catch {
+                try {
+                    storage.setItem(this.storageKey, "{}");
+                }
+                catch {
+                }
+            }
+        }
+        scheduleStoredSessionRemoval(staleRefreshTokens, session) {
+            const locks = this.webLocks();
+            if (!locks)
+                return;
+            void locks
+                .request(this.refreshLockName, { mode: "exclusive" }, () => {
+                try {
+                    const raw = this.readStoredSessionRaw();
+                    if (raw === null)
+                        return;
+                    const current = this.parseStoredSession(raw, true);
+                    if (!current ||
+                        staleRefreshTokens.has(current.refresh_token) ||
+                        (session !== null && this.sameSessionIdentity(current, session)))
+                        this.removeStoredSessionBestEffort();
+                }
+                catch {
+                }
+            })
+                .catch(() => undefined);
+        }
+        readStoredSessionForCleanup(tokens) {
+            try {
+                const raw = this.readStoredSessionRaw();
+                if (raw === null)
+                    return null;
+                const stored = this.parseStoredSession(raw, true);
+                if (stored) {
+                    tokens.add(stored.refresh_token);
+                    return stored;
+                }
+            }
+            catch {
+            }
+            return null;
+        }
+        sameSessionIdentity(left, right) {
+            return (left.base === right.base && left.session_id === right.session_id);
+        }
+        async revokeSession(payload) {
+            try {
+                await this.send("auth/logout", payload, false, "");
+            }
+            catch {
+            }
+        }
+        webLocks() {
+            if (typeof navigator === "undefined")
+                return null;
+            try {
+                return navigator.locks ?? null;
+            }
+            catch {
+                return null;
+            }
+        }
+        storage(required) {
+            if (typeof localStorage === "undefined") {
+                if (required)
+                    throw this.storageError();
+                return null;
+            }
+            try {
+                return localStorage;
+            }
+            catch {
+                throw this.storageAccessError();
+            }
+        }
+        storageError() {
+            return new ApiError("Browser storage is unavailable. Sign in again when storage is enabled.", "storage_unavailable", 503);
+        }
+        storageAccessError() {
+            return new ApiError("Browser storage is unavailable. Sign in again when storage is enabled.", "storage_access_unavailable", 503);
+        }
+        handleStorageChange(event) {
+            if (event.key !== this.storageKey)
+                return;
+            let currentRaw;
+            try {
+                currentRaw = this.readStoredSessionRaw();
+            }
+            catch {
+                if (this.remembered) {
+                    this.resetMemory(true);
+                    this.onAuthenticationLost?.();
+                }
+                return;
+            }
+            if (currentRaw === null) {
+                if (this.remembered) {
+                    this.resetMemory(true);
+                    this.onAuthenticationLost?.();
+                }
+                return;
+            }
+            const stored = this.parseStoredSession(currentRaw, true);
+            if (!stored) {
+                if (this.remembered) {
+                    this.resetMemory(true);
+                    this.onAuthenticationLost?.();
+                }
+                try {
+                    if (this.readStoredSessionRaw() === currentRaw)
+                        this.removeStoredSessionBestEffort();
+                }
+                catch {
+                }
+                return;
+            }
+            if (stored.refreshing)
+                return;
+            if (this.remembered)
+                this.installStoredSession(stored);
+        }
+        resetMemory(invalidatePersistence) {
+            this.authGeneration += 1;
+            this.tokenGeneration += 1;
+            if (invalidatePersistence)
+                this.persistenceGeneration += 1;
+            this.bearer = "";
+            this.refreshToken = "";
+            this.accessExpiresAt = 0;
+            this.subject = "";
+            this.scopes = null;
+            this.remembered = false;
+            this.refreshInFlight = null;
+            for (const request of this.requests)
+                request.abort();
+            this.requests.clear();
         }
         async send(route, payload, protectedRoute, bearer) {
             const controller = new AbortController();
@@ -4097,6 +4515,7 @@ var Amaterasu;
         navigation = new Map();
         notification = Amaterasu.el("div");
         notificationTimer = 0;
+        restorationGeneration = 0;
         constructor() {
             this.root = document.getElementById("app");
             document
@@ -4119,14 +4538,44 @@ var Amaterasu;
                 if (this.signedIn)
                     this.renderPage(this.currentPage());
             });
-            window.addEventListener("pagehide", () => this.api.clear());
+            window.addEventListener("pagehide", () => this.api.suspend());
             window.addEventListener("pageshow", (event) => {
                 if (event.persisted) {
-                    this.api.clear();
-                    this.loginScreen();
+                    void this.restoreRememberedSession();
                 }
             });
-            this.loginScreen();
+            void this.restoreRememberedSession();
+        }
+        async restoreRememberedSession() {
+            const generation = ++this.restorationGeneration;
+            this.sessionRestoringScreen();
+            let restored = false;
+            try {
+                restored = await this.api.restoreSession();
+            }
+            catch {
+            }
+            if (generation !== this.restorationGeneration)
+                return;
+            if (restored)
+                this.shell();
+            else
+                this.loginScreen();
+        }
+        sessionRestoringScreen() {
+            this.signedIn = false;
+            const main = Amaterasu.el("main", "login-layout");
+            main.id = "main";
+            main.tabIndex = -1;
+            main.setAttribute("aria-busy", "true");
+            const intro = Amaterasu.el("section", "login-intro", this.brand(), Amaterasu.el("div", "", Amaterasu.badge("LOCAL HOST MANAGEMENT", "accent"), Amaterasu.el("h1", "", "Your host.\nWithin reach."), Amaterasu.el("p", "", "Checking for a remembered session.")));
+            const status = Amaterasu.el("section", "login-card", Amaterasu.el("p", "eyebrow", "WELCOME BACK"), Amaterasu.el("h2", "", "Restoring your session"), Amaterasu.el("p", "muted", "Please wait while we check this browser."));
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            status.setAttribute("aria-atomic", "true");
+            main.append(intro, Amaterasu.el("div", "login-side", status));
+            this.root.replaceChildren(main);
+            document.title = "Restoring session · Amaterasu";
         }
         currentPage() {
             const value = location.hash.slice(1);
@@ -4153,7 +4602,7 @@ var Amaterasu;
             password.autocomplete = "current-password";
             password.required = true;
             const rememberMe = Amaterasu.input("remember_me", "", "checkbox");
-            const rememberField = Amaterasu.field("Remember this tab", rememberMe, "Use the longer refresh lifetime; tokens still stay in memory.");
+            const rememberField = Amaterasu.field("Remember this browser", rememberMe, "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Safe refresh requires Web Locks in a secure browser context; without them, sign in again when refresh is needed.");
             const token = Amaterasu.input("token", "", "password");
             token.autocomplete = "off";
             token.spellcheck = false;
@@ -4198,7 +4647,7 @@ var Amaterasu;
                 });
             });
             const setup = Amaterasu.el("details", "setup-note", Amaterasu.el("summary", "", "First time setting up this host?"), Amaterasu.el("p", "", "An administrator must create the initial credentials through the trusted local console. Password setup is not available in this browser."), Amaterasu.el("p", "muted", "The management listener must be enabled and this browser origin allowed. Contact the person who configured the host."));
-            card.append(form, setup, Amaterasu.el("div", "login-security", Amaterasu.el("span", "status-dot"), Amaterasu.el("span", "", "Tokens stay in this tab’s memory. Reloading signs you out.")));
+            card.append(form, setup, Amaterasu.el("div", "login-security", Amaterasu.el("span", "status-dot"), Amaterasu.el("span", "", "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.")));
             main.append(intro, Amaterasu.el("div", "login-side", card));
             this.root.replaceChildren(main);
             username.focus();

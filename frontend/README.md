@@ -34,8 +34,10 @@ browser API calls.
 ## Implemented workflows
 
 - Administrator username/password login with an optional remembered session, or
-  existing scoped API token sign-in. Administrator sessions silently rotate their
-  access and refresh pair as needed for requests while the tab remains open.
+  existing scoped API token sign-in. A remembered session is restored before the
+  authenticated shell appears and when the browser returns the page from its
+  back/forward cache. Administrator sessions silently rotate their access and
+  refresh pair as needed for requests while the tab remains open.
   First-run instructions explain that initial credentials must be created through
   the trusted local console. There is no browser password bootstrap.
 - Overview shows actual responses from catalog, sessions, applications, and Steam.
@@ -70,18 +72,32 @@ checked locally and the server authenticates every subsequent request.
 
 ## Browser security and accessibility
 
-Bearer tokens exist only in the API client's memory. There is no localStorage,
-sessionStorage, IndexedDB, cookie auth, credential logging, URL token, or persistent
-login cache. Reload and page departure clear the tokens; restoring from browser
-back/forward cache returns to login. Sign-out immediately clears the browser
-session and sends a best-effort revocation using the refresh token. If the page is
-reloaded or closed before revocation completes, the server session remains valid
-until its absolute refresh expiry or trusted-administrator revocation. Signing out
-with an API token does not revoke that token.
+Non-remembered administrator bearer tokens exist only in the API client's memory.
+Scoped API-token sign-in also stays memory-only and is never written to the
+remembered administrator-session record. With Remember this browser enabled, the
+raw administrator access and refresh token pair is stored together in one browser
+`localStorage` record. That record persists across page reloads and browser
+restarts, subject to the refresh token's server expiry. Same-origin scripts can
+read browser storage, so this is not HttpOnly protection. Native modules are
+trusted code; browser token storage is not a native-code sandbox. The backend
+persists token digests only, never the raw token values. Remembered administrator
+sessions can survive a management-module restart while the refresh token remains
+valid. Cross-tab refresh coordination requires Web Locks in a secure browser
+context. Without Web Locks, the browser fails closed and must sign in again when
+a refresh is needed.
 
-Remember me selects the configured longer refresh lifetime. It does not persist
-authentication across a page reload or browser restart. The backend currently
-keeps sessions only in module memory, so a module restart also requires login.
+Page departure clears in-memory credentials while preserving a valid remembered
+pair. Returning through the browser back/forward cache runs the same remembered
+session restore flow before showing the authenticated shell. If a refresh is
+ambiguous during suspension, it is not replayed. Sign-out immediately clears the
+browser credentials through `Api.logout()` and sends a best-effort revocation
+using the refresh token. If the page is reloaded or closed before revocation
+completes, the server session remains valid until its absolute refresh expiry or
+trusted-administrator revocation. Signing out with an API token does not revoke
+that token.
+
+Remember me also selects the configured longer refresh lifetime. Without it, the
+browser keeps administrator session tokens in memory only.
 
 Requests use POST JSON, Authorization Bearer, omitted cookies, no-store caching,
 and a 12-second browser timeout. An explicit unauthorized response may cause one

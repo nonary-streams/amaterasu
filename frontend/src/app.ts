@@ -26,6 +26,7 @@ namespace Amaterasu {
     private navigation = new Map<Page, HTMLButtonElement>();
     private notification = el("div");
     private notificationTimer = 0;
+    private restorationGeneration = 0;
 
     constructor() {
       this.root = document.getElementById("app")!;
@@ -52,14 +53,60 @@ namespace Amaterasu {
       window.addEventListener("hashchange", () => {
         if (this.signedIn) this.renderPage(this.currentPage());
       });
-      window.addEventListener("pagehide", () => this.api.clear());
+      window.addEventListener("pagehide", () => this.api.suspend());
       window.addEventListener("pageshow", (event) => {
         if (event.persisted) {
-          this.api.clear();
-          this.loginScreen();
+          void this.restoreRememberedSession();
         }
       });
-      this.loginScreen();
+      void this.restoreRememberedSession();
+    }
+
+    private async restoreRememberedSession(): Promise<void> {
+      const generation = ++this.restorationGeneration;
+      this.sessionRestoringScreen();
+      let restored = false;
+      try {
+        restored = await this.api.restoreSession();
+      } catch {
+        // An unavailable or expired remembered session returns to sign-in.
+      }
+      if (generation !== this.restorationGeneration) return;
+      if (restored) this.shell();
+      else this.loginScreen();
+    }
+
+    private sessionRestoringScreen(): void {
+      this.signedIn = false;
+      const main = el("main", "login-layout");
+      main.id = "main";
+      main.tabIndex = -1;
+      main.setAttribute("aria-busy", "true");
+      const intro = el(
+        "section",
+        "login-intro",
+        this.brand(),
+        el(
+          "div",
+          "",
+          badge("LOCAL HOST MANAGEMENT", "accent"),
+          el("h1", "", "Your host.\nWithin reach."),
+          el("p", "", "Checking for a remembered session."),
+        ),
+      );
+      const status = el(
+        "section",
+        "login-card",
+        el("p", "eyebrow", "WELCOME BACK"),
+        el("h2", "", "Restoring your session"),
+        el("p", "muted", "Please wait while we check this browser."),
+      );
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      status.setAttribute("aria-atomic", "true");
+      main.append(intro, el("div", "login-side", status));
+      this.root.replaceChildren(main);
+      document.title = "Restoring session · Amaterasu";
     }
 
     private currentPage(): Page {
@@ -114,9 +161,9 @@ namespace Amaterasu {
       password.required = true;
       const rememberMe = input("remember_me", "", "checkbox");
       const rememberField = field(
-        "Remember this tab",
+        "Remember this browser",
         rememberMe,
-        "Use the longer refresh lifetime; tokens still stay in memory.",
+        "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Safe refresh requires Web Locks in a secure browser context; without them, sign in again when refresh is needed.",
       );
       const token = input("token", "", "password");
       token.autocomplete = "off";
@@ -210,7 +257,7 @@ namespace Amaterasu {
           el(
             "span",
             "",
-            "Tokens stay in this tab’s memory. Reloading signs you out.",
+            "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.",
           ),
         ),
       );
