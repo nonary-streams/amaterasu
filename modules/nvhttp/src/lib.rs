@@ -100,6 +100,8 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         audio_sink_capture_only: FieldUpdate<bool>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
+        nvenc_spatial_aq: FieldUpdate<bool>,
+        #[serde(default, deserialize_with = "deserialize_field_update")]
         external_ip: FieldUpdate<String>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         stream_audio: FieldUpdate<bool>,
@@ -529,6 +531,7 @@ impl NvhttpModule {
                                 audio_sink,
                                 virtual_sink,
                                 audio_sink_capture_only,
+                                nvenc_spatial_aq,
                                 external_ip,
                                 stream_audio,
                                 capture,
@@ -578,6 +581,7 @@ impl NvhttpModule {
                                     audio_sink,
                                     virtual_sink,
                                     audio_sink_capture_only,
+                                    nvenc_spatial_aq,
                                     external_ip,
                                     stream_audio,
                                     capture,
@@ -786,6 +790,7 @@ mod tests {
             ping_timeout_ms: omitted_ping_timeout,
             lan_encryption_mode: omitted_lan_encryption,
             wan_encryption_mode: omitted_wan_encryption,
+            nvenc_spatial_aq: omitted_nvenc_spatial_aq,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
@@ -807,6 +812,7 @@ mod tests {
         assert_eq!(omitted_ping_timeout, FieldUpdate::Omitted);
         assert_eq!(omitted_lan_encryption, FieldUpdate::Omitted);
         assert_eq!(omitted_wan_encryption, FieldUpdate::Omitted);
+        assert_eq!(omitted_nvenc_spatial_aq, FieldUpdate::Omitted);
 
         let Operation::SettingsUpdate {
             address_family: reset_family,
@@ -822,12 +828,13 @@ mod tests {
             ping_timeout_ms: null_ping_timeout,
             lan_encryption_mode: null_lan_encryption,
             wan_encryption_mode: null_wan_encryption,
+            nvenc_spatial_aq: null_nvenc_spatial_aq,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":null,"bind_address":"","output_name":null,"audio_sink":null,"stream_audio":null,"capture":null,
             "video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,
-            "lan_encryption_mode":null,"wan_encryption_mode":null
+            "lan_encryption_mode":null,"wan_encryption_mode":null,"nvenc_spatial_aq":null
         }))
         .unwrap()
         else {
@@ -846,6 +853,7 @@ mod tests {
         assert_eq!(null_ping_timeout, FieldUpdate::Null);
         assert_eq!(null_lan_encryption, FieldUpdate::Null);
         assert_eq!(null_wan_encryption, FieldUpdate::Null);
+        assert_eq!(null_nvenc_spatial_aq, FieldUpdate::Null);
 
         let Operation::SettingsUpdate {
             address_family: family,
@@ -861,12 +869,13 @@ mod tests {
             ping_timeout_ms,
             lan_encryption_mode,
             wan_encryption_mode,
+            nvenc_spatial_aq,
             ..
         } = serde_json::from_value(json!({
             "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
             "address_family":"both","bind_address":"::1","output_name":"stable-display-id","audio_sink":"render.selected","stream_audio":false,"capture":"wgcc",
             "video_max_batch_size_kb":32,"max_bitrate":-15000,"minimum_fps_target":23.5,"wgc_pacing_smoothing":false,"ping_timeout_ms":-1,
-            "lan_encryption_mode":2,"wan_encryption_mode":0
+            "lan_encryption_mode":2,"wan_encryption_mode":0,"nvenc_spatial_aq":false
         }))
         .unwrap()
         else {
@@ -885,6 +894,7 @@ mod tests {
         assert_eq!(ping_timeout_ms, FieldUpdate::Value(-1));
         assert_eq!(lan_encryption_mode, FieldUpdate::Value(2));
         assert_eq!(wan_encryption_mode, FieldUpdate::Value(0));
+        assert_eq!(nvenc_spatial_aq, FieldUpdate::Value(false));
 
         assert!(
             serde_json::from_value::<Operation>(json!({
@@ -893,6 +903,15 @@ mod tests {
             }))
             .is_err()
         );
+        for invalid in [json!(0), json!("false")] {
+            assert!(
+                serde_json::from_value::<Operation>(json!({
+                    "action":"settings_update","hostname":"Host","port":48000,
+                    "expected_revision":2,"nvenc_spatial_aq":invalid
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

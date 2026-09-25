@@ -56,6 +56,7 @@ pub(crate) enum AdminAction {
         audio_sink: FieldUpdate<String>,
         virtual_sink: FieldUpdate<String>,
         audio_sink_capture_only: FieldUpdate<bool>,
+        nvenc_spatial_aq: FieldUpdate<bool>,
         external_ip: FieldUpdate<String>,
         stream_audio: FieldUpdate<bool>,
         capture: FieldUpdate<CaptureMode>,
@@ -990,6 +991,7 @@ impl ProductSettings {
                 audio_sink,
                 virtual_sink,
                 audio_sink_capture_only,
+                nvenc_spatial_aq,
                 external_ip,
                 stream_audio,
                 capture,
@@ -1073,7 +1075,7 @@ impl ProductSettings {
                     }
                 };
                 let nvenc_spatial_aq =
-                    apply_nvenc_spatial_aq_update(FieldUpdate::Omitted, self.nvenc_spatial_aq);
+                    apply_nvenc_spatial_aq_update(nvenc_spatial_aq, self.nvenc_spatial_aq);
                 let external_ip = match apply_external_ip_update(
                     external_ip,
                     self.configured_external_ip.clone(),
@@ -3461,7 +3463,7 @@ mod tests {
     }
 
     #[test]
-    fn external_ip_admin_update_persists_and_reads_back_exact_text() {
+    fn external_ip_and_nvenc_admin_updates_persist_and_read_back() {
         let target = NetworkTarget::from(settings::DEFAULT_PORT);
         let initial_update = product_update_payload(
             4,
@@ -3472,7 +3474,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
-                nvenc_spatial_aq: false,
+                nvenc_spatial_aq: true,
                 external_ip: Some("198.51.100.7".into()),
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -3513,6 +3515,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Value(false),
                     external_ip: FieldUpdate::Value(external_ip.into()),
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
@@ -3537,6 +3540,7 @@ mod tests {
         assert_eq!(pending.payload["version"], initial_document["version"]);
         assert_eq!(pending.payload["expected_revision"], 4);
         assert_eq!(pending.payload["values"]["external_ip"], external_ip);
+        assert_eq!(pending.payload["values"]["nvenc_spatial_aq"], false);
 
         let confirmation = v17_update_confirmation(json!({
             "ok":true,
@@ -3555,6 +3559,7 @@ mod tests {
             .expect("settings response")
             .payload;
         assert_eq!(readback["configured_external_ip"], external_ip);
+        assert_eq!(readback["nvenc_spatial_aq"], false);
         assert_eq!(readback["revision"], 5);
 
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
@@ -3563,6 +3568,7 @@ mod tests {
             restarted.settings_payload()["configured_external_ip"],
             external_ip
         );
+        assert_eq!(restarted.settings_payload()["nvenc_spatial_aq"], false);
     }
 
     #[test]
@@ -3706,6 +3712,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -3807,6 +3814,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Value(true),
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
@@ -3878,6 +3886,7 @@ mod tests {
                     audio_sink: FieldUpdate::Value("render.selected".into()),
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
@@ -3948,6 +3957,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -4029,6 +4039,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -4636,6 +4647,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
@@ -5283,6 +5295,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -5421,6 +5434,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -5642,6 +5656,7 @@ mod tests {
                         audio_sink: FieldUpdate::Omitted,
                         virtual_sink: FieldUpdate::Omitted,
                         audio_sink_capture_only: FieldUpdate::Omitted,
+                        nvenc_spatial_aq: FieldUpdate::Omitted,
                         external_ip: FieldUpdate::Omitted,
                         stream_audio: FieldUpdate::Omitted,
                         capture: FieldUpdate::Omitted,
@@ -5717,6 +5732,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Omitted,
@@ -5763,6 +5779,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Null,
                     capture: FieldUpdate::Omitted,
@@ -5812,6 +5829,7 @@ mod tests {
                     audio_sink: FieldUpdate::Omitted,
                     virtual_sink: FieldUpdate::Omitted,
                     audio_sink_capture_only: FieldUpdate::Omitted,
+                    nvenc_spatial_aq: FieldUpdate::Omitted,
                     external_ip: FieldUpdate::Omitted,
                     stream_audio: FieldUpdate::Omitted,
                     capture: FieldUpdate::Value(CaptureMode::Wgcc),
