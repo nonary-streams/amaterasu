@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Deserialize)]
@@ -107,6 +108,12 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct PrepareConfig {
     pub peer_ip: IpAddr,
+    /// Frozen launch policy; retained with the prepared operation for retries.
+    #[serde(default)]
+    pub frame_limiter_settings: Option<Value>,
+    /// Exact executable selected by the authenticated Catalog launch preflight.
+    #[serde(default)]
+    pub frame_limiter_executable_path: Option<String>,
     #[serde(default)]
     pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     #[serde(default)]
@@ -142,6 +149,7 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        self.validate_frame_limiter_snapshot()?;
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
@@ -150,6 +158,27 @@ impl PrepareConfig {
         self.validate_identity()?;
         self.audio.validate()?;
         self.video.validate()
+    }
+
+    fn validate_frame_limiter_snapshot(&self) -> Result<(), &'static str> {
+        match (
+            &self.frame_limiter_settings,
+            &self.frame_limiter_executable_path,
+        ) {
+            (None, None) => Ok(()),
+            (Some(snapshot), Some(path)) => {
+                if path.trim().is_empty()
+                    || path.len() > 4096
+                    || path.chars().any(char::is_control)
+                    || snapshot.get("version").and_then(Value::as_u64) != Some(1)
+                    || !valid_frame_limiter_settings(snapshot)
+                {
+                    return Err("invalid_frame_limiter_snapshot");
+                }
+                Ok(())
+            }
+            _ => Err("invalid_frame_limiter_snapshot"),
+        }
     }
 
     fn validate_destination(&self, allow_remote: bool) -> Result<(), &'static str> {
@@ -198,6 +227,113 @@ impl PrepareConfig {
         }
         Ok(())
     }
+}
+
+fn valid_frame_limiter_settings(snapshot: &Value) -> bool {
+    let Some(fields) = snapshot.as_object() else {
+        return false;
+    };
+    let Some(settings) = fields.get("settings").and_then(Value::as_object) else {
+        return false;
+    };
+    const SNAPSHOT_FIELDS: [&str; 9] = [
+        "version",
+        "settings",
+        "requested_stream_fps_millihz",
+        "client_display_mode_override_millihz",
+        "lossless_scaling_limit_millihz",
+        "virtual_display_active",
+        "physical_framegen_capture",
+        "game_frame_generation_mode",
+        "rtss_frame_limit_type_explicit_override",
+    ];
+    if fields.len() != SNAPSHOT_FIELDS.len()
+        || fields
+            .keys()
+            .any(|key| !SNAPSHOT_FIELDS.contains(&key.as_str()))
+        || settings.len() != 11
+    {
+        return false;
+    }
+    let rate = |key: &str| {
+        settings
+            .get(key)
+            .and_then(Value::as_u64)
+            .is_some_and(|rate| rate <= 1_000_000)
+    };
+    let text = |key: &str| settings.get(key).and_then(Value::as_str);
+    let boolean = |key: &str| settings.get(key).is_some_and(Value::is_boolean);
+    if !rate("frame_limiter_fps_limit_millihz")
+        || !boolean("frame_limiter_enable")
+        || !boolean("frame_limiter_disable_vsync")
+        || !boolean("rtss_allow_virtual_display_override")
+        || !boolean("mangohud_always_show_graph")
+        || !text("frame_limiter_provider").is_some_and(|value| {
+            matches!(
+                value,
+                "auto"
+                    | "rtss"
+                    | "nvidia-control-panel"
+                    | "mangohud"
+                    | "proton"
+                    | "mangohud-proton"
+                    | "none"
+            )
+        })
+        || !text("frame_limiter_auto_virtual_framegen")
+            .is_some_and(|value| matches!(value, "enabled" | "vrr" | "legacy" | "disabled"))
+        || !text("rtss_frame_limit_type").is_some_and(|value| {
+            matches!(
+                value,
+                "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+            )
+        })
+        || !text("mangohud_preset")
+            .is_some_and(|value| matches!(value, "custom" | "1" | "2" | "3" | "4"))
+        || !text("mangohud_limiter_method").is_some_and(|value| matches!(value, "early" | "late"))
+        || !text("rtss_install_path")
+            .is_some_and(|value| value.len() <= 4096 && !value.chars().any(char::is_control))
+    {
+        return false;
+    }
+    for key in [
+        "requested_stream_fps_millihz",
+        "client_display_mode_override_millihz",
+        "lossless_scaling_limit_millihz",
+    ] {
+        if !fields.get(key).is_some_and(|value| {
+            value.is_null() || value.as_u64().is_some_and(|rate| rate <= 1_000_000)
+        }) {
+            return false;
+        }
+    }
+    for key in [
+        "virtual_display_active",
+        "physical_framegen_capture",
+        "rtss_frame_limit_type_explicit_override",
+    ] {
+        if !fields
+            .get(key)
+            .is_some_and(|value| value.is_null() || value.is_boolean())
+        {
+            return false;
+        }
+    }
+    fields
+        .get("game_frame_generation_mode")
+        .is_some_and(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|mode| {
+                    matches!(
+                        mode,
+                        "none"
+                            | "lossless-scaling"
+                            | "game-provided"
+                            | "nvidia-smooth-motion"
+                            | "other"
+                    )
+                })
+        })
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]

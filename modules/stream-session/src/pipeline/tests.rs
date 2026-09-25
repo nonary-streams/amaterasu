@@ -19,6 +19,57 @@ fn fixed_media_response_without_readiness_fields_remains_compatible() {
 }
 
 #[test]
+fn prepared_frame_limiter_snapshot_is_frozen_across_retry_and_readback() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    let snapshot = json!({
+        "version":1,
+        "settings":{
+            "frame_limiter_enable":true,
+            "frame_limiter_fps_limit_millihz":60000,
+            "frame_limiter_provider":"auto",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":"enabled",
+            "rtss_frame_limit_type":"async",
+            "rtss_allow_virtual_display_override":false,
+            "rtss_install_path":"",
+            "mangohud_limiter_method":"late",
+            "mangohud_preset":"custom",
+            "mangohud_always_show_graph":false
+        },
+        "requested_stream_fps_millihz":60000,
+        "client_display_mode_override_millihz":null,
+        "lossless_scaling_limit_millihz":null,
+        "virtual_display_active":null,
+        "physical_framegen_capture":null,
+        "game_frame_generation_mode":null,
+        "rtss_frame_limit_type_explicit_override":null
+    });
+    request["frame_limiter_settings"] = snapshot.clone();
+    request["frame_limiter_executable_path"] = json!(r"C:\Games\Example.exe");
+
+    let prepared = host.response(1, request.clone());
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["frame_limiter_settings"], snapshot);
+    let session = prepared["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, request.clone())["session"], session);
+
+    request["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
+    assert_eq!(host.response(3, request)["code"], "operation_conflict");
+    let status = host.response(4, json!({"action":"status","session":session}));
+    assert_eq!(status["frame_limiter_settings"], snapshot);
+
+    let mut malformed = prepare();
+    malformed["frame_limiter_settings"] = snapshot;
+    malformed["frame_limiter_settings"]["settings"]["frame_limiter_provider"] = json!("unknown");
+    malformed["frame_limiter_executable_path"] = json!(r"C:\Games\Example.exe");
+    assert_eq!(
+        Harness::new().response(1, malformed)["code"],
+        "invalid_frame_limiter_snapshot"
+    );
+}
+
+#[test]
 fn configured_ping_timeout_reaches_media_discovery_and_control() {
     for selected in [0, 250, i32::MAX as u32] {
         let mut host = Harness::new();
