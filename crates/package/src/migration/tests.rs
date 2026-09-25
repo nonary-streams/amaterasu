@@ -400,6 +400,64 @@ file_state = credentials/custom_state.json\n",
 }
 
 #[test]
+fn empty_credentials_file_inherits_configured_file_state() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let state = b"configured primary state";
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"credentials_file = \"\"\nfile_state = \"private/custom_state.json\"\n",
+    );
+    write(&predecessor.join("private/custom_state.json"), state);
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    let state_path = PathBuf::from("private/custom_state.json");
+    assert!(collected.files.contains(&state_path));
+    assert!(collected.configured_state_files.contains(&state_path));
+    assert!(
+        !collected
+            .configured_authentication_files
+            .contains(&state_path)
+    );
+
+    let destination = fixture.path().join("Amaterasu");
+    let receipt = import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Sunshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: true,
+        }],
+    )
+    .unwrap();
+    let imported_state_path = destination
+        .join(LEGACY_IMPORT_DIRECTORY)
+        .join("sunshine/private/custom_state.json");
+    assert!(
+        receipt
+            .imported_files
+            .iter()
+            .any(|imported| imported.path == imported_state_path)
+    );
+    assert_eq!(fs::read(imported_state_path).unwrap(), state);
+
+    for empty_identity_path in ["pkey = \"\"\n", "cert = \"\"\n"] {
+        write(
+            &predecessor.join("sunshine.conf"),
+            empty_identity_path.as_bytes(),
+        );
+        assert!(collect_configuration_files(&predecessor).is_err());
+    }
+
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"credentials_file = \"../outside.json\"\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[test]
 fn snapshots_configured_paths_with_hashes_inside_quoted_values() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");

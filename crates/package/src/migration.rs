@@ -879,7 +879,11 @@ fn collect_configured_sensitive_files(
             if !matches!(key.as_str(), "pkey" | "cert" | "credentials_file") {
                 continue;
             }
-            let relative = Path::new(value.trim().trim_matches('"'));
+            let configured_path = value.trim().trim_matches('"');
+            if key == "credentials_file" && configured_path.is_empty() {
+                continue;
+            }
+            let relative = Path::new(configured_path);
             if relative.as_os_str().is_empty()
                 || !relative
                     .components()
