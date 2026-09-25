@@ -150,6 +150,7 @@ impl PeerIdentity {
             frame_limiter_disable_vsync,
             frame_limiter_auto_virtual_framegen,
             rtss_frame_limit_type,
+            ..
         } = config_overrides;
         let client_frame_limiter_settings = FrameLimiterSettings {
             frame_limiter_enable,
