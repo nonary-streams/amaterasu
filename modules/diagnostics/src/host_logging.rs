@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
+// A single diagnostics reader per caller can reattach to this key across restarts.
+const HOST_LOGGING_OPERATION_ID: &str = "diagnostics.host-configuration.logging.read";
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -28,7 +30,6 @@ enum PendingPhase {
 pub(crate) struct HostLoggingConfigurationReader {
     pending: Option<PendingPhase>,
     next_attempt: Option<Instant>,
-    next_operation_id: u64,
     last_revision: Option<u64>,
 }
 
@@ -102,32 +103,24 @@ impl HostLoggingConfigurationReader {
             return None;
         }
 
-        let operation_id = self.next_operation_id;
-        let Some(next_operation_id) = self.next_operation_id.checked_add(1) else {
-            self.schedule_retry(now);
-            return None;
-        };
-
         match send(Command::Request {
             service: HOST_CONFIGURATION_SERVICE.into(),
             payload: json!({"action":"get"}),
             timeout_ms: REQUEST_TIMEOUT_MS,
-            operation_id: format!("diagnostics.host-configuration.logging.{operation_id}"),
+            operation_id: HOST_LOGGING_OPERATION_ID.into(),
             parent: None,
         }) {
             Ok(Response::Accepted { id }) => {
-                self.next_operation_id = next_operation_id;
                 self.pending = Some(PendingPhase::Waiting { request_id: id });
                 None
             }
             Ok(_) => {
-                self.next_operation_id = next_operation_id;
                 self.schedule_retry(now);
                 None
             }
             Err(_) => {
                 // The request may have been accepted before the transport failed.
-                // Reuse its operation ID so the broker returns that same request.
+                // Reuse the stable operation ID so the broker returns that same request.
                 self.schedule_retry(now);
                 None
             }
@@ -246,9 +239,7 @@ mod tests {
                         } => {
                             assert_eq!(service, HOST_CONFIGURATION_SERVICE);
                             assert_eq!(payload, json!({"action":"get"}));
-                            assert!(
-                                operation_id.starts_with("diagnostics.host-configuration.logging.")
-                            );
+                            assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
                             assert_eq!(parent, None);
                             lifecycle.push("request");
                             Ok(Response::Accepted { id: 10 })
@@ -428,6 +419,7 @@ mod tests {
             reader
                 .tick(started, |command| match command {
                     Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
                         first_operation_id = Some(operation_id);
                         Err("request acknowledgement was lost".into())
                     }
@@ -440,6 +432,7 @@ mod tests {
             reader
                 .tick(started + Duration::from_secs(5), |command| match command {
                     Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
                         assert_eq!(Some(operation_id), first_operation_id);
                         Ok(Response::Accepted { id: 40 })
                     }
@@ -447,5 +440,157 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    // Restart simulations are sequential; simultaneous readers would share this caller-scoped key.
+    #[test]
+    fn a_restarted_single_reader_reattaches_to_its_pending_request() {
+        let started = Instant::now();
+        let mut original_reader = HostLoggingConfigurationReader::default();
+        let mut retained_request_id = None;
+        let mut enqueued_requests = 0;
+
+        assert!(
+            original_reader
+                .tick(started, |command| match command {
+                    Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        retained_request_id = Some(50);
+                        enqueued_requests += 1;
+                        Ok(Response::Accepted { id: 50 })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        drop(original_reader);
+
+        let mut restarted_reader = HostLoggingConfigurationReader::default();
+        assert!(
+            restarted_reader
+                .tick(started + Duration::from_secs(1), |command| match command {
+                    Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        Ok(Response::Accepted {
+                            id: retained_request_id.expect("the original request is retained"),
+                        })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(
+            restarted_reader
+                .tick(started + Duration::from_secs(2), |command| match command {
+                    Command::TakeResult { request: 50 } => Ok(Response::Pending),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+
+        assert_eq!(enqueued_requests, 1);
+        assert_eq!(retained_request_id, Some(50));
+    }
+
+    #[test]
+    fn a_restarted_single_reader_reuses_a_completion_until_release_then_refreshes() {
+        let started = Instant::now();
+        let mut original_reader = HostLoggingConfigurationReader::default();
+        let mut retained_request_id = None;
+        let mut next_request_id = 70;
+        let mut enqueued_requests = 0;
+        let mut released_requests = Vec::new();
+
+        assert!(
+            original_reader
+                .tick(started, |command| match command {
+                    Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        retained_request_id = Some(next_request_id);
+                        enqueued_requests += 1;
+                        Ok(Response::Accepted {
+                            id: next_request_id,
+                        })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        drop(original_reader);
+
+        let mut restarted_reader = HostLoggingConfigurationReader::default();
+        assert!(
+            restarted_reader
+                .tick(started + Duration::from_secs(1), |command| match command {
+                    Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        Ok(Response::Accepted {
+                            id: retained_request_id.expect("the completed request is retained"),
+                        })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+
+        let first_configuration = ready_configuration(1);
+        let loaded =
+            restarted_reader.tick(started + Duration::from_secs(2), |command| match command {
+                Command::TakeResult { request } => {
+                    assert_eq!(Some(request), retained_request_id);
+                    Ok(Response::Result {
+                        payload: first_configuration.clone(),
+                    })
+                }
+                Command::ReleaseResult { request } => {
+                    assert_eq!(Some(request), retained_request_id);
+                    released_requests.push(request);
+                    retained_request_id = None;
+                    Ok(Response::Ok)
+                }
+                unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+            });
+        assert_eq!(loaded, Some(first_configuration));
+
+        next_request_id += 1;
+        assert!(
+            restarted_reader
+                .tick(started + Duration::from_secs(32), |command| match command {
+                    Command::Request { operation_id, .. } => {
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        assert!(retained_request_id.is_none());
+                        retained_request_id = Some(next_request_id);
+                        enqueued_requests += 1;
+                        Ok(Response::Accepted {
+                            id: next_request_id,
+                        })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+
+        let refreshed_configuration = ready_configuration(2);
+        let refreshed =
+            restarted_reader.tick(started + Duration::from_secs(33), |command| match command {
+                Command::TakeResult { request } => {
+                    assert_eq!(Some(request), retained_request_id);
+                    Ok(Response::Result {
+                        payload: refreshed_configuration.clone(),
+                    })
+                }
+                Command::ReleaseResult { request } => {
+                    assert_eq!(Some(request), retained_request_id);
+                    released_requests.push(request);
+                    retained_request_id = None;
+                    Ok(Response::Ok)
+                }
+                unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+            });
+
+        assert_eq!(refreshed, Some(refreshed_configuration));
+        assert_eq!(enqueued_requests, 2);
+        assert_eq!(released_requests, [70, 71]);
+        assert_eq!(retained_request_id, None);
     }
 }
