@@ -33,9 +33,10 @@ host process environment; `$$` produces a literal dollar sign, and absent names
 produce an empty string. Other dollar text remains literal, and an unclosed
 `$(...)` reference is invalid. Expansion is bounded and is not shell evaluation:
 the expanded string still goes through the host platform's argv parser and
-existing count, length, and argument limits. Detached commands do not support
-per-command environment overrides, output redirection,
-or elevation; a detached-command spawn failure does not fail the main launch.
+existing count, length, and argument limits. Detached commands have no
+per-command environment overrides, output redirection, or independent elevation
+field; they receive the same launch-level `elevated` flag as the primary
+application. A detached-command spawn failure does not fail the main launch.
 
 Launch may also contain up to eight ordered preparation steps:
 
@@ -61,7 +62,8 @@ raw compatibility form used by catalog launchers:
 ```
 
 Structured commands use literal argv, a cleared explicit environment, optional
-absolute `cwd`, and null standard handles, just like the application. Raw steps
+absolute `cwd`, and null standard handles, just like the application. They have
+no `elevated` field and are spawned with `elevated` set to false. Raw steps
 accept exact `do` and `undo` command strings (both default empty) and an
 `elevated` flag (default false). Raw strings are split with the host platform's
 argument parser without invoking a shell. `$(NAME)` expands from the launch's
@@ -102,7 +104,9 @@ The environment is cleared before applying the supplied map; host secrets and
 PATH are not inherited. Supply any platform/application-required variables
 explicitly. Stdin, stdout, and stderr are null handles. Main executables and
 preparation commands use structured argv with no command-string splitting or
-implicit shell. There is no output capture, elevation, or executable allowlist.
+implicit shell. There is no output capture or executable allowlist. The launch-level
+`elevated` flag defaults to false and is passed to the primary application and
+detached children; Unix spawning ignores it.
 `.bat` and `.cmd` executable extensions are rejected case-insensitively on every
 platform because Windows may otherwise invoke a shell implicitly. A trusted
 caller can explicitly choose an interpreter and pass arguments to it. Arguments
@@ -229,9 +233,9 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Detached launchers are a bounded argv-only subset: output handling and elevation
-remain parity gaps. Desktop pseudo-apps, URI launch, and launcher-specific
-behavior also remain unimplemented.
+Detached launchers are a bounded argv-only subset: output handling and
+per-command environment overrides remain parity gaps. Desktop pseudo-apps, URI
+launch, and launcher-specific behavior also remain unimplemented.
 In particular, this module's omitted cwd inherits the host cwd rather than using
 the executable directory.
 
