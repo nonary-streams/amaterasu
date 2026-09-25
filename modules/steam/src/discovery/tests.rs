@@ -114,6 +114,32 @@ fn completed_refresh_re_resolves_a_moved_steam_client() {
     assert_eq!(provider.games[&42].name, "Example");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_default_client_resolution_prefers_registered_custom_install() {
+    let fixture = Libraries::new();
+    let registered = fixture.library("custom-steam");
+    let program_files = fixture.library("program-files");
+    let registered_client = registered.join("steam.exe");
+    let fallback_client = program_files.join("Steam/steam.exe");
+    fs::write(&registered_client, "registered client").unwrap();
+    fs::create_dir_all(fallback_client.parent().unwrap()).unwrap();
+    fs::write(&fallback_client, "fallback client").unwrap();
+
+    let candidates =
+        windows_default_client_candidates(Some(registered), None, Some(program_files), None);
+    assert_eq!(
+        resolve_client_candidates(candidates.clone()),
+        Some(registered_client.canonicalize().unwrap())
+    );
+
+    fs::remove_file(&registered_client).unwrap();
+    assert_eq!(
+        resolve_client_candidates(candidates),
+        Some(fallback_client.canonicalize().unwrap())
+    );
+}
+
 #[test]
 fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     let fixture = Libraries::new();

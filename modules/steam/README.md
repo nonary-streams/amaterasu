@@ -99,6 +99,8 @@ management catalog and accepts no caller-supplied owner selector.
 Each completed discovery scan resolves the Steam client again. A client installed
 or moved after module startup can be used by the next complete reconciliation;
 if the client disappears, catalog writes pause until a later scan finds one.
+On Windows, client resolution checks configured roots first, then the current
+user's registered Steam path and the Program Files and Local AppData defaults.
 
 The snapshot protocol writes bounded batches and declares completion only after
 a successful full scan. Catalog ownership markers preserve manually changed or

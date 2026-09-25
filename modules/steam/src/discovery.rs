@@ -211,9 +211,12 @@ pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
     }
 
     #[cfg(target_os = "windows")]
-    if let Some(program_files) = std::env::var_os("ProgramFiles(x86)") {
-        candidates.push(PathBuf::from(program_files).join("Steam/steam.exe"));
-    }
+    candidates.extend(windows_default_client_candidates(
+        windows_registered_steam_root(),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        std::env::var_os("LocalAppData").map(PathBuf::from),
+    ));
 
     #[cfg(target_os = "linux")]
     if let Some(path) = std::env::var_os("PATH") {
@@ -231,10 +234,108 @@ pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
         }
     }
 
+    resolve_client_candidates(candidates)
+}
+
+fn resolve_client_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find_map(|candidate| {
         let canonical = candidate.canonicalize().ok()?;
         canonical.is_file().then_some(canonical)
     })
+}
+
+#[cfg(windows)]
+fn windows_default_client_candidates(
+    registered_root: Option<PathBuf>,
+    program_files_x86: Option<PathBuf>,
+    program_files: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    registered_root
+        .into_iter()
+        .chain(program_files_x86.map(|path| path.join("Steam")))
+        .chain(program_files.map(|path| path.join("Steam")))
+        .chain(local_app_data.map(|path| path.join("Steam")))
+        .map(|root| root.join("steam.exe"))
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_registered_steam_root() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    const HKEY_CURRENT_USER: isize = -2_147_483_647;
+    const RRF_RT_REG_SZ: u32 = 2;
+    const ERROR_SUCCESS: u32 = 0;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut std::ffi::c_void,
+            data_bytes: *mut u32,
+        ) -> u32;
+    }
+
+    let subkey = "Software\\Valve\\Steam"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let value = "SteamPath"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut byte_count = 0_u32;
+    // SAFETY: Both name pointers refer to terminated UTF-16 buffers that live
+    // through the call. The output size pointer is valid; no data is requested.
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut byte_count,
+        )
+    };
+    if result != ERROR_SUCCESS
+        || !(4..=32 * 1024).contains(&byte_count)
+        || !byte_count.is_multiple_of(2)
+    {
+        return None;
+    }
+    let mut path = vec![0_u16; byte_count as usize / 2];
+    // SAFETY: `path` owns `byte_count` writable bytes and remains allocated
+    // through the call. RegGetValueW receives its exact capacity and a valid
+    // mutable size pointer; the registry string is read as REG_SZ only.
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            path.as_mut_ptr().cast(),
+            &mut byte_count,
+        )
+    };
+    if result != ERROR_SUCCESS
+        || byte_count as usize > path.len() * 2
+        || !byte_count.is_multiple_of(2)
+    {
+        return None;
+    }
+    let text = &path[..byte_count as usize / 2];
+    let terminator = text.iter().position(|unit| *unit == 0)?;
+    if terminator == 0 {
+        return None;
+    }
+    Some(std::ffi::OsString::from_wide(&text[..terminator]).into())
 }
 
 fn read_document(path: &Path) -> Result<Value, String> {
