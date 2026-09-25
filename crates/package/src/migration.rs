@@ -920,6 +920,11 @@ fn collect_configured_sensitive_files(
 /// Preserve configured primary and auxiliary state files for the migration
 /// importers. State paths are followed only when their canonical regular files
 /// remain inside the supplied predecessor root.
+struct ConfiguredStatePath {
+    relative: PathBuf,
+    canonical_file: Option<PathBuf>,
+}
+
 fn collect_configured_state_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
@@ -927,7 +932,7 @@ fn collect_configured_state_files(
     copy_sources: &mut BTreeMap<PathBuf, PathBuf>,
 ) -> PackageResult<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
-    let mut configured = BTreeMap::<String, PathBuf>::new();
+    let mut configured = BTreeMap::<String, ConfiguredStatePath>::new();
     for name in [
         "apollo.conf",
         "sunshine.conf",
@@ -964,14 +969,33 @@ fn collect_configured_state_files(
             {
                 return Err("predecessor configuration has an unsafe state path".into());
             }
-            if configured
-                .insert(key, relative.to_path_buf())
-                .is_some_and(|previous| previous != relative.to_path_buf())
+            let previous = configured.get(&key);
+            let has_different_spelling =
+                previous.is_some_and(|previous| previous.relative.as_path() != relative);
+            if has_different_spelling && key != "vibeshine_file_state" {
+                return Err("predecessor configuration has conflicting state paths".into());
+            }
+
+            let canonical_file = optional_contained_state_file(root, &canonical_root, relative)?;
+            if has_different_spelling
+                && !previous
+                    .and_then(|previous| previous.canonical_file.as_ref())
+                    .zip(canonical_file.as_ref())
+                    .is_some_and(|(previous, current)| previous == current)
             {
                 return Err("predecessor configuration has conflicting state paths".into());
             }
-            let Some(canonical) = optional_contained_state_file(root, &canonical_root, relative)?
-            else {
+            if previous.is_none() {
+                configured.insert(
+                    key,
+                    ConfiguredStatePath {
+                        relative: relative.to_path_buf(),
+                        canonical_file: canonical_file.clone(),
+                    },
+                );
+            }
+
+            let Some(canonical) = canonical_file else {
                 continue;
             };
             let copied = relative.to_path_buf();

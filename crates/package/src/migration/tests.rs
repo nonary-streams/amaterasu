@@ -782,6 +782,78 @@ fn snapshots_configured_primary_and_auxiliary_state_files_only_when_contained() 
     assert!(collect_configuration_files(&predecessor).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn snapshots_repeated_vibeshine_state_spellings_when_they_resolve_to_one_file() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    let state = br#"{"root":{}}"#;
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/state.json\nvibeshine_file_state = state-alias.json\n",
+    );
+    write(&predecessor.join("private/state.json"), state);
+    symlink("private/state.json", predecessor.join("state-alias.json")).unwrap();
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    let canonical_state = predecessor
+        .join("private/state.json")
+        .canonicalize()
+        .unwrap();
+    for relative in ["private/state.json", "state-alias.json"] {
+        let relative = PathBuf::from(relative);
+        assert!(collected.files.contains(&relative));
+        assert!(collected.configured_state_files.contains(&relative));
+        assert_eq!(
+            collected.copy_sources.get(&relative),
+            Some(&canonical_state)
+        );
+    }
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Vibeshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Vibeshine,
+            pairing: true,
+            authentication: false,
+        }],
+    )
+    .unwrap();
+
+    let imported_root = destination.join(LEGACY_IMPORT_DIRECTORY).join("vibeshine");
+    assert_eq!(
+        fs::read(imported_root.join("private/state.json")).unwrap(),
+        state
+    );
+    assert_eq!(
+        fs::read(imported_root.join("state-alias.json")).unwrap(),
+        state
+    );
+}
+
+#[test]
+fn rejects_repeated_vibeshine_state_spellings_for_distinct_or_missing_targets() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/first.json\nvibeshine_file_state = private/second.json\n",
+    );
+    write(&predecessor.join("private/first.json"), b"first");
+    write(&predecessor.join("private/second.json"), b"second");
+    assert!(collect_configuration_files(&predecessor).is_err());
+
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/first.json\nvibeshine_file_state = private/not-created.json\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+}
+
 #[test]
 fn classifies_custom_configured_primary_state_as_pairing_and_authentication_input() {
     let fixture = TemporaryDirectory::new();
