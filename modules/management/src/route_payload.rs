@@ -1199,6 +1199,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
                     "audio_sink_capture_only",
                     "external_ip",
                     "wgc_pacing_smoothing",
+                    "nvenc_spatial_aq",
                     "ping_timeout_ms",
                     "global_preparation",
                 ],
@@ -1320,6 +1321,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             {
                 return Err(INVALID);
             }
+            optional_nullable_boolean(object, "nvenc_spatial_aq")?;
             if object.get("ping_timeout_ms").is_some_and(|value| {
                 !value.is_null()
                     && !value
@@ -1340,6 +1342,57 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
 #[cfg(test)]
 mod nvhttp_tests {
     use super::*;
+
+    #[test]
+    fn nvenc_spatial_aq_update_accepts_optional_nullable_booleans_only() {
+        let route = Route {
+            service: "amaterasu.nvhttp/1",
+            action: "settings_update",
+            scope: Some("configuration.write"),
+            requires_empty_body: false,
+        };
+        let required_fields = serde_json::json!({
+            "hostname": "Host",
+            "port": 47989,
+            "expected_revision": 0,
+        });
+        assert!(validate(route, required_fields.as_object().unwrap()).is_ok());
+
+        for value in [
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host",
+                "port": 47989,
+                "expected_revision": 0,
+                "nvenc_spatial_aq": value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_ok(),
+                "{payload}"
+            );
+        }
+
+        for value in [
+            serde_json::json!(1),
+            serde_json::json!("true"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let payload = serde_json::json!({
+                "hostname": "Host",
+                "port": 47989,
+                "expected_revision": 0,
+                "nvenc_spatial_aq": value,
+            });
+            assert!(
+                validate(route, payload.as_object().unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
 
     #[test]
     fn ping_timeout_update_accepts_reset_and_reference_range() {
