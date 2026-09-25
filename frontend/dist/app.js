@@ -1,6 +1,23 @@
 "use strict";
 var Amaterasu;
 (function (Amaterasu) {
+    const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"];
+    function parseRefreshRateOptionOverride(value) {
+        if (value === "")
+            return null;
+        if (refreshRateOptionValues.includes(value))
+            return value;
+        throw new Error("Refresh rate option must be auto, disabled, manual, or prefer_highest.");
+    }
+    Amaterasu.parseRefreshRateOptionOverride = parseRefreshRateOptionOverride;
+    function parsePrefer10BitSdrOverride(value) {
+        return parseInputBooleanOverride(value, "10-bit SDR preference");
+    }
+    Amaterasu.parsePrefer10BitSdrOverride = parsePrefer10BitSdrOverride;
+    function usesManualRefreshRateCompanion(value) {
+        return value === "manual";
+    }
+    Amaterasu.usesManualRefreshRateCompanion = usesManualRefreshRateCompanion;
     function parseArguments(value) {
         const parsed = JSON.parse(value || "[]");
         if (!Array.isArray(parsed) ||
@@ -286,9 +303,22 @@ var Amaterasu;
         const gamepad = parseGamepadProfileOverride(text("gamepad"), recognizedGamepadProfiles);
         const keyboard = parseInputBooleanOverride(text("keyboard"), "Keyboard input");
         const mouse = parseInputBooleanOverride(text("mouse"), "Mouse input");
+        const refreshRateOption = parseRefreshRateOptionOverride(String(data.get("dd_refresh_rate_option") ?? ""));
+        const prefer10BitSdr = parsePrefer10BitSdrOverride(String(data.get("prefer_10bit_sdr") ?? ""));
         const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
         const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
-        const configOverrides = fecPercentage === null && streamAudio === null && audioSink === null && virtualSink === null && audioSinkCaptureOnly === null && backButtonTimeout === null && controller === null && gamepad === null && keyboard === null && mouse === null
+        const configOverrides = fecPercentage === null &&
+            streamAudio === null &&
+            audioSink === null &&
+            virtualSink === null &&
+            audioSinkCaptureOnly === null &&
+            backButtonTimeout === null &&
+            controller === null &&
+            gamepad === null &&
+            keyboard === null &&
+            mouse === null &&
+            refreshRateOption === null &&
+            prefer10BitSdr === null
             ? undefined
             : {
                 ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
@@ -301,6 +331,8 @@ var Amaterasu;
                 ...(gamepad === null ? {} : { gamepad }),
                 ...(keyboard === null ? {} : { keyboard }),
                 ...(mouse === null ? {} : { mouse }),
+                ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
+                ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
             };
         const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
         const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];
@@ -803,6 +835,59 @@ var Amaterasu;
         select.value = current === undefined ? "" : String(current);
         return select;
     }
+    const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"];
+    function catalogEnumOverrideSelect(name, current, values) {
+        const select = Amaterasu.el("select");
+        select.name = name;
+        const inherit = Amaterasu.el("option", "", "Inherit");
+        inherit.value = "";
+        select.append(inherit);
+        for (const value of values) {
+            const option = Amaterasu.el("option", "", value);
+            option.value = value;
+            select.append(option);
+        }
+        if (current != null && !values.includes(current)) {
+            const saved = Amaterasu.el("option", "", `Saved value: ${current}`);
+            saved.value = current;
+            select.append(saved);
+        }
+        select.value = current ?? "";
+        return select;
+    }
+    function catalogRefreshRateOptionText(value) {
+        return value ?? "";
+    }
+    Amaterasu.catalogRefreshRateOptionText = catalogRefreshRateOptionText;
+    function parseCatalogRefreshRateOptionOverride(data) {
+        return Amaterasu.parseRefreshRateOptionOverride(String(data.get("dd_refresh_rate_option") ?? ""));
+    }
+    Amaterasu.parseCatalogRefreshRateOptionOverride = parseCatalogRefreshRateOptionOverride;
+    function catalogManualRefreshRateCompanionVisible(value) {
+        return Amaterasu.usesManualRefreshRateCompanion(value);
+    }
+    Amaterasu.catalogManualRefreshRateCompanionVisible = catalogManualRefreshRateCompanionVisible;
+    function catalogPrefer10BitSdrOverrideValue(value) {
+        if (value == null)
+            return null;
+        if (typeof value !== "boolean")
+            throw new Error("Saved 10-bit SDR preference must be a boolean or null.");
+        return value;
+    }
+    Amaterasu.catalogPrefer10BitSdrOverrideValue = catalogPrefer10BitSdrOverrideValue;
+    function catalogRefreshRateOptionFields(current) {
+        const option = catalogEnumOverrideSelect("dd_refresh_rate_option", catalogRefreshRateOptionText(current), refreshRateOptionValues);
+        const manualCompanionNotice = Amaterasu.el("p", "muted", "Manual mode uses the separate dd_manual_refresh_rate setting.");
+        const updateManualCompanionNotice = () => {
+            manualCompanionNotice.hidden = !catalogManualRefreshRateCompanionVisible(option.value);
+        };
+        option.addEventListener("change", updateManualCompanionNotice);
+        updateManualCompanionNotice();
+        return [
+            Amaterasu.field("Refresh rate option", option, "Blank inherits the next scope. Choose auto, disabled, manual, or prefer_highest."),
+            manualCompanionNotice,
+        ];
+    }
     function inputGamepadOverrideSelect(name, current, status) {
         const select = Amaterasu.el("select");
         select.name = name;
@@ -1034,7 +1119,8 @@ var Amaterasu;
             const gamepad = inputGamepadOverrideSelect("gamepad", row.entry.config_overrides?.gamepad, runtimeStatus);
             const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
             const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
+            const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -1045,7 +1131,10 @@ var Amaterasu;
                 if (!form.reportValidity())
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles);
+                    const config_overrides = {
+                        ...Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
+                        dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
+                    };
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
                             id: row.id,
@@ -1185,6 +1274,8 @@ var Amaterasu;
         const gamepad = inputGamepadOverrideSelect("gamepad", entry?.config_overrides?.gamepad, runtimeStatus);
         const keyboard = audioOverrideSelect("keyboard", entry?.config_overrides?.keyboard);
         const mouse = audioOverrideSelect("mouse", entry?.config_overrides?.mouse);
+        const refreshRateOptionFields = catalogRefreshRateOptionFields(entry?.config_overrides?.dd_refresh_rate_option);
+        const prefer10BitSdr = audioOverrideSelect("prefer_10bit_sdr", catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr) ?? undefined);
         const steamId = Amaterasu.input("steam_id", entry?.steam_id ?? "");
         steamId.maxLength = 10;
         const steamInstallDir = Amaterasu.input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -1214,7 +1305,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
@@ -1236,9 +1327,11 @@ var Amaterasu;
     Amaterasu.parseVirtualSinkSelection = parseVirtualSinkSelection;
     function parseHistorySettings(enabled, ttlDays, sizeLimitMb) {
         if (typeof enabled !== "boolean" ||
+            typeof ttlDays !== "number" ||
             !Number.isSafeInteger(ttlDays) ||
             ttlDays < 0 ||
             ttlDays > maxHistoryLimit ||
+            typeof sizeLimitMb !== "number" ||
             !Number.isSafeInteger(sizeLimitMb) ||
             sizeLimitMb < 0 ||
             sizeLimitMb > maxHistoryLimit)
@@ -1246,6 +1339,29 @@ var Amaterasu;
         return { enabled, ttl_days: ttlDays, db_size_limit_mb: sizeLimitMb };
     }
     Amaterasu.parseHistorySettings = parseHistorySettings;
+    function parseHistorySettingsReply(value) {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Session history settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true)
+            throw new Error("Session history settings reply must report success.");
+        if (reply.settings === null || typeof reply.settings !== "object" || Array.isArray(reply.settings))
+            throw new Error("Session history settings reply contains invalid settings.");
+        if (typeof reply.revision !== "number" ||
+            !Number.isSafeInteger(reply.revision) ||
+            reply.revision < 0)
+            throw new Error("Session history settings revision must be a nonnegative safe integer.");
+        if (typeof reply.effective_enabled !== "boolean")
+            throw new Error("Session history effective enabled state must be a boolean.");
+        const settings = reply.settings;
+        return {
+            ok: true,
+            settings: parseHistorySettings(settings.enabled, settings.ttl_days, settings.db_size_limit_mb),
+            revision: reply.revision,
+            effective_enabled: reply.effective_enabled,
+        };
+    }
+    Amaterasu.parseHistorySettingsReply = parseHistorySettingsReply;
     function parseAuthTokenLifetimes(sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
         if (!Number.isSafeInteger(sessionTokenTtlSeconds) ||
             sessionTokenTtlSeconds < 1 ||
@@ -2069,7 +2185,7 @@ var Amaterasu;
                 const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
-                recentGames.max = "10000";
+                recentGames.max = "50";
                 recentGames.step = "1";
                 const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
@@ -2110,7 +2226,7 @@ var Amaterasu;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–50); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
@@ -2338,7 +2454,7 @@ var Amaterasu;
         async function loadHistorySettings() {
             historyArea.replaceChildren(Amaterasu.el("p", "muted", "Loading session history settings…"));
             try {
-                const reply = await context.api.post("history/settings_get");
+                const reply = parseHistorySettingsReply(await context.api.post("history/settings_get"));
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -2370,10 +2486,10 @@ var Amaterasu;
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
-                        const updated = await context.api.post("history/settings_update", {
+                        const updated = parseHistorySettingsReply(await context.api.post("history/settings_update", {
                             settings: parseHistorySettings(enabled.checked, ttl.valueAsNumber, size.valueAsNumber),
                             expected_revision: reply.revision,
-                        });
+                        }));
                         context.notify(updated.effective_enabled === updated.settings.enabled
                             ? "Session history settings saved."
                             : "Session history settings saved; the recording change is deferred.");
@@ -2835,6 +2951,257 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    Amaterasu.LOCALE_OPTIONS = [
+        "bg",
+        "cs",
+        "de",
+        "en",
+        "en_GB",
+        "en_US",
+        "es",
+        "fr",
+        "hu",
+        "it",
+        "ja",
+        "ko",
+        "pl",
+        "pt",
+        "pt_BR",
+        "ru",
+        "sv",
+        "tr",
+        "uk",
+        "vi",
+        "zh",
+        "zh_TW",
+    ];
+    function isRecord(value) {
+        return typeof value === "object" && value !== null && !Array.isArray(value);
+    }
+    function localeFieldDefinition() {
+        return {
+            type: "enum",
+            default: "en",
+            options: [...Amaterasu.LOCALE_OPTIONS],
+        };
+    }
+    function validateLocale(value) {
+        if (typeof value !== "string" ||
+            !Amaterasu.LOCALE_OPTIONS.includes(value)) {
+            throw new Error("The locale value is not one of the supported tokens.");
+        }
+        return value;
+    }
+    Amaterasu.validateLocale = validateLocale;
+    function validateLocaleDefinition(definition) {
+        if (!isRecord(definition) || definition.type !== "enum") {
+            throw new Error("The registered locale field must be an enum.");
+        }
+        if (definition.default !== "en") {
+            throw new Error("The registered locale field must default to en.");
+        }
+        const options = definition.options;
+        if (!Array.isArray(options) ||
+            options.length !== Amaterasu.LOCALE_OPTIONS.length ||
+            !Amaterasu.LOCALE_OPTIONS.every((locale, index) => options[index] === locale)) {
+            throw new Error("The registered locale options are incompatible.");
+        }
+    }
+    Amaterasu.validateLocaleDefinition = validateLocaleDefinition;
+    function validateConfigurationDocument(configuration) {
+        if (!isRecord(configuration) ||
+            !Number.isSafeInteger(configuration.revision) ||
+            !isRecord(configuration.fields) ||
+            (configuration.values !== undefined && !isRecord(configuration.values))) {
+            throw new Error("The configuration service returned an invalid document.");
+        }
+        return configuration;
+    }
+    function localeFromConfiguration(configuration) {
+        const document = validateConfigurationDocument(configuration);
+        if (!Object.prototype.hasOwnProperty.call(document.fields, "locale")) {
+            throw new Error("The registered configuration has no locale field.");
+        }
+        const definition = document.fields.locale;
+        validateLocaleDefinition(definition);
+        const values = document.values ?? {};
+        const value = Object.prototype.hasOwnProperty.call(values, "locale")
+            ? values.locale
+            : definition.default;
+        return validateLocale(value);
+    }
+    Amaterasu.localeFromConfiguration = localeFromConfiguration;
+    function extendLocaleConfiguration(configuration) {
+        const document = validateConfigurationDocument(configuration);
+        if (Object.prototype.hasOwnProperty.call(document.fields, "locale")) {
+            throw new Error("The registered locale field cannot be replaced.");
+        }
+        return {
+            ...document,
+            fields: {
+                ...document.fields,
+                locale: localeFieldDefinition(),
+            },
+            values: {
+                ...(document.values ?? {}),
+            },
+        };
+    }
+    Amaterasu.extendLocaleConfiguration = extendLocaleConfiguration;
+    function documentLanguage(value) {
+        return validateLocale(value).replaceAll("_", "-");
+    }
+    Amaterasu.documentLanguage = documentLanguage;
+    function errorMessage(error) {
+        return error instanceof Error ? error.message : String(error);
+    }
+    function errorCode(error) {
+        if (!isRecord(error) || typeof error.code !== "string")
+            return null;
+        return error.code;
+    }
+    async function getLocaleConfiguration(api) {
+        try {
+            return validateConfigurationDocument(await api.post("configuration/get"));
+        }
+        catch (error) {
+            if (errorCode(error) !== "not_registered")
+                throw error;
+            if (!api.allows("configuration.write")) {
+                throw new Error("Locale setup requires configuration.write access.");
+            }
+            await api.post("configuration/register", {
+                fields: { locale: localeFieldDefinition() },
+            });
+            return validateConfigurationDocument(await api.post("configuration/get"));
+        }
+    }
+    async function ensureLocaleConfiguration(api) {
+        if (!api.allows("configuration.read")) {
+            throw new Error("Locale preferences require configuration.read access.");
+        }
+        let configuration = await getLocaleConfiguration(api);
+        if (!Object.prototype.hasOwnProperty.call(configuration.fields, "locale")) {
+            if (!api.allows("configuration.write")) {
+                throw new Error("Adding the locale preference requires configuration.write access.");
+            }
+            const extended = extendLocaleConfiguration(configuration);
+            await api.post("configuration/migrate", {
+                fields: extended.fields,
+                expected_revision: configuration.revision,
+            });
+            configuration = validateConfigurationDocument(await api.post("configuration/get"));
+        }
+        localeFromConfiguration(configuration);
+        return configuration;
+    }
+    function mountLocaleSelector(api) {
+        const container = document.createElement("div");
+        container.className = "locale-control";
+        const label = document.createElement("label");
+        label.htmlFor = "global-locale";
+        label.textContent = "Locale";
+        label.title = "Stored locale preference. Console text remains English.";
+        const select = document.createElement("select");
+        select.id = "global-locale";
+        select.setAttribute("aria-label", "Locale");
+        for (const locale of Amaterasu.LOCALE_OPTIONS) {
+            const option = document.createElement("option");
+            option.value = locale;
+            option.textContent = locale;
+            select.append(option);
+        }
+        select.disabled = true;
+        const status = document.createElement("span");
+        status.className = "locale-status";
+        status.setAttribute("role", "status");
+        const error = document.createElement("span");
+        error.className = "locale-error";
+        error.setAttribute("role", "alert");
+        const note = document.createElement("small");
+        note.textContent = "Console text remains English.";
+        container.append(label, select, status, error, note);
+        const canWrite = api.allows("configuration.write");
+        let busy = false;
+        let loaded = false;
+        let revision = null;
+        const updateDisabledState = () => {
+            select.disabled = busy || !canWrite || !loaded;
+        };
+        const showError = (message) => {
+            status.textContent = "";
+            error.textContent = message;
+        };
+        const clearError = () => {
+            error.textContent = "";
+        };
+        const load = async (previousError) => {
+            busy = true;
+            updateDisabledState();
+            status.textContent = "Loading locale preference…";
+            clearError();
+            try {
+                const configuration = await ensureLocaleConfiguration(api);
+                const locale = localeFromConfiguration(configuration);
+                select.value = locale;
+                document.documentElement.lang = documentLanguage(locale);
+                revision = configuration.revision;
+                loaded = true;
+                if (previousError)
+                    showError(previousError);
+                else if (!canWrite)
+                    status.textContent = "Read only";
+                else
+                    status.textContent = "";
+            }
+            catch (loadError) {
+                loaded = false;
+                revision = null;
+                showError(previousError
+                    ? `${previousError} Reload failed: ${errorMessage(loadError)}`
+                    : `Unable to load locale preference: ${errorMessage(loadError)}`);
+            }
+            finally {
+                busy = false;
+                updateDisabledState();
+            }
+        };
+        select.addEventListener("change", () => {
+            if (!loaded || !canWrite || revision === null)
+                return;
+            let locale;
+            try {
+                locale = validateLocale(select.value);
+            }
+            catch (validationError) {
+                showError(errorMessage(validationError));
+                return;
+            }
+            busy = true;
+            updateDisabledState();
+            status.textContent = "Saving locale preference…";
+            clearError();
+            void api
+                .post("configuration/update", {
+                values: { locale },
+                expected_revision: revision,
+            })
+                .then(() => load())
+                .catch((saveError) => load(`Unable to save locale preference: ${errorMessage(saveError)}`));
+        });
+        if (!api.allows("configuration.read")) {
+            showError("Locale preferences require configuration.read access.");
+        }
+        else {
+            void load();
+        }
+        updateDisabledState();
+        return container;
+    }
+    Amaterasu.mountLocaleSelector = mountLocaleSelector;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function renderOverview(context) {
         const area = Amaterasu.el("div");
         context.content.append(Amaterasu.sectionHeading("Host overview", "Your applications, sessions, and local services in one place.", Amaterasu.button("Refresh", load)), area);
@@ -3091,42 +3458,223 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderApplications = renderApplications;
+    function steamForceSyncOutcome(provider) {
+        if (provider.enabled === false)
+            return "failure";
+        if (provider.force_sync_pending !== false ||
+            provider.catalog_sync?.force_sync_pending !== false) {
+            return "pending";
+        }
+        return provider.complete && provider.catalog_sync?.last_error === null
+            ? "success"
+            : "failure";
+    }
+    Amaterasu.steamForceSyncOutcome = steamForceSyncOutcome;
     function renderSteam(context) {
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
         let revision;
         let after;
+        let providerStatus;
+        let forceSyncPending = false;
+        let forceSyncPollTimer;
+        let forceSyncPollGeneration = 0;
+        let forceSyncControl;
         const history = [undefined];
-        const scan = Amaterasu.button("Scan libraries", () => Amaterasu.runAction(scan, status, async () => {
-            await context.api.post("steam/refresh");
+        function resetPagination() {
             revision = undefined;
             after = undefined;
             history.splice(0, history.length, undefined);
+        }
+        const scan = Amaterasu.button("Scan libraries", () => Amaterasu.runAction(scan, status, async () => {
+            await context.api.post("steam/refresh");
+            resetPagination();
             context.notify("Steam scan requested. Refresh to see completed discoveries.");
             await load();
         }), "primary");
-        scan.disabled = !context.api.allows("steam.refresh");
-        context.content.append(Amaterasu.sectionHeading("Steam library", "Read-only discovery from the Steam roots configured on this host.", Amaterasu.button("Refresh", () => {
-            revision = undefined;
-            after = undefined;
-            history.splice(0, history.length, undefined);
-            return load();
-        }), scan), status, area);
-        async function load() {
+        function updateForceSyncControl() {
+            if (!forceSyncControl)
+                return;
+            const allowed = context.api.allows("steam.refresh");
+            forceSyncControl.hidden = !allowed;
+            forceSyncControl.disabled =
+                !allowed ||
+                    providerStatus?.enabled === false ||
+                    providerStatus?.settings_ready === false ||
+                    forceSyncPending;
+        }
+        function stopForceSyncPolling() {
+            forceSyncPollGeneration += 1;
+            if (forceSyncPollTimer !== undefined) {
+                window.clearTimeout(forceSyncPollTimer);
+                forceSyncPollTimer = undefined;
+            }
+        }
+        function stopUnobservableForceSync() {
+            if (!forceSyncPending)
+                return;
+            forceSyncPending = false;
+            stopForceSyncPolling();
+            updateForceSyncControl();
+            const message = "Force catalog sync was accepted, but this session lacks steam.read and cannot check its status.";
+            status.replaceChildren(Amaterasu.el("p", "notice warning", message));
+            context.notify(message);
+        }
+        function finishForceSync(provider) {
+            const outcome = steamForceSyncOutcome(provider);
+            if (outcome === "pending")
+                return;
+            forceSyncPending = false;
+            stopForceSyncPolling();
+            updateForceSyncControl();
+            if (outcome === "success") {
+                status.replaceChildren(Amaterasu.el("p", "notice good", "Steam discovery completed and catalog sync succeeded."));
+                context.notify("Steam discovery completed and catalog sync succeeded.");
+                return;
+            }
+            const reason = provider.catalog_sync?.last_error;
+            const message = reason
+                ? `Steam catalog sync did not complete: ${reason}`
+                : provider.enabled === false
+                    ? "Steam discovery was disabled; no catalog sync was confirmed."
+                    : provider.complete
+                        ? "Steam catalog sync ended without a confirmed successful result."
+                        : "Steam discovery was incomplete; no catalog sync was confirmed.";
+            status.replaceChildren(Amaterasu.el("p", "notice warning", message));
+            context.notify(message);
+        }
+        async function pollForceSync(generation) {
+            if (!context.content.isConnected) {
+                stopForceSyncPolling();
+                return;
+            }
+            if (!context.api.allows("steam.read")) {
+                stopUnobservableForceSync();
+                return;
+            }
+            if (generation !== forceSyncPollGeneration ||
+                !forceSyncPending ||
+                !context.content.isConnected) {
+                return;
+            }
             try {
+                const provider = await context.api.post("steam/status");
+                if (generation !== forceSyncPollGeneration ||
+                    !forceSyncPending ||
+                    !context.content.isConnected) {
+                    return;
+                }
+                providerStatus = provider;
+                finishForceSync(provider);
+                updateForceSyncControl();
+                if (!forceSyncPending && context.content.isConnected) {
+                    resetPagination();
+                    await load(false);
+                }
+            }
+            catch (error) {
+                if (generation !== forceSyncPollGeneration ||
+                    !forceSyncPending ||
+                    !context.content.isConnected) {
+                    return;
+                }
+                if (!context.api.allows("steam.read")) {
+                    stopUnobservableForceSync();
+                    return;
+                }
+                status.replaceChildren(Amaterasu.errorPanel(error));
+            }
+            if (generation === forceSyncPollGeneration &&
+                forceSyncPending &&
+                context.content.isConnected) {
+                forceSyncPollTimer = window.setTimeout(() => {
+                    forceSyncPollTimer = undefined;
+                    void pollForceSync(generation);
+                }, 1000);
+            }
+        }
+        function startForceSyncPolling() {
+            if (!forceSyncPending || !context.content.isConnected)
+                return;
+            if (!context.api.allows("steam.read")) {
+                stopUnobservableForceSync();
+                return;
+            }
+            stopForceSyncPolling();
+            const generation = forceSyncPollGeneration;
+            forceSyncPollTimer = window.setTimeout(() => {
+                forceSyncPollTimer = undefined;
+                void pollForceSync(generation);
+            }, 1000);
+        }
+        async function requestForceSync() {
+            const target = forceSyncControl;
+            if (!target)
+                return;
+            await Amaterasu.runAction(target, status, async () => {
+                const reply = await context.api.post("steam/force_sync");
+                if (reply.ok !== true ||
+                    reply.accepted !== true ||
+                    reply.settings_ready !== true ||
+                    reply.force_sync_pending !== true ||
+                    reply.catalog_sync?.force_sync_pending !== true) {
+                    throw new Error(reply.code
+                        ? `Force catalog sync was not accepted: ${reply.code}`
+                        : "Force catalog sync was not accepted.");
+                }
+                forceSyncPending = true;
+                status.replaceChildren(Amaterasu.el("p", "notice", "Force catalog sync accepted. Waiting for a complete Steam scan."));
+                updateForceSyncControl();
+                if (!context.content.isConnected)
+                    return;
+                if (!context.api.allows("steam.read")) {
+                    stopUnobservableForceSync();
+                    return;
+                }
+                resetPagination();
+                await load();
+                startForceSyncPolling();
+            });
+            updateForceSyncControl();
+        }
+        const canForceSync = context.api.allows("steam.refresh");
+        if (canForceSync) {
+            forceSyncControl = Amaterasu.button("Force catalog sync", requestForceSync);
+        }
+        updateForceSyncControl();
+        scan.disabled = !context.api.allows("steam.refresh");
+        context.content.append(Amaterasu.sectionHeading("Steam library", "Discover local Steam games and optionally sync a complete scan into the catalog.", Amaterasu.button("Refresh", () => {
+            resetPagination();
+            return load();
+        }), scan, forceSyncControl), status, area);
+        async function load(refreshProviderStatus = true) {
+            if (!context.api.allows("steam.read")) {
+                if (context.content.isConnected) {
+                    area.replaceChildren(Amaterasu.empty("Steam status unavailable", "This session can request a Steam force sync but needs steam.read to inspect discoveries or track its progress."));
+                }
+                return;
+            }
+            try {
+                const providerRequest = refreshProviderStatus
+                    ? context.api.post("steam/status")
+                    : Promise.resolve(providerStatus);
                 const [reply, provider] = await Promise.all([
                     context.api.post("steam/list", {
                         ...(revision != null ? { revision } : {}),
                         ...(after != null ? { after } : {}),
                         limit: 16,
                     }),
-                    context.api.post("steam/status"),
+                    providerRequest,
                 ]);
-                if (!context.content.isConnected)
+                if (!context.content.isConnected || !provider)
                     return;
                 revision = reply.revision;
+                providerStatus = provider;
                 scan.disabled =
                     !context.api.allows("steam.refresh") || provider.enabled === false;
+                if (forceSyncPending)
+                    finishForceSync(provider);
+                updateForceSyncControl();
                 const rows = reply.games.map((game) => [
                     Amaterasu.el("div", "", Amaterasu.el("strong", "", game.name), Amaterasu.el("small", "path block", game.install_directory ?? "")),
                     String(game.app_id),
@@ -3397,7 +3945,7 @@ var Amaterasu;
                     .forEach((dialog) => dialog.remove());
                 this.loginScreen();
             }, "quiet");
-            const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", this.api.subject), logout));
+            const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", this.api.subject), Amaterasu.mountLocaleSelector(this.api), logout));
             this.notification = Amaterasu.el("div", "toast");
             this.notification.setAttribute("role", "status");
             this.notification.hidden = true;

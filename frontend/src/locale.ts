@@ -62,12 +62,11 @@ namespace Amaterasu {
     if (definition.default !== "en") {
       throw new Error("The registered locale field must default to en.");
     }
+    const options = definition.options;
     if (
-      !Array.isArray(definition.options) ||
-      definition.options.length !== LOCALE_OPTIONS.length ||
-      !LOCALE_OPTIONS.every(
-        (locale, index) => definition.options[index] === locale,
-      )
+      !Array.isArray(options) ||
+      options.length !== LOCALE_OPTIONS.length ||
+      !LOCALE_OPTIONS.every((locale, index) => options[index] === locale)
     ) {
       throw new Error("The registered locale options are incompatible.");
     }
