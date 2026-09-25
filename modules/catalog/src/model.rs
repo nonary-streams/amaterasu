@@ -94,6 +94,8 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_refresh_rate_option: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_request_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
@@ -186,6 +188,13 @@ impl ConfigOverrides {
             return Err("dd_refresh_rate_option must be auto, disabled, manual, or prefer_highest");
         }
         if self
+            .dd_hdr_request_override
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "auto" | "force_on" | "force_off"))
+        {
+            return Err("dd_hdr_request_override must be auto, force_on, or force_off");
+        }
+        if self
             .frame_limiter_fps_limit
             .is_some_and(|limit| !valid_millihertz_value(limit))
         {
@@ -259,6 +268,7 @@ impl ConfigOverrides {
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
             && self.dd_refresh_rate_option.is_none()
+            && self.dd_hdr_request_override.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.virtual_sink.is_none()
@@ -815,11 +825,9 @@ mod tests {
         assert_eq!(legacy.config_overrides.stream_audio, None);
         let legacy_json = serde_json::to_value(legacy).unwrap();
         assert_eq!(legacy_json["config_overrides"]["fec_percentage"], 37);
-        assert!(
-            legacy_json["config_overrides"]
-                .get("stream_audio")
-                .is_none()
-        );
+        assert!(legacy_json["config_overrides"]
+            .get("stream_audio")
+            .is_none());
 
         let inherited: Entry = serde_json::from_value(json!({
             "name":"Inherited entry",
@@ -828,12 +836,10 @@ mod tests {
         .unwrap();
         inherited.validate().unwrap();
         assert!(inherited.config_overrides.is_empty());
-        assert!(
-            serde_json::to_value(inherited)
-                .unwrap()
-                .get("config_overrides")
-                .is_none()
-        );
+        assert!(serde_json::to_value(inherited)
+            .unwrap()
+            .get("config_overrides")
+            .is_none());
 
         let disabled: ConfigOverrides =
             serde_json::from_value(json!({"fec_percentage":37,"stream_audio":false})).unwrap();
@@ -925,12 +931,10 @@ mod tests {
         .unwrap();
         absent_entry.validate().unwrap();
         assert_eq!(absent_entry.config_overrides.dd_refresh_rate_option, None);
-        assert!(
-            serde_json::to_value(absent_entry)
-                .unwrap()
-                .get("config_overrides")
-                .is_none()
-        );
+        assert!(serde_json::to_value(absent_entry)
+            .unwrap()
+            .get("config_overrides")
+            .is_none());
 
         let inherited: Entry = serde_json::from_value(json!({
             "name":"Inherited refresh rate option",
@@ -940,12 +944,10 @@ mod tests {
         .unwrap();
         inherited.validate().unwrap();
         assert_eq!(inherited.config_overrides.dd_refresh_rate_option, None);
-        assert!(
-            serde_json::to_value(inherited)
-                .unwrap()
-                .get("config_overrides")
-                .is_none()
-        );
+        assert!(serde_json::to_value(inherited)
+            .unwrap()
+            .get("config_overrides")
+            .is_none());
 
         for option in ["auto", "disabled", "manual", "prefer_highest"] {
             let entry: Entry = serde_json::from_value(json!({
@@ -998,6 +1000,101 @@ mod tests {
                 }))
                 .is_err(),
                 "accepted non-string refresh rate option {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn dd_hdr_request_override_is_sparse_exact_and_roundtrips_through_catalog_entries() {
+        let absent: ConfigOverrides = serde_json::from_value(json!({})).unwrap();
+        let null: ConfigOverrides =
+            serde_json::from_value(json!({"dd_hdr_request_override":null})).unwrap();
+        assert_eq!(absent.dd_hdr_request_override, None);
+        assert_eq!(null.dd_hdr_request_override, None);
+        assert!(absent.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        let absent_entry: Entry = serde_json::from_value(json!({
+            "name":"Inherited HDR request",
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        absent_entry.validate().unwrap();
+        assert_eq!(absent_entry.config_overrides.dd_hdr_request_override, None);
+        assert!(serde_json::to_value(absent_entry)
+            .unwrap()
+            .get("config_overrides")
+            .is_none());
+
+        let inherited_entry: Entry = serde_json::from_value(json!({
+            "name":"Inherited HDR request",
+            "config_overrides":{"dd_hdr_request_override":null},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        inherited_entry.validate().unwrap();
+        assert_eq!(
+            inherited_entry.config_overrides.dd_hdr_request_override,
+            None
+        );
+        assert!(serde_json::to_value(inherited_entry)
+            .unwrap()
+            .get("config_overrides")
+            .is_none());
+
+        for mode in ["auto", "force_on", "force_off"] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Selected HDR request",
+                "config_overrides":{"dd_hdr_request_override":mode},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .unwrap();
+            entry.validate().unwrap();
+            assert_eq!(
+                entry.config_overrides.dd_hdr_request_override.as_deref(),
+                Some(mode)
+            );
+
+            let serialized = serde_json::to_value(&entry).unwrap();
+            assert_eq!(
+                serialized["config_overrides"]["dd_hdr_request_override"],
+                mode
+            );
+            let restored: Entry = serde_json::from_value(serialized).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(
+                restored.config_overrides.dd_hdr_request_override.as_deref(),
+                Some(mode)
+            );
+        }
+
+        let explicit_auto: ConfigOverrides =
+            serde_json::from_value(json!({"dd_hdr_request_override":"auto"})).unwrap();
+        assert_eq!(
+            explicit_auto.dd_hdr_request_override.as_deref(),
+            Some("auto")
+        );
+        assert!(!explicit_auto.is_empty());
+
+        for unsupported in ["AUTO", "force-on", "unknown", "auto "] {
+            let overrides: ConfigOverrides = serde_json::from_value(json!({
+                "dd_hdr_request_override":unsupported
+            }))
+            .unwrap();
+            assert!(
+                overrides.validate().is_err(),
+                "accepted HDR request override {unsupported:?}"
+            );
+        }
+        for invalid in [json!(1), json!(true), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(json!({
+                    "dd_hdr_request_override":invalid
+                }))
+                .is_err(),
+                "accepted non-string HDR request override {invalid}"
             );
         }
     }
@@ -1092,14 +1189,12 @@ mod tests {
             .validate()
             .unwrap();
         }
-        assert!(
-            ConfigOverrides {
-                video_max_batch_size_kb: Some(65),
-                ..ConfigOverrides::default()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(ConfigOverrides {
+            video_max_batch_size_kb: Some(65),
+            ..ConfigOverrides::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1110,12 +1205,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!omitted.elevated);
-        assert!(
-            serde_json::to_value(&omitted)
-                .unwrap()
-                .get("elevated")
-                .is_none()
-        );
+        assert!(serde_json::to_value(&omitted)
+            .unwrap()
+            .get("elevated")
+            .is_none());
 
         let elevated: Entry = serde_json::from_value(json!({
             "name":"Elevated executable",
@@ -1209,12 +1302,10 @@ mod tests {
         let enabled: ConfigOverrides =
             serde_json::from_value(json!({"audio_sink_capture_only":true})).unwrap();
         assert_eq!(enabled.audio_sink_capture_only, Some(true));
-        assert!(
-            serde_json::from_value::<ConfigOverrides>(json!({
-                "audio_sink_capture_only":"false"
-            }))
-            .is_err()
-        );
+        assert!(serde_json::from_value::<ConfigOverrides>(json!({
+            "audio_sink_capture_only":"false"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1283,18 +1374,14 @@ mod tests {
                 json!({"back_button_timeout":timeout})
             );
         }
-        assert!(
-            serde_json::from_value::<ConfigOverrides>(json!({
-                "back_button_timeout":2147483648i64
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<ConfigOverrides>(json!({
-                "back_button_timeout":1.5
-            }))
-            .is_err()
-        );
+        assert!(serde_json::from_value::<ConfigOverrides>(json!({
+            "back_button_timeout":2147483648i64
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ConfigOverrides>(json!({
+            "back_button_timeout":1.5
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1472,14 +1559,12 @@ mod tests {
             assert!(entry.validate().is_err(), "accepted artwork {reference}");
         }
 
-        assert!(
-            serde_json::from_value::<Entry>(json!({
-                "name":"Unknown artwork provider",
-                "artwork":{"provider":"local_path","path":"C:/private/image.png"},
-                "launch":{"kind":"application","path":"/games/example"}
-            }))
-            .is_err()
-        );
+        assert!(serde_json::from_value::<Entry>(json!({
+            "name":"Unknown artwork provider",
+            "artwork":{"provider":"local_path","path":"C:/private/image.png"},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .is_err());
     }
 
     #[test]

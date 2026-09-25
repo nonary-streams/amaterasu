@@ -343,14 +343,12 @@ fn playnite_fullscreen_synthetic_entry_is_fixed_cas_owned_and_survives_snapshots
         "amaterasu.management",
     );
     assert_eq!(unauthorized["error"]["code"], "permission_denied");
-    assert!(
-        serde_json::from_value::<Operation>(json!({
-            "action":"provider_playnite_fullscreen_entry",
-            "enabled":true,
-            "owner":"amaterasu.steam"
-        }))
-        .is_err()
-    );
+    assert!(serde_json::from_value::<Operation>(json!({
+        "action":"provider_playnite_fullscreen_entry",
+        "enabled":true,
+        "owner":"amaterasu.steam"
+    }))
+    .is_err());
 
     let begin = backend.run_for(
         &mut playnite,
@@ -783,12 +781,10 @@ fn old_provider_markers_default_to_no_uninstalled_tombstone() {
             .video_max_batch_size_kb,
         None
     );
-    assert!(
-        old_marker_with_overrides
-            .config_overrides
-            .validate()
-            .is_ok()
-    );
+    assert!(old_marker_with_overrides
+        .config_overrides
+        .validate()
+        .is_ok());
 
     let mut persisted_marker = old_marker_with_overrides;
     persisted_marker.config_overrides.max_bitrate = Some(42_000);
@@ -1188,11 +1184,9 @@ fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority()
     let resolve = || Operation::ResolveLaunch {
         id: "app-0000000000000001".into(),
     };
-    assert!(
-        pipeline
-            .select_catalog("stranger", "victim", resolve())
-            .is_err()
-    );
+    assert!(pipeline
+        .select_catalog("stranger", "victim", resolve())
+        .is_err());
     let (key, catalog_owner, operation) = pipeline
         .select_catalog("launch", "original.client", resolve())
         .unwrap();
@@ -1209,12 +1203,10 @@ fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority()
         )
         .unwrap();
     assert_eq!(key, "principal/launch");
-    assert!(
-        serde_json::from_value::<Operation>(
-            json!({"action":"resolve_launch","id":"app-0000000000000001","owner":"victim"})
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_value::<Operation>(
+        json!({"action":"resolve_launch","id":"app-0000000000000001","owner":"victim"})
+    )
+    .is_err());
 }
 
 #[test]
@@ -1480,30 +1472,24 @@ fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner(
     let resolve = || Operation::ResolveExportedLaunch {
         id: "app-0000000000000001".into(),
     };
-    assert!(
-        pipeline
-            .select_catalog("stranger", "nvhttp", resolve())
-            .is_err()
-    );
-    assert!(
-        pipeline
-            .select_catalog("launch", "foreign", resolve())
-            .is_err()
-    );
+    assert!(pipeline
+        .select_catalog("stranger", "nvhttp", resolve())
+        .is_err());
+    assert!(pipeline
+        .select_catalog("launch", "foreign", resolve())
+        .is_err());
     let (key, owner, operation) = pipeline
         .select_catalog("launch", "nvhttp", resolve())
         .unwrap();
     assert_eq!(key, "principal/management");
     assert_eq!(owner.as_deref(), Some("management"));
     assert!(matches!(operation, Operation::ResolveExportedLaunch { .. }));
-    assert!(
-        serde_json::from_value::<Operation>(json!({
-            "action":"resolve_exported_launch",
-            "id":"app-0000000000000001",
-            "owner":"victim"
-        }))
-        .is_err()
-    );
+    assert!(serde_json::from_value::<Operation>(json!({
+        "action":"resolve_exported_launch",
+        "id":"app-0000000000000001",
+        "owner":"victim"
+    }))
+    .is_err());
 
     let entry = json!({
         "name":"Managed game",
@@ -2618,11 +2604,9 @@ fn playnite_uninstalled_cleanup_is_explicit_gated_and_scoped_to_unchanged_rows()
     );
     assert_eq!(cleaned["ok"], true);
     assert!(!backend.entries.contains_key("app-0000000000000001"));
-    assert!(
-        !backend
-            .entries
-            .contains_key("~provider.entry:amaterasu.playnite:playnite:10")
-    );
+    assert!(!backend
+        .entries
+        .contains_key("~provider.entry:amaterasu.playnite:playnite:10"));
     assert!(backend.entries.contains_key("app-0000000000000002"));
     assert!(backend.entries.contains_key("app-0000000000000003"));
     assert!(backend.entries.contains_key("app-0000000000000004"));
@@ -2795,11 +2779,9 @@ fn empty_or_rejected_playnite_snapshot_has_no_cleanup_effect() {
     );
     assert_eq!(empty_complete["ok"], true);
     assert!(backend.entries.contains_key("app-0000000000000001"));
-    assert!(
-        backend
-            .entries
-            .contains_key("~provider.entry:amaterasu.playnite:playnite:10")
-    );
+    assert!(backend
+        .entries
+        .contains_key("~provider.entry:amaterasu.playnite:playnite:10"));
 }
 
 #[test]
@@ -2842,6 +2824,47 @@ fn resolve_launch_preserves_exact_amd_av1_latency_mode_tokens() {
         assert_eq!(
             resolved["entry"]["config_overrides"],
             json!({"amd_av1_latency_mode":mode})
+        );
+    }
+}
+
+#[test]
+fn dd_hdr_request_override_persists_across_catalog_reload() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::default();
+
+    for (index, mode) in ["auto", "force_on", "force_off"].into_iter().enumerate() {
+        let mut catalog_entry = entry(&format!("HDR request {mode}"));
+        catalog_entry["config_overrides"] = json!({"dd_hdr_request_override":mode});
+        let created = backend.run_for(
+            &mut pipeline,
+            json!({
+                "action":"create",
+                "expected_revision":index,
+                "entry":catalog_entry
+            }),
+            "owner",
+            "owner",
+            "owner",
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(
+            backend.entries[created["id"].as_str().unwrap()]["config_overrides"]
+                ["dd_hdr_request_override"],
+            mode
+        );
+
+        let reloaded = backend.run_for(
+            &mut Pipeline::default(),
+            json!({"action":"get","id":created["id"]}),
+            "owner",
+            "owner",
+            "owner",
+        );
+        assert_eq!(reloaded["ok"], true, "{reloaded}");
+        assert_eq!(
+            reloaded["entry"]["config_overrides"]["dd_hdr_request_override"],
+            mode
         );
     }
 }
@@ -2969,11 +2992,9 @@ fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() 
         backend.entries["app-0000000000000001"]["name"],
         "Hand edited"
     );
-    assert!(
-        !backend
-            .entries
-            .contains_key("~provider.entry:steam:steam:10")
-    );
+    assert!(!backend
+        .entries
+        .contains_key("~provider.entry:steam:steam:10"));
 }
 
 #[test]
@@ -3174,11 +3195,9 @@ fn provider_refresh_rate_option_override_is_strict_and_survives_playnite_refresh
         assert_eq!(rejected["error"]["code"], "invalid_request");
         assert_eq!(backend.metadata["revision"], 1);
         assert!(backend.entries[id].get("config_overrides").is_none());
-        assert!(
-            backend.entries[marker_key]["config_overrides"]
-                .get("dd_refresh_rate_option")
-                .is_none()
-        );
+        assert!(backend.entries[marker_key]["config_overrides"]
+            .get("dd_refresh_rate_option")
+            .is_none());
     }
 
     let unsupported = backend.run_for(
@@ -3241,6 +3260,67 @@ fn provider_refresh_rate_option_override_is_strict_and_survives_playnite_refresh
     assert_eq!(
         backend.entries[marker_key]["config_overrides"]["dd_refresh_rate_option"],
         "prefer_highest"
+    );
+}
+
+#[test]
+fn provider_dd_hdr_request_override_survives_playnite_refresh_without_marker_version_bump() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let imported = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-dd-hdr-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let id = "app-0000000000000001";
+    let marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
+    let updated = backend.run_for(
+        &mut pipeline,
+        update_provider_config_overrides(id, 1, json!({"dd_hdr_request_override":"force_off"})),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(updated["ok"], true, "{updated}");
+    assert_eq!(
+        updated["config_overrides"]["dd_hdr_request_override"],
+        "force_off"
+    );
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["dd_hdr_request_override"],
+        "force_off"
+    );
+    assert_eq!(backend.entries[marker_key]["version"], 1);
+    assert_eq!(
+        backend.entries[marker_key]["config_overrides"]["dd_hdr_request_override"],
+        "force_off"
+    );
+
+    let refreshed = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-dd-hdr-2",
+        2,
+        updated["revision"].as_u64().unwrap(),
+        "playnite:10",
+        "Provider renamed title",
+    );
+    assert_eq!(refreshed["ok"], true, "{refreshed}");
+    assert_eq!(backend.entries[id]["name"], "Provider renamed title");
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["dd_hdr_request_override"],
+        "force_off"
+    );
+    assert_eq!(backend.entries[marker_key]["version"], 1);
+    assert_eq!(
+        backend.entries[marker_key]["config_overrides"]["dd_hdr_request_override"],
+        "force_off"
     );
 }
 
@@ -3630,11 +3710,9 @@ fn finish_policy_retains_then_cleans_only_unchanged_provider_entries_and_replays
     );
     assert_eq!(ambiguous["error"]["code"], "deadline_exceeded");
     assert!(backend.entries.contains_key("app-0000000000000001"));
-    assert!(
-        backend
-            .entries
-            .contains_key("~provider.entry:steam:steam:10")
-    );
+    assert!(backend
+        .entries
+        .contains_key("~provider.entry:steam:steam:10"));
 
     let mut restarted_pipeline = steam_importer();
     let replay = backend.run_for(
@@ -3680,11 +3758,9 @@ fn finish_policy_retains_then_cleans_only_unchanged_provider_entries_and_replays
     assert_eq!(cleaned["ok"], true);
     assert_eq!(cleaned["remove_stale"], true);
     assert!(!backend.entries.contains_key("app-0000000000000001"));
-    assert!(
-        !backend
-            .entries
-            .contains_key("~provider.entry:steam:steam:10")
-    );
+    assert!(!backend
+        .entries
+        .contains_key("~provider.entry:steam:steam:10"));
 }
 
 #[test]
@@ -3967,11 +4043,9 @@ fn retained_manually_edited_entry_loses_marker_but_survives_later_cleanup() {
         backend.entries["app-0000000000000001"]["name"],
         "Hand edited"
     );
-    assert!(
-        backend
-            .entries
-            .contains_key("~provider.entry:steam:steam:10")
-    );
+    assert!(backend
+        .entries
+        .contains_key("~provider.entry:steam:steam:10"));
 
     let third = backend.run_for(
         &mut pipeline,
@@ -4000,9 +4074,7 @@ fn retained_manually_edited_entry_loses_marker_but_survives_later_cleanup() {
         backend.entries["app-0000000000000001"]["name"],
         "Hand edited"
     );
-    assert!(
-        !backend
-            .entries
-            .contains_key("~provider.entry:steam:steam:10")
-    );
+    assert!(!backend
+        .entries
+        .contains_key("~provider.entry:steam:steam:10"));
 }

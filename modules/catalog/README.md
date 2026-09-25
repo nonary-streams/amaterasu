@@ -41,6 +41,15 @@ an explicit `auto` remains an application override. Catalog validates, stores,
 and returns this token unchanged; it does not resolve global or client policy.
 Existing entries omit the field, so no catalog migration is needed.
 
+The optional `dd_hdr_request_override` string accepts exactly `auto`,
+`force_on`, or `force_off` (case-sensitive). Omit it or set it to null to
+inherit; an explicit `auto` remains an application override. Catalog validates,
+stores, and returns this token unchanged, and provider refreshes preserve it.
+Existing entries and version-1 provider markers may omit it, so no catalog
+document or provider-marker version bump is needed. Catalog storage does not
+apply this request to a display provider; runtime projection remains outside
+this module.
+
 The optional `nvenc_spatial_aq` override is a strict boolean. Omit it or set it
 to null to inherit; explicit `true` and `false` values are stored and returned,
 including through provider-marker refreshes. Existing entries and markers may
