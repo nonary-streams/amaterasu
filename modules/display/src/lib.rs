@@ -1,7 +1,13 @@
 //! Physical display changes guarded by a durable recovery journal.
+pub mod mode_remapping;
 mod model;
 mod pipeline;
 mod platform;
+
+pub use mode_remapping::{
+    DisplayMode, ModeRemapping, ModeRemappingEntry, ModeRemappingError, Resolution, ResolverContext,
+};
+pub use model::Rational;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use pipeline::Pipeline;
