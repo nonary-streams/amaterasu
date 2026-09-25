@@ -112,29 +112,43 @@ impl LoggingSettings {
 #[derive(Default)]
 pub(crate) struct SessionLogger {
     minimum_level: u8,
+    settings: Option<LoggingSettings>,
     session: Option<SessionLog>,
 }
 
 impl SessionLogger {
     pub(crate) fn open(settings: LoggingSettings) -> (Self, Option<String>) {
+        let minimum_level = settings.minimum_level;
+        let logging_enabled = settings.log_path.is_some();
         let mut logger = Self {
-            minimum_level: settings.minimum_level,
+            minimum_level,
+            settings: logging_enabled.then_some(settings),
             session: None,
         };
-        let session = match (settings.log_path, settings.state_root) {
-            (Some(log_path), Some(state_root)) => SessionLog::new(&log_path, &state_root),
-            _ => return (logger, None),
-        };
-        match session {
-            Ok(session) => logger.session = Some(session),
-            Err(error) => return (logger, Some(error.to_string())),
+        if let Some(session) = logger.open_configured_session() {
+            match session {
+                Ok(session) => logger.session = Some(session),
+                Err(error) => return (logger, Some(error.to_string())),
+            }
         }
         (logger, None)
+    }
+
+    fn open_configured_session(&self) -> Option<io::Result<SessionLog>> {
+        let settings = self.settings.as_ref()?;
+        let log_path = settings.log_path.as_deref()?;
+        let state_root = settings.state_root.as_deref()?;
+        Some(SessionLog::new(log_path, state_root))
     }
 
     pub(crate) fn write_record(&mut self, record: &Record) {
         if record.level.numeric() < self.minimum_level {
             return;
+        }
+        if self.session.is_none()
+            && let Some(Ok(session)) = self.open_configured_session()
+        {
+            self.session = Some(session);
         }
         if let Some(session) = &mut self.session
             && session.write_record(record).is_err()
@@ -559,6 +573,66 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path.canonicalize().unwrap()
+    }
+
+    fn test_record(message: &str) -> Record {
+        Record {
+            sequence: 1,
+            level: crate::protocol::Level::Info,
+            target: "diagnostics::test".into(),
+            message: message.into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn failed_sink_reopens_for_the_next_qualifying_record() {
+        let state_root = temp_root();
+        let settings = LoggingSettings::from_value(json!({
+            "log_path":"capture.log",
+            "state_root":state_root,
+        }))
+        .unwrap();
+        let (mut logger, warning) = SessionLogger::open(settings);
+        assert!(warning.is_none());
+        let original_path = logger.session.as_ref().unwrap().active_path.clone();
+
+        drop(logger.session.as_mut().unwrap().file.take());
+        logger.write_record(&test_record("lost to closed sink"));
+        assert!(logger.session.is_none());
+
+        logger.write_record(&test_record("written after reopening"));
+        let reopened = logger.session.as_ref().unwrap();
+        assert_ne!(reopened.active_path, original_path);
+        let contents = fs::read_to_string(&reopened.active_path).unwrap();
+        assert!(contents.contains("written after reopening"));
+        assert!(!contents.contains("lost to closed sink"));
+
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn initially_unavailable_sink_reopens_when_a_later_record_arrives() {
+        let state_root = temp_root();
+        let blocking_path = state_root.join("delayed");
+        fs::write(&blocking_path, b"block directory creation").unwrap();
+        let settings = LoggingSettings::from_value(json!({
+            "log_path":"delayed/capture.log",
+            "state_root":state_root,
+        }))
+        .unwrap();
+        let (mut logger, warning) = SessionLogger::open(settings);
+        assert!(warning.is_some());
+        assert!(logger.session.is_none());
+
+        fs::remove_file(&blocking_path).unwrap();
+        logger.write_record(&test_record("recovered after initial open failure"));
+
+        let session = logger.session.as_ref().unwrap();
+        let contents = fs::read_to_string(&session.active_path).unwrap();
+        assert!(contents.contains("recovered after initial open failure"));
+
+        fs::remove_dir_all(state_root).unwrap();
     }
 
     #[test]
