@@ -45,10 +45,10 @@ pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> 
 fn open_rejects_policy_mismatch_before_udp_setup() {
     let (video, audio) = receivers();
     let mut settings = request(&video, &audio, false);
-    settings.video_encryption_policy = Some(VideoEncryptionPolicySnapshot {
+    settings.video_encryption_policy = Some(Box::new(VideoEncryptionPolicySnapshot {
         lan_mode: 2,
         wan_mode: 0,
-    });
+    }));
     settings.video_bind = Some(video.local_addr().unwrap());
 
     assert!(matches!(

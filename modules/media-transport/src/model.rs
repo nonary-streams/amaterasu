@@ -184,7 +184,7 @@ impl Encryption {
 pub struct Open {
     pub peer_ip: IpAddr,
     #[serde(default)]
-    pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
+    pub video_encryption_policy: Option<Box<VideoEncryptionPolicySnapshot>>,
     #[serde(default)]
     pub video_port: Option<u16>,
     #[serde(default)]
@@ -264,7 +264,7 @@ impl Open {
     }
 
     pub(crate) fn validate_video_encryption_policy(&self) -> TransportResult<()> {
-        let Some(snapshot) = self.video_encryption_policy else {
+        let Some(snapshot) = self.video_encryption_policy.as_deref() else {
             return Ok(());
         };
         let policy = NetworkEncryptionPolicy {
