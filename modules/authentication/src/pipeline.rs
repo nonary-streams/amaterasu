@@ -324,7 +324,12 @@ impl Pipeline {
                 if payload["ok"] != true || payload["revision"].as_u64() != committed_revision {
                     return complete(send, pending.request.id, error("state_unavailable"));
                 }
-                if let Some(followup) = followup {
+                if let Some(mut followup) = followup {
+                    // State revisions belong to the principal namespace, not
+                    // individual keys. The first write advanced the revision
+                    // used by the session sidecar CAS.
+                    followup.expected_revision =
+                        committed_revision.expect("validated committed revision");
                     return self.submit_state_mutation(
                         pending.request,
                         followup,

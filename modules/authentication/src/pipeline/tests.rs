@@ -89,17 +89,18 @@ impl StateHarness {
                     } else {
                         assert_eq!(key, SESSION_STATE_KEY);
                         if payload["action"] == "get" {
-                            json!({"ok":true,"revision":self.session_revision,"found":self.session_stored.is_some(),"value":self.session_stored})
+                            json!({"ok":true,"revision":self.revision,"found":self.session_stored.is_some(),"value":self.session_stored})
                         } else {
                             assert_eq!(payload["action"], "set");
-                            assert_eq!(payload["expected_revision"], self.session_revision);
+                            assert_eq!(payload["expected_revision"], self.revision);
                             self.writes += 1;
                             if self.fail_write || self.fail_session_write {
                                 json!({"ok":false,"error":{"code":"io_error","message":"sensitive transport failure"}})
                             } else {
                                 self.session_stored = Some(payload["value"].clone());
+                                self.revision += 1;
                                 self.session_revision += 1;
-                                json!({"ok":true,"revision":self.session_revision})
+                                json!({"ok":true,"revision":self.revision})
                             }
                         }
                     };
@@ -791,6 +792,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings_with_ttls(120, 400));
     state.setup(&mut pipeline);
+    let credential_document = state.stored.clone();
 
     let login = state.request(
         &mut pipeline,
@@ -799,10 +801,8 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         100,
     );
     assert_eq!(login["ok"], true);
-    assert_eq!(
-        state.revision, 1,
-        "login must not rewrite the legacy document"
-    );
+    assert_eq!(state.revision, 2);
+    assert_eq!(state.stored, credential_document);
     assert_eq!(state.session_revision, 1);
     let stored = state.session_stored.as_ref().unwrap();
     assert_eq!(stored["sessions"].as_array().unwrap().len(), 1);
@@ -838,10 +838,8 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
     );
     assert_eq!(rotated["ok"], true);
     assert_eq!(rotated["refresh_expires_at"], 500);
-    assert_eq!(
-        state.revision, 1,
-        "rotation only changes the session sidecar"
-    );
+    assert_eq!(state.revision, 3);
+    assert_eq!(state.stored, credential_document);
     assert_eq!(state.session_revision, 2);
     assert_eq!(
         state.session_stored.as_ref().unwrap()["sessions"][0]["session_id"],
@@ -1044,6 +1042,8 @@ fn legacy_login_waits_for_session_sidecar_commit_after_credential_upgrade() {
     );
     assert!(state.session_stored.is_none());
 
+    assert_eq!(state.revision, 2, "the credential write committed");
+
     state.fail_session_write = false;
     let committed_login = state.request(
         &mut pipeline,
@@ -1053,6 +1053,87 @@ fn legacy_login_waits_for_session_sidecar_commit_after_credential_upgrade() {
     );
     assert_eq!(committed_login["ok"], true);
     assert!(state.session_stored.is_some());
+    assert_eq!(state.revision, 3);
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":committed_login["bearer"],"required_scopes":[]}),
+            102,
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn legacy_credential_upgrade_persists_session_at_shared_namespace_revision() {
+    let mut state = StateHarness::new();
+    let salt = "AbCdEfGhIjKlMnOp";
+    let password = "correct horse battery staple";
+    state.stored = Some(json!({
+        "credential": {
+            "username": "Admin",
+            "password_hash": crate::crypto::token_digest(&format!("{password}{salt}")),
+            "legacy_salt": salt,
+            "case_insensitive_username": true
+        },
+        "tokens": []
+    }));
+    state.revision = 1;
+
+    let mut pipeline = Pipeline::new(settings());
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password,"remember_me":true}),
+        100,
+    );
+    assert_eq!(login["ok"], true);
+    assert_eq!(state.revision, 3, "both keys share one revision");
+    assert_eq!(state.session_revision, 1);
+    assert!(
+        state.stored.as_ref().unwrap()["credential"]
+            .get("legacy_salt")
+            .is_none()
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
+            101,
+        )["ok"],
+        true
+    );
+    let refreshed = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        102,
+    );
+    assert_eq!(refreshed["ok"], true);
+    assert_eq!(state.revision, 4);
+
+    let mut restarted_again = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":["catalog.read"]}),
+            103,
+        )["ok"],
+        true
+    );
 }
 
 #[test]
