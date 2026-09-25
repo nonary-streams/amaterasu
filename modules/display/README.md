@@ -34,11 +34,17 @@ request, or perform provider/native display effects.
 The library exposes `ResolutionOption` as a reusable typed configuration model.
 Its default is `Auto`, and its serialized tokens are `auto`, `disabled`,
 and `manual`.
-The legacy token parser maps unknown values to `Disabled`. The `Manual` variant
-uses the separate `dd_manual_resolution` setting.
+The legacy token parser maps unknown values to `Disabled`. Its documented meanings
+are:
 
-This model does not persist settings, project scoped values into a runtime
-request, perform provider effects, or implement the `Moonlight` gate.
+- `auto` changes to the client's requested resolution.
+- `disabled` performs no additional resolution configuration.
+- `manual` uses the separate `dd_manual_resolution` setting.
+
+Moonlight requires `Optimize game settings` to be enabled for this option to work.
+This module exposes the model only; it does not persist settings, project scoped
+values into runtime requests, perform provider effects, or implement the
+Moonlight gate.
 
 ## API
 
