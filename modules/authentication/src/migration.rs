@@ -1169,18 +1169,18 @@ mod tests {
             "vibepollo.conf",
         ];
 
-        for first_index in 0..CONFIG_FILES.len() {
-            for second_index in first_index + 1..CONFIG_FILES.len() {
+        for (first_index, &first_config) in CONFIG_FILES.iter().enumerate() {
+            for &second_config in CONFIG_FILES.iter().skip(first_index + 1) {
                 let pair_name = format!(
                     "{}-{}",
-                    CONFIG_FILES[first_index].trim_end_matches(".conf"),
-                    CONFIG_FILES[second_index].trim_end_matches(".conf")
+                    first_config.trim_end_matches(".conf"),
+                    second_config.trim_end_matches(".conf")
                 );
                 let source = temporary_directory(&format!("credentials-cross-config-{pair_name}"));
                 std::fs::create_dir_all(source.join("private")).unwrap();
                 std::fs::write(
                     source.join("private/primary.json"),
-                    credential_record("Shared", "shared password", "SharedSalt12345"),
+                    credential_record("Shared", "shared password", "SharedSalt123456"),
                 )
                 .unwrap();
                 #[cfg(unix)]
@@ -1195,8 +1195,8 @@ mod tests {
                     "private/primary.json"
                 };
                 for (config_file, credentials_path) in [
-                    (CONFIG_FILES[first_index], "private/primary.json"),
-                    (CONFIG_FILES[second_index], second_path),
+                    (first_config, "private/primary.json"),
+                    (second_config, second_path),
                 ] {
                     std::fs::write(
                         source.join(config_file),
@@ -1225,17 +1225,17 @@ mod tests {
                 std::fs::create_dir_all(distinct.join("private")).unwrap();
                 std::fs::write(
                     distinct.join("private/first.json"),
-                    credential_record("First", "first password", "FirstSalt123456"),
+                    credential_record("First", "first password", "FirstSalt1234567"),
                 )
                 .unwrap();
                 std::fs::write(
                     distinct.join("private/second.json"),
-                    credential_record("Second", "second password", "SecondSalt12345"),
+                    credential_record("Second", "second password", "SecondSalt123456"),
                 )
                 .unwrap();
                 for (config_file, credentials_path) in [
-                    (CONFIG_FILES[first_index], "private/first.json"),
-                    (CONFIG_FILES[second_index], "private/second.json"),
+                    (first_config, "private/first.json"),
+                    (second_config, "private/second.json"),
                 ] {
                     std::fs::write(
                         distinct.join(config_file),
@@ -1249,7 +1249,7 @@ mod tests {
                     Err("legacy_authentication_credential_ambiguous")
                 ));
                 std::fs::write(
-                    distinct.join(CONFIG_FILES[second_index]),
+                    distinct.join(second_config),
                     "credentials_file = ../outside.json\n",
                 )
                 .unwrap();
@@ -1271,40 +1271,37 @@ mod tests {
             "vibepollo.conf",
         ];
 
-        for first_index in 0..CONFIG_FILES.len() {
-            for second_index in first_index + 1..CONFIG_FILES.len() {
-                for credentials_index in [first_index, second_index] {
-                    let state_index = if credentials_index == first_index {
-                        second_index
-                    } else {
-                        first_index
-                    };
+        for (first_index, &first_config) in CONFIG_FILES.iter().enumerate() {
+            for &second_config in CONFIG_FILES.iter().skip(first_index + 1) {
+                for (credentials_config, state_config) in
+                    [(first_config, second_config), (second_config, first_config)]
+                {
                     let pair_name = format!(
                         "{}-{}-credentials-in-{}",
-                        CONFIG_FILES[first_index].trim_end_matches(".conf"),
-                        CONFIG_FILES[second_index].trim_end_matches(".conf"),
-                        CONFIG_FILES[credentials_index].trim_end_matches(".conf")
+                        first_config.trim_end_matches(".conf"),
+                        second_config.trim_end_matches(".conf"),
+                        credentials_config.trim_end_matches(".conf")
                     );
                     let source =
                         temporary_directory(&format!("credentials-overrides-state-{pair_name}"));
                     std::fs::create_dir_all(source.join("private")).unwrap();
                     std::fs::write(
                         source.join("private/explicit.json"),
-                        credential_record("Explicit", "explicit password", "ExplicitSalt123"),
+                        credential_record("Explicit", "explicit password", "ExplicitSalt1234"),
                     )
                     .unwrap();
                     std::fs::write(
                         source.join("private/fallback.json"),
-                        credential_record("Fallback", "fallback password", "FallbackSalt12"),
+                        credential_record("Fallback", "fallback password", "FallbackSalt1234"),
                     )
                     .unwrap();
                     std::fs::write(
-                        source.join(CONFIG_FILES[credentials_index]),
+                        source.join(credentials_config),
                         "credentials_file = private/explicit.json\n",
                     )
                     .unwrap();
                     std::fs::write(
-                        source.join(CONFIG_FILES[state_index]),
+                        source.join(state_config),
                         "file_state = private/fallback.json\n",
                     )
                     .unwrap();
