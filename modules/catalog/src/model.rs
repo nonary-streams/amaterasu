@@ -825,9 +825,11 @@ mod tests {
         assert_eq!(legacy.config_overrides.stream_audio, None);
         let legacy_json = serde_json::to_value(legacy).unwrap();
         assert_eq!(legacy_json["config_overrides"]["fec_percentage"], 37);
-        assert!(legacy_json["config_overrides"]
-            .get("stream_audio")
-            .is_none());
+        assert!(
+            legacy_json["config_overrides"]
+                .get("stream_audio")
+                .is_none()
+        );
 
         let inherited: Entry = serde_json::from_value(json!({
             "name":"Inherited entry",
@@ -836,10 +838,12 @@ mod tests {
         .unwrap();
         inherited.validate().unwrap();
         assert!(inherited.config_overrides.is_empty());
-        assert!(serde_json::to_value(inherited)
-            .unwrap()
-            .get("config_overrides")
-            .is_none());
+        assert!(
+            serde_json::to_value(inherited)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
 
         let disabled: ConfigOverrides =
             serde_json::from_value(json!({"fec_percentage":37,"stream_audio":false})).unwrap();
@@ -931,10 +935,12 @@ mod tests {
         .unwrap();
         absent_entry.validate().unwrap();
         assert_eq!(absent_entry.config_overrides.dd_refresh_rate_option, None);
-        assert!(serde_json::to_value(absent_entry)
-            .unwrap()
-            .get("config_overrides")
-            .is_none());
+        assert!(
+            serde_json::to_value(absent_entry)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
 
         let inherited: Entry = serde_json::from_value(json!({
             "name":"Inherited refresh rate option",
@@ -944,10 +950,12 @@ mod tests {
         .unwrap();
         inherited.validate().unwrap();
         assert_eq!(inherited.config_overrides.dd_refresh_rate_option, None);
-        assert!(serde_json::to_value(inherited)
-            .unwrap()
-            .get("config_overrides")
-            .is_none());
+        assert!(
+            serde_json::to_value(inherited)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
 
         for option in ["auto", "disabled", "manual", "prefer_highest"] {
             let entry: Entry = serde_json::from_value(json!({
@@ -1023,10 +1031,12 @@ mod tests {
         .unwrap();
         absent_entry.validate().unwrap();
         assert_eq!(absent_entry.config_overrides.dd_hdr_request_override, None);
-        assert!(serde_json::to_value(absent_entry)
-            .unwrap()
-            .get("config_overrides")
-            .is_none());
+        assert!(
+            serde_json::to_value(absent_entry)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
 
         let inherited_entry: Entry = serde_json::from_value(json!({
             "name":"Inherited HDR request",
@@ -1039,10 +1049,12 @@ mod tests {
             inherited_entry.config_overrides.dd_hdr_request_override,
             None
         );
-        assert!(serde_json::to_value(inherited_entry)
-            .unwrap()
-            .get("config_overrides")
-            .is_none());
+        assert!(
+            serde_json::to_value(inherited_entry)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
 
         for mode in ["auto", "force_on", "force_off"] {
             let entry: Entry = serde_json::from_value(json!({
@@ -1189,12 +1201,14 @@ mod tests {
             .validate()
             .unwrap();
         }
-        assert!(ConfigOverrides {
-            video_max_batch_size_kb: Some(65),
-            ..ConfigOverrides::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            ConfigOverrides {
+                video_max_batch_size_kb: Some(65),
+                ..ConfigOverrides::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1205,10 +1219,12 @@ mod tests {
         }))
         .unwrap();
         assert!(!omitted.elevated);
-        assert!(serde_json::to_value(&omitted)
-            .unwrap()
-            .get("elevated")
-            .is_none());
+        assert!(
+            serde_json::to_value(&omitted)
+                .unwrap()
+                .get("elevated")
+                .is_none()
+        );
 
         let elevated: Entry = serde_json::from_value(json!({
             "name":"Elevated executable",
@@ -1302,10 +1318,12 @@ mod tests {
         let enabled: ConfigOverrides =
             serde_json::from_value(json!({"audio_sink_capture_only":true})).unwrap();
         assert_eq!(enabled.audio_sink_capture_only, Some(true));
-        assert!(serde_json::from_value::<ConfigOverrides>(json!({
-            "audio_sink_capture_only":"false"
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "audio_sink_capture_only":"false"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1374,14 +1392,18 @@ mod tests {
                 json!({"back_button_timeout":timeout})
             );
         }
-        assert!(serde_json::from_value::<ConfigOverrides>(json!({
-            "back_button_timeout":2147483648i64
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<ConfigOverrides>(json!({
-            "back_button_timeout":1.5
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "back_button_timeout":2147483648i64
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ConfigOverrides>(json!({
+                "back_button_timeout":1.5
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1559,12 +1581,14 @@ mod tests {
             assert!(entry.validate().is_err(), "accepted artwork {reference}");
         }
 
-        assert!(serde_json::from_value::<Entry>(json!({
-            "name":"Unknown artwork provider",
-            "artwork":{"provider":"local_path","path":"C:/private/image.png"},
-            "launch":{"kind":"application","path":"/games/example"}
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<Entry>(json!({
+                "name":"Unknown artwork provider",
+                "artwork":{"provider":"local_path","path":"C:/private/image.png"},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
