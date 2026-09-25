@@ -196,7 +196,8 @@ impl FullscreenSessions {
                         .focus_retry
                         .tick_with(now, FocusRetry::attempt_windows_focus);
                     if session.playnite_exiting {
-                        if !tracked_fullscreen_process_is_running(session, processes) {
+                        if playnite_exit_is_confirmed(session, now, &mut scan_fullscreen_processes)
+                        {
                             session.transition(State::Stopped, now);
                         }
                     } else if session.active_game.is_some() {
@@ -226,7 +227,8 @@ impl FullscreenSessions {
                         session.fullscreen_process = Some(fullscreen_process);
                     }
                     if session.playnite_exiting {
-                        if !tracked_fullscreen_process_is_running(session, processes) {
+                        if playnite_exit_is_confirmed(session, now, &mut scan_fullscreen_processes)
+                        {
                             session.transition(State::Stopped, now);
                         }
                     } else {
@@ -786,6 +788,21 @@ fn tracked_fullscreen_process_is_running(session: &Session, processes: &[Process
             .iter()
             .any(|process| process.same_identity(expected))
     })
+}
+
+fn playnite_exit_is_confirmed(
+    session: &mut Session,
+    now: Instant,
+    scan_fullscreen_processes: &mut impl FnMut(&Installation) -> Option<Vec<ProcessImage>>,
+) -> bool {
+    if session
+        .next_fullscreen_process_scan
+        .is_some_and(|deadline| now < deadline)
+    {
+        return false;
+    }
+    session.next_fullscreen_process_scan = now.checked_add(CLOSE_RETRY_INTERVAL);
+    scan_fullscreen_processes(&session.installation).is_some_and(|processes| processes.is_empty())
 }
 
 fn advance_active_game(
@@ -1913,6 +1930,75 @@ mod tests {
             |_| panic!("closed fullscreen UI must not relaunch"),
         );
         assert_eq!(sessions.status(&ticket)["state"], "stopped");
+    }
+
+    #[test]
+    fn playnite_exiting_with_unknown_fullscreen_scan_retains_running_ticket() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::PlayniteExiting, None),
+            extension.clone(),
+        );
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(2),
+            &[extension],
+            Some(&[]),
+            |_| None,
+            |_| true,
+            |_| panic!("intentional exit must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "running");
+        assert_eq!(sessions.active_count(), 1);
+    }
+
+    #[test]
+    fn playnite_exiting_keeps_playing_ticket_when_exact_scan_finds_ui() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        queue_status(
+            &sessions,
+            &ticket,
+            status(
+                FullscreenStatusKind::GameStarted,
+                Some("a1b2c3d4-1234-5678-9abc-0123456789ab"),
+            ),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            &[fullscreen_process(80), extension.clone()],
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("active game must not relaunch"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::PlayniteExiting, None),
+            extension.clone(),
+        );
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            &[extension],
+            Some(&[]),
+            |_| Some(vec![fullscreen_process(80)]),
+            |_| true,
+            |_| panic!("intentional exit must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert_eq!(sessions.active_count(), 1);
     }
 
     #[test]
