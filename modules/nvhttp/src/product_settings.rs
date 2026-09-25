@@ -514,14 +514,6 @@ impl ProductSettings {
         self.stream_audio
     }
 
-    pub fn lan_encryption_mode(&self) -> u8 {
-        self.lan_encryption_mode
-    }
-
-    pub fn wan_encryption_mode(&self) -> u8 {
-        self.wan_encryption_mode
-    }
-
     pub fn effective_output_name(&self) -> Option<&str> {
         self.configured_output_name.as_deref().or_else(|| {
             self.bootstrap_settings
