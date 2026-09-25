@@ -163,7 +163,7 @@ namespace Amaterasu {
       const rememberField = field(
         "Remember this browser",
         rememberMe,
-        "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Safe refresh requires Web Locks in a secure browser context; without them, sign in again when refresh is needed.",
+        "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.",
       );
       const token = input("token", "", "password");
       token.autocomplete = "off";
@@ -220,7 +220,7 @@ namespace Amaterasu {
         event.preventDefault();
         if (!form.reportValidity()) return;
         void runAction(submit, status, async () => {
-          if (tokenMode) this.api.useToken(token.value.trim());
+          if (tokenMode) await this.api.useToken(token.value.trim());
           else
             await this.api.login(
               username.value.trim(),

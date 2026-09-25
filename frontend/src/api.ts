@@ -47,6 +47,7 @@ namespace Amaterasu {
     private readonly storageKey: string;
     private readonly refreshLockName: string;
     private remembered = false;
+    private sessionId: string | null = null;
     onAuthenticationLost: (() => void) | null = null;
     subject = "";
     scopes: string[] | null = null;
@@ -79,24 +80,39 @@ namespace Amaterasu {
       password: string,
       rememberMe = false,
     ): Promise<void> {
+      if (rememberMe && !this.webLocks())
+        throw this.rememberedRefreshLockError();
       const generation = this.authGeneration;
       const reply = await this.post<SessionReply>(
         "auth/login",
         { username, password, remember_me: rememberMe },
         false,
       );
-      this.installSession(reply, generation, true, rememberMe);
+      await this.installSession(reply, generation, true, rememberMe);
     }
 
     async restoreSession(): Promise<boolean> {
       this.resetMemory(true);
-      const stored = this.readStoredSession();
+      const generation = this.authGeneration;
+      const persistenceGeneration = this.persistenceGeneration;
+      const stored = await this.withSessionLock(() => {
+        if (
+          generation !== this.authGeneration ||
+          persistenceGeneration !== this.persistenceGeneration
+        )
+          return null;
+        const candidate = this.readStoredSession();
+        if (
+          candidate &&
+          generation === this.authGeneration &&
+          persistenceGeneration === this.persistenceGeneration
+        )
+          this.installStoredSession(candidate);
+        return candidate;
+      });
       if (!stored) return false;
 
-      this.installStoredSession(stored);
-      const generation = this.authGeneration;
       const token = this.refreshToken;
-      const persistenceGeneration = this.persistenceGeneration;
       if (stored.expires_at - Date.now() / 1000 <= 60)
         await this.refreshOrClear(generation, token, persistenceGeneration);
       return generation === this.authGeneration && this.bearer !== "";
@@ -108,12 +124,12 @@ namespace Amaterasu {
       this.resetMemory(false);
     }
 
-    useToken(token: string): void {
+    async useToken(token: string): Promise<void> {
       if (!/^ama_[a-f0-9]{64}$/.test(token))
         throw new Error(
           "Enter an Amaterasu token beginning with ama_ followed by 64 hexadecimal characters.",
         );
-      this.clear();
+      await this.clear();
       this.bearer = token;
       this.subject = "API token";
       this.scopes = null;
@@ -121,13 +137,12 @@ namespace Amaterasu {
     }
 
     async logout(): Promise<void> {
+      const sessionId = this.remembered ? this.sessionId : null;
       const refreshTokens = new Set<string>();
       const bearerToken = this.refreshToken ? "" : this.bearer;
       if (this.refreshToken) refreshTokens.add(this.refreshToken);
-      const storedBeforeLogout = this.readStoredSessionForCleanup(refreshTokens);
 
       this.resetMemory(true);
-      this.removeStoredSessionBestEffort();
 
       const locks = this.webLocks();
       if (locks) {
@@ -136,22 +151,23 @@ namespace Amaterasu {
             this.refreshLockName,
             { mode: "exclusive" },
             () => {
-              // A refresh already holding the lock may have rotated before the
-              // immediate removal. Revoke its latest pair if it left one.
-              const latest = this.readStoredSessionForCleanup(new Set<string>());
-              if (
-                latest &&
-                storedBeforeLogout &&
-                this.sameSessionIdentity(latest, storedBeforeLogout)
-              ) {
+              // A refresh already holding the lock may have rotated. Revoke
+              // the latest pair after it completes.
+              const latest = this.readStoredSessionForCleanup(
+                new Set<string>(),
+                sessionId,
+              );
+              if (latest) {
                 refreshTokens.add(latest.refresh_token);
-                this.removeStoredSessionBestEffort();
+                this.removeStoredSessionBestEffort(sessionId);
               }
             },
           );
         } catch {
           // Local sign-out is immediate even when lock cleanup cannot complete.
         }
+      } else {
+        this.removeStoredSessionBestEffort(sessionId);
       }
 
       for (const refreshToken of refreshTokens) {
@@ -160,13 +176,10 @@ namespace Amaterasu {
       if (bearerToken) await this.revokeSession({ bearer: bearerToken });
     }
 
-    clear(): void {
-      const staleRefreshTokens = new Set<string>();
-      if (this.refreshToken) staleRefreshTokens.add(this.refreshToken);
-      const storedBeforeClear = this.readStoredSessionForCleanup(staleRefreshTokens);
+    async clear(): Promise<void> {
+      const sessionId = this.remembered ? this.sessionId : null;
       this.resetMemory(true);
-      this.removeStoredSessionBestEffort();
-      this.scheduleStoredSessionRemoval(staleRefreshTokens, storedBeforeClear);
+      await this.removeStoredSessionForIdentity(sessionId);
     }
 
     allows(scope: string): boolean {
@@ -229,7 +242,7 @@ namespace Amaterasu {
           expectedToken === this.refreshToken &&
           expectedPersistenceGeneration === this.persistenceGeneration
         ) {
-          this.clear();
+          await this.clear();
           this.onAuthenticationLost?.();
         }
         throw error;
@@ -288,12 +301,7 @@ namespace Amaterasu {
       token: string,
     ): Promise<void> {
       const locks = this.webLocks();
-      if (!locks)
-        throw new ApiError(
-          "This browser cannot safely refresh a remembered session. Use a browser with Web Locks or sign in without Remember me.",
-          "refresh_lock_unavailable",
-          503,
-        );
+      if (!locks) throw this.rememberedRefreshLockError();
 
       await locks.request(
         this.refreshLockName,
@@ -375,51 +383,46 @@ namespace Amaterasu {
             suspendGeneration === this.authGeneration &&
             persistenceGeneration === this.persistenceGeneration
           ) {
-            this.applyValidatedSession(validated, true);
+            this.applyValidatedSession(validated, true, stored.session_id);
           }
         },
       );
     }
 
-    private installSession(
+    private async installSession(
       reply: SessionReply,
       generation: number,
       newSession: boolean,
       rememberRequested: boolean,
-    ): void {
+    ): Promise<void> {
       if (generation !== this.authGeneration)
         throw new Error("The sign-in attempt was cancelled.");
       const validated = this.validateSession(reply);
       const shouldRemember = rememberRequested && validated.remember_me;
+      const previousSessionId = this.remembered ? this.sessionId : null;
+      let sessionId: string | null = null;
 
       if (newSession) {
         try {
           if (shouldRemember) {
-            this.writeStoredSession(this.storedSession(validated));
+            const locks = this.webLocks();
+            if (!locks) throw this.rememberedRefreshLockError();
+            const stored = this.storedSession(validated);
+            await locks.request(
+              this.refreshLockName,
+              { mode: "exclusive" },
+              () => {
+                if (generation !== this.authGeneration)
+                  throw new Error("The sign-in attempt was cancelled.");
+                this.writeStoredSession(stored);
+              },
+            );
+            sessionId = stored.session_id;
           } else {
-            try {
-              const storage = this.storage(false);
-              if (storage) {
-                const staleRefreshTokens = new Set<string>();
-                const storedBeforeClear = this.readStoredSessionForCleanup(
-                  staleRefreshTokens,
-                );
-                this.removeStoredSessionRequired();
-                this.scheduleStoredSessionRemoval(
-                  staleRefreshTokens,
-                  storedBeforeClear,
-                );
-              }
-            } catch (error) {
-              if (
-                !(error instanceof ApiError) ||
-                error.code !== "storage_access_unavailable"
-              )
-                throw error;
-            }
+            await this.removeStoredSessionForIdentity(previousSessionId);
           }
         } catch (error) {
-          this.clear();
+          await this.clear();
           if (shouldRemember)
             void this.revokeSession({ refresh_token: validated.refresh_token });
           throw error;
@@ -428,7 +431,7 @@ namespace Amaterasu {
 
       if (generation !== this.authGeneration)
         throw new Error("The sign-in attempt was cancelled.");
-      this.applyValidatedSession(validated, shouldRemember);
+      this.applyValidatedSession(validated, shouldRemember, sessionId);
       if (newSession) {
         this.authGeneration += 1;
         this.persistenceGeneration += 1;
@@ -468,6 +471,7 @@ namespace Amaterasu {
     private applyValidatedSession(
       session: ValidatedSession,
       remembered: boolean,
+      sessionId: string | null = null,
     ): void {
       this.bearer = session.bearer;
       this.refreshToken = session.refresh_token;
@@ -475,11 +479,12 @@ namespace Amaterasu {
       this.subject = session.subject;
       this.scopes = [...session.scopes];
       this.remembered = remembered;
+      this.sessionId = remembered ? sessionId : null;
       this.tokenGeneration += 1;
     }
 
     private installStoredSession(session: StoredSession): void {
-      this.applyValidatedSession(session, true);
+      this.applyValidatedSession(session, true, session.session_id);
     }
 
     private storedSession(
@@ -511,7 +516,7 @@ namespace Amaterasu {
       if (raw === null) return null;
       const stored = this.parseStoredSession(raw, false);
       if (stored) return stored;
-      this.removeStoredSessionRequired();
+      this.removeStoredSessionRequired(null, raw);
       return null;
     }
 
@@ -576,13 +581,40 @@ namespace Amaterasu {
       }
     }
 
-    private removeStoredSessionRequired(): void {
+    private removeStoredSessionRequired(
+      expectedSessionId?: string | null,
+      expectedRaw?: string,
+    ): void {
       const storage = this.storage(false);
       if (!storage) return;
       try {
+        if (expectedSessionId !== undefined) {
+          const currentRaw = storage.getItem(this.storageKey);
+          if (
+            currentRaw === null ||
+            !this.canRemoveStoredSession(
+              currentRaw,
+              expectedSessionId,
+              expectedRaw,
+            )
+          )
+            return;
+        }
         storage.removeItem(this.storageKey);
       } catch {
         try {
+          if (expectedSessionId !== undefined) {
+            const currentRaw = storage.getItem(this.storageKey);
+            if (
+              currentRaw === null ||
+              !this.canRemoveStoredSession(
+                currentRaw,
+                expectedSessionId,
+                expectedRaw,
+              )
+            )
+              return;
+          }
           // If removal is blocked but writes still work, invalidate without
           // leaving either credential in browser storage.
           storage.setItem(this.storageKey, "{}");
@@ -592,7 +624,10 @@ namespace Amaterasu {
       }
     }
 
-    private removeStoredSessionBestEffort(): void {
+    private removeStoredSessionBestEffort(
+      expectedSessionId?: string | null,
+      expectedRaw?: string,
+    ): void {
       let storage: Storage | null;
       try {
         storage = this.storage(false);
@@ -601,9 +636,33 @@ namespace Amaterasu {
       }
       if (!storage) return;
       try {
+        if (expectedSessionId !== undefined) {
+          const currentRaw = storage.getItem(this.storageKey);
+          if (
+            currentRaw === null ||
+            !this.canRemoveStoredSession(
+              currentRaw,
+              expectedSessionId,
+              expectedRaw,
+            )
+          )
+            return;
+        }
         storage.removeItem(this.storageKey);
       } catch {
         try {
+          if (expectedSessionId !== undefined) {
+            const currentRaw = storage.getItem(this.storageKey);
+            if (
+              currentRaw === null ||
+              !this.canRemoveStoredSession(
+                currentRaw,
+                expectedSessionId,
+                expectedRaw,
+              )
+            )
+              return;
+          }
           storage.setItem(this.storageKey, "{}");
         } catch {
           // Memory is already cleared. Storage access is unavailable.
@@ -611,39 +670,49 @@ namespace Amaterasu {
       }
     }
 
-    private scheduleStoredSessionRemoval(
-      staleRefreshTokens: Set<string>,
-      session: StoredSession | null,
-    ): void {
-      const locks = this.webLocks();
-      if (!locks) return;
-      void locks
-        .request(this.refreshLockName, { mode: "exclusive" }, () => {
-          try {
-            const raw = this.readStoredSessionRaw();
-            if (raw === null) return;
-            const current = this.parseStoredSession(raw, true);
-            if (
-              !current ||
-              staleRefreshTokens.has(current.refresh_token) ||
-              (session !== null && this.sameSessionIdentity(current, session))
-            )
-              this.removeStoredSessionBestEffort();
-          } catch {
-            // The synchronous clear already removed what storage allowed.
-          }
-        })
-        .catch(() => undefined);
+    private async removeStoredSessionForIdentity(
+      expectedSessionId: string | null,
+      expectedRaw?: string,
+    ): Promise<void> {
+      const removeCurrentSession = (): void => {
+        try {
+          const raw = this.readStoredSessionRaw();
+          if (raw === null || (expectedRaw !== undefined && raw !== expectedRaw))
+            return;
+          const current = this.parseStoredSession(raw, true);
+          if (
+            current &&
+            (expectedRaw !== undefined ||
+              expectedSessionId === null ||
+              current.session_id !== expectedSessionId)
+          )
+            return;
+          this.removeStoredSessionRequired(expectedSessionId, raw);
+        } catch {
+          // Local sign-out and nonremembered login remain available when storage fails.
+        }
+      };
+
+      try {
+        await this.withSessionLock(removeCurrentSession);
+      } catch {
+        if (!this.webLocks()) removeCurrentSession();
+      }
     }
 
     private readStoredSessionForCleanup(
       tokens: Set<string>,
+      expectedSessionId: string | null,
     ): StoredSession | null {
       try {
         const raw = this.readStoredSessionRaw();
         if (raw === null) return null;
         const stored = this.parseStoredSession(raw, true);
-        if (stored) {
+        if (
+          stored &&
+          expectedSessionId !== null &&
+          stored.session_id === expectedSessionId
+        ) {
           tokens.add(stored.refresh_token);
           return stored;
         }
@@ -653,12 +722,19 @@ namespace Amaterasu {
       return null;
     }
 
-    private sameSessionIdentity(
-      left: StoredSession,
-      right: StoredSession,
+    private canRemoveStoredSession(
+      raw: string,
+      expectedSessionId: string | null | undefined,
+      expectedRaw?: string,
     ): boolean {
+      if (expectedRaw !== undefined) return raw === expectedRaw;
+      if (expectedSessionId === undefined) return true;
+      const stored = this.parseStoredSession(raw, true);
+      if (!stored) return true;
       return (
-        left.base === right.base && left.session_id === right.session_id
+        expectedSessionId !== null &&
+        stored.base === this.base &&
+        stored.session_id === expectedSessionId
       );
     }
 
@@ -677,6 +753,24 @@ namespace Amaterasu {
       } catch {
         return null;
       }
+    }
+
+    private async withSessionLock<T>(action: () => T | Promise<T>): Promise<T> {
+      const locks = this.webLocks();
+      if (!locks) return action();
+      return locks.request(
+        this.refreshLockName,
+        { mode: "exclusive" },
+        action,
+      );
+    }
+
+    private rememberedRefreshLockError(): ApiError {
+      return new ApiError(
+        "Remember me requires Web Locks in a secure browser context. Sign in without Remember me when unavailable.",
+        "refresh_lock_unavailable",
+        503,
+      );
     }
 
     private storage(required: boolean): Storage | null {
@@ -733,12 +827,7 @@ namespace Amaterasu {
           this.resetMemory(true);
           this.onAuthenticationLost?.();
         }
-        try {
-          if (this.readStoredSessionRaw() === currentRaw)
-            this.removeStoredSessionBestEffort();
-        } catch {
-          // The invalid value will be rejected again on the next restore.
-        }
+        void this.removeStoredSessionForIdentity(null, currentRaw);
         return;
       }
       if (stored.refreshing) return;
@@ -755,6 +844,7 @@ namespace Amaterasu {
       this.subject = "";
       this.scopes = null;
       this.remembered = false;
+      this.sessionId = null;
       this.refreshInFlight = null;
       for (const request of this.requests) request.abort();
       this.requests.clear();

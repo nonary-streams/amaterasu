@@ -458,6 +458,7 @@ var Amaterasu;
         storageKey;
         refreshLockName;
         remembered = false;
+        sessionId = null;
         onAuthenticationLost = null;
         subject = "";
         scopes = null;
@@ -478,19 +479,30 @@ var Amaterasu;
             }
         }
         async login(username, password, rememberMe = false) {
+            if (rememberMe && !this.webLocks())
+                throw this.rememberedRefreshLockError();
             const generation = this.authGeneration;
             const reply = await this.post("auth/login", { username, password, remember_me: rememberMe }, false);
-            this.installSession(reply, generation, true, rememberMe);
+            await this.installSession(reply, generation, true, rememberMe);
         }
         async restoreSession() {
             this.resetMemory(true);
-            const stored = this.readStoredSession();
+            const generation = this.authGeneration;
+            const persistenceGeneration = this.persistenceGeneration;
+            const stored = await this.withSessionLock(() => {
+                if (generation !== this.authGeneration ||
+                    persistenceGeneration !== this.persistenceGeneration)
+                    return null;
+                const candidate = this.readStoredSession();
+                if (candidate &&
+                    generation === this.authGeneration &&
+                    persistenceGeneration === this.persistenceGeneration)
+                    this.installStoredSession(candidate);
+                return candidate;
+            });
             if (!stored)
                 return false;
-            this.installStoredSession(stored);
-            const generation = this.authGeneration;
             const token = this.refreshToken;
-            const persistenceGeneration = this.persistenceGeneration;
             if (stored.expires_at - Date.now() / 1000 <= 60)
                 await this.refreshOrClear(generation, token, persistenceGeneration);
             return generation === this.authGeneration && this.bearer !== "";
@@ -498,38 +510,38 @@ var Amaterasu;
         suspend() {
             this.resetMemory(false);
         }
-        useToken(token) {
+        async useToken(token) {
             if (!/^ama_[a-f0-9]{64}$/.test(token))
                 throw new Error("Enter an Amaterasu token beginning with ama_ followed by 64 hexadecimal characters.");
-            this.clear();
+            await this.clear();
             this.bearer = token;
             this.subject = "API token";
             this.scopes = null;
             this.tokenGeneration += 1;
         }
         async logout() {
+            const sessionId = this.remembered ? this.sessionId : null;
             const refreshTokens = new Set();
             const bearerToken = this.refreshToken ? "" : this.bearer;
             if (this.refreshToken)
                 refreshTokens.add(this.refreshToken);
-            const storedBeforeLogout = this.readStoredSessionForCleanup(refreshTokens);
             this.resetMemory(true);
-            this.removeStoredSessionBestEffort();
             const locks = this.webLocks();
             if (locks) {
                 try {
                     await locks.request(this.refreshLockName, { mode: "exclusive" }, () => {
-                        const latest = this.readStoredSessionForCleanup(new Set());
-                        if (latest &&
-                            storedBeforeLogout &&
-                            this.sameSessionIdentity(latest, storedBeforeLogout)) {
+                        const latest = this.readStoredSessionForCleanup(new Set(), sessionId);
+                        if (latest) {
                             refreshTokens.add(latest.refresh_token);
-                            this.removeStoredSessionBestEffort();
+                            this.removeStoredSessionBestEffort(sessionId);
                         }
                     });
                 }
                 catch {
                 }
+            }
+            else {
+                this.removeStoredSessionBestEffort(sessionId);
             }
             for (const refreshToken of refreshTokens) {
                 await this.revokeSession({ refresh_token: refreshToken });
@@ -537,14 +549,10 @@ var Amaterasu;
             if (bearerToken)
                 await this.revokeSession({ bearer: bearerToken });
         }
-        clear() {
-            const staleRefreshTokens = new Set();
-            if (this.refreshToken)
-                staleRefreshTokens.add(this.refreshToken);
-            const storedBeforeClear = this.readStoredSessionForCleanup(staleRefreshTokens);
+        async clear() {
+            const sessionId = this.remembered ? this.sessionId : null;
             this.resetMemory(true);
-            this.removeStoredSessionBestEffort();
-            this.scheduleStoredSessionRemoval(staleRefreshTokens, storedBeforeClear);
+            await this.removeStoredSessionForIdentity(sessionId);
         }
         allows(scope) {
             return this.scopes === null || this.scopes.includes(scope);
@@ -589,7 +597,7 @@ var Amaterasu;
                     expectedGeneration === this.authGeneration &&
                     expectedToken === this.refreshToken &&
                     expectedPersistenceGeneration === this.persistenceGeneration) {
-                    this.clear();
+                    await this.clear();
                     this.onAuthenticationLost?.();
                 }
                 throw error;
@@ -630,7 +638,7 @@ var Amaterasu;
         async refreshRememberedSession(generation, persistenceGeneration, suspendGeneration, token) {
             const locks = this.webLocks();
             if (!locks)
-                throw new ApiError("This browser cannot safely refresh a remembered session. Use a browser with Web Locks or sign in without Remember me.", "refresh_lock_unavailable", 503);
+                throw this.rememberedRefreshLockError();
             await locks.request(this.refreshLockName, { mode: "exclusive" }, async () => {
                 if (generation !== this.authGeneration ||
                     persistenceGeneration !== this.persistenceGeneration)
@@ -681,39 +689,37 @@ var Amaterasu;
                 if (generation === this.authGeneration &&
                     suspendGeneration === this.authGeneration &&
                     persistenceGeneration === this.persistenceGeneration) {
-                    this.applyValidatedSession(validated, true);
+                    this.applyValidatedSession(validated, true, stored.session_id);
                 }
             });
         }
-        installSession(reply, generation, newSession, rememberRequested) {
+        async installSession(reply, generation, newSession, rememberRequested) {
             if (generation !== this.authGeneration)
                 throw new Error("The sign-in attempt was cancelled.");
             const validated = this.validateSession(reply);
             const shouldRemember = rememberRequested && validated.remember_me;
+            const previousSessionId = this.remembered ? this.sessionId : null;
+            let sessionId = null;
             if (newSession) {
                 try {
                     if (shouldRemember) {
-                        this.writeStoredSession(this.storedSession(validated));
+                        const locks = this.webLocks();
+                        if (!locks)
+                            throw this.rememberedRefreshLockError();
+                        const stored = this.storedSession(validated);
+                        await locks.request(this.refreshLockName, { mode: "exclusive" }, () => {
+                            if (generation !== this.authGeneration)
+                                throw new Error("The sign-in attempt was cancelled.");
+                            this.writeStoredSession(stored);
+                        });
+                        sessionId = stored.session_id;
                     }
                     else {
-                        try {
-                            const storage = this.storage(false);
-                            if (storage) {
-                                const staleRefreshTokens = new Set();
-                                const storedBeforeClear = this.readStoredSessionForCleanup(staleRefreshTokens);
-                                this.removeStoredSessionRequired();
-                                this.scheduleStoredSessionRemoval(staleRefreshTokens, storedBeforeClear);
-                            }
-                        }
-                        catch (error) {
-                            if (!(error instanceof ApiError) ||
-                                error.code !== "storage_access_unavailable")
-                                throw error;
-                        }
+                        await this.removeStoredSessionForIdentity(previousSessionId);
                     }
                 }
                 catch (error) {
-                    this.clear();
+                    await this.clear();
                     if (shouldRemember)
                         void this.revokeSession({ refresh_token: validated.refresh_token });
                     throw error;
@@ -721,7 +727,7 @@ var Amaterasu;
             }
             if (generation !== this.authGeneration)
                 throw new Error("The sign-in attempt was cancelled.");
-            this.applyValidatedSession(validated, shouldRemember);
+            this.applyValidatedSession(validated, shouldRemember, sessionId);
             if (newSession) {
                 this.authGeneration += 1;
                 this.persistenceGeneration += 1;
@@ -750,17 +756,18 @@ var Amaterasu;
                 remember_me: reply.remember_me,
             };
         }
-        applyValidatedSession(session, remembered) {
+        applyValidatedSession(session, remembered, sessionId = null) {
             this.bearer = session.bearer;
             this.refreshToken = session.refresh_token;
             this.accessExpiresAt = session.expires_at;
             this.subject = session.subject;
             this.scopes = [...session.scopes];
             this.remembered = remembered;
+            this.sessionId = remembered ? sessionId : null;
             this.tokenGeneration += 1;
         }
         installStoredSession(session) {
-            this.applyValidatedSession(session, true);
+            this.applyValidatedSession(session, true, session.session_id);
         }
         storedSession(session, sessionId = this.newSessionId()) {
             return {
@@ -786,7 +793,7 @@ var Amaterasu;
             const stored = this.parseStoredSession(raw, false);
             if (stored)
                 return stored;
-            this.removeStoredSessionRequired();
+            this.removeStoredSessionRequired(null, raw);
             return null;
         }
         readStoredSessionRaw() {
@@ -846,15 +853,27 @@ var Amaterasu;
                 throw this.storageError();
             }
         }
-        removeStoredSessionRequired() {
+        removeStoredSessionRequired(expectedSessionId, expectedRaw) {
             const storage = this.storage(false);
             if (!storage)
                 return;
             try {
+                if (expectedSessionId !== undefined) {
+                    const currentRaw = storage.getItem(this.storageKey);
+                    if (currentRaw === null ||
+                        !this.canRemoveStoredSession(currentRaw, expectedSessionId, expectedRaw))
+                        return;
+                }
                 storage.removeItem(this.storageKey);
             }
             catch {
                 try {
+                    if (expectedSessionId !== undefined) {
+                        const currentRaw = storage.getItem(this.storageKey);
+                        if (currentRaw === null ||
+                            !this.canRemoveStoredSession(currentRaw, expectedSessionId, expectedRaw))
+                            return;
+                    }
                     storage.setItem(this.storageKey, "{}");
                 }
                 catch {
@@ -862,7 +881,7 @@ var Amaterasu;
                 }
             }
         }
-        removeStoredSessionBestEffort() {
+        removeStoredSessionBestEffort(expectedSessionId, expectedRaw) {
             let storage;
             try {
                 storage = this.storage(false);
@@ -873,44 +892,62 @@ var Amaterasu;
             if (!storage)
                 return;
             try {
+                if (expectedSessionId !== undefined) {
+                    const currentRaw = storage.getItem(this.storageKey);
+                    if (currentRaw === null ||
+                        !this.canRemoveStoredSession(currentRaw, expectedSessionId, expectedRaw))
+                        return;
+                }
                 storage.removeItem(this.storageKey);
             }
             catch {
                 try {
+                    if (expectedSessionId !== undefined) {
+                        const currentRaw = storage.getItem(this.storageKey);
+                        if (currentRaw === null ||
+                            !this.canRemoveStoredSession(currentRaw, expectedSessionId, expectedRaw))
+                            return;
+                    }
                     storage.setItem(this.storageKey, "{}");
                 }
                 catch {
                 }
             }
         }
-        scheduleStoredSessionRemoval(staleRefreshTokens, session) {
-            const locks = this.webLocks();
-            if (!locks)
-                return;
-            void locks
-                .request(this.refreshLockName, { mode: "exclusive" }, () => {
+        async removeStoredSessionForIdentity(expectedSessionId, expectedRaw) {
+            const removeCurrentSession = () => {
                 try {
                     const raw = this.readStoredSessionRaw();
-                    if (raw === null)
+                    if (raw === null || (expectedRaw !== undefined && raw !== expectedRaw))
                         return;
                     const current = this.parseStoredSession(raw, true);
-                    if (!current ||
-                        staleRefreshTokens.has(current.refresh_token) ||
-                        (session !== null && this.sameSessionIdentity(current, session)))
-                        this.removeStoredSessionBestEffort();
+                    if (current &&
+                        (expectedRaw !== undefined ||
+                            expectedSessionId === null ||
+                            current.session_id !== expectedSessionId))
+                        return;
+                    this.removeStoredSessionRequired(expectedSessionId, raw);
                 }
                 catch {
                 }
-            })
-                .catch(() => undefined);
+            };
+            try {
+                await this.withSessionLock(removeCurrentSession);
+            }
+            catch {
+                if (!this.webLocks())
+                    removeCurrentSession();
+            }
         }
-        readStoredSessionForCleanup(tokens) {
+        readStoredSessionForCleanup(tokens, expectedSessionId) {
             try {
                 const raw = this.readStoredSessionRaw();
                 if (raw === null)
                     return null;
                 const stored = this.parseStoredSession(raw, true);
-                if (stored) {
+                if (stored &&
+                    expectedSessionId !== null &&
+                    stored.session_id === expectedSessionId) {
                     tokens.add(stored.refresh_token);
                     return stored;
                 }
@@ -919,8 +956,17 @@ var Amaterasu;
             }
             return null;
         }
-        sameSessionIdentity(left, right) {
-            return (left.base === right.base && left.session_id === right.session_id);
+        canRemoveStoredSession(raw, expectedSessionId, expectedRaw) {
+            if (expectedRaw !== undefined)
+                return raw === expectedRaw;
+            if (expectedSessionId === undefined)
+                return true;
+            const stored = this.parseStoredSession(raw, true);
+            if (!stored)
+                return true;
+            return (expectedSessionId !== null &&
+                stored.base === this.base &&
+                stored.session_id === expectedSessionId);
         }
         async revokeSession(payload) {
             try {
@@ -938,6 +984,15 @@ var Amaterasu;
             catch {
                 return null;
             }
+        }
+        async withSessionLock(action) {
+            const locks = this.webLocks();
+            if (!locks)
+                return action();
+            return locks.request(this.refreshLockName, { mode: "exclusive" }, action);
+        }
+        rememberedRefreshLockError() {
+            return new ApiError("Remember me requires Web Locks in a secure browser context. Sign in without Remember me when unavailable.", "refresh_lock_unavailable", 503);
         }
         storage(required) {
             if (typeof localStorage === "undefined") {
@@ -985,12 +1040,7 @@ var Amaterasu;
                     this.resetMemory(true);
                     this.onAuthenticationLost?.();
                 }
-                try {
-                    if (this.readStoredSessionRaw() === currentRaw)
-                        this.removeStoredSessionBestEffort();
-                }
-                catch {
-                }
+                void this.removeStoredSessionForIdentity(null, currentRaw);
                 return;
             }
             if (stored.refreshing)
@@ -1009,6 +1059,7 @@ var Amaterasu;
             this.subject = "";
             this.scopes = null;
             this.remembered = false;
+            this.sessionId = null;
             this.refreshInFlight = null;
             for (const request of this.requests)
                 request.abort();
@@ -4602,7 +4653,7 @@ var Amaterasu;
             password.autocomplete = "current-password";
             password.required = true;
             const rememberMe = Amaterasu.input("remember_me", "", "checkbox");
-            const rememberField = Amaterasu.field("Remember this browser", rememberMe, "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Safe refresh requires Web Locks in a secure browser context; without them, sign in again when refresh is needed.");
+            const rememberField = Amaterasu.field("Remember this browser", rememberMe, "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.");
             const token = Amaterasu.input("token", "", "password");
             token.autocomplete = "off";
             token.spellcheck = false;
@@ -4638,7 +4689,7 @@ var Amaterasu;
                     return;
                 void Amaterasu.runAction(submit, status, async () => {
                     if (tokenMode)
-                        this.api.useToken(token.value.trim());
+                        await this.api.useToken(token.value.trim());
                     else
                         await this.api.login(username.value.trim(), password.value, rememberMe.checked);
                     password.value = "";

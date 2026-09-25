@@ -81,18 +81,19 @@ restarts, subject to the refresh token's server expiry. Same-origin scripts can
 read browser storage, so this is not HttpOnly protection. Native modules are
 trusted code; browser token storage is not a native-code sandbox. The backend
 persists token digests only, never the raw token values. Remembered administrator
-sessions can survive a management-module restart while the refresh token remains
-valid. Cross-tab refresh coordination requires Web Locks in a secure browser
-context. Without Web Locks, the browser fails closed and must sign in again when
-a refresh is needed.
+  sessions can survive a management-module restart while the refresh token remains
+  valid. Remember me requires Web Locks in a secure browser context so storage
+  updates and refreshes stay serialized across tabs. If Web Locks are unavailable,
+  sign in with Remember this browser unchecked.
 
 Page departure clears in-memory credentials while preserving a valid remembered
 pair. Returning through the browser back/forward cache runs the same remembered
 session restore flow before showing the authenticated shell. If a refresh is
-ambiguous during suspension, it is not replayed. Sign-out immediately clears the
-browser credentials through `Api.logout()` and sends a best-effort revocation
-using the refresh token. If the page is reloaded or closed before revocation
-completes, the server session remains valid until its absolute refresh expiry or
+ambiguous during suspension, it is not replayed. Sign-out clears in-memory
+credentials immediately, then removes the matching remembered pair under the
+same lock used for refresh and login. It sends a best-effort revocation using the
+refresh token. If the page is reloaded or closed before revocation completes, the
+server session remains valid until its absolute refresh expiry or
 trusted-administrator revocation. Signing out with an API token does not revoke
 that token.
 
