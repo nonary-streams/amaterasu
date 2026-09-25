@@ -129,10 +129,14 @@ the original stream; changing any of those values conflicts. The optional
 `continuous_audio` object accepts `packet_ms` values of 5 or 10. Missing or null
 keeps legacy capture packet sizes and returns `MEDIA_PENDING` when capture is
 idle. An enabled stream combines short capture packets and splits long ones into
-fixed-duration frames without changing captured PCM. At the idle deadline, it
-zero-pads a partial frame or produces a full zero frame. It sets `AUDIO_SILENT`
-only when every sample in the complete output frame is zero. Output sequence and
-timestamps advance per frame, and capture discontinuity flags are retained.
+frames without changing captured PCM. Frame count uses integer
+`sample_rate * packet_ms / 1000` arithmetic and truncates fractional frames, so
+44.1 kHz at 5 ms produces 220 frames. At the idle deadline, it zero-pads a partial
+frame or produces a full zero frame. It sets `AUDIO_SILENT` only when every
+sample in the complete output frame is zero. Full synthetic idle frames use
+elapsed monotonic timestamps and set `AUDIO_TIMESTAMP_ESTIMATED`; partial frames
+retain captured timestamp flags and QPC timing. Output sequence and timestamps
+advance per frame, and capture discontinuity flags are retained.
 The packet duration participates in operation retry identity. After close, retry returns
 `stream_closed` and lookup returns `stream_not_found`. Up to 128 operation
 records remain in memory per module instance. There are at most four live

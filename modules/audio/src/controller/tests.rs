@@ -338,6 +338,7 @@ fn continuous_idle_emits_silent_fixed_frames_with_advancing_clock() {
     );
     let first = sink.packets[0].clone();
     assert_eq!(first.0 & AUDIO_SILENT, AUDIO_SILENT);
+    assert_eq!(first.0 & AUDIO_TIMESTAMP_ESTIMATED, 0);
     assert_eq!(first.1, 240);
     assert_eq!(first.3, 0);
     assert_eq!(first.4, vec![0; 240 * 2 * 4]);
@@ -356,6 +357,7 @@ fn continuous_idle_emits_silent_fixed_frames_with_advancing_clock() {
     );
     let second = &sink.packets[1];
     assert_eq!(second.0 & AUDIO_SILENT, AUDIO_SILENT);
+    assert_ne!(second.0 & AUDIO_TIMESTAMP_ESTIMATED, 0);
     assert_eq!(second.1, 240);
     assert_eq!(second.3, 1);
     assert!(second.2 > first.2);
@@ -370,7 +372,7 @@ fn continuous_packetizer_pads_partial_pcm_only_when_idle_and_preserves_it() {
     let ready = packetizer
         .push(Packet {
             frames: 1,
-            flags: AUDIO_DISCONTINUITY,
+            flags: AUDIO_DISCONTINUITY | AUDIO_TIMESTAMP_ESTIMATED,
             bytes: captured.to_vec(),
             timestamp_us: 2_000,
             sequence: 9,
@@ -384,7 +386,16 @@ fn continuous_packetizer_pads_partial_pcm_only_when_idle_and_preserves_it() {
     assert!(padded.bytes[captured.len()..].iter().all(|byte| *byte == 0));
     assert_eq!(padded.flags & AUDIO_SILENT, 0);
     assert_ne!(padded.flags & AUDIO_DISCONTINUITY, 0);
+    assert_ne!(padded.flags & AUDIO_TIMESTAMP_ESTIMATED, 0);
     assert_eq!((padded.timestamp_us, padded.sequence), (2_000, 0));
+}
+
+#[test]
+fn continuous_packet_frame_count_truncates_fractional_samples() {
+    let format = Format::new(44_100, 2, PCM_F32).unwrap();
+    let continuous = ContinuousStream::new(format, ContinuousAudio { packet_ms: 5 }).unwrap();
+
+    assert_eq!(continuous.packetizer.frames_per_packet, 220);
 }
 
 #[test]

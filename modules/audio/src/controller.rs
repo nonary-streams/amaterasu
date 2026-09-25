@@ -4,8 +4,8 @@ use crate::{
     worker::{Backend, NativeBackend, Opened, Source},
 };
 use amaterasu_media::{
-    AudioFrame, AudioSink, AUDIO_SILENT, MEDIA_BACKEND_ERROR, MEDIA_CLOSED, MEDIA_PENDING, PCM_F32,
-    PCM_I16,
+    AudioFrame, AudioSink, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, MEDIA_BACKEND_ERROR,
+    MEDIA_CLOSED, MEDIA_PENDING, PCM_F32, PCM_I16,
 };
 use amaterasu_module_sdk::abi::{Status, STATUS_OK};
 use serde_json::{json, Value};
@@ -73,9 +73,8 @@ impl ContinuousStream {
         let frames_per_packet = format
             .sample_rate
             .checked_mul(continuous_audio.packet_ms)
-            .filter(|frames| *frames % 1000 == 0)
-            .map(|frames| frames / 1000)
-            .ok_or("unsupported_packet_size")?;
+            .ok_or("unsupported_packet_size")?
+            / 1000;
         let packetizer = ContinuousPacketizer::new(format, frames_per_packet)?;
         let packet_duration = Duration::from_millis(u64::from(continuous_audio.packet_ms));
         let started_at = Instant::now();
@@ -186,7 +185,8 @@ impl ContinuousPacketizer {
     }
 
     fn idle(&mut self, elapsed_us: u64) -> AudioResult<Packet> {
-        let timestamp_us = if self.pending_bytes.is_empty() {
+        let synthetic_silence = self.pending_bytes.is_empty();
+        let timestamp_us = if synthetic_silence {
             self.next_timestamp_us
                 .map_or(elapsed_us, |next| elapsed_us.max(next))
         } else {
@@ -194,7 +194,10 @@ impl ContinuousPacketizer {
                 .take()
                 .ok_or("audio_timeline_failed")?
         };
-        let flags = std::mem::take(&mut self.pending_flags);
+        let mut flags = std::mem::take(&mut self.pending_flags);
+        if synthetic_silence {
+            flags |= AUDIO_TIMESTAMP_ESTIMATED;
+        }
         let mut bytes = std::mem::replace(
             &mut self.pending_bytes,
             Vec::with_capacity(self.bytes_per_packet),
