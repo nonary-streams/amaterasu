@@ -407,3 +407,14 @@ Remaining blockers and mismatches:
 - The coordinator confirmed LAN/WAN encryption fields share the one NVHTTP v16-to-v17 migration with frame-limiter and legacy preparation. Luna02 is the persistence writer; Luna06 will send `lan_encryption_mode` and `wan_encryption_mode` in the existing signed settings update and render their configured values without changing `/v1`.
 - The confirmed frame-limiter contract uses decimal-Hz `frame_limiter_fps_limit` for persistence and scoped overrides. The management editor now preserves absent/null inheritance separately from false/zero and normalizes `rtss_disable_vsync_ullm` to `frame_limiter_disable_vsync`. The six scoped fields and global-only RTSS/MangoHUD fields are reflected in the editor allowlists.
 - Next bounded slice: follow up on locale request 0016 with the coordinator for an approved host-configuration v1 contract and exact management/UI path ownership; do not extend host-configuration or write foreign-owned paths without that grant. The stream override editor is ready for L05 persistence only after coordinator/L05 confirms proposed catalog schema v2; L02/L05 still own runtime precedence and snapshots. The coordinator's clean integration checkout must run Rust checks, migration tests, browser qualification, and runtime/platform validation. Keep every unproven ID pending.
+
+
+## Main validation: prerelease logging default
+
+The diagnostics prerelease default candidate `a3476f12fefbd0774b54f8e136d8b931041dd653` landed on main as `c4ffb1ca27a13a55fbd799029d88a557e6838d06`. Coordinator validation passed:
+
+- `cargo fmt --check -p amaterasu-diagnostics`.
+- `cargo test -p amaterasu-diagnostics` — 24/24, including the three channel-default and explicit-override regressions.
+- `cargo clippy -p amaterasu-diagnostics --all-targets -- -D warnings`.
+
+Supported-platform runtime qualification remains pending. Full `global:min_log_level` parity also remains pending, including product registration/integration and end-to-end settings-to-consumer evidence. The lightweight lane did not run Cargo tests, builds, packaging, or Clippy. The NVENC editor remains gated on L02 confirmation of the exact v17 persisted/readback shape; no v18 is allocated.
