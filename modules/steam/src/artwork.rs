@@ -469,16 +469,16 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
         }
     }
 
-    best_candidate.map_or_else(
-        || ArtworkMetadata {
-            candidate_signature,
-            ..ArtworkMetadata::default()
-        },
-        |candidate| ArtworkMetadata {
+    match best_candidate {
+        Some(candidate) => ArtworkMetadata {
             candidate_signature,
             ..candidate.metadata
         },
-    )
+        None => ArtworkMetadata {
+            candidate_signature,
+            ..ArtworkMetadata::default()
+        },
+    }
 }
 
 fn local_candidate_signature(candidates: &[LocalArtworkCandidate]) -> String {
