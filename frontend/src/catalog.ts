@@ -78,22 +78,87 @@ namespace Amaterasu {
   }
 
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
-  const catalogFrameLimiterProviderValues: readonly CatalogFrameLimiterProvider[] = [
-    "auto",
-    "rtss",
-    "nvidia-control-panel",
-    "mangohud",
-    "proton",
-    "mangohud-proton",
-    "none",
-  ];
   const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"] as const;
-  const catalogRtssFrameLimitTypes = [
-    "async",
-    "front edge sync",
-    "back edge sync",
-    "nvidia reflex",
-  ] as const;
+
+  export type CatalogFrameLimiterCapabilityName =
+    | "frame_limiter_provider"
+    | "rtss_frame_limit_type";
+
+  function catalogSavedUnsupportedEnumValueToken(values: readonly string[]): string {
+    let token = "__amaterasu_keep_saved_unsupported_enum_value__";
+    while (values.includes(token)) token += "_";
+    return token;
+  }
+
+  export function catalogFrameLimiterOverrideOptionValues(
+    name: CatalogFrameLimiterCapabilityName,
+    capabilities: CatalogConfigOverrideCapabilities,
+    current: string | null | undefined,
+  ): string[] {
+    const values = capabilities[name];
+    const options = ["", ...values];
+    if (current != null && !values.includes(current))
+      options.push(catalogSavedUnsupportedEnumValueToken(values));
+    return options;
+  }
+
+  export function catalogFrameLimiterOverrideIsDisabled(
+    name: CatalogFrameLimiterCapabilityName,
+    capabilities: CatalogConfigOverrideCapabilities,
+  ): boolean {
+    return name === "rtss_frame_limit_type" && capabilities.rtss_frame_limit_type.length === 0;
+  }
+
+  function catalogFrameLimiterCapabilitySelect(
+    name: CatalogFrameLimiterCapabilityName,
+    current: string | null | undefined,
+    capabilities: CatalogConfigOverrideCapabilities,
+  ): HTMLElement {
+    const values = capabilities[name];
+    const unsupportedCurrent = current != null && !values.includes(current);
+    const options = catalogFrameLimiterOverrideOptionValues(name, capabilities, current);
+    const select = el("select");
+    select.name = name;
+    const inherit = el("option", "", "Inherit");
+    inherit.value = "";
+    select.append(inherit);
+    for (const value of values) {
+      const option = el("option", "", value);
+      option.value = value;
+      select.append(option);
+    }
+    if (unsupportedCurrent) {
+      const saved = el("option", "", `Keep saved value: ${current} (unsupported on this host)`);
+      saved.value = options[options.length - 1];
+      select.append(saved);
+    }
+    select.value = unsupportedCurrent ? options[options.length - 1] : current ?? "";
+
+    if (!catalogFrameLimiterOverrideIsDisabled(name, capabilities)) return select;
+
+    select.disabled = true;
+    select.removeAttribute("name");
+    const preservedValue = input(
+      name,
+      unsupportedCurrent ? options[options.length - 1] : "",
+      "hidden",
+    );
+    const controls: HTMLElement[] = [
+      select,
+      preservedValue,
+      el("span", "muted", "Unsupported on this host."),
+    ];
+    if (unsupportedCurrent) {
+      const clear = button("Clear override", () => {
+        preservedValue.value = "";
+        select.value = "";
+        clear.disabled = true;
+      }, "quiet");
+      clear.type = "button";
+      controls.push(clear);
+    }
+    return el("div", "catalog-enum-override", ...controls);
+  }
 
   function catalogEnumOverrideSelect(
     name: string,
@@ -153,6 +218,7 @@ namespace Amaterasu {
 
   function catalogFrameLimiterOverrideFields(
     overrides: Entry["config_overrides"] | undefined,
+    capabilities: CatalogConfigOverrideCapabilities,
   ): HTMLElement[] {
     const values = catalogFrameLimiterOverrideFormValues(overrides);
     const enable = audioOverrideSelect(
@@ -164,10 +230,10 @@ namespace Amaterasu {
     fpsLimit.max = "1000";
     fpsLimit.step = "0.001";
     fpsLimit.placeholder = "Inherit";
-    const provider = catalogEnumOverrideSelect(
+    const provider = catalogFrameLimiterCapabilitySelect(
       "frame_limiter_provider",
       values.frame_limiter_provider,
-      catalogFrameLimiterProviderValues,
+      capabilities,
     );
     const disableVsync = audioOverrideSelect(
       "frame_limiter_disable_vsync",
@@ -180,10 +246,10 @@ namespace Amaterasu {
       values.frame_limiter_auto_virtual_framegen,
       catalogAutoVirtualFramegenModes,
     );
-    const rtssFrameLimitType = catalogEnumOverrideSelect(
+    const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect(
       "rtss_frame_limit_type",
       values.rtss_frame_limit_type,
-      catalogRtssFrameLimitTypes,
+      capabilities,
     );
     const ds4BackAsTouchpadClick = audioOverrideSelect(
       "ds4_back_as_touchpad_click",
@@ -204,7 +270,7 @@ namespace Amaterasu {
       field(
         "RTSS frame limit type",
         rtssFrameLimitType,
-        "Blank inherits. RTSS frame limit types are available on Windows.",
+        "Blank inherits. Available RTSS choices depend on host support.",
       ),
       field(
         "DS4 Back as touchpad click",
@@ -217,9 +283,15 @@ namespace Amaterasu {
   function parseCatalogFrameLimiterEnum<T extends string>(
     value: string,
     allowedValues: readonly T[],
+    currentValue: string | null | undefined,
     label: string,
   ): T | null {
     if (value === "") return null;
+    if (
+      currentValue != null &&
+      !allowedValues.includes(currentValue as T) &&
+      value === catalogSavedUnsupportedEnumValueToken(allowedValues)
+    ) return currentValue as T;
     if (!allowedValues.includes(value as T))
       throw new Error(`${label} must be one of the supported values.`);
     return value as T;
@@ -250,6 +322,8 @@ namespace Amaterasu {
 
   export function parseCatalogFrameLimiterOverrides(
     data: FormData,
+    capabilities: CatalogConfigOverrideCapabilities,
+    currentOverrides?: Entry["config_overrides"],
   ): CatalogFrameLimiterOverrides {
     const text = (name: keyof CatalogFrameLimiterOverrides) =>
       String(data.get(name) ?? "");
@@ -263,7 +337,8 @@ namespace Amaterasu {
       ),
       frame_limiter_provider: parseCatalogFrameLimiterEnum(
         text("frame_limiter_provider"),
-        catalogFrameLimiterProviderValues,
+        capabilities.frame_limiter_provider,
+        currentOverrides?.frame_limiter_provider,
         "Frame limiter provider",
       ),
       frame_limiter_disable_vsync: Amaterasu.parseInputBooleanOverride(
@@ -273,11 +348,13 @@ namespace Amaterasu {
       frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(
         text("frame_limiter_auto_virtual_framegen"),
         catalogAutoVirtualFramegenModes,
+        undefined,
         "Auto virtual frame generation mode",
       ),
       rtss_frame_limit_type: parseCatalogFrameLimiterEnum(
         text("rtss_frame_limit_type"),
-        catalogRtssFrameLimitTypes,
+        capabilities.rtss_frame_limit_type,
+        currentOverrides?.rtss_frame_limit_type,
         "RTSS frame limit type",
       ),
       ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(
@@ -446,8 +523,11 @@ namespace Amaterasu {
     let cursors: unknown[] = [null];
     let page = 0;
     let generation = 0;
-    const add = button("+ Add application", () => showEditor(), "primary");
-    add.disabled = !api.allows("catalog.write");
+    let configOverrideCapabilities: CatalogConfigOverrideCapabilities | null = null;
+    const add = button("+ Add application", () => {
+      if (configOverrideCapabilities) showEditor(undefined, configOverrideCapabilities);
+    }, "primary");
+    add.disabled = true;
     content.append(
       sectionHeading(
         "Your library",
@@ -470,8 +550,11 @@ namespace Amaterasu {
         );
         if (!content.isConnected || current !== generation) return;
         revision = reply.revision;
+        configOverrideCapabilities = reply.config_override_capabilities;
+        add.disabled = !api.allows("catalog.write");
         const grid = el("div", "catalog-grid");
-        for (const row of reply.entries) grid.append(card(row));
+        for (const row of reply.entries)
+          grid.append(card(row, reply.config_override_capabilities));
         results.replaceChildren(
           el(
             "div",
@@ -528,16 +611,19 @@ namespace Amaterasu {
       reset();
     });
 
-    function card(row: CatalogRow): HTMLElement {
+    function card(
+      row: CatalogRow,
+      capabilities: CatalogConfigOverrideCapabilities,
+    ): HTMLElement {
       const providerLaunch = row.entry.launch.kind === "playnite";
-      const edit = button("Edit", () => showEditor(row));
+      const edit = button("Edit", () => showEditor(row, capabilities));
       edit.disabled = !api.allows("catalog.write") || providerLaunch;
       if (providerLaunch) edit.title = "Playnite launch targets are managed by the provider.";
       const actions = [edit];
       if (providerLaunch) {
         const configure = button(
           "Streaming settings",
-          () => showProviderOverrideEditor(row),
+          () => showProviderOverrideEditor(row, capabilities),
           "secondary",
         );
         configure.disabled = !api.allows("catalog.write");
@@ -613,10 +699,14 @@ namespace Amaterasu {
       );
     }
 
-    function showProviderOverrideEditor(row: CatalogRow): void {
+    function showProviderOverrideEditor(
+      row: CatalogRow,
+      capabilities: CatalogConfigOverrideCapabilities,
+    ): void {
       editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
       void loadInputRuntimeStatus().then((status) => {
-        if (context.content.isConnected) renderProviderOverrideEditor(row, status);
+        if (context.content.isConnected)
+          renderProviderOverrideEditor(row, status, capabilities);
       });
     }
 
@@ -639,7 +729,11 @@ namespace Amaterasu {
       }
     }
 
-    function renderProviderOverrideEditor(row: CatalogRow, runtimeStatus: InputRuntimeStatus): void {
+    function renderProviderOverrideEditor(
+      row: CatalogRow,
+      runtimeStatus: InputRuntimeStatus,
+      capabilities: CatalogConfigOverrideCapabilities,
+    ): void {
       let editRevision = revision;
       const currentFec = row.entry.config_overrides?.fec_percentage;
       const fec = input(
@@ -652,7 +746,10 @@ namespace Amaterasu {
       fec.step = "1";
       fec.placeholder = "Inherit";
       fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
-      const frameLimiterFields = catalogFrameLimiterOverrideFields(row.entry.config_overrides);
+      const frameLimiterFields = catalogFrameLimiterOverrideFields(
+        row.entry.config_overrides,
+        capabilities,
+      );
       const streamAudio = audioOverrideSelect(
         "stream_audio",
         row.entry.config_overrides?.stream_audio,
@@ -711,7 +808,11 @@ namespace Amaterasu {
         void runAction(save, feedback, async () => {
           const config_overrides = {
             ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
-            ...parseCatalogFrameLimiterOverrides(new FormData(form)),
+            ...parseCatalogFrameLimiterOverrides(
+              new FormData(form),
+              capabilities,
+              row.entry.config_overrides,
+            ),
             dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
           };
           try {
@@ -777,15 +878,23 @@ namespace Amaterasu {
       fec.focus();
     }
 
-    function showEditor(row?: CatalogRow): void {
+    function showEditor(
+      row: CatalogRow | undefined,
+      capabilities: CatalogConfigOverrideCapabilities,
+    ): void {
       void loadInputRuntimeStatus().then((runtimeStatus) => {
-        if (context.content.isConnected) renderEditor(row, runtimeStatus);
+        if (context.content.isConnected)
+          renderEditor(row, runtimeStatus, capabilities);
       });
     }
 
-    function renderEditor(row: CatalogRow | undefined, runtimeStatus: InputRuntimeStatus): void {
+    function renderEditor(
+      row: CatalogRow | undefined,
+      runtimeStatus: InputRuntimeStatus,
+      capabilities: CatalogConfigOverrideCapabilities,
+    ): void {
       const editRevision = revision;
-      const form = entryForm(row?.entry, runtimeStatus);
+      const form = entryForm(row?.entry, runtimeStatus, capabilities);
       const feedback = el("div");
       const save = el(
         "button",
@@ -802,7 +911,11 @@ namespace Amaterasu {
           const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
           entry.config_overrides = {
             ...(entry.config_overrides ?? {}),
-            ...parseCatalogFrameLimiterOverrides(new FormData(form)),
+            ...parseCatalogFrameLimiterOverrides(
+              new FormData(form),
+              capabilities,
+              row?.entry.config_overrides,
+            ),
           };
           await api.post(row ? "catalog/update" : "catalog/create", {
             ...(row ? { id: row.id } : {}),
@@ -831,7 +944,11 @@ namespace Amaterasu {
     void load();
   }
 
-  function entryForm(entry: Entry | undefined, runtimeStatus: InputRuntimeStatus): HTMLFormElement {
+  function entryForm(
+    entry: Entry | undefined,
+    runtimeStatus: InputRuntimeStatus,
+    capabilities: CatalogConfigOverrideCapabilities,
+  ): HTMLFormElement {
     const form = el("form", "editor-form");
     const name = input("name", entry?.name ?? "");
     name.required = true;
@@ -906,7 +1023,10 @@ namespace Amaterasu {
     fec.min = "1";
     fec.max = "255";
     fec.step = "1";
-    const frameLimiterFields = catalogFrameLimiterOverrideFields(entry?.config_overrides);
+    const frameLimiterFields = catalogFrameLimiterOverrideFields(
+      entry?.config_overrides,
+      capabilities,
+    );
     const streamAudio = audioOverrideSelect(
       "stream_audio",
       entry?.config_overrides?.stream_audio,

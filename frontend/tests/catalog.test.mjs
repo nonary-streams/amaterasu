@@ -15,6 +15,15 @@ for (const source of ["src/model.ts", "src/catalog.ts"]) {
 }
 const readSteamArtwork = context.Amaterasu.readSteamArtwork;
 const reference = { provider: "steam", app_id: 730, revision: "42" };
+const windowsCapabilities = {
+  frame_limiter_provider: ["auto", "rtss", "nvidia-control-panel"],
+  rtss_frame_limit_type: [
+    "async",
+    "front edge sync",
+    "back edge sync",
+    "nvidia reflex",
+  ],
+};
 
 test("application refresh rate option editor reads back and writes sparse exact tokens", () => {
   const parse = context.Amaterasu.parseCatalogRefreshRateOptionOverride;
@@ -86,7 +95,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
 
   const form = new FormData();
   for (const [name, value] of Object.entries(editorValues)) form.set(name, value);
-  const savedPayload = JSON.parse(JSON.stringify(parse(form)));
+  const savedPayload = JSON.parse(JSON.stringify(parse(form, windowsCapabilities, existingOverrides)));
   assert.deepEqual(savedPayload, {
     frame_limiter_enable: false,
     frame_limiter_fps_limit: 0,
@@ -104,7 +113,7 @@ test("Catalog frame limiter editor round-trips inherited values, explicit false,
 test("Catalog frame limiter controls enforce the current override types and domains", () => {
   const parse = context.Amaterasu.parseCatalogFrameLimiterOverrides;
   const fields = new FormData();
-  assert.deepEqual(JSON.parse(JSON.stringify(parse(fields))), {
+  assert.deepEqual(JSON.parse(JSON.stringify(parse(fields, windowsCapabilities))), {
     frame_limiter_enable: null,
     frame_limiter_fps_limit: null,
     frame_limiter_provider: null,
@@ -114,17 +123,9 @@ test("Catalog frame limiter controls enforce the current override types and doma
     ds4_back_as_touchpad_click: null,
   });
 
-  for (const provider of [
-    "auto",
-    "rtss",
-    "nvidia-control-panel",
-    "mangohud",
-    "proton",
-    "mangohud-proton",
-    "none",
-  ]) {
+  for (const provider of windowsCapabilities.frame_limiter_provider) {
     fields.set("frame_limiter_provider", provider);
-    assert.equal(parse(fields).frame_limiter_provider, provider);
+    assert.equal(parse(fields, windowsCapabilities).frame_limiter_provider, provider);
   }
   for (const name of [
     "frame_limiter_enable",
@@ -132,19 +133,19 @@ test("Catalog frame limiter controls enforce the current override types and doma
     "ds4_back_as_touchpad_click",
   ]) {
     fields.set(name, "true");
-    assert.equal(parse(fields)[name], true);
+    assert.equal(parse(fields, windowsCapabilities)[name], true);
   }
   for (const mode of ["enabled", "vrr", "legacy", "disabled"]) {
     fields.set("frame_limiter_auto_virtual_framegen", mode);
-    assert.equal(parse(fields).frame_limiter_auto_virtual_framegen, mode);
+    assert.equal(parse(fields, windowsCapabilities).frame_limiter_auto_virtual_framegen, mode);
   }
-  for (const limitType of ["async", "front edge sync", "back edge sync", "nvidia reflex"]) {
+  for (const limitType of windowsCapabilities.rtss_frame_limit_type) {
     fields.set("rtss_frame_limit_type", limitType);
-    assert.equal(parse(fields).rtss_frame_limit_type, limitType);
+    assert.equal(parse(fields, windowsCapabilities).rtss_frame_limit_type, limitType);
   }
   for (const fpsLimit of ["0", "59.94", "1000", "1.2300"]) {
     fields.set("frame_limiter_fps_limit", fpsLimit);
-    assert.equal(parse(fields).frame_limiter_fps_limit, Number(fpsLimit));
+    assert.equal(parse(fields, windowsCapabilities).frame_limiter_fps_limit, Number(fpsLimit));
   }
 
   for (const [name, value] of [
@@ -163,8 +164,115 @@ test("Catalog frame limiter controls enforce the current override types and doma
   ]) {
     const invalidFields = new FormData();
     invalidFields.set(name, value);
-    assert.throws(() => parse(invalidFields), /Frame limiter|VSync|DS4 Back|Auto virtual|RTSS frame limit/);
+    assert.throws(
+      () => parse(invalidFields, windowsCapabilities),
+      /Frame limiter|VSync|DS4 Back|Auto virtual|RTSS frame limit/,
+    );
   }
+});
+
+test("Catalog frame limiter controls use populated Windows-like host capabilities", () => {
+  const capabilities = {
+    frame_limiter_provider: ["auto", "rtss", "nvidia-control-panel"],
+    rtss_frame_limit_type: ["async", "front edge sync"],
+  };
+  const options = context.Amaterasu.catalogFrameLimiterOverrideOptionValues;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(options("frame_limiter_provider", capabilities, null))),
+    ["", ...capabilities.frame_limiter_provider],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(options("rtss_frame_limit_type", capabilities, null))),
+    ["", ...capabilities.rtss_frame_limit_type],
+  );
+
+  const parse = context.Amaterasu.parseCatalogFrameLimiterOverrides;
+  const fields = new FormData();
+  const providerFromHost = capabilities.frame_limiter_provider.at(-1);
+  const rtssFromHost = capabilities.rtss_frame_limit_type.at(-1);
+  fields.set("frame_limiter_provider", providerFromHost);
+  fields.set("rtss_frame_limit_type", rtssFromHost);
+  const parsed = JSON.parse(JSON.stringify(parse(fields, capabilities)));
+  assert.equal(parsed.frame_limiter_provider, providerFromHost);
+  assert.equal(parsed.rtss_frame_limit_type, rtssFromHost);
+
+  for (const [name, value] of [
+    ["frame_limiter_provider", "provider-not-returned-by-host"],
+    ["rtss_frame_limit_type", "rtss-mode-not-returned-by-host"],
+  ]) {
+    const unsupported = new FormData();
+    unsupported.set(name, value);
+    assert.throws(() => parse(unsupported, capabilities), /supported values/);
+  }
+});
+
+test("Catalog disables unavailable RTSS choices and preserves saved unsupported values explicitly", () => {
+  const capabilities = {
+    frame_limiter_provider: ["host-provider"],
+    rtss_frame_limit_type: [],
+  };
+  const isDisabled = context.Amaterasu.catalogFrameLimiterOverrideIsDisabled;
+  const optionValues = context.Amaterasu.catalogFrameLimiterOverrideOptionValues;
+  const parse = context.Amaterasu.parseCatalogFrameLimiterOverrides;
+  assert.equal(isDisabled("rtss_frame_limit_type", capabilities), true);
+  assert.equal(isDisabled("frame_limiter_provider", capabilities), false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(optionValues("rtss_frame_limit_type", capabilities, null))),
+    [""],
+  );
+
+  const emptyChoices = new FormData();
+  assert.equal(parse(emptyChoices, capabilities).rtss_frame_limit_type, null);
+  emptyChoices.set("rtss_frame_limit_type", "new-unsupported-rtss-value");
+  assert.throws(() => parse(emptyChoices, capabilities), /supported values/);
+
+  const savedProvider = "previous-provider-choice";
+  const savedRtss = "previous-rtss-choice";
+  const existingOverrides = {
+    frame_limiter_provider: savedProvider,
+    rtss_frame_limit_type: savedRtss,
+  };
+  const providerOptions = optionValues(
+    "frame_limiter_provider",
+    capabilities,
+    savedProvider,
+  );
+  const rtssOptions = optionValues(
+    "rtss_frame_limit_type",
+    capabilities,
+    savedRtss,
+  );
+  const providerPreserveToken = providerOptions.at(-1);
+  const rtssPreserveToken = rtssOptions.at(-1);
+  assert.notEqual(providerPreserveToken, savedProvider);
+  assert.notEqual(rtssPreserveToken, savedRtss);
+  assert.equal(providerOptions.includes(savedProvider), false);
+  assert.equal(rtssOptions.includes(savedRtss), false);
+
+  const unchanged = new FormData();
+  unchanged.set("frame_limiter_provider", providerPreserveToken);
+  unchanged.set("rtss_frame_limit_type", rtssPreserveToken);
+  const preserved = JSON.parse(
+    JSON.stringify(parse(unchanged, capabilities, existingOverrides)),
+  );
+  assert.equal(preserved.frame_limiter_provider, savedProvider);
+  assert.equal(preserved.rtss_frame_limit_type, savedRtss);
+
+  unchanged.set("frame_limiter_provider", "");
+  unchanged.set("rtss_frame_limit_type", "");
+  const inherited = JSON.parse(
+    JSON.stringify(parse(unchanged, capabilities, existingOverrides)),
+  );
+  assert.equal(inherited.frame_limiter_provider, null);
+  assert.equal(inherited.rtss_frame_limit_type, null);
+
+  const newlySelectedUnsupported = new FormData();
+  newlySelectedUnsupported.set("frame_limiter_provider", savedProvider);
+  newlySelectedUnsupported.set("rtss_frame_limit_type", savedRtss);
+  assert.throws(
+    () => parse(newlySelectedUnsupported, capabilities, existingOverrides),
+    /supported values/,
+  );
 });
 
 test("Steam artwork chunks assemble into the expected image without a local path", async () => {

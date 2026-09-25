@@ -41,20 +41,9 @@ namespace Amaterasu {
     cwd?: string | null;
     timeout_ms?: number;
   }
-  export type CatalogFrameLimiterProvider =
-    | "auto"
-    | "rtss"
-    | "nvidia-control-panel"
-    | "mangohud"
-    | "proton"
-    | "mangohud-proton"
-    | "none";
+  export type CatalogFrameLimiterProvider = string;
   export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
-  export type CatalogRtssFrameLimitType =
-    | "async"
-    | "front edge sync"
-    | "back edge sync"
-    | "nvidia reflex";
+  export type CatalogRtssFrameLimitType = string;
   export interface Entry {
     name: string;
     description: string;
@@ -91,10 +80,15 @@ namespace Amaterasu {
     id: string;
     entry: Entry;
   }
+  export interface CatalogConfigOverrideCapabilities {
+    frame_limiter_provider: string[];
+    rtss_frame_limit_type: string[];
+  }
   export interface CatalogReply {
     revision: number;
     entries: CatalogRow[];
     next_cursor: unknown | null;
+    config_override_capabilities: CatalogConfigOverrideCapabilities;
   }
   export type Field =
     | { type: "boolean"; default: boolean }
