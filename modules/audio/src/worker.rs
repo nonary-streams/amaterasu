@@ -259,15 +259,9 @@ fn run_capture_loop<F>(
     while !stop.load(Ordering::Acquire) {
         match capture.read() {
             Ok(Some(mut packet)) => {
-                let recovered_packet = match continuity.normalize(&mut packet) {
-                    Ok(recovered_packet) => recovered_packet,
-                    Err(error) => {
-                        fail(health, error);
-                        break;
-                    }
-                };
-                if recovered_packet {
-                    set_recovering(health, false);
+                if let Err(error) = continuity.normalize(&mut packet) {
+                    fail(health, error);
+                    break;
                 }
                 if !enqueue(sender, health, packet) {
                     break;
@@ -304,6 +298,7 @@ fn run_capture_loop<F>(
                                 set_active_endpoint(health, reopened.endpoint());
                             }
                             capture = reopened;
+                            set_recovering(health, false);
                             break;
                         }
                         Err(error) if error == "audio_endpoint_changed" => {
@@ -374,6 +369,7 @@ mod tests {
         endpoint: String,
         format: Format,
         events: VecDeque<AudioResult<Option<Packet>>>,
+        drops: Option<Arc<AtomicUsize>>,
     }
 
     impl FakeCapture {
@@ -385,12 +381,26 @@ mod tests {
                 endpoint: "render.fixed".into(),
                 format,
                 events: events.into_iter().collect(),
+                drops: None,
             }
         }
 
         fn with_endpoint(mut self, endpoint: &str) -> Self {
             self.endpoint = endpoint.into();
             self
+        }
+
+        fn with_drop_counter(mut self, drops: Arc<AtomicUsize>) -> Self {
+            self.drops = Some(drops);
+            self
+        }
+    }
+
+    impl Drop for FakeCapture {
+        fn drop(&mut self) {
+            if let Some(drops) = &self.drops {
+                drops.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -446,11 +456,14 @@ mod tests {
         let health = Arc::new(Mutex::new(Health::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
+        let recovering_during_retry = Arc::new(AtomicBool::new(false));
 
         let runner = thread::spawn({
             let health = health.clone();
+            let recovery_health = health.clone();
             let stop = stop.clone();
             let attempts = attempts.clone();
+            let recovering_during_retry = recovering_during_retry.clone();
             move || {
                 let mut recovery_attempt = 0;
                 run_capture_loop(
@@ -459,6 +472,10 @@ mod tests {
                         attempts.fetch_add(1, Ordering::SeqCst);
                         recovery_attempt += 1;
                         if recovery_attempt == 1 {
+                            recovering_during_retry.store(
+                                recovery_health.lock().unwrap().recovering,
+                                Ordering::Release,
+                            );
                             return Err("endpoint_not_found");
                         }
                         Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
@@ -488,6 +505,7 @@ mod tests {
         assert!(recovered.timestamp_us > first.timestamp_us);
         assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(recovering_during_retry.load(Ordering::Acquire));
         let health = health.lock().unwrap();
         assert!(!health.recovering);
         assert_eq!(health.failure, None);
@@ -536,6 +554,64 @@ mod tests {
         runner.thread().unpark();
         runner.join().unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn quiet_reopened_capture_is_active_and_released_on_shutdown() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial =
+            FakeCapture::new(format, [Err("device_lost")]).with_drop_counter(drops.clone());
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reopened = Arc::new(AtomicBool::new(false));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            let reopened = reopened.clone();
+            let drops = drops.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    || {
+                        reopened.store(true, Ordering::Release);
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(None)]).with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: false,
+                        retry_delay: Duration::ZERO,
+                    },
+                );
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reopened.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(reopened.load(Ordering::Acquire));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (drops.load(Ordering::SeqCst) == 0 || health.lock().unwrap().recovering)
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        let snapshot = health.lock().unwrap().clone();
+        assert!(!snapshot.recovering);
+        assert_eq!(snapshot.failure, None);
+        assert_eq!(snapshot.active_endpoint.as_deref(), Some("render.fixed"));
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
