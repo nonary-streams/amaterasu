@@ -228,8 +228,35 @@ fn disconnected_snapshot_worker_does_not_stick_in_busy_state() {
         receiver: Some(receiver),
         _thread: None,
         settings_epoch: 0,
+        processes: Vec::new(),
     };
 
     assert!(worker.take_result().unwrap().is_err());
     assert!(!worker.busy());
+}
+
+#[test]
+fn process_restart_revokes_launch_eligibility_until_a_current_import_completes() {
+    let old_process = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let new_process = process(73, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let mut eligible = ["a1b2c3d4-1234-5678-9abc-0123456789ab".into()]
+        .into_iter()
+        .collect();
+    let discovered = discovery::Discovery {
+        running: true,
+        processes: vec![new_process.clone()],
+        executable_paths: vec![new_process.path.clone()],
+    };
+
+    retain_eligibility_for_discovery(
+        std::slice::from_ref(&old_process),
+        &discovered.processes,
+        &mut eligible,
+    );
+    assert!(eligible.is_empty());
+    assert!(!can_publish_eligibility(Some(&[old_process]), &discovered));
+    assert!(can_publish_eligibility(Some(&[new_process]), &discovered));
+
+    let stopped = discovery::Discovery::default();
+    assert!(!can_publish_eligibility(Some(&[]), &stopped));
 }

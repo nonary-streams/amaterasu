@@ -139,18 +139,21 @@ struct SnapshotWorker {
     receiver: Option<Receiver<Result<Snapshot, String>>>,
     _thread: Option<JoinHandle<()>>,
     settings_epoch: u64,
+    processes: Vec<discovery::ProcessImage>,
 }
 
 impl SnapshotWorker {
     fn start(settings_epoch: u64, processes: Vec<discovery::ProcessImage>) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let request_processes = processes.clone();
         let worker = thread::spawn(move || {
-            let _ = sender.send(connector::request_snapshot(&processes));
+            let _ = sender.send(connector::request_snapshot(&request_processes));
         });
         Self {
             receiver: Some(receiver),
             _thread: Some(worker),
             settings_epoch,
+            processes,
         }
     }
 
@@ -184,6 +187,7 @@ struct PlayniteModule {
     last_snapshot_games: usize,
     last_discovery: discovery::Discovery,
     eligible_launch_ids: std::collections::BTreeSet<String>,
+    catalog_processes: Option<Vec<discovery::ProcessImage>>,
     launches: launch::Launches,
     fullscreen_launches: fullscreen::FullscreenSessions,
     fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync,
@@ -207,6 +211,7 @@ impl ManagedModule for PlayniteModule {
             last_snapshot_games: 0,
             last_discovery: discovery::Discovery::default(),
             eligible_launch_ids: std::collections::BTreeSet::new(),
+            catalog_processes: None,
             launches: launch::Launches::default(),
             fullscreen_launches: fullscreen::FullscreenSessions::default(),
             fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync::default(),
@@ -228,7 +233,9 @@ impl ManagedModule for PlayniteModule {
             .advance(&self.runtime, self.settings_epoch)
             .map_err(|error| format!("Playnite catalog import failed: {error}"))?;
         self.fullscreen_entry_sync.advance(&self.runtime)?;
-        if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids() {
+        if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids()
+            && can_publish_eligibility(self.catalog_processes.as_deref(), &self.last_discovery)
+        {
             self.eligible_launch_ids = launchable_game_ids;
         }
         match self.runtime.send(Command::Poll {})? {
@@ -251,6 +258,7 @@ impl PlayniteModule {
         }
         self.observed_settings_epoch = self.settings_epoch;
         self.eligible_launch_ids.clear();
+        self.catalog_processes = None;
         let settings = self.configuration.settings();
         self.fullscreen_entry_sync
             .set_desired(cfg!(windows) && settings.enabled && settings.fullscreen_entry_enabled);
@@ -262,6 +270,7 @@ impl PlayniteModule {
     }
 
     fn refresh_discovery(&mut self) {
+        let previous_processes = self.last_discovery.processes.clone();
         refresh_discovery_at(
             &mut self.last_discovery,
             &mut self.next_discovery,
@@ -269,17 +278,28 @@ impl PlayniteModule {
             false,
             discovery::discover,
         );
+        retain_eligibility_for_discovery(
+            &previous_processes,
+            &self.last_discovery.processes,
+            &mut self.eligible_launch_ids,
+        );
     }
 
-    fn refresh_discovery_for_stop(&mut self) {
-        // Stop/recovery needs the current PID after a Playnite restart. The launch
-        // coordinator still checks every refreshed path against the trusted install root.
+    fn refresh_discovery_now(&mut self) {
+        // Launch and stop need current PIDs after a Playnite restart. Recovery
+        // also checks paths against the launch's trusted install root.
+        let previous_processes = self.last_discovery.processes.clone();
         refresh_discovery_at(
             &mut self.last_discovery,
             &mut self.next_discovery,
             Instant::now(),
             true,
             discovery::discover,
+        );
+        retain_eligibility_for_discovery(
+            &previous_processes,
+            &self.last_discovery.processes,
+            &mut self.eligible_launch_ids,
         );
     }
 
@@ -289,6 +309,13 @@ impl PlayniteModule {
         };
         if self.snapshot_worker.settings_epoch != self.settings_epoch {
             self.last_error = Some("discarded a Playnite snapshot after settings changed".into());
+            return;
+        }
+        if self.snapshot_worker.processes != self.last_discovery.processes
+            || !self.last_discovery.running
+        {
+            self.last_error =
+                Some("discarded a Playnite snapshot after its process changed".into());
             return;
         }
         match result {
@@ -303,7 +330,10 @@ impl PlayniteModule {
                     self.settings_epoch,
                     now,
                 ) {
-                    Ok(()) => self.last_error = None,
+                    Ok(()) => {
+                        self.catalog_processes = Some(self.snapshot_worker.processes.clone());
+                        self.last_error = None;
+                    }
                     Err(error) => self.last_error = Some(error),
                 }
             }
@@ -372,7 +402,7 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, launch::not_started_error("playnite_disabled"));
                 }
-                self.refresh_discovery();
+                self.refresh_discovery_now();
                 if !self.last_discovery.running {
                     return self.complete(id, launch::not_started_error("playnite_not_running"));
                 }
@@ -401,7 +431,7 @@ impl PlayniteModule {
                 ticket,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery_for_stop();
+                self.refresh_discovery_now();
                 let response = self.launches.stop(
                     &ticket,
                     exit_timeout_seconds,
@@ -414,7 +444,7 @@ impl PlayniteModule {
                 game_id,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery_for_stop();
+                self.refresh_discovery_now();
                 let response = self.launches.recover_stop(
                     &operation_id,
                     &game_id,
@@ -433,7 +463,7 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, launch::not_started_error("playnite_disabled"));
                 }
-                self.refresh_discovery_for_stop();
+                self.refresh_discovery_now();
                 let installation = installation::Installation::discover_associated();
                 let response = self.fullscreen_launches.start(
                     &operation_id,
@@ -459,7 +489,7 @@ impl PlayniteModule {
                 ticket,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery_for_stop();
+                self.refresh_discovery_now();
                 let response = self.fullscreen_launches.stop(
                     &ticket,
                     exit_timeout_seconds,
@@ -471,7 +501,7 @@ impl PlayniteModule {
                 operation_id,
                 exit_timeout_seconds,
             } => {
-                self.refresh_discovery_for_stop();
+                self.refresh_discovery_now();
                 let response = self.fullscreen_launches.recover_stop(
                     &operation_id,
                     exit_timeout_seconds,
@@ -611,6 +641,23 @@ fn refresh_discovery_at(
         *last_discovery = discover();
         *next_discovery = Instant::now() + Duration::from_secs(2);
     }
+}
+
+fn retain_eligibility_for_discovery(
+    previous: &[discovery::ProcessImage],
+    current: &[discovery::ProcessImage],
+    eligible_launch_ids: &mut std::collections::BTreeSet<String>,
+) {
+    if previous != current {
+        eligible_launch_ids.clear();
+    }
+}
+
+fn can_publish_eligibility(
+    catalog_processes: Option<&[discovery::ProcessImage]>,
+    discovery: &discovery::Discovery,
+) -> bool {
+    discovery.running && catalog_processes == Some(discovery.processes.as_slice())
 }
 
 fn settings_caller_is_authorized(caller: &str) -> bool {

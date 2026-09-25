@@ -59,6 +59,11 @@ With `enabled` and `auto_sync` both true, the provider starts a background
 snapshot when settings load or change, then schedules another attempt 30 seconds
 after each start; an active snapshot or catalog transaction can delay the next
 attempt. This polling also retries when Playnite is stopped or a snapshot fails.
+Launch eligibility is tied to the discovered Playnite process IDs and paths.
+When Playnite stops or restarts, previously imported game IDs cannot launch
+against the new extension instance until a snapshot from that instance has
+completed catalog reconciliation. A snapshot or catalog completion from the
+previous instance cannot restore eligibility.
 Vibeshine instead requests a sync when its configuration is applied and
 otherwise reconciles snapshots sent by the Playnite extension, which coalesces
 library changes with a three-second debounce. The 30-second polling interval
