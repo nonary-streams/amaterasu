@@ -71,6 +71,51 @@ impl WindowsBackend {
         }
         self.keyboard_plan(key)
     }
+
+    fn inject_with_sender(
+        &mut self,
+        event: &Event,
+        mut send_input: impl FnMut(&INPUT, Option<KeyboardPlan>) -> InputResult<()>,
+    ) -> InputResult<()> {
+        self.validate(event)?;
+        if matches!(event, Event::Controller { .. }) {
+            return self.gamepads.inject(event);
+        }
+        let key_identity = match event {
+            Event::Key { key, .. } => Self::moonlight_key_identity(key),
+            _ => None,
+        };
+        let plan = self.event_keyboard_plan(event)?;
+        let input = native_input_with_plan(event, plan)?;
+        if let Some(identity) = key_identity
+            && matches!(
+                event,
+                Event::Key {
+                    state: KeyState::Down,
+                    ..
+                }
+            )
+        {
+            // SendInput failure can leave delivery uncertain. Retain the plan
+            // before attempting the down so cleanup uses the same representation.
+            self.held_key_plans.insert(identity, plan);
+        }
+        let held_plan_snapshot =
+            key_identity.and_then(|identity| self.held_key_plans.get(&identity).copied());
+        send_input(&input, held_plan_snapshot)?;
+        if let (Some(identity), Event::Key { state, .. }) = (key_identity, event) {
+            match state {
+                KeyState::Down => {
+                    self.held_key_plans.insert(identity, plan);
+                }
+                KeyState::Up => {
+                    self.held_key_plans.remove(&identity);
+                }
+                KeyState::Repeat => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Backend for WindowsBackend {
@@ -127,53 +172,21 @@ impl Backend for WindowsBackend {
     }
 
     fn inject(&mut self, event: &Event) -> InputResult<()> {
-        self.validate(event)?;
-        if matches!(event, Event::Controller { .. }) {
-            return self.gamepads.inject(event);
-        }
-        let key_identity = match event {
-            Event::Key { key, .. } => Self::moonlight_key_identity(key),
-            _ => None,
-        };
-        let plan = self.event_keyboard_plan(event)?;
-        let input = native_input_with_plan(event, plan)?;
-        if let Some(identity) = key_identity
-            && matches!(
-                event,
-                Event::Key {
-                    state: KeyState::Down,
-                    ..
-                }
-            )
-        {
-            // SendInput failure can leave delivery uncertain. Retain the plan
-            // before attempting the down so cleanup uses the same representation.
-            self.held_key_plans.insert(identity, plan);
-        }
-        // SAFETY: input is a fully initialized INPUT with the matching union tag.
-        // SendInput reads this one owned record synchronously and retains no pointer.
-        let accepted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
-        if accepted != 1 {
-            return Err(InputError::new(
-                "injection_failed",
-                format!(
-                    "SendInput accepted {accepted}/1 events (desktop/UIPI restrictions may apply): {}",
-                    std::io::Error::last_os_error()
-                ),
-            ));
-        }
-        if let (Some(identity), Event::Key { state, .. }) = (key_identity, event) {
-            match state {
-                KeyState::Down => {
-                    self.held_key_plans.insert(identity, plan);
-                }
-                KeyState::Up => {
-                    self.held_key_plans.remove(&identity);
-                }
-                KeyState::Repeat => {}
+        self.inject_with_sender(event, |input, _held_plan_snapshot| {
+            // SAFETY: input is a fully initialized INPUT with the matching union tag.
+            // SendInput reads this one owned record synchronously and retains no pointer.
+            let accepted = unsafe { SendInput(1, input, std::mem::size_of::<INPUT>() as i32) };
+            if accepted != 1 {
+                return Err(InputError::new(
+                    "injection_failed",
+                    format!(
+                        "SendInput accepted {accepted}/1 events (desktop/UIPI restrictions may apply): {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn set_always_send_scancodes(&mut self, enabled: bool) {
@@ -412,6 +425,10 @@ mod tests {
     }
 
     fn keyboard_record(input: INPUT) -> KEYBDINPUT {
+        keyboard_record_ref(&input)
+    }
+
+    fn keyboard_record_ref(input: &INPUT) -> KEYBDINPUT {
         assert_eq!(input.r#type, INPUT_KEYBOARD);
         // SAFETY: callers pass an INPUT generated as INPUT_KEYBOARD.
         unsafe { input.Anonymous.ki }
@@ -520,6 +537,73 @@ mod tests {
         assert_eq!(release.wVk, 0);
         assert_eq!(release.wScan, 0x1e);
         assert_eq!(release.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
+    }
+
+    #[test]
+    fn injection_retains_held_plan_across_failed_delivery_and_setting_changes() {
+        let mut backend = WindowsBackend::new(String::new());
+        backend.set_always_send_scancodes(false);
+        let plan = KeyboardPlan::Virtual {
+            code: 0x41,
+            extended: false,
+        };
+
+        let down = key(0x41, false, KeyState::Down);
+        let down_result = backend.inject_with_sender(&down, |input, held_plan_snapshot| {
+            assert_eq!(held_plan_snapshot, Some(plan));
+            let record = keyboard_record_ref(input);
+            assert_eq!(record.wVk, 0x41);
+            assert_eq!(record.wScan, 0);
+            assert_eq!(record.dwFlags, 0);
+            Err(InputError::new(
+                "injection_failed",
+                "simulated key-down failure",
+            ))
+        });
+        assert!(down_result.is_err());
+        assert_eq!(backend.held_key_plans.get(&0x41), Some(&plan));
+
+        backend.set_always_send_scancodes(true);
+
+        let repeat = key(0x41, false, KeyState::Repeat);
+        backend
+            .inject_with_sender(&repeat, |input, held_plan_snapshot| {
+                assert_eq!(held_plan_snapshot, Some(plan));
+                let record = keyboard_record_ref(input);
+                assert_eq!(record.wVk, 0x41);
+                assert_eq!(record.wScan, 0);
+                assert_eq!(record.dwFlags, 0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(backend.held_key_plans.get(&0x41), Some(&plan));
+
+        let up = key(0x41, false, KeyState::Up);
+        let up_result = backend.inject_with_sender(&up, |input, held_plan_snapshot| {
+            assert_eq!(held_plan_snapshot, Some(plan));
+            let record = keyboard_record_ref(input);
+            assert_eq!(record.wVk, 0x41);
+            assert_eq!(record.wScan, 0);
+            assert_eq!(record.dwFlags, KEYEVENTF_KEYUP);
+            Err(InputError::new(
+                "injection_failed",
+                "simulated key-up failure",
+            ))
+        });
+        assert!(up_result.is_err());
+        assert_eq!(backend.held_key_plans.get(&0x41), Some(&plan));
+
+        backend
+            .inject_with_sender(&up, |input, held_plan_snapshot| {
+                assert_eq!(held_plan_snapshot, Some(plan));
+                let record = keyboard_record_ref(input);
+                assert_eq!(record.wVk, 0x41);
+                assert_eq!(record.wScan, 0);
+                assert_eq!(record.dwFlags, KEYEVENTF_KEYUP);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!backend.held_key_plans.contains_key(&0x41));
     }
 
     #[test]
