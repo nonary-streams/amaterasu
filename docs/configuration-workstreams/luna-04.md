@@ -1,6 +1,65 @@
 # Luna-04: audio and input configuration parity
 
-## Current bounded slice
+## Current bounded slice: active endpoint in audio status
+
+- Lane code commit: `f753d95f002476f2275a972944827725b2c0a4be`; isolated worker source commit: `7041b6545df4c405ef4709375f8528a2b1690e6b`; worker and lane base: `b8f3a1596e215dbd4ae54cb00381a619072033ba`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable ID in scope: `global:audio_sink`. It remains pending. `global:audio_sink_capture_only` and `global:virtual_sink` were not changed and remain pending.
+- Verified worker session `01a0d516-8713-7b83-87f1-d35c0828ae10`, thread `01a0d5f5-a807-75c1-bb2a-c49f4ad12bd8`, model/effort `gpt-6-luna`/`xhigh`. The child used isolated worktree `D:/sources/worktrees/amaterasu-audio-active-endpoint-status-xhigh`, branch `codex/luna04-audio-active-endpoint-status-xhigh`, and confirmed its clean base immediately before edits.
+- Changed source paths: `modules/audio/src/model.rs`, `modules/audio/src/worker.rs`, `modules/audio/src/controller.rs`, `modules/audio/src/controller/tests.rs`, and `modules/audio/README.md`. Lead review confirmed the child commit's exact path ownership and required plan trailers before cherry-pick.
+- Internal worker health now tracks the active capture endpoint in a serde-skipped field, sets it from the initial capture, and updates it only after a Console-default-follow reopen passes endpoint/format acceptance. Status uses that value through its existing `endpoint` field, falling back to the opening snapshot before worker initialization. Open and lookup continue to return the immutable initial endpoint and original `requested_endpoint`; the response shape is unchanged.
+- Regression coverage updates the followed-default recovery worker test to assert the reopened endpoint and adds controller coverage showing status moves to the new endpoint while repeated open and lookup retain the initial endpoint. Explicit endpoint IDs stay pinned; explicit/automatic virtual sink and capture-only routing policy code is unchanged.
+- Worker and lane checks: `cargo fmt --all -- --check` and `git diff --check` passed. No Cargo tests, build, or Clippy ran in the lightweight lane. Windows endpoint switching/hardware qualification was not performed.
+- Cross-lane status-semantics request is recorded in outbox `017-audio-active-endpoint-status-contract.json`. No response from the coordinator/L02/L06 was present when this handoff was updated; acknowledge the proposed distinction between active status and immutable open/lookup identity before coordinator direct-to-main landing.
+- Remaining parity: persistence/default migration, scoped client/application resolution, management edit authority, full stream integration and Windows hardware qualification remain open. Keep all audio IDs pending. The next slice should first record any outbox 017 contract response, then inspect an owned capture-only or virtual-sink runtime gap without editing L02/L05/L06 paths.
+
+## Current bounded slice: open_selected Clippy correction
+
+- Lane code commit: `7651a3c049a45936c1dae5ccb48ad7e817f33f29` (`refactor(audio): group selected capture options`); isolated worker source commit: `3904a8a70160cc4ab333e778fcb82a5440335d86`; base: `d71ba1db9d89574abcd9b396befe965e874e0ca8`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable IDs and runtime behavior are unchanged by this lint correction. The Console-default-follow slice remains pending broader parity review.
+- Verified worker process session `01a0d516-8713-7b83-87f1-d35c0828ae10`, thread `01a0d5e8-d504-7f12-9f92-9592dc8565b5`; the thread row in `state_5.sqlite` reported `gpt-6-luna`/`xhigh`. The worker used isolated worktree `D:/sources/worktrees/amaterasu-audio-open-selected-clippy-xhigh`, branch `codex/luna04-audio-open-selected-clippy-xhigh`, based cleanly on `d71ba1db`.
+- Changed path: `modules/audio/src/platform/windows.rs` only. The private `OpenSelectedOptions` groups desired channel layout, preferred valid bits, capture-only routing, and Console-default-follow policy. `open_selected` now takes five arguments instead of eight; both callers populate the options object. No behavior or feature changes were made. Lead review confirmed exact path ownership and both plan trailers.
+- Worker and lane `rustfmt --edition 2024 --check modules/audio/src/platform/windows.rs` and `git diff --check` passed. Cargo tests/build/Clippy were not run in the lightweight worktrees.
+- The coordinator reported main commit `f9ce0a86` passed 49 Windows-target audio tests with one hardware test ignored; strict Clippy found only the original `clippy::too_many_arguments` on `open_selected`. Coordinator must rerun tests and strict Clippy after landing this correction. No Windows audio hardware qualification was run.
+
+## Previous bounded slice: follow Windows Console default
+
+- Lane code candidate: `c694ce65e97b378d57be7ff9272f7387a1db797c` (`fix(audio): follow the Windows Console default`); isolated worker source commit: `6b8309d271b710964516c5eff990b5906f4d07e0`; worker base: `bff3338ab61906f89b4e8d97afbe510dee7db2a0`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`. Final lane SHA after the handoff update is recorded by the handoff commit and outbox `015-audio-console-default-runtime.json`.
+- Stable ID touched: `global:audio_sink`. It remains pending; `global:audio_sink_capture_only` and `global:virtual_sink` also remain pending.
+- Verified worker session `01a0d5cf-9972-7e21-b4b0-6e50485f0d7e` (`gpt-6-luna`/`xhigh`; parent thread `01a0d516-8713-7b83-87f1-d35c0828ae10`) worked in isolated worktree `D:/sources/worktrees/amaterasu-audio-default-follow-xhigh`, branch `codex/luna04-audio-default-follow-xhigh`. The worker confirmed the worktree was clean at the lane base before edits.
+- Changed paths: `modules/audio/README.md`, `modules/audio/src/platform/mod.rs`, `modules/audio/src/platform/windows.rs`, and `modules/audio/src/worker.rs`. The worker commit was reviewed and cherry-picked into the lane; it contains the required plan trailers.
+- With no explicit or automatic virtual sink, empty and `default` regular endpoint selectors now initially resolve to the Windows Console render endpoint and follow Console endpoint changes. The audio worker checks every 100 ms, immediately attempts capture reacquisition when the endpoint changes or the query fails, and uses the existing cancellable five-second delay only after a failed reopen. These captures do not change Windows default roles. Explicit endpoint IDs and explicit/automatic virtual sink selections remain pinned. Format validation, packet sequence/timestamp continuity, and first-recovered-packet discontinuity behavior remain in place.
+- The `amaterasu.audio/1` payload shape and `AudioCapture` API are unchanged. Endpoint reporting remains the initially selected endpoint snapshot so existing stream-session shared-lease identity remains stable; lease metadata is not updated after a followed default change. This limitation is documented in the audio README.
+- Cross-lane contract proposal was sent in outbox `014-audio-default-endpoint-contract.json` to the coordinator and L02/L05/L06 before implementation. The coordinator approved these selector semantics in inbox `coordinator-audio-default-endpoint-decision.json` and requested each consumer lane acknowledge or identify a concrete conflict. No foreign-owned paths or shared schemas were edited; record the pending L02/L05/L06 acknowledgements before changing their consumer paths.
+- Added selector-policy and fake-worker tests for default aliases, virtual-selection exclusion, changed-endpoint reacquisition, packet-clock continuity, discontinuity, and explicit endpoint pinning. Tests/build/Clippy were not run in either lightweight worktree. `rustfmt --edition 2024 --check modules/audio/src/platform/mod.rs modules/audio/src/platform/windows.rs modules/audio/src/worker.rs` and `git diff --check` passed in the worker and lane.
+- Windows device-change/hardware qualification was not run. The implementation uses periodic COM default-endpoint queries; default switching on a real Windows render device remains unqualified. Non-Windows audio capture remains unsupported. Persistence/default migration, scoped client/application resolution, management edit authority, and full audio streaming parity remain incomplete; do not close any stable ID.
+
+## Previous bounded slice: virtual sink policy Clippy correction
+
+- Original lane code candidate: `1d8bb712fb2e538d29a5ac5ee55d739caffa84a4` (`fix(audio): normalize virtual sink capture policy`); worker source commit: `9309259000e87a2cbc88703179abf75bf8310e42`. The coordinator landed it on main as `3914de70f487ec035fefcf46c5f5745655348dd6`.
+- Clippy correction lane commit: `83ace03562570ffb18633c864b5227aa09f6c026` (`refactor(audio): fold virtual sink check into open match`); worker source commit: `7c5cb8f717062d88832d92ae1758a3f2a2a27e8b`; correction base: `e527a5e3cb95da5ed45d1e94e3fe722ea0950665`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable IDs in scope: `global:audio_sink_capture_only` and `global:virtual_sink`. Both remain pending full parity review.
+- The verified worker session `01a0d596-d04d-7801-b897-d9e289125eb8` (`gpt-6-luna`/`xhigh`) worked in isolated worktree `D:/sources/worktrees/amaterasu-audio-policy-next-xhigh`, branch `codex/luna04-audio-policy-next-xhigh`. It owned only `modules/audio/src/lib.rs` and new `modules/audio/src/open_policy.rs`.
+- The correction worker session `01a0d516-8713-7b83-87f1-d35c0828ae10` / thread `01a0d5b0-2eee-7822-a1b2-290f19c48097` was independently verified in `state_5.sqlite` as `gpt-6-luna`/`xhigh` before edit authorization. Its isolated worktree was `D:/sources/worktrees/amaterasu-open-policy-clippy-xhigh`, branch `codex/luna04-open-policy-clippy-xhigh`; it owned only `modules/audio/src/open_policy.rs`.
+- The public audio request ingress now clears `capture_sink_without_routing` when an explicit virtual sink selector is present, including the empty selector used for the default Steam virtual endpoint. It preserves every other operation field and leaves non-Open operations unchanged. This makes the direct `amaterasu.audio/1` service path comply with the pinned rule that capture-only routing applies only without a configured virtual sink.
+- The focused Clippy fix matches `virtual_sink: Some(_)` directly in the `Operation::Open` pattern, replacing the nested `is_some()` branch. `Some("")` remains a present selector and still clears capture-only; `None` retains its capture-only value; non-Open operations remain unchanged. Lead review confirmed the worker commit changes only the authorized path and contains both required plan trailers.
+- Inspection found the regular NVHTTP-to-stream-session path already sets capture-only false when a virtual selector is configured and rejects an invalid virtual-sink/capture-only combination before calling audio. This change therefore covers direct audio service requests; it does not alter normal route construction or add configuration persistence/resolution.
+- Coordinator validation of main commit `3914de70f487ec035fefcf46c5f5745655348dd6` passed Windows-target tests (`46 passed, 0 failed, 1 ignored live-endpoint test`) and reported strict Clippy's only finding as `clippy::collapsible_if` in `open_policy.rs:4`. In the lightweight lane, `rustfmt --edition 2024 --check modules/audio/src/open_policy.rs` and `git diff --check e527a5e3cb95da5ed45d1e94e3fe722ea0950665 HEAD` passed after the correction. Cargo tests, build, and Clippy were not run here; coordinator rerun is pending.
+- The four policy tests added with the original candidate cover nonempty and empty virtual selectors, preserving capture-only with no selector, and preserving non-Open operations. They were not rerun in this lane. No Windows endpoint, virtual audio driver, or hardware qualification was performed. Recovery paths and other lanes were not modified; no main edit or direct-to-main cherry-pick was performed by this lane.
+
+## Previous bounded slice: recovery Clippy correction
+
+- Lane code candidate: `ecf2a15c7782deb15b29effd6e39ad3149156a06` (`fix(audio): group capture recovery expectations`); worker source commit: `18e6da37cf2ac7739795913ee67cba3373d88c63`.
+- Base SHA: `f23da668410c8ca1dce7d9fb38b1415dc0cfeb37`; branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Coordinator validation of the landed recovery source passed `cargo fmt --check --package amaterasu-audio` and Windows-target tests (`42 passed, 0 failed, 1 ignored`). Strict Clippy failed only for `clippy::too_many_arguments` on `run_capture_loop` at `worker.rs:230`; the coordinator requested a focused correction before the next parity slice.
+- The verified XHigh worker session `01a0d596-d04d-7801-b897-d9e289125eb8` (`gpt-6-luna`/`xhigh`) changed only `modules/audio/src/worker.rs`. `RecoveryPolicy` groups the expected endpoint, expected PCM format, and retry delay; the worker entry and three unit-test call sites were updated without changing recovery behavior.
+- Lead review and cherry-pick completed. `rustfmt --edition 2024 --check modules/audio/src/worker.rs` and `git diff --check f23da668410c8ca1dce7d9fb38b1415dc0cfeb37 HEAD` passed in the lightweight lane. Cargo tests/build/Clippy were not run here; the coordinator must rerun them on main.
+- The Windows endpoint-dependent test remains ignored without a controlled endpoint. Device loss/re-enumeration and route lease release/reacquisition still need hardware qualification. No main edits or direct-to-main cherry-pick were performed by this lane.
+
+## Previous bounded slice: Windows capture recovery
 
 - Lane candidate: `0c9e1fb9be6759827693ed93a11c6e678a479cfd` (`fix(audio): recover Windows capture after device loss`).
 - Worker source commit: `f6c4c8dd633c9d5924415e08dceaea52016c012e`; lane base: `87caa50f886965173a3cba09eedd5746a6daedc7`.
@@ -17,7 +76,7 @@ This slice does not complete `global:audio_sink` or `global:virtual_sink`. Opus 
 
 The coordinator owns direct lane-commit cherry-picks into `main`; no integration branch is used. No main cherry-pick was performed in this lane.
 
-## Previous bounded slice: DS4 lease snapshot correction
+## Earlier bounded slice: DS4 lease snapshot correction
 
 - Candidate source commit: `431acd70a632f6960b22be18a915cc49107c215a` (cherry-picked from worker candidate `bd03e85c2b26fb62dbe08e73a9a2c813e28092cb`).
 - Follow-up test expectation commit: `2f8775d230628f272c8290f802f6e193ab2b7de7` updates the v9 absent-document bootstrap default assertion discovered by the full package suite.
@@ -130,7 +189,7 @@ The lane-start coverage snapshot reported all 23 IDs pending. This candidate doe
 
 ## Next bounded slice
 
-While cross-lane consumers integrate, continue independent input settings work on lane-owned paths. For audio, continue parity for `global:audio_sink`, `global:virtual_sink`, `global:audio_sink_capture_only`, and `global:stream_audio`: review product defaults/persistence, management and scoped caller resolution, and qualify Windows routing and recovery on device-removal/re-enumeration hardware. Leave these IDs pending until the coordinator has validated the full behavior and required platform evidence.
+Record acknowledgements to the coordinator's default-endpoint decision as they arrive, without editing L02/L05/L06 paths. Then inspect the remaining runtime gaps for `global:audio_sink_capture_only` or `global:virtual_sink` and choose a bounded audio-owned change that respects the current L02 persistence and launch contract. Persistence, scoped resolution, management edit authority, full audio streaming behavior, and Windows device qualification remain open; keep all three audio IDs pending until the coordinator reviews full parity and platform evidence.
 
 ## Earlier recovery attempt (stopped before code edits)
 
