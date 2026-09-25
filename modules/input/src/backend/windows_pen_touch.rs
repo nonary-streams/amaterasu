@@ -17,8 +17,8 @@ use windows_sys::Win32::UI::Input::Pointer::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_BARREL, PEN_FLAG_ERASER, PEN_FLAG_NONE, PEN_MASK_NONE,
     PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_NONE,
-    TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    TOUCH_MASK_CONTACTAREA, TOUCH_MASK_NONE, TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE,
 };
 
 const MAX_PEN_CONTACTS: usize = 1;
@@ -186,6 +186,8 @@ impl WindowsPenTouch {
             rotation_degrees: *rotation_degrees,
             pen_tool: *pen_tool,
             pen_buttons: *pen_buttons,
+            effective_pen_tool: None,
+            effective_pen_buttons: None,
             tilt: *tilt,
         };
         let frame = {
@@ -194,6 +196,16 @@ impl WindowsPenTouch {
                 .as_mut()
                 .expect("pointer device state was created above");
             let previous = state.contacts.get(pointer_id).copied();
+            let mut contact = contact;
+            contact.effective_pen_tool = match contact.pen_tool {
+                Some(PenTool::Pen | PenTool::Eraser) => contact.pen_tool,
+                Some(PenTool::Unknown) | None => {
+                    previous.and_then(|previous| previous.effective_pen_tool)
+                }
+            };
+            contact.effective_pen_buttons = contact
+                .pen_buttons
+                .or_else(|| previous.and_then(|previous| previous.effective_pen_buttons));
             state.contacts.insert(*pointer_id, contact);
             let frame = build_pointer_frame(
                 *device,
@@ -360,26 +372,48 @@ struct PointerContact {
     contact_area_major: Option<f32>,
     contact_area_minor: Option<f32>,
     rotation_degrees: Option<u16>,
+    // These fields preserve exactly what the latest event reported. None and
+    // Unknown mean the event did not update native tool/button state.
     pen_tool: Option<PenTool>,
     pen_buttons: Option<u8>,
+    // Windows frames are rebuilt from scratch, so carry forward effective
+    // state separately when the latest event omits a tool or button value.
+    effective_pen_tool: Option<PenTool>,
+    effective_pen_buttons: Option<u8>,
     tilt: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VirtualDesktop {
+    left: i32,
+    top: i32,
     width: u32,
     height: u32,
 }
 
 impl VirtualDesktop {
-    fn new(width: i32, height: i32) -> InputResult<Self> {
+    fn new(left: i32, top: i32, width: i32, height: i32) -> InputResult<Self> {
         if width <= 0 || height <= 0 {
             return Err(InputError::new(
                 "desktop_unavailable",
                 "Windows reported an invalid virtual desktop size",
             ));
         }
+        left.checked_add(width).ok_or_else(|| {
+            InputError::new(
+                "desktop_unavailable",
+                "Windows virtual desktop horizontal bounds exceed pointer API limits",
+            )
+        })?;
+        top.checked_add(height).ok_or_else(|| {
+            InputError::new(
+                "desktop_unavailable",
+                "Windows virtual desktop vertical bounds exceed pointer API limits",
+            )
+        })?;
         Ok(Self {
+            left,
+            top,
             width: width as u32,
             height: height as u32,
         })
@@ -387,10 +421,21 @@ impl VirtualDesktop {
 
     fn map(&self, x: u16, y: u16) -> InputResult<(i32, i32)> {
         Ok((
-            map_normalized_coordinate(x, self.width)?,
-            map_normalized_coordinate(y, self.height)?,
+            self.left
+                .checked_add(map_normalized_coordinate(x, self.width)?)
+                .ok_or_else(coordinate_overflow_error)?,
+            self.top
+                .checked_add(map_normalized_coordinate(y, self.height)?)
+                .ok_or_else(coordinate_overflow_error)?,
         ))
     }
+}
+
+fn coordinate_overflow_error() -> InputError {
+    InputError::new(
+        "desktop_unavailable",
+        "Windows virtual desktop coordinate exceeds pointer API limits",
+    )
 }
 
 fn map_normalized_coordinate(value: u16, extent: u32) -> InputResult<i32> {
@@ -467,10 +512,13 @@ fn pointer_info_for_contact(
             pen_info.penFlags = PEN_FLAG_NONE;
             pen_info.penMask = PEN_MASK_NONE;
 
-            if contact.pen_tool == Some(PenTool::Eraser) {
+            if contact.effective_pen_tool == Some(PenTool::Eraser) {
                 pen_info.penFlags |= PEN_FLAG_ERASER;
             }
-            if contact.pen_buttons.is_some_and(|buttons| buttons != 0) {
+            if contact
+                .effective_pen_buttons
+                .is_some_and(|buttons| buttons != 0)
+            {
                 // Windows synthetic pens expose one barrel button. Preserve
                 // the client mask in state and map any pressed button to it.
                 pen_info.penFlags |= PEN_FLAG_BARREL;
@@ -569,19 +617,23 @@ fn contact_rectangle(
     let height = absolute_trig_component(major_angle.sin()) * major_pixels
         + absolute_trig_component(minor_angle.sin()) * minor_pixels;
 
+    let desktop_left = f64::from(virtual_desktop.left);
+    let desktop_top = f64::from(virtual_desktop.top);
+    let desktop_right = desktop_left + f64::from(virtual_desktop.width);
+    let desktop_bottom = desktop_top + f64::from(virtual_desktop.height);
     RECT {
         left: ((f64::from(center_x) - width / 2.0)
             .floor()
-            .clamp(0.0, f64::from(virtual_desktop.width))) as i32,
+            .clamp(desktop_left, desktop_right)) as i32,
         top: ((f64::from(center_y) - height / 2.0)
             .floor()
-            .clamp(0.0, f64::from(virtual_desktop.height))) as i32,
+            .clamp(desktop_top, desktop_bottom)) as i32,
         right: ((f64::from(center_x) + width / 2.0)
             .ceil()
-            .clamp(0.0, f64::from(virtual_desktop.width))) as i32,
+            .clamp(desktop_left, desktop_right)) as i32,
         bottom: ((f64::from(center_y) + height / 2.0)
             .ceil()
-            .clamp(0.0, f64::from(virtual_desktop.height))) as i32,
+            .clamp(desktop_top, desktop_bottom)) as i32,
     }
 }
 
@@ -664,11 +716,13 @@ impl SyntheticPointerApi for NativeSyntheticPointerApi {
     }
 
     fn virtual_desktop(&self) -> InputResult<VirtualDesktop> {
-        // InjectSyntheticPointerInput expects coordinates relative to the
-        // virtual desktop's top-left, so only its full width and height apply.
+        // Pointer positions and contact rectangles include the virtual screen
+        // origin, which can be negative when a monitor sits left/above primary.
+        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
         let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-        VirtualDesktop::new(width, height)
+        VirtualDesktop::new(left, top, width, height)
     }
 
     fn create_device(&mut self, device: PenTouchDevice) -> InputResult<SyntheticPointerHandle> {
@@ -818,10 +872,7 @@ mod tests {
     fn backend_with_support(supported: bool) -> (WindowsPenTouch, Rc<RefCell<FakeState>>) {
         let state = Rc::new(RefCell::new(FakeState {
             supported,
-            desktop: Some(VirtualDesktop {
-                width: 1920,
-                height: 1080,
-            }),
+            desktop: Some(VirtualDesktop::new(0, 0, 1920, 1080).unwrap()),
             ..FakeState::default()
         }));
         let api = FakePointerApi {
@@ -1001,6 +1052,8 @@ mod tests {
         assert_eq!(contact.pen_tool, Some(PenTool::Unknown));
         assert_eq!(contact.rotation_degrees, None);
         assert_eq!(contact.pen_buttons, None);
+        assert_eq!(contact.effective_pen_tool, None);
+        assert_eq!(contact.effective_pen_buttons, None);
         assert_eq!(contact.tilt, Some(40));
 
         let pen = pen_info(&state.borrow().frames[0].1[0]);
@@ -1009,6 +1062,110 @@ mod tests {
             pen.penMask & (PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y),
             0
         );
+    }
+
+    #[test]
+    fn missing_and_unknown_pen_metadata_preserve_native_tool_and_button_state() {
+        let (mut backend, state) = backend();
+        let mut down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            100,
+            200,
+        );
+        if let Event::PenTouch {
+            pen_tool,
+            pen_buttons,
+            ..
+        } = &mut down
+        {
+            *pen_tool = Some(PenTool::Eraser);
+            *pen_buttons = Some(1);
+        }
+        backend.inject(&down).unwrap();
+
+        let mut unknown_metadata = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            110,
+            210,
+        );
+        if let Event::PenTouch {
+            pen_tool,
+            pen_buttons,
+            ..
+        } = &mut unknown_metadata
+        {
+            *pen_tool = Some(PenTool::Unknown);
+            *pen_buttons = None;
+        }
+        backend.inject(&unknown_metadata).unwrap();
+
+        let mut absent_metadata = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            120,
+            220,
+        );
+        if let Event::PenTouch {
+            pen_tool,
+            pen_buttons,
+            ..
+        } = &mut absent_metadata
+        {
+            *pen_tool = None;
+            *pen_buttons = None;
+        }
+        backend.inject(&absent_metadata).unwrap();
+
+        let mut explicit_release = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            130,
+            230,
+        );
+        if let Event::PenTouch {
+            pen_tool,
+            pen_buttons,
+            ..
+        } = &mut explicit_release
+        {
+            *pen_tool = Some(PenTool::Pen);
+            *pen_buttons = Some(0);
+        }
+        backend.inject(&explicit_release).unwrap();
+
+        let frames = &state.borrow().frames;
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            pen_info(&frames[0].1[0]).penFlags,
+            PEN_FLAG_ERASER | PEN_FLAG_BARREL
+        );
+        assert_eq!(
+            pen_info(&frames[1].1[0]).penFlags,
+            PEN_FLAG_ERASER | PEN_FLAG_BARREL
+        );
+        assert_eq!(
+            pen_info(&frames[2].1[0]).penFlags,
+            PEN_FLAG_ERASER | PEN_FLAG_BARREL
+        );
+        assert_eq!(pen_info(&frames[3].1[0]).penFlags, PEN_FLAG_NONE);
+
+        let contact = backend
+            .pen
+            .as_ref()
+            .unwrap()
+            .contacts
+            .get(&PEN_POINTER_ID)
+            .unwrap();
+        assert_eq!(contact.pen_tool, Some(PenTool::Pen));
+        assert_eq!(contact.pen_buttons, Some(0));
+        assert_eq!(contact.effective_pen_tool, Some(PenTool::Pen));
+        assert_eq!(contact.effective_pen_buttons, Some(0));
     }
 
     #[test]
@@ -1556,15 +1713,46 @@ mod tests {
     }
 
     #[test]
-    fn normalized_coordinates_use_full_virtual_desktop_extents_without_origin_offset() {
-        let virtual_desktop = VirtualDesktop::new(3840, 2160).unwrap();
-        assert_eq!(virtual_desktop.map(0, 0).unwrap(), (0, 0));
+    fn normalized_coordinates_include_negative_virtual_desktop_origin() {
+        let virtual_desktop = VirtualDesktop::new(-1920, -1080, 3840, 2160).unwrap();
+        assert_eq!(virtual_desktop.map(0, 0).unwrap(), (-1920, -1080));
         assert_eq!(
             virtual_desktop.map(u16::MAX, u16::MAX).unwrap(),
-            (3839, 2159)
+            (1919, 1079)
         );
-        assert_eq!(virtual_desktop.map(32768, 32768).unwrap(), (1920, 1080));
-        assert!(VirtualDesktop::new(0, 1080).is_err());
+        assert_eq!(virtual_desktop.map(32768, 32768).unwrap(), (0, 0));
+        assert!(VirtualDesktop::new(0, 0, 0, 1080).is_err());
+        assert!(VirtualDesktop::new(i32::MAX, 0, 1, 1).is_err());
         assert!(map_normalized_coordinate(0, 0).is_err());
+    }
+
+    #[test]
+    fn touch_contact_bounds_clip_to_negative_virtual_desktop_origin() {
+        let (mut backend, state) = backend();
+        let virtual_desktop = VirtualDesktop::new(-1920, -1080, 3840, 2160).unwrap();
+        state.borrow_mut().desktop = Some(virtual_desktop);
+
+        let mut down = event(5, PenTouchDevice::Touch, PenTouchPhase::Down, 0, 0);
+        if let Event::PenTouch {
+            contact_area_major,
+            contact_area_minor,
+            ..
+        } = &mut down
+        {
+            *contact_area_major = Some(0.001);
+            *contact_area_minor = Some(0.0005);
+        }
+        backend.inject(&down).unwrap();
+
+        let frames = &state.borrow().frames;
+        let touch = touch_info(&frames[0].1[0]);
+        assert_eq!(touch.pointerInfo.ptPixelLocation.x, -1920);
+        assert_eq!(touch.pointerInfo.ptPixelLocation.y, -1080);
+        assert_eq!(touch.rcContact.left, -1920);
+        assert_eq!(touch.rcContact.top, -1080);
+        assert!(touch.rcContact.right > touch.rcContact.left);
+        assert!(touch.rcContact.bottom > touch.rcContact.top);
+        assert!(touch.rcContact.right <= 1920);
+        assert!(touch.rcContact.bottom <= 1080);
     }
 }
