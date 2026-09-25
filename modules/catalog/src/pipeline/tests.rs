@@ -1267,6 +1267,80 @@ fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
 }
 
 #[test]
+fn list_and_search_replies_advertise_override_capabilities_without_changing_exports() {
+    let mut backend = Backend::default();
+    let mut ordinary_pipeline = Pipeline::default();
+    let created = backend.run(
+        &mut ordinary_pipeline,
+        json!({
+            "action":"create",
+            "expected_revision":0,
+            "entry":{
+                "name":"Capability game",
+                "launch":{"kind":"application","path":"/Applications/Game.app"}
+            }
+        }),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+
+    let expected_capabilities = if cfg!(windows) {
+        json!({
+            "frame_limiter_provider":["auto","rtss","nvidia-control-panel","none"],
+            "rtss_frame_limit_type":["async","front edge sync","back edge sync","nvidia reflex"]
+        })
+    } else if cfg!(target_os = "linux") {
+        json!({
+            "frame_limiter_provider":["auto","mangohud","proton","mangohud-proton","none"],
+            "rtss_frame_limit_type":[]
+        })
+    } else {
+        json!({
+            "frame_limiter_provider":["auto"],
+            "rtss_frame_limit_type":[]
+        })
+    };
+
+    let list = backend.run(&mut ordinary_pipeline, json!({"action":"list"}));
+    assert_eq!(list["config_override_capabilities"], expected_capabilities);
+    assert_eq!(list["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(list["entries"][0]["id"], created["id"]);
+
+    let search = backend.run(
+        &mut ordinary_pipeline,
+        json!({"action":"search","query":"capability"}),
+    );
+    assert_eq!(
+        search["config_override_capabilities"],
+        expected_capabilities
+    );
+    assert_eq!(search["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(search["entries"][0]["id"], created["id"]);
+
+    let mut export_pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("exporter".into(), "caller.one".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let export = backend.run_for(
+        &mut export_pipeline,
+        json!({"action":"export_list"}),
+        "exporter",
+        "unrelated",
+        "caller.one",
+    );
+    assert_eq!(
+        export,
+        json!({
+            "ok":true,
+            "revision":1,
+            "entries":[{"id":created["id"],"name":"Capability game"}],
+            "next_cursor":null
+        })
+    );
+}
+
+#[test]
 fn steam_id_export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
     let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),

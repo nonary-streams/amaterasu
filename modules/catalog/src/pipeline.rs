@@ -2523,7 +2523,13 @@ impl Scan {
             ScanProjection::SteamIds => {
                 json!({"ok":true,"revision":self.revision,"steam_ids":self.entries,"next_cursor":cursor})
             }
-            ScanProjection::List | ScanProjection::ExportList => {
+            ScanProjection::List => {
+                let mut reply = json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor});
+                reply["config_override_capabilities"] =
+                    crate::protocol::config_override_capabilities();
+                reply
+            }
+            ScanProjection::ExportList => {
                 json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor})
             }
         }
