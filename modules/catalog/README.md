@@ -64,6 +64,14 @@ only: L02 effective application-over-paired-client resolution and runtime
 projection remain pending. L03 outbox item 0071 records that there is no current
 video/encode field to project this setting to.
 
+The optional `native_pen_touch` strict boolean corresponds to the stable setting
+ID `global:native_pen_touch`. Catalog stores only this sparse per-application
+override: absent or null means inherit, while explicit `true` and `false` remain
+distinct. Catalog does not resolve global or client settings and does not
+project this value into launch requests. Existing entries and version-1 provider
+markers may omit it, so no catalog document or provider-marker version bump or
+migration is required.
+
 ```json
 {"action":"create","expected_revision":0,"entry":{"name":"AV1 and 10-bit SDR preferences","config_overrides":{"amd_av1_latency_mode":"power_saving","nvenc_spatial_aq":false,"prefer_10bit_sdr":true},"launch":{"kind":"application","path":"/games/example"}}}
 ```

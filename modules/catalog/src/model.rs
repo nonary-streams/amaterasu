@@ -137,6 +137,8 @@ pub struct ConfigOverrides {
     pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_pen_touch: Option<bool>,
 }
 
 fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -288,6 +290,7 @@ impl ConfigOverrides {
             && self.frame_limiter_auto_virtual_framegen.is_none()
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
+            && self.native_pen_touch.is_none()
     }
 }
 

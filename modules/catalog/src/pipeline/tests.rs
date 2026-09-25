@@ -2887,6 +2887,66 @@ fn dd_hdr_request_override_persists_across_catalog_reload() {
 }
 
 #[test]
+fn native_pen_touch_override_is_sparse_strict_and_round_trips_through_catalog() {
+    let cases = [
+        ("omitted", None, None),
+        ("null", Some(json!({"native_pen_touch":null})), None),
+        (
+            "false",
+            Some(json!({"native_pen_touch":false})),
+            Some(false),
+        ),
+        ("true", Some(json!({"native_pen_touch":true})), Some(true)),
+    ];
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::default();
+    let mut revision = 0;
+
+    for (name, config_overrides, expected) in cases {
+        let mut catalog_entry = entry(name);
+        if let Some(config_overrides) = config_overrides {
+            catalog_entry["config_overrides"] = config_overrides;
+        }
+
+        let created = backend.run(
+            &mut pipeline,
+            json!({
+                "action":"create",
+                "expected_revision":revision,
+                "entry":catalog_entry
+            }),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        revision = created["revision"].as_u64().unwrap();
+
+        let id = created["id"].as_str().unwrap();
+        let stored_entry = &backend.entries[id];
+        let reloaded = backend.run(&mut Pipeline::default(), json!({"action":"get","id":id}));
+        assert_eq!(reloaded["ok"], true, "{reloaded}");
+
+        if let Some(expected) = expected {
+            assert_eq!(
+                stored_entry["config_overrides"]["native_pen_touch"],
+                expected
+            );
+            assert_eq!(
+                reloaded["entry"]["config_overrides"]["native_pen_touch"],
+                expected
+            );
+        } else {
+            assert!(stored_entry.get("config_overrides").is_none());
+            assert!(reloaded["entry"].get("config_overrides").is_none());
+        }
+    }
+
+    for invalid_value in [json!("false"), json!(0), json!({}), json!([])] {
+        let mut invalid_entry = entry("Invalid native pen touch override");
+        invalid_entry["config_overrides"] = json!({"native_pen_touch":invalid_value});
+        assert!(serde_json::from_value::<crate::model::Entry>(invalid_entry).is_err());
+    }
+}
+
+#[test]
 fn provider_snapshot_preserves_manual_config_overrides_across_later_refreshes() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();
