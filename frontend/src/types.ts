@@ -260,6 +260,7 @@ namespace Amaterasu {
       back_button_timeout: number;
       gamepad: string;
       controller: boolean;
+      native_pen_touch: boolean;
     };
   }
   export interface InputRuntimeStatus {

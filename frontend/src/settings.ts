@@ -93,6 +93,7 @@ namespace Amaterasu {
     gamepadProfile: string = "auto",
     selectableGamepadProfiles: readonly string[] = ["auto"],
     controllerEnabled: boolean = true,
+    nativePenTouch: boolean = true,
   ): InputPolicySettings["values"] {
     if (
       typeof keyboard !== "boolean" ||
@@ -111,7 +112,8 @@ namespace Amaterasu {
       typeof gamepadProfile !== "string" ||
       !Array.isArray(selectableGamepadProfiles) ||
       !selectableGamepadProfiles.includes(gamepadProfile) ||
-      typeof controllerEnabled !== "boolean"
+      typeof controllerEnabled !== "boolean" ||
+      typeof nativePenTouch !== "boolean"
     )
       throw new Error("Input policy values, key repeat settings, or Back timeout are invalid.");
     return {
@@ -125,6 +127,7 @@ namespace Amaterasu {
       back_button_timeout: backButtonTimeout,
       gamepad: gamepadProfile,
       controller: controllerEnabled,
+      native_pen_touch: nativePenTouch,
     };
   }
 
@@ -1679,6 +1682,8 @@ namespace Amaterasu {
         mouse.checked = settings.values.mouse;
         const controller = input("input_controller", "", "checkbox");
         controller.checked = settings.values.controller;
+        const nativePenTouch = input("input_native_pen_touch", "", "checkbox");
+        nativePenTouch.checked = settings.values.native_pen_touch;
         const highResolutionScrolling = input(
           "input_high_resolution_scrolling",
           "",
@@ -1772,6 +1777,11 @@ namespace Amaterasu {
             "Disabling controller input suppresses controller activity and removes owned virtual gamepad slots. Keyboard and mouse input continue.",
           ),
           field(
+            "Native pen and touch policy",
+            nativePenTouch,
+            "Windows-only global preference. Native pen/touch event transport and platform support are not implemented; saving this value does not activate pen or touch events.",
+          ),
+          field(
             "High-resolution scrolling",
             highResolutionScrolling,
             "Preserves raw wheel units for supported streaming clients. Disable to convert scroll input to legacy 120-unit detents.",
@@ -1829,6 +1839,7 @@ namespace Amaterasu {
                     gamepadProfile.value,
                     gamepadProfileChoices.map((choice) => choice.value),
                     controller.checked,
+                    nativePenTouch.checked,
                   ),
                   expected_revision: settings.revision,
                 },

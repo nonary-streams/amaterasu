@@ -59,6 +59,7 @@ test("input policy editor validates key repeat settings and reports cleanup hone
     back_button_timeout: -1,
     gamepad: "auto",
     controller: true,
+    native_pen_touch: true,
   });
   assert.deepEqual(
     ordinary(parsePolicy(true, true, true, true, false, 2147483647, 31.25, 2147483647)),
@@ -73,8 +74,16 @@ test("input policy editor validates key repeat settings and reports cleanup hone
       back_button_timeout: 2147483647,
       gamepad: "auto",
       controller: true,
+      native_pen_touch: true,
     },
   );
+  const parseNativePenTouch = (nativePenTouch) =>
+    parsePolicy(true, true, true, true, false, 500, 24.9, -1, "auto", ["auto"], true, nativePenTouch);
+  assert.equal(ordinary(parseNativePenTouch(true)).native_pen_touch, true);
+  assert.equal(ordinary(parseNativePenTouch(false)).native_pen_touch, false);
+  for (const invalidNativePenTouch of [null, 0, 1, "false", [], {}]) {
+    assert.throws(() => parseNativePenTouch(invalidNativePenTouch));
+  }
   assert.equal(
     ordinary(parsePolicy(true, true, true, true, false, 0, 0, -2147483648))
       .back_button_timeout,

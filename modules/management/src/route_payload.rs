@@ -391,6 +391,7 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                     "back_button_timeout",
                     "gamepad",
                     "controller",
+                    "native_pen_touch",
                 ],
             )?;
             if object.get("keyboard").and_then(Value::as_bool).is_none()
@@ -424,6 +425,9 @@ fn input(action: &str, object: &Object) -> Result<(), &'static str> {
                 })
                 || object
                     .get("controller")
+                    .is_some_and(|value| value.as_bool().is_none())
+                || object
+                    .get("native_pen_touch")
                     .is_some_and(|value| value.as_bool().is_none())
                 || object
                     .get("expected_revision")
@@ -2306,6 +2310,8 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":true,"back_button_timeout":-2147483648,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"gamepad":"auto","expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":true,"controller":false,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"native_pen_touch":true,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":true,"native_pen_touch":false,"expected_revision":0}),
             #[cfg(windows)]
             serde_json::json!({"keyboard":true,"mouse":true,"gamepad":"ds4","expected_revision":0}),
             #[cfg(target_os = "linux")]
@@ -2337,6 +2343,11 @@ mod input_tests {
             serde_json::json!({"keyboard":true,"mouse":false,"gamepad":null,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"controller":null,"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"controller":"false","expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"native_pen_touch":null,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"native_pen_touch":0,"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"native_pen_touch":"false","expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"native_pen_touch":[],"expected_revision":0}),
+            serde_json::json!({"keyboard":true,"mouse":false,"native_pen_touch":{},"expected_revision":0}),
             serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"invented","expected_revision":0}),
             #[cfg(windows)]
             serde_json::json!({"keyboard":true,"mouse":false,"gamepad":"xone","expected_revision":0}),
