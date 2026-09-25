@@ -357,3 +357,19 @@ Continue only with an independent, version-approved network slice or an already-
 Finish the isolated UPnP lifecycle candidate and request L01 workspace/version
 coordination. Keep the AV1/audio projection work pending until its exact path
 reservation and the existing dirty launch changes can be integrated safely.
+
+## Coordinator v17 NVHTTP gate recheck (2026-09-25)
+
+- The stream-control gate record above is for main validation tip
+  `ca207e527ff39de638bd3f8a387ddcbc2cd278f3`. That commit predates the later
+  v17 persistence commit `7e16e7fe5aae39cb528f5fdb2732ddaae3b038c7`; its
+  163/163 NVHTTP test result does not validate the v17 product-settings code.
+- At current main tip `095a15e2`, the coordinator reran
+  `cargo test -p amaterasu-nvhttp`. Compilation still fails in
+  `modules/nvhttp/src/product_settings.rs:1794` because the flat settings JSON
+  exceeds the `serde_json::json!` macro recursion limit. No current NVHTTP test
+  or Clippy pass is claimed for the v17 candidate.
+- The v17 gate remains blocked pending a focused, committed correction in the
+  owning NVHTTP path and coordinator reruns of formatting, package tests, and
+  strict Clippy. Preserve the existing flat readback fields, revision behavior,
+  defaults, and omitted-versus-null update semantics during that correction.
