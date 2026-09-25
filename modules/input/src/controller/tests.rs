@@ -424,6 +424,79 @@ fn acquire_retry_distinguishes_zero_key_repeat_delay_from_unspecified() {
 }
 
 #[test]
+fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
+    let backend = FakeBackend::default();
+    let trace = backend.trace.clone();
+    let mut controller = Controller::new(backend, true);
+    controller.set_key_repeat_policy(500, 100.0);
+    let start = Instant::now();
+    let acquire = |frequency| Operation::Acquire {
+        operation_id: Some("key-repeat-frequency-cadence".into()),
+        ttl_ms: Some(5_000),
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click: None,
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: Some(100),
+        key_repeat_frequency: Some(frequency),
+    };
+
+    let acquired = controller.handle("owner", acquire(20.0), start, &mut || Ok(()));
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["key_repeat_frequency"], 20.0);
+    let token = acquired["lease"].as_str().unwrap();
+    assert_eq!(controller.effective_key_repeat_policy(), (100, 20.0));
+
+    let key_down_at = start + Duration::from_millis(10);
+    let key_down = controller.handle(
+        "owner",
+        Operation::Batch {
+            lease: token.into(),
+            events: vec![key(30, KeyState::Down)],
+        },
+        key_down_at,
+        &mut || Ok(()),
+    );
+    assert_eq!(key_down["ok"], true);
+    assert_eq!(trace.borrow().as_slice(), &[key(30, KeyState::Down)]);
+
+    controller.expire(key_down_at + Duration::from_millis(99));
+    assert_eq!(trace.borrow().len(), 1);
+    controller.expire(key_down_at + Duration::from_millis(100));
+    assert_eq!(
+        trace.borrow().as_slice(),
+        &[key(30, KeyState::Down), key(30, KeyState::Repeat)]
+    );
+
+    controller.expire(key_down_at + Duration::from_millis(149));
+    assert_eq!(trace.borrow().len(), 2);
+    controller.expire(key_down_at + Duration::from_millis(150));
+    assert_eq!(
+        trace.borrow().as_slice(),
+        &[
+            key(30, KeyState::Down),
+            key(30, KeyState::Repeat),
+            key(30, KeyState::Repeat),
+        ]
+    );
+
+    let retry_at = key_down_at + Duration::from_millis(150);
+    let retry = controller.handle("owner", acquire(20.0), retry_at, &mut || Ok(()));
+    assert_eq!(retry["ok"], true);
+    assert_eq!(retry["lease"], token);
+
+    let changed_retry = controller.handle("owner", acquire(40.0), retry_at, &mut || Ok(()));
+    assert_eq!(changed_retry["error"]["code"], "operation_conflict");
+    assert_eq!(controller.lease.as_ref().unwrap().token, token);
+    assert_eq!(controller.effective_key_repeat_policy(), (100, 20.0));
+}
+
+#[test]
 fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
