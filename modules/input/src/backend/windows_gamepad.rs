@@ -402,6 +402,25 @@ impl GamepadDevice for VigemGamepad {
         self.ds4_back_as_touchpad_click = enabled;
     }
 
+    fn recover_after_update_failure(&mut self, _error: InputError) -> InputResult<()> {
+        // Removal is the boundary after which a possibly applied report can no
+        // longer reach applications. Retain the old target if detach fails so
+        // lease cleanup can retry it; never allocate a replacement first.
+        self.release()?;
+        let replacement = match self.profile {
+            GamepadProfile::Ds4 => self.connection.create_ds4_target()?,
+            GamepadProfile::Auto | GamepadProfile::X360 => self.connection.create_x360_target()?,
+            _ => {
+                return Err(InputError::new(
+                    "controller_unavailable",
+                    "requested gamepad profile is not supported by the ViGEm backend",
+                ));
+            }
+        };
+        self.target = Some(replacement);
+        Ok(())
+    }
+
     fn release(&mut self) -> InputResult<()> {
         if let Some(target) = self.target {
             // Detach even if a neutral report is rejected. Successful removal

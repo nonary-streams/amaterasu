@@ -213,6 +213,12 @@ pub(crate) fn gamepad_key_codes() -> impl Iterator<Item = u16> {
 pub(crate) trait GamepadDevice {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()>;
 
+    /// A failed native write may have partially applied. Implementations that
+    /// can detach the old device may replace it before the state is sent again.
+    fn recover_after_update_failure(&mut self, error: InputError) -> InputResult<()> {
+        Err(error)
+    }
+
     fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) {}
 
     fn release(&mut self) -> InputResult<()> {
@@ -290,7 +296,11 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
 
     fn write_effective_state(&mut self, now: Instant) -> InputResult<()> {
         self.dirty = true;
-        self.device.update(self.effective_state(now))?;
+        let state = self.effective_state(now);
+        if let Err(error) = self.device.update(state) {
+            self.device.recover_after_update_failure(error)?;
+            self.device.update(state)?;
+        }
         self.dirty = false;
         if self.guide_pulse_pending {
             self.guide_pulse_pending = false;
@@ -1276,5 +1286,204 @@ mod tests {
             *updates.borrow().last().unwrap(),
             GUIDE_BUTTON_MASK
         ));
+    }
+
+    #[test]
+    fn failed_target_update_detaches_before_replacement_and_replays_current_state() {
+        struct RecoverableDevice {
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            fail_update: Rc<std::cell::Cell<bool>>,
+        }
+        impl GamepadDevice for RecoverableDevice {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                assert_eq!(state.buttons, BACK_BUTTON_MASK);
+                self.trace.borrow_mut().push("update");
+                if self.fail_update.replace(false) {
+                    Err(InputError::new("controller_unavailable", "stale target"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                self.trace.borrow_mut().extend(["detach", "allocate"]);
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                self.trace.borrow_mut().push("release");
+                Ok(())
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let fail_update = Rc::new(std::cell::Cell::new(true));
+        let mut slots = GamepadSlots::new();
+        slots
+            .apply(
+                0,
+                1,
+                ControllerSnapshot {
+                    buttons: BACK_BUTTON_MASK,
+                    ..ControllerSnapshot::default()
+                },
+                -1,
+                Instant::now(),
+                |_| {
+                    Ok(RecoverableDevice {
+                        trace: trace.clone(),
+                        fail_update: fail_update.clone(),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            &*trace.borrow(),
+            &["update", "detach", "allocate", "update"]
+        );
+        slots.stop().unwrap();
+        assert_eq!(trace.borrow().last(), Some(&"release"));
+        assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn failed_recovery_remains_owned_until_lease_release_succeeds() {
+        struct PendingDetach {
+            detach_fails: Rc<std::cell::Cell<bool>>,
+            replacements: Rc<std::cell::Cell<usize>>,
+        }
+        impl GamepadDevice for PendingDetach {
+            fn update(&mut self, _: ControllerSnapshot) -> InputResult<()> {
+                Err(InputError::new("controller_unavailable", "stale target"))
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                if self.detach_fails.get() {
+                    return Err(InputError::new("controller_unavailable", "detach failed"));
+                }
+                self.replacements.set(self.replacements.get() + 1);
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                if self.detach_fails.get() {
+                    Err(InputError::new("controller_unavailable", "detach failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let detach_fails = Rc::new(std::cell::Cell::new(true));
+        let replacements = Rc::new(std::cell::Cell::new(0));
+        let mut slots = GamepadSlots::new();
+        assert_eq!(
+            slots
+                .apply(
+                    0,
+                    1,
+                    ControllerSnapshot::default(),
+                    -1,
+                    Instant::now(),
+                    |_| {
+                        Ok(PendingDetach {
+                            detach_fails: detach_fails.clone(),
+                            replacements: replacements.clone(),
+                        })
+                    },
+                )
+                .unwrap_err()
+                .code,
+            "controller_unavailable"
+        );
+        assert_eq!(slots.stop().unwrap_err().code, "controller_unavailable");
+        assert!(!slots.is_empty());
+        assert_eq!(replacements.get(), 0);
+        detach_fails.set(false);
+        slots.stop().unwrap();
+        assert!(slots.is_empty());
+        assert_eq!(replacements.get(), 0);
+    }
+
+    #[test]
+    fn replacement_allocation_failure_recovers_on_tick_without_losing_state() {
+        struct ReplacingDevice {
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            attached: bool,
+            fail_update: bool,
+            fail_allocation: bool,
+        }
+        impl GamepadDevice for ReplacingDevice {
+            fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
+                assert_eq!(state.buttons, BACK_BUTTON_MASK);
+                self.trace.borrow_mut().push("update");
+                if !self.attached || std::mem::take(&mut self.fail_update) {
+                    Err(InputError::new("controller_unavailable", "stale target"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                if self.attached {
+                    self.trace.borrow_mut().push("detach");
+                    self.attached = false;
+                }
+                self.trace.borrow_mut().push("allocate");
+                if std::mem::take(&mut self.fail_allocation) {
+                    return Err(InputError::new(
+                        "controller_unavailable",
+                        "allocation failed",
+                    ));
+                }
+                self.attached = true;
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                self.trace.borrow_mut().push("release");
+                self.attached = false;
+                Ok(())
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut slots = GamepadSlots::new();
+        let start = Instant::now();
+        assert_eq!(
+            slots
+                .apply(
+                    0,
+                    1,
+                    ControllerSnapshot {
+                        buttons: BACK_BUTTON_MASK,
+                        ..ControllerSnapshot::default()
+                    },
+                    -1,
+                    start,
+                    |_| {
+                        Ok(ReplacingDevice {
+                            trace: trace.clone(),
+                            attached: true,
+                            fail_update: true,
+                            fail_allocation: true,
+                        })
+                    },
+                )
+                .unwrap_err()
+                .code,
+            "controller_unavailable"
+        );
+        assert_eq!(&*trace.borrow(), &["update", "detach", "allocate"]);
+        slots.advance(start + Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            &*trace.borrow(),
+            &[
+                "update", "detach", "allocate", "update", "allocate", "update"
+            ]
+        );
+        slots.stop().unwrap();
+        assert_eq!(trace.borrow().last(), Some(&"release"));
+        assert!(slots.is_empty());
     }
 }

@@ -170,6 +170,12 @@ has not been exercised on this Windows host, and
 Windows virtual-device delivery has not been qualified against an installed
 ViGEmBus driver, so platform-qualified controller parity remains pending.
 
+If an active ViGEm target rejects a report, input detaches that target before
+creating a replacement and submitting the current state. A failed detach keeps
+the old target owned for later cleanup; a failed replacement remains retryable
+on module ticks. This recovers a stale target within the existing client
+connection. Reconnecting a lost ViGEmBus client connection is not implemented.
+
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
 VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw
 Moonlight packets on Windows and Linux. The backend records the native key chosen
