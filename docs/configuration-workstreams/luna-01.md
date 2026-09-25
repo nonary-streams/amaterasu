@@ -300,3 +300,10 @@ Lane code commit `b36c9aa708f2fdf7e4023ccc9d6ef9a1d96815c0` landed on main as `9
 ### Coordinator handoff reconciliation
 
 Lane handoff commit `41f00213aeecc757463ff2cb4c22d9d175ebb63a` was integrated after the package candidate completed main validation. Its original pending-gate note predates code commit `45b48244`; the package gates above supersede that note. The handoff remains cumulative, and all assigned IDs stay pending.
+
+### Coordinator validation update: primary credentials migration inheritance (2026-09-25)
+
+- L01 worker source `bdadd0141b76f42494848e58ed1fa62b9819fb57` and lane code `3d165219a15bee47b35d20f4264a7895a847645e` landed directly on main as `19226495`. Omitted or empty `credentials_file` now inherits a configured `file_state`; an explicit non-empty path remains authoritative, and a missing configured primary does not fall through to stale default credentials.
+- Main validation found one old test still expected primary and auxiliary records to be ambiguous, contrary to the agreed primary-state precedence. Coordinator commit `bef498e3a6ee3231c4e06540f7d602a8ea304936` updates the fixture to assert primary selection and removes two needless returns reported by strict Clippy. Auxiliary files remain checked for unsupported API tokens.
+- `cargo fmt --check -p amaterasu-authentication -p amaterasu-package` passed. Authentication passed 48 tests; package passed 51 library tests and 4 CLI tests. Strict Clippy passed for both crates.
+- `global:credentials_file` remains pending signed management editing and authorization, identity consumer integration, migration approval flow, and Windows/Unix execution evidence. No stable ID is closed by this update.
