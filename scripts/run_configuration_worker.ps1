@@ -6,10 +6,10 @@ param(
     [Parameter(Mandatory)][string]$ExpectedHead,
     [Parameter(Mandatory)][string]$TaskFile,
     [Parameter(Mandatory)][string]$RunDirectory,
-    [string]$Model = 'gpt-6-luna',
-    [string]$ReasoningEffort = 'max',
-    [string]$SubagentModel = 'gpt-6-luna',
-    [string]$SubagentReasoningEffort = 'xhigh',
+    [ValidateSet('gpt-6-luna')][string]$Model = 'gpt-6-luna',
+    [ValidateSet('max')][string]$ReasoningEffort = 'max',
+    [ValidateSet('gpt-6-luna')][string]$SubagentModel = 'gpt-6-luna',
+    [ValidateSet('xhigh')][string]$SubagentReasoningEffort = 'xhigh',
     [switch]$Coordinator,
     [switch]$PreflightOnly
 )
@@ -78,6 +78,14 @@ Assign disjoint paths and a feature-level acceptance test. No startup-only
 sessions or model verification approval round trips. Verify checkout state in
 the same command that starts useful work. You may act on all reserved feature
 paths without per-file approval. Escalate only an actual cross-team collision.
+The runner pins this coordinator to gpt-6-luna/max and every native worker to
+gpt-6-luna/xhigh. Do not override these models or spawn Sol workers. If you are
+continuing an older coordinator session launched as Sol, stop assigning new
+work and wait for every already-running worker to finish and commit. Record
+their SHAs and the remaining task in STATUS.json/INBOX.json, then exit for root
+to relaunch a fresh Luna Max codex exec on this same team worktree. The resumed
+session reads the mailbox and commits before continuing; do not terminate or
+duplicate workers or replay completed tasks.
 Keep your workers doing useful work; do not become a mailbox-only manager.
 Review worker changes locally, integrate into your team branch, and publish
 READY.json in your assigned team mailbox after checks pass. Include base/head,
