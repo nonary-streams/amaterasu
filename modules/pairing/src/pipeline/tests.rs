@@ -713,28 +713,6 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(transport_write["code"], "forbidden");
     assert_eq!(state.writes, writes_before_transport_attempt);
 
-    let invalid_stream_override = state.request(
-        &mut pipeline,
-        "console",
-        json!({
-            "action": "update_client_config_overrides",
-            "certificate_id": certificate_id,
-            "expected_revision": initial_revision,
-            "config_overrides": {"minimum_fps_target":-1.0}
-        }),
-        now(),
-    );
-    assert_eq!(invalid_stream_override["code"], "invalid_request");
-    assert_eq!(state.writes, writes_before_transport_attempt);
-    let unchanged_revision = state.request(
-        &mut pipeline,
-        "console",
-        json!({"action":"list_clients"}),
-        now(),
-    );
-    assert_eq!(unchanged_revision["revision"], initial_revision);
-    assert_eq!(state.writes, writes_before_transport_attempt);
-
     let write = state.request(
         &mut pipeline,
         "console",
@@ -742,15 +720,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
             "action": "update_client_config_overrides",
             "certificate_id": certificate_id,
             "expected_revision": initial_revision,
-            "config_overrides": {
-                "fec_percentage":47,
-                "max_bitrate":-15000,
-                "minimum_fps_target":0.0,
-                "video_max_batch_size_kb":0,
-                "stream_audio":false,
-                "audio_sink_capture_only":false,
-                "back_button_timeout":-1
-            }
+            "config_overrides": {"fec_percentage":47,"stream_audio":false,"audio_sink_capture_only":false,"back_button_timeout":-1}
         }),
         now(),
     );
@@ -766,18 +736,6 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         certificate_readback["config_overrides"]["fec_percentage"],
         47
-    );
-    assert_eq!(
-        certificate_readback["config_overrides"]["max_bitrate"],
-        -15000
-    );
-    assert_eq!(
-        certificate_readback["config_overrides"]["minimum_fps_target"],
-        0.0
-    );
-    assert_eq!(
-        certificate_readback["config_overrides"]["video_max_batch_size_kb"],
-        0
     );
     assert_eq!(
         certificate_readback["config_overrides"]["stream_audio"],
@@ -809,18 +767,6 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["fec_percentage"],
         47
-    );
-    assert_eq!(
-        persisted["clients"][0]["config_overrides"]["max_bitrate"],
-        -15000
-    );
-    assert_eq!(
-        persisted["clients"][0]["config_overrides"]["minimum_fps_target"],
-        0.0
-    );
-    assert_eq!(
-        persisted["clients"][0]["config_overrides"]["video_max_batch_size_kb"],
-        0
     );
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["stream_audio"],
@@ -859,9 +805,6 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         now(),
     );
     assert_eq!(unchanged["config_overrides"]["fec_percentage"], 47);
-    assert_eq!(unchanged["config_overrides"]["max_bitrate"], -15000);
-    assert_eq!(unchanged["config_overrides"]["minimum_fps_target"], 0.0);
-    assert_eq!(unchanged["config_overrides"]["video_max_batch_size_kb"], 0);
     assert_eq!(unchanged["config_overrides"]["stream_audio"], false);
     assert_eq!(
         unchanged["config_overrides"]["audio_sink_capture_only"],
@@ -901,17 +844,6 @@ fn old_paired_fec_override_document_loads_without_audio_migration() {
     );
     assert_eq!(result["paired"], 1);
     assert_eq!(result["config_overrides"]["fec_percentage"], 73);
-    assert!(result["config_overrides"].get("max_bitrate").is_none());
-    assert!(
-        result["config_overrides"]
-            .get("minimum_fps_target")
-            .is_none()
-    );
-    assert!(
-        result["config_overrides"]
-            .get("video_max_batch_size_kb")
-            .is_none()
-    );
     assert!(result["config_overrides"].get("stream_audio").is_none());
     assert!(
         result["config_overrides"]

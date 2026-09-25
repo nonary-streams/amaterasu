@@ -213,12 +213,6 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bitrate: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimum_fps_target: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub video_max_batch_size_kb: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
@@ -257,13 +251,6 @@ impl ClientConfigOverrides {
             return Err("invalid_config_overrides");
         }
         if self
-            .minimum_fps_target
-            .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
-            || self.video_max_batch_size_kb.is_some_and(|size| size > 64)
-        {
-            return Err("invalid_config_overrides");
-        }
-        if self
             .audio_sink
             .as_deref()
             .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
@@ -298,9 +285,6 @@ impl ClientConfigOverrides {
 
     pub fn is_empty(&self) -> bool {
         self.fec_percentage.is_none()
-            && self.max_bitrate.is_none()
-            && self.minimum_fps_target.is_none()
-            && self.video_max_batch_size_kb.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.virtual_sink.is_none()
@@ -413,9 +397,6 @@ mod tests {
         let legacy: ClientConfigOverrides =
             serde_json::from_value(json!({"fec_percentage":73})).unwrap();
         assert_eq!(legacy.fec_percentage, Some(73));
-        assert_eq!(legacy.max_bitrate, None);
-        assert_eq!(legacy.minimum_fps_target, None);
-        assert_eq!(legacy.video_max_batch_size_kb, None);
         assert_eq!(legacy.stream_audio, None);
         legacy.validate().unwrap();
         assert_eq!(
@@ -440,98 +421,6 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":73,"stream_audio":false})
         );
-    }
-
-    #[test]
-    fn client_video_overrides_preserve_absence_null_and_explicit_zero() {
-        let absent = ClientConfigOverrides::default();
-        assert!(absent.is_empty());
-        assert_eq!(serde_json::to_value(&absent).unwrap(), json!({}));
-
-        let null_values: ClientConfigOverrides = serde_json::from_value(json!({
-            "max_bitrate":null,
-            "minimum_fps_target":null,
-            "video_max_batch_size_kb":null
-        }))
-        .unwrap();
-        assert_eq!(null_values.max_bitrate, None);
-        assert_eq!(null_values.minimum_fps_target, None);
-        assert_eq!(null_values.video_max_batch_size_kb, None);
-        assert!(null_values.is_empty());
-        assert_eq!(serde_json::to_value(null_values).unwrap(), json!({}));
-
-        let zero_values: ClientConfigOverrides = serde_json::from_value(json!({
-            "max_bitrate":0,
-            "minimum_fps_target":0.0,
-            "video_max_batch_size_kb":0
-        }))
-        .unwrap();
-        assert_eq!(zero_values.max_bitrate, Some(0));
-        assert_eq!(zero_values.minimum_fps_target, Some(0.0));
-        assert_eq!(zero_values.video_max_batch_size_kb, Some(0));
-        assert!(!zero_values.is_empty());
-        zero_values.validate().unwrap();
-        assert_eq!(
-            serde_json::to_value(zero_values).unwrap(),
-            json!({
-                "max_bitrate":0,
-                "minimum_fps_target":0.0,
-                "video_max_batch_size_kb":0
-            })
-        );
-    }
-
-    #[test]
-    fn client_video_overrides_accept_boundaries_and_signed_bitrates() {
-        for overrides in [
-            ClientConfigOverrides {
-                max_bitrate: Some(i32::MIN),
-                minimum_fps_target: Some(0.0),
-                video_max_batch_size_kb: Some(0),
-                ..ClientConfigOverrides::default()
-            },
-            ClientConfigOverrides {
-                max_bitrate: Some(i32::MAX),
-                minimum_fps_target: Some(1000.0),
-                video_max_batch_size_kb: Some(64),
-                ..ClientConfigOverrides::default()
-            },
-        ] {
-            overrides.validate().unwrap();
-        }
-
-        for overrides in [
-            ClientConfigOverrides {
-                minimum_fps_target: Some(-0.1),
-                ..ClientConfigOverrides::default()
-            },
-            ClientConfigOverrides {
-                minimum_fps_target: Some(1000.1),
-                ..ClientConfigOverrides::default()
-            },
-            ClientConfigOverrides {
-                minimum_fps_target: Some(f64::NAN),
-                ..ClientConfigOverrides::default()
-            },
-            ClientConfigOverrides {
-                minimum_fps_target: Some(f64::INFINITY),
-                ..ClientConfigOverrides::default()
-            },
-            ClientConfigOverrides {
-                video_max_batch_size_kb: Some(65),
-                ..ClientConfigOverrides::default()
-            },
-        ] {
-            assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
-        }
-
-        for invalid in [
-            json!({"max_bitrate":2147483648_u64}),
-            json!({"minimum_fps_target":"60"}),
-            json!({"video_max_batch_size_kb":65}),
-        ] {
-            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
-        }
     }
 
     #[test]

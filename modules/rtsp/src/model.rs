@@ -448,8 +448,6 @@ pub struct Open {
     pub key_repeat_delay: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_bitrate_kbps: Option<u32>,
     pub capture: Capture,
     #[serde(default)]
     pub profile: Profile,
@@ -462,33 +460,8 @@ impl Open {
         self.validate_operation_id()?;
         self.validate_destination(allow_remote)?;
         self.validate_capture()?;
-        self.validate_max_bitrate()?;
         self.profile.validate()?;
         decode_key(&self.key_hex)
-    }
-
-    fn validate_max_bitrate(&self) -> Result<(), &'static str> {
-        if self
-            .max_bitrate_kbps
-            .is_some_and(|maximum| maximum > 0 && maximum < 100)
-        {
-            return Err("invalid_max_bitrate");
-        }
-        Ok(())
-    }
-
-    fn encoder_bitrate_kbps(&self) -> u32 {
-        self.max_bitrate_kbps
-            .filter(|maximum| *maximum > 0)
-            .map_or(self.profile.bitrate_kbps, |maximum| {
-                self.profile.bitrate_kbps.min(maximum)
-            })
-    }
-
-    pub(crate) fn effective_profile(&self) -> Profile {
-        let mut profile = self.profile.clone();
-        profile.bitrate_kbps = self.encoder_bitrate_kbps();
-        profile
     }
 
     fn validate_operation_id(&self) -> Result<(), &'static str> {
@@ -638,7 +611,7 @@ impl Open {
                     "width": self.profile.width,
                     "height": self.profile.height,
                     "fps": self.profile.fps,
-                    "bitrate": self.encoder_bitrate_kbps() * 1000,
+                    "bitrate": self.profile.bitrate_kbps * 1000,
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
@@ -1476,77 +1449,13 @@ mod tests {
     }
 
     #[test]
-    fn absent_maximum_bitrate_cap_preserves_requested_rate_in_older_open_payloads() {
+    fn capped_profile_bitrate_reaches_stream_session_start_in_bits_per_second() {
         let mut request = open();
         request.profile = matching_profile();
         request.profile.bitrate_kbps = 7_500;
 
-        assert_eq!(request.max_bitrate_kbps, None);
-        assert!(request.validate(false).is_ok());
         let arm = request.arm(41);
         assert_eq!(arm["configuration"]["configuration"]["bitrate"], 7_500_000);
-    }
-
-    #[test]
-    fn maximum_bitrate_cap_limits_only_encoder_start_bitrate() {
-        let mut request = open();
-        request.profile = matching_profile();
-        request.profile.bitrate_kbps = 7_500;
-        request.max_bitrate_kbps = Some(5_000);
-
-        assert!(request.validate(false).is_ok());
-        assert_eq!(request.profile.bitrate_kbps, 7_500);
-        assert_eq!(request.effective_profile().bitrate_kbps, 5_000);
-        assert_eq!(
-            request.arm(41)["configuration"]["configuration"]["bitrate"],
-            5_000_000
-        );
-
-        let mut announce =
-            parse_announce(changed_announce("x-ss-general.encryptionEnabled", "7").as_bytes())
-                .unwrap();
-        announce.video.bitrate_kbps = 5_000;
-        assert!(request.effective_profile().matches(&announce));
-        assert!(!request.profile.matches(&announce));
-    }
-
-    #[test]
-    fn maximum_bitrate_cap_above_requested_rate_preserves_requested_rate() {
-        let mut request = open();
-        request.profile = matching_profile();
-        request.profile.bitrate_kbps = 7_500;
-        request.max_bitrate_kbps = Some(8_000);
-
-        assert!(request.validate(false).is_ok());
-        assert_eq!(request.effective_profile().bitrate_kbps, 7_500);
-        assert_eq!(
-            request.arm(41)["configuration"]["configuration"]["bitrate"],
-            7_500_000
-        );
-    }
-
-    #[test]
-    fn zero_maximum_bitrate_cap_preserves_requested_rate() {
-        let mut request = open();
-        request.profile = matching_profile();
-        request.profile.bitrate_kbps = 7_500;
-        request.max_bitrate_kbps = Some(0);
-
-        assert!(request.validate(false).is_ok());
-        assert_eq!(request.effective_profile().bitrate_kbps, 7_500);
-        assert_eq!(
-            request.arm(41)["configuration"]["configuration"]["bitrate"],
-            7_500_000
-        );
-    }
-
-    #[test]
-    fn positive_maximum_bitrate_cap_below_encoder_minimum_is_rejected() {
-        let mut value = open_json();
-        value["max_bitrate_kbps"] = json!(99);
-        let request: Open = serde_json::from_value(value).unwrap();
-
-        assert_eq!(request.validate(false), Err("invalid_max_bitrate"));
     }
 
     #[test]

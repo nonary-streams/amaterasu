@@ -168,11 +168,15 @@ impl Controller {
                     "width": record.request.width,
                     "height": record.request.height,
                     "fps": record.request.fps,
-                    "bitrate_kbps": config.profile.bitrate_kbps,
+                    "bitrate_kbps": record
+                        .global_max_bitrate_kbps
+                        .map_or(config.profile.bitrate_kbps, |limit| {
+                            config.profile.bitrate_kbps.min(limit)
+                        }),
                     "max_reference_frames": config.profile.max_reference_frames,
                     "packet_size": config.profile.packet_size,
                     "fec_percentage": record.effective_fec_percentage,
-                    "video_max_batch_size_kb": record.effective_video_max_batch_size_kb,
+                    "video_max_batch_size_kb": record.global_video_max_batch_size_kb,
                     "min_parity_shards": config.profile.min_parity_shards,
                     "max_fec_blocks": config.profile.max_fec_blocks,
                     "packet_ms": config.profile.packet_ms,
@@ -207,8 +211,7 @@ impl Controller {
                         "key_repeat_delay": record.scoped_key_repeat_delay,
                         "key_repeat_frequency": record.scoped_key_repeat_frequency,
                         "ping_timeout_ms": record.global_ping_timeout_ms,
-                        "max_bitrate_kbps": record.effective_max_bitrate_kbps,
-                        "minimum_fps_target": record.effective_minimum_fps_target,
+                        "minimum_fps_target": record.global_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "capture": capture,
                         "profile": profile,
@@ -269,21 +272,6 @@ impl Controller {
                                     .client_fec_percentage
                                     .or(application_fec_percentage)
                                     .unwrap_or(record.global_fec_percentage);
-                                record.effective_max_bitrate_kbps = resolve_max_bitrate_kbps(
-                                    record.peer.client_max_bitrate,
-                                    application_overrides.max_bitrate,
-                                    record.global_max_bitrate_kbps,
-                                );
-                                record.effective_minimum_fps_target = record
-                                    .peer
-                                    .client_minimum_fps_target
-                                    .or(application_overrides.minimum_fps_target)
-                                    .unwrap_or(record.global_minimum_fps_target);
-                                record.effective_video_max_batch_size_kb = record
-                                    .peer
-                                    .client_video_max_batch_size_kb
-                                    .or(application_overrides.video_max_batch_size_kb)
-                                    .unwrap_or(record.global_video_max_batch_size_kb);
                                 record.application_stream_audio =
                                     application_overrides.stream_audio;
                                 record.effective_stream_audio = record
@@ -384,12 +372,7 @@ impl Controller {
                                     .profile
                                     .clone();
                                 profile.fec_percentage = record.effective_fec_percentage;
-                                if record
-                                    .effective_max_bitrate_kbps
-                                    .is_some_and(|bitrate| bitrate < 100)
-                                {
-                                    fail_record(record, "max_bitrate_below_encoder_minimum", now);
-                                } else if profile.validate().is_ok() {
+                                if profile.validate().is_ok() {
                                     record.stage = Stage::OpenRtsp;
                                 } else {
                                     fail_record(record, "invalid_streaming_profile_override", now);
@@ -714,9 +697,6 @@ fn application_response<'a>(
 #[serde(default, deny_unknown_fields)]
 struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
-    max_bitrate: Option<i32>,
-    minimum_fps_target: Option<f64>,
-    video_max_batch_size_kb: Option<u8>,
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
@@ -748,12 +728,6 @@ fn application_config_overrides(
     };
     if config_overrides.fec_percentage == Some(0)
         || config_overrides
-            .minimum_fps_target
-            .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
-        || config_overrides
-            .video_max_batch_size_kb
-            .is_some_and(|size| size > 64)
-        || config_overrides
             .audio_sink
             .as_deref()
             .is_some_and(|value| !super::valid_audio_sink_override(value))
@@ -784,18 +758,6 @@ fn application_config_overrides(
         return Err("invalid_application_response");
     }
     Ok(config_overrides)
-}
-
-fn resolve_max_bitrate_kbps(
-    client_override: Option<i32>,
-    application_override: Option<i32>,
-    global_override: Option<u32>,
-) -> Option<u32> {
-    match client_override.or(application_override) {
-        Some(value) if value > 0 => Some(value as u32),
-        Some(_) => None,
-        None => global_override,
-    }
 }
 
 fn valid_gamepad_profile(profile: &str) -> bool {

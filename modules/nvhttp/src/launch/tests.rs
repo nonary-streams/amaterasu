@@ -38,28 +38,6 @@ fn peer_with_fec(marker: u8, fec_percentage: Option<u8>) -> PeerIdentity {
     peer_with_overrides(marker, fec_percentage, None)
 }
 
-fn peer_with_stream_overrides(
-    marker: u8,
-    max_bitrate: Option<i32>,
-    minimum_fps_target: Option<f64>,
-    video_max_batch_size_kb: Option<u8>,
-) -> PeerIdentity {
-    let certificate = vec![marker; 32];
-    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
-        .unwrap()
-        .with_paired_identity(
-            format!("client-{marker}"),
-            fingerprint(&certificate),
-            ClientConfigOverrides {
-                max_bitrate,
-                minimum_fps_target,
-                video_max_batch_size_kb,
-                ..Default::default()
-            },
-        )
-        .unwrap()
-}
-
 fn peer_with_overrides(
     marker: u8,
     fec_percentage: Option<u8>,
@@ -852,9 +830,6 @@ struct Broker {
     application_stopped: bool,
     application_unhealthy: bool,
     application_fec_percentage: Option<u8>,
-    application_max_bitrate: Option<i32>,
-    application_minimum_fps_target: Option<f64>,
-    application_video_max_batch_size_kb: Option<u8>,
     application_stream_audio: Option<bool>,
     application_audio_sink: Option<String>,
     application_virtual_sink: Option<String>,
@@ -886,9 +861,6 @@ impl Default for Broker {
             application_stopped: false,
             application_unhealthy: false,
             application_fec_percentage: None,
-            application_max_bitrate: None,
-            application_minimum_fps_target: None,
-            application_video_max_batch_size_kb: None,
             application_stream_audio: None,
             application_audio_sink: None,
             application_virtual_sink: None,
@@ -1005,9 +977,6 @@ impl Broker {
                 },
             });
             if self.application_fec_percentage.is_some()
-                || self.application_max_bitrate.is_some()
-                || self.application_minimum_fps_target.is_some()
-                || self.application_video_max_batch_size_kb.is_some()
                 || self.application_stream_audio.is_some()
                 || self.application_audio_sink.is_some()
                 || self.application_virtual_sink.is_some()
@@ -1025,15 +994,6 @@ impl Broker {
                 let mut config_overrides = json!({});
                 if let Some(fec_percentage) = self.application_fec_percentage {
                     config_overrides["fec_percentage"] = json!(fec_percentage);
-                }
-                if let Some(max_bitrate) = self.application_max_bitrate {
-                    config_overrides["max_bitrate"] = json!(max_bitrate);
-                }
-                if let Some(minimum_fps_target) = self.application_minimum_fps_target {
-                    config_overrides["minimum_fps_target"] = json!(minimum_fps_target);
-                }
-                if let Some(video_max_batch_size_kb) = self.application_video_max_batch_size_kb {
-                    config_overrides["video_max_batch_size_kb"] = json!(video_max_batch_size_kb);
                 }
                 if let Some(stream_audio) = self.application_stream_audio {
                     config_overrides["stream_audio"] = json!(stream_audio);
@@ -1288,11 +1248,11 @@ fn global_ping_timeout_reaches_rtsp_open_and_is_snapshotted_at_admission() {
 }
 
 #[test]
-fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
+fn global_max_bitrate_caps_rtsp_profile_and_is_snapshotted_at_admission() {
     for (configured, later_value, expected) in [
-        (Some(5_000), Some(8_000), Some(5_000)),
-        (Some(200_000), None, Some(200_000)),
-        (None, Some(5_000), None),
+        (Some(5_000), Some(8_000), 5_000),
+        (Some(200_000), None, 10_000),
+        (None, Some(5_000), 10_000),
     ] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
@@ -1313,80 +1273,8 @@ fn global_max_bitrate_is_sent_as_encoder_cap_and_snapshotted_at_admission() {
                 _ => None,
             })
             .expect("RTSP open request");
-        assert_eq!(rtsp_open["profile"]["bitrate_kbps"], 10_000);
-        assert_eq!(rtsp_open["max_bitrate_kbps"], json!(expected));
+        assert_eq!(rtsp_open["profile"]["bitrate_kbps"], expected);
     }
-}
-
-#[test]
-fn stream_overrides_resolve_client_before_application_before_global() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_max_bitrate_kbps(Some(9_000));
-    controller.set_global_minimum_fps_target(20.0);
-    controller.set_global_video_max_batch_size_kb(64);
-    let client = peer_with_stream_overrides(1, Some(5_000), Some(45.5), Some(16));
-    let mut broker = Broker {
-        application_max_bitrate: Some(6_000),
-        application_minimum_fps_target: Some(30.0),
-        application_video_max_batch_size_kb: Some(32),
-        ..Default::default()
-    };
-
-    assert!(controller.launch(10, request(1), client, now).is_none());
-    controller.set_global_max_bitrate_kbps(None);
-    controller.set_global_minimum_fps_target(60.0);
-    controller.set_global_video_max_batch_size_kb(64);
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
-
-    let rtsp_open = opened_rtsp_payload(&broker);
-    assert_eq!(rtsp_open["profile"]["bitrate_kbps"], 10_000);
-    assert_eq!(rtsp_open["max_bitrate_kbps"], 5_000);
-    assert_eq!(rtsp_open["minimum_fps_target"], 45.5);
-    assert_eq!(rtsp_open["profile"]["video_max_batch_size_kb"], 16);
-}
-
-#[test]
-fn stream_overrides_preserve_explicit_zero_and_fall_back_to_application_or_global() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_max_bitrate_kbps(Some(8_000));
-    controller.set_global_minimum_fps_target(20.0);
-    controller.set_global_video_max_batch_size_kb(16);
-    let mut broker = Broker {
-        application_max_bitrate: Some(6_000),
-        application_minimum_fps_target: Some(30.0),
-        application_video_max_batch_size_kb: Some(32),
-        ..Default::default()
-    };
-
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
-
-    let rtsp_open = opened_rtsp_payload(&broker);
-    assert_eq!(rtsp_open["max_bitrate_kbps"], 6_000);
-    assert_eq!(rtsp_open["minimum_fps_target"], 30.0);
-    assert_eq!(rtsp_open["profile"]["video_max_batch_size_kb"], 32);
-
-    let mut controller = Controller::new(Some(config())).unwrap();
-    controller.set_global_max_bitrate_kbps(Some(8_000));
-    controller.set_global_minimum_fps_target(20.0);
-    controller.set_global_video_max_batch_size_kb(16);
-    let client = peer_with_stream_overrides(2, Some(0), Some(0.0), Some(0));
-    let mut broker = Broker {
-        application_max_bitrate: Some(6_000),
-        application_minimum_fps_target: Some(30.0),
-        application_video_max_batch_size_kb: Some(32),
-        ..Default::default()
-    };
-
-    assert!(controller.launch(10, request(2), client, now).is_none());
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
-
-    let rtsp_open = opened_rtsp_payload(&broker);
-    assert_eq!(rtsp_open["max_bitrate_kbps"], Value::Null);
-    assert_eq!(rtsp_open["minimum_fps_target"], 0.0);
-    assert_eq!(rtsp_open["profile"]["video_max_batch_size_kb"], 0);
 }
 
 #[test]

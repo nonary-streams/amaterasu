@@ -52,9 +52,6 @@ pub struct PeerIdentity {
     client_id: Option<String>,
     certificate_id: Option<String>,
     client_fec_percentage: Option<u8>,
-    client_max_bitrate: Option<i32>,
-    client_minimum_fps_target: Option<f64>,
-    client_video_max_batch_size_kb: Option<u8>,
     client_stream_audio: Option<bool>,
     client_audio_sink: Option<String>,
     client_virtual_sink: Option<String>,
@@ -85,9 +82,6 @@ impl PeerIdentity {
             client_id: None,
             certificate_id: None,
             client_fec_percentage: None,
-            client_max_bitrate: None,
-            client_minimum_fps_target: None,
-            client_video_max_batch_size_kb: None,
             client_stream_audio: None,
             client_audio_sink: None,
             client_virtual_sink: None,
@@ -113,9 +107,6 @@ impl PeerIdentity {
     ) -> Result<Self, &'static str> {
         let ClientConfigOverrides {
             fec_percentage,
-            max_bitrate,
-            minimum_fps_target,
-            video_max_batch_size_kb,
             stream_audio,
             audio_sink,
             virtual_sink,
@@ -135,9 +126,6 @@ impl PeerIdentity {
             || !valid_fingerprint(&certificate_id)
             || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
             || fec_percentage == Some(0)
-            || minimum_fps_target
-                .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
-            || video_max_batch_size_kb.is_some_and(|size| size > 64)
             || audio_sink
                 .as_deref()
                 .is_some_and(|value| !valid_audio_sink_override(value))
@@ -156,9 +144,6 @@ impl PeerIdentity {
         self.client_id = Some(client_id);
         self.certificate_id = Some(certificate_id.to_ascii_lowercase());
         self.client_fec_percentage = fec_percentage;
-        self.client_max_bitrate = max_bitrate;
-        self.client_minimum_fps_target = minimum_fps_target;
-        self.client_video_max_batch_size_kb = video_max_batch_size_kb;
         self.client_stream_audio = stream_audio;
         self.client_audio_sink = audio_sink;
         self.client_virtual_sink = virtual_sink;
