@@ -48,6 +48,52 @@ fn update_is_rejected_for_non_management_callers_before_state_access() {
     assert_eq!(completed.unwrap()["error"]["code"], "permission_denied");
 }
 
+fn assert_parent_traversal_update_is_rejected_before_state_access(field: &str) {
+    let mut pipeline = Pipeline::new(Ok(test_root()));
+    let mut payload = json!({
+        "action":"update","expected_revision":0,
+        "file_state":"state.json","vibeshine_file_state":"legacy.json",
+        "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+        "log_path":"service.log","min_log_level":"info"
+    });
+    payload[field] = json!("../outside.pem");
+
+    let mut incoming = Some(request("amaterasu.management", payload));
+    let mut completed = None;
+    pipeline
+        .tick(|command| match command {
+            Command::Poll {} => Ok(incoming.take().unwrap_or(Response::Pending)),
+            Command::Complete { payload, .. } => {
+                completed = Some(payload);
+                Ok(Response::Ok)
+            }
+            Command::Request { .. }
+            | Command::Cancel { .. }
+            | Command::TakeResult { .. }
+            | Command::ReleaseResult { .. } => {
+                panic!("invalid {field} update issued a state command: {command:?}")
+            }
+            command => panic!("unexpected command for invalid {field} update: {command:?}"),
+        })
+        .unwrap();
+
+    assert_eq!(
+        completed.unwrap()["error"]["code"],
+        "invalid_settings",
+        "{field} parent traversal must be rejected before state access"
+    );
+}
+
+#[test]
+fn parent_traversal_in_pkey_is_rejected_before_state_access() {
+    assert_parent_traversal_update_is_rejected_before_state_access("pkey");
+}
+
+#[test]
+fn parent_traversal_in_cert_is_rejected_before_state_access() {
+    assert_parent_traversal_update_is_rejected_before_state_access("cert");
+}
+
 #[test]
 fn missing_state_key_reads_as_the_default_document_without_a_write() {
     let root = test_root();
