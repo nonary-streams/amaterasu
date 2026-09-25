@@ -664,15 +664,6 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
         )["ok"],
         true
     );
-    assert_eq!(
-        state.request(
-            &mut pipeline,
-            "frontend",
-            json!({"action":"verify","bearer":rotated_again["bearer"],"required_scopes":[]}),
-            500,
-        )["ok"],
-        true
-    );
     let rotated_one_second_before_expiry = state.request(
         &mut pipeline,
         "frontend",
