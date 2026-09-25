@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_MINIMUM_LEVEL: u8 = 2;
 const SESSION_LIMIT: usize = 30;
 const ROLLOVER_SIZE: u64 = 2 * 1024 * 1024;
 const SESSION_SIZE: u64 = 10 * 1024 * 1024;
@@ -37,7 +36,9 @@ impl LoggingSettings {
     pub(crate) fn from_value(value: serde_json::Value) -> Result<Self, String> {
         let raw: RawSettings = serde_json::from_value(value)
             .map_err(|error| format!("invalid host logging settings: {error}"))?;
-        let minimum_level = raw.min_log_level.unwrap_or(DEFAULT_MINIMUM_LEVEL);
+        let minimum_level = raw
+            .min_log_level
+            .unwrap_or_else(|| default_minimum_level(env!("CARGO_PKG_VERSION_PRE")));
         if minimum_level > 6 {
             return Err("host minimum log level must be between 0 and 6".into());
         }
@@ -107,6 +108,19 @@ impl LoggingSettings {
             "state_root":state_root,
         }))
     }
+}
+
+fn default_minimum_level(prerelease: &str) -> u8 {
+    if is_prerelease_channel(prerelease) {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_prerelease_channel(prerelease: &str) -> bool {
+    let first_identifier = prerelease.split(['.', '+']).next().unwrap_or_default();
+    !first_identifier.is_empty() && !first_identifier.eq_ignore_ascii_case("stable")
 }
 
 #[derive(Default)]
@@ -508,6 +522,32 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn default_minimum_level_matches_stable_and_prerelease_channels() {
+        assert_eq!(default_minimum_level(""), 2);
+        assert_eq!(default_minimum_level("stable.4"), 2);
+        assert_eq!(default_minimum_level("StAbLe.rc1"), 2);
+        assert_eq!(default_minimum_level("alpha.1"), 1);
+        assert_eq!(default_minimum_level("1.0"), 1);
+    }
+
+    #[test]
+    fn from_value_uses_the_package_version_channel_by_default() {
+        let settings = LoggingSettings::from_value(json!({})).unwrap();
+
+        assert_eq!(
+            settings.minimum_level,
+            default_minimum_level(env!("CARGO_PKG_VERSION_PRE"))
+        );
+    }
+
+    #[test]
+    fn from_value_preserves_an_explicit_minimum_level() {
+        let settings = LoggingSettings::from_value(json!({"min_log_level":4})).unwrap();
+
+        assert_eq!(settings.minimum_level, 4);
+    }
 
     #[test]
     fn persisted_host_configuration_maps_effective_levels_and_preserves_stored_paths() {
