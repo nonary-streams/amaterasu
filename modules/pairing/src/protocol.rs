@@ -678,6 +678,10 @@ mod tests {
         assert!(absent.is_empty());
         assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
 
+        let inherited: ClientConfigOverrides = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(inherited.nvenc_spatial_aq, None);
+        assert!(inherited.is_empty());
+
         let null: ClientConfigOverrides =
             serde_json::from_value(json!({"nvenc_spatial_aq":null})).unwrap();
         assert_eq!(null.nvenc_spatial_aq, None);
@@ -696,7 +700,11 @@ mod tests {
             );
         }
 
-        for invalid in [json!(0), json!("false"), json!([])] {
+        for invalid in [
+            json!({"nvenc_spatial_aq":0}),
+            json!({"nvenc_spatial_aq":"false"}),
+            json!({"nvenc_spatial_aq":[]}),
+        ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }
 
@@ -838,14 +846,20 @@ mod tests {
             ..ClientConfigOverrides::default()
         };
         assert_eq!(above_boundary.validate(), Err("invalid_config_overrides"));
-        for invalid in [
-            json!({"frame_limiter_fps_limit":-0.001}),
-            json!({"frame_limiter_fps_limit":1000.001}),
-            json!({"frame_limiter_fps_limit":59.9999}),
-            json!({"frame_limiter_fps_limit":"60"}),
-        ] {
-            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        for fps in [-0.001, 1000.001, 59.9999] {
+            let overrides: ClientConfigOverrides = serde_json::from_value(json!({
+                "frame_limiter_fps_limit":fps
+            }))
+            .unwrap();
+            assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
         }
+
+        assert!(
+            serde_json::from_value::<ClientConfigOverrides>(json!({
+                "frame_limiter_fps_limit":"60"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
