@@ -224,7 +224,7 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
 
 fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     let mut configured_primary_file_state = None::<(PathBuf, Option<PathBuf>)>;
-    let mut configured_vibeshine_file_state = None::<PathBuf>;
+    let mut configured_vibeshine_file_state = None::<(PathBuf, Option<PathBuf>)>;
     let mut paths = Vec::new();
     for name in [
         "apollo.conf",
@@ -285,13 +285,19 @@ fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
                     path
                 }
                 "vibeshine_file_state" => {
-                    if configured_vibeshine_file_state
-                        .replace(relative.to_path_buf())
-                        .is_some_and(|previous| previous != relative)
+                    let path = optional_regular_contained_file(root, relative)?;
+                    if let Some((previous_relative, previous_path)) =
+                        &configured_vibeshine_file_state
+                        && previous_relative != relative
+                        && !matches!(
+                            (previous_path.as_ref(), path.as_ref()),
+                            (Some(previous), Some(current)) if previous == current
+                        )
                     {
                         return Err("legacy_authentication_credential_ambiguous");
                     }
-                    optional_regular_contained_file(root, relative)?
+                    configured_vibeshine_file_state = Some((relative.to_path_buf(), path.clone()));
+                    path
                 }
                 _ => unreachable!("only supported state keys reach this point"),
             };
@@ -656,6 +662,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(source);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn imports_case_variant_vibeshine_file_state_spellings_as_one_windows_candidate() {
+        let source = temporary_directory("windows-vibeshine-file-state-case-alias");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::write(
+            source.join("private/primary.json"),
+            serde_json::json!({"username":"Admin","password":hash,"salt":salt}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = private/primary.json\nvibeshine_file_state = PRIVATE/PRIMARY.JSON\n",
+        )
+        .unwrap();
+
+        let root = canonical_directory(&source).unwrap();
+        let candidates = credential_candidates(&root).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Admin"
+        );
+        let _ = std::fs::remove_dir_all(source);
+    }
+
     #[cfg(unix)]
     #[test]
     fn keeps_distinct_case_sensitive_file_state_paths_conflicting_on_unix() {
@@ -674,6 +713,81 @@ mod tests {
         std::fs::write(
             source.join("sunshine.conf"),
             "file_state = private/primary.json\nfile_state = private/PRIMARY.JSON\n",
+        )
+        .unwrap();
+        let root = canonical_directory(&source).unwrap();
+
+        assert!(matches!(
+            configured_state_paths(&root),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_distinct_case_sensitive_vibeshine_paths_conflicting_on_unix() {
+        let source = temporary_directory("unix-vibeshine-case-distinct");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let lowercase_path = source.join("private/primary.json");
+        let uppercase_path = source.join("private/PRIMARY.JSON");
+        std::fs::write(&lowercase_path, b"{}").unwrap();
+        std::fs::write(&uppercase_path, b"{}").unwrap();
+
+        if lowercase_path.canonicalize().unwrap() == uppercase_path.canonicalize().unwrap() {
+            let _ = std::fs::remove_dir_all(source);
+            return;
+        }
+
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = private/primary.json\nvibeshine_file_state = private/PRIMARY.JSON\n",
+        )
+        .unwrap();
+        let root = canonical_directory(&source).unwrap();
+
+        assert!(matches!(
+            configured_state_paths(&root),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_vibeshine_file_state_alias_on_unix() {
+        let source = temporary_directory("unix-vibeshine-missing-alias");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let missing_path = source.join("private/primary.json");
+        let existing_path = source.join("private/PRIMARY.JSON");
+        std::fs::write(&existing_path, b"{}").unwrap();
+
+        if missing_path.try_exists().unwrap() {
+            let _ = std::fs::remove_dir_all(source);
+            return;
+        }
+
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = private/primary.json\nvibeshine_file_state = private/PRIMARY.JSON\n",
+        )
+        .unwrap();
+        let root = canonical_directory(&source).unwrap();
+
+        assert!(matches!(
+            configured_state_paths(&root),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn rejects_differently_spelled_missing_vibeshine_file_state_aliases() {
+        let source = temporary_directory("missing-vibeshine-file-state-alias");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = private/not-created.json\nvibeshine_file_state = PRIVATE/NOT-CREATED.JSON\n",
         )
         .unwrap();
         let root = canonical_directory(&source).unwrap();
