@@ -11,6 +11,22 @@ pub enum DisplayHdrOption {
     Disabled,
 }
 
+/// Resolve an HDR option to the display HDR state selected for a provider.
+///
+/// The effective client HDR request must already be computed by the caller.
+/// Higher-priority forced states, such as RTX HDR forced-SDR and
+/// `dd_wa_dummy_plug_hdr10` forced-HDR, remain outside this helper. This pure
+/// helper only selects a state; a provider applies it only when supported.
+pub fn resolve_hdr_configuration(
+    option: DisplayHdrOption,
+    effective_client_hdr_request: bool,
+) -> Option<bool> {
+    match option {
+        DisplayHdrOption::Auto => Some(effective_client_hdr_request),
+        DisplayHdrOption::Disabled => None,
+    }
+}
+
 impl DisplayHdrOption {
     /// Parse a legacy token, falling back to `Disabled` when it is not recognized.
     pub fn from_legacy_token(token: &str) -> Self {
@@ -24,7 +40,7 @@ impl DisplayHdrOption {
 
 #[cfg(test)]
 mod tests {
-    use super::DisplayHdrOption;
+    use super::{DisplayHdrOption, resolve_hdr_configuration};
 
     #[test]
     fn default_is_auto() {
@@ -81,5 +97,37 @@ mod tests {
                 DisplayHdrOption::Disabled
             );
         }
+    }
+
+    #[test]
+    fn auto_resolves_true_client_request_to_hdr_enabled() {
+        assert_eq!(
+            resolve_hdr_configuration(DisplayHdrOption::Auto, true),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn auto_resolves_false_client_request_to_hdr_disabled() {
+        assert_eq!(
+            resolve_hdr_configuration(DisplayHdrOption::Auto, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn disabled_ignores_true_client_request() {
+        assert_eq!(
+            resolve_hdr_configuration(DisplayHdrOption::Disabled, true),
+            None
+        );
+    }
+
+    #[test]
+    fn disabled_ignores_false_client_request() {
+        assert_eq!(
+            resolve_hdr_configuration(DisplayHdrOption::Disabled, false),
+            None
+        );
     }
 }
