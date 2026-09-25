@@ -60,11 +60,20 @@ fn prepared_frame_limiter_snapshot_is_frozen_across_retry_and_readback() {
     assert_eq!(status["frame_limiter_settings"], snapshot);
 
     let mut malformed = prepare();
-    malformed["frame_limiter_settings"] = snapshot;
+    malformed["frame_limiter_settings"] = snapshot.clone();
     malformed["frame_limiter_settings"]["settings"]["frame_limiter_provider"] = json!("unknown");
     malformed["frame_limiter_executable_path"] = json!(r"C:\Games\Example.exe");
     assert_eq!(
         Harness::new().response(1, malformed)["code"],
+        "invalid_frame_limiter_snapshot"
+    );
+
+    let mut missing_rate = prepare();
+    missing_rate["frame_limiter_settings"] = snapshot;
+    missing_rate["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(0);
+    missing_rate["frame_limiter_executable_path"] = json!(r"C:\Games\Example.exe");
+    assert_eq!(
+        Harness::new().response(1, missing_rate)["code"],
         "invalid_frame_limiter_snapshot"
     );
 }

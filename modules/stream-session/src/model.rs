@@ -296,8 +296,14 @@ fn valid_frame_limiter_settings(snapshot: &Value) -> bool {
     {
         return false;
     }
+    if !fields
+        .get("requested_stream_fps_millihz")
+        .and_then(Value::as_u64)
+        .is_some_and(|rate| (1..=1_000_000).contains(&rate))
+    {
+        return false;
+    }
     for key in [
-        "requested_stream_fps_millihz",
         "client_display_mode_override_millihz",
         "lossless_scaling_limit_millihz",
     ] {
