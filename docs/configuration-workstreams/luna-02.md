@@ -411,3 +411,9 @@ reservation and the existing dirty launch changes can be integrated safely.
 - `cargo fmt --check -p amaterasu-nvhttp` and `git diff --check` passed; `cargo test -p amaterasu-nvhttp` passed 181/181.
 - Strict Clippy remains red on four unused accessors awaiting their consumers, the large `Purpose::Update` variant, four boolean comparison assertions in `frame_limiter.rs`, and four cloned-reference slice assertions in product-settings tests. Exact findings were sent to L02 for a worker-owned correction; no suppressions were added.
 - `global:external_ip` remains pending effective address detection and advertisement, signed route/editor coverage, and platform/runtime qualification. This test closes no stable ID.
+
+## Coordinator validation update: NVHTTP Clippy candidate fixes (2026-09-25)
+
+- L02's lane commits `011f782528e52a814e03187b74c05225e2c90a2e` and `1dab1a02b6f09773e435ebdbdfb4b28b7076a5b7` landed on main as `08822b44` and `b8863e80`. The first replaces four false-valued boolean comparisons with `assert!`; the second boxes the update callback state and uses borrowed single-item slices in four tests.
+- `cargo fmt --check -p amaterasu-nvhttp` and `git diff --check` passed; `cargo test -p amaterasu-nvhttp` passed 181/181. Strict Clippy now reports only the four settings accessors that are waiting for L02's pending launch/stream consumers: `legacy_global_preparation`, `configured_frame_limiter`, `lan_encryption_mode`, and `wan_encryption_mode`.
+- L02 was asked to compose those accessors in its existing projection work. Do not suppress dead-code lint; rerun strict Clippy once those consumers land. No stable ID is closed by these lint-only commits.
