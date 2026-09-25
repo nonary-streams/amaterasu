@@ -197,13 +197,37 @@ pub struct ProviderCandidate {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAvailability {
     Unknown,
+    Available,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseState {
     PolicyOnly,
+    Applied,
+    AlreadyApplied,
+    NotNeeded,
     RuntimeUnavailable,
+    LeaseConflict,
+    StaleLease,
+    Restored,
+    RestoreFailed,
+    NotFound,
+}
+
+/// Caller-visible lease state. Stale entries retain their token so the owner
+/// can request cleanup after a provider or module restart.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseStatus {
+    pub lease: String,
+    pub session_id: String,
+    pub executable_path: String,
+    pub provider: String,
+    pub state: ResponseState,
+    pub applied: bool,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -214,10 +238,16 @@ pub struct OperationResponse {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Always false until a runtime adapter applies provider settings.
+    /// True only when the selected provider effect is confirmed by readback.
     pub applied: bool,
     pub state: ResponseState,
     pub provider_availability: ProviderAvailability,
+    /// Present on apply only after the exact provider state is verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
+    /// Caller-owned active, stale, or restore-pending leases returned by status.
+    pub leases: Vec<LeaseStatus>,
+    pub diagnostics: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<PolicyOnlyPlan>,
 }
@@ -528,6 +558,9 @@ pub fn build_response(operation: &Operation) -> Result<OperationResponse, Servic
         applied: false,
         state,
         provider_availability: ProviderAvailability::Unknown,
+        lease: None,
+        leases: Vec::new(),
+        diagnostics: Vec::new(),
         plan,
     })
 }
@@ -1096,5 +1129,63 @@ mod tests {
                 ServiceError::InvalidRestoreTarget
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_response_schema_only_exposes_verified_apply_leases() {
+        let lease = LeaseStatus {
+            lease: "frame-lease-1".into(),
+            session_id: "session-17".into(),
+            executable_path: executable_path(),
+            provider: "rtss".into(),
+            state: ResponseState::Applied,
+            applied: true,
+            diagnostics: Vec::new(),
+        };
+        let applied = OperationResponse {
+            ok: true,
+            version: CONTRACT_VERSION,
+            action: "apply".into(),
+            session_id: Some("session-17".into()),
+            applied: true,
+            state: ResponseState::Applied,
+            provider_availability: ProviderAvailability::Available,
+            lease: Some(lease.lease.clone()),
+            leases: vec![lease.clone()],
+            diagnostics: Vec::new(),
+            plan: None,
+        };
+        let value = serde_json::to_value(applied).unwrap();
+        assert_eq!(value["state"], "applied");
+        assert_eq!(value["provider_availability"], "available");
+        assert_eq!(value["lease"], "frame-lease-1");
+        assert_eq!(value["leases"][0]["lease"], "frame-lease-1");
+        assert_eq!(value["leases"][0]["applied"], true);
+
+        let stale = LeaseStatus {
+            state: ResponseState::StaleLease,
+            applied: false,
+            diagnostics: vec!["provider_state_changed".into()],
+            ..lease
+        };
+        let response = OperationResponse {
+            ok: true,
+            version: CONTRACT_VERSION,
+            action: "status".into(),
+            session_id: Some("session-17".into()),
+            applied: false,
+            state: ResponseState::StaleLease,
+            provider_availability: ProviderAvailability::Unavailable,
+            lease: None,
+            leases: vec![stale],
+            diagnostics: vec!["stale_lease_detected_after_restart".into()],
+            plan: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["state"], "stale_lease");
+        assert_eq!(value["applied"], false);
+        assert!(value.get("lease").is_none());
+        assert_eq!(value["leases"][0]["state"], "stale_lease");
+        assert_eq!(value["leases"][0]["applied"], false);
     }
 }
