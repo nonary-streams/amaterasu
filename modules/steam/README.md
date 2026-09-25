@@ -72,7 +72,8 @@ first (App ID breaks ties), and takes at most `recent_games`. With
 tool filtering apply before recent-game ordering and limits. `include_tools=true`
 includes every installed app; the default filters Steam types `tool`, `config`,
 `dlc`, `driver`, `music`, and `video`, plus known runtime IDs and runtime-name
-fallbacks.
+fallbacks. Type and name checks lowercase ASCII letters only; non-ASCII UTF-8
+characters retain their bytewise identity in runtime-name matching.
 
 App types are read from the configured Steam install's binary
 `appcache/appinfo.vdf`; play history is read from every numeric account's

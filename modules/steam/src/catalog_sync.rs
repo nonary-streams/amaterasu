@@ -837,7 +837,9 @@ fn is_importable(game: &Game, include_tools: bool) -> bool {
     if RUNTIME_APP_IDS.contains(&game.app_id) {
         return false;
     }
-    let name = game.name.to_lowercase();
+    // Match Vibeshine's C-locale bytewise lowercase behavior. Unicode case
+    // conversion can change UTF-8 names into strings that match runtime names.
+    let name = game.name.to_ascii_lowercase();
     !name.starts_with("proton ")
         && !name.starts_with("steam linux runtime")
         && name != "steamworks common redistributables"
@@ -1338,6 +1340,20 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn runtime_name_fallback_uses_ascii_bytewise_case_conversion() {
+        let ascii_runtime_name = game(42, "Steamworks Common Redistributables", true);
+        let non_ascii_runtime_name = game(43, "Steamwor\u{212A}s Common Redistributables", true);
+        let uppercase_tool_type = Game {
+            app_type: Some("TOOL".into()),
+            ..game(44, "Uppercase tool type", true)
+        };
+
+        assert!(!is_importable(&ascii_runtime_name, false));
+        assert!(is_importable(&non_ascii_runtime_name, false));
+        assert!(!is_importable(&uppercase_tool_type, false));
     }
 
     #[test]
