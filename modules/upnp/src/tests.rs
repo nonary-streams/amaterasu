@@ -28,6 +28,10 @@ impl FakeGateway {
         self.0.borrow_mut().fail_add_for = Some(key);
     }
 
+    fn set_remove_failure(&self, key: Option<MappingKey>) {
+        self.0.borrow_mut().fail_remove_for = key;
+    }
+
     fn mappings(&self) -> BTreeMap<MappingKey, Mapping> {
         self.0.borrow().mappings.clone()
     }
@@ -143,6 +147,59 @@ fn reconcile_updates_to_a_distinct_endpoint_and_port() {
     assert!(mappings.contains_key(&key(48000, Protocol::Tcp)));
     assert!(mappings.contains_key(&key(48000, Protocol::Udp)));
     assert!(!mappings.contains_key(&key(47989, Protocol::Tcp)));
+}
+
+#[test]
+fn reconcile_retries_failed_stale_mapping_cleanup() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let stale_mapping_key = key(47989, Protocol::Tcp);
+    let desired_endpoints = [endpoint([192, 168, 1, 20], 48000, true)];
+    fake_gateway.set_remove_failure(Some(stale_mapping_key));
+
+    let error = manager.reconcile(&desired_endpoints).unwrap_err();
+
+    assert!(matches!(error, UpnpError::CleanupFailed { .. }));
+    assert_eq!(manager.owned_mappings().count(), 3);
+    assert!(
+        manager
+            .owned_mappings()
+            .any(|mapping| mapping.key() == stale_mapping_key)
+    );
+    assert!(fake_gateway.mappings().contains_key(&stale_mapping_key));
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(48000, Protocol::Tcp))
+    );
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(48000, Protocol::Udp))
+    );
+
+    fake_gateway.set_remove_failure(None);
+    let report = manager.reconcile(&desired_endpoints).unwrap();
+
+    assert_eq!(report.created, 0);
+    assert_eq!(report.removed, 1);
+    assert_eq!(report.already_active, 2);
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.mappings().len(), 2);
+    assert!(!fake_gateway.mappings().contains_key(&stale_mapping_key));
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(48000, Protocol::Tcp))
+    );
+    assert!(
+        fake_gateway
+            .mappings()
+            .contains_key(&key(48000, Protocol::Udp))
+    );
 }
 
 #[test]
@@ -263,4 +320,39 @@ fn shutdown_removes_only_unchanged_mappings_owned_by_this_manager() {
         fake_gateway.mappings().get(&key(47989, Protocol::Udp)),
         Some(&changed_udp_mapping)
     );
+}
+
+#[test]
+fn shutdown_retries_failed_mapping_cleanup() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let failed_mapping_key = key(47989, Protocol::Tcp);
+    fake_gateway.set_remove_failure(Some(failed_mapping_key));
+
+    let error = manager.shutdown().unwrap_err();
+
+    assert!(matches!(error, UpnpError::ShutdownFailed { .. }));
+    assert_eq!(manager.owned_mappings().count(), 1);
+    assert!(
+        manager
+            .owned_mappings()
+            .any(|mapping| mapping.key() == failed_mapping_key)
+    );
+    assert_eq!(fake_gateway.mappings().len(), 1);
+    assert!(fake_gateway.mappings().contains_key(&failed_mapping_key));
+
+    fake_gateway.set_remove_failure(None);
+    assert_eq!(
+        manager.shutdown().unwrap(),
+        ShutdownReport {
+            removed: 1,
+            already_missing: 0,
+            changed_mappings_preserved: 0,
+        }
+    );
+    assert_eq!(manager.owned_mappings().count(), 0);
+    assert!(fake_gateway.mappings().is_empty());
 }
