@@ -529,9 +529,9 @@ impl Broker {
                     "video":video.effective(),"video_batch_size_fallback":video.batch_size_fallback(),
                     "audio":request["audio"],
                     "stream_audio":request["stream_audio"],
-                    "video_encrypted":request["encryption"]["video"],
-                    "audio_encrypted":request["encryption"]["audio"],
-                    "permit_legacy_audio_iv_wrap":request["encryption"]["permit_legacy_audio_iv_wrap"]});
+                    "video_encrypted":request["encryption"]["video"].as_bool().unwrap_or(false),
+                    "audio_encrypted":request["encryption"]["audio"].as_bool().unwrap_or(false),
+                    "permit_legacy_audio_iv_wrap":request["encryption"]["permit_legacy_audio_iv_wrap"].as_bool().unwrap_or(false)});
                 if request["discovery"].is_object() {
                     metadata["peer_discovery"] = json!(true);
                     metadata["video_port"] = json!(self.discovered_video_port);
