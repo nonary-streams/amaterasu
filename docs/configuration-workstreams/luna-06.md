@@ -476,3 +476,9 @@ the coordinator-owned coverage ledger.
 - L06 code candidate `f80f2a01ef5f3e6f310138f4f357b4d1d6159684` landed directly on main as `23269ee3`. The lane commit omitted the tracked production bundle, and its first coordinator build found a TypeScript property-narrowing error in locale definition validation. Coordinator correction `b7865eb` captures the options array before callback validation and regenerates `frontend/dist/app.js`.
 - `npm --prefix frontend test` passed the TypeScript typecheck and all 64 tests. `npm --prefix frontend run build` passed after the correction. The candidate's independent X-High review reported no actionable findings; tests do not exercise API/DOM sequencing.
 - `global:locale` remains pending browser/API-to-DOM sequencing, runtime behavior, and platform qualification. The selector only writes HTML language metadata; it does not claim translated console text.
+
+## Coordinator validation update: locale selector lifecycle tests (2026-09-25)
+
+- L06 test candidate `b035a1c5bbb26e39d4dbf355bd7f16ab31676222` landed on main as `416450d3`. Its tests cover missing-document registration, schema migration preserving unrelated values, revision-bound updates followed by authoritative GET readback, and nonfatal service/scope failures.
+- Coordinator commit `820a14e` corrected the fake API's cross-realm payload comparison and replaced a fixed promise-turn count with an event-loop turn. `npm --prefix frontend test` passed typecheck and all 68 tests.
+- Live signed-request integration and real-browser/platform qualification remain pending. `global:locale` is not verified.
