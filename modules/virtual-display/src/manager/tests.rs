@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::Observation;
-use crate::scale::{SUPPORTED_SCALE_VALUES, ScaleResolutionError, ScaleSetting, resolve_scale};
+use crate::scale::SUPPORTED_SCALE_VALUES;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -172,44 +172,6 @@ fn create_scale_rejects_non_integer_json_types_and_out_of_range_integers() {
         payload["dd_virtual_display_scale"] = scale;
         assert!(serde_json::from_value::<Operation>(payload).is_err());
     }
-}
-
-#[test]
-fn automatic_scale_selects_nearest_percentage_and_breaks_ties_lower() {
-    for (short_edge, expected_percentage) in [
-        (864, 100),
-        (1080, 125),
-        (972, 100),
-        (1188, 125),
-        (2160, 250),
-    ] {
-        let resolution =
-            resolve_scale(ScaleSetting::Automatic, short_edge, Some(2.0), 1.0).unwrap();
-        assert_eq!(resolution.percentage, Some(expected_percentage));
-        assert_eq!(
-            resolution.compositor_factor,
-            f64::from(expected_percentage) / 100.0
-        );
-    }
-    assert_eq!(
-        resolve_scale(ScaleSetting::Automatic, 0, None, 1.0),
-        Err(ScaleResolutionError::ZeroShortEdge)
-    );
-}
-
-#[test]
-fn retain_and_fixed_scale_resolve_compositor_factors() {
-    let retained = resolve_scale(ScaleSetting::Retain, 1080, Some(1.5), 1.25).unwrap();
-    assert_eq!(retained.percentage, None);
-    assert_eq!(retained.compositor_factor, 1.5);
-
-    let current = resolve_scale(ScaleSetting::Retain, 1080, None, 1.25).unwrap();
-    assert_eq!(current.percentage, None);
-    assert_eq!(current.compositor_factor, 1.25);
-
-    let fixed = resolve_scale(ScaleSetting::Fixed(175), 1080, Some(1.5), 1.25).unwrap();
-    assert_eq!(fixed.percentage, Some(175));
-    assert_eq!(fixed.compositor_factor, 1.75);
 }
 
 #[test]

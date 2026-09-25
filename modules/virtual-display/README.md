@@ -46,14 +46,14 @@ Requests reject unknown fields. Examples:
 Create may include the optional integer `dd_virtual_display_scale`; omission
 defaults to `0` and preserves older callers. Accepted values are `-1`, `0`,
 `100`, `125`, `150`, `175`, `200`, `225`, `250`, `300`, `350`, `400`, `450`,
-and `500`. Zero retains an existing compositor scale, or its current scale if
-there is no retained value. A positive value requests that fixed percentage
-without changing output-pixel resolution. `-1` selects the supported percentage
-nearest to `short_edge * 100 / 864`; exact ties select the lower percentage.
-This module has no DPI or compositor-scale provider, so a valid nonzero request
-returns `unsupported_scale` before any driver or native call. Zero and omission
-continue through the existing temporary-monitor create behavior. Non-integer
-JSON values and integers outside the accepted set return `invalid_request`.
+and `500`. Zero preserves the existing compositor scale, or its current scale
+when no retained value exists. `-1` requests automatic scaling, and a positive
+value requests a fixed percentage without changing output-pixel resolution.
+Automatic target resolution, retained-factor lookup, and compositor-scale
+effects are not implemented by this module. Valid nonzero requests return
+`unsupported_scale` before any driver or native call. Zero and omission continue
+through the existing temporary-monitor create behavior. Non-integer JSON values
+and integers outside the accepted set return `invalid_request`.
 
 Identity must be a nonzero canonical lowercase UUID. Resolution bounds are
 320–7680 by 200–4320; refresh is 1000–1000000 millihertz. Name is 1–31 printable
