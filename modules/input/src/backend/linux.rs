@@ -6,8 +6,11 @@ use crate::gamepad::{
 };
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
-    Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
+    effective_virtual_key,
 };
+mod linux_pen_touch;
+use linux_pen_touch::LinuxPenTouch;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
@@ -18,6 +21,21 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const ABS_PRESSURE: u16 = 0x18;
+const ABS_TILT_X: u16 = 0x1a;
+const ABS_TILT_Y: u16 = 0x1b;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_POSITION_X: u16 = 0x35;
+const ABS_MT_POSITION_Y: u16 = 0x36;
+const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_MT_PRESSURE: u16 = 0x3a;
+const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_TOUCH: u16 = 0x14a;
+const MAX_TOUCH_SLOTS: u8 = 10;
+const INPUT_PROP_DIRECT: u32 = 1;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
 const REL_HWHEEL: u16 = 6;
@@ -29,6 +47,7 @@ const UI_SET_EVBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 100);
 const UI_SET_KEYBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 101);
 const UI_SET_RELBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 102);
 const UI_SET_ABSBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 103);
+const UI_SET_PROPBIT: libc::Ioctl = libc::_IOW::<libc::c_int>(b'U' as u32, 110);
 const UI_DEV_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_setup>(b'U' as u32, 3);
 const UI_ABS_SETUP: libc::Ioctl = libc::_IOW::<libc::uinput_abs_setup>(b'U' as u32, 4);
 const UI_DEV_CREATE: libc::Ioctl = libc::_IO(b'U' as u32, 1);
@@ -71,6 +90,45 @@ impl Device {
             b"Amaterasu pointer"
         };
         create_device(file, name)
+    }
+
+    fn create_pen(path: &str) -> InputResult<Self> {
+        let file = open_uinput(path)?;
+        let fd = file.as_raw_fd();
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
+        set_bit(fd, UI_SET_KEYBIT, u32::from(BTN_TOOL_PEN))?;
+        set_bit(fd, UI_SET_KEYBIT, u32::from(BTN_TOUCH))?;
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS))?;
+        for (code, minimum, maximum) in [
+            (ABS_X, 0, i32::from(u16::MAX)),
+            (ABS_Y, 0, i32::from(u16::MAX)),
+            (ABS_PRESSURE, 0, i32::from(u16::MAX)),
+            (ABS_TILT_X, -90, 90),
+            (ABS_TILT_Y, -90, 90),
+        ] {
+            set_absolute_axis(fd, code, minimum, maximum)?;
+        }
+        create_device(file, b"Amaterasu pen tablet")
+    }
+
+    fn create_touchscreen(path: &str) -> InputResult<Self> {
+        let file = open_uinput(path)?;
+        let fd = file.as_raw_fd();
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
+        set_bit(fd, UI_SET_KEYBIT, u32::from(BTN_TOUCH))?;
+        // INPUT_PROP_DIRECT identifies a touchscreen rather than a touchpad.
+        set_bit(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT)?;
+        set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS))?;
+        for (code, minimum, maximum) in [
+            (ABS_MT_SLOT, 0, i32::from(MAX_TOUCH_SLOTS - 1)),
+            (ABS_MT_TRACKING_ID, 0, i32::MAX),
+            (ABS_MT_POSITION_X, 0, i32::from(u16::MAX)),
+            (ABS_MT_POSITION_Y, 0, i32::from(u16::MAX)),
+            (ABS_MT_PRESSURE, 0, i32::from(u16::MAX)),
+        ] {
+            set_absolute_axis(fd, code, minimum, maximum)?;
+        }
+        create_device(file, b"Amaterasu touchscreen")
     }
 
     fn create_gamepad(path: &str, controller_number: u8) -> InputResult<Self> {
@@ -159,6 +217,17 @@ fn open_uinput(path: &str) -> InputResult<File> {
         ));
     }
     Ok(file)
+}
+
+fn uinput_pen_touch_available(path: &str) -> bool {
+    let Ok(file) = open_uinput(path) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    // These capability ioctls only configure the probe descriptor. Closing it
+    // discards that setup without creating or affecting any input device.
+    set_bit(fd, UI_SET_EVBIT, u32::from(EV_ABS)).is_ok()
+        && set_bit(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT).is_ok()
 }
 
 fn create_device(file: File, name: &[u8]) -> InputResult<Device> {
@@ -278,6 +347,7 @@ pub struct LinuxBackend {
     horizontal_scroll_remainder: i32,
     gamepads: GamepadSlots<UinputGamepad>,
     gamepad_probe: Option<Device>,
+    pen_touch: LinuxPenTouch,
     controller_input_supported: bool,
     profile: GamepadProfile,
     effective_profile: Option<&'static str>,
@@ -296,6 +366,7 @@ impl LinuxBackend {
             horizontal_scroll_remainder: 0,
             gamepads: GamepadSlots::new(),
             gamepad_probe: None,
+            pen_touch: LinuxPenTouch::new(),
             controller_input_supported: false,
             profile: GamepadProfile::Auto,
             effective_profile: None,
@@ -313,6 +384,18 @@ impl Backend for LinuxBackend {
     }
     fn absolute_pointer(&self) -> bool {
         false
+    }
+    fn pen_touch_supported(&self) -> bool {
+        // UInput availability requires a writable character device (commonly
+        // granted through a udev rule or membership in the uinput group).
+        // Compositor acceptance and coordinate calibration need platform QA.
+        uinput_pen_touch_available(&self.path)
+    }
+    fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
+        Some(match device {
+            PenTouchDevice::Pen => 1,
+            PenTouchDevice::Touch => usize::from(MAX_TOUCH_SLOTS),
+        })
     }
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
@@ -335,6 +418,12 @@ impl Backend for LinuxBackend {
     }
     fn validate(&self, event: &Event) -> InputResult<()> {
         event.validate()?;
+        if matches!(event, Event::PenTouch { .. }) && !self.pen_touch_supported() {
+            return Err(InputError::new(
+                "pen_touch_unavailable",
+                "Linux pen/touch requires permission to open the uinput character device",
+            ));
+        }
         if matches!(event, Event::Controller { .. }) && !self.controller_input_supported {
             return Err(InputError::new(
                 "controller_unavailable",
@@ -376,6 +465,7 @@ impl Backend for LinuxBackend {
             || self.pointer.is_some()
             || !self.gamepads.is_empty()
             || self.gamepad_probe.is_some()
+            || !self.pen_touch.is_idle()
         {
             return Err(InputError::new(
                 "backend_busy",
@@ -421,6 +511,9 @@ impl Backend for LinuxBackend {
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
         self.validate(event)?;
+        if matches!(event, Event::PenTouch { .. }) {
+            return self.pen_touch.inject(&self.path, event);
+        }
         if let Event::Controller {
             number,
             active_mask,
@@ -537,6 +630,7 @@ impl Backend for LinuxBackend {
         }
     }
     fn stop(&mut self) -> InputResult<()> {
+        let pen_touch_result = self.pen_touch.stop();
         self.gamepads.stop()?;
         if let Some(probe) = self.gamepad_probe.as_mut() {
             probe.destroy()?;
@@ -550,7 +644,7 @@ impl Backend for LinuxBackend {
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
-        Ok(())
+        pen_touch_result
     }
 
     fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {
@@ -606,6 +700,22 @@ mod profile_tests {
                 .gamepad_unavailable_reason()
                 .unwrap()
                 .contains("ds4")
+        );
+    }
+
+    #[test]
+    fn pen_touch_capability_is_false_when_uinput_cannot_be_opened() {
+        let backend = LinuxBackend::new("/missing/uinput".into());
+        assert!(!backend.pen_touch_supported());
+    }
+
+    #[test]
+    fn pen_touch_contact_limits_match_the_native_uinput_devices() {
+        let backend = LinuxBackend::new("/dev/uinput".into());
+        assert_eq!(backend.pen_touch_max_contacts(PenTouchDevice::Pen), Some(1));
+        assert_eq!(
+            backend.pen_touch_max_contacts(PenTouchDevice::Touch),
+            Some(usize::from(MAX_TOUCH_SLOTS))
         );
     }
 }
@@ -837,6 +947,25 @@ fn set_bit(fd: RawFd, request: libc::Ioctl, bit: u32) -> InputResult<()> {
     // SAFETY: capability ioctls take a scalar bit number, not a pointer; fd is live.
     check(unsafe { libc::ioctl(fd, request, bit as libc::c_int) })
 }
+fn set_absolute_axis(fd: RawFd, code: u16, minimum: i32, maximum: i32) -> InputResult<()> {
+    set_bit(fd, UI_SET_ABSBIT, u32::from(code))?;
+    // SAFETY: uinput_abs_setup and input_absinfo are integer-only Linux UAPI
+    // records, and all fields are initialized before the kernel reads them.
+    let setup = libc::uinput_abs_setup {
+        code,
+        absinfo: libc::input_absinfo {
+            value: 0,
+            minimum,
+            maximum,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        },
+    };
+    // SAFETY: fd is a live owned uinput descriptor; setup stays valid for the
+    // exact uinput_abs_setup size encoded by UI_ABS_SETUP.
+    check(unsafe { libc::ioctl(fd, UI_ABS_SETUP, &setup) })
+}
 fn check(result: libc::c_int) -> InputResult<()> {
     if result < 0 {
         Err(system_error(std::io::Error::last_os_error()))
@@ -860,6 +989,7 @@ const _: () = {
     assert!(UI_SET_KEYBIT == 0x4004_5565);
     assert!(UI_SET_RELBIT == 0x4004_5566);
     assert!(UI_SET_ABSBIT == 0x4004_5567);
+    assert!(UI_SET_PROPBIT == 0x4004_556e);
     assert!(UI_DEV_CREATE == 0x5501);
     assert!(UI_DEV_DESTROY == 0x5502);
     assert!(std::mem::size_of::<libc::uinput_abs_setup>() == 28);
