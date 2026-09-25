@@ -323,3 +323,37 @@ Continue an independent network-owned RTSP/media runtime slice while the coordin
 ### Next slice
 
 Continue only with an independent, version-approved network slice or an already-reserved launch projection. Do not expand v17, modify the encryption mismatch guard, write L06 editor paths, or land `db14b28e` without the required dependency and integration gates.
+
+## Coordinator main validation: scoped stream controls (2026-09-25)
+
+- Luna03's independent read-only review found one P2 in `db14b28e`: the global
+  bitrate minimum was checked before client/application precedence. The focused
+  correction is source commit `be11030282ae9b067c3511819c65037719161b2a`; the
+  required four precedence cases were added there. The pairing semantic-test
+  correction is `2d90b0319da825fcebf6718ca5b67b0e3b576294`.
+- The coordinator landed the ordered source commits
+  `db14b28e5b0d1da50382f02b02052c4ebc67feb4`,
+  `be11030282ae9b067c3511819c65037719161b2a`, and
+  `2d90b0319da825fcebf6718ca5b67b0e3b576294` on main as
+  `592c479f279f967304826f7513d995143c0cf11d`,
+  `ce27aa5550a63e12d366d6af6be2f12abf62d9a4`, and
+  `ca207e527ff39de638bd3f8a387ddcbc2cd278f3`, respectively. At validation
+  tip `ca207e527ff39de638bd3f8a387ddcbc2cd278f3`, format passed, NVHTTP passed
+  163/163, pairing passed 37/37, RTSP passed 67/67, and strict Clippy passed
+  for all three packages. This resolves the review/integration hold for the
+  main landing. The later main tip is `0330b471965fabf026cd86173d1a3cc0480f186e`.
+- These are coordinator source-checkout results; no Cargo tests, builds, or
+  Clippy were run in this lightweight lane. The full configuration parity for
+  `global:max_bitrate` and related stream-control IDs remains pending editor,
+  persistence, and runtime qualification. The coordinator-owned coverage ledger
+  remains unchanged.
+- At lane head `7d3aadf87339c265460d3d4e5cc2701a2fdb3cb0`, the pre-existing
+  uncommitted NVHTTP, pairing protocol, RTSP model, and stream-session launch
+  projection paths remain preserved. `modules/pairing/src/migration.rs` remains
+  untouched. The independent UPnP worker is isolated to `modules/upnp/**`.
+
+### Next slice
+
+Finish the isolated UPnP lifecycle candidate and request L01 workspace/version
+coordination. Keep the AV1/audio projection work pending until its exact path
+reservation and the existing dirty launch changes can be integrated safely.
