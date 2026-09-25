@@ -695,15 +695,12 @@ fn catalog_records(
         })
         .collect::<Vec<_>>();
     if !settings.sync_all_installed {
+        let max_age_seconds = u64::from(settings.recent_max_age_days) * 24 * 60 * 60;
         selected.retain(|game| {
             let Some(last_played) = game.last_played.filter(|timestamp| *timestamp > 0) else {
                 return false;
             };
-            if last_played > now {
-                return false;
-            }
-            let max_age_days = u64::from(settings.recent_max_age_days);
-            max_age_days == 0 || now - last_played <= max_age_days * 24 * 60 * 60
+            max_age_seconds == 0 || (last_played <= now && now - last_played <= max_age_seconds)
         });
         selected.sort_by(|left, right| {
             right
@@ -1131,6 +1128,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["steam:10", "steam:40"]
         );
+    }
+
+    #[test]
+    fn zero_recent_max_age_days_does_not_filter_future_timestamps() {
+        let mut future_game = game(70, "Future timestamp", true);
+        future_game.last_played = Some(1_000_001);
+        let games = [(70, future_game)].into_iter().collect();
+        let settings = ProductSettings {
+            recent_games: 1,
+            recent_max_age_days: 0,
+            ..ProductSettings::default()
+        };
+        let executable = std::env::current_exe().unwrap();
+
+        let records = catalog_records(&games, &settings, &executable, 1_000_000).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["source_id"], "steam:70");
+
+        let age_limited_settings = ProductSettings {
+            recent_max_age_days: 1,
+            ..settings
+        };
+        let age_limited_records =
+            catalog_records(&games, &age_limited_settings, &executable, 1_000_000).unwrap();
+
+        assert!(age_limited_records.is_empty());
     }
 
     #[test]

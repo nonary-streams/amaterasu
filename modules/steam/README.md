@@ -66,8 +66,10 @@ even when discovery is unchanged. Failed or incomplete attempts do not cache a
 fingerprint; a new automatic scan is scheduled 30 seconds after the failure.
 
 With `sync_all_installed=false`, the provider selects installed games with
-nonzero local `LastPlayed`, keeps those within the configured age, orders newest
-first (App ID breaks ties), and takes at most `recent_games`. With
+nonzero local `LastPlayed`, filters future timestamps and entries older than the
+configured age when `recent_max_age_days` is nonzero, orders newest first (App ID
+breaks ties), and takes at most `recent_games`. A zero age disables both age
+checks, including the future timestamp check. With
 `sync_all_installed=true`, every installed game is selected. Exclusions and
 tool filtering apply before recent-game ordering and limits. `include_tools=true`
 includes every installed app; the default filters Steam types `tool`, `config`,
