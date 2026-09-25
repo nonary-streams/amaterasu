@@ -313,6 +313,14 @@ fn normalized_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+// Win32 ERROR_NO_MORE_FILES. It is the only failed Toolhelp call that proves
+// the process snapshot ended normally rather than being incomplete.
+const TOOLHELP_ERROR_NO_MORE_FILES: u32 = 18;
+
+fn process_enumeration_step_is_complete(found_entry: bool, last_error: u32) -> bool {
+    found_entry || last_error == TOOLHELP_ERROR_NO_MORE_FILES
+}
+
 fn close_target_matches(
     expected_path: &str,
     expected_process_id: u32,
@@ -364,11 +372,13 @@ fn query_playnite_association() -> Option<PathBuf> {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Installation, close_target_matches, normalized_path};
+    use super::{
+        Installation, close_target_matches, normalized_path, process_enumeration_step_is_complete,
+    };
     use crate::discovery::ProcessImage;
     use std::collections::BTreeMap;
     use std::mem::{size_of, zeroed};
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HWND, LPARAM};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -397,6 +407,19 @@ mod windows {
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         // SAFETY: snapshot is valid and entry is a writable, correctly sized buffer.
         let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        if !process_enumeration_step_is_complete(
+            has_entry,
+            if has_entry {
+                0
+            } else {
+                // SAFETY: GetLastError reports the immediately preceding failed Toolhelp call.
+                unsafe { GetLastError() }
+            },
+        ) {
+            // SAFETY: snapshot is the owned process-list handle created above.
+            unsafe { CloseHandle(snapshot) };
+            return None;
+        }
         let mut exact_processes = Vec::new();
         let mut complete = true;
         while has_entry {
@@ -452,6 +475,15 @@ mod windows {
             }
             // SAFETY: snapshot is still valid and entry is writable.
             has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+            if !has_entry
+                && !process_enumeration_step_is_complete(
+                    false,
+                    // SAFETY: GetLastError reports the immediately preceding failed Toolhelp call.
+                    unsafe { GetLastError() },
+                )
+            {
+                complete = false;
+            }
         }
         // SAFETY: snapshot is the owned process-list handle created above.
         unsafe { CloseHandle(snapshot) };
@@ -576,7 +608,8 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::{
-        Installation, close_target_matches, same_installation, valid_associated_executable_name,
+        Installation, close_target_matches, process_enumeration_step_is_complete,
+        same_installation, valid_associated_executable_name,
     };
     use crate::discovery::ProcessImage;
     use std::path::PathBuf;
@@ -590,6 +623,13 @@ mod tests {
         ));
         assert!(!valid_associated_executable_name("Playnite.exe"));
         assert!(!valid_associated_executable_name("cmd.exe"));
+    }
+
+    #[test]
+    fn exact_image_watchdog_requires_a_normal_toolhelp_end_marker() {
+        assert!(process_enumeration_step_is_complete(true, u32::MAX));
+        assert!(process_enumeration_step_is_complete(false, 18));
+        assert!(!process_enumeration_step_is_complete(false, 5));
     }
 
     #[test]

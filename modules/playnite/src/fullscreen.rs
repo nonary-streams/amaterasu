@@ -1500,7 +1500,7 @@ mod tests {
             &sessions,
             &ticket,
             status(FullscreenStatusKind::GameStopped, Some(game_id)),
-            old_extension,
+            old_extension.clone(),
         );
         sessions.advance_with(
             now + Duration::from_secs(5),
@@ -1560,6 +1560,63 @@ mod tests {
             sessions.by_ticket[&ticket]
                 .retired_extension_processes
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn queued_shutdown_handoff_precedes_disconnect_and_later_old_events_are_discarded() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let old_extension = extension_process(31, 310);
+        let new_extension = extension_process(32, 320);
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStarted, Some(game_id)),
+            old_extension.clone(),
+        );
+        sessions
+            .by_ticket
+            .get(&ticket)
+            .unwrap()
+            .watch_event_sender
+            .send(FullscreenWatchEvent::Disconnected {
+                extension_process: old_extension.clone(),
+            })
+            .unwrap();
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStopped, Some(game_id)),
+            old_extension.clone(),
+        );
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStarted, Some(game_id)),
+            new_extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            &[fullscreen_process(80), new_extension],
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("a shutdown handoff does not relaunch"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert!(
+            sessions.by_ticket[&ticket]
+                .retired_extension_processes
+                .contains(&old_extension)
+        );
+        assert!(
+            !sessions.by_ticket[&ticket]
+                .active_game
+                .as_ref()
+                .unwrap()
+                .stop_observed
         );
     }
 
