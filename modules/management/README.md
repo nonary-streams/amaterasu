@@ -62,7 +62,7 @@ the remember-me setting controls refresh lifetime, not browser-storage persisten
 | `/v1/application/` | launch | `application.launch` |
 | `/v1/application/` | terminate | `application.terminate` |
 | `/v1/steam/` | list, status | `steam.read` |
-| `/v1/steam/` | refresh | `steam.refresh` |
+| `/v1/steam/` | refresh, force_sync | `steam.refresh` |
 | `/v1/diagnostics/` | query, counters | `diagnostics.read` |
 | `/v1/diagnostics/` | record, increment | `diagnostics.write` |
 | `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
@@ -77,6 +77,12 @@ Example authenticated request body for `/v1/catalog/create`:
 ```json
 {"expected_revision":0,"entry":{"name":"Example","launch":{"kind":"application","path":"/Applications/Example.app"}}}
 ```
+
+`POST /v1/steam/force_sync` accepts only `{}` and requires `steam.refresh`. It
+dispatches the fixed `force_sync` action to `amaterasu.steam/1` as
+`amaterasu.management`. This is an in-memory, one-shot request; it does not add
+a persisted force-sync setting or require a Steam schema version change. It is
+available even when automatic catalog sync is disabled.
 
 Business service JSON is returned unchanged with HTTP 200, including domain errors
 such as revision conflicts; clients must inspect `ok`. Missing bearer yields 401,

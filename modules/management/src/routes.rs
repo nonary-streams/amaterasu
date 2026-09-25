@@ -93,6 +93,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         ("steam", "artwork_read") => ("amaterasu.steam/1", "artwork_read", Some("steam.read")),
         ("steam", "status") => ("amaterasu.steam/1", "status", Some("steam.read")),
         ("steam", "refresh") => ("amaterasu.steam/1", "refresh", Some("steam.refresh")),
+        ("steam", "force_sync") => ("amaterasu.steam/1", "force_sync", Some("steam.refresh")),
         ("steam", "settings") => (
             "amaterasu.steam/1",
             "settings_get",
@@ -184,7 +185,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         service,
         action,
         scope,
-        requires_empty_body: domain == "media",
+        requires_empty_body: domain == "media" || (domain == "steam" && action == "force_sync"),
     })
 }
 
@@ -914,6 +915,28 @@ mod tests {
                 "accepted malformed Steam settings payload: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn steam_force_sync_route_is_fixed_scoped_and_requires_an_empty_object() {
+        let route = resolve("/v1/steam/force_sync").unwrap();
+        assert_eq!(route.service, "amaterasu.steam/1");
+        assert_eq!(route.action, "force_sync");
+        assert_eq!(route.scope, Some("steam.refresh"));
+        assert!(route.requires_empty_body);
+        assert_eq!(
+            payload(route, br#"{}"#).unwrap(),
+            serde_json::json!({"action":"force_sync"})
+        );
+        for invalid_body in [
+            br#"{"force":true}"#.as_slice(),
+            br#"{"action":"refresh"}"#,
+            br#"[]"#,
+            br#"null"#,
+        ] {
+            assert!(payload(route, invalid_body).is_err());
+        }
+        assert!(resolve("/v1/steam/force_sync/extra").is_none());
     }
 
     #[test]

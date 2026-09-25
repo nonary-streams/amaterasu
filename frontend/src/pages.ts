@@ -441,11 +441,48 @@ namespace Amaterasu {
     void load();
   }
 
+  interface SteamCatalogSyncStatus {
+    enabled: boolean;
+    syncing: boolean;
+    force_sync_pending: boolean;
+    last_error: string | null;
+  }
+
+  interface SteamForceSyncStatus extends SteamStatus {
+    settings_ready: boolean;
+    force_sync_pending: boolean;
+    catalog_sync: SteamCatalogSyncStatus;
+  }
+
+  type SteamForceSyncReply =
+    | (SteamForceSyncStatus & { ok: true; accepted: true })
+    | { ok: false; code: string };
+
+  export function steamForceSyncOutcome(
+    provider: SteamForceSyncStatus,
+  ): "pending" | "success" | "failure" {
+    if (provider.enabled === false) return "failure";
+    if (
+      provider.force_sync_pending !== false ||
+      provider.catalog_sync?.force_sync_pending !== false
+    ) {
+      return "pending";
+    }
+    return provider.complete && provider.catalog_sync?.last_error === null
+      ? "success"
+      : "failure";
+  }
+
   export function renderSteam(context: PageContext): void {
     const area = el("div");
     const status = el("div");
     let revision: number | undefined;
     let after: number | undefined;
+    let providerStatus: SteamForceSyncStatus | undefined;
+    let forceSyncPending = false;
+    let forceSyncPollTimer: number | undefined;
+    let forceSyncPollGeneration = 0;
+    let forceSyncControl: HTMLButtonElement | undefined;
     const history: (number | undefined)[] = [undefined];
     const scan = button(
       "Scan libraries",
@@ -462,11 +499,190 @@ namespace Amaterasu {
         }),
       "primary",
     );
+
+    function updateForceSyncControl(): void {
+      if (!forceSyncControl) return;
+      const allowed = context.api.allows("steam.refresh");
+      forceSyncControl.hidden = !allowed;
+      forceSyncControl.disabled =
+        !allowed ||
+        providerStatus?.enabled === false ||
+        providerStatus?.settings_ready === false ||
+        forceSyncPending;
+    }
+
+    function stopForceSyncPolling(): void {
+      forceSyncPollGeneration += 1;
+      if (forceSyncPollTimer !== undefined) {
+        window.clearTimeout(forceSyncPollTimer);
+        forceSyncPollTimer = undefined;
+      }
+    }
+
+    function stopUnobservableForceSync(): void {
+      if (!forceSyncPending) return;
+      forceSyncPending = false;
+      stopForceSyncPolling();
+      updateForceSyncControl();
+      const message =
+        "Force catalog sync was accepted, but this session lacks steam.read and cannot check its status.";
+      status.replaceChildren(el("p", "notice warning", message));
+      context.notify(message);
+    }
+
+    function finishForceSync(provider: SteamForceSyncStatus): void {
+      const outcome = steamForceSyncOutcome(provider);
+      if (outcome === "pending") return;
+      forceSyncPending = false;
+      stopForceSyncPolling();
+      updateForceSyncControl();
+      if (outcome === "success") {
+        status.replaceChildren(
+          el("p", "notice good", "Steam discovery completed and catalog sync succeeded."),
+        );
+        context.notify("Steam discovery completed and catalog sync succeeded.");
+        return;
+      }
+
+      const reason = provider.catalog_sync?.last_error;
+      const message = reason
+        ? `Steam catalog sync did not complete: ${reason}`
+        : provider.enabled === false
+          ? "Steam discovery was disabled; no catalog sync was confirmed."
+          : provider.complete
+            ? "Steam catalog sync ended without a confirmed successful result."
+            : "Steam discovery was incomplete; no catalog sync was confirmed.";
+      status.replaceChildren(el("p", "notice warning", message));
+      context.notify(message);
+    }
+
+    async function pollForceSync(generation: number): Promise<void> {
+      if (!context.content.isConnected) {
+        stopForceSyncPolling();
+        return;
+      }
+      if (!context.api.allows("steam.read")) {
+        stopUnobservableForceSync();
+        return;
+      }
+      if (
+        generation !== forceSyncPollGeneration ||
+        !forceSyncPending ||
+        !context.content.isConnected
+      ) {
+        return;
+      }
+      try {
+        const provider = await context.api.post<SteamForceSyncStatus>(
+          "steam/status",
+        );
+        if (
+          generation !== forceSyncPollGeneration ||
+          !forceSyncPending ||
+          !context.content.isConnected
+        ) {
+          return;
+        }
+        providerStatus = provider;
+        finishForceSync(provider);
+        updateForceSyncControl();
+        if (!forceSyncPending && context.content.isConnected) await load(false);
+      } catch (error) {
+        if (
+          generation !== forceSyncPollGeneration ||
+          !forceSyncPending ||
+          !context.content.isConnected
+        ) {
+          return;
+        }
+        if (!context.api.allows("steam.read")) {
+          stopUnobservableForceSync();
+          return;
+        }
+        status.replaceChildren(errorPanel(error));
+      }
+
+      if (
+        generation === forceSyncPollGeneration &&
+        forceSyncPending &&
+        context.content.isConnected
+      ) {
+        forceSyncPollTimer = window.setTimeout(() => {
+          forceSyncPollTimer = undefined;
+          void pollForceSync(generation);
+        }, 1000);
+      }
+    }
+
+    function startForceSyncPolling(): void {
+      if (!forceSyncPending || !context.content.isConnected) return;
+      if (!context.api.allows("steam.read")) {
+        stopUnobservableForceSync();
+        return;
+      }
+      stopForceSyncPolling();
+      const generation = forceSyncPollGeneration;
+      forceSyncPollTimer = window.setTimeout(() => {
+        forceSyncPollTimer = undefined;
+        void pollForceSync(generation);
+      }, 1000);
+    }
+
+    async function requestForceSync(): Promise<void> {
+      const target = forceSyncControl;
+      if (!target) return;
+      await runAction(target, status, async () => {
+        const reply = await context.api.post<SteamForceSyncReply>(
+          "steam/force_sync",
+        );
+        if (reply.ok !== true || reply.accepted !== true) {
+          throw new Error(
+            reply.code
+              ? `Force catalog sync was not accepted: ${reply.code}`
+              : "Force catalog sync was not accepted.",
+          );
+        }
+        if (
+          reply.force_sync_pending !== true ||
+          reply.catalog_sync.force_sync_pending !== true
+        ) {
+          throw new Error("Force catalog sync returned no pending status.");
+        }
+
+        forceSyncPending = true;
+        providerStatus = reply;
+        status.replaceChildren(
+          el(
+            "p",
+            "notice",
+            "Force catalog sync accepted. Waiting for a complete Steam scan.",
+          ),
+        );
+        updateForceSyncControl();
+        if (!context.content.isConnected) return;
+        if (!context.api.allows("steam.read")) {
+          stopUnobservableForceSync();
+          return;
+        }
+        await load();
+        startForceSyncPolling();
+      });
+      updateForceSyncControl();
+    }
+
+    const canForceSync = context.api.allows("steam.refresh");
+    if (canForceSync) {
+      forceSyncControl = button(
+        "Force catalog sync",
+        requestForceSync,
+      );
+    }
+    updateForceSyncControl();
     scan.disabled = !context.api.allows("steam.refresh");
     context.content.append(
       sectionHeading(
         "Steam library",
-        "Read-only discovery from the Steam roots configured on this host.",
+        "Discover local Steam games and optionally sync a complete scan into the catalog.",
         button("Refresh", () => {
           revision = undefined;
           after = undefined;
@@ -474,24 +690,42 @@ namespace Amaterasu {
           return load();
         }),
         scan,
+        forceSyncControl,
       ),
       status,
       area,
     );
-    async function load(): Promise<void> {
+    async function load(refreshProviderStatus = true): Promise<void> {
+      if (!context.api.allows("steam.read")) {
+        if (context.content.isConnected) {
+          area.replaceChildren(
+            empty(
+              "Steam status unavailable",
+              "This session can request a Steam force sync but needs steam.read to inspect discoveries or track its progress.",
+            ),
+          );
+        }
+        return;
+      }
       try {
+        const providerRequest = refreshProviderStatus
+          ? context.api.post<SteamForceSyncStatus>("steam/status")
+          : Promise.resolve(providerStatus);
         const [reply, provider] = await Promise.all([
           context.api.post<SteamReply>("steam/list", {
             ...(revision != null ? { revision } : {}),
             ...(after != null ? { after } : {}),
             limit: 16,
           }),
-          context.api.post<SteamStatus>("steam/status"),
+          providerRequest,
         ]);
-        if (!context.content.isConnected) return;
+        if (!context.content.isConnected || !provider) return;
         revision = reply.revision;
+        providerStatus = provider;
         scan.disabled =
           !context.api.allows("steam.refresh") || provider.enabled === false;
+        if (forceSyncPending) finishForceSync(provider);
+        updateForceSyncControl();
         const rows = reply.games.map((game) => [
           el(
             "div",
