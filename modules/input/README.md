@@ -300,13 +300,14 @@ At most 128 keys/buttons and 16 pen/touch contacts may be held. Supported events
   `phase` (`down`, `move`, `up`, or `cancel`), and normalized absolute `x`/`y`
   coordinates (`u16`, 0–65535). Optional pressure is finite and normalized to
   0–1. Optional pen tilt must provide both `tilt_x` and `tilt_y`, each from
-  -90 to 90 degrees; touch tilt is rejected. Contact ownership is keyed by
-  (`device`, `pointer_id`): Down must create a free identity, and Move, Up, and
-  Cancel must refer to an identity held by this lease. A duplicate Down or
-  unowned event is rejected before injection. Repeated identical Move samples
-  are coalesced. Disable, lease finish, release, expiry, failure, and shutdown
-  cancel only the exact contacts owned by that lease; failed cancellations stay
-  owned and retry through the lease cleanup path.
+  -90 to 90 degrees; touch tilt is rejected. When enabled for the lease,
+  contacts are keyed by (`device`, `pointer_id`): Down must create a free
+  identity, and Move, Up, and Cancel must refer to an identity held by this
+  lease. A duplicate Down or unowned event is rejected before injection.
+  Repeated identical Move samples are coalesced. Policy-suppressed events remain
+  accepted without creating contacts. Lease release, expiry, failure, and
+  shutdown cancel only the exact contacts injected by that lease; failed
+  cancellations stay owned and retry through the lease cleanup path.
 
 Linux key example:
 
