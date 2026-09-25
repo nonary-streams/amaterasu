@@ -634,3 +634,36 @@ The coordinator reported that `cargo test -p amaterasu-video` compiled but faile
 ### Remaining parity gaps
 
 This correction restores the intended request-mode semantics but does not complete `global:capture`. Coordinator validation of the corrected main candidate, L02 persistence/defaults and the sole v16-to-v17 migration, L06 management authority/readback, scoped launch projection, host integration, provider runtime effects, and Windows DXGI/WGC qualification remain pending.
+
+## Slice 18: Video pipeline strict Clippy correction
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Lane base SHA: `3a6ea040e954b355e2ff9e06889cbf47fa2f8eee`
+- Worker source commit: `b58f89365fcb21f1eb302c9eac93af749f1cae4e`
+- Lane code commit: `21a994e903bf0e83e8ae8092d666b6ff84bd1728`
+- Worker/lane tree: `d220cf038b7216ad6e55c978d14cc29ce1fb5b66`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Coordinator source candidate: `f1a1d792264fcce581d4fd7e0be7953acabc3499`
+- Coordinator main code commit: `fad027688eec7325f09fbbe565153020c624d758`
+- Coordinator main handoff commit: `bccf4e08be032a0a95c92fbb0e569542e5ef1f7a`
+- Scope: strict Clippy cleanup in the capture rejection path. This commit closes no stable ID; `global:capture` and all other assigned IDs remain pending.
+
+### Correction and review
+
+The coordinator reported `cargo fmt --check -p amaterasu-video` passed and `cargo test -p amaterasu-video` passed 80/80 on the main code candidate. Strict Clippy (`cargo clippy -p amaterasu-video --all-targets -- -D warnings`) then reported `collapsible_if` at `modules/video/src/pipeline.rs:844` and `explicit_auto_deref` at `modules/video/src/pipeline/tests.rs:60`.
+
+The production edit combines the capture-stage, explicit rejection, and `unsupported_platform` predicates while keeping the existing fallback, failed-step, and `return false` behavior. The test edit passes the stored code through reference coercion. Parent review found no behavior changes or unrelated edits.
+
+### Changed paths, worker, and checks
+
+- `modules/video/src/pipeline.rs`
+- `modules/video/src/pipeline/tests.rs`
+- Worker `/root/video_strict_clippy_correction` used isolated worktree `D:/sources/worktrees/amaterasu-video-strict-clippy-correction-xhigh`, branch `codex/luna03-video-strict-clippy-correction-xhigh`, based on the clean lane base above. Its actual session attribution was verified as `gpt-6-luna` / `xhigh` (thread `01a0d6b7-e0f7-72e2-9fbc-923a5a5209b9`). It committed only the two paths as `b58f89365fcb21f1eb302c9eac93af749f1cae4e`, with the required plan trailers and configured Nonary identity.
+- Parent verified the worker parent SHA, exact changed paths, commit trailers, model attribution, and clean worktree; reviewed the complete diff; and cherry-picked the commit as lane code commit `21a994e903bf0e83e8ae8092d666b6ff84bd1728`. The worker and lane trees match.
+- Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/pipeline.rs modules/video/src/pipeline/tests.rs`, `git diff --check`, and `git show --check`.
+- Lane code commit `21a994e903bf0e83e8ae8092d666b6ff84bd1728` was directly cherry-picked to main as `d58139c7`. The coordinator is rerunning `cargo fmt --check -p amaterasu-video`, `cargo test -p amaterasu-video`, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings`; results remain pending.
+
+### Remaining parity gaps
+
+This is a lint-only correction and adds no persistence, defaults, validation, management authority/editor behavior, host registration, scoped launch projection, provider effect, or platform qualification. Keep `global:capture` pending until those requirements and coordinator validation are reviewed; Windows DXGI/WGC runtime qualification also remains outstanding. No stable ID is marked verified by this slice.
