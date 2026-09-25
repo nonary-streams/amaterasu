@@ -105,17 +105,18 @@ impl ModeRemapping {
             };
 
         for (entry_index, entry) in entries.iter().enumerate() {
-            let parsed = parse_entry(kind, entry, entry_index)?;
-            if parsed.final_resolution.is_none() && parsed.final_refresh_rate.is_none() {
-                return Err(ModeRemappingError::MissingFinalOutput { entry_index });
-            }
-
             // The pinned configuration contract gates rules that use resolution
             // fields on the explicit client-side optimization setting.
             if !context.optimize_game_settings
-                && (parsed.requested_resolution.is_some() || parsed.final_resolution.is_some())
+                && (!entry.requested_resolution.trim().is_empty()
+                    || !entry.final_resolution.trim().is_empty())
             {
                 continue;
+            }
+
+            let parsed = parse_entry(kind, entry, entry_index)?;
+            if parsed.final_resolution.is_none() && parsed.final_refresh_rate.is_none() {
+                return Err(ModeRemappingError::MissingFinalOutput { entry_index });
             }
 
             if parsed
@@ -501,6 +502,32 @@ mod tests {
         assert_eq!(
             remapping.resolve(context(true, true, true), requested),
             Ok(mode(2560, 1440, 120, 1))
+        );
+    }
+
+    #[test]
+    fn malformed_resolution_rule_is_ignored_when_optimization_is_disabled() {
+        let remapping = ModeRemapping {
+            mixed: vec![
+                ModeRemappingEntry {
+                    requested_fps: "60".into(),
+                    final_refresh_rate: "120".into(),
+                    final_resolution: "invalid".into(),
+                    ..ModeRemappingEntry::default()
+                },
+                ModeRemappingEntry {
+                    requested_fps: "60".into(),
+                    final_refresh_rate: "90".into(),
+                    ..ModeRemappingEntry::default()
+                },
+            ],
+            ..ModeRemapping::default()
+        };
+        let requested = mode(1920, 1080, 60, 1);
+
+        assert_eq!(
+            remapping.resolve(context(true, true, false), requested),
+            Ok(mode(1920, 1080, 90, 1))
         );
     }
 }
