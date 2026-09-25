@@ -641,6 +641,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_configured_primary_does_not_promote_auxiliary_state() {
+        let source = temporary_directory("missing-primary-with-auxiliary-state");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("private/auxiliary.json"),
+            credential_record("Auxiliary", "auxiliary password", "AuxiliarySalt123"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = private/not-created.json\nvibeshine_file_state = private/auxiliary.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
     fn nonempty_credentials_file_overrides_primary_file_state() {
         let source = temporary_directory("credentials-file-override");
         std::fs::create_dir_all(source.join("private")).unwrap();
