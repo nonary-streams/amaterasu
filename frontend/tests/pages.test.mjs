@@ -346,6 +346,50 @@ test("Steam force sync does not poll after an immediate unaccepted response", as
   assert.equal(harness.timers.size, 0);
 });
 
+test("Steam force sync rejects responses without exact settings readiness", async () => {
+  for (const readiness of [false, undefined]) {
+    const accepted = {
+      ...syncStatus({
+        scanning: true,
+        force_sync_pending: true,
+        catalog_sync: { syncing: true, force_sync_pending: true },
+      }),
+      ok: true,
+      accepted: true,
+    };
+    if (readiness === false) accepted.settings_ready = false;
+    else delete accepted.settings_ready;
+
+    const harness = createHarness({
+      allowsRefresh: true,
+      forceReply: accepted,
+      statuses: [syncStatus()],
+    });
+
+    await waitFor(
+      () => pageReady(harness.content),
+      "initial Steam page render",
+    );
+    findButton(harness.content, "Force catalog sync").click();
+    await waitFor(
+      () =>
+        harness.content.textContent.includes(
+          "Force catalog sync was not accepted.",
+        ),
+      "the rejected malformed force-sync response",
+    );
+    assert.equal(
+      harness.calls.filter((call) => call.route === "steam/force_sync").length,
+      1,
+    );
+    assert.equal(
+      harness.calls.filter((call) => call.route === "steam/status").length,
+      1,
+    );
+    assert.equal(harness.timers.size, 0);
+  }
+});
+
 test("Steam force sync reports unobservable progress to refresh-only sessions", async () => {
   const pending = syncStatus({
     force_sync_pending: true,

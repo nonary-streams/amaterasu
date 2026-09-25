@@ -454,9 +454,14 @@ namespace Amaterasu {
     catalog_sync: SteamCatalogSyncStatus;
   }
 
-  type SteamForceSyncReply =
-    | (SteamForceSyncStatus & { ok: true; accepted: true })
-    | { ok: false; code: string };
+  interface SteamForceSyncReply {
+    ok?: boolean;
+    accepted?: boolean;
+    settings_ready?: boolean;
+    force_sync_pending?: boolean;
+    catalog_sync?: Partial<SteamCatalogSyncStatus>;
+    code?: string;
+  }
 
   export function steamForceSyncOutcome(
     provider: SteamForceSyncStatus,
@@ -643,22 +648,21 @@ namespace Amaterasu {
         const reply = await context.api.post<SteamForceSyncReply>(
           "steam/force_sync",
         );
-        if (reply.ok !== true || reply.accepted !== true) {
+        if (
+          reply.ok !== true ||
+          reply.accepted !== true ||
+          reply.settings_ready !== true ||
+          reply.force_sync_pending !== true ||
+          reply.catalog_sync?.force_sync_pending !== true
+        ) {
           throw new Error(
             reply.code
               ? `Force catalog sync was not accepted: ${reply.code}`
               : "Force catalog sync was not accepted.",
           );
         }
-        if (
-          reply.force_sync_pending !== true ||
-          reply.catalog_sync.force_sync_pending !== true
-        ) {
-          throw new Error("Force catalog sync returned no pending status.");
-        }
 
         forceSyncPending = true;
-        providerStatus = reply;
         status.replaceChildren(
           el(
             "p",
