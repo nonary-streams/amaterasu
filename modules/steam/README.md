@@ -23,10 +23,11 @@ disabled provider rejects refresh and drops its in-memory scan and snapshot;
 enabling it allows callers with the Steam service grant to request an explicit
 refresh. Settings are stored through `amaterasu.configuration/1` as version 1
 product settings with revision-based compare-and-swap. Only the management
-principal can use the provider's `settings_get` and `settings_update` actions;
-the fixed management routes expose `/v1/steam/settings` and
-`/v1/steam/settings_update`. Startup roots remain bootstrap settings and cannot
-be changed through these product settings routes. While the initial product
+principal can use the provider's `settings_get`, `settings_update`, and
+`force_sync` actions. The management API contract maps
+`POST /v1/steam/force_sync` to `force_sync` with the `steam.refresh` scope.
+Startup roots remain bootstrap settings and cannot be changed through these
+product settings routes. While the initial product
 document loads or a write is pending, status and list requests remain available
 and include `settings_ready`; refresh waits for initial settings, and overlapping
 settings actions return `settings_loading` or `settings_busy`. If an update's
@@ -139,14 +140,21 @@ is not included in provider or list responses.
 Session artwork revisions remain untracked. Playtime remains limited to the
 `LastPlayed` values available from supported `localconfig.vdf` sidecars; elapsed
 playtime and per-session playtime state are not represented. The Steam
-`refresh` action only refreshes discovery; it does not force catalog
-reconciliation when `auto_sync` is false, unlike Vibeshine's authenticated
-force-sync endpoint. Unlike Vibeshine's legacy host config parser, the product
-API rejects negative counts and ages as malformed unsigned values instead of
-clamping them to zero.
+`refresh` action remains discovery-only when `auto_sync` is false. The
+management-only `force_sync` action accepts an in-memory one-shot request when
+Steam is enabled and product settings are ready. It starts a discovery scan or
+joins the scan already in progress, then reconciles a newer complete, usable
+snapshot even when `auto_sync` is false. The accepted response and status/list
+results expose `force_sync_pending` while discovery or catalog reconciliation
+is in progress. Repeated requests coalesce. An incomplete or unusable newer
+discovery clears the request without writing to the catalog. The request is not
+persisted, and the version 1 product settings schema is unchanged. Unlike
+Vibeshine's legacy host config parser, the product API rejects negative counts
+and ages as malformed unsigned values instead of clamping them to zero.
 
 ```json
 {"action":"refresh"}
+{"action":"force_sync"}
 {"action":"status"}
 {"action":"list","limit":16}
 {"action":"list","revision":1,"after":730,"limit":16}

@@ -24,6 +24,7 @@ const MANAGEMENT_CALLER: &str = "amaterasu.management";
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     Refresh {},
+    ForceSync {},
     Status {},
     SettingsGet {},
     SettingsUpdate {
@@ -147,6 +148,7 @@ impl Provider {
                 self.start_scan();
                 ActionResult::Immediate(self.status())
             }
+            Action::ForceSync {} => ActionResult::ForceSync,
             Action::Status {} => ActionResult::Immediate(self.status()),
             Action::SettingsGet {} => ActionResult::SettingsGet,
             Action::SettingsUpdate {
@@ -320,6 +322,7 @@ fn artwork_chunk_payload(app_id: u32, offset: u64, chunk: artwork::ArtworkChunk)
 
 enum ActionResult {
     Immediate(Value),
+    ForceSync,
     ArtworkRead {
         app_id: u32,
         revision: String,
@@ -444,7 +447,10 @@ impl SteamModule {
         };
         let is_management_action = matches!(
             &action,
-            Action::SettingsGet {} | Action::SettingsUpdate { .. } | Action::ArtworkRead { .. }
+            Action::SettingsGet {}
+                | Action::SettingsUpdate { .. }
+                | Action::ArtworkRead { .. }
+                | Action::ForceSync {}
         );
         if is_management_action && !is_management_caller(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
@@ -461,7 +467,9 @@ impl SteamModule {
             };
             return self.complete(id, json!({"ok":false,"code":code}));
         }
-        if !self.configuration.is_ready() && matches!(&action, Action::Refresh {}) {
+        if !self.configuration.is_ready()
+            && matches!(&action, Action::Refresh {} | Action::ForceSync {})
+        {
             return self.complete(id, json!({"ok":false,"code":"settings_loading"}));
         }
         match self.provider.handle_action(action) {
@@ -472,6 +480,29 @@ impl SteamModule {
                     self.catalog_sync.status(),
                 ),
             ),
+            ActionResult::ForceSync => {
+                match self
+                    .catalog_sync
+                    .request_force_sync(&mut self.provider, self.configuration.settings())
+                {
+                    Ok(()) => {
+                        let mut payload = self.provider.status();
+                        if let Some(object) = payload.as_object_mut() {
+                            object.insert("ok".into(), json!(true));
+                            object.insert("accepted".into(), json!(true));
+                            object.insert("force_sync_pending".into(), json!(true));
+                        }
+                        self.complete(
+                            id,
+                            with_catalog_sync_status(
+                                with_settings_ready(payload, self.configuration.is_ready()),
+                                self.catalog_sync.status(),
+                            ),
+                        )
+                    }
+                    Err(code) => self.complete(id, json!({"ok":false,"code":code})),
+                }
+            }
             ActionResult::SettingsGet => {
                 self.complete(id, self.configuration.management_response())
             }
@@ -538,6 +569,10 @@ fn with_settings_ready(mut payload: Value, settings_ready: bool) -> Value {
 
 fn with_catalog_sync_status(mut payload: Value, status: Value) -> Value {
     if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "force_sync_pending".into(),
+            json!(status["force_sync_pending"].as_bool().unwrap_or(false)),
+        );
         object.insert("catalog_sync".into(), status);
     }
     payload
@@ -549,6 +584,7 @@ impl Provider {
         match serde_json::from_value::<Action>(payload) {
             Ok(action) => match self.handle_action(action) {
                 ActionResult::Immediate(payload) => payload,
+                ActionResult::ForceSync => json!({"ok":false,"code":"management_only"}),
                 ActionResult::ArtworkRead { .. } => {
                     json!({"ok":false,"code":"async_only"})
                 }

@@ -33,6 +33,7 @@ enum CallState {
 struct Transaction {
     sync_id: String,
     source_revision: u64,
+    force_sync: bool,
     settings_epoch: u64,
     source_fingerprint: SourceFingerprint,
     remove_stale: bool,
@@ -47,6 +48,11 @@ struct Transaction {
     retry_attempt: u32,
     delay_ticks: u32,
     cancel_after_call: bool,
+}
+
+struct ForceSyncRequest {
+    after_revision: u64,
+    target_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +257,7 @@ pub(super) struct CatalogSync {
     next_artwork_retry: Option<Instant>,
     sync_requested: bool,
     next_scan: Option<Instant>,
+    force_sync_request: Option<ForceSyncRequest>,
     transaction: Option<Transaction>,
     operation_sequence: u64,
     last_error: Option<String>,
@@ -267,6 +274,7 @@ impl CatalogSync {
             next_artwork_retry: None,
             sync_requested: false,
             next_scan: None,
+            force_sync_request: None,
             transaction: None,
             operation_sequence: 0,
             last_error: None,
@@ -302,16 +310,28 @@ impl CatalogSync {
             }
         }
 
-        if self.transaction.is_none()
-            && self.sync_requested
-            && settings.enabled
-            && settings.auto_sync
-            && provider.has_complete_snapshot()
-            && let Err(error) = self.start_transaction(provider, settings)
-        {
-            self.last_error = Some(error);
-            self.sync_requested = false;
-            self.schedule_next_scan(now);
+        if self.transaction.is_none() {
+            let force_sync_ready = self
+                .force_sync_request
+                .as_ref()
+                .is_some_and(|request| request.target_revision == Some(provider.revision));
+            if force_sync_ready {
+                if let Err(error) = self.start_transaction(provider, settings, true) {
+                    self.last_error = Some(error);
+                    self.force_sync_request = None;
+                    self.sync_requested = false;
+                    self.schedule_next_scan(now);
+                }
+            } else if self.sync_requested
+                && settings.enabled
+                && settings.auto_sync
+                && provider.has_complete_snapshot()
+                && let Err(error) = self.start_transaction(provider, settings, false)
+            {
+                self.last_error = Some(error);
+                self.sync_requested = false;
+                self.schedule_next_scan(now);
+            }
         }
         self.advance_transaction(runtime, now)
     }
@@ -326,6 +346,7 @@ impl CatalogSync {
             && settings.auto_sync
             && self.transaction.is_none()
             && !self.sync_requested
+            && self.force_sync_request.is_none()
             && !provider.scan_in_progress()
             && self.next_scan.is_some_and(|deadline| now >= deadline)
     }
@@ -344,8 +365,47 @@ impl CatalogSync {
         json!({
             "enabled":self.settings.as_ref().is_some_and(|settings| settings.enabled && settings.auto_sync),
             "syncing":self.transaction.is_some(),
+            "force_sync_pending":self.force_sync_request.is_some(),
             "last_error":self.last_error,
         })
+    }
+
+    pub(super) fn request_force_sync(
+        &mut self,
+        provider: &mut Provider,
+        settings: &ProductSettings,
+    ) -> Result<(), &'static str> {
+        if !settings.enabled || !provider.enabled {
+            self.force_sync_request = None;
+            return Err("steam_disabled");
+        }
+        if self.force_sync_request.is_some() {
+            return Ok(());
+        }
+        if !provider.scan_in_progress() && provider.revision == u64::MAX {
+            return Err("revision_exhausted");
+        }
+        if !provider.scan_in_progress() && !provider.start_scan() {
+            return Err("scan_unavailable");
+        }
+        self.sync_requested = false;
+        self.force_sync_request = Some(ForceSyncRequest {
+            after_revision: provider.revision,
+            target_revision: None,
+        });
+        let finish_may_have_committed = self.transaction.as_ref().is_some_and(|transaction| {
+            transaction.stage == Stage::Finish
+                && matches!(transaction.call, CallState::Waiting { .. })
+        });
+        if finish_may_have_committed {
+            self.last_successful_fingerprint = None;
+            self.next_artwork_retry = None;
+        }
+        if let Some(transaction) = &mut self.transaction {
+            transaction.cancel_after_call = true;
+        }
+        self.last_error = None;
+        Ok(())
     }
 
     fn observe_settings(
@@ -373,6 +433,9 @@ impl CatalogSync {
             self.sync_requested = false;
             self.next_scan = None;
         }
+        if !settings.enabled {
+            self.force_sync_request = None;
+        }
         if let Some(transaction) = &mut self.transaction {
             transaction.cancel_after_call = true;
         }
@@ -383,8 +446,48 @@ impl CatalogSync {
             return;
         }
         self.observed_provider_revision = provider.revision;
-        if !settings.enabled || !settings.auto_sync {
+        if !settings.enabled {
             self.observed_source_fingerprint = None;
+            self.force_sync_request = None;
+            return;
+        }
+        let force_snapshot_is_newer = self
+            .force_sync_request
+            .as_ref()
+            .is_some_and(|request| provider.revision > request.after_revision);
+        if force_snapshot_is_newer {
+            if !provider.has_complete_snapshot() {
+                self.cancel_transaction_for_changed_source(None);
+                self.observed_source_fingerprint = None;
+                self.force_sync_request = None;
+                self.sync_requested = false;
+                self.last_error =
+                    Some("Steam discovery scan was incomplete; catalog was left unchanged".into());
+                self.schedule_next_scan(now);
+                return;
+            }
+            if let Some(message) = catalog_source_error(provider, settings) {
+                self.cancel_transaction_for_changed_source(None);
+                self.observed_source_fingerprint = None;
+                self.force_sync_request = None;
+                self.sync_requested = false;
+                self.last_error = Some(message);
+                self.schedule_next_scan(now);
+                return;
+            }
+            if let Some(request) = &mut self.force_sync_request {
+                request.target_revision = Some(provider.revision);
+            }
+        }
+        if !settings.auto_sync {
+            self.observed_source_fingerprint = self
+                .force_sync_request
+                .as_ref()
+                .filter(|request| request.target_revision == Some(provider.revision))
+                .map(|_| source_fingerprint(provider));
+            if self.observed_source_fingerprint.is_some() {
+                self.cancel_transaction_for_changed_source(self.observed_source_fingerprint);
+            }
             return;
         }
         if !provider.has_complete_snapshot() {
@@ -407,10 +510,18 @@ impl CatalogSync {
 
         let fingerprint = source_fingerprint(provider);
         self.observed_source_fingerprint = Some(fingerprint);
+        let force_requires_new_revision = self.force_sync_request.as_ref().is_some_and(|request| {
+            request.target_revision == Some(provider.revision)
+                && self
+                    .transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.source_revision < provider.revision)
+        });
         if self.transaction.as_ref().is_some_and(|transaction| {
             transaction.settings_epoch == self.settings_epoch
                 && transaction.source_fingerprint == fingerprint
-        }) {
+        }) && !force_requires_new_revision
+        {
             if let Some(transaction) = &mut self.transaction {
                 transaction.cancel_after_call = false;
             }
@@ -433,11 +544,27 @@ impl CatalogSync {
         &mut self,
         current_fingerprint: Option<SourceFingerprint>,
     ) {
-        if let Some(transaction) = &mut self.transaction
-            && (transaction.settings_epoch != self.settings_epoch
-                || Some(transaction.source_fingerprint) != current_fingerprint)
-        {
-            transaction.cancel_after_call = true;
+        let force_sync_revision = self
+            .force_sync_request
+            .as_ref()
+            .and_then(|request| request.target_revision);
+        let canceled_finish_may_have_committed =
+            self.transaction.as_mut().is_some_and(|transaction| {
+                if transaction.settings_epoch != self.settings_epoch
+                    || Some(transaction.source_fingerprint) != current_fingerprint
+                    || force_sync_revision
+                        .is_some_and(|revision| revision > transaction.source_revision)
+                {
+                    transaction.cancel_after_call = true;
+                    transaction.stage == Stage::Finish
+                        && matches!(transaction.call, CallState::Waiting { .. })
+                } else {
+                    false
+                }
+            });
+        if canceled_finish_may_have_committed {
+            self.last_successful_fingerprint = None;
+            self.next_artwork_retry = None;
         }
     }
 
@@ -452,6 +579,7 @@ impl CatalogSync {
         &mut self,
         provider: &Provider,
         settings: &ProductSettings,
+        force_sync: bool,
     ) -> ModuleResult<()> {
         if let Some(message) = catalog_source_error(provider, settings) {
             return Err(message);
@@ -470,6 +598,7 @@ impl CatalogSync {
         self.transaction = Some(Transaction {
             sync_id: new_sync_id(provider.revision),
             source_revision: provider.revision,
+            force_sync,
             settings_epoch: self.settings_epoch,
             source_fingerprint,
             remove_stale: should_remove_stale(settings),
@@ -584,6 +713,13 @@ impl CatalogSync {
                 let Some(transaction) = self.transaction.take() else {
                     return;
                 };
+                if transaction.force_sync
+                    && self.force_sync_request.as_ref().is_some_and(|request| {
+                        request.target_revision == Some(transaction.source_revision)
+                    })
+                {
+                    self.force_sync_request = None;
+                }
                 self.last_successful_fingerprint = Some(transaction.source_fingerprint);
                 self.next_artwork_retry = Some(now + ARTWORK_RETRY_INTERVAL);
                 self.schedule_next_scan(now);
@@ -616,11 +752,19 @@ impl CatalogSync {
     }
 
     fn fail_transaction(&mut self, message: String, now: Instant) {
-        if let Some(transaction) = self.transaction.take()
-            && (transaction.settings_epoch != self.settings_epoch
-                || Some(transaction.source_fingerprint) != self.observed_source_fingerprint)
-        {
-            self.sync_requested = true;
+        if let Some(transaction) = self.transaction.take() {
+            if transaction.force_sync
+                && self.force_sync_request.as_ref().is_some_and(|request| {
+                    request.target_revision == Some(transaction.source_revision)
+                })
+            {
+                self.force_sync_request = None;
+            }
+            if transaction.settings_epoch != self.settings_epoch
+                || Some(transaction.source_fingerprint) != self.observed_source_fingerprint
+            {
+                self.sync_requested = true;
+            }
         }
         self.last_error = Some(message);
         self.schedule_next_scan(now);
@@ -975,6 +1119,7 @@ mod tests {
         Transaction {
             sync_id: "finish-test".into(),
             source_revision,
+            force_sync: false,
             settings_epoch,
             source_fingerprint: fingerprint,
             remove_stale: true,
@@ -1517,6 +1662,7 @@ mod tests {
         let transaction = Transaction {
             sync_id: "test-sync".into(),
             source_revision: 4,
+            force_sync: false,
             settings_epoch: 1,
             source_fingerprint: SourceFingerprint(1),
             remove_stale: false,
@@ -1602,6 +1748,7 @@ mod tests {
         let mut transaction = Transaction {
             sync_id: "sync".into(),
             source_revision: 1,
+            force_sync: false,
             settings_epoch: 1,
             source_fingerprint: SourceFingerprint(1),
             remove_stale: true,
@@ -1634,6 +1781,7 @@ mod tests {
         let mut transaction = Transaction {
             sync_id: "sync".into(),
             source_revision: 1,
+            force_sync: false,
             settings_epoch: 1,
             source_fingerprint: SourceFingerprint(1),
             remove_stale: true,

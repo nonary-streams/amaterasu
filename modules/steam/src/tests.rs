@@ -428,6 +428,18 @@ fn persisted_settings(enabled: bool, revision: u64) -> Response {
     }
 }
 
+fn persisted_settings_with_sync_policy(enabled: bool, auto_sync: bool, revision: u64) -> Response {
+    Response::Result {
+        payload: json!({
+            "ok":true,
+            "found":true,
+            "version":1,
+            "revision":revision,
+            "values":{"enabled":enabled,"auto_sync":auto_sync,"sync_all_installed":true}
+        }),
+    }
+}
+
 fn persisted_settings_with_auto_sync(exclusions: Value, revision: u64) -> Response {
     Response::Result {
         payload: json!({
@@ -468,6 +480,244 @@ fn set_complete_test_snapshot(provider: &mut Provider, revision: u64, name: &str
     provider.snapshot_complete = true;
     provider.appinfo_complete = true;
     provider.history_complete = true;
+}
+
+#[test]
+fn force_sync_is_management_only_and_requires_ready_enabled_settings() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings(false, 1));
+    let mut module = start_test_module(&mut host);
+
+    module
+        .handle_request(
+            10,
+            "amaterasu.console",
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(
+        host.completed[0],
+        (10, json!({"ok":false,"code":"forbidden"}))
+    );
+    assert!(module.provider.scan.is_none());
+
+    module
+        .handle_request(
+            11,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(
+        host.completed[1],
+        (11, json!({"ok":false,"code":"settings_loading"}))
+    );
+
+    module.tick().unwrap();
+    module.tick().unwrap();
+    module
+        .handle_request(
+            12,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed[2].1["code"], "steam_disabled");
+    assert!(module.provider.scan.is_none());
+}
+
+#[test]
+fn force_sync_rejects_an_exhausted_discovery_revision() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    module.provider.revision = u64::MAX;
+
+    module
+        .handle_request(
+            13,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+
+    assert_eq!(
+        host.completed.last().unwrap().1,
+        json!({"ok":false,"code":"revision_exhausted"})
+    );
+    assert!(module.provider.scan.is_none());
+    assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
+}
+
+#[test]
+fn force_sync_coalesces_duplicates_and_reconciles_a_new_snapshot_with_auto_sync_off() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    set_complete_test_snapshot(&mut module.provider, 7, "Before force sync");
+    module.tick().unwrap();
+
+    module
+        .handle_request(
+            20,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["accepted"], true);
+    assert_eq!(host.completed.last().unwrap().1["force_sync_pending"], true);
+    assert_eq!(module.provider.status()["scanning"], true);
+
+    module
+        .handle_request(
+            21,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["accepted"], true);
+    assert_eq!(module.provider.status()["scanning"], true);
+
+    module
+        .handle_request(
+            22,
+            MANAGEMENT_CALLER,
+            json!({"action":"status"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["force_sync_pending"], true);
+    module
+        .handle_request(
+            23,
+            MANAGEMENT_CALLER,
+            json!({"action":"list","limit":16}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["force_sync_pending"], true);
+
+    set_complete_test_snapshot(&mut module.provider, 8, "After force sync");
+    for _ in 0..8 {
+        module.tick().unwrap();
+    }
+
+    assert_eq!(
+        host.catalog_requests
+            .iter()
+            .map(|request| request["action"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "provider_snapshot_begin",
+            "provider_snapshot_batch",
+            "provider_snapshot_finish"
+        ]
+    );
+    assert!(
+        host.catalog_requests
+            .iter()
+            .all(|request| request["source_revision"] == 8)
+    );
+    assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
+}
+
+#[test]
+fn incomplete_force_sync_discovery_clears_the_request_without_catalog_writes() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module
+        .handle_request(
+            30,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(module.catalog_sync.status()["force_sync_pending"], true);
+
+    module.tick().unwrap();
+    assert_eq!(module.provider.status()["complete"], false);
+    assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
+    assert!(host.catalog_requests.is_empty());
+}
+
+#[test]
+fn unusable_force_sync_snapshot_clears_the_request_without_catalog_writes() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module
+        .handle_request(
+            40,
+            MANAGEMENT_CALLER,
+            json!({"action":"force_sync"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    set_complete_test_snapshot(&mut module.provider, 1, "Missing client");
+    module.provider.steam_executable = None;
+    module.tick().unwrap();
+
+    assert_eq!(module.catalog_sync.status()["force_sync_pending"], false);
+    assert!(
+        module.catalog_sync.status()["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("executable")
+    );
+    assert!(host.catalog_requests.is_empty());
+}
+
+#[test]
+fn ordinary_refresh_remains_discovery_only_when_auto_sync_is_disabled() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+
+    module
+        .handle_request(
+            50,
+            "amaterasu.console",
+            json!({"action":"refresh"}),
+            CONFIGURATION_TIMEOUT_MS,
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap().1["scanning"], true);
+    assert_eq!(
+        host.completed.last().unwrap().1["force_sync_pending"],
+        false
+    );
+
+    set_complete_test_snapshot(&mut module.provider, 1, "Refresh only");
+    for _ in 0..4 {
+        module.tick().unwrap();
+    }
+    assert!(host.catalog_requests.is_empty());
 }
 
 #[test]
