@@ -12,6 +12,8 @@ characters remain distinct (for example, the Kelvin sign `K` does not match
 ASCII `k`). This follows the pinned reference's byte-oriented lowercase
 behavior. The reference sets the process locale to C before applying
 locale-sensitive `std::tolower`; no Playnite runtime qualification was run.
+Duplicate category entries remain accepted and retained as in the reference
+parser. Matching folds each list into a set, so repeats do not change selection.
 
 `sync_plugins` and `exclude_plugins` compare plugin IDs after ASCII lowercase.
 ASCII letters match regardless of case, while non-ASCII characters remain
@@ -21,12 +23,9 @@ matches the pinned reference, which sets the process locale to C and applies
 reference parser; matching folds the lists into sets, so duplicates do not
 change selection.
 
-`exclude_games` applies the same bytewise comparison to Playnite IDs. Filter
-validation uses ASCII case folding for category uniqueness, so Unicode case
-equivalents remain distinct. Repeated ASCII category filters are rejected.
-Repeated game IDs remain accepted and retained as in the reference parser;
-matching folds exclusions into a set, so duplicates do not change selection.
-Plugin filter lists also preserve the reference's duplicate acceptance.
+`exclude_games` applies the same bytewise comparison to Playnite IDs. Repeated
+game IDs remain accepted and retained as in the reference parser; matching
+folds exclusions into a set, so duplicates do not change selection.
 
 `auto_sync` controls membership reconciliation. When it is enabled together with
 `autosync_remove_uninstalled`, the provider sends tombstones only for explicit

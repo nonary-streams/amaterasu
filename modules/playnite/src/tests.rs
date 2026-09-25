@@ -71,6 +71,42 @@ fn settings_update_preserves_duplicate_game_exclusions() {
 }
 
 #[test]
+fn settings_update_preserves_duplicate_category_filters() {
+    let sync_categories = vec!["Arcade", "arcade", "Arcade"];
+    let exclude_categories = vec!["Strategy", "strategy", "Strategy"];
+    let action: Action = serde_json::from_value(json!({
+        "action":"settings_update",
+        "enabled":true,
+        "sync_categories":sync_categories,
+        "exclude_categories":exclude_categories,
+        "expected_revision":3
+    }))
+    .unwrap();
+
+    let Action::SettingsUpdate {
+        sync_categories,
+        exclude_categories,
+        ..
+    } = action
+    else {
+        panic!("expected settings update")
+    };
+
+    assert_eq!(
+        sync_categories,
+        Some(vec!["Arcade".into(), "arcade".into(), "Arcade".into()])
+    );
+    assert_eq!(
+        exclude_categories,
+        Some(vec![
+            "Strategy".into(),
+            "strategy".into(),
+            "Strategy".into()
+        ])
+    );
+}
+
+#[test]
 fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     let action: Action = serde_json::from_value(json!({
         "action":"settings_update",

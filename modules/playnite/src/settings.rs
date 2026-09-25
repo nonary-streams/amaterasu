@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
 pub const PRODUCT_SETTINGS_VERSION: u32 = 1;
 const MAX_FILTERS: usize = 256;
@@ -116,11 +115,11 @@ impl ProductSettings {
         {
             return Err("Playnite numeric settings exceed their supported bounds");
         }
-        validate_filter_values(&self.sync_categories, "category", true)?;
-        validate_filter_values(&self.exclude_categories, "category", true)?;
-        validate_filter_values(&self.sync_plugins, "plugin ID", false)?;
-        validate_filter_values(&self.exclude_plugins, "plugin ID", false)?;
-        validate_filter_values(&self.exclude_games, "game ID", false)?;
+        validate_filter_values(&self.sync_categories, "category")?;
+        validate_filter_values(&self.exclude_categories, "category")?;
+        validate_filter_values(&self.sync_plugins, "plugin ID")?;
+        validate_filter_values(&self.exclude_plugins, "plugin ID")?;
+        validate_filter_values(&self.exclude_games, "game ID")?;
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > MAX_SETTINGS_BYTES) {
             return Err("Playnite product settings exceed the 12000 byte limit");
         }
@@ -192,24 +191,17 @@ impl ProductSettings {
     }
 }
 
-fn validate_filter_values(
-    values: &[String],
-    label: &'static str,
-    require_unique: bool,
-) -> Result<(), &'static str> {
+fn validate_filter_values(values: &[String], label: &'static str) -> Result<(), &'static str> {
     if values.len() > MAX_FILTERS {
         return Err("Playnite filter list exceeds 256 entries");
     }
-    let mut unique = BTreeSet::new();
     for value in values {
-        let normalized = value.to_ascii_lowercase();
         if value.trim().is_empty()
             || value.len() > MAX_FILTER_BYTES
             || value.chars().any(char::is_control)
-            || (require_unique && !unique.insert(normalized))
         {
             return Err(match label {
-                "category" => "category filters must be unique nonempty text of at most 512 bytes",
+                "category" => "category filters must be nonempty text of at most 512 bytes",
                 "plugin ID" => "plugin filters must be nonempty text of at most 512 bytes",
                 _ => "game filters must be nonempty text of at most 512 bytes",
             });
@@ -417,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn filters_are_bounded_and_category_values_are_unique_case_insensitively() {
+    fn filters_are_bounded_and_category_duplicates_are_allowed() {
         for sync_categories in [
             vec!["".into()],
-            vec!["Arcade".into(), "arcade".into()],
+            vec!["   ".into()],
             vec!["x".repeat(MAX_FILTER_BYTES + 1)],
             vec!["invalid\ncategory".into()],
         ] {
@@ -443,6 +435,31 @@ mod tests {
         );
         assert!(
             ProductSettings {
+                sync_categories: vec!["Arcade".into(), "arcade".into(), "Arcade".into()],
+                exclude_categories: vec!["Strategy".into(), "strategy".into(), "Strategy".into()],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                sync_categories: vec!["Arcade".into(); MAX_FILTERS],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ProductSettings {
+                exclude_categories: vec!["Arcade".into(); MAX_FILTERS + 1],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ProductSettings {
                 exclude_games: vec!["game-id".repeat(512); 32],
                 ..ProductSettings::default()
             }
@@ -451,11 +468,46 @@ mod tests {
         );
         assert!(
             ProductSettings {
-                exclude_categories: vec!["Arcade".into(), "arcade".into()],
+                sync_categories: vec!["x".repeat(MAX_FILTER_BYTES); 24],
                 ..ProductSettings::default()
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn category_duplicates_survive_document_and_update_payload_roundtrips() {
+        let settings = ProductSettings {
+            sync_categories: vec!["Arcade".into(), "arcade".into(), "Arcade".into()],
+            exclude_categories: vec!["Strategy".into(), "strategy".into(), "Strategy".into()],
+            ..ProductSettings::default()
+        };
+        let document = json!({
+            "ok":true,
+            "found":true,
+            "version":PRODUCT_SETTINGS_VERSION,
+            "revision":7,
+            "values":settings
+        });
+
+        let (loaded_settings, revision) =
+            ProductSettings::from_product_document(&document).unwrap();
+        assert_eq!(revision, 7);
+        assert_eq!(loaded_settings, settings);
+
+        let update_payload = loaded_settings.product_update_payload(revision);
+        let update_settings: ProductSettings =
+            serde_json::from_value(update_payload["values"].clone()).unwrap();
+        assert_eq!(update_settings, settings);
+        assert_eq!(
+            update_payload,
+            json!({
+                "action":"product_update",
+                "expected_revision":7,
+                "version":PRODUCT_SETTINGS_VERSION,
+                "values":settings
+            })
         );
     }
 
