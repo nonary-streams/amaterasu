@@ -32,7 +32,6 @@ pub struct SteamCatalogRead {
     steam_ids: BTreeSet<u32>,
     call: Call,
     operation_sequence: u64,
-    stop_after_call: bool,
 }
 
 impl SteamCatalogRead {
@@ -45,23 +44,10 @@ impl SteamCatalogRead {
                 operation_id: "lutris.steam-id-export.1".into(),
             },
             operation_sequence: 1,
-            stop_after_call: false,
         }
-    }
-
-    pub fn cancel(&mut self) {
-        self.stop_after_call = true;
     }
 
     pub fn advance(&mut self, runtime: &RuntimeClient) -> ModuleResult<Progress> {
-        if self.stop_after_call {
-            match self.call {
-                Call::Submit { .. } | Call::Delay { .. } => {
-                    return Ok(Progress::Failed("cancelled_after_settings_change".into()));
-                }
-                Call::Waiting { .. } => {}
-            }
-        }
         match self.call.clone() {
             Call::Delay { ticks } if ticks > 1 => {
                 self.call = Call::Delay { ticks: ticks - 1 };
@@ -225,8 +211,6 @@ impl SteamCatalogRead {
                 operation_id: self.next_operation_id(),
             };
             Ok(Progress::Pending)
-        } else if self.stop_after_call {
-            Ok(Progress::Failed("cancelled_after_settings_change".into()))
         } else {
             self.revision = Some(revision);
             self.steam_ids.extend(page_ids);

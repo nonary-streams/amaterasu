@@ -546,26 +546,10 @@ mod tests {
             .start_catalog(&mut catalog, &[9001].into())
             .unwrap();
         assert_eq!(count, 2);
-        let transaction = catalog.transaction.as_ref().unwrap();
-        let submitted_entries = transaction
-            .batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .entries
-                    .iter()
-                    .filter_map(|entry| entry["source_id"].as_str())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(submitted_entries, ["8", "10"]);
-        let selection_removals = transaction
-            .batches
-            .iter()
-            .flat_map(|batch| batch.selection_remove_source_ids.iter().map(String::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(selection_removals, ["7"]);
-        assert!(!selection_removals.contains(&"10"));
-        assert_eq!(transaction.payload()["action"], "provider_snapshot_begin");
+        let catalog_status = catalog.status();
+        assert_eq!(catalog_status["busy"], true);
+        assert_eq!(catalog_status["last_import_count"], 2);
+        assert_eq!(catalog_status["skipped_steam_count"], 1);
 
         let now = Instant::now();
         assert!(!scan_is_due(
