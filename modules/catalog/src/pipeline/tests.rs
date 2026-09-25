@@ -2964,7 +2964,7 @@ fn generic_management_update_cannot_replace_provider_owned_playnite_identity() {
 }
 
 #[test]
-fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup() {
+fn provider_override_preserves_explicit_zero_values_across_playnite_refresh_and_cleanup() {
     let mut backend = Backend::default();
     let mut pipeline = playnite_importer();
     let finished = import_playnite_entry(
@@ -2979,10 +2979,22 @@ fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup(
     assert_eq!(finished["ok"], true);
     assert_eq!(backend.metadata["revision"], 1);
     let id = "app-0000000000000001";
+    let config_overrides = json!({
+        "fec_percentage":37,
+        "max_bitrate":0,
+        "minimum_fps_target":0.0,
+        "video_max_batch_size_kb":0
+    });
+    let assert_override_values = |overrides: &Value| {
+        assert_eq!(overrides["fec_percentage"], 37);
+        assert_eq!(overrides["max_bitrate"], 0);
+        assert_eq!(overrides["minimum_fps_target"], json!(0.0));
+        assert_eq!(overrides["video_max_batch_size_kb"], 0);
+    };
 
     let updated = backend.run_for(
         &mut pipeline,
-        update_provider_overrides(id, 1, json!(37)),
+        update_provider_config_overrides(id, 1, config_overrides.clone()),
         "amaterasu.management",
         "amaterasu.management",
         "amaterasu.management",
@@ -2991,26 +3003,20 @@ fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup(
     assert_eq!(updated["revision"], 2);
     assert_eq!(updated["changed"], true);
     assert_eq!(updated["replayed"], false);
-    assert_eq!(updated["config_overrides"]["fec_percentage"], 37);
-    assert_eq!(
-        backend.entries[id]["config_overrides"]["fec_percentage"],
-        37
-    );
+    assert_override_values(&updated["config_overrides"]);
+    assert_override_values(&backend.entries[id]["config_overrides"]);
     assert_eq!(backend.entries[id]["launch"]["kind"], "playnite");
     assert_eq!(
         backend.entries[id]["launch"]["game_id"],
         "a1b2c3d4-1234-5678-9abc-0123456789ab"
     );
     let marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
-    assert_eq!(
-        backend.entries[marker_key]["config_overrides"]["fec_percentage"],
-        37
-    );
+    assert_override_values(&backend.entries[marker_key]["config_overrides"]);
     assert_eq!(backend.entries[marker_key]["detached"], false);
 
     let repeated = backend.run_for(
         &mut pipeline,
-        update_provider_overrides(id, 2, json!(37)),
+        update_provider_config_overrides(id, 2, config_overrides.clone()),
         "amaterasu.management",
         "amaterasu.management",
         "amaterasu.management",
@@ -3031,14 +3037,12 @@ fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup(
     );
     assert_eq!(refreshed["ok"], true);
     assert_eq!(backend.entries[id]["name"], "Provider renamed title");
-    assert_eq!(
-        backend.entries[id]["config_overrides"]["fec_percentage"],
-        37
-    );
+    assert_override_values(&backend.entries[id]["config_overrides"]);
     assert_eq!(
         backend.entries[id]["launch"]["game_id"],
         "a1b2c3d4-1234-5678-9abc-0123456789ab"
     );
+    assert_override_values(&backend.entries[marker_key]["config_overrides"]);
     assert_eq!(backend.entries[marker_key]["detached"], false);
 
     let begin = backend.run_for(
@@ -3068,7 +3072,7 @@ fn provider_override_updates_only_fec_and_survives_playnite_refresh_and_cleanup(
     let current_revision = backend.metadata["revision"].as_u64().unwrap();
     let after_delete = backend.run_for(
         &mut pipeline,
-        update_provider_overrides(id, current_revision, json!(37)),
+        update_provider_config_overrides(id, current_revision, config_overrides),
         "amaterasu.management",
         "amaterasu.management",
         "amaterasu.management",
