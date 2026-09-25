@@ -375,6 +375,55 @@ fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
 }
 
 #[test]
+fn acquire_retry_distinguishes_zero_key_repeat_delay_from_unspecified() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    controller.set_key_repeat_policy(500, 25.0);
+    let now = Instant::now();
+    let acquire = |key_repeat_delay| Operation::Acquire {
+        operation_id: Some("key-repeat-delay-retry".into()),
+        ttl_ms: None,
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click: None,
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay,
+        key_repeat_frequency: None,
+    };
+
+    let acquired = controller.handle("owner", acquire(Some(0)), now, &mut || Ok(()));
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(acquired["key_repeat_delay"], 0);
+    let token = acquired["lease"].as_str().unwrap();
+    assert_eq!(controller.effective_key_repeat_policy(), (0, 25.0));
+
+    assert_eq!(
+        batch(&mut controller, token, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+    assert!(controller.repeating_key.is_none());
+    let event_count = controller.backend.trace.borrow().len();
+    controller.expire(Instant::now() + Duration::from_millis(500));
+    assert_eq!(controller.backend.trace.borrow().len(), event_count);
+
+    let retry = controller.handle("owner", acquire(Some(0)), now, &mut || Ok(()));
+    assert_eq!(retry["ok"], true);
+    assert_eq!(retry["lease"], token);
+
+    let changed_retry = controller.handle("owner", acquire(None), now, &mut || Ok(()));
+    assert_eq!(changed_retry["error"]["code"], "operation_conflict");
+    let lease = controller.lease.as_ref().unwrap();
+    assert_eq!(lease.token, token);
+    assert_eq!(lease.requested_key_repeat_delay, Some(0));
+    assert_eq!(controller.effective_key_repeat_policy(), (0, 25.0));
+    assert_eq!(controller.pressed.len(), 1);
+}
+
+#[test]
 fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
