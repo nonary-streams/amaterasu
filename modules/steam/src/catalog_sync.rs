@@ -647,6 +647,7 @@ fn source_fingerprint(provider: &Provider) -> SourceFingerprint {
         fingerprint.write_optional_string(game.artwork_revision.as_deref());
         fingerprint.write_optional_string(game.artwork_source_path.as_deref());
         fingerprint.write_bool(game.artwork_is_remote);
+        fingerprint.write_bytes(game.artwork_candidate_signature.as_bytes());
     }
     let steam_executable = provider
         .steam_executable
@@ -938,6 +939,7 @@ mod tests {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         }
     }
 
@@ -1194,6 +1196,27 @@ mod tests {
             Some("/Steam/art/portrait.jpg".into());
         assert_ne!(source_fingerprint(&provider), original);
         provider.games.get_mut(&42).unwrap().artwork_source_path = None;
+
+        provider
+            .games
+            .get_mut(&42)
+            .unwrap()
+            .artwork_candidate_signature = "candidate-set-a".into();
+        let candidate_signature_fingerprint = source_fingerprint(&provider);
+        provider
+            .games
+            .get_mut(&42)
+            .unwrap()
+            .artwork_candidate_signature = "candidate-set-b".into();
+        assert_ne!(
+            source_fingerprint(&provider),
+            candidate_signature_fingerprint
+        );
+        provider
+            .games
+            .get_mut(&42)
+            .unwrap()
+            .artwork_candidate_signature = String::new();
 
         provider.steam_executable = Some(Path::new("/Steam/updated-steam.exe").to_path_buf());
         assert_ne!(source_fingerprint(&provider), original);

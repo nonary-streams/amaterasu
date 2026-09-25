@@ -85,9 +85,12 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     assert_eq!(first.artwork_source_path.as_deref(), artwork_path.to_str());
     assert!(!first.artwork_is_remote);
     let first_revision = first.artwork_revision.clone().unwrap();
+    let first_candidate_signature = first.artwork_candidate_signature.clone();
+    assert!(!first_candidate_signature.is_empty());
     let listed = serde_json::to_value(first).unwrap();
     assert_eq!(listed["artwork_revision"], first_revision);
     assert!(listed.get("artwork_source_path").is_none());
+    assert!(listed.get("artwork_candidate_signature").is_none());
 
     fs::write(&artwork_path, b"\x89PNG\r\n\x1a\nchanged artwork data").unwrap();
     let mut refreshed = Scan::new(&[library]);
@@ -95,6 +98,10 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     assert_ne!(
         refreshed.games[&42].artwork_revision.as_deref(),
         Some(first_revision.as_str())
+    );
+    assert_ne!(
+        refreshed.games[&42].artwork_candidate_signature,
+        first_candidate_signature
     );
 }
 
@@ -271,6 +278,7 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 artwork_revision: None,
                 artwork_source_path: None,
                 artwork_is_remote: false,
+                artwork_candidate_signature: String::new(),
             },
         );
     }

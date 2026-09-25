@@ -130,14 +130,20 @@ and replaces low-resolution local art when a full portrait is available; those
 behaviors remain pending. Amaterasu has no Steam-authorized product cache root
 or host service for persistent artwork, so remote images are not persisted or
 converted to PNG and a low-resolution local portrait is not replaced remotely.
-Vibeshine's sync fingerprint also tracks all artwork candidate paths and file
-metadata, session artwork revisions, and playtime. Amaterasu discovery does not
-represent all of those inputs, so changes limited to those unrepresented fields
-cannot independently trigger a fingerprint change. The Steam `refresh` action
-only refreshes discovery; it does not force catalog reconciliation when
-`auto_sync` is false, unlike Vibeshine's authenticated force-sync endpoint.
-Unlike Vibeshine's legacy host config parser, the product API rejects negative
-counts and ages as malformed unsigned values instead of clamping them to zero.
+The sync fingerprint also includes an internal, bounded signature over every
+valid local artwork candidate found during discovery, including its canonical
+path, byte length, and modification timestamp, plus role and dimensions used for
+selection. When auto-sync is enabled, changes to a valid local candidate can
+trigger reconciliation even if the selected artwork is unchanged. The signature
+is not included in provider or list responses.
+Session artwork revisions remain untracked. Playtime remains limited to the
+`LastPlayed` values available from supported `localconfig.vdf` sidecars; elapsed
+playtime and per-session playtime state are not represented. The Steam
+`refresh` action only refreshes discovery; it does not force catalog
+reconciliation when `auto_sync` is false, unlike Vibeshine's authenticated
+force-sync endpoint. Unlike Vibeshine's legacy host config parser, the product
+API rejects negative counts and ages as malformed unsigned values instead of
+clamping them to zero.
 
 ```json
 {"action":"refresh"}

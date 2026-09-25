@@ -31,6 +31,8 @@ pub struct Game {
     pub artwork_source_path: Option<String>,
     #[serde(skip)]
     pub artwork_is_remote: bool,
+    #[serde(skip)]
+    pub artwork_candidate_signature: String,
 }
 
 #[derive(Default)]
@@ -342,6 +344,7 @@ fn read_game(
         artwork_revision,
         artwork_source_path: artwork.source_path,
         artwork_is_remote,
+        artwork_candidate_signature: artwork.candidate_signature,
     };
     if serde_json::to_vec(&game)
         .map_err(|error| error.to_string())?

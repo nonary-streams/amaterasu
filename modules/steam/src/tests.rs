@@ -83,6 +83,7 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
             artwork_revision: artwork.revision,
             artwork_source_path: artwork.source_path,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
 
@@ -180,6 +181,7 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
 
@@ -457,6 +459,7 @@ fn set_complete_test_snapshot(provider: &mut Provider, revision: u64, name: &str
             artwork_revision: Some("123".into()),
             artwork_source_path: Some("/Steam/art/42.jpg".into()),
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     )]
     .into_iter()
@@ -623,6 +626,7 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
     module.provider.games.insert(
@@ -641,6 +645,7 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
     module.provider.revision = 1;
@@ -826,6 +831,7 @@ fn catalog_cleanup_waits_for_appinfo_when_tool_filtering_is_active() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
     module.provider.revision = 1;
@@ -875,6 +881,7 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_candidate_signature: String::new(),
         },
     );
     module.provider.revision = 1;

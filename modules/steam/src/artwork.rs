@@ -26,10 +26,14 @@ pub const ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
 pub struct ArtworkMetadata {
     pub source_path: Option<String>,
     pub revision: Option<String>,
+    pub candidate_signature: String,
 }
 
 struct LocalArtworkCandidate {
     metadata: ArtworkMetadata,
+    canonical_path: PathBuf,
+    byte_length: u64,
+    modified_nanos: u128,
     role_priority: u8,
     pixel_area: u64,
     width: u32,
@@ -449,20 +453,117 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
         }
     }
 
-    let mut best_candidate: Option<LocalArtworkCandidate> = None;
+    let mut candidates = Vec::new();
     for root in roots {
-        for candidate in local_candidates(app_id, &root) {
-            let replace = best_candidate
-                .as_ref()
-                .is_none_or(|previous| candidate.is_better_than(previous));
-            if replace {
-                best_candidate = Some(candidate);
-            }
+        candidates.extend(local_candidates(app_id, &root));
+    }
+
+    let candidate_signature = local_candidate_signature(&candidates);
+    let mut best_candidate: Option<LocalArtworkCandidate> = None;
+    for candidate in candidates {
+        let replace = best_candidate
+            .as_ref()
+            .is_none_or(|previous| candidate.is_better_than(previous));
+        if replace {
+            best_candidate = Some(candidate);
         }
     }
-    best_candidate
-        .map(|candidate| candidate.metadata)
-        .unwrap_or_default()
+
+    best_candidate.map_or_else(
+        || ArtworkMetadata {
+            candidate_signature,
+            ..ArtworkMetadata::default()
+        },
+        |candidate| ArtworkMetadata {
+            candidate_signature,
+            ..candidate.metadata
+        },
+    )
+}
+
+fn local_candidate_signature(candidates: &[LocalArtworkCandidate]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+
+    let mut candidates_in_signature_order = candidates.iter().collect::<Vec<_>>();
+    candidates_in_signature_order.sort_by(|left, right| {
+        left.canonical_path
+            .cmp(&right.canonical_path)
+            .then_with(|| left.role_priority.cmp(&right.role_priority))
+            .then_with(|| left.byte_length.cmp(&right.byte_length))
+            .then_with(|| left.modified_nanos.cmp(&right.modified_nanos))
+            .then_with(|| left.width.cmp(&right.width))
+            .then_with(|| left.height.cmp(&right.height))
+    });
+
+    let mut signature = CandidateSignatureBuilder::new();
+    signature.write_u64(candidates_in_signature_order.len() as u64);
+    for candidate in candidates_in_signature_order {
+        signature.write_bytes(&canonical_path_signature_bytes(&candidate.canonical_path));
+        signature.write_u64(candidate.byte_length);
+        signature.write_u128(candidate.modified_nanos);
+        signature.write_u64(u64::from(candidate.role_priority));
+        signature.write_u64(u64::from(candidate.width));
+        signature.write_u64(u64::from(candidate.height));
+    }
+    format!("{:016x}", signature.finish())
+}
+
+struct CandidateSignatureBuilder(u64);
+
+impl CandidateSignatureBuilder {
+    fn new() -> Self {
+        Self(1_469_598_103_934_665_603)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+fn canonical_path_signature_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn canonical_path_signature_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn canonical_path_signature_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
 }
 
 fn local_candidates(app_id: u32, root: &Path) -> Vec<LocalArtworkCandidate> {
@@ -605,7 +706,11 @@ fn inspect_candidate(
         metadata: ArtworkMetadata {
             source_path: canonical_path.to_str().map(str::to_owned),
             revision: Some(revision),
+            candidate_signature: String::new(),
         },
+        canonical_path,
+        byte_length: metadata.len(),
+        modified_nanos,
         role_priority,
         pixel_area: u64::from(width) * u64::from(height),
         width,
@@ -859,6 +964,61 @@ mod tests {
         let second = discover(42, &root.0, &[]);
         assert_eq!(second.source_path.as_deref(), portrait.to_str());
         assert_ne!(second.revision, first.revision);
+    }
+
+    #[test]
+    fn candidate_signature_tracks_non_selected_artwork_candidates() {
+        let root = TemporaryRoot::new();
+        let cache = root.0.join("appcache/librarycache");
+        fs::create_dir_all(&cache).unwrap();
+        let portrait = cache.join("42_library_600x900_2x.png");
+        let header = cache.join("42_header.png");
+        let icon = cache.join("42_icon.png");
+        fs::write(&portrait, synthetic_png(600, 900)).unwrap();
+        fs::write(&header, synthetic_png(1280, 720)).unwrap();
+
+        let first = discover(42, &root.0, &[]);
+        assert_eq!(first.source_path.as_deref(), portrait.to_str());
+        assert!(!first.candidate_signature.is_empty());
+
+        let mut updated_header = synthetic_png(1280, 720);
+        updated_header.push(1);
+        fs::write(&header, updated_header).unwrap();
+        let after_mutation = discover(42, &root.0, &[]);
+        assert_eq!(after_mutation.source_path.as_deref(), portrait.to_str());
+        assert_ne!(
+            after_mutation.candidate_signature,
+            first.candidate_signature
+        );
+
+        fs::write(&icon, synthetic_png(64, 64)).unwrap();
+        let after_addition = discover(42, &root.0, &[]);
+        assert_eq!(after_addition.source_path.as_deref(), portrait.to_str());
+        assert_ne!(
+            after_addition.candidate_signature,
+            after_mutation.candidate_signature
+        );
+    }
+
+    #[test]
+    fn candidate_signature_is_independent_of_root_enumeration_order() {
+        let first_root = TemporaryRoot::new();
+        let second_root = TemporaryRoot::new();
+        let first_cache = first_root.0.join("appcache/librarycache");
+        let second_cache = second_root.0.join("appcache/librarycache");
+        fs::create_dir_all(&first_cache).unwrap();
+        fs::create_dir_all(&second_cache).unwrap();
+        fs::write(
+            first_cache.join("42_library_600x900_2x.png"),
+            synthetic_png(600, 900),
+        )
+        .unwrap();
+        fs::write(second_cache.join("42_icon.png"), synthetic_png(64, 64)).unwrap();
+
+        let forward = discover(42, &first_root.0, std::slice::from_ref(&second_root.0));
+        let reverse = discover(42, &second_root.0, std::slice::from_ref(&first_root.0));
+
+        assert_eq!(forward.candidate_signature, reverse.candidate_signature);
     }
 
     #[test]
