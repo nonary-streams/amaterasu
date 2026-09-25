@@ -20,13 +20,27 @@ separate operations, so the real adapter checks immediately before deletion;
 the protocol does not provide an atomic compare-and-delete operation.
 Likewise, creation preflights the mapping table before `AddPortMapping`, but
 IGD does not provide an atomic create-if-absent operation; an external writer
-could race between those requests.
+could race between those requests. Refresh also checks the complete mapping
+immediately before `AddPortMapping`; IGD provides no atomic compare-and-refresh
+operation, so an external writer could race between the check and refresh.
+
+Call `MappingManager::refresh_owned` periodically to reassert owned mappings.
+It refreshes only mappings whose complete recorded value still matches, drops
+ownership for missing or changed mappings, and preserves changed gateway entries.
+Refresh errors are returned and their mappings remain owned for a later retry.
+The current lease request is zero, which IGDv2 interprets as its maximum lease
+of 604,800 seconds (one week). IGDv2 reports the remaining lease and counts it
+down, so that dynamic value is excluded from stable ownership comparisons. The
+mapping must be refreshed before that lease expires. The recommended
+caller-driven interval `RECOMMENDED_REFRESH_INTERVAL` (30 minutes) is a safety
+margin before expiry, not a timer; callers schedule refreshes. The crate does
+not add a runtime dependency.
 
 `discover_gateway` applies the crate's two-second search timeout and returns
-discovery errors. Mapping and cleanup errors are also returned to the caller.
+discovery errors. Mapping, cleanup, and refresh errors are returned to the
+caller.
 Tests use a deterministic fake gateway and do not contact a router.
 
 This slice does not integrate configuration storage, settings migration,
-management editing, WAN exposure policy, listener startup, or periodic mapping
-refresh. `global:upnp` remains pending until those integration and parity gates
-are completed.
+management editing, WAN exposure policy, or listener startup. `global:upnp`
+remains pending until those integration and parity gates are completed.

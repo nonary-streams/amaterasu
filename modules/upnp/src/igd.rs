@@ -6,7 +6,7 @@ use igd_next::{
     PortMappingProtocol, SearchOptions,
 };
 
-use crate::{Gateway, GatewayError, Mapping, MappingKey, Protocol, RemovalOutcome};
+use crate::{Gateway, GatewayError, Mapping, MappingKey, Protocol, RefreshOutcome, RemovalOutcome};
 
 /// Upper bound for each IGD discovery search iteration.
 pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -83,7 +83,10 @@ impl Gateway for IgdGateway {
         if current_mappings.is_empty() {
             return Ok(RemovalOutcome::Missing);
         }
-        if !current_mappings.iter().any(|current| current == mapping) {
+        if !current_mappings
+            .iter()
+            .any(|current| current.has_same_owned_attributes(mapping))
+        {
             return Ok(RemovalOutcome::Changed);
         }
 
@@ -92,6 +95,35 @@ impl Gateway for IgdGateway {
             .map_err(|error| GatewayError::new(format!("failed to remove IGD mapping: {error}")))?;
 
         Ok(RemovalOutcome::Removed)
+    }
+
+    fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError> {
+        let current_mappings = self.find_mappings(mapping.key())?;
+        if current_mappings.is_empty() {
+            return Ok(RefreshOutcome::Missing);
+        }
+        if !current_mappings
+            .iter()
+            .any(|current| current.has_same_owned_attributes(mapping))
+        {
+            return Ok(RefreshOutcome::Changed);
+        }
+
+        // IGD has no atomic compare-and-refresh operation; another writer can race
+        // between this complete-value check and AddPortMapping.
+        self.gateway
+            .add_port(
+                protocol_to_igd(mapping.protocol),
+                mapping.external_port,
+                SocketAddr::new(IpAddr::V4(mapping.internal_address), mapping.internal_port),
+                mapping.lease_duration_seconds,
+                &mapping.description,
+            )
+            .map_err(|error| {
+                GatewayError::new(format!("failed to refresh IGD mapping: {error}"))
+            })?;
+
+        Ok(RefreshOutcome::Refreshed)
     }
 }
 

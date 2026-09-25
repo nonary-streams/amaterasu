@@ -1,8 +1,9 @@
 //! Explicit, caller-driven lifecycle management for IPv4 UPnP port mappings.
 //!
-//! The manager owns only mappings it successfully created. Call [`MappingManager::shutdown`]
-//! during orderly shutdown to remove those mappings while they still match the exact
-//! recorded mapping.
+//! The manager owns only mappings it successfully created. Call
+//! [`MappingManager::refresh_owned`] periodically to reassert their recorded leases, and
+//! call [`MappingManager::shutdown`] during orderly shutdown to remove mappings that
+//! still match the exact recorded mapping.
 
 mod igd;
 
@@ -13,12 +14,19 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 mod tests;
 
 static OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Recommended caller-driven interval for refreshing owned mappings.
+///
+/// A zero-duration lease request is the IGDv2 maximum of 604,800 seconds (one week).
+/// Callers must refresh before that lease expires. This interval is a safety margin;
+/// callers schedule it because this crate does not run a refresh timer.
+pub const RECOMMENDED_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// The network protocol used by an IGD port mapping.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,6 +52,7 @@ pub struct Mapping {
     pub remote_host: String,
     pub enabled: bool,
     pub description: String,
+    /// Requested lease on writes; IGDv2 queries report remaining seconds that count down.
     pub lease_duration_seconds: u32,
 }
 
@@ -54,6 +63,20 @@ impl Mapping {
             external_port: self.external_port,
             protocol: self.protocol,
         }
+    }
+
+    /// Returns whether the stable attributes identifying this owned mapping match.
+    ///
+    /// IGDv2 reports the remaining lease duration, which counts down between reads.
+    /// That dynamic field is excluded; every other mapping attribute must match.
+    pub fn has_same_owned_attributes(&self, other: &Self) -> bool {
+        self.external_port == other.external_port
+            && self.protocol == other.protocol
+            && self.internal_address == other.internal_address
+            && self.internal_port == other.internal_port
+            && self.remote_host == other.remote_host
+            && self.enabled == other.enabled
+            && self.description == other.description
     }
 }
 
@@ -105,17 +128,29 @@ pub enum RemovalOutcome {
     Changed,
 }
 
+/// Result of refreshing an owned mapping after checking its complete recorded value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOutcome {
+    Refreshed,
+    Missing,
+    Changed,
+}
+
 /// The adapter contract used by the lifecycle manager.
 ///
 /// `create_if_absent` must refuse to replace any mapping with the same external
-/// port and protocol. `remove_if_matches` must compare the full mapping before
-/// removing it and report whether it was removed, missing, or changed.
+/// port and protocol. `remove_if_matches` and `refresh_if_matches` must compare
+/// all stable mapping attributes, excluding only the IGDv2 remaining lease value,
+/// before acting and report whether they removed/refreshed, found missing, or found
+/// changed mappings.
 pub trait Gateway {
     fn find_mappings(&mut self, key: MappingKey) -> Result<Vec<Mapping>, GatewayError>;
 
     fn create_if_absent(&mut self, mapping: &Mapping) -> Result<(), GatewayError>;
 
     fn remove_if_matches(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError>;
+
+    fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +158,7 @@ pub enum MappingOperation {
     Inspect,
     Add,
     Remove,
+    Refresh,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +187,9 @@ pub enum UpnpError {
         failures: Vec<MappingFailure>,
     },
     ShutdownFailed {
+        failures: Vec<MappingFailure>,
+    },
+    RefreshFailed {
         failures: Vec<MappingFailure>,
     },
 }
@@ -197,6 +236,11 @@ impl fmt::Display for UpnpError {
                 "UPnP shutdown left {} mapping cleanup failure(s)",
                 failures.len()
             ),
+            Self::RefreshFailed { failures } => write!(
+                formatter,
+                "UPnP refresh failed for {} owned mapping(s)",
+                failures.len()
+            ),
         }
     }
 }
@@ -215,6 +259,13 @@ pub struct ReconcileReport {
 pub struct ShutdownReport {
     pub removed: usize,
     pub already_missing: usize,
+    pub changed_mappings_preserved: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RefreshReport {
+    pub refreshed: usize,
+    pub missing: usize,
     pub changed_mappings_preserved: usize,
 }
 
@@ -274,7 +325,9 @@ impl<G: Gateway> MappingManager<G> {
             if existing.is_empty() {
                 additions.push(expected_mapping.clone());
             } else if self.owned.get(key) == Some(expected_mapping)
-                && existing.iter().any(|mapping| mapping == expected_mapping)
+                && existing
+                    .iter()
+                    .any(|mapping| mapping.has_same_owned_attributes(expected_mapping))
             {
                 report.already_active += 1;
             } else {
@@ -381,6 +434,43 @@ impl<G: Gateway> MappingManager<G> {
             Ok(report)
         } else {
             Err(UpnpError::ShutdownFailed { failures })
+        }
+    }
+
+    /// Refreshes each currently owned mapping after the gateway confirms it still matches.
+    ///
+    /// Missing and changed mappings are removed from ownership. Gateway errors are
+    /// returned after attempting every mapping, and the affected mappings remain owned
+    /// so a later call can retry them.
+    pub fn refresh_owned(&mut self) -> Result<RefreshReport, UpnpError> {
+        let owned_mappings: Vec<Mapping> = self.owned.values().cloned().collect();
+        let mut report = RefreshReport::default();
+        let mut failures = Vec::new();
+
+        for mapping in owned_mappings {
+            let key = mapping.key();
+            match self.gateway.refresh_if_matches(&mapping) {
+                Ok(RefreshOutcome::Refreshed) => report.refreshed += 1,
+                Ok(RefreshOutcome::Missing) => {
+                    self.owned.remove(&key);
+                    report.missing += 1;
+                }
+                Ok(RefreshOutcome::Changed) => {
+                    self.owned.remove(&key);
+                    report.changed_mappings_preserved += 1;
+                }
+                Err(source) => failures.push(MappingFailure {
+                    operation: MappingOperation::Refresh,
+                    mapping: key,
+                    source,
+                }),
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(report)
+        } else {
+            Err(UpnpError::RefreshFailed { failures })
         }
     }
 

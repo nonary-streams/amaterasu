@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::{
     Gateway, GatewayError, ListenerEndpoint, Mapping, MappingKey, MappingManager, Protocol,
-    ReconcileReport, RemovalOutcome, ShutdownReport, UpnpError,
+    ReconcileReport, RefreshOutcome, RefreshReport, RemovalOutcome, ShutdownReport, UpnpError,
 };
 
 #[derive(Clone, Default)]
@@ -16,7 +16,10 @@ struct FakeGatewayState {
     mappings: BTreeMap<MappingKey, Mapping>,
     fail_add_for: Option<MappingKey>,
     fail_remove_for: Option<MappingKey>,
+    fail_refresh_for: Option<MappingKey>,
     add_attempts: usize,
+    refresh_attempts: usize,
+    refresh_requests: Vec<Mapping>,
 }
 
 impl FakeGateway {
@@ -32,6 +35,10 @@ impl FakeGateway {
         self.0.borrow_mut().fail_remove_for = key;
     }
 
+    fn set_refresh_failure(&self, key: Option<MappingKey>) {
+        self.0.borrow_mut().fail_refresh_for = key;
+    }
+
     fn mappings(&self) -> BTreeMap<MappingKey, Mapping> {
         self.0.borrow().mappings.clone()
     }
@@ -40,8 +47,29 @@ impl FakeGateway {
         self.0.borrow().add_attempts
     }
 
+    fn refresh_attempts(&self) -> usize {
+        self.0.borrow().refresh_attempts
+    }
+
+    fn refresh_requests(&self) -> Vec<Mapping> {
+        self.0.borrow().refresh_requests.clone()
+    }
+
     fn change_mapping(&self, mapping: Mapping) {
         self.0.borrow_mut().mappings.insert(mapping.key(), mapping);
+    }
+
+    fn remove_mapping(&self, key: MappingKey) {
+        self.0.borrow_mut().mappings.remove(&key);
+    }
+
+    fn set_remaining_lease_seconds(&self, key: MappingKey, seconds: u32) {
+        self.0
+            .borrow_mut()
+            .mappings
+            .get_mut(&key)
+            .expect("test mapping should exist")
+            .lease_duration_seconds = seconds;
     }
 }
 
@@ -82,11 +110,30 @@ impl Gateway for FakeGateway {
 
         match state.mappings.get(&key) {
             None => Ok(RemovalOutcome::Missing),
-            Some(current) if current == mapping => {
+            Some(current) if current.has_same_owned_attributes(mapping) => {
                 state.mappings.remove(&key);
                 Ok(RemovalOutcome::Removed)
             }
             Some(_) => Ok(RemovalOutcome::Changed),
+        }
+    }
+
+    fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError> {
+        let mut state = self.0.borrow_mut();
+        let key = mapping.key();
+        state.refresh_attempts += 1;
+        state.refresh_requests.push(mapping.clone());
+
+        if state.fail_refresh_for == Some(key) {
+            return Err(GatewayError::new("injected refresh failure"));
+        }
+
+        match state.mappings.get(&key) {
+            None => Ok(RefreshOutcome::Missing),
+            Some(current) if current.has_same_owned_attributes(mapping) => {
+                Ok(RefreshOutcome::Refreshed)
+            }
+            Some(_) => Ok(RefreshOutcome::Changed),
         }
     }
 }
@@ -349,6 +396,129 @@ fn shutdown_retries_failed_mapping_cleanup() {
         manager.shutdown().unwrap(),
         ShutdownReport {
             removed: 1,
+            already_missing: 0,
+            changed_mappings_preserved: 0,
+        }
+    );
+    assert_eq!(manager.owned_mappings().count(), 0);
+    assert!(fake_gateway.mappings().is_empty());
+}
+
+#[test]
+fn refresh_owned_refreshes_exact_owned_mappings_with_the_recorded_tuple() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let owned_mappings: Vec<Mapping> = manager.owned_mappings().cloned().collect();
+
+    let report = manager.refresh_owned().unwrap();
+
+    assert_eq!(
+        report,
+        RefreshReport {
+            refreshed: 2,
+            missing: 0,
+            changed_mappings_preserved: 0,
+        }
+    );
+    assert_eq!(fake_gateway.refresh_requests(), owned_mappings);
+    assert_eq!(manager.owned_mappings().count(), 2);
+}
+
+#[test]
+fn refresh_owned_relinquishes_missing_and_changed_mappings() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let missing_key = key(47989, Protocol::Tcp);
+    let changed_key = key(47989, Protocol::Udp);
+    fake_gateway.remove_mapping(missing_key);
+    let mut changed_mapping = fake_gateway.mappings()[&changed_key].clone();
+    changed_mapping.description = "replaced by another owner".into();
+    fake_gateway.change_mapping(changed_mapping.clone());
+
+    let report = manager.refresh_owned().unwrap();
+
+    assert_eq!(
+        report,
+        RefreshReport {
+            refreshed: 0,
+            missing: 1,
+            changed_mappings_preserved: 1,
+        }
+    );
+    assert_eq!(manager.owned_mappings().count(), 0);
+    assert!(!fake_gateway.mappings().contains_key(&missing_key));
+    assert_eq!(
+        fake_gateway.mappings().get(&changed_key),
+        Some(&changed_mapping)
+    );
+}
+
+#[test]
+fn refresh_owned_retains_failed_mappings_and_retries_them() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let failed_key = key(47989, Protocol::Tcp);
+    fake_gateway.set_refresh_failure(Some(failed_key));
+
+    let error = manager.refresh_owned().unwrap_err();
+
+    assert!(matches!(
+        error,
+        UpnpError::RefreshFailed { failures }
+            if failures.len() == 1
+                && failures[0].operation == super::MappingOperation::Refresh
+                && failures[0].mapping == failed_key
+    ));
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.refresh_attempts(), 2);
+
+    fake_gateway.set_refresh_failure(None);
+    let report = manager.refresh_owned().unwrap();
+
+    assert_eq!(report.refreshed, 2);
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.refresh_attempts(), 4);
+}
+
+#[test]
+fn remaining_lease_countdown_does_not_change_owned_mapping_identity() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    let configured = [endpoint([192, 168, 1, 10], 47989, true)];
+    manager.reconcile(&configured).unwrap();
+    let tcp_key = key(47989, Protocol::Tcp);
+    let udp_key = key(47989, Protocol::Udp);
+
+    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_800);
+    fake_gateway.set_remaining_lease_seconds(udp_key, 604_800);
+    let reconcile_report = manager.reconcile(&configured).unwrap();
+
+    assert_eq!(reconcile_report.created, 0);
+    assert_eq!(reconcile_report.already_active, 2);
+    assert_eq!(manager.owned_mappings().count(), 2);
+
+    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_799);
+    fake_gateway.set_remaining_lease_seconds(udp_key, 604_798);
+    let refresh_report = manager.refresh_owned().unwrap();
+
+    assert_eq!(refresh_report.refreshed, 2);
+    assert_eq!(manager.owned_mappings().count(), 2);
+
+    fake_gateway.set_remaining_lease_seconds(tcp_key, 604_798);
+    fake_gateway.set_remaining_lease_seconds(udp_key, 604_797);
+    assert_eq!(
+        manager.shutdown().unwrap(),
+        ShutdownReport {
+            removed: 2,
             already_missing: 0,
             changed_mappings_preserved: 0,
         }
