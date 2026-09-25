@@ -1036,19 +1036,19 @@ mod tests {
             "vibepollo.conf",
         ];
 
-        for first_index in 0..CONFIG_FILES.len() {
-            for second_index in first_index + 1..CONFIG_FILES.len() {
+        for (first_index, first_config_file) in CONFIG_FILES.iter().enumerate() {
+            for second_config_file in CONFIG_FILES.iter().skip(first_index + 1) {
                 let pair_name = format!(
                     "{}-{}",
-                    CONFIG_FILES[first_index].trim_end_matches(".conf"),
-                    CONFIG_FILES[second_index].trim_end_matches(".conf")
+                    first_config_file.trim_end_matches(".conf"),
+                    second_config_file.trim_end_matches(".conf")
                 );
 
                 let same_source = temporary_directory(&format!("cross-config-same-{pair_name}"));
                 std::fs::create_dir_all(same_source.join("private")).unwrap();
                 std::fs::write(
                     same_source.join("private/primary.json"),
-                    credential_record("Shared", "shared password", "SharedSalt12345"),
+                    credential_record("Shared", "shared password", "SharedSalt123456"),
                 )
                 .unwrap();
                 #[cfg(unix)]
@@ -1063,8 +1063,8 @@ mod tests {
                     "private/primary.json"
                 };
                 for (config_file, state_path) in [
-                    (CONFIG_FILES[first_index], "private/primary.json"),
-                    (CONFIG_FILES[second_index], second_state_path),
+                    (*first_config_file, "private/primary.json"),
+                    (*second_config_file, second_state_path),
                 ] {
                     std::fs::write(
                         same_source.join(config_file),
@@ -1098,17 +1098,17 @@ mod tests {
                 std::fs::create_dir_all(distinct_source.join("private")).unwrap();
                 std::fs::write(
                     distinct_source.join("private/first.json"),
-                    credential_record("First", "first password", "FirstSalt123456"),
+                    credential_record("First", "first password", "FirstSalt1234567"),
                 )
                 .unwrap();
                 std::fs::write(
                     distinct_source.join("private/second.json"),
-                    credential_record("Second", "second password", "SecondSalt12345"),
+                    credential_record("Second", "second password", "SecondSalt123456"),
                 )
                 .unwrap();
                 for (config_file, state_path) in [
-                    (CONFIG_FILES[first_index], "private/first.json"),
-                    (CONFIG_FILES[second_index], "private/second.json"),
+                    (*first_config_file, "private/first.json"),
+                    (*second_config_file, "private/second.json"),
                 ] {
                     std::fs::write(
                         distinct_source.join(config_file),
@@ -1136,12 +1136,12 @@ mod tests {
                 )
                 .unwrap();
                 std::fs::write(
-                    mixed_source.join(CONFIG_FILES[first_index]),
+                    mixed_source.join(first_config_file),
                     "file_state = private/missing.json\n",
                 )
                 .unwrap();
                 std::fs::write(
-                    mixed_source.join(CONFIG_FILES[second_index]),
+                    mixed_source.join(second_config_file),
                     "file_state = private/existing.json\n",
                 )
                 .unwrap();
