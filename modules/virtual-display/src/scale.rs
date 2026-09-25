@@ -1,4 +1,4 @@
-//! Pure policy for virtual-display compositor scale requests.
+//! Accepted virtual-display scale request values and validation.
 
 /// Values accepted by `dd_virtual_display_scale`, in ascending order.
 pub const SUPPORTED_SCALE_VALUES: [i32; 14] = [
