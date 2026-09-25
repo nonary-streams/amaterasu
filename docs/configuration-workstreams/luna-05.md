@@ -472,3 +472,10 @@
 - Lane candidate `3ab7b78976aef1497717d7c799799dd6b6462fc8` landed directly on main as `dfc3bf1868f6047a56408b7b4fbce56bb83d67a7`. The Catalog model stores `prefer_10bit_sdr` sparsely as `Option<bool>`: absent/null inherits, explicit true or false persists, and wrong JSON types reject. Catalog document and provider marker versions remain unchanged.
 - Main validation passed `cargo fmt --check -p amaterasu-catalog`, all 77 Catalog tests, strict all-target Catalog Clippy, and `git diff --cached --check` before the source commit.
 - `per_application:prefer-10bit-sdr` remains pending L06 editor/readback integration, L02 launch/NVHTTP effective projection, end-to-end snapshot/runtime behavior, and platform qualification. Catalog storage alone has no launch or runtime effect.
+
+## Coordinator validation update: per-application HDR request storage
+
+- L05 lane code commit `c0ff9151cc76d5f4613bdb3701068f43080d20ea` landed directly on main as `200a4b622f6ffd621a39b25d421e58b8b40a8279`. The optional `dd_hdr_request_override` stores exactly `auto`, `force_on`, or `force_off`; absent/null inherits, explicit `auto` persists, and unknown or non-string values reject. Catalog and provider-marker versions remain unchanged.
+- Main `cargo fmt --check` found assertion reflow from the stale lane formatter. Coordinator commit `a141941b9747dd34cfa8e2b6697b53ca1182a799` reapplied the package Cargo formatter; the net candidate changes remain limited to `modules/catalog/src/model.rs`, `modules/catalog/src/pipeline/tests.rs`, and `modules/catalog/README.md`.
+- Main validation passed formatting, `git diff --check`, all 80 Catalog tests, and strict all-target Catalog Clippy.
+- Storage only is implemented. `per_application:dd_hdr_request_override` and `global:dd_hdr_request_override` remain pending effective policy resolution, Launch projection, management readback, display/runtime effects, and platform qualification.

@@ -332,3 +332,10 @@ The child passed `rustfmt --edition 2024 --check crates/package/src/migration.rs
 - Lane code commit `660039b988d280fb6c50fc7138c54da976d88988` landed directly on main as `e8da9a7f8cb0cf2343b54b8763d0ef55bb7af8ee`. The cherry-pick required no conflict. Formatting passed, all 55 package library tests and 4 CLI tests passed, and strict all-target package Clippy passed.
 - The Windows case-only primary-state alias regression passed in the coordinator run. The Unix symlink/import qualification remains outstanding because WSL is unavailable here.
 - `global:file_state` and all other L01 stable IDs remain pending consumer, management, migration, and platform evidence. This package candidate does not close the ID.
+
+## Coordinator validation update: credentials across predecessor configs (2026-09-25)
+
+- L01 lane test commit `81ff881e6c7cc91b2e9b08aa1c8f0625d8f239f9` landed directly on main as `d82277d7d44281218d867ac32362d9e1b2c94273`. It adds coverage only; production migration behavior and versions are unchanged.
+- Main validation initially found invalid legacy salts and strict Clippy range-loop warnings. Coordinator follow-up `dcebf41` uses valid 16-byte salts and iterator-based pair enumeration.
+- `cargo fmt --check -p amaterasu-authentication`, `git diff --check`, all 52 authentication tests, and `cargo clippy -p amaterasu-authentication --all-targets -- -D warnings` passed after the correction.
+- The precedence and conflict cases ran on Windows; the Unix symlink-alias branch did not run here. `global:credentials_file` remains pending full migration, management, consumer, and platform evidence.

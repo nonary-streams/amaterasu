@@ -6,7 +6,7 @@
 - Main checkout: `C:\Users\Chase\sources\amaterasu`
 - No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: see the current session snapshot at the end of this file. The last process check found four live lane leads; L03 had completed its parser candidate, while L04 had stopped at a cross-lane contract gate.
+- Status: see the current session snapshot at the end of this file. The latest process check found all six lane leads live; L03 and L04 were resumed after completing a slice or reaching a gate.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -344,6 +344,8 @@ Coordinator decisions and dependency acknowledgments are tracked here and in the
 | luna-04 direct virtual-sink capture-policy normalization | `1d8bb712`, `83ace035` | `3914de70`, `f5425f9a` | Direct audio API opens clear capture-only routing when a virtual-sink selector is present. Formatting passed, Windows-target tests passed (46 passed, 1 ignored live-endpoint test), and strict Clippy passed after the one-file XHigh correction. Both audio setting IDs remain pending for persistence, caller-scoped resolution, management, and device qualification. |
 | luna-02 pairing identity inline-comment handling | `a9c75702` | pending | Lane committed the parser correction and focused tests; coordinator package validation is pending. |
 | luna-03 manual-resolution parser | `afe11022` | `d66ac2a9` | Cherry-picked directly to main. `cargo fmt --check -p amaterasu-display`, `git diff --check`, 40 display tests, and strict Clippy passed. The parser slice does not add persistence, scoped resolution, UI readback, or runtime effects; `global:dd_manual_resolution` remains pending. |
+| luna-01 cross-config credential migration tests | `81ff881e` | `d82277d7`, `dcebf41` | Direct cherry-pick followed by a coordinator fixture/Clippy correction. Formatting, all 52 authentication tests, and strict all-target Clippy passed. Production behavior is unchanged; the Unix symlink case and the remaining credential migration/management/runtime evidence are pending. |
+| luna-05 per-app HDR request storage | `c0ff9151` | `200a4b62`, `a141941` | Direct cherry-pick followed by coordinator Cargo-format cleanup of stale assertion reflow. The net change is limited to the three reserved Catalog paths; formatting, all 80 Catalog tests, and strict all-target Clippy passed. L02 projection, L06 readback, runtime effects, and platform evidence remain pending. |
 
 Cherry-pick each new lane candidate directly onto `main`, resolve clear conflicts in the main checkout, and record the resulting main commit here. Lightweight lane worktrees remain source-only; package tests and Clippy run from this coordinator checkout.
 
@@ -383,11 +385,11 @@ This reflects the latest process and worktree check. Lead session IDs remain the
 
 | Lead | Lead process | Latest work evidence |
 | --- | --- | --- |
-| luna-01 | PID 45472, live | Its XHigh credentials worker (session `01a0d8e5-cd34-7620-a043-72b29cb01c8b`, PID 56812) has an uncommitted 161-line change in `modules/authentication/src/migration.rs`. |
+| luna-01 | PID 47792, live | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. The lead is resumed for the next independent slice. |
 | luna-02 | PID 52592, live | Network lane has a 13-file draft across NVHTTP, RTSP, and stream-session. |
-| luna-03 | stopped | Manual-resolution parser landed on main as `d66ac2a9`; coordinator formatting, 40 tests, and strict Clippy passed. The ID remains pending. |
-| luna-04 | stopped | Native pen/touch worker candidate is reviewed but held pending L02/L05 contract acknowledgements and coordinator release. |
-| luna-05 | PID 50380, live | Its XHigh Catalog worker committed `2d87ceb6` for `dd_hdr_request_override`; lead review and validation are pending. |
-| luna-06 | PID 33088, live | Its XHigh locale worker (session `01a0d8e5-6cd6-7951-aa66-e3efc85e5cf6`, PID 56584) is live; no worktree diff was visible at the last check. |
+| luna-03 | PID 4472, live | Manual-resolution parser landed on main as `d66ac2a9`; coordinator formatting, 40 tests, and strict Clippy passed. The lead is resumed for another unblocked slice; the ID remains pending. |
+| luna-04 | PID 56892, live | Native pen/touch worker candidate is reviewed but held pending L02/L05 contract acknowledgements and coordinator release. The lead is resumed for another independent input slice. |
+| luna-05 | PID 50380, live | Catalog HDR storage landed as `200a4b62` and formatter cleanup as `a141941`; 80 tests and strict Clippy passed. The next reservation is an application README correction for `per_application:elevated`. |
+| luna-06 | PID 33088, live | The locale worker session ended at its clean reserved base without a code candidate. The coordinator corrected the conflicting topology instruction and asked the lead to inspect the session and continue the authorized slice. |
 
-L03 and L04 can be resumed when new work or the outstanding gate is ready. The main checkout remains the direct landing point; do not push.
+The main checkout remains the direct landing point; do not push.
