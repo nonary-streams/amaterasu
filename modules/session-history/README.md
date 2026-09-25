@@ -47,9 +47,12 @@ do not fail the history module tick or the stream session.
 
 History detail responses cap samples to the latest 32 and events to the latest
 8. Session listing is capped at 25 items per page and active listing at 16.
+Storage keeps the latest 7,200 samples and 2,000 events per session; inserts
+and trimming commit together so failed trimming cannot leave an unbounded row.
 Retention is applied by age and approximate live SQLite page bytes. Both
 policies delete ended sessions only; active records are retained even if the
-configured size limit cannot yet be met. A size of zero disables its policy.
+configured size limit cannot yet be met. Retention still applies to ended
+records while new recording is disabled. A size of zero disables its policy.
 
 ## Integration status
 

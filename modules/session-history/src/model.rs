@@ -11,6 +11,8 @@ pub const MAX_SESSION_LIMIT: usize = 25;
 pub const MAX_ACTIVE_LIMIT: usize = 16;
 pub const MAX_DETAIL_SAMPLES: usize = 32;
 pub const MAX_DETAIL_EVENTS: usize = 8;
+pub const MAX_STORED_SAMPLES: usize = 7200;
+pub const MAX_STORED_EVENTS: usize = 2000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

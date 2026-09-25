@@ -1,7 +1,7 @@
 use crate::model::{
     HistorySettings, HistoryStatus, MAX_ACTIVE_LIMIT, MAX_DETAIL_EVENTS, MAX_DETAIL_SAMPLES,
-    MAX_SESSION_LIMIT, PruneReport, SessionDetail, SessionEvent, SessionMetadata, SessionSample,
-    SessionSummary, validate_text,
+    MAX_SESSION_LIMIT, MAX_STORED_EVENTS, MAX_STORED_SAMPLES, PruneReport, SessionDetail,
+    SessionEvent, SessionMetadata, SessionSample, SessionSummary, validate_text,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -181,6 +181,7 @@ impl HistoryStore {
              VALUES (?1, ?2, 'stream_started', NULL)",
             params![metadata.session_id, started_at_unix],
         )?;
+        trim_events(&transaction, &metadata.session_id)?;
         transaction.commit()?;
         self.active_streams.insert(metadata.session_id.clone());
         Ok(true)
@@ -217,6 +218,7 @@ impl HistoryStore {
                      VALUES (?1, ?2, 'stream_ended', NULL)",
                     params![session_id, ended_at_unix],
                 )?;
+                trim_events(&transaction, session_id)?;
                 ended = true;
             }
             transaction.commit()?;
@@ -242,7 +244,10 @@ impl HistoryStore {
             .map_err(|_| HistoryError::Invalid("bytes_sent exceeds SQLite integer range"))?;
         let dropped_frames = i64::try_from(sample.dropped_frames)
             .map_err(|_| HistoryError::Invalid("dropped_frames exceeds SQLite integer range"))?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO samples (
                 session_id, recorded_at_unix, frames_sent, bytes_sent, dropped_frames,
                 actual_fps, actual_bitrate_kbps, encode_latency_ms
@@ -258,6 +263,8 @@ impl HistoryStore {
                 sample.encode_latency_ms,
             ],
         )?;
+        trim_samples(&transaction, &sample.session_id)?;
+        transaction.commit()?;
         Ok(true)
     }
 
@@ -272,7 +279,10 @@ impl HistoryStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|_| HistoryError::Database)?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO events (session_id, recorded_at_unix, event_type, payload)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -282,6 +292,8 @@ impl HistoryStore {
                 payload
             ],
         )?;
+        trim_events(&transaction, &event.session_id)?;
+        transaction.commit()?;
         Ok(true)
     }
 
@@ -370,7 +382,7 @@ impl HistoryStore {
     }
 
     pub fn prune(&mut self, now_unix: i64) -> Result<PruneReport, HistoryError> {
-        if !self.effective_enabled {
+        if !self.configuration_ready {
             return Ok(self.last_prune.clone());
         }
         let transaction = self
@@ -447,7 +459,7 @@ impl HistoryStore {
     }
 
     fn prune_best_effort(&mut self, now_unix: i64) {
-        if self.effective_enabled && self.prune(now_unix).is_err() {
+        if self.configuration_ready && self.prune(now_unix).is_err() {
             self.record_failure();
         }
     }
@@ -474,6 +486,7 @@ impl HistoryStore {
                  VALUES (?1, ?2, 'stream_interrupted', NULL)",
                 params![session_id, now_unix],
             )?;
+            trim_events(&transaction, &session_id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -659,6 +672,28 @@ fn table_count(connection: &Connection, table: &str) -> Result<usize, HistoryErr
     };
     let count: i64 = connection.query_row(sql, [], |row| row.get(0))?;
     Ok(usize::try_from(count).unwrap_or_default())
+}
+
+fn trim_samples(connection: &Connection, session_id: &str) -> Result<(), HistoryError> {
+    connection.execute(
+        "DELETE FROM samples WHERE id IN (
+            SELECT id FROM samples WHERE session_id = ?1
+            ORDER BY recorded_at_unix DESC, id DESC LIMIT -1 OFFSET ?2
+        )",
+        params![session_id, MAX_STORED_SAMPLES as i64],
+    )?;
+    Ok(())
+}
+
+fn trim_events(connection: &Connection, session_id: &str) -> Result<(), HistoryError> {
+    connection.execute(
+        "DELETE FROM events WHERE id IN (
+            SELECT id FROM events WHERE session_id = ?1
+            ORDER BY recorded_at_unix DESC, id DESC LIMIT -1 OFFSET ?2
+        )",
+        params![session_id, MAX_STORED_EVENTS as i64],
+    )?;
+    Ok(())
 }
 
 fn estimate_live_bytes(connection: &Connection) -> Result<u64, HistoryError> {
@@ -1045,6 +1080,121 @@ mod tests {
     }
 
     #[test]
+    fn disabled_recording_still_applies_retention_after_restart() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        {
+            let mut store = HistoryStore::open(&path, 100).unwrap();
+            configure(&mut store, HistorySettings::default(), 100);
+            store.begin_session(&metadata("expired"), 100).unwrap();
+            store.end_session("expired", 110).unwrap();
+            store.begin_session(&metadata("recent"), 170_000).unwrap();
+            store.end_session("recent", 170_010).unwrap();
+        }
+
+        let mut store = HistoryStore::open(&path, 200_000).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 1,
+                db_size_limit_mb: 0,
+            },
+            200_000,
+        );
+        assert!(!store.settings().1);
+        assert!(matches!(
+            store.session_detail("expired"),
+            Err(HistoryError::NotFound)
+        ));
+        assert_eq!(
+            store.session_detail("recent").unwrap().session.session_id,
+            "recent"
+        );
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+        assert!(
+            !store
+                .begin_session(&metadata("unrecorded"), 200_001)
+                .unwrap()
+        );
+        assert_eq!(store.status().unwrap().sessions, 1);
+    }
+
+    #[test]
+    fn disabled_recording_still_applies_size_limit_to_ended_records() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store.begin_session(&metadata("large"), 100).unwrap();
+        for index in 0..300 {
+            store
+                .record_event(&event("large", 101 + index, json!("x".repeat(4000))))
+                .unwrap();
+        }
+        store.end_session("large", 500).unwrap();
+
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 0,
+                db_size_limit_mb: 1,
+            },
+            600,
+        );
+        assert!(!store.settings().1);
+        assert!(matches!(
+            store.session_detail("large"),
+            Err(HistoryError::NotFound)
+        ));
+        let status = store.status().unwrap();
+        assert_eq!(status.last_prune.sessions_deleted, 1);
+        assert!(!status.last_prune.size_limit_unmet);
+    }
+
+    #[test]
+    fn disabling_during_a_stream_keeps_its_recording_until_all_streams_end() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let mut store = HistoryStore::open(&path, 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        assert!(store.begin_session(&metadata("first"), 100).unwrap());
+
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 0,
+                db_size_limit_mb: 0,
+            },
+            101,
+        );
+        assert!(store.settings().1);
+        assert!(store.begin_session(&metadata("second"), 102).unwrap());
+        assert!(store.end_session("first", 103).unwrap());
+        assert!(store.settings().1);
+        assert!(store.end_session("second", 104).unwrap());
+        assert!(!store.settings().1);
+        assert!(!store.begin_session(&metadata("third"), 105).unwrap());
+        assert!(!store.end_session("third", 106).unwrap());
+        assert_eq!(store.status().unwrap().sessions, 2);
+
+        drop(store);
+        let mut reopened = HistoryStore::open(&path, 200).unwrap();
+        configure(
+            &mut reopened,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 0,
+                db_size_limit_mb: 0,
+            },
+            200,
+        );
+        assert_eq!(reopened.list_sessions(25, 0).unwrap().len(), 2);
+        assert!(reopened.active_sessions(16).unwrap().is_empty());
+    }
+
+    #[test]
     fn size_pruning_removes_oldest_ended_sessions_without_deleting_active_records() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
@@ -1159,5 +1309,87 @@ mod tests {
             store.active_sessions(17),
             Err(HistoryError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn sample_and_event_storage_keeps_the_newest_per_session_after_restart() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let mut store = HistoryStore::open(&path, 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store
+            .begin_session(&metadata("bounded-storage"), 100)
+            .unwrap();
+
+        // Seed a full history in one transaction; the public writes at the
+        // boundary exercise both retention paths and their readback.
+        {
+            let transaction = store.connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO samples (session_id, recorded_at_unix, frames_sent,
+                     bytes_sent, dropped_frames, actual_fps, actual_bitrate_kbps,
+                     encode_latency_ms) VALUES ('bounded-storage', ?1, 0, 0, 0, 0, 0, 0)",
+                    )
+                    .unwrap();
+                for timestamp in 101..=100 + MAX_STORED_SAMPLES as i64 {
+                    insert.execute([timestamp]).unwrap();
+                }
+            }
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO events (session_id, recorded_at_unix, event_type, payload)
+                     VALUES ('bounded-storage', ?1, 'marker', NULL)",
+                    )
+                    .unwrap();
+                for timestamp in 101..100 + MAX_STORED_EVENTS as i64 {
+                    insert.execute([timestamp]).unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        assert!(
+            store
+                .record_sample(&SessionSample {
+                    session_id: "bounded-storage".into(),
+                    recorded_at_unix: 10_000,
+                    frames_sent: 1,
+                    bytes_sent: 2,
+                    dropped_frames: 0,
+                    actual_fps: 60.0,
+                    actual_bitrate_kbps: 10_000.0,
+                    encode_latency_ms: 1.0,
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_event(&event("bounded-storage", 10_001, json!(null)))
+                .unwrap()
+        );
+        assert!(store.end_session("bounded-storage", 10_002).unwrap());
+        assert_eq!(store.status().unwrap().samples, MAX_STORED_SAMPLES);
+        assert_eq!(store.status().unwrap().events, MAX_STORED_EVENTS);
+        let oldest_sample: i64 = store
+            .connection
+            .query_row(
+                "SELECT min(recorded_at_unix) FROM samples WHERE session_id = 'bounded-storage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest_sample, 102);
+
+        drop(store);
+        let mut reopened = HistoryStore::open(&path, 20_000).unwrap();
+        configure(&mut reopened, HistorySettings::default(), 20_000);
+        let detail = reopened.session_detail("bounded-storage").unwrap();
+        assert_eq!(detail.sample_count, MAX_STORED_SAMPLES);
+        assert_eq!(detail.event_count, MAX_STORED_EVENTS);
+        assert_eq!(detail.samples.last().unwrap().recorded_at_unix, 10_000);
+        assert_eq!(detail.events.last().unwrap().event_type, "stream_ended");
     }
 }
