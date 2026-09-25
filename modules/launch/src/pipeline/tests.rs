@@ -68,6 +68,7 @@ struct Harness {
     catalog_audio_sink_capture_only: Option<bool>,
     catalog_back_button_timeout: Option<i32>,
     catalog_amd_av1_latency_mode: Option<Value>,
+    catalog_nvenc_spatial_aq: Option<Value>,
     catalog_playnite_game_id: Option<String>,
     catalog_playnite_exit_timeout_seconds: u64,
     provider_launches: Vec<TestProviderLaunch>,
@@ -122,6 +123,7 @@ impl Harness {
             catalog_audio_sink_capture_only: None,
             catalog_back_button_timeout: None,
             catalog_amd_av1_latency_mode: None,
+            catalog_nvenc_spatial_aq: None,
             catalog_playnite_game_id: None,
             catalog_playnite_exit_timeout_seconds: 10,
             provider_launches: Vec::new(),
@@ -568,6 +570,9 @@ impl Harness {
                         }
                         if let Some(mode) = &self.catalog_amd_av1_latency_mode {
                             overrides.insert("amd_av1_latency_mode".into(), mode.clone());
+                        }
+                        if let Some(enabled) = &self.catalog_nvenc_spatial_aq {
+                            overrides.insert("nvenc_spatial_aq".into(), enabled.clone());
                         }
                         if !overrides.is_empty() {
                             reply["entry"]["config_overrides"] = json!(overrides);
@@ -1026,35 +1031,25 @@ fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
 #[test]
 fn nvenc_spatial_aq_is_retained_across_launch_retry_and_status() {
     let cases = [
-        (
-            "absent",
-            None,
-            Some(json!({"nvenc_spatial_aq":true})),
-            json!({}),
-        ),
-        (
-            "null",
-            Some(json!({"nvenc_spatial_aq":null})),
-            Some(json!({"nvenc_spatial_aq":false})),
-            json!({}),
-        ),
+        ("absent", None, Some(json!(true)), json!({})),
+        ("null", Some(json!(null)), Some(json!(false)), json!({})),
         (
             "true",
-            Some(json!({"nvenc_spatial_aq":true})),
-            Some(json!({"nvenc_spatial_aq":false})),
+            Some(json!(true)),
+            Some(json!(false)),
             json!({"nvenc_spatial_aq":true}),
         ),
         (
             "false",
-            Some(json!({"nvenc_spatial_aq":false})),
-            Some(json!({"nvenc_spatial_aq":true})),
+            Some(json!(false)),
+            Some(json!(true)),
             json!({"nvenc_spatial_aq":false}),
         ),
     ];
 
     for (case, initial_config_overrides, changed_config_overrides, expected_snapshot) in cases {
         let mut harness = Harness::new();
-        harness.catalog_config_overrides = initial_config_overrides;
+        harness.catalog_nvenc_spatial_aq = initial_config_overrides;
         let mut pipeline = pipeline();
         let operation_id = format!("nvenc-spatial-aq-{case}");
 
@@ -1071,7 +1066,7 @@ fn nvenc_spatial_aq_is_retained_across_launch_retry_and_status() {
         let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
 
         // Catalog edits do not replace the settings captured by the launch.
-        harness.catalog_config_overrides = changed_config_overrides;
+        harness.catalog_nvenc_spatial_aq = changed_config_overrides;
         let retry = harness.request(&mut pipeline, "alice", launch(&operation_id));
         assert_eq!(
             retry["launch"]
@@ -1105,7 +1100,7 @@ fn invalid_nvenc_spatial_aq_fails_before_session_creation() {
         .enumerate()
     {
         let mut harness = Harness::new();
-        harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":invalid}));
+        harness.catalog_nvenc_spatial_aq = Some(invalid);
         let mut pipeline = pipeline();
 
         let failed = harness.request(
