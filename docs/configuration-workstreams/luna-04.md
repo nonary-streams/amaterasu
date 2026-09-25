@@ -301,3 +301,9 @@ Record acknowledgements to the coordinator's default-endpoint decision as they a
 - The continuous-framing receiver commits `80d3548355dde55978799eb6429f8792d3ec6879` and `0c0942782eff83553695144b47bb0fa89ea4cff6` landed directly as `f439a922217a11307014d4fac690726968553d0b` and `d30fb2ca21276e1b2aa2c79358c09a3af5284747`. Main commit `ad1fba3` groups the request fields and fixed-width sample checks after strict Clippy identified lint findings.
 - The accepted `amaterasu.audio/1` Open contract accepts optional 5 or 10 ms packet framing; missing or null retains legacy pending-on-idle behavior. Main validation passed `cargo fmt --check -p amaterasu-audio`, `git diff --check`, 62 audio tests (one hardware test ignored), and strict Clippy.
 - This is the receiver half of L02's session-only `continuousAudio` path. Its producer remains isolated in L02's lane and must pass consumer and coordinator package tests before the feature is verified. No stable ID is closed here; management, persistence and Windows capture qualification remain pending for the assigned IDs.
+
+## Coordinator validation update: zero-duration Back timeout (2026-09-25)
+
+- Lane code candidate `a6e116b227038c8653d4c8928eb04ef38fb16f21` landed directly on main as `ce58dfbb`. The zero-timeout Back press now reaches the device before a subsequent timer advancement expires its deadline; the regression covers the initial snapshot, same-time expiry, Guide pulse, held-button suppression, and release/re-press delivery.
+- Main validation passed `cargo fmt --check -p amaterasu-input`, all 119 `amaterasu-input` tests, strict all-target input Clippy, and `git diff --check`.
+- `global:back_button_timeout` remains pending durable defaults/migration, scoped override validation through the actual consumer, management readback, and platform runtime qualification. No stable ID is closed by this slice.
