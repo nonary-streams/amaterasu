@@ -340,6 +340,32 @@ fn ready_ticket_uses_configured_ping_timeout_after_preparation() {
 }
 
 #[test]
+fn ready_ticket_uses_default_ping_timeout_after_preparation() {
+    let admission_time = 0_u64;
+    let request = open("default-timeout-operation");
+    assert!(request.get("ping_timeout_ms").is_none());
+    let Operation::Open(config) =
+        serde_json::from_value(request.clone()).expect("valid open request")
+    else {
+        panic!("open helper should deserialize as an open operation");
+    };
+    assert_eq!(config.ping_timeout_ms, 10_000);
+
+    let mut endpoint = Endpoint::default();
+    endpoint.enqueue(1, "owner", request);
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).expect("controller");
+
+    finish_prepare(&mut controller, &runtime);
+
+    let record = controller.records.values().next().expect("prepared ticket");
+    assert!(record.state == State::Ready);
+    assert_eq!(record.config.ping_timeout_ms, 10_000);
+    let expected_expiry = admission_time + 10_000;
+    assert!((expected_expiry..=expected_expiry + 2).contains(&record.expires));
+}
+
+#[test]
 fn discovery_tokens_are_fresh_per_ticket_stable_on_retry_and_never_public() {
     let mut endpoint = Endpoint::default();
     endpoint.enqueue(1, "owner", discovery_open("discovery-one"));
