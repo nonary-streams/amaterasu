@@ -1110,7 +1110,7 @@ namespace Amaterasu {
         );
         recentGames.required = true;
         recentGames.min = "0";
-        recentGames.max = "10000";
+        recentGames.max = "50";
         recentGames.step = "1";
         const recentMaxAgeDays = input(
           "playnite_recent_max_age_days",
@@ -1231,7 +1231,7 @@ namespace Amaterasu {
           field(
             "Recent games to import",
             recentGames,
-            "Maximum number of recent games (0–10000); zero disables recent-game selection.",
+            "Maximum number of recent games (0–50); zero disables recent-game selection.",
           ),
           field(
             "Recent game age limit (days)",

@@ -285,6 +285,32 @@ test("Playnite editor validates complete sparse settings and bounded filter list
   }
 });
 
+test("recent-games UI keeps the Playnite limit at 50 and Steam limit at 10000", () => {
+  const settingsSource = readFileSync("src/settings.ts", "utf8");
+  const steamSettingsUi = settingsSource.slice(
+    settingsSource.indexOf("async function loadSteam(): Promise<void>"),
+    settingsSource.indexOf("async function loadLutris(): Promise<void>"),
+  );
+  const playniteSettingsUi = settingsSource.slice(
+    settingsSource.indexOf("async function loadPlaynite(): Promise<void>"),
+    settingsSource.indexOf(
+      "async function loadPlayniteSettings(): Promise<PlayniteSettings>",
+    ),
+  );
+
+  assert.match(steamSettingsUi, /recentGames\.max = "10000";/);
+  assert.match(
+    steamSettingsUi,
+    /Maximum number of recently played games \(0–10000\); zero imports none in recent-only mode\./,
+  );
+  assert.match(playniteSettingsUi, /recentGames\.min = "0";/);
+  assert.match(playniteSettingsUi, /recentGames\.max = "50";/);
+  assert.match(
+    playniteSettingsUi,
+    /Maximum number of recent games \(0–50\); zero disables recent-game selection\./,
+  );
+});
+
 test("Playnite status explains disabled, unavailable, and active scan states", () => {
   const describe = context.Amaterasu.playniteStatusDescription;
   const status = {
