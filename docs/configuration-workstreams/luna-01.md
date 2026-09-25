@@ -290,3 +290,7 @@ The worker and lane passed edition-2024 rustfmt and `git diff --check`; Cargo te
 L01 workspace-registration lane commit `7472c8e67fa30ab5056bcf238887aa7f52b7438d` landed on main as `b8703e0b`. The UPnP package and caller-driven lease-refresh fix are now on main as `ad0f72bb`; coordinator formatting, 13/13 tests, and strict Clippy passed. Root manifest paths are released. `global:upnp` remains pending settings migration, management authority/editor, listener lifecycle and refresh scheduling, router testing, and platform qualification.
 
 All seven L01 IDs remain pending. The credentials-file slice does not close `global:credentials_file`; signed management editing and authorization, identity consumer integration, migration approval/user flow, and platform qualification remain.
+
+### Coordinator handoff reconciliation
+
+Lane handoff commit `41f00213aeecc757463ff2cb4c22d9d175ebb63a` was integrated after the package candidate completed main validation. Its original pending-gate note predates code commit `45b48244`; the package gates above supersede that note. The handoff remains cumulative, and all assigned IDs stay pending.
