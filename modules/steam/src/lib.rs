@@ -124,6 +124,10 @@ impl Provider {
         }
         if self.scan.as_ref().is_some_and(|scan| scan.finished) {
             let scan = self.scan.take().expect("finished scan exists");
+            // The Steam client can be installed, moved, or removed while the
+            // provider is running. Resolve it with each discovery snapshot so
+            // reconciliation never keeps a stale launch program.
+            self.steam_executable = discovery::find_steam_executable(&self.roots);
             self.games = scan.games;
             self.warnings = scan.warnings;
             self.warning_count = scan.warning_count;

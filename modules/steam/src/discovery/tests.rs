@@ -70,6 +70,51 @@ fn steam_client_resolution_uses_the_configured_install_root_not_a_game_library()
 }
 
 #[test]
+fn completed_refresh_re_resolves_a_moved_steam_client() {
+    let fixture = Libraries::new();
+    let first = fixture.library("first-install");
+    let second = fixture.library("second-install");
+    fixture.manifest(&first, 42, "Example", 4);
+    let first_client = first.join("steam.exe");
+    let second_client = second.join("steam.exe");
+    fs::write(&first_client, "first client").unwrap();
+    let mut provider = Provider {
+        enabled: true,
+        roots: vec![first.clone(), second.clone()],
+        ..Provider::default()
+    };
+
+    assert!(provider.start_scan());
+    for _ in 0..10_000 {
+        provider.tick();
+        if !provider.scan_in_progress() {
+            break;
+        }
+    }
+    assert_eq!(
+        provider.steam_executable,
+        Some(first_client.canonicalize().unwrap())
+    );
+    assert_eq!(provider.games[&42].name, "Example");
+
+    fs::remove_file(&first_client).unwrap();
+    fs::write(&second_client, "second client").unwrap();
+    assert!(provider.start_scan());
+    for _ in 0..10_000 {
+        provider.tick();
+        if !provider.scan_in_progress() {
+            break;
+        }
+    }
+    assert!(!provider.scan_in_progress());
+    assert_eq!(
+        provider.steam_executable,
+        Some(second_client.canonicalize().unwrap())
+    );
+    assert_eq!(provider.games[&42].name, "Example");
+}
+
+#[test]
 fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     let fixture = Libraries::new();
     let library = fixture.library("steam-install");
