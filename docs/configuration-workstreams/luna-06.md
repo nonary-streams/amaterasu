@@ -464,3 +464,9 @@ five-second retry delay before persisted settings are adopted. Supported
 platform runtime qualification and end-to-end settings-to-diagnostics evidence
 remain pending. `global:log_path` and `global:min_log_level` remain pending in
 the coordinator-owned coverage ledger.
+
+## Coordinator validation update: per-application SDR 10-bit preference editor (2026-09-25)
+
+- L06 code candidate `dcef76b8d9a53d1606b202049d4e88d05c8836c6` landed on main as `336a5ea43be102755aaac2abc9bebada4e70986a`. Main had advanced frontend files since the lane base; conflict resolution kept current main content and applied only the candidate's five reserved paths. A coordinator follow-up `bfb07c164d833e8a9a06b8bd53901fc65055b9de` maps the sparse inherited `null` readback to the current selector API's `undefined` input.
+- `npm --prefix frontend test` passed TypeScript typecheck and 59/59 tests. Coverage preserves inherited, explicit true, and explicit false values; rejects malformed saved data; and keeps unrelated FEC/audio overrides in the application payload.
+- `per_application:prefer-10bit-sdr` remains pending L02 effective launch snapshot and consumer projection, L03 runtime behavior, integrated launch/runtime checks, and platform qualification. No runtime effect is claimed by the editor.
