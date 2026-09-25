@@ -6,7 +6,7 @@
 - Main checkout: `C:\Users\Chase\sources\amaterasu`
 - No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: see the current session snapshot at the end of this file. The latest process check found five live lane leads; L04 reported no safe independent slice and stopped at the native pen/touch contract gate.
+- Status: see the current session snapshot at the end of this file. The latest process check found three live lane leads; L04 and L05 are stopped at explicit cross-lane gates after reporting no safe independent next slice.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -346,6 +346,9 @@ Coordinator decisions and dependency acknowledgments are tracked here and in the
 | luna-03 manual-resolution parser | `afe11022` | `d66ac2a9` | Cherry-picked directly to main. `cargo fmt --check -p amaterasu-display`, `git diff --check`, 40 display tests, and strict Clippy passed. The parser slice does not add persistence, scoped resolution, UI readback, or runtime effects; `global:dd_manual_resolution` remains pending. |
 | luna-01 cross-config credential migration tests | `81ff881e` | `d82277d7`, `dcebf41` | Direct cherry-pick followed by a coordinator fixture/Clippy correction. Formatting, all 52 authentication tests, and strict all-target Clippy passed. Production behavior is unchanged; the Unix symlink case and the remaining credential migration/management/runtime evidence are pending. |
 | luna-05 per-app HDR request storage | `c0ff9151` | `200a4b62`, `a141941` | Direct cherry-pick followed by coordinator Cargo-format cleanup of stale assertion reflow. The net change is limited to the three reserved Catalog paths; formatting, all 80 Catalog tests, and strict all-target Clippy passed. L02 projection, L06 readback, runtime effects, and platform evidence remain pending. |
+| luna-03 resolution option selection policy | `31d2f19b` | `1682e708` | Cherry-picked directly to main. Formatting, all 47 display tests, and strict all-target Clippy passed. This is pure option policy with no persistence, caller wiring, or provider effect; `global:dd_resolution_option` and `global:dd_manual_resolution` remain pending. |
+| luna-05 application elevation documentation | `f45c0598` | `62aad945` | Direct cherry-pick with README conflict resolved by preserving main's host-environment wording and applying the reviewed elevation behavior. `git diff --check` and `git show --check` passed; documentation-only, so Rust tests were not applicable. `per_application:elevated` remains pending runtime/platform and management evidence. |
+| luna-06 global locale editor | `f80f2a01` | `23269ee3`, `b7865eb` | Cherry-picked directly to main. The coordinator corrected a TypeScript narrowing issue found by the production build and regenerated tracked `frontend/dist/app.js`. Frontend typecheck, all 64 tests, and `npm --prefix frontend run build` passed. Browser/API-to-DOM sequencing and runtime qualification remain pending; `global:locale` is not verified. |
 
 Cherry-pick each new lane candidate directly onto `main`, resolve clear conflicts in the main checkout, and record the resulting main commit here. Lightweight lane worktrees remain source-only; package tests and Clippy run from this coordinator checkout.
 
@@ -385,11 +388,11 @@ This reflects the latest process and worktree check. Lead session IDs remain the
 
 | Lead | Lead process | Latest work evidence |
 | --- | --- | --- |
-| luna-01 | PID 47792, live | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. The lead is resumed for the next independent slice. |
-| luna-02 | PID 52592, live | Network lane has a 13-file draft across NVHTTP, RTSP, and stream-session. |
-| luna-03 | PID 4472, live | Manual-resolution parser landed on main as `d66ac2a9`; coordinator formatting, 40 tests, and strict Clippy passed. The lead is resumed for another unblocked slice; the ID remains pending. |
-| luna-04 | stopped | Outbox 062 found no safe independent input/audio slice. Its reviewed native pen/touch candidate awaits L02/L05 contract acknowledgements and coordinator release; follow-up requests were sent. |
-| luna-05 | PID 50380, live | Catalog HDR storage landed as `200a4b62` and formatter cleanup as `a141941`; 80 tests and strict Clippy passed. The next reservation is an application README correction for `per_application:elevated`. |
-| luna-06 | PID 33088, live | The locale worker session ended at its clean reserved base without a code candidate. The coordinator corrected the conflicting topology instruction and asked the lead to inspect the session and continue the authorized slice. |
+| luna-01 | stopped | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. Reservation 0098 covers strict session TTL expiry. The lead ended its latest resume without starting a worker because L06's consumer ACK had not arrived then; the contract ACK request remains open. |
+| luna-02 | PID 52592, live | Network lane retains a 13-file draft across NVHTTP, RTSP, and stream-session. It also submitted reviewed candidate `ecc5c4f1` for LAN/WAN peer-mode boundary regressions; coordinator package validation and L03 review are pending. |
+| luna-03 | PID 27308, live | Manual-resolution parser and selection policy landed as `d66ac2a9` and `1682e708`; 47 display tests and strict Clippy passed. The lead is resumed for another independent slice and has received L02's media peer-mode review request; the display IDs remain pending. |
+| luna-04 | stopped | Outbox 062 found no safe independent input/audio slice. Its reviewed native pen/touch candidate has L05 and L06 contract ACKs; L02's ACK and coordinator release remain. |
+| luna-05 | stopped | Catalog HDR storage landed as `200a4b62`/`a141941`; the elevation README correction landed as `62aad945`. Outbox 123 found no further safe independent code slice under current contracts. |
+| luna-06 | PID 47360, live | Reviewed locale candidate `f80f2a01` landed as `23269ee3`; coordinator build correction and generated bundle are `b7865eb`. Frontend typecheck, 64 tests, and bundle build passed. The locale ID remains pending browser/API-to-DOM sequencing and runtime evidence. L06 still has the session-TTL consumer ACK request and L04 pen/touch ACK request in its inbox. |
 
-The main checkout remains the direct landing point; do not push. L04 can resume once its contract gate is resolved.
+The main checkout remains the direct landing point; do not push. L04 can resume once L02's contract ACK and the coordinator release arrive.

@@ -479,3 +479,9 @@
 - Main `cargo fmt --check` found assertion reflow from the stale lane formatter. Coordinator commit `a141941b9747dd34cfa8e2b6697b53ca1182a799` reapplied the package Cargo formatter; the net candidate changes remain limited to `modules/catalog/src/model.rs`, `modules/catalog/src/pipeline/tests.rs`, and `modules/catalog/README.md`.
 - Main validation passed formatting, `git diff --check`, all 80 Catalog tests, and strict all-target Catalog Clippy.
 - Storage only is implemented. `per_application:dd_hdr_request_override` and `global:dd_hdr_request_override` remain pending effective policy resolution, Launch projection, management readback, display/runtime effects, and platform qualification.
+
+## Coordinator validation update: application elevation documentation
+
+- L05 lane commit `f45c0598904f98ee6a6281c2547d05a2316a65af` landed directly on main as `62aad945c63a91d8fb0800e0e590ad1cca9c33ee`. The README now documents that primary and detached children share the launch-level elevation flag, Unix ignores it, raw preparation has a per-step flag, and structured preparation uses false.
+- Main's README also contained a verified host-process environment expansion correction. The stale-base conflict was resolved by preserving that current wording while applying the reserved elevation documentation. The final change touches only `modules/application/README.md`; `git diff --check` and `git show --check` passed.
+- This documentation correction does not qualify runtime behavior. `per_application:elevated` remains pending management readback and Windows/Unix runtime evidence.

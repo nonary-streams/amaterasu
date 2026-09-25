@@ -470,3 +470,9 @@ the coordinator-owned coverage ledger.
 - L06 code candidate `dcef76b8d9a53d1606b202049d4e88d05c8836c6` landed on main as `336a5ea43be102755aaac2abc9bebada4e70986a`. Main had advanced frontend files since the lane base; conflict resolution kept current main content and applied only the candidate's five reserved paths. A coordinator follow-up `bfb07c164d833e8a9a06b8bd53901fc65055b9de` maps the sparse inherited `null` readback to the current selector API's `undefined` input.
 - `npm --prefix frontend test` passed TypeScript typecheck and 59/59 tests. Coverage preserves inherited, explicit true, and explicit false values; rejects malformed saved data; and keeps unrelated FEC/audio overrides in the application payload.
 - `per_application:prefer-10bit-sdr` remains pending L02 effective launch snapshot and consumer projection, L03 runtime behavior, integrated launch/runtime checks, and platform qualification. No runtime effect is claimed by the editor.
+
+## Coordinator validation update: global locale editor (2026-09-25)
+
+- L06 code candidate `f80f2a01ef5f3e6f310138f4f357b4d1d6159684` landed directly on main as `23269ee3`. The lane commit omitted the tracked production bundle, and its first coordinator build found a TypeScript property-narrowing error in locale definition validation. Coordinator correction `b7865eb` captures the options array before callback validation and regenerates `frontend/dist/app.js`.
+- `npm --prefix frontend test` passed the TypeScript typecheck and all 64 tests. `npm --prefix frontend run build` passed after the correction. The candidate's independent X-High review reported no actionable findings; tests do not exercise API/DOM sequencing.
+- `global:locale` remains pending browser/API-to-DOM sequencing, runtime behavior, and platform qualification. The selector only writes HTML language metadata; it does not claim translated console text.

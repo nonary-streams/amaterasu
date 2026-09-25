@@ -739,3 +739,15 @@ This is regression coverage only; it does not add or change WGC pacing behavior.
 - The parser normalizes `x` and `×`, accepts unsigned dimensions including zero, rejects malformed components and `u32` overflow, and preserves the existing `auto` token behavior.
 - On main, `cargo fmt --check -p amaterasu-display`, `git diff --check`, `cargo test -p amaterasu-display` (40 passed), and `cargo clippy -p amaterasu-display --all-targets -- -D warnings` passed.
 - This parser slice adds no persistence/default migration, management readback, scoped projection, runtime effect, or platform qualification. Keep `global:dd_manual_resolution` pending.
+
+## Coordinator validation update: resolution option selection policy (2026-09-25)
+
+- L03 lane code commit `31d2f19b3d7214df3898e4b5529254867aef0c24` landed directly on main as `1682e708f9f4a8640a702c5e7d923c9f67b41258`, with no conflict.
+- The pure policy honors the Optimize game settings gate, selects the validated client resolution for `auto`, adds no resolution for `disabled`, and requires a specified manual value for `manual`. It leaves explicit launch-resolution and client `display_mode` precedence to the caller.
+- On main, `cargo fmt --check -p amaterasu-display`, `git diff --check`, all 47 display tests, and `cargo clippy -p amaterasu-display --all-targets -- -D warnings` passed.
+- This does not add persistence, scoped resolution, request wiring, management readback, provider effects, or platform qualification. Keep `global:dd_resolution_option` and `global:dd_manual_resolution` pending.
+
+## Coordinator review request: L02 media peer-mode regressions (2026-09-25)
+
+- L02 submitted candidate `ecc5c4f137bdd402ace42d7d3762db7aa246d539` in outbox 0077 for the LAN/WAN peer-mode selection regressions. Its exact code path is `modules/media-transport/src/model.rs`; the other changed path is the L02 handoff.
+- Please finish the requested read-only review against the candidate and report any findings to the coordinator and L02. Coordinator package tests and strict Clippy are still pending; do not treat either encryption-mode ID as verified.
