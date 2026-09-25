@@ -520,11 +520,9 @@ fn pen_frame(event: &Event, metadata: PenMetadata) -> InputResult<Vec<(u16, u16,
     if let Some((tilt_x, tilt_y)) = pen_tilt_axes(*tilt, *rotation_degrees) {
         frame.push((EV_ABS, ABS_TILT_X, tilt_x.round() as i32));
         frame.push((EV_ABS, ABS_TILT_Y, tilt_y.round() as i32));
-    } else if matches!(
-        phase,
-        PenTouchPhase::Down | PenTouchPhase::Up | PenTouchPhase::Cancel
-    ) {
-        // Do not carry a previous contact's tilt into a new contact or release.
+    } else {
+        // Linux has no unknown-tilt sentinel; neutralize both axes so a missing
+        // sample cannot leave a previous move's tilt stuck in the device.
         frame.push((EV_ABS, ABS_TILT_X, 0));
         frame.push((EV_ABS, ABS_TILT_Y, 0));
     }
@@ -620,7 +618,8 @@ fn touch_frame(
         }
         if let Some(rotation) = rotation_degrees {
             frame.push((EV_ABS, ABS_MT_ORIENTATION, touch_orientation(*rotation)));
-        } else if *phase == PenTouchPhase::Down {
+        } else {
+            // ABS_MT_ORIENTATION has no unknown value; zero is the neutral angle.
             frame.push((EV_ABS, ABS_MT_ORIENTATION, 0));
         }
         if *phase == PenTouchPhase::Down && active_contacts == 1 {
@@ -1137,13 +1136,27 @@ mod tests {
         );
         assert_eq!(event_at(touch_frame, EV_ABS, ABS_MT_ORIENTATION), Some(-90));
 
+        let mut touch_move = with_phase(&touch_down, PenTouchPhase::Move);
+        if let Event::PenTouch {
+            rotation_degrees, ..
+        } = &mut touch_move
+        {
+            *rotation_degrees = None;
+        }
+        emit(&mut tracker, &mut writer, &touch_move).unwrap();
+        assert_eq!(
+            event_at(&writer.frames[1].1, EV_ABS, ABS_MT_ORIENTATION),
+            Some(0),
+            "unknown rotation must neutralize the prior orientation"
+        );
+
         emit(
             &mut tracker,
             &mut writer,
-            &with_phase(&touch_down, PenTouchPhase::Cancel),
+            &with_phase(&touch_move, PenTouchPhase::Cancel),
         )
         .unwrap();
-        let touch_cancel = &writer.frames[1].1;
+        let touch_cancel = &writer.frames[2].1;
         assert_eq!(event_at(touch_cancel, EV_ABS, ABS_MT_TRACKING_ID), Some(-1));
         for code in [
             ABS_MT_PRESSURE,
@@ -1170,7 +1183,7 @@ mod tests {
             tilt: Some(45),
         };
         emit(&mut tracker, &mut writer, &pen_down).unwrap();
-        let pen_frame = &writer.frames[2].1;
+        let pen_frame = &writer.frames[3].1;
         assert_eq!(event_at(pen_frame, EV_ABS, ABS_TILT_X), Some(-45));
         assert_eq!(event_at(pen_frame, EV_ABS, ABS_TILT_Y), Some(0));
         assert_eq!(event_at(pen_frame, EV_KEY, BTN_TOOL_PEN), Some(0));
@@ -1194,7 +1207,17 @@ mod tests {
             tilt: None,
         };
         emit(&mut tracker, &mut writer, &pen_move).unwrap();
-        let pen_move_frame = &writer.frames[3].1;
+        let pen_move_frame = &writer.frames[4].1;
+        assert_eq!(
+            event_at(pen_move_frame, EV_ABS, ABS_TILT_X),
+            Some(0),
+            "unknown tilt must neutralize the prior X tilt"
+        );
+        assert_eq!(
+            event_at(pen_move_frame, EV_ABS, ABS_TILT_Y),
+            Some(0),
+            "unknown tilt must neutralize the prior Y tilt"
+        );
         assert_eq!(event_at(pen_move_frame, EV_KEY, BTN_TOOL_PEN), Some(0));
         assert_eq!(event_at(pen_move_frame, EV_KEY, BTN_TOOL_RUBBER), Some(1));
         assert_eq!(event_at(pen_move_frame, EV_KEY, BTN_STYLUS), Some(1));
@@ -1206,7 +1229,7 @@ mod tests {
             &with_phase(&pen_move, PenTouchPhase::Cancel),
         )
         .unwrap();
-        let pen_cancel = &writer.frames[4].1;
+        let pen_cancel = &writer.frames[5].1;
         assert_eq!(event_at(pen_cancel, EV_ABS, ABS_PRESSURE), Some(0));
         assert_eq!(event_at(pen_cancel, EV_ABS, ABS_TILT_X), Some(0));
         assert_eq!(event_at(pen_cancel, EV_ABS, ABS_TILT_Y), Some(0));
