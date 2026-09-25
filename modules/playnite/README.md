@@ -97,18 +97,43 @@ unexpected empty process scan leaves the ticket occupying the single-session
 slot; only a correlated stop that confirms the launcher and FullscreenApp have
 exited releases it.
 
+Each Fullscreen ticket also owns a local authenticated launcher-status watcher.
+The helper connects with the generic `role: launcher` / `mode: fullscreen`
+hello, and Amaterasu binds every received record to the exact local ticket and
+the verified Playnite process image plus Windows process creation FILETIME. The
+extension sends active-game sync and `gameStarted` records with a GUID, install
+directory, and executable, but the record itself has no ticket, PID, or creation
+identity. Only one game can be associated with a ticket; duplicates of that
+GUID are idempotent and a second distinct game ID makes the session fail closed.
+The exact-executable watchdog checks the full reported image path at most once
+per second. It requires either a matching authenticated `gameStopped` or prior
+observation of that exact image, then requires three seconds with no process of
+that image before restoration. Access-denied and incomplete process scans do
+not count as exit evidence. Since the extension does not report a game PID or
+bind game status to a ticket, a same-path process from another launch delays
+return, and a process that starts and exits before the first scan without a
+stop status cannot safely be attributed or recovered. The pinned extension
+normally omits `gameStopped` for games started after a generic launcher
+connection; exact-image process observation is the fallback. Its session-bound
+`playniteExiting` record suppresses auto-return for an intentional Playnite
+exit. Reconnect is allowed for the same live process identity, while a restart
+retires the previous creation-time identity and discards its queued events.
+Return focuses only the ticket's verified FullscreenApp process, or relaunches
+from the still-validated canonical install when no uncorrelated FullscreenApp
+is present. Exact image/PID/creation-time checks, ambiguous process lists, and
+unknown scans fail closed. Native Windows pipe, process enumeration, focus, and
+restart behavior still requires runtime qualification.
+
 Manual `playnite_fullscreen` entries use only a typed launch kind and bounded
 `exit_timeout_seconds` (0..=300); callers cannot provide a path or game GUID.
 Zero still posts the safe close request and uses a fixed 20-second recovery
 grace rather than an unbounded wait. This is intentionally bounded and differs
 from ordinary executable timeout semantics.
 
-Remaining fullscreen parity includes the reference helper's active-game
-watchdog, return-to-fullscreen behavior, relaunch after game exit, and full
-extension-driven focus/cleanup behavior. Current focus retries are based on
-authenticated process paths but do not establish those missing lifecycle
-guarantees. Playnite selection and age settings have Amaterasu-specific bounds,
-so this does not claim every reference input edge is identical.
+Playnite selection and age settings have Amaterasu-specific bounds, so this does
+not claim every reference input edge is identical. The fullscreen helper still
+cannot attribute a game process to the reported GUID because the extension
+protocol supplies neither a PID nor a ticket for lifecycle statuses.
 
 Focus settings default to 3 confirmed focus attempts, a 15-second timeout, and
 `focus_exit_on_first=false`. Zero attempts or zero timeout disables focus;

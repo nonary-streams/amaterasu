@@ -20,6 +20,38 @@ const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STATUS_LINE_BYTES: usize = 8 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FullscreenStatusKind {
+    GameStarted,
+    GameStopped,
+    PlayniteExiting,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FullscreenStatus {
+    pub(crate) kind: FullscreenStatusKind,
+    pub(crate) game_id: Option<String>,
+    pub(crate) install_directory: Option<String>,
+    pub(crate) executable: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FullscreenWatchEvent {
+    Status {
+        status: FullscreenStatus,
+        extension_process: ProcessImage,
+    },
+    Disconnected {
+        extension_process: ProcessImage,
+    },
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum FullscreenWatchCommand {
+    UpdateProcesses(Vec<ProcessImage>),
+    Cancel,
+}
+
 #[cfg(windows)]
 struct Pipe(windows_sys::Win32::Foundation::HANDLE);
 
@@ -132,7 +164,7 @@ fn validated_server_process(pipe: &Pipe, expected: &[ProcessImage]) -> Result<u3
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
 
     let mut process_id = 0;
@@ -152,14 +184,31 @@ fn validated_server_process(pipe: &Pipe, expected: &[ProcessImage]) -> Result<u3
     let mut length = path.len() as u32;
     // SAFETY: process is valid and path is a writable buffer for length UTF-16 units.
     let queried = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
+    let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: process is valid and creation_time is writable output.
+    let has_creation_time = unsafe {
+        GetProcessTimes(
+            process,
+            &mut creation_time,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0;
     // SAFETY: process is owned by this helper.
     unsafe { CloseHandle(process) };
-    if queried == 0 {
+    if queried == 0 || !has_creation_time || length as usize > path.len() {
         return Err("Playnite pipe server image could not be read".into());
     }
     let actual_path = String::from_utf16_lossy(&path[..length as usize]);
-    if !actual_path.eq_ignore_ascii_case(&expected_image.path) {
-        return Err("Playnite pipe server path changed after process discovery".into());
+    let actual_creation_time = crate::discovery::filetime_value(creation_time);
+    if !actual_path.eq_ignore_ascii_case(&expected_image.path)
+        || actual_creation_time != expected_image.creation_time
+    {
+        return Err("Playnite pipe server identity changed after process discovery".into());
     }
     Ok(process_id)
 }
@@ -169,7 +218,8 @@ fn connect_role(
     expected_processes: &[ProcessImage],
     role: &str,
     game_id: Option<&str>,
-) -> Result<Pipe, String> {
+    mode: Option<&str>,
+) -> Result<(Pipe, ProcessImage), String> {
     use std::thread;
 
     if expected_processes.is_empty() {
@@ -177,7 +227,12 @@ fn connect_role(
     }
     let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
     let control = Pipe::open(CONTROL_PIPE, connect_deadline)?;
-    let control_server = validated_server_process(&control, expected_processes)?;
+    let control_server_id = validated_server_process(&control, expected_processes)?;
+    let control_server = expected_processes
+        .iter()
+        .find(|process| process.process_id == control_server_id)
+        .cloned()
+        .ok_or_else(|| "Playnite pipe server identity was not discovered".to_string())?;
     let mut handshake = [0u8; 80];
     let mut handshake_bytes = 0;
     while handshake_bytes < handshake.len() && Instant::now() < connect_deadline {
@@ -197,7 +252,7 @@ fn connect_role(
     control.write_all(&[0x02])?;
 
     let data_pipe = Pipe::open(&pipe_name, Instant::now() + CONNECT_TIMEOUT)?;
-    if validated_server_process(&data_pipe, expected_processes)? != control_server {
+    if validated_server_process(&data_pipe, expected_processes)? != control_server_id {
         return Err(
             "Playnite data pipe server did not match the authenticated control server".into(),
         );
@@ -206,15 +261,18 @@ fn connect_role(
     if let Some(game_id) = game_id {
         hello["gameId"] = game_id.into();
     }
+    if let Some(mode) = mode {
+        hello["mode"] = mode.into();
+    }
     let mut line = serde_json::to_vec(&hello).map_err(|_| "Playnite hello serialization failed")?;
     line.push(b'\n');
     data_pipe.write_all(&line)?;
-    Ok(data_pipe)
+    Ok((data_pipe, control_server))
 }
 
 #[cfg(windows)]
 pub fn request_snapshot(expected_processes: &[ProcessImage]) -> Result<Snapshot, String> {
-    let data_pipe = connect_role(expected_processes, "sunshine", None)?;
+    let (data_pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
     data_pipe.write_all(b"{\"command\":\"snapshot\"}\n")?;
 
     let mut assembler = SnapshotAssembler::default();
@@ -280,7 +338,7 @@ pub fn watch_game(
     let launch_deadline = Instant::now() + LAUNCH_START_TIMEOUT;
     let mut expected_processes = expected_processes.to_vec();
 
-    let mut pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
+    let (mut pipe, _) = match connect_role(&expected_processes, "launcher", Some(game_id), None) {
         Ok(pipe) => pipe,
         Err(_) => {
             fail(if recovery {
@@ -310,7 +368,7 @@ pub fn watch_game(
             }
         };
         if validated_server_process(&pipe, &expected_processes).is_err() {
-            pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
+            (pipe, _) = match connect_role(&expected_processes, "launcher", Some(game_id), None) {
                 Ok(pipe) => pipe,
                 Err(_) => {
                     fail(super::launch::State::CleanupFailed);
@@ -348,13 +406,14 @@ pub fn watch_game(
                     }
                 };
                 if validated_server_process(&pipe, &expected_processes).is_err() {
-                    pipe = match connect_role(&expected_processes, "launcher", Some(game_id)) {
-                        Ok(pipe) => pipe,
-                        Err(_) => {
-                            fail(super::launch::State::CleanupFailed);
-                            return;
-                        }
-                    };
+                    (pipe, _) =
+                        match connect_role(&expected_processes, "launcher", Some(game_id), None) {
+                            Ok(pipe) => pipe,
+                            Err(_) => {
+                                fail(super::launch::State::CleanupFailed);
+                                return;
+                            }
+                        };
                 }
                 if send_command(&expected_processes, &json!({"command":"stop","id":game_id}))
                     .is_err()
@@ -461,12 +520,123 @@ pub fn watch_game(
     });
 }
 
+#[cfg(not(test))]
+pub(crate) fn watch_fullscreen(
+    initial_processes: &[ProcessImage],
+    commands: Receiver<FullscreenWatchCommand>,
+    events: Sender<FullscreenWatchEvent>,
+) {
+    #[cfg(windows)]
+    watch_fullscreen_windows(initial_processes, commands, events);
+    #[cfg(not(windows))]
+    {
+        let _ = (initial_processes, commands, events);
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn watch_fullscreen_windows(
+    initial_processes: &[ProcessImage],
+    commands: Receiver<FullscreenWatchCommand>,
+    events: Sender<FullscreenWatchEvent>,
+) {
+    let mut expected_processes = initial_processes.to_vec();
+    let mut pipe = None;
+    let mut extension_process: Option<ProcessImage> = None;
+    let mut line = Vec::new();
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        loop {
+            match commands.try_recv() {
+                Ok(FullscreenWatchCommand::UpdateProcesses(processes)) => {
+                    expected_processes = processes;
+                }
+                Ok(FullscreenWatchCommand::Cancel) | Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        if pipe.is_none() {
+            if expected_processes.is_empty() {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            match connect_role(&expected_processes, "launcher", None, Some("fullscreen")) {
+                Ok((connected_pipe, server_process)) => {
+                    extension_process = Some(server_process);
+                    pipe = Some(connected_pipe);
+                    line.clear();
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            }
+        }
+
+        let current_pipe = pipe.as_ref().expect("connected pipe was just initialized");
+        let available = match current_pipe.available() {
+            Ok(available) => available as usize,
+            Err(_) => {
+                if let Some(extension_process) = extension_process.clone() {
+                    let _ = events.send(FullscreenWatchEvent::Disconnected { extension_process });
+                }
+                pipe = None;
+                extension_process = None;
+                line.clear();
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if available == 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let read_length = available.min(buffer.len());
+        let count = match current_pipe.read_some(&mut buffer[..read_length]) {
+            Ok(count) => count,
+            Err(_) => {
+                if let Some(extension_process) = extension_process.clone() {
+                    let _ = events.send(FullscreenWatchEvent::Disconnected { extension_process });
+                }
+                pipe = None;
+                extension_process = None;
+                line.clear();
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        for byte in &buffer[..count] {
+            if *byte == b'\n' {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if let (Some(status), Some(extension_process)) =
+                    (parse_fullscreen_status(&line), extension_process.as_ref())
+                {
+                    let _ = events.send(FullscreenWatchEvent::Status {
+                        status,
+                        extension_process: extension_process.clone(),
+                    });
+                }
+                line.clear();
+            } else {
+                line.push(*byte);
+                if line.len() > MAX_STATUS_LINE_BYTES {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn send_command(
     expected_processes: &[ProcessImage],
     command: &serde_json::Value,
 ) -> Result<(), String> {
-    let pipe = connect_role(expected_processes, "sunshine", None)?;
+    let (pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
     let mut line =
         serde_json::to_vec(command).map_err(|_| "Playnite command serialization failed")?;
     line.push(b'\n');
@@ -478,6 +648,48 @@ struct GameStatus {
     name: String,
     game_id: String,
     focus_target: FocusTarget,
+}
+
+fn parse_fullscreen_status(line: &[u8]) -> Option<FullscreenStatus> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if message["type"] != "status"
+        || message.get("ticket").is_some()
+        || message.pointer("/status/ticket").is_some()
+    {
+        return None;
+    }
+    let status = message.get("status")?;
+    let name = status.get("name")?.as_str()?;
+    let (kind, game_id) = match name {
+        "gameStarted" | "gameStopped" => {
+            let game_id = status.get("id")?.as_str()?;
+            if !valid_playnite_id(game_id) {
+                return None;
+            }
+            (
+                if name == "gameStarted" {
+                    FullscreenStatusKind::GameStarted
+                } else {
+                    FullscreenStatusKind::GameStopped
+                },
+                Some(game_id.to_ascii_lowercase()),
+            )
+        }
+        "playniteExiting" => (FullscreenStatusKind::PlayniteExiting, None),
+        _ => return None,
+    };
+    Some(FullscreenStatus {
+        kind,
+        game_id,
+        install_directory: status
+            .get("installDir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        executable: status
+            .get("exe")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 fn parse_game_status(line: &[u8]) -> Option<GameStatus> {
@@ -563,6 +775,7 @@ fn decode_pipe_name(bytes: &[u8; 80]) -> Result<String, String> {
 mod tests {
     #[cfg(windows)]
     use super::decode_pipe_name;
+    use super::{FullscreenStatusKind, parse_fullscreen_status};
     use super::{apply_game_status, parse_game_status, state_after_start_failure};
     use crate::focus::FocusTarget;
     use crate::launch::State;
@@ -608,6 +821,36 @@ mod tests {
             if invalid.windows(8).any(|window| window == b"\"type\"") {
                 assert!(parse_game_status(invalid).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn fullscreen_status_parser_accepts_only_ticketless_lifecycle_records() {
+        let started = parse_fullscreen_status(
+            br#"{"type":"status","status":{"name":"gameStarted","id":"A1B2C3D4-1234-5678-9ABC-0123456789AB","installDir":"C:\\Games\\Sample","exe":"C:\\Games\\Sample\\game.exe"}}"#,
+        )
+        .unwrap();
+        assert_eq!(started.kind, FullscreenStatusKind::GameStarted);
+        assert_eq!(
+            started.game_id.as_deref(),
+            Some("a1b2c3d4-1234-5678-9abc-0123456789ab")
+        );
+        assert_eq!(
+            started.executable.as_deref(),
+            Some(r"C:\Games\Sample\game.exe")
+        );
+        assert_eq!(
+            parse_fullscreen_status(br#"{"type":"status","status":{"name":"playniteExiting"}}"#)
+                .unwrap()
+                .kind,
+            FullscreenStatusKind::PlayniteExiting
+        );
+        for invalid in [
+            br#"{"type":"status","status":{"name":"gameStarted","id":"not-a-guid"}}"#.as_slice(),
+            br#"{"type":"status","ticket":"ticket","status":{"name":"playniteExiting"}}"#,
+            br#"{"type":"status","status":{"name":"gamePaused"}}"#,
+        ] {
+            assert!(parse_fullscreen_status(invalid).is_none());
         }
     }
 

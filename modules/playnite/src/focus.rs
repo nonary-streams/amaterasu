@@ -39,6 +39,8 @@ impl FocusPolicy {
 pub struct FocusTarget {
     pub install_directory: Option<String>,
     pub executable: Option<String>,
+    pub process_id: Option<u32>,
+    pub process_creation_time: Option<u64>,
 }
 
 impl FocusTarget {
@@ -53,7 +55,16 @@ impl FocusTarget {
         Self {
             install_directory: install_directory.and_then(|path| bounded_absolute_path(path, true)),
             executable,
+            process_id: None,
+            process_creation_time: None,
         }
+    }
+
+    pub fn for_process(executable: &str, process_id: u32, creation_time: u64) -> Self {
+        let mut target = Self::from_status_paths(None, Some(executable));
+        target.process_id = Some(process_id);
+        target.process_creation_time = Some(creation_time);
+        target
     }
 
     fn merge_nonempty(&mut self, update: Self) {
@@ -62,6 +73,20 @@ impl FocusTarget {
         }
         if update.executable.is_some() {
             self.executable = update.executable;
+        }
+        if update.process_id.is_some() && update.process_creation_time.is_some() {
+            self.process_id = update.process_id;
+            self.process_creation_time = update.process_creation_time;
+        }
+    }
+
+    fn matches_process_identity(&self, process_id: u32, creation_time: u64) -> bool {
+        match (self.process_id, self.process_creation_time) {
+            (Some(expected_id), Some(expected_time)) => {
+                expected_id == process_id && expected_time == creation_time
+            }
+            (None, None) => true,
+            _ => false,
         }
     }
 }
@@ -201,7 +226,7 @@ mod windows_focus {
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GetForegroundWindow, GetWindow, GetWindowThreadProcessId, IsIconic,
@@ -211,18 +236,20 @@ mod windows_focus {
 
     struct WindowSearch<'a> {
         target: &'a FocusTarget,
-        image_paths: BTreeMap<u32, Option<String>>,
+        process_images: BTreeMap<u32, Option<(String, u64)>>,
         candidate: Option<(HWND, u32)>,
         visited: usize,
     }
 
     pub fn attempt(target: &FocusTarget) -> bool {
-        if target.install_directory.is_none() && target.executable.is_none() {
+        if (target.install_directory.is_none() && target.executable.is_none())
+            || target.process_id.is_some() != target.process_creation_time.is_some()
+        {
             return false;
         }
         let mut search = WindowSearch {
             target,
-            image_paths: BTreeMap::new(),
+            process_images: BTreeMap::new(),
             candidate: None,
             visited: 0,
         };
@@ -280,21 +307,23 @@ mod windows_focus {
         if unsafe { GetWindowThreadProcessId(window, &mut process_id) } == 0 || process_id == 0 {
             return 1;
         }
-        let image_path = search
-            .image_paths
+        let image = search
+            .process_images
             .entry(process_id)
-            .or_insert_with(|| query_image_path(process_id));
-        if image_path
-            .as_deref()
-            .is_some_and(|path| matches_image_path(path, search.target))
-        {
+            .or_insert_with(|| query_process_image(process_id));
+        if image.as_ref().is_some_and(|(path, creation_time)| {
+            matches_image_path(path, search.target)
+                && search
+                    .target
+                    .matches_process_identity(process_id, *creation_time)
+        }) {
             search.candidate = Some((window, process_id));
             return 0;
         }
         1
     }
 
-    fn query_image_path(process_id: u32) -> Option<String> {
+    fn query_process_image(process_id: u32) -> Option<(String, u64)> {
         // SAFETY: process_id came from an OS-owned window; query access cannot
         // write to or launch the process.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
@@ -306,12 +335,29 @@ mod windows_focus {
         // SAFETY: process is valid and path is writable for length UTF-16 units.
         let queried =
             unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
+        let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: process is valid and creation_time is writable output.
+        let has_creation_time = unsafe {
+            GetProcessTimes(
+                process,
+                &mut creation_time,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0;
         // SAFETY: this function owns the process handle returned by OpenProcess.
         unsafe { CloseHandle(process) };
-        if queried == 0 || length as usize > path.len() {
+        if queried == 0 || !has_creation_time || length as usize > path.len() {
             return None;
         }
-        Some(String::from_utf16_lossy(&path[..length as usize]))
+        Some((
+            String::from_utf16_lossy(&path[..length as usize]),
+            crate::discovery::filetime_value(creation_time),
+        ))
     }
 }
 
@@ -347,6 +393,8 @@ mod tests {
         FocusTarget {
             install_directory: Some(r"C:\Games\Sample".into()),
             executable: Some(r"C:\Games\Sample\game.exe".into()),
+            process_id: None,
+            process_creation_time: None,
         }
     }
 
@@ -520,5 +568,13 @@ mod tests {
             FocusTarget::default(),
             "an invalid supplied executable must not broaden matching to the install directory"
         );
+    }
+
+    #[test]
+    fn exact_focus_target_rejects_reused_pid_and_image_mismatch() {
+        let target = FocusTarget::for_process(r"C:\Playnite\Playnite.FullscreenApp.exe", 41, 700);
+        assert!(target.matches_process_identity(41, 700));
+        assert!(!target.matches_process_identity(41, 701));
+        assert!(!target.matches_process_identity(42, 700));
     }
 }

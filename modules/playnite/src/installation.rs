@@ -102,28 +102,57 @@ impl Installation {
             .collect()
     }
 
-    pub fn launch_process_is_running(&self, process_id: u32, processes: &[ProcessImage]) -> bool {
-        processes.iter().any(|process| {
-            process.process_id == process_id
-                && normalized_path(&process.path)
-                    == normalized_path(&self.launch_executable.to_string_lossy())
-        })
+    pub fn launch_process_is_running(
+        &self,
+        launched_process: &ProcessImage,
+        processes: &[ProcessImage],
+    ) -> bool {
+        processes
+            .iter()
+            .any(|process| process.same_identity(launched_process))
     }
 
-    pub fn focus_target(&self) -> crate::focus::FocusTarget {
-        crate::focus::FocusTarget::from_status_paths(
-            self.install_directory.to_str(),
-            self.fullscreen_executable.to_str(),
-        )
+    pub fn processes_for_installation<'a>(
+        &self,
+        processes: &'a [ProcessImage],
+    ) -> Vec<&'a ProcessImage> {
+        processes
+            .iter()
+            .filter(|process| same_installation(&self.install_directory, Path::new(&process.path)))
+            .collect()
+    }
+
+    pub fn still_valid(&self) -> bool {
+        let Ok(launch_executable) = std::fs::canonicalize(&self.launch_executable) else {
+            return false;
+        };
+        let Ok(fullscreen_executable) = std::fs::canonicalize(&self.fullscreen_executable) else {
+            return false;
+        };
+        launch_executable.is_file()
+            && fullscreen_executable.is_file()
+            && same_installation(&self.install_directory, &launch_executable)
+            && same_installation(&self.install_directory, &fullscreen_executable)
+            && normalized_path(&launch_executable.to_string_lossy())
+                == normalized_path(&self.launch_executable.to_string_lossy())
+            && normalized_path(&fullscreen_executable.to_string_lossy())
+                == normalized_path(&self.fullscreen_executable.to_string_lossy())
+    }
+
+    pub fn valid_launch_process_identity(&self, process: &ProcessImage) -> bool {
+        process.process_id != 0
+            && process.creation_time != 0
+            && normalized_path(&process.path)
+                == normalized_path(&self.launch_executable.to_string_lossy())
     }
 
     #[cfg(windows)]
-    pub fn launch_fullscreen(&self) -> Result<u32, &'static str> {
+    pub fn launch_fullscreen(&self) -> Result<ProcessImage, &'static str> {
         use std::os::windows::ffi::OsStrExt;
         use std::ptr::null;
         use windows_sys::Win32::System::Threading::{
             CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
-            PROCESS_INFORMATION, STARTUPINFOW,
+            GetProcessTimes, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
         };
 
         let executable: Vec<u16> = self
@@ -173,17 +202,47 @@ impl Installation {
         if created == 0 {
             return Err("fullscreen_launch_failed");
         }
+        let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: CreateProcessW returned an owned process handle and creation_time is writable output.
+        let has_creation_time = unsafe {
+            GetProcessTimes(
+                process_information.hProcess,
+                &mut creation_time,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        if !has_creation_time {
+            // SAFETY: this is the exact process just created above, still owned by
+            // its CreateProcessW handle; no PID or image-name lookup is involved.
+            unsafe { TerminateProcess(process_information.hProcess, 1) };
+            // SAFETY: CreateProcessW returned owned thread/process handles.
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(process_information.hThread);
+                windows_sys::Win32::Foundation::CloseHandle(process_information.hProcess);
+            }
+            return Err("fullscreen_launch_failed");
+        }
+        let process_identity = ProcessImage {
+            process_id: process_information.dwProcessId,
+            path: self.launch_executable.to_string_lossy().into_owned(),
+            creation_time: crate::discovery::filetime_value(creation_time),
+        };
         // SAFETY: CreateProcessW returned owned thread/process handles; this
-        // provider retains only the PID and revalidates its image during polling.
+        // provider retains the PID, image, and creation time for exact revalidation.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(process_information.hThread);
             windows_sys::Win32::Foundation::CloseHandle(process_information.hProcess);
         }
-        Ok(process_information.dwProcessId)
+        Ok(process_identity)
     }
 
     #[cfg(not(windows))]
-    pub fn launch_fullscreen(&self) -> Result<u32, &'static str> {
+    pub fn launch_fullscreen(&self) -> Result<ProcessImage, &'static str> {
         Err("unsupported_platform")
     }
 
@@ -201,6 +260,18 @@ impl Installation {
         _processes: &[ProcessImage],
     ) -> Result<usize, &'static str> {
         Err("unsupported_platform")
+    }
+
+    pub(crate) fn processes_with_exact_image(&self, executable: &str) -> Option<Vec<ProcessImage>> {
+        #[cfg(windows)]
+        {
+            windows::processes_with_exact_image(executable)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = executable;
+            Some(Vec::new())
+        }
     }
 
     fn expected_fullscreen_path(&self) -> &Path {
@@ -242,6 +313,19 @@ fn normalized_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn close_target_matches(
+    expected_path: &str,
+    expected_process_id: u32,
+    expected_creation_time: u64,
+    observed_process_id: u32,
+    observed_path: &str,
+    observed_creation_time: u64,
+) -> bool {
+    expected_process_id == observed_process_id
+        && expected_creation_time == observed_creation_time
+        && normalized_path(expected_path) == normalized_path(observed_path)
+}
+
 #[cfg(windows)]
 fn query_playnite_association() -> Option<PathBuf> {
     use windows_sys::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_EXECUTABLE, AssocQueryStringW};
@@ -280,21 +364,103 @@ fn query_playnite_association() -> Option<PathBuf> {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Installation, normalized_path};
+    use super::{Installation, close_target_matches, normalized_path};
     use crate::discovery::ProcessImage;
-    use std::collections::BTreeSet;
-    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use std::collections::BTreeMap;
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
     };
     use windows_sys::core::BOOL;
 
+    pub fn processes_with_exact_image(executable: &str) -> Option<Vec<ProcessImage>> {
+        let expected_path = normalized_path(executable);
+        let expected_name = std::path::Path::new(executable)
+            .file_name()?
+            .to_str()?
+            .to_owned();
+        // SAFETY: the snapshot handle is owned and closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == -1isize as HANDLE {
+            return None;
+        }
+        // SAFETY: zeroed is valid for PROCESSENTRY32W; dwSize is required by the API.
+        let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: snapshot is valid and entry is a writable, correctly sized buffer.
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        let mut exact_processes = Vec::new();
+        let mut complete = true;
+        while has_entry {
+            let image_name_length = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let image_name = String::from_utf16_lossy(&entry.szExeFile[..image_name_length]);
+            if image_name.eq_ignore_ascii_case(&expected_name) {
+                // SAFETY: PID came from the current process snapshot; query access is read-only.
+                let process = unsafe {
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID)
+                };
+                if process.is_null() {
+                    complete = false;
+                } else {
+                    let mut image_path = [0u16; 32_768];
+                    let mut length = image_path.len() as u32;
+                    // SAFETY: process is valid and image_path is writable for length UTF-16 units.
+                    let queried = unsafe {
+                        QueryFullProcessImageNameW(process, 0, image_path.as_mut_ptr(), &mut length)
+                    };
+                    let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+                        dwLowDateTime: 0,
+                        dwHighDateTime: 0,
+                    };
+                    // SAFETY: process is valid and creation_time is writable output.
+                    let has_creation_time = unsafe {
+                        GetProcessTimes(
+                            process,
+                            &mut creation_time,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    } != 0;
+                    if queried == 0 || !has_creation_time || length as usize > image_path.len() {
+                        complete = false;
+                    } else {
+                        let path = String::from_utf16_lossy(&image_path[..length as usize]);
+                        if normalized_path(&path) == expected_path {
+                            exact_processes.push(ProcessImage {
+                                process_id: entry.th32ProcessID,
+                                path,
+                                creation_time: crate::discovery::filetime_value(creation_time),
+                            });
+                        }
+                    }
+                    // SAFETY: process handle is owned by this function.
+                    unsafe { CloseHandle(process) };
+                }
+            }
+            // SAFETY: snapshot is still valid and entry is writable.
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        // SAFETY: snapshot is the owned process-list handle created above.
+        unsafe { CloseHandle(snapshot) };
+        complete.then_some(exact_processes)
+    }
+
     struct CloseSearch {
         expected_path: String,
-        process_ids: BTreeSet<u32>,
+        process_creation_times: BTreeMap<u32, u64>,
         visited: usize,
         closed_windows: usize,
     }
@@ -303,19 +469,19 @@ mod windows {
         installation: &Installation,
         processes: &[ProcessImage],
     ) -> Result<usize, &'static str> {
-        let process_ids: BTreeSet<u32> = installation
+        let process_creation_times: BTreeMap<u32, u64> = installation
             .fullscreen_processes(processes)
             .into_iter()
-            .map(|process| process.process_id)
+            .map(|process| (process.process_id, process.creation_time))
             .collect();
-        if process_ids.is_empty() {
+        if process_creation_times.is_empty() {
             return Ok(0);
         }
         let mut search = CloseSearch {
             expected_path: normalized_path(
                 &installation.expected_fullscreen_path().to_string_lossy(),
             ),
-            process_ids,
+            process_creation_times,
             visited: 0,
             closed_windows: 0,
         };
@@ -339,16 +505,26 @@ mod windows {
         let mut process_id = 0;
         // SAFETY: window is supplied by EnumWindows for this callback.
         if unsafe { GetWindowThreadProcessId(window, &mut process_id) } == 0
-            || !search.process_ids.contains(&process_id)
+            || !search.process_creation_times.contains_key(&process_id)
             // SAFETY: window is valid for the callback duration.
             || !unsafe { GetWindow(window, GW_OWNER) }.is_null()
         {
             return 1;
         }
-        if query_image_path(process_id)
-            .as_deref()
-            .is_none_or(|path| normalized_path(path) != search.expected_path)
-        {
+        let Some((path, creation_time)) = query_image_identity(process_id) else {
+            return 1;
+        };
+        let Some(expected_creation_time) = search.process_creation_times.get(&process_id) else {
+            return 1;
+        };
+        if !close_target_matches(
+            &search.expected_path,
+            process_id,
+            *expected_creation_time,
+            process_id,
+            &path,
+            creation_time,
+        ) {
             return 1;
         }
         // SAFETY: image identity was revalidated after enumerating the window;
@@ -359,7 +535,7 @@ mod windows {
         1
     }
 
-    fn query_image_path(process_id: u32) -> Option<String> {
+    fn query_image_identity(process_id: u32) -> Option<(String, u64)> {
         // SAFETY: process_id comes from a current window; query access cannot
         // write to or launch the process.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
@@ -371,18 +547,37 @@ mod windows {
         // SAFETY: process is valid and path is writable for length UTF-16 units.
         let queried =
             unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
+        let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: process is valid and creation_time is writable output.
+        let has_creation_time = unsafe {
+            GetProcessTimes(
+                process,
+                &mut creation_time,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0;
         // SAFETY: this function owns the process handle returned by OpenProcess.
         unsafe { CloseHandle(process) };
-        if queried == 0 || length as usize > path.len() {
+        if queried == 0 || !has_creation_time || length as usize > path.len() {
             return None;
         }
-        Some(String::from_utf16_lossy(&path[..length as usize]))
+        Some((
+            String::from_utf16_lossy(&path[..length as usize]),
+            crate::discovery::filetime_value(creation_time),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Installation, same_installation, valid_associated_executable_name};
+    use super::{
+        Installation, close_target_matches, same_installation, valid_associated_executable_name,
+    };
     use crate::discovery::ProcessImage;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -421,15 +616,18 @@ mod tests {
         assert!(installation.matches_running_processes(&[ProcessImage {
             process_id: 12,
             path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            creation_time: 12,
         }]));
         assert!(!installation.matches_running_processes(&[
             ProcessImage {
                 process_id: 12,
                 path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+                creation_time: 12,
             },
             ProcessImage {
                 process_id: 13,
                 path: r"D:\Playnite\Playnite.FullscreenApp.exe".into(),
+                creation_time: 13,
             }
         ]));
         assert_eq!(
@@ -437,10 +635,40 @@ mod tests {
                 .fullscreen_processes(&[ProcessImage {
                     process_id: 13,
                     path: r"D:\Playnite\Playnite.FullscreenApp.exe".into(),
+                    creation_time: 13,
                 }])
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn close_revalidation_rejects_reused_pid_and_image_mismatch() {
+        let expected_path = r"C:\Playnite\Playnite.FullscreenApp.exe";
+        assert!(close_target_matches(
+            expected_path,
+            41,
+            700,
+            41,
+            expected_path,
+            700
+        ));
+        assert!(!close_target_matches(
+            expected_path,
+            41,
+            700,
+            41,
+            expected_path,
+            701
+        ));
+        assert!(!close_target_matches(
+            expected_path,
+            41,
+            700,
+            41,
+            r"C:\Other\Playnite.FullscreenApp.exe",
+            700
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ fn process(process_id: u32, path: &str) -> discovery::ProcessImage {
     discovery::ProcessImage {
         process_id,
         path: path.into(),
+        creation_time: u64::from(process_id),
     }
 }
 

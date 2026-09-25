@@ -12,6 +12,17 @@ pub struct Discovery {
 pub struct ProcessImage {
     pub process_id: u32,
     pub path: String,
+    /// Windows process creation FILETIME. This distinguishes PID reuse while a
+    /// previously discovered image is still being authorized.
+    pub creation_time: u64,
+}
+
+impl ProcessImage {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.process_id == other.process_id
+            && self.creation_time == other.creation_time
+            && self.path.eq_ignore_ascii_case(&other.path)
+    }
 }
 
 #[cfg(windows)]
@@ -23,7 +34,7 @@ pub fn discover() -> Discovery {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
 
     // SAFETY: CreateToolhelp32Snapshot returns an owned kernel handle which is
@@ -64,7 +75,21 @@ pub fn discover() -> Discovery {
                         &mut length,
                     )
                 };
-                if queried != 0 {
+                let mut creation_time = windows_sys::Win32::Foundation::FILETIME {
+                    dwLowDateTime: 0,
+                    dwHighDateTime: 0,
+                };
+                // SAFETY: process_handle is valid and creation_time is writable output.
+                let has_creation_time = unsafe {
+                    GetProcessTimes(
+                        process_handle,
+                        &mut creation_time,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                } != 0;
+                if queried != 0 && has_creation_time {
                     let path = String::from_utf16_lossy(&image_path[..length as usize]);
                     if valid_playnite_image(&path, &executable_name)
                         && !found
@@ -76,6 +101,7 @@ pub fn discover() -> Discovery {
                         found.processes.push(ProcessImage {
                             process_id: process.th32ProcessID,
                             path: path.clone(),
+                            creation_time: filetime_value(creation_time),
                         });
                         found.executable_paths.push(path);
                     }
@@ -96,6 +122,11 @@ pub fn discover() -> Discovery {
         .processes
         .sort_unstable_by_key(|process| process.process_id);
     found
+}
+
+#[cfg(windows)]
+pub(crate) fn filetime_value(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
 
 #[cfg(windows)]

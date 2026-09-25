@@ -493,6 +493,7 @@ mod tests {
         ProcessImage {
             process_id,
             path: path.into(),
+            creation_time: u64::from(process_id),
         }
     }
 
