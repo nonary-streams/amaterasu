@@ -112,6 +112,9 @@ impl ManagedModule for SessionHistoryModule {
         self.product_settings
             .advance(&mut |command| runtime.send(command))?;
         self.apply_configuration_if_changed();
+        if let Some(store) = self.store.as_mut() {
+            store.prune_if_due(unix_time_seconds());
+        }
         self.cleanup_legacy_settings();
         self.complete_settings_updates()?;
         self.drain_deferred_settings()?;

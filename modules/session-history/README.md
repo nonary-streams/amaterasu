@@ -52,7 +52,8 @@ and trimming commit together so failed trimming cannot leave an unbounded row.
 Retention is applied by age and approximate live SQLite page bytes. Both
 policies delete ended sessions only; active records are retained even if the
 configured size limit cannot yet be met. Retention still applies to ended
-records while new recording is disabled. A size of zero disables its policy.
+records while new recording is disabled, with an hourly sweep when no sessions
+end. A size of zero disables its policy.
 
 ## Integration status
 

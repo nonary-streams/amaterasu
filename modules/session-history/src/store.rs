@@ -10,6 +10,7 @@ use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 2;
 const SECONDS_PER_DAY: i64 = 86_400;
+const PRUNE_INTERVAL_SECONDS: i64 = 3_600;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 
 #[derive(Debug)]
@@ -43,6 +44,7 @@ pub struct HistoryStore {
     active_streams: BTreeSet<String>,
     failed_operations: u64,
     last_prune: PruneReport,
+    next_prune_at_unix: Option<i64>,
 }
 
 impl HistoryStore {
@@ -71,6 +73,7 @@ impl HistoryStore {
             active_streams: BTreeSet::new(),
             failed_operations: 0,
             last_prune: empty_prune_report(),
+            next_prune_at_unix: None,
         };
         store.close_interrupted_sessions(now_unix)?;
         store.trim_existing_rows()?;
@@ -123,7 +126,23 @@ impl HistoryStore {
             self.effective_enabled = self.settings.enabled;
         }
         self.prune_best_effort(now_unix);
+        self.next_prune_at_unix = Some(now_unix.saturating_add(PRUNE_INTERVAL_SECONDS));
         Ok(())
+    }
+
+    /// Periodic retention also runs when no further sessions end. Failed
+    /// attempts count as degraded operations and retry at the next interval.
+    pub fn prune_if_due(&mut self, now_unix: i64) {
+        let Some(next_prune_at_unix) = self.next_prune_at_unix else {
+            return;
+        };
+        if now_unix < next_prune_at_unix {
+            return;
+        }
+        self.next_prune_at_unix = Some(now_unix.saturating_add(PRUNE_INTERVAL_SECONDS));
+        if self.settings.ttl_days > 0 || self.settings.db_size_limit_mb > 0 {
+            self.prune_best_effort(now_unix);
+        }
     }
 
     /// Removes the v1 local policy only after the central document is known
@@ -1153,6 +1172,35 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.status().unwrap().sessions, 1);
+    }
+
+    #[test]
+    fn periodic_prune_expires_ended_records_without_new_streams() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store
+            .begin_session(&metadata("expires-later"), 100)
+            .unwrap();
+        store.end_session("expires-later", 101).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 1,
+                db_size_limit_mb: 0,
+            },
+            200,
+        );
+        assert_eq!(store.status().unwrap().sessions, 1);
+        store.prune_if_due(200 + PRUNE_INTERVAL_SECONDS - 1);
+        assert_eq!(store.status().unwrap().sessions, 1);
+
+        // The process stays open and no session ends while wall time advances.
+        store.prune_if_due(86_502);
+        assert_eq!(store.status().unwrap().sessions, 0);
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+        assert!(!store.settings().1);
     }
 
     #[test]
