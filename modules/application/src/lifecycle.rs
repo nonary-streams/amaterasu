@@ -950,10 +950,10 @@ impl ApplicationLifecycle {
             },
             // A blocked undo is retained with its child handle until an explicit
             // cleanup retry can observe it again. Once it settles, a failed result
-            // leaves the obligation available for a fresh command attempt.
+            // remains owed for another explicit cleanup pass.
             CommandPurpose::UndoRetry(index) => match result {
                 Ok(()) => self.complete_undo(index),
-                Err(_) => {}
+                Err(failure) => self.record_undo_failure(index, failure),
             },
         }
     }
@@ -976,6 +976,10 @@ impl ApplicationLifecycle {
     }
 
     fn record_undo_failure(&mut self, index: usize, failure: CommandFailure) {
+        // A retained live command can report the same wait failure on later ticks.
+        if self.attempted_undo.contains(&index) {
+            return;
+        }
         self.cleanup.failures.push(failure.at("undo", index));
         self.attempted_undo.push(index);
     }
@@ -1042,5 +1046,78 @@ impl ApplicationLifecycle {
 
     pub(crate) fn has_active_command(&self) -> bool {
         self.active.is_some()
+    }
+}
+
+#[cfg(test)]
+mod undo_retry_tests {
+    use super::*;
+
+    fn preparation_step(index: usize) -> PreparationStep {
+        let missing_directory = std::env::temp_dir().join(format!(
+            "amaterasu-missing-undo-executables-{}",
+            std::process::id()
+        ));
+        assert!(!missing_directory.exists());
+        let executable = missing_directory.join(format!("undo-{index}.exe"));
+        let command = ConfiguredCommand {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: None,
+            timeout_ms: 1_000,
+        };
+        PreparationStep::Structured(StructuredPreparationStep {
+            run: command.clone(),
+            undo: Some(command),
+        })
+    }
+
+    #[test]
+    fn settled_retry_failure_is_reported_once_before_older_undo_is_attempted() {
+        let mut lifecycle =
+            ApplicationLifecycle::new(vec![preparation_step(0), preparation_step(1)]).unwrap();
+        lifecycle.phase = Phase::CleanupFailed;
+        lifecycle.cleanup.state = CleanupState::Failed;
+        lifecycle.cleanup.remaining = 2;
+        lifecycle.cleanup.failures =
+            vec![CommandFailure::new(CommandFailureKind::ContainmentFailed).at("undo", 1)];
+        lifecycle.pending_undo = vec![0, 1];
+        lifecycle.attempted_undo.push(1);
+        lifecycle.retry_cleanup();
+
+        lifecycle.finish_command(
+            CommandPurpose::UndoRetry(1),
+            Err(CommandFailure::new(CommandFailureKind::ExitFailed)),
+        );
+        lifecycle.record_undo_failure(
+            1,
+            CommandFailure::new(CommandFailureKind::ContainmentFailed),
+        );
+        assert_eq!(lifecycle.cleanup.failures.len(), 1);
+        assert_eq!(lifecycle.cleanup.failures[0].step, 1);
+        assert!(matches!(
+            lifecycle.cleanup.failures[0].kind,
+            CommandFailureKind::ExitFailed
+        ));
+
+        lifecycle.start_next_undo(Instant::now());
+        assert_eq!(lifecycle.attempted_undo, [1, 0]);
+        assert_eq!(lifecycle.cleanup.failures.len(), 2);
+        assert_eq!(lifecycle.cleanup.failures[1].step, 0);
+        assert!(matches!(
+            lifecycle.cleanup.failures[1].kind,
+            CommandFailureKind::SpawnFailed
+        ));
+
+        lifecycle.finish_cleanup_pass();
+        assert!(lifecycle.cleanup_failed());
+        lifecycle.retry_cleanup();
+        assert!(lifecycle.cleanup.failures.is_empty());
+        lifecycle.record_undo_failure(
+            1,
+            CommandFailure::new(CommandFailureKind::ContainmentFailed),
+        );
+        assert_eq!(lifecycle.cleanup.failures.len(), 1);
     }
 }
