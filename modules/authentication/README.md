@@ -11,7 +11,7 @@ Startup settings (administrator and scope arrays default empty, denying
 administrator operations):
 
 ```json
-{"administrator_principals":["amaterasu.console"],"allowed_scopes":["catalog.read","catalog.write"],"session_token_ttl_seconds":7200,"remember_me_refresh_token_ttl_seconds":604800}
+{"administrator_principals":["amaterasu.console"],"allowed_scopes":["catalog.read","catalog.write"],"authorization_policy_generation":0,"session_token_ttl_seconds":7200,"remember_me_refresh_token_ttl_seconds":604800}
 ```
 
 The administrator list is restricted to 16 runtime principals. Scope names are
@@ -34,6 +34,18 @@ similarly require the initiating consumer's configuration call grant. State and
 product configuration isolate records by the immediate provider identity. Never
 use payload caller, username, token
 subject, or HTTP-supplied role claims as runtime authority.
+
+`authorization_policy_generation` is a deployment-maintained monotonic counter.
+Increase it whenever `allowed_scopes` or `administrator_principals` changes,
+including when restoring an earlier policy value. Never decrease or reuse a
+generation. This preserves revocation across a policy change and revert that
+occurs while the authentication module is stopped or receives no request. A
+session is bound to the generation at login; the first later auth request under
+a different generation durably prunes the old session before processing the
+request. A new login uses the current bootstrap scopes and generation. The
+scope digest remains an additional check when a policy change is observed even
+if the generation was not advanced. This counter is part of module startup
+settings and is separate from the product-document revision for token lifetimes.
 
 The following strict JSON actions are supported:
 
@@ -118,18 +130,23 @@ session or credential document fields, state keys, schema versions, or service
 version. API-token expiry semantics are unchanged.
 
 Administrator sessions persist in a separate versioned
-`authentication/sessions/v1` state document (schema version 1), apart from
+`authentication/sessions/v1` state document (schema version 2), apart from
 credential and API-token state at `authentication/v1`. The session document is
 bounded to 16 records and 12,000 serialized bytes. It stores bearer digests,
-credential and scope digests, and session metadata; it never stores raw bearer or
-refresh-token secrets. On module restart, sessions restore only when their
-credential and configured-scope digests still match and their absolute refresh
-expiry has not passed. The administrator token lifetime settings remain durable
-across module restarts. The packaged runtime profile supplies default TTL
-settings, and the management API and settings editor expose administrator-facing
-lifetime controls. Verify returns identity/scope/expiry metadata without the
-bearer, with kind `administrator_session` or `api_token`; a
-token's subject is its issuing runtime principal. All required scopes must match.
+credential and scope digests, the policy generation, and session metadata; it
+never stores raw bearer or refresh-token secrets. On module restart, sessions
+restore only when their credential and configured-scope digests and policy
+generation still match and their absolute refresh expiry has not passed. Legacy
+schema version 1 sidecars have no generation and are therefore rejected and
+durably upgraded to an empty schema version 2 document before the request is
+processed. The administrator token lifetime settings remain durable across
+module restarts, and lifetime edits alone do not advance the authorization-policy
+generation or invalidate sessions. The packaged runtime profile supplies
+default TTL settings, and the management API and settings editor expose
+administrator-facing lifetime controls. Verify returns
+identity/scope/expiry metadata without the bearer, with kind
+`administrator_session` or `api_token`; a token's subject is its issuing runtime
+principal. All required scopes must match.
 Removing a configured scope denies any session/token that still grants it,
 including otherwise valid requests for a smaller subset.
 
@@ -191,7 +208,8 @@ Offline state/host compromise is outside this in-process authority boundary.
 
 Tests exercise the real Argon2 implementation, asynchronous state request/reply
 ordering, retained document reconstruction, cancellation, password rotation,
-credential-bound session invalidation, write failure, scope
+credential-bound session invalidation, policy-generation ABA pruning across
+restart and legacy-sidecar upgrade, write failure, scope
 and ownership boundaries, token digest storage, deterministic expiry, logout,
 capacity, and login rate limits. The transport harness models state acknowledgment;
 state disk durability and complete runtime integration require their own tests.

@@ -25,6 +25,7 @@ pub enum Change {
 #[derive(Clone)]
 struct Session {
     credential_digest: String,
+    policy_generation: u64,
     subject: String,
     scopes: BTreeSet<String>,
     expires_at: u64,
@@ -131,8 +132,8 @@ impl Engine {
             .as_ref()
             .map(|credential| crypto::token_digest(&credential.password_hash));
         let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
-        // Both sidecar bindings must match the current credential and exact
-        // deterministic scope set before a session is trusted after restart.
+        // Sidecar bindings must match the current credential, exact scope set,
+        // and monotonic policy generation before a session is trusted.
         self.restore_sessions(
             &session_document,
             credential_digest.as_deref(),
@@ -196,8 +197,8 @@ impl Engine {
         }
     }
 
-    /// Remove records that cannot be trusted under the currently observed
-    /// credential, scope policy, or time before a request uses the sidecar.
+    /// Remove records that cannot be trusted under the current credential,
+    /// authorization policy, or time before a request uses the sidecar.
     pub fn prune_sessions(
         &self,
         credential_document: &Document,
@@ -210,12 +211,16 @@ impl Engine {
             .map(|credential| crypto::token_digest(&credential.password_hash));
         let scope_digest = Self::scope_digest(&self.settings.allowed_scopes);
         let original_len = session_document.sessions.len();
+        let original_version = session_document.version;
         session_document.sessions.retain(|session| {
             Some(session.credential_digest.as_str()) == credential_digest.as_deref()
                 && session.scope_digest == scope_digest
+                && session.policy_generation == Some(self.settings.authorization_policy_generation)
                 && session.refresh_expires_at > now.max(self.latest_time)
         });
-        let removed = session_document.sessions.len() != original_len;
+        session_document.version = SESSION_DOCUMENT_VERSION;
+        let removed = session_document.sessions.len() != original_len
+            || original_version != SESSION_DOCUMENT_VERSION;
         (session_document, removed)
     }
 
@@ -322,6 +327,7 @@ impl Engine {
             digest.clone(),
             Session {
                 credential_digest,
+                policy_generation: self.settings.authorization_policy_generation,
                 subject: username,
                 scopes,
                 expires_at,
@@ -419,6 +425,7 @@ impl Engine {
         for record in &document.sessions {
             if Some(record.credential_digest.as_str()) != credential_digest
                 || record.scope_digest != scope_digest
+                || record.policy_generation != Some(self.settings.authorization_policy_generation)
                 || record.refresh_expires_at <= self.latest_time
             {
                 continue;
@@ -431,6 +438,9 @@ impl Engine {
                 record.session_id.clone(),
                 Session {
                     credential_digest: record.credential_digest.clone(),
+                    policy_generation: record
+                        .policy_generation
+                        .expect("session generation was validated before restoration"),
                     subject: record.subject.clone(),
                     scopes: self.settings.allowed_scopes.clone(),
                     expires_at: record.expires_at,
@@ -452,6 +462,7 @@ impl Engine {
                     session_id: session_id.clone(),
                     credential_digest: session.credential_digest.clone(),
                     scope_digest: scope_digest.to_owned(),
+                    policy_generation: Some(session.policy_generation),
                     subject: session.subject.clone(),
                     expires_at: session.expires_at,
                     refresh_expires_at: session.refresh_expires_at,

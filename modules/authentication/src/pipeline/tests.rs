@@ -962,6 +962,122 @@ fn scope_digest_mismatch_invalidates_hydrated_sessions() {
 }
 
 #[test]
+fn policy_generation_prunes_sessions_after_unobserved_revert_and_restart() {
+    let mut state = StateHarness::new();
+    let original_settings = Settings {
+        authorization_policy_generation: 41,
+        ..settings()
+    };
+    let mut original_policy = Pipeline::new(original_settings.clone());
+    state.setup(&mut original_policy);
+    let original_session = state.request(
+        &mut original_policy,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        100,
+    );
+    assert_eq!(original_session["ok"], true);
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["policy_generation"],
+        41
+    );
+
+    // The changed policy is installed at generation 42, then restored at 43
+    // before authentication handles another request. The session document
+    // still contains generation 41, so restart cannot revive it by digest ABA.
+    let _intermediate_policy = Settings {
+        allowed_scopes: BTreeSet::from(["catalog.read".into()]),
+        authorization_policy_generation: 42,
+        ..original_settings.clone()
+    };
+    let restored_settings = Settings {
+        authorization_policy_generation: 43,
+        ..original_settings
+    };
+    let mut restarted = Pipeline::new(restored_settings.clone());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"refresh","refresh_token":original_session["refresh_token"]}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+    let pruned = state.session_stored.as_ref().unwrap();
+    assert_eq!(pruned["version"], SESSION_DOCUMENT_VERSION);
+    assert_eq!(pruned["sessions"], json!([]));
+
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":original_session["bearer"],"required_scopes":["catalog.read"]}),
+            102,
+        )["code"],
+        "unauthorized"
+    );
+    let restored_login = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        103,
+    );
+    assert_eq!(restored_login["ok"], true);
+    assert_eq!(
+        restored_login["scopes"],
+        json!(["catalog.read", "catalog.write"])
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"][0]["policy_generation"],
+        43
+    );
+    let mut after_login_restart = Pipeline::new(restored_settings);
+    assert_eq!(
+        state.request(
+            &mut after_login_restart,
+            "frontend",
+            json!({"action":"verify","bearer":restored_login["bearer"],"required_scopes":["catalog.write"]}),
+            104,
+        )["ok"],
+        true
+    );
+}
+
+#[test]
+fn legacy_session_records_without_a_policy_generation_are_durably_pruned() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let session = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple"}),
+        100,
+    );
+    let legacy_document = state.session_stored.as_mut().unwrap();
+    legacy_document["version"] = json!(1);
+    for record in legacy_document["sessions"].as_array_mut().unwrap() {
+        record.as_object_mut().unwrap().remove("policy_generation");
+    }
+
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":session["bearer"],"required_scopes":[]}),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap(),
+        &json!({"version":SESSION_DOCUMENT_VERSION,"sessions":[]})
+    );
+}
+
+#[test]
 fn failed_prune_write_blocks_request_until_policy_mismatch_is_persisted() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());

@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 pub const MAX_TOKENS: usize = 32;
 pub const MAX_SESSIONS: usize = 16;
 pub const MAX_SESSION_DOCUMENT_BYTES: usize = 12_000;
-pub const SESSION_DOCUMENT_VERSION: u32 = 1;
+pub const LEGACY_SESSION_DOCUMENT_VERSION: u32 = 1;
+pub const SESSION_DOCUMENT_VERSION: u32 = 2;
 pub const MAX_SCOPES: usize = 64;
 pub const DEFAULT_SESSION_TOKEN_TTL_SECONDS: u64 = 7200;
 pub const DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS: u64 = 604800;
@@ -18,6 +19,9 @@ pub const MAX_TOKEN_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub allowed_scopes: BTreeSet<String>,
+    /// Advance for every authentication-policy edit, including restoring old values.
+    #[serde(default)]
+    pub authorization_policy_generation: u64,
     pub session_token_ttl_seconds: u64,
     pub remember_me_refresh_token_ttl_seconds: u64,
 }
@@ -27,6 +31,7 @@ impl Default for Settings {
         Self {
             administrator_principals: BTreeSet::new(),
             allowed_scopes: BTreeSet::new(),
+            authorization_policy_generation: 0,
             session_token_ttl_seconds: DEFAULT_SESSION_TOKEN_TTL_SECONDS,
             remember_me_refresh_token_ttl_seconds: DEFAULT_REMEMBER_ME_REFRESH_TOKEN_TTL_SECONDS,
         }
@@ -210,6 +215,8 @@ pub struct SessionRecord {
     pub session_id: String,
     pub credential_digest: String,
     pub scope_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<u64>,
     pub subject: String,
     pub expires_at: u64,
     pub refresh_expires_at: u64,
@@ -219,8 +226,10 @@ pub struct SessionRecord {
 
 impl SessionDocument {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version != SESSION_DOCUMENT_VERSION
-            || self.sessions.len() > MAX_SESSIONS
+        if !matches!(
+            self.version,
+            LEGACY_SESSION_DOCUMENT_VERSION | SESSION_DOCUMENT_VERSION
+        ) || self.sessions.len() > MAX_SESSIONS
             || serde_json::to_vec(self)
                 .map_or(true, |bytes| bytes.len() > MAX_SESSION_DOCUMENT_BYTES)
         {
@@ -229,7 +238,13 @@ impl SessionDocument {
         let mut session_ids = BTreeSet::new();
         let mut refresh_token_digests = BTreeSet::new();
         for session in &self.sessions {
-            if !valid_digest(&session.session_id)
+            let generation_matches_document = match self.version {
+                LEGACY_SESSION_DOCUMENT_VERSION => session.policy_generation.is_none(),
+                SESSION_DOCUMENT_VERSION => session.policy_generation.is_some(),
+                _ => false,
+            };
+            if !generation_matches_document
+                || !valid_digest(&session.session_id)
                 || !session_ids.insert(&session.session_id)
                 || !valid_digest(&session.credential_digest)
                 || !valid_digest(&session.scope_digest)
@@ -339,6 +354,7 @@ mod scope_tests {
     #[test]
     fn authentication_ttl_defaults_and_bounds_are_explicit() {
         let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.authorization_policy_generation, 0);
         assert_eq!(defaults.session_token_ttl_seconds, 7200);
         assert_eq!(defaults.remember_me_refresh_token_ttl_seconds, 604800);
         defaults.validate().unwrap();
@@ -400,6 +416,7 @@ mod scope_tests {
                     session_id: format!("{index:064x}"),
                     credential_digest: "b".repeat(64),
                     scope_digest: scope_digest.clone(),
+                    policy_generation: Some(0),
                     subject: "s".repeat(64),
                     expires_at: u64::MAX,
                     refresh_expires_at: u64::MAX,
@@ -419,6 +436,7 @@ mod scope_tests {
             session_id: "f".repeat(64),
             credential_digest: "b".repeat(64),
             scope_digest,
+            policy_generation: Some(0),
             subject: "s".repeat(64),
             expires_at: u64::MAX,
             refresh_expires_at: u64::MAX,
@@ -431,8 +449,35 @@ mod scope_tests {
     #[test]
     fn session_document_rejects_bad_versions_unknown_fields_and_digests() {
         for malformed in [
-            json!({"version":2,"sessions":[]}),
+            json!({"version":3,"sessions":[]}),
             json!({"version":1,"sessions":[],"legacy":true}),
+            json!({
+                "version":2,
+                "sessions":[{
+                    "session_id":"a".repeat(64),
+                    "credential_digest":"b".repeat(64),
+                    "scope_digest":"c".repeat(64),
+                    "subject":"admin",
+                    "expires_at":120,
+                    "refresh_expires_at":500,
+                    "refresh_token_digest":"d".repeat(64),
+                    "remember_me":true
+                }]
+            }),
+            json!({
+                "version":1,
+                "sessions":[{
+                    "session_id":"a".repeat(64),
+                    "credential_digest":"b".repeat(64),
+                    "scope_digest":"c".repeat(64),
+                    "policy_generation":0,
+                    "subject":"admin",
+                    "expires_at":120,
+                    "refresh_expires_at":500,
+                    "refresh_token_digest":"d".repeat(64),
+                    "remember_me":true
+                }]
+            }),
             json!({
                 "version":1,
                 "sessions":[{
