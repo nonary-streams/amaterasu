@@ -298,16 +298,28 @@ At most 128 keys/buttons and 16 pen/touch contacts may be held. Supported events
   accumulates each axis and emits `scroll` detents instead.
 - `pen_touch`: carries a `pointer_id` (`u32`), `device` (`pen` or `touch`),
   `phase` (`down`, `move`, `up`, or `cancel`), and normalized absolute `x`/`y`
-  coordinates (`u16`, 0–65535). Optional pressure is finite and normalized to
-  0–1. Optional pen tilt must provide both `tilt_x` and `tilt_y`, each from
-  -90 to 90 degrees; touch tilt is rejected. When enabled for the lease,
-  contacts are keyed by (`device`, `pointer_id`): Down must create a free
-  identity, and Move, Up, and Cancel must refer to an identity held by this
-  lease. A duplicate Down or unowned event is rejected before injection.
-  Repeated identical Move samples are coalesced. Policy-suppressed events remain
-  accepted without creating contacts. Lease release, expiry, failure, and
-  shutdown cancel only the exact contacts injected by that lease; failed
-  cancellations stay owned and retry through the lease cleanup path.
+  coordinates (`u16`, 0–65535). Touch pointer IDs retain the packet ID; pen
+  uses the stable `pointer_id` 1 in its separate device namespace because the
+  source pen packet has no ID. Optional pressure is finite and normalized to
+  0–1. Touch and pen can carry paired normalized `contact_area_major` and
+  `contact_area_minor` values. Optional `rotation_degrees` preserves unknown as
+  `null` and accepts known values from 0 through 359. Pen can also carry
+  `pen_tool` (`unknown`, `pen`, or `eraser`), a `pen_buttons` bit mask
+  (`primary` 1, `secondary` 2, `tertiary` 4), and raw `tilt` from 0 through
+  90 degrees; absent values preserve protocol unknowns. Touch rejects pen-only
+  metadata, and malformed, non-finite, or out-of-range values are rejected
+  before injection. Backends convert the retained metadata to their native
+  orientation, contact, tool, button, and tilt representations.
+
+  When enabled for the lease, contacts are keyed by (`device`, `pointer_id`):
+  Down must create a free identity, and Move, Up, and Cancel must refer to an
+  identity held by this lease. A duplicate Down or unowned event is rejected
+  before injection; a cancellation for another pointer is never synthesized.
+  Repeated identical Move samples are coalesced. Policy-suppressed events
+  remain accepted without creating contacts. Lease release, expiry, failure,
+  device loss, and shutdown cancel only the exact contacts injected by that
+  lease; failed cancellations stay owned and retry through the lease cleanup
+  path.
 
 Linux key example:
 
@@ -405,17 +417,25 @@ Wayland absolute-pointer integration, DS4/DS5/Switch reports, VHF/UMDF
 and Inputtino integrations, rumble/LED feedback, and crash-surviving Windows
 keyboard/mouse cleanup remain unimplemented.
 
+The pen/touch event coordinates and contact dimensions arriving at this module
+are expected to have already been transformed from client coordinates into the
+captured desktop geometry by the protocol adapter. The Linux backend reports
+touch orientation through its signed ABS_MT orientation range; Windows derives
+touch contact bounds and pen tilt axes from the retained rotation and tilt when
+those values are known. Native pointer ranges and contact geometry still need
+qualification on supported operating-system versions and input stacks.
+
 ## Validation and reference
 
-Tests use a fake backend for ownership, stale tokens, batch admission, chord
+Tests use fake backends for ownership, stale tokens, batch admission, chord
 release order, cancellation, partial failure, expiry, retained failed releases,
-retry and shutdown, including pen/touch identity and contact cleanup. Windows
-encoding tests inspect INPUT records without calling SendInput. Windows and Linux
-native sources cross-compile from macOS. **No test
+retry and shutdown, including pen/touch identity, multiple contacts, duplicate
+events, device loss, and contact cleanup. Platform mapping tests inspect native
+event records without injecting input or creating a uinput device. **No test
 injects input or creates a uinput device on the developer desktop.** Native
-pen/touch delivery, Windows and KDE Wayland behavior, and device-loss handling
-remain hardware gates. Network ingress mapping remains the responsibility of
-the protocol adapter.
+pen/touch delivery, Windows and Linux compositor behavior, and hardware device
+loss remain qualification gates. The GameStream protocol adapter owns network
+ingress mapping and client-to-desktop coordinate transforms.
 
 Vibeshine commit `aa292c4cb097f22beab19d6ebf0307367f9bf449` was a behavioral
 reference, including its keyboard/mouse interfaces and history concerning
