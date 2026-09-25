@@ -560,6 +560,22 @@ fn active_render_endpoints(enumerator: &IMMDeviceEnumerator) -> AudioResult<Vec<
     }
 }
 
+fn default_render_endpoint_is_active(
+    enumerator: &IMMDeviceEnumerator,
+    endpoints: &[Endpoint],
+    role: ERole,
+) -> bool {
+    // SAFETY: querying the default render endpoint does not open a capture
+    // stream, and the returned COM reference stays on this apartment thread.
+    unsafe {
+        enumerator
+            .GetDefaultAudioEndpoint(eRender, role)
+            .ok()
+            .and_then(|device| identifier(&device).ok())
+            .is_some_and(|id| endpoints.iter().any(|endpoint| endpoint.id == id))
+    }
+}
+
 fn property_text(
     properties: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
     key: &windows::Win32::Foundation::PROPERTYKEY,
@@ -816,8 +832,18 @@ impl Capture {
         } else {
             None
         };
+        let console_default_available = active_endpoints.as_deref().is_some_and(|endpoints| {
+            default_render_endpoint_is_active(&enumerator, endpoints, eConsole)
+        });
         let automatic_virtual_sink = active_endpoints.as_deref().and_then(|endpoints| {
-            select_policy_virtual_sink(endpoints, requested, virtual_sink, host_audio_enabled)
+            select_policy_virtual_sink(
+                endpoints,
+                requested,
+                virtual_sink,
+                host_audio_enabled,
+                console_default_available,
+                capture_sink_without_routing,
+            )
         });
         let uses_virtual_sink = virtual_sink.is_some() || automatic_virtual_sink.is_some();
         let effective_channels = channels.or_else(|| automatic_virtual_sink.map(|_| 2));

@@ -142,13 +142,21 @@ pub fn select_policy_virtual_sink<'a>(
     requested_endpoint: &str,
     explicit_virtual_sink: Option<&str>,
     host_audio_enabled: bool,
+    console_default_available: bool,
+    capture_sink_without_routing: bool,
 ) -> Option<&'a Endpoint> {
     if explicit_virtual_sink.is_some() {
         return None;
     }
 
+    // Capture-only opens retain their pre-existing Multimedia availability rule.
+    let default_sink_available = if capture_sink_without_routing {
+        endpoints.iter().any(|endpoint| endpoint.default_multimedia)
+    } else {
+        console_default_available
+    };
     let ordinary_sink_missing = (requested_endpoint.is_empty() || requested_endpoint == "default")
-        && !endpoints.iter().any(|endpoint| endpoint.default_multimedia);
+        && !default_sink_available;
     if host_audio_enabled && !ordinary_sink_missing {
         return None;
     }
@@ -235,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_policy_uses_steam_when_host_audio_is_disabled_or_ordinary_sink_is_missing() {
+    fn audio_policy_uses_console_availability_for_default_sink_fallback() {
         let mut endpoints = [
             endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
             endpoint(
@@ -246,21 +254,60 @@ mod tests {
             ),
         ];
         endpoints[0].default_multimedia = true;
+        // Console is missing even though Multimedia is available.
         assert_eq!(
-            select_policy_virtual_sink(&endpoints, "render.default", None, false)
+            select_policy_virtual_sink(&endpoints, "", None, true, false, false)
                 .unwrap()
                 .id,
             "render.virtual"
         );
-        assert!(select_policy_virtual_sink(&endpoints, "", None, true).is_none());
-        assert!(select_policy_virtual_sink(&endpoints, "default", None, true).is_none());
+        assert_eq!(
+            select_policy_virtual_sink(&endpoints, "default", None, true, false, false)
+                .unwrap()
+                .id,
+            "render.virtual"
+        );
+
+        // Console is available even though Multimedia is missing.
         endpoints[0].default_multimedia = false;
+        assert!(select_policy_virtual_sink(&endpoints, "", None, true, true, false).is_none());
+        assert!(
+            select_policy_virtual_sink(&endpoints, "default", None, true, true, false).is_none()
+        );
+    }
+
+    #[test]
+    fn audio_policy_keeps_host_disabled_explicit_and_capture_only_behavior() {
+        let mut endpoints = [
+            endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
+            endpoint(
+                "render.virtual",
+                "Steam Streaming Speakers",
+                "virtual speakers",
+                DEFAULT_VIRTUAL_SINK_ADAPTER,
+            ),
+        ];
+
         assert_eq!(
-            select_policy_virtual_sink(&endpoints, "", None, true)
+            select_policy_virtual_sink(&endpoints, "render.default", None, false, true, false)
                 .unwrap()
                 .id,
             "render.virtual"
         );
+        assert!(
+            select_policy_virtual_sink(&endpoints, "render.default", None, true, false, false)
+                .is_none()
+        );
+
+        // Capture-only keeps its existing Multimedia-based selection behavior.
+        assert_eq!(
+            select_policy_virtual_sink(&endpoints, "", None, true, true, true)
+                .unwrap()
+                .id,
+            "render.virtual"
+        );
+        endpoints[0].default_multimedia = true;
+        assert!(select_policy_virtual_sink(&endpoints, "", None, true, false, true).is_none());
     }
 
     #[test]
@@ -273,8 +320,18 @@ mod tests {
         )];
 
         assert!(
-            select_policy_virtual_sink(&endpoints, "render.default", Some("missing"), false)
-                .is_none()
+            select_policy_virtual_sink(
+                &endpoints,
+                "render.default",
+                Some("missing"),
+                false,
+                false,
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            select_policy_virtual_sink(&endpoints, "", Some(""), false, false, false).is_none()
         );
     }
 
@@ -287,7 +344,10 @@ mod tests {
             "Realtek Audio",
         )];
 
-        assert!(select_policy_virtual_sink(&endpoints, "render.default", None, false).is_none());
+        assert!(
+            select_policy_virtual_sink(&endpoints, "render.default", None, false, false, false)
+                .is_none()
+        );
     }
 
     #[test]
