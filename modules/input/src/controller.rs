@@ -341,12 +341,8 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_key_repeat_policy(&mut self, delay_ms: u32, frequency_hz: f64) {
-        let previous = self.effective_key_repeat_policy();
         self.key_repeat_delay_ms = delay_ms;
         self.key_repeat_frequency_hz = frequency_hz;
-        if previous != self.effective_key_repeat_policy() {
-            self.repeating_key = None;
-        }
     }
 
     pub fn back_button_timeout_ms(&self) -> i32 {
@@ -1033,10 +1029,12 @@ impl<B: Backend> Controller<B> {
                 KeyState::Up,
             ))?;
         }
-        match next_repeat_deadline(repeat.next_due, now, repeat.period) {
+        let period = repeat_period(self.effective_key_repeat_policy().1);
+        match next_repeat_deadline(repeat.next_due, now, period) {
             Some(next_due) => {
                 if let Some(repeating) = &mut self.repeating_key {
                     repeating.next_due = next_due;
+                    repeating.period = period;
                 }
             }
             None => self.repeating_key = None,

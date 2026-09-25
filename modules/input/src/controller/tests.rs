@@ -2340,28 +2340,142 @@ fn tiny_positive_frequency_keeps_the_initial_repeat_delay() {
 }
 
 #[test]
-fn settings_change_and_lease_end_cancel_repeat_state() {
-    let mut controller = Controller::new(FakeBackend::default(), true);
-    let token = acquire(&mut controller, Instant::now());
-    assert_eq!(
-        batch(&mut controller, &token, vec![key(30, KeyState::Down)])["ok"],
-        true
+fn global_repeat_policy_updates_preserve_pending_deadlines_and_release_cancels() {
+    let backend = FakeBackend::default();
+    let trace = backend.trace.clone();
+    let mut controller = Controller::new(backend, true);
+    controller.set_key_repeat_policy(10, 100.0);
+    let start = Instant::now();
+    let token = acquire(&mut controller, start);
+    let key_down_at = start + Duration::from_millis(1);
+    let key_down = controller.handle(
+        "owner",
+        Operation::Batch {
+            lease: token.clone(),
+            events: vec![key(30, KeyState::Down)],
+        },
+        key_down_at,
+        &mut || Ok(()),
     );
-    assert!(controller.repeating_key.is_some());
-    controller.set_key_repeat_policy(250, 30.5);
+    assert_eq!(key_down["ok"], true);
+
+    let first_due = key_down_at + Duration::from_millis(10);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        first_due
+    );
+    controller.set_key_repeat_policy(250, 20.0);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        first_due
+    );
+
+    controller.expire(first_due - Duration::from_millis(1));
+    assert_eq!(trace.borrow().len(), 1);
+    controller.expire(first_due);
+    assert_eq!(
+        trace.borrow().as_slice(),
+        &[key(30, KeyState::Down), key(30, KeyState::Repeat)]
+    );
+
+    let second_due = first_due + Duration::from_millis(50);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        second_due
+    );
+    controller.set_key_repeat_policy(25, 5.0);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        second_due
+    );
+
+    controller.expire(second_due - Duration::from_millis(1));
+    assert_eq!(trace.borrow().len(), 2);
+    controller.expire(second_due);
+    assert_eq!(trace.borrow().len(), 3);
+    assert_eq!(trace.borrow()[2], key(30, KeyState::Repeat));
+
+    let third_due = second_due + Duration::from_millis(200);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        third_due
+    );
+    assert_eq!(controller.key_repeat_policy(), (25, 5.0));
+    let release = controller.handle(
+        "owner",
+        Operation::Release { lease: token },
+        second_due + Duration::from_millis(1),
+        &mut || Ok(()),
+    );
+    assert_eq!(release["released"], true);
     assert!(controller.repeating_key.is_none());
-    assert_eq!(controller.key_repeat_policy(), (250, 30.5));
+
+    let event_count = trace.borrow().len();
+    controller.expire(third_due);
+    assert_eq!(trace.borrow().len(), event_count);
+}
+
+#[test]
+fn lease_repeat_overrides_survive_global_policy_updates() {
+    let backend = FakeBackend::default();
+    let trace = backend.trace.clone();
+    let mut controller = Controller::new(backend, true);
+    controller.set_key_repeat_policy(500, 100.0);
+    let start = Instant::now();
+    let acquired = controller.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: None,
+            ttl_ms: Some(1_000),
+            back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            ds4_back_as_touchpad_click: None,
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: Some(20),
+            key_repeat_frequency: Some(25.0),
+        },
+        start,
+        &mut || Ok(()),
+    );
+    assert_eq!(acquired["ok"], true);
+    let token = acquired["lease"].as_str().unwrap().to_owned();
+
+    controller.set_key_repeat_policy(5, 1.0);
+    assert_eq!(controller.effective_key_repeat_policy(), (20, 25.0));
+    let key_down_at = start + Duration::from_millis(1);
+    let key_down = controller.handle(
+        "owner",
+        Operation::Batch {
+            lease: token.clone(),
+            events: vec![key(30, KeyState::Down)],
+        },
+        key_down_at,
+        &mut || Ok(()),
+    );
+    assert_eq!(key_down["ok"], true);
+
+    let first_due = key_down_at + Duration::from_millis(20);
+    controller.set_key_repeat_policy(250, 200.0);
+    assert_eq!(controller.effective_key_repeat_policy(), (20, 25.0));
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        first_due
+    );
+    controller.expire(first_due);
 
     assert_eq!(
-        controller.handle(
-            "owner",
-            Operation::Release { lease: token },
-            Instant::now(),
-            &mut || Ok(()),
-        )["released"],
-        true
+        trace.borrow().as_slice(),
+        &[key(30, KeyState::Down), key(30, KeyState::Repeat)]
     );
-    assert!(controller.repeating_key.is_none());
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        first_due + Duration::from_millis(40)
+    );
 }
 
 #[test]
