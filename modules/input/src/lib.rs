@@ -72,6 +72,8 @@ enum SettingsOperation {
         gamepad: Option<gamepad_profile::GamepadProfile>,
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
+        #[serde(default)]
+        native_pen_touch: Option<bool>,
         expected_revision: u64,
     },
 }
@@ -224,6 +226,7 @@ impl InputModule {
                     back_button_timeout,
                     gamepad,
                     ds4_back_as_touchpad_click,
+                    native_pen_touch,
                     expected_revision,
                 }) => {
                     if let Err(error) = self.check_request(request.id) {
@@ -245,6 +248,7 @@ impl InputModule {
                         back_button_timeout,
                         gamepad,
                         ds4_back_as_touchpad_click,
+                        native_pen_touch,
                     });
                     match self.product_settings.begin_update(
                         request.id,
@@ -413,6 +417,7 @@ mod tests {
                 back_button_timeout: None,
                 gamepad: None,
                 controller: None,
+                native_pen_touch: None,
                 ..
             }
         ));
@@ -429,6 +434,7 @@ mod tests {
             "back_button_timeout":-1,
             "gamepad":"auto",
             "controller":false,
+            "native_pen_touch":false,
             "expected_revision":4,
         }))
         .unwrap();
@@ -443,6 +449,7 @@ mod tests {
                 back_button_timeout: Some(-1),
                 gamepad: Some(gamepad_profile::GamepadProfile::Auto),
                 controller: Some(false),
+                native_pen_touch: Some(false),
                 ..
             }
         ));

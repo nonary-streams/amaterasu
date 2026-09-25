@@ -37,6 +37,8 @@ pub enum Operation {
         #[serde(default)]
         ds4_back_as_touchpad_click: Option<bool>,
         #[serde(default)]
+        native_pen_touch: Option<bool>,
+        #[serde(default)]
         keyboard: Option<bool>,
         #[serde(default)]
         mouse: Option<bool>,
@@ -530,6 +532,7 @@ mod tests {
             inherited,
             Operation::Acquire {
                 back_button_timeout: None,
+                native_pen_touch: None,
                 ..
             }
         ));
@@ -571,6 +574,7 @@ mod tests {
             "always_send_scancodes":false,
             "key_rightalt_to_key_win":true,
             "ds4_back_as_touchpad_click":false,
+            "native_pen_touch":false,
             "key_repeat_delay":0,
             "key_repeat_frequency":0.0
         }))
@@ -581,6 +585,7 @@ mod tests {
                 controller: Some(false),
                 gamepad: Some(GamepadProfile::Auto),
                 ds4_back_as_touchpad_click: Some(false),
+                native_pen_touch: Some(false),
                 keyboard: Some(true),
                 mouse: Some(false),
                 high_resolution_scrolling: Some(false),
@@ -625,6 +630,36 @@ mod tests {
             serde_json::from_value::<Operation>(json!({
                 "action":"acquire",
                 "ds4_back_as_touchpad_click":"false"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn acquire_native_pen_touch_is_an_optional_boolean() {
+        for (value, expected) in [
+            (None, None),
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+        ] {
+            let mut payload = json!({"action":"acquire"});
+            if let Some(value) = value {
+                payload["native_pen_touch"] = json!(value);
+            }
+            let operation: Operation = serde_json::from_value(payload).unwrap();
+            assert!(matches!(
+                operation,
+                Operation::Acquire {
+                    native_pen_touch: actual,
+                    ..
+                } if actual == expected
+            ));
+        }
+
+        assert!(
+            serde_json::from_value::<Operation>(json!({
+                "action":"acquire",
+                "native_pen_touch":"true"
             }))
             .is_err()
         );

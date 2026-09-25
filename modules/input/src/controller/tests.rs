@@ -161,6 +161,7 @@ fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -196,6 +197,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -231,6 +233,7 @@ fn scoped_timeout_is_snapshotted_for_a_lease_and_global_updates_apply_after_rele
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -259,6 +262,7 @@ fn scoped_ds4_back_mapping_survives_global_updates_and_restores_after_release() 
             controller: None,
             gamepad: Some(GamepadProfile::Auto),
             ds4_back_as_touchpad_click: Some(false),
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -346,6 +350,125 @@ fn unscoped_ds4_back_mapping_is_snapshotted_from_the_v9_default() {
 }
 
 #[test]
+fn native_pen_touch_resolution_is_snapshotted_and_retry_identity_is_optional_value() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let acquire = |operation_id: &str, native_pen_touch| Operation::Acquire {
+        operation_id: Some(operation_id.into()),
+        ttl_ms: None,
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click: None,
+        native_pen_touch,
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: None,
+        key_repeat_frequency: None,
+    };
+    let release = |controller: &mut Controller<FakeBackend>, response: &serde_json::Value| {
+        controller.handle(
+            "owner",
+            Operation::Release {
+                lease: response["lease"].as_str().unwrap().into(),
+            },
+            now,
+            &mut || Ok(()),
+        )
+    };
+
+    let inherited = controller.handle(
+        "owner",
+        acquire("pen-touch-default", None),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(inherited["native_pen_touch"], true);
+    let token = inherited["lease"].clone();
+    let retry = controller.handle(
+        "owner",
+        acquire("pen-touch-default", None),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(retry["lease"], token);
+    assert_eq!(retry["native_pen_touch"], true);
+
+    controller.set_native_pen_touch(false);
+    let status = controller.status("owner", now);
+    let lookup = controller.handle(
+        "owner",
+        Operation::Lookup {
+            operation_id: "pen-touch-default".into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(status["native_pen_touch"], false);
+    assert_eq!(status["lease"]["native_pen_touch"], true);
+    assert_eq!(lookup["native_pen_touch"], true);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            acquire("pen-touch-default", Some(true)),
+            now,
+            &mut || Ok(())
+        )["error"]["code"],
+        "operation_conflict"
+    );
+    release(&mut controller, &inherited);
+    let terminal_lookup = controller.handle(
+        "owner",
+        Operation::Lookup {
+            operation_id: "pen-touch-default".into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(terminal_lookup["native_pen_touch"], true);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            acquire("pen-touch-default", Some(true)),
+            now,
+            &mut || Ok(())
+        )["error"]["code"],
+        "operation_conflict"
+    );
+
+    let next_inherited = controller.handle(
+        "owner",
+        acquire("pen-touch-next-default", None),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(next_inherited["native_pen_touch"], false);
+    release(&mut controller, &next_inherited);
+
+    controller.set_native_pen_touch(true);
+    let explicitly_disabled = controller.handle(
+        "owner",
+        acquire("pen-touch-disabled", Some(false)),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(explicitly_disabled["native_pen_touch"], false);
+    release(&mut controller, &explicitly_disabled);
+
+    controller.set_native_pen_touch(false);
+    let explicitly_enabled = controller.handle(
+        "owner",
+        acquire("pen-touch-enabled", Some(true)),
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(explicitly_enabled["native_pen_touch"], true);
+}
+
+#[test]
 fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();
@@ -356,6 +479,7 @@ fn acquire_retry_with_a_different_ds4_back_mapping_conflicts() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: Some(enabled),
+        native_pen_touch: None,
         keyboard: None,
         mouse: None,
         high_resolution_scrolling: None,
@@ -386,6 +510,7 @@ fn acquire_retry_distinguishes_zero_key_repeat_delay_from_unspecified() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        native_pen_touch: None,
         keyboard: None,
         mouse: None,
         high_resolution_scrolling: None,
@@ -437,6 +562,7 @@ fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        native_pen_touch: None,
         keyboard: None,
         mouse: None,
         high_resolution_scrolling: None,
@@ -517,6 +643,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -538,6 +665,7 @@ fn acquire_retry_with_a_different_scoped_timeout_conflicts() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -572,6 +700,7 @@ fn controller_capability_is_present_in_status_and_active_lease_responses() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -623,6 +752,7 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -695,6 +825,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             controller: Some(true),
             gamepad: Some(GamepadProfile::Auto),
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: Some(true),
             mouse: Some(false),
             high_resolution_scrolling: None,
@@ -780,6 +911,7 @@ fn scoped_input_policy_overrides_host_defaults_then_restores_them_on_release() {
             controller: Some(true),
             gamepad: Some(global_gamepad),
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: Some(true),
             mouse: None,
             high_resolution_scrolling: None,
@@ -833,6 +965,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: Some(false),
@@ -941,6 +1074,7 @@ fn scoped_keyboard_and_scroll_overrides_hold_through_cleanup_and_restore_default
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1443,6 +1577,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1524,6 +1659,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1547,6 +1683,7 @@ fn disabled_policy_cancelled_acquire_and_malformed_coordinates_do_not_activate()
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1589,6 +1726,7 @@ fn lost_error_replies_preserve_the_existing_lease_and_pressed_keys() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1637,6 +1775,7 @@ fn lost_success_replies_release_new_acquisition_and_batch_state() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -1690,6 +1829,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
         controller: None,
         gamepad: None,
         ds4_back_as_touchpad_click: None,
+        native_pen_touch: None,
         keyboard: None,
         mouse: None,
         high_resolution_scrolling: None,
@@ -1741,6 +1881,7 @@ fn acquire_operation_retries_lookup_and_terminal_tombstones_are_owner_scoped() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
@@ -2450,6 +2591,7 @@ fn lease_repeat_overrides_survive_global_policy_updates() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,

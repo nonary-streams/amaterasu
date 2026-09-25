@@ -81,7 +81,7 @@ fn absent_product_document_uses_enabled_bootstrap_defaults() {
     assert_eq!(policy, InputPolicy::default());
     assert_eq!(
         policy.values(),
-        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true})
+        json!({"keyboard":true,"mouse":true,"controller":true,"high_resolution_scrolling":true,"always_send_scancodes":true,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true})
     );
     assert_eq!(revision, 0);
 }
@@ -285,7 +285,7 @@ fn product_v8_preserves_an_explicitly_disabled_controller_policy() {
 }
 
 #[test]
-fn product_v9_persists_ds4_back_mapping_and_defaults_legacy_documents_on() {
+fn product_v10_migrates_v9_native_pen_touch_to_true_and_reads_v10_values() {
     let (legacy, _) = read_document(&json!({
         "ok":true,
         "found":true,
@@ -295,6 +295,7 @@ fn product_v9_persists_ds4_back_mapping_and_defaults_legacy_documents_on() {
     }))
     .unwrap();
     assert!(legacy.ds4_back_as_touchpad_click);
+    assert!(legacy.native_pen_touch);
 
     let (disabled, _) = read_document(&json!({
         "ok":true,
@@ -305,6 +306,30 @@ fn product_v9_persists_ds4_back_mapping_and_defaults_legacy_documents_on() {
     }))
     .unwrap();
     assert!(!disabled.ds4_back_as_touchpad_click);
+    assert!(disabled.native_pen_touch);
+
+    for native_pen_touch in [true, false] {
+        let (policy, _) = read_document(&json!({
+            "ok":true,
+            "found":true,
+            "version":10,
+            "revision":25,
+            "values":{"keyboard":true,"mouse":true,"native_pen_touch":native_pen_touch},
+        }))
+        .unwrap();
+        assert_eq!(policy.native_pen_touch, native_pen_touch);
+        assert_eq!(policy.values()["native_pen_touch"], native_pen_touch);
+    }
+
+    let (missing, _) = read_document(&json!({
+        "ok":true,
+        "found":true,
+        "version":10,
+        "revision":26,
+        "values":{"keyboard":true,"mouse":true},
+    }))
+    .unwrap();
+    assert!(missing.native_pen_touch);
 }
 
 #[test]
@@ -335,7 +360,10 @@ fn product_v3_reads_scancode_policy_and_defaults_a_missing_field_on() {
 #[test]
 fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
     for document in [
-        json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":11,"revision":1,"values":{"keyboard":true,"mouse":true}}),
+        json!({"ok":true,"found":true,"version":9,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":false}}),
+        json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"native_pen_touch":"false"}}),
+        json!({"ok":true,"found":true,"version":10,"revision":1,"values":{"keyboard":true,"mouse":true,"unexpected":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{"keyboard":true,"mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":"true","mouse":true}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"keyboard":true,"mouse":true,"controller":true}}),
@@ -362,7 +390,7 @@ fn product_documents_reject_bad_versions_revisions_types_and_unknown_keys() {
 }
 
 #[test]
-fn update_requires_current_revision_and_sends_whole_v9_document() {
+fn update_requires_current_revision_and_sends_whole_v10_document() {
     let mut settings = ProductSettings::new();
     settings.ready = true;
     settings.revision = 4;
@@ -423,10 +451,23 @@ fn update_requires_current_revision_and_sends_whole_v9_document() {
         &json!({
             "action":"product_update",
             "expected_revision":4,
-            "version":9,
-            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true},
+            "version":10,
+            "values":{"keyboard":false,"mouse":false,"controller":true,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":false,"key_repeat_delay":500,"key_repeat_frequency":24.9,"back_button_timeout":-1,"gamepad":"auto","ds4_back_as_touchpad_click":true,"native_pen_touch":true},
         })
     );
+}
+
+#[test]
+fn v10_update_serializes_an_explicitly_disabled_native_pen_touch_setting() {
+    let policy = InputPolicy {
+        native_pen_touch: false,
+        ..InputPolicy::default()
+    };
+
+    let payload = policy.update_payload(12);
+
+    assert_eq!(payload["version"], 10);
+    assert_eq!(payload["values"]["native_pen_touch"], false);
 }
 
 #[test]
@@ -443,6 +484,7 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     settings.policy.gamepad = selected_supported_profile();
     settings.policy.controller = false;
     settings.policy.ds4_back_as_touchpad_click = false;
+    settings.policy.native_pen_touch = false;
     let legacy_desired = settings.merge_update(InputPolicyUpdate {
         keyboard: false,
         mouse: true,
@@ -454,16 +496,17 @@ fn old_updates_preserve_new_scancode_and_high_resolution_values() {
     assert_eq!(legacy_desired.gamepad, selected_supported_profile());
     assert!(!legacy_desired.ds4_back_as_touchpad_click);
     assert!(!legacy_desired.controller);
+    assert!(!legacy_desired.native_pen_touch);
     settings
         .begin_update(90, 9, legacy_desired, 10_000)
         .unwrap();
     let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
         panic!("legacy settings update was not submitted");
     };
-    assert_eq!(payload["version"], 9);
+    assert_eq!(payload["version"], 10);
     assert_eq!(
         payload["values"],
-        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false})
+        json!({"keyboard":false,"mouse":true,"controller":false,"high_resolution_scrolling":false,"always_send_scancodes":false,"key_rightalt_to_key_win":true,"key_repeat_delay":230,"key_repeat_frequency":40.0,"back_button_timeout":-1,"gamepad":selected_supported_profile().as_str(),"ds4_back_as_touchpad_click":false,"native_pen_touch":false})
     );
     assert!(
         !settings
@@ -570,6 +613,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
         back_button_timeout: 1_250,
         gamepad: selected_supported_profile(),
         ds4_back_as_touchpad_click: false,
+        native_pen_touch: false,
     };
 
     settings
@@ -588,6 +632,7 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert_eq!(controller.back_button_timeout_ms(), 1_250);
     assert_eq!(controller.gamepad_profile(), selected_supported_profile());
     assert!(!controller.ds4_back_as_touchpad_click());
+    assert!(!controller.native_pen_touch());
     assert!(!controller.controller_enabled());
     assert_eq!(settings.get_response(&controller)["applied"], true);
     assert_eq!(
@@ -597,6 +642,10 @@ fn applying_durable_scroll_policy_updates_controller_before_reporting_applied() 
     assert_eq!(
         settings.get_response(&controller)["values"]["key_rightalt_to_key_win"],
         true
+    );
+    assert_eq!(
+        settings.get_response(&controller)["values"]["native_pen_touch"],
+        false
     );
     assert_eq!(
         settings.get_response(&controller)["values"]["back_button_timeout"],
@@ -780,6 +829,7 @@ fn native_release_failure_reports_saved_policy_as_pending() {
             controller: None,
             gamepad: None,
             ds4_back_as_touchpad_click: None,
+            native_pen_touch: None,
             keyboard: None,
             mouse: None,
             high_resolution_scrolling: None,
