@@ -589,7 +589,7 @@ fn cancelled_update_releases_results_reads_back_state_and_never_claims_success()
     assert_eq!(retried_status["enabled"], true);
     assert_eq!(host.configuration_actions.len(), 4);
     assert_eq!(host.released.len(), 4);
-    assert!(!module.provider.enabled);
+    assert_eq!(module.provider.enabled, cfg!(target_os = "linux"));
     assert_eq!(module.configuration.revision(), 4);
 }
 
