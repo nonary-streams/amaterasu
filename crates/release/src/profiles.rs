@@ -768,6 +768,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "steam_id_export_principals": {"amaterasu.lutris": "amaterasu.management"},
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",
                     "amaterasu.playnite": "amaterasu.management",
@@ -858,6 +859,7 @@ pub fn installer_policy(
             json!({
                 "launch_principals": ["amaterasu.launch"],
                 "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "steam_id_export_principals": {"amaterasu.lutris": "amaterasu.management"},
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",
                     "amaterasu.playnite": "amaterasu.management",

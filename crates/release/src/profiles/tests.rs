@@ -342,6 +342,32 @@ fn installer_policy_enables_only_the_loopback_control_plane() {
 }
 
 #[test]
+fn catalog_profiles_scope_lutris_steam_id_export_authorization() {
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-catalog-export-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+
+    for policy in [development, installer] {
+        let catalog = &policy.settings[CATALOG.id];
+        assert_eq!(
+            catalog["steam_id_export_principals"],
+            json!({"amaterasu.lutris": "amaterasu.management"})
+        );
+        assert_eq!(
+            catalog["export_principals"],
+            json!({"amaterasu.nvhttp": "amaterasu.management"})
+        );
+    }
+}
+
+#[test]
 fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_reload() {
     assert!(AUTHENTICATION.calls.contains(&"amaterasu.configuration/1"));
     assert!(AUTHENTICATION.dependencies.contains(&CONFIGURATION.id));
