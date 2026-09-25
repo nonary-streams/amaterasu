@@ -139,6 +139,7 @@ struct UpdatePurpose {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
     capture: CaptureMode,
@@ -183,6 +184,7 @@ struct ProductDocument {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
     capture: CaptureMode,
@@ -203,6 +205,7 @@ struct ProductStreamingSettings {
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    nvenc_spatial_aq: bool,
     external_ip: Option<String>,
     stream_audio: bool,
     capture: CaptureMode,
@@ -257,6 +260,7 @@ pub struct ProductSettings {
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
     audio_sink_capture_only: bool,
+    nvenc_spatial_aq: bool,
     configured_external_ip: Option<String>,
     configured_capture: CaptureMode,
     configured_video_max_batch_size_kb: Option<u8>,
@@ -361,6 +365,7 @@ impl ProductSettings {
             configured_audio_sink: None,
             configured_virtual_sink: None,
             audio_sink_capture_only: false,
+            nvenc_spatial_aq: false,
             configured_external_ip: None,
             configured_capture: CaptureMode::Auto,
             configured_video_max_batch_size_kb: None,
@@ -1067,6 +1072,8 @@ impl ProductSettings {
                         return;
                     }
                 };
+                let nvenc_spatial_aq =
+                    apply_nvenc_spatial_aq_update(FieldUpdate::Omitted, self.nvenc_spatial_aq);
                 let external_ip = match apply_external_ip_update(
                     external_ip,
                     self.configured_external_ip.clone(),
@@ -1283,6 +1290,7 @@ impl ProductSettings {
                             audio_sink: audio_sink.clone(),
                             virtual_sink: virtual_sink.clone(),
                             audio_sink_capture_only,
+                            nvenc_spatial_aq,
                             external_ip: external_ip.clone(),
                             stream_audio,
                             capture,
@@ -1308,6 +1316,7 @@ impl ProductSettings {
                         audio_sink,
                         virtual_sink,
                         audio_sink_capture_only,
+                        nvenc_spatial_aq,
                         external_ip,
                         stream_audio,
                         capture,
@@ -1436,6 +1445,7 @@ impl ProductSettings {
                     audio_sink,
                     virtual_sink,
                     audio_sink_capture_only,
+                    nvenc_spatial_aq,
                     external_ip,
                     stream_audio,
                     capture,
@@ -1462,6 +1472,7 @@ impl ProductSettings {
                             audio_sink: audio_sink.as_deref(),
                             virtual_sink: virtual_sink.as_deref(),
                             audio_sink_capture_only,
+                            nvenc_spatial_aq,
                             external_ip: external_ip.as_deref(),
                             stream_audio,
                             capture,
@@ -1777,6 +1788,7 @@ impl ProductSettings {
         self.configured_audio_sink = document.audio_sink;
         self.configured_virtual_sink = document.virtual_sink;
         self.audio_sink_capture_only = document.audio_sink_capture_only;
+        self.nvenc_spatial_aq = document.nvenc_spatial_aq;
         self.configured_external_ip = document.external_ip;
         self.stream_audio = document.stream_audio;
         self.configured_capture = document.capture;
@@ -1813,6 +1825,7 @@ impl ProductSettings {
                 "configured_output_name":self.configured_output_name,
                 "configured_audio_sink":self.configured_audio_sink,
                 "configured_virtual_sink":self.configured_virtual_sink,
+                "nvenc_spatial_aq":self.nvenc_spatial_aq,
             }),
             json!({
                 "configured_global_preparation":self.configured_global_preparation,
@@ -1926,6 +1939,7 @@ fn product_update_payload(
         "audio_sink":streaming.audio_sink,
         "virtual_sink":streaming.virtual_sink,
         "audio_sink_capture_only":streaming.audio_sink_capture_only,
+        "nvenc_spatial_aq":streaming.nvenc_spatial_aq,
         "external_ip":streaming.external_ip,
         "stream_audio":streaming.stream_audio,
         "capture":streaming.capture,
@@ -2038,6 +2052,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             audio_sink: None,
             virtual_sink: None,
             audio_sink_capture_only: false,
+            nvenc_spatial_aq: false,
             external_ip: None,
             stream_audio: true,
             capture: CaptureMode::Auto,
@@ -2100,10 +2115,12 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION => 15,
         VIRTUAL_SINK_SETTINGS_VERSION => 16,
         GLOBAL_PREPARATION_SETTINGS_VERSION => 17,
-        GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 31,
+        GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 32,
         _ => unreachable!(),
     };
-    if values.len() != expected_value_count
+    let matches_expected_value_count = values.len() == expected_value_count
+        || (version == GLOBAL_RAW_PREPARATION_SETTINGS_VERSION && values.len() == 31);
+    if !matches_expected_value_count
         || !values.contains_key("hostname")
         || (version >= PORT_SETTINGS_VERSION && !values.contains_key("port"))
         || (version >= NETWORK_SETTINGS_VERSION
@@ -2306,6 +2323,22 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
     } else {
         false
     };
+    let nvenc_spatial_aq_update = if version >= GLOBAL_RAW_PREPARATION_SETTINGS_VERSION {
+        parse_nvenc_spatial_aq_update(values.get("nvenc_spatial_aq"))
+            .map_err(|()| invalid_state("persisted nvenc_spatial_aq is not a boolean"))?
+    } else {
+        FieldUpdate::Omitted
+    };
+    let nvenc_spatial_aq = match nvenc_spatial_aq_update {
+        FieldUpdate::Value(value) => value,
+        FieldUpdate::Omitted
+            if version < GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
+                || values.len() == expected_value_count - 1 =>
+        {
+            false
+        }
+        _ => return Err(invalid_state("persisted nvenc_spatial_aq is not a boolean")),
+    };
     let global_preparation = if version >= GLOBAL_PREPARATION_SETTINGS_VERSION {
         serde_json::from_value::<Vec<PreparationStep>>(
             values
@@ -2376,6 +2409,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         audio_sink,
         virtual_sink,
         audio_sink_capture_only,
+        nvenc_spatial_aq,
         external_ip,
         stream_audio,
         capture,
@@ -2401,6 +2435,7 @@ struct UpdateExpectation<'a> {
     audio_sink: Option<&'a str>,
     virtual_sink: Option<&'a str>,
     audio_sink_capture_only: bool,
+    nvenc_spatial_aq: bool,
     external_ip: Option<&'a str>,
     stream_audio: bool,
     capture: CaptureMode,
@@ -2435,6 +2470,7 @@ fn update_result(
         || document.audio_sink.as_deref() != expected.audio_sink
         || document.virtual_sink.as_deref() != expected.virtual_sink
         || document.audio_sink_capture_only != expected.audio_sink_capture_only
+        || document.nvenc_spatial_aq != expected.nvenc_spatial_aq
         || document.external_ip.as_deref() != expected.external_ip
         || document.stream_audio != expected.stream_audio
         || document.capture != expected.capture
@@ -2482,6 +2518,23 @@ fn apply_ping_timeout_update(
         FieldUpdate::Null | FieldUpdate::Value(-1) => Ok(None),
         FieldUpdate::Value(value) if value >= 0 => Ok(Some(value)),
         FieldUpdate::Value(_) => Err(()),
+    }
+}
+
+fn parse_nvenc_spatial_aq_update(value: Option<&Value>) -> Result<FieldUpdate<bool>, ()> {
+    match value {
+        None => Ok(FieldUpdate::Omitted),
+        Some(Value::Null) => Ok(FieldUpdate::Null),
+        Some(Value::Bool(value)) => Ok(FieldUpdate::Value(*value)),
+        Some(_) => Err(()),
+    }
+}
+
+fn apply_nvenc_spatial_aq_update(update: FieldUpdate<bool>, current: bool) -> bool {
+    match update {
+        FieldUpdate::Omitted => current,
+        FieldUpdate::Null => false,
+        FieldUpdate::Value(value) => value,
     }
 }
 
@@ -2792,6 +2845,9 @@ mod tests {
         values
             .entry("wan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_WAN_ENCRYPTION_MODE));
+        values
+            .entry("nvenc_spatial_aq".into())
+            .or_insert_with(|| json!(false));
         payload
     }
 
@@ -3416,6 +3472,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: Some("198.51.100.7".into()),
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -3595,6 +3652,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -4157,6 +4215,7 @@ mod tests {
             audio_sink: None,
             virtual_sink: None,
             audio_sink_capture_only: false,
+            nvenc_spatial_aq: false,
             external_ip: None,
             stream_audio: true,
             capture: CaptureMode::Auto,
@@ -4279,6 +4338,7 @@ mod tests {
                 "global_preparation":[structured]}
         });
         let migrated_document = parse_document(&version_16).unwrap();
+        assert!(!migrated_document.nvenc_spatial_aq);
         assert_eq!(
             migrated_document.global_preparation.as_slice(),
             std::slice::from_ref(&structured)
@@ -4322,6 +4382,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: product.nvenc_spatial_aq,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -4338,7 +4399,8 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 31);
+        assert_eq!(update["values"].as_object().unwrap().len(), 32);
+        assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
                 .as_array()
@@ -4379,6 +4441,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: true,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -4399,6 +4462,7 @@ mod tests {
             "values":payload["values"].clone()
         }));
         let document = parse_document(&reply).unwrap();
+        assert!(document.nvenc_spatial_aq);
         assert_eq!(
             document.global_preparation.as_slice(),
             std::slice::from_ref(&structured)
@@ -4431,6 +4495,7 @@ mod tests {
         assert_eq!(restarted.lan_encryption_mode(), 2);
         assert_eq!(restarted.wan_encryption_mode(), 0);
         let readback = restarted.settings_payload();
+        assert!(readback["nvenc_spatial_aq"]);
         assert_eq!(
             readback["configured_legacy_global_preparation"][0]["do"],
             "  echo $(DISPLAY)  "
@@ -4443,6 +4508,81 @@ mod tests {
             readback["configured_frame_limiter"]["frame_limiter_fps_limit"],
             0.0
         );
+
+        let mut old_v17 = reply.clone();
+        old_v17["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("nvenc_spatial_aq");
+        let old_v17_document = parse_document(&old_v17).unwrap();
+        assert!(!old_v17_document.nvenc_spatial_aq);
+        let mut old_v17_restart = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        old_v17_restart.apply_document(old_v17_document);
+        assert!(!old_v17_restart.settings_payload()["nvenc_spatial_aq"]);
+    }
+
+    #[test]
+    fn nvenc_spatial_aq_update_preserves_omission_resets_null_and_rejects_other_types() {
+        let current = true;
+        assert!(apply_nvenc_spatial_aq_update(
+            parse_nvenc_spatial_aq_update(None).unwrap(),
+            current
+        ),);
+        assert_eq!(
+            apply_nvenc_spatial_aq_update(
+                parse_nvenc_spatial_aq_update(Some(&Value::Null)).unwrap(),
+                current,
+            ),
+            false
+        );
+        for value in [json!(false), json!(true)] {
+            let update = parse_nvenc_spatial_aq_update(Some(&value)).unwrap();
+            assert_eq!(
+                apply_nvenc_spatial_aq_update(update, current),
+                value.as_bool().unwrap()
+            );
+        }
+        for invalid in [json!(0), json!("true"), json!([]), json!({})] {
+            assert!(parse_nvenc_spatial_aq_update(Some(&invalid)).is_err());
+        }
+
+        let persisted_value = apply_nvenc_spatial_aq_update(
+            parse_nvenc_spatial_aq_update(Some(&Value::Null)).unwrap(),
+            current,
+        );
+        let write = product_update_payload(
+            4,
+            "Host",
+            &NetworkTarget::from(settings::DEFAULT_PORT),
+            None,
+            ProductStreamingSettings {
+                audio_sink: None,
+                virtual_sink: None,
+                audio_sink_capture_only: false,
+                nvenc_spatial_aq: persisted_value,
+                external_ip: None,
+                stream_audio: true,
+                capture: CaptureMode::Auto,
+                video_max_batch_size_kb: None,
+                max_bitrate: None,
+                minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
+                ping_timeout_ms: None,
+                global_preparation: Vec::new(),
+                legacy_global_preparation: Vec::new(),
+                frame_limiter: FrameLimiterSettings::default(),
+                lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
+                wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+            },
+        );
+        assert_eq!(write["values"]["nvenc_spatial_aq"], false);
+        let persisted = json!({
+            "ok":true,"found":true,"version":SETTINGS_VERSION,"revision":5,
+            "values":write["values"].clone()
+        });
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&persisted).unwrap());
+        assert!(!restarted.settings_payload()["nvenc_spatial_aq"]);
     }
 
     #[test]
@@ -4457,6 +4597,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: true,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -4521,6 +4662,7 @@ mod tests {
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["values"]["lan_encryption_mode"], 2);
         assert_eq!(pending.payload["values"]["wan_encryption_mode"], 1);
+        assert_eq!(pending.payload["values"]["nvenc_spatial_aq"], true);
         let confirmation = v17_update_confirmation(json!({
             "ok":true,
             "found":true,
@@ -4537,6 +4679,7 @@ mod tests {
             .payload;
         assert_eq!(readback["lan_encryption_mode"], 2);
         assert_eq!(readback["wan_encryption_mode"], 1);
+        assert_eq!(readback["nvenc_spatial_aq"], true);
         assert_eq!(readback["revision"], 5);
     }
 
@@ -4619,6 +4762,7 @@ mod tests {
                     "configured_output_name":null,
                     "configured_audio_sink":null,
                     "configured_virtual_sink":null,
+                    "nvenc_spatial_aq":false,
                 }),
                 json!({
                     "configured_global_preparation":[],
@@ -4770,6 +4914,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -4839,6 +4984,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -5021,6 +5167,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Auto,
@@ -5368,6 +5515,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: false,
                 capture: CaptureMode::Auto,
@@ -5406,6 +5554,7 @@ mod tests {
                 audio_sink: None,
                 virtual_sink: None,
                 audio_sink_capture_only: false,
+                nvenc_spatial_aq: false,
                 external_ip: None,
                 stream_audio: true,
                 capture: CaptureMode::Wgcc,
