@@ -713,3 +713,10 @@ This is regression coverage only; it does not add or change WGC pacing behavior.
 - L03's reviewed lane candidate `42bd52e8978f65247d2ec81456cce895a5f7626a` landed directly as `90b1b320c347b660b763c2707d2deafc5ff722b4`. It replaces the test's `assert_eq!` with a boolean equality assertion, keeping the production `Configuration` type unchanged.
 - Main validation passed `cargo fmt --check -p amaterasu-encode`, `git diff --check`, 21 encode tests (one hardware test ignored), and strict Clippy.
 - `global:nvenc_h264_cavlc` remains pending settings/defaults and scoped projection, management readback/editor behavior, the actual provider effect, and Windows hardware qualification.
+
+## Coordinator validation update: WGC smoothing retry identity (2026-09-25)
+
+- L03's reviewed test commit `afb9300feab74cf4237cb278cf6f8caca930b4ad` landed directly on main as `89463e1c`. Coordinator validation found that the second open response was still asynchronous when the test read `runtime.completed`; the test was reading the prior conflict response.
+- Coordinator commit `6135151` retries the second operation with the same operation ID and settings before inspecting the response. This verifies the returned stream 2 snapshot is `wgc_pacing_smoothing: true` while stream 1 remains false, without allocating another stream.
+- `cargo fmt --check -p amaterasu-video`, `git diff --check`, all 82 video tests, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings` passed on main after the correction.
+- This slice is regression coverage only. `global:wgc_pacing_smoothing` remains pending management readback and Windows WGC qualification; current main already persists the global v17 value, and no application/client override is part of this contract. No stable ID is closed by this update.

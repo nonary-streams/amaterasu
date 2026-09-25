@@ -397,3 +397,10 @@ reservation and the existing dirty launch changes can be integrated safely.
 
 - Source commit `755a51352dc9211426c4215c7a85ef56e6f87de9` landed on main as `ad0f72bb`. Main formatting passed, package tests passed 13/13, and strict Clippy passed.
 - `global:upnp` remains pending listener refresh scheduling, product-settings migration, management authority/editor integration, router testing, and platform qualification. The package exposes refresh but does not add a timer.
+
+## Coordinator validation update: v17 NVHTTP and continuous audio (2026-09-25)
+
+- The reviewed continuous-audio sender commit `ff136dd8667b23af5f8f81e46febcaa1f7eb3e80` landed directly on main as `4e8f2df24f31824607576029282032b35c2a0a64`. L04's independent read-only review found no issues against the receiver contract. The change captures the global `stream_audio` value at admission, applies client/application/global precedence, forwards `continuous_audio` only when audio is effectively enabled, and carries the prepared 5 or 10 ms packet duration through RTSP and stream-session.
+- The initial main package build exposed a crate macro recursion limit and stale v16 test fixtures. Coordinator commit `96312d7` raises the limit and aligns fixture map keys, numeric typing, and update confirmations with settings v17. Formatting passed and `cargo test -p amaterasu-nvhttp -p amaterasu-rtsp -p amaterasu-stream-session` passed.
+- Strict Clippy passed for RTSP and stream-session. NVHTTP strict Clippy still reports four unused settings accessors that L02's pending consumers should use, the large `Purpose::Update` variant, boolean assertion style in `frame_limiter.rs`, and four cloned-reference slice lints in product-settings tests. These findings were sent to L02; no lint suppression was added.
+- The sender depends on the existing v17 `stream_audio` value and does not itself complete `global:stream_audio` parity. Management/editor projection and override qualification, Windows audio behavior, and confirmation of remaining persistence requirements are still pending. No stable ID is closed by this validation update.
