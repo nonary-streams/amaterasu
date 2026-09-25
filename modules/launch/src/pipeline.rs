@@ -48,8 +48,22 @@ fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
     }
     if !snapshot
         .get("game_frame_generation_mode")
-        .is_some_and(|value| value.is_null() || value.as_str().is_some_and(|mode| mode.len() <= 64))
-        || snapshot.get("rtss_frame_limit_type_explicit_override") != Some(&Value::Null)
+        .is_some_and(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|mode| {
+                    matches!(
+                        mode,
+                        "none"
+                            | "lossless-scaling"
+                            | "game-provided"
+                            | "nvidia-smooth-motion"
+                            | "other"
+                    )
+                })
+        })
+        || !snapshot
+            .get("rtss_frame_limit_type_explicit_override")
+            .is_some_and(|value| value.is_null() || value.is_boolean())
     {
         return false;
     }
@@ -71,26 +85,16 @@ fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
         return false;
     }
     let string = |key| settings.get(key).and_then(Value::as_str);
-    string("frame_limiter_provider").is_some_and(|provider| {
-        matches!(
-            provider,
-            "auto"
-                | "none"
-                | "rtss"
-                | "nvidia-control-panel"
-                | "mangohud"
-                | "proton"
-                | "mangohud-proton"
-        )
-    }) && string("frame_limiter_auto_virtual_framegen")
-        .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
+    string("frame_limiter_provider").is_some_and(valid_host_frame_limiter_provider)
+        && string("frame_limiter_auto_virtual_framegen")
+            .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
         && string("rtss_frame_limit_type").is_some_and(|mode| {
             matches!(
                 mode,
                 "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
             )
         })
-        && string("rtss_install_path").is_some_and(|path| path.len() <= 4096)
+        && string("rtss_install_path").is_some_and(valid_rtss_install_path)
         && string("mangohud_limiter_method")
             .is_some_and(|method| matches!(method, "early" | "late"))
         && string("mangohud_preset")
@@ -128,30 +132,22 @@ fn valid_client_frame_limiter_overrides(overrides: &BTreeMap<String, Value>) -> 
                     && (0.0..=1000.0).contains(&fps)
                     && ((fps * 1000.0) - (fps * 1000.0).round()).abs() < 0.000_001
             }),
-            "frame_limiter_provider" => value.as_str().is_some_and(|provider| {
-                matches!(
-                    provider,
-                    "auto"
-                        | "none"
-                        | "rtss"
-                        | "nvidia-control-panel"
-                        | "mangohud"
-                        | "proton"
-                        | "mangohud-proton"
-                )
-            }),
+            "frame_limiter_provider" => value
+                .as_str()
+                .is_some_and(valid_host_frame_limiter_provider),
             "frame_limiter_auto_virtual_framegen" => value
                 .as_str()
                 .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled")),
-            "rtss_frame_limit_type" => value.as_str().is_some_and(|mode| {
-                matches!(
-                    mode,
-                    "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-                )
-            }),
-            "rtss_install_path" => value
-                .as_str()
-                .is_some_and(|path| path.len() <= 4096 && !path.chars().any(char::is_control)),
+            "rtss_frame_limit_type" => {
+                cfg!(windows)
+                    && value.as_str().is_some_and(|mode| {
+                        matches!(
+                            mode,
+                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                        )
+                    })
+            }
+            "rtss_install_path" => value.as_str().is_some_and(valid_rtss_install_path),
             "mangohud_limiter_method" => value
                 .as_str()
                 .is_some_and(|method| matches!(method, "early" | "late")),
@@ -161,6 +157,57 @@ fn valid_client_frame_limiter_overrides(overrides: &BTreeMap<String, Value>) -> 
             _ => false,
         }
     })
+}
+
+fn valid_host_frame_limiter_provider(provider: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(provider, "auto" | "none" | "rtss" | "nvidia-control-panel")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            provider,
+            "auto" | "none" | "mangohud" | "proton" | "mangohud-proton"
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(provider, "auto" | "none")
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = provider;
+        false
+    }
+}
+
+fn valid_rtss_install_path(path: &str) -> bool {
+    if path.len() > 4096 || path.chars().any(char::is_control) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        if path.is_empty() {
+            return true;
+        }
+        let bytes = path.as_bytes();
+        let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+        let drive_root = drive_prefix && bytes.len() >= 3 && matches!(bytes[2], b'\\' | b'/');
+        let unc_root = path.starts_with("\\\\") || path.starts_with("//");
+        let valid_unc = unc_root
+            && path[2..]
+                .split(['\\', '/'])
+                .filter(|part| !part.is_empty())
+                .count()
+                >= 2;
+        let relative = !matches!(bytes.first().copied(), Some(b'\\' | b'/')) && !drive_prefix;
+        drive_root || valid_unc || relative
+    }
+    #[cfg(not(windows))]
+    {
+        path.is_empty()
+    }
 }
 
 fn snapshot_matches_application_policy(
@@ -176,6 +223,18 @@ fn snapshot_matches_application_policy(
         .as_ref()
         .map(|overrides| serde_json::to_value(overrides).expect("serializable overrides"))
         .unwrap_or_else(|| serde_json::json!({}));
+    let explicit_rtss_type = client
+        .and_then(|overrides| overrides.get("rtss_frame_limit_type"))
+        .filter(|value| !value.is_null())
+        .or_else(|| application.get("rtss_frame_limit_type"))
+        .is_some();
+    let provenance = snapshot.get("rtss_frame_limit_type_explicit_override");
+    if explicit_rtss_type && provenance != Some(&Value::Bool(true)) {
+        return false;
+    }
+    if !explicit_rtss_type && provenance == Some(&Value::Bool(true)) {
+        return false;
+    }
     for (key, effective_key) in [
         ("frame_limiter_enable", "frame_limiter_enable"),
         ("frame_limiter_provider", "frame_limiter_provider"),
