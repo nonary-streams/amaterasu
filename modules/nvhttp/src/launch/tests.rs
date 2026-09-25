@@ -1545,6 +1545,31 @@ fn effective_client_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
 }
 
 #[test]
+fn effective_application_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(5_000));
+    let mut broker = Broker {
+        application_max_bitrate: Some(99),
+        ..Default::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_eq!(
+        controller
+            .records
+            .values()
+            .next()
+            .expect("launch record")
+            .failure,
+        Some("max_bitrate_below_encoder_minimum")
+    );
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
 fn global_bitrate_below_encoder_minimum_without_override_fails_before_rtsp_open() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
