@@ -237,6 +237,8 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_pen_touch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_resolution_scrolling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_send_scancodes: Option<bool>,
@@ -310,6 +312,7 @@ impl ClientConfigOverrides {
             && self.gamepad.is_none()
             && self.keyboard.is_none()
             && self.mouse.is_none()
+            && self.native_pen_touch.is_none()
             && self.high_resolution_scrolling.is_none()
             && self.always_send_scancodes.is_none()
             && self.key_rightalt_to_key_win.is_none()
@@ -440,6 +443,42 @@ mod tests {
             serde_json::to_value(disabled).unwrap(),
             json!({"fec_percentage":73,"stream_audio":false})
         );
+    }
+
+    #[test]
+    fn client_native_pen_touch_override_is_sparse_and_strictly_boolean() {
+        let missing = ClientConfigOverrides::default();
+        assert_eq!(missing.native_pen_touch, None);
+        assert!(missing.is_empty());
+        assert_eq!(serde_json::to_value(missing).unwrap(), json!({}));
+
+        let null: ClientConfigOverrides =
+            serde_json::from_value(json!({"native_pen_touch":null})).unwrap();
+        assert_eq!(null.native_pen_touch, None);
+        assert!(null.is_empty());
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        for value in [false, true] {
+            let overrides: ClientConfigOverrides =
+                serde_json::from_value(json!({"native_pen_touch":value})).unwrap();
+            assert_eq!(overrides.native_pen_touch, Some(value));
+            assert!(!overrides.is_empty());
+            overrides.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap(),
+                json!({"native_pen_touch":value})
+            );
+        }
+
+        for invalid in [
+            json!({"native_pen_touch":0}),
+            json!({"native_pen_touch":1}),
+            json!({"native_pen_touch":"false"}),
+            json!({"native_pen_touch":[]}),
+            json!({"native_pen_touch":{}}),
+        ] {
+            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
     }
 
     #[test]

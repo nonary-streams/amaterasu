@@ -749,6 +749,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
                 "minimum_fps_target":0.0,
                 "video_max_batch_size_kb":0,
                 "stream_audio":false,
+                "native_pen_touch":false,
                 "audio_sink_capture_only":false,
                 "back_button_timeout":-1
             }
@@ -782,6 +783,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(
         certificate_readback["config_overrides"]["stream_audio"],
+        false
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["native_pen_touch"],
         false
     );
     assert_eq!(
@@ -828,6 +833,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         false
     );
     assert_eq!(
+        persisted["clients"][0]["config_overrides"]["native_pen_touch"],
+        false
+    );
+    assert_eq!(
         persisted["clients"][0]["config_overrides"]["audio_sink_capture_only"],
         false
     );
@@ -864,6 +873,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(unchanged["config_overrides"]["minimum_fps_target"], 0.0);
     assert_eq!(unchanged["config_overrides"]["video_max_batch_size_kb"], 0);
     assert_eq!(unchanged["config_overrides"]["stream_audio"], false);
+    assert_eq!(unchanged["config_overrides"]["native_pen_touch"], false);
     assert_eq!(
         unchanged["config_overrides"]["audio_sink_capture_only"],
         false
