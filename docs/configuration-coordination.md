@@ -401,4 +401,4 @@ This reflects the latest process and worktree check. Lead session IDs remain the
 | luna-05 | PID 41420, active read-only review | Reviewing L02 paired-client `native_pen_touch` propagation. The reviewer confirmed the Catalog field exists and is checking the separate management allow-list boundary; no source edits. |
 | luna-06 | review complete; no live process | Independent XHigh review found no issue in L02's global `native_pen_touch` fallback; current main editor still states that saving the preference does not activate event transport or platform support. |
 
-The main checkout remains the direct landing point; do not push. At this snapshot, only L03 and L05 have live lead processes, both on read-only reviews; no implementation worker is active. The current main tip is `93221a1393311c059deec331faa13625d53a658e`.
+The main checkout remains the direct landing point; do not push. At this snapshot, only L03 and L05 have live lead processes, both on read-only reviews; no implementation worker is active. The latest code landing recorded here is `93221a13`; use `git rev-parse HEAD` for the current main tip.
