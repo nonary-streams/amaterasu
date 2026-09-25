@@ -418,3 +418,49 @@ The diagnostics prerelease default candidate `a3476f12fefbd0774b54f8e136d8b93104
 - `cargo clippy -p amaterasu-diagnostics --all-targets -- -D warnings`.
 
 Supported-platform runtime qualification remains pending. Full `global:min_log_level` parity also remains pending, including product registration/integration and end-to-end settings-to-consumer evidence. The lightweight lane did not run Cargo tests, builds, packaging, or Clippy. The NVENC editor remains gated on L02 confirmation of the exact v17 persisted/readback shape; no v18 is allocated.
+
+## Diagnostics restart-safe revision adoption
+
+Candidate `8bddf15f5aa362e00c1c0132ea7d5dbf6860213f` was held after an
+independent review found that its process-local revision high-water mark could
+not reject a retained older result as the restarted reader's first snapshot.
+It was not cherry-picked. The correction worker used isolated worktree
+`D:/sources/worktrees/luna06-diagnostics-revision-retry-xhigh`, branch
+`codex/luna06-diagnostics-revision-retry-xhigh`, based on the clean lane commit
+`85014a22a28a16bc434767a0e4857426f8002f0a`. Worker session
+`01a0d679-2255-7a12-a1b8-b4e837210bce` was verified as `gpt-6-luna/xhigh`.
+
+Child commit `482d5c531433024244482a20078efca0961cf7c2` changes only
+`modules/diagnostics/src/host_logging.rs` and `modules/diagnostics/README.md`.
+After each diagnostics process starts, the reader releases and discards its
+first valid ready response, then waits for the retry interval and issues a new
+GET with the same stable caller-scoped operation ID. This ensures that a
+retained pre-restart response is not applied before a fresh read. The reader
+then applies only positive revisions above the highest adopted revision in
+that process. Bootstrap logging remains active during the extra read; worker
+`READY` remains independent of persisted settings hydration. Revision-zero,
+invalid, and unavailable responses keep the bootstrap policy in place.
+
+Independent reviewer session `01a0d681-9dc3-7301-bb46-5f4bc47dbebb` was
+verified as `gpt-6-luna/xhigh` in worktree
+`D:/sources/worktrees/luna06-review-diagnostics-restart-fence-482d5c5`, branch
+`codex/luna06-review-diagnostics-restart-fence-482d5c5`, at the exact candidate
+SHA. The reviewer found no actionable issues in startup discard, stable-key
+release/reuse, revision-zero fallback, in-process `3→3→2→4` ordering, tests,
+README, path scope, or footers. Lead review also confirmed the only paths are
+the diagnostics reader and README. The reviewed child commit was cherry-picked
+onto lane head `85014a22a28a16bc434767a0e4857426f8002f0a` as
+`a70f6ac2bad818e6e9043dd9fbf6291bf5629b91`.
+
+The worker and lane passed `rustfmt --edition 2024 --check
+modules/diagnostics/src/host_logging.rs` and committed `git diff --check`; the
+independent reviewer ran source and diff checks only. Cargo tests/build/Clippy
+were not run in this lightweight lane. The restart tests simulate the retained
+request lifecycle and do not instantiate the runtime broker. The behavior
+relies on `ReleaseResult` removing the caller's stable-key request and on one
+reader per caller; simultaneous readers can race, and a broker restart clears
+the retained request table. The first ready result after startup can add the
+five-second retry delay before persisted settings are adopted. Supported
+platform runtime qualification and end-to-end settings-to-diagnostics evidence
+remain pending. `global:log_path` and `global:min_log_level` remain pending in
+the coordinator-owned coverage ledger.
