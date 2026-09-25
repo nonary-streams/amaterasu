@@ -92,6 +92,8 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_refresh_rate_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
@@ -173,6 +175,15 @@ impl ConfigOverrides {
             return Err("minimum_fps_target must be finite and between 0 and 1000");
         }
         if self
+            .dd_refresh_rate_option
+            .as_deref()
+            .is_some_and(|option| {
+                !matches!(option, "auto" | "disabled" | "manual" | "prefer_highest")
+            })
+        {
+            return Err("dd_refresh_rate_option must be auto, disabled, manual, or prefer_highest");
+        }
+        if self
             .frame_limiter_fps_limit
             .is_some_and(|limit| !valid_millihertz_value(limit))
         {
@@ -245,6 +256,7 @@ impl ConfigOverrides {
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
+            && self.dd_refresh_rate_option.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.virtual_sink.is_none()
@@ -887,6 +899,102 @@ mod tests {
                 }))
                 .is_err(),
                 "accepted non-string mode {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn dd_refresh_rate_option_is_sparse_exact_and_roundtrips_through_catalog_entries() {
+        let absent: ConfigOverrides = serde_json::from_value(json!({})).unwrap();
+        let null: ConfigOverrides =
+            serde_json::from_value(json!({"dd_refresh_rate_option":null})).unwrap();
+        assert_eq!(absent.dd_refresh_rate_option, None);
+        assert_eq!(null.dd_refresh_rate_option, None);
+        assert!(absent.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        let absent_entry: Entry = serde_json::from_value(json!({
+            "name":"Inherited refresh rate option",
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        absent_entry.validate().unwrap();
+        assert_eq!(absent_entry.config_overrides.dd_refresh_rate_option, None);
+        assert!(
+            serde_json::to_value(absent_entry)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
+
+        let inherited: Entry = serde_json::from_value(json!({
+            "name":"Inherited refresh rate option",
+            "config_overrides":{"dd_refresh_rate_option":null},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        inherited.validate().unwrap();
+        assert_eq!(inherited.config_overrides.dd_refresh_rate_option, None);
+        assert!(
+            serde_json::to_value(inherited)
+                .unwrap()
+                .get("config_overrides")
+                .is_none()
+        );
+
+        for option in ["auto", "disabled", "manual", "prefer_highest"] {
+            let entry: Entry = serde_json::from_value(json!({
+                "name":"Selected refresh rate option",
+                "config_overrides":{"dd_refresh_rate_option":option},
+                "launch":{"kind":"application","path":"/games/example"}
+            }))
+            .unwrap();
+            entry.validate().unwrap();
+            assert_eq!(
+                entry.config_overrides.dd_refresh_rate_option.as_deref(),
+                Some(option)
+            );
+
+            let serialized = serde_json::to_value(&entry).unwrap();
+            assert_eq!(
+                serialized["config_overrides"]["dd_refresh_rate_option"],
+                option
+            );
+            let restored: Entry = serde_json::from_value(serialized).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(
+                restored.config_overrides.dd_refresh_rate_option.as_deref(),
+                Some(option)
+            );
+        }
+
+        let explicit_auto: ConfigOverrides =
+            serde_json::from_value(json!({"dd_refresh_rate_option":"auto"})).unwrap();
+        assert_eq!(
+            explicit_auto.dd_refresh_rate_option.as_deref(),
+            Some("auto")
+        );
+        assert!(!explicit_auto.is_empty());
+
+        for unsupported in ["AUTO", "prefer-highest", "future", "manual "] {
+            let overrides: ConfigOverrides = serde_json::from_value(json!({
+                "dd_refresh_rate_option":unsupported
+            }))
+            .unwrap();
+            assert!(
+                overrides.validate().is_err(),
+                "accepted refresh rate option {unsupported:?}"
+            );
+        }
+        for invalid in [json!(1), json!(true), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(json!({
+                    "dd_refresh_rate_option":invalid
+                }))
+                .is_err(),
+                "accepted non-string refresh rate option {invalid}"
             );
         }
     }

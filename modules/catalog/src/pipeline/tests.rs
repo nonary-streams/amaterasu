@@ -3147,6 +3147,104 @@ fn provider_override_preserves_explicit_zero_values_across_playnite_refresh_and_
 }
 
 #[test]
+fn provider_refresh_rate_option_override_is_strict_and_survives_playnite_refresh() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let finished = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-refresh-rate-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(finished["ok"], true);
+
+    let id = "app-0000000000000001";
+    let marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
+    for invalid in [json!(1), json!(true), json!([]), json!({})] {
+        let rejected = backend.run_for(
+            &mut pipeline,
+            update_provider_config_overrides(id, 1, json!({"dd_refresh_rate_option":invalid})),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(rejected["error"]["code"], "invalid_request");
+        assert_eq!(backend.metadata["revision"], 1);
+        assert!(backend.entries[id].get("config_overrides").is_none());
+        assert!(
+            backend.entries[marker_key]["config_overrides"]
+                .get("dd_refresh_rate_option")
+                .is_none()
+        );
+    }
+
+    let unsupported = backend.run_for(
+        &mut pipeline,
+        update_provider_config_overrides(id, 1, json!({"dd_refresh_rate_option":"unknown"})),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(unsupported["error"]["code"], "invalid_request");
+    assert_eq!(backend.metadata["revision"], 1);
+
+    let mut expected_revision = 1;
+    for option in ["auto", "disabled", "manual", "prefer_highest"] {
+        let updated = backend.run_for(
+            &mut pipeline,
+            update_provider_config_overrides(
+                id,
+                expected_revision,
+                json!({"dd_refresh_rate_option":option}),
+            ),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(updated["ok"], true, "{updated}");
+        assert_eq!(updated["changed"], true);
+        assert_eq!(
+            updated["config_overrides"]["dd_refresh_rate_option"],
+            option
+        );
+        assert_eq!(
+            backend.entries[id]["config_overrides"]["dd_refresh_rate_option"],
+            option
+        );
+        assert_eq!(backend.entries[marker_key]["version"], 1);
+        assert_eq!(
+            backend.entries[marker_key]["config_overrides"]["dd_refresh_rate_option"],
+            option
+        );
+        expected_revision = updated["revision"].as_u64().unwrap();
+    }
+
+    let refreshed = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-refresh-rate-2",
+        2,
+        expected_revision,
+        "playnite:10",
+        "Provider renamed title",
+    );
+    assert_eq!(refreshed["ok"], true, "{refreshed}");
+    assert_eq!(backend.entries[id]["name"], "Provider renamed title");
+    assert_eq!(
+        backend.entries[id]["config_overrides"]["dd_refresh_rate_option"],
+        "prefer_highest"
+    );
+    assert_eq!(backend.entries[marker_key]["version"], 1);
+    assert_eq!(
+        backend.entries[marker_key]["config_overrides"]["dd_refresh_rate_option"],
+        "prefer_highest"
+    );
+}
+
+#[test]
 fn provider_override_enforces_management_and_fixed_playnite_identity() {
     let mut backend = Backend::default();
     let mut pipeline = playnite_importer();
