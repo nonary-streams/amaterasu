@@ -961,6 +961,16 @@ fn optional_boolean(object: &Object, canonical: &str, alias: &str) -> Result<(),
     Ok(())
 }
 
+fn optional_nullable_boolean(object: &Object, key: &str) -> Result<(), &'static str> {
+    if object
+        .get(key)
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 fn optional_timeout(object: &Object, canonical: &str, alias: &str) -> Result<(), &'static str> {
     if object.contains_key(canonical) && object.contains_key(alias) {
         return Err(INVALID);
@@ -1315,12 +1325,7 @@ fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
             }) {
                 return Err(INVALID);
             }
-            if object
-                .get("wgc_pacing_smoothing")
-                .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
-            {
-                return Err(INVALID);
-            }
+            optional_nullable_boolean(object, "wgc_pacing_smoothing")?;
             optional_nullable_boolean(object, "nvenc_spatial_aq")?;
             if object.get("ping_timeout_ms").is_some_and(|value| {
                 !value.is_null()
