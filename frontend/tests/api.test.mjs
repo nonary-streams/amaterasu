@@ -141,6 +141,138 @@ test("remembered login carries the choice and protected requests use bearer auth
   assert.equal(calls.length, 2);
 });
 
+test("a stale queued remembered login only revokes its own refresh token", async () => {
+  const winningBearer = secret("c");
+  const winningRefresh = secret("d");
+  const losingBearer = secret("e");
+  const losingRefresh = secret("f");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const refreshLockName = "amaterasu.session.refresh:http://127.0.0.1:5000";
+  const baseLocks = lockManager();
+
+  let releaseBlocker;
+  let signalBlockerAcquired;
+  const blockerAcquired = new Promise((resolve) => {
+    signalBlockerAcquired = resolve;
+  });
+  const blocker = baseLocks.request(
+    refreshLockName,
+    { mode: "exclusive" },
+    () => new Promise((resolve) => {
+      releaseBlocker = resolve;
+      signalBlockerAcquired();
+    }),
+  );
+  await blockerAcquired;
+
+  let queuedInstallCount = 0;
+  let signalFirstInstallQueued;
+  let signalBothInstallsQueued;
+  const firstInstallQueued = new Promise((resolve) => {
+    signalFirstInstallQueued = resolve;
+  });
+  const bothInstallsQueued = new Promise((resolve) => {
+    signalBothInstallsQueued = resolve;
+  });
+  let releaseSecondInstall;
+  const secondInstallGate = new Promise((resolve) => {
+    releaseSecondInstall = resolve;
+  });
+  let signalSecondInstallWaiting;
+  const secondInstallWaiting = new Promise((resolve) => {
+    signalSecondInstallWaiting = resolve;
+  });
+  const locks = {
+    request(name, options, callback) {
+      queuedInstallCount += 1;
+      const guardedCallback = queuedInstallCount === 2
+        ? async (lock) => {
+            signalSecondInstallWaiting();
+            await secondInstallGate;
+            return callback(lock);
+          }
+        : callback;
+      const pending = baseLocks.request(name, options, guardedCallback);
+      if (queuedInstallCount === 1) signalFirstInstallQueued();
+      if (queuedInstallCount === 2) signalBothInstallsQueued();
+      return pending;
+    },
+  };
+
+  const loginResponses = new Map();
+  let loginRequestCount = 0;
+  let signalBothLoginRequests;
+  const bothLoginRequests = new Promise((resolve) => {
+    signalBothLoginRequests = resolve;
+  });
+  let signalRevocationStarted;
+  const revocationStarted = new Promise((resolve) => {
+    signalRevocationStarted = resolve;
+  });
+  const responder = (url, options) => {
+    if (url.endsWith("/auth/login")) {
+      const username = JSON.parse(options.body).username;
+      loginRequestCount += 1;
+      if (loginRequestCount === 2) signalBothLoginRequests();
+      return new Promise((resolve) => loginResponses.set(username, resolve));
+    }
+    if (url.endsWith("/auth/logout")) {
+      signalRevocationStarted();
+      return Response.json({ ok: true });
+    }
+    return Response.json({ ok: true });
+  };
+  const { api, calls } = apiHarness(responder, { storage, locks });
+
+  const winningLogin = api.login("winner", "password", true);
+  const staleLogin = api.login("stale", "password", true);
+  await bothLoginRequests;
+
+  const resolveWinningResponse = loginResponses.get("winner");
+  assert.ok(resolveWinningResponse);
+  resolveWinningResponse(Response.json(
+    sessionReply(winningBearer, winningRefresh, future(3600), future(7200), {
+      remember_me: true,
+    }),
+  ));
+  await firstInstallQueued;
+
+  const resolveStaleResponse = loginResponses.get("stale");
+  assert.ok(resolveStaleResponse);
+  resolveStaleResponse(Response.json(
+    sessionReply(losingBearer, losingRefresh, future(3600), future(7200), {
+      remember_me: true,
+    }),
+  ));
+  await bothInstallsQueued;
+
+  releaseBlocker();
+  await blocker;
+  await secondInstallWaiting;
+  await winningLogin;
+  releaseSecondInstall();
+  const results = await Promise.allSettled([winningLogin, staleLogin]);
+  await revocationStarted;
+
+  assert.equal(results[0].status, "fulfilled");
+  assert.equal(results[1].status, "rejected");
+  assert.match(results[1].reason.message, /sign-in attempt was cancelled/i);
+  assert.equal(api.subject, "admin");
+  assert.equal(api.bearer, winningBearer);
+  assert.equal(api.refreshToken, winningRefresh);
+
+  const stored = JSON.parse(storage.getItem(storageKey));
+  assert.equal(stored.bearer, winningBearer);
+  assert.equal(stored.refresh_token, winningRefresh);
+
+  const revocations = calls.filter((call) => call.url.endsWith("/auth/logout"));
+  assert.equal(revocations.length, 1);
+  assert.deepEqual(JSON.parse(revocations[0].options.body), {
+    refresh_token: losingRefresh,
+  });
+});
+
 test("simultaneous requests share one proactive refresh and use the rotated pair", async () => {
   const oldBearer = secret("c");
   const oldRefresh = secret("d");
