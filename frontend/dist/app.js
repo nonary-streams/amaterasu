@@ -1536,6 +1536,24 @@ var Amaterasu;
         };
     }
     Amaterasu.parseAuthTokenLifetimes = parseAuthTokenLifetimes;
+    async function saveAuthTokenLifetimes(api, revision, sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
+        if (!Number.isSafeInteger(revision) || revision < 0)
+            throw new Error("Authentication settings revision is invalid.");
+        const values = parseAuthTokenLifetimes(sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds);
+        await api.post("auth/settings_update", {
+            ...values,
+            expected_revision: revision,
+        });
+        const saved = await api.post("auth/settings");
+        if (!Number.isSafeInteger(saved?.revision) ||
+            saved.revision <= revision ||
+            saved.values?.session_token_ttl_seconds !== values.session_token_ttl_seconds ||
+            saved.values?.remember_me_refresh_token_ttl_seconds !==
+                values.remember_me_refresh_token_ttl_seconds)
+            throw new Error("Authentication settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveAuthTokenLifetimes = saveAuthTokenLifetimes;
     function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
@@ -2118,10 +2136,10 @@ var Amaterasu;
                     control.required = true;
                     control.max = String(maxConfiguredAuthTtlSeconds);
                 }
-                sessionTtl.min = "60";
-                sessionTtl.step = "60";
-                refreshTtl.min = "3600";
-                refreshTtl.step = "3600";
+                sessionTtl.min = "1";
+                sessionTtl.step = "1";
+                refreshTtl.min = "1";
+                refreshTtl.step = "1";
                 const status = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save authentication settings");
                 save.type = "submit";
@@ -2130,13 +2148,19 @@ var Amaterasu;
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
-                        const values = parseAuthTokenLifetimes(sessionTtl.valueAsNumber, refreshTtl.valueAsNumber);
-                        await context.api.post("auth/settings_update", {
-                            ...values,
-                            expected_revision: settings.revision,
-                        });
-                        context.notify("Authentication lifetimes saved.");
+                        try {
+                            await saveAuthTokenLifetimes(context.api, settings.revision, sessionTtl.valueAsNumber, refreshTtl.valueAsNumber);
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                await loadAuth();
+                                context.notify("Authentication settings changed elsewhere. Review the latest values and save again.");
+                                return;
+                            }
+                            throw error;
+                        }
                         await loadAuth();
+                        context.notify("Authentication lifetimes saved and confirmed.");
                     });
                 });
                 authArea.replaceChildren(Amaterasu.panel("Authentication session lifetimes", form));

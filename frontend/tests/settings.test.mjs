@@ -37,6 +37,91 @@ test("authentication lifetime editor accepts bounded whole seconds", () => {
   }
 });
 
+test("authentication editor signs a revisioned update and confirms persisted readback", async () => {
+  const calls = [];
+  let stored = {
+    revision: 7,
+    values: {
+      session_token_ttl_seconds: 7200,
+      remember_me_refresh_token_ttl_seconds: 604800,
+    },
+  };
+  const api = {
+    async post(route, body = {}) {
+      calls.push([route, ordinary(body)]);
+      if (route === "auth/settings") return ordinary(stored);
+      assert.equal(route, "auth/settings_update");
+      assert.deepEqual(ordinary(body), {
+        session_token_ttl_seconds: 1,
+        remember_me_refresh_token_ttl_seconds: 2147483647,
+        expected_revision: 7,
+      });
+      stored = {
+        revision: stored.revision + 1,
+        values: {
+          session_token_ttl_seconds: body.session_token_ttl_seconds,
+          remember_me_refresh_token_ttl_seconds: body.remember_me_refresh_token_ttl_seconds,
+        },
+      };
+      return { ok: true };
+    },
+  };
+  const initial = await api.post("auth/settings");
+  const saved = await context.Amaterasu.saveAuthTokenLifetimes(api, initial.revision, 1, 2147483647);
+  assert.deepEqual(ordinary(saved), stored);
+  assert.deepEqual(calls.map(([route]) => route), ["auth/settings", "auth/settings_update", "auth/settings"]);
+  // A newly loaded editor requests the authoritative values again.
+  assert.deepEqual(await api.post("auth/settings"), stored);
+});
+
+test("authentication editor reports conflicts and unconfirmed writes", async () => {
+  const conflictCalls = [];
+  const conflict = {
+    async post(route) {
+      conflictCalls.push(route);
+      assert.equal(route, "auth/settings_update");
+      throw new Error("revision_conflict");
+    },
+  };
+  await assert.rejects(
+    context.Amaterasu.saveAuthTokenLifetimes(conflict, 4, 60, 3600),
+    /revision_conflict/,
+  );
+  assert.deepEqual(conflictCalls, ["auth/settings_update"]);
+  const stale = {
+    async post(route, body) {
+      if (route === "auth/settings_update") {
+        assert.equal(body.expected_revision, 4);
+        return { ok: true };
+      }
+      assert.equal(route, "auth/settings");
+      return {
+        revision: 4,
+        values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 },
+      };
+    },
+  };
+  await assert.rejects(
+    context.Amaterasu.saveAuthTokenLifetimes(stale, 4, 60, 3600),
+    /could not be confirmed/,
+  );
+  for (const readback of [
+    { revision: 5, values: { session_token_ttl_seconds: 61, remember_me_refresh_token_ttl_seconds: 3600 } },
+    { revision: "5", values: { session_token_ttl_seconds: 60, remember_me_refresh_token_ttl_seconds: 3600 } },
+    null,
+  ]) {
+    const api = {
+      async post(route) {
+        return route === "auth/settings_update" ? { ok: true } : readback;
+      },
+    };
+    await assert.rejects(
+      context.Amaterasu.saveAuthTokenLifetimes(api, 4, 60, 3600),
+      /could not be confirmed/,
+    );
+  }
+});
+
 test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
   const parseSelection = context.Amaterasu.parseVirtualSinkSelection;
   assert.equal(parseSelection(false, "unused value"), null);
