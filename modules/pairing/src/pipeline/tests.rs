@@ -792,7 +792,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(
         certificate_readback["config_overrides"]["nvenc_spatial_aq"],
-        false
+        json!(false)
     );
     assert_eq!(
         certificate_readback["config_overrides"]["audio_sink_capture_only"],
@@ -843,7 +843,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["nvenc_spatial_aq"],
-        false
+        json!(false)
     );
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["audio_sink_capture_only"],
