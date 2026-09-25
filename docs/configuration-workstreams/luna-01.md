@@ -274,3 +274,19 @@ All seven assigned IDs remain `pending`; this slice does not close `global:vibes
 - Lane code `0baec8351598972f6263b3487e32f13c32e268a2` landed as `da0b7d06`; the handoff landed as `b38845b` with main's cumulative notes preserved.
 - `cargo fmt --check -p amaterasu-authentication` passed; `cargo test -p amaterasu-authentication` passed 44/44; strict Clippy passed.
 - Windows case-variant behavior executed in this Windows checkout. Unix case-distinct and missing-versus-existing execution remains pending; no stable ID is closed.
+
+## Independent foundation slice: global:credentials_file inheritance
+
+Coordinator-owned host-configuration documentation defines omitted or empty `credentials_file` as inheritance from `file_state`; the pinned Vibeshine configuration initializes the credentials path from `file_state` and applies only a non-empty override. Package migration previously rejected an explicit empty `credentials_file` as an unsafe empty path before collecting configured state input.
+
+The migration collector now skips only an empty `credentials_file` alias, allowing the existing `file_state` collector to preserve the state file under its configured archive path. Empty `pkey`/`cert` and unsafe non-empty credential paths remain rejected. The regression imports the configured state file with an empty `credentials_file` and checks its bytes and archive path; no schema or migration version changed.
+
+The isolated worker `/root/package_credentials_file_inheritance`, thread `01a0d70e-3986-7a93-86be-2f3496d26cd3`, session `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, was verified as `gpt-6-luna/xhigh` before edits. It committed `9b9410661398d59e2773be2bff3ff95a7d1c428c`, changing only `crates/package/src/migration.rs` and `crates/package/src/migration/tests.rs`; the lane lead reviewed the exact diff and integrated it as `a189584f5f78e4e1572e386fcd02c610650bb42d`.
+
+The worker and lane passed edition-2024 rustfmt and `git diff --check`; Cargo tests/build/Clippy were not run in the lightweight worktrees. The coordinator integrated the code on main as `45b48244`; `cargo fmt --check -p amaterasu-package` passed, 50 library tests and 4 CLI tests passed, and strict Clippy passed. Unix and Windows qualification is not claimed.
+
+### Coordinator validation update: UPnP registration
+
+L01 workspace-registration lane commit `7472c8e67fa30ab5056bcf238887aa7f52b7438d` landed on main as `b8703e0b`. The UPnP package and caller-driven lease-refresh fix are now on main as `ad0f72bb`; coordinator formatting, 13/13 tests, and strict Clippy passed. Root manifest paths are released. `global:upnp` remains pending settings migration, management authority/editor, listener lifecycle and refresh scheduling, router testing, and platform qualification.
+
+All seven L01 IDs remain pending. The credentials-file slice does not close `global:credentials_file`; signed management editing and authorization, identity consumer integration, migration approval/user flow, and platform qualification remain.
