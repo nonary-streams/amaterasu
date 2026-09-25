@@ -28,10 +28,23 @@ struct TouchSlot {
     tracking_id: i32,
 }
 
+#[derive(Clone)]
+struct TrackedContact {
+    initial_down: Event,
+    last_event: Event,
+    down_written: bool,
+}
+
+#[derive(Clone)]
+struct TrackedTouch {
+    slot: TouchSlot,
+    contact: TrackedContact,
+}
+
 #[derive(Default)]
 struct ContactTracker {
-    pen: Option<Event>,
-    touches: BTreeMap<u32, (TouchSlot, Event)>,
+    pen: Option<TrackedContact>,
+    touches: BTreeMap<u32, TrackedTouch>,
     next_tracking_id: i32,
 }
 
@@ -68,32 +81,62 @@ impl ContactTracker {
         event: &Event,
         emit: &mut impl FnMut(Target, &[(u16, u16, i32)]) -> InputResult<()>,
     ) -> InputResult<()> {
-        let active_pointer = self.pen.as_ref().and_then(pointer_id_of);
+        let active_pointer = self
+            .pen
+            .as_ref()
+            .and_then(|contact| pointer_id_of(&contact.initial_down));
         match phase {
             PenTouchPhase::Down => match active_pointer {
-                Some(active) if active == pointer_id => return Ok(()),
+                Some(active) if active == pointer_id => {
+                    let contact = self.pen.as_ref().expect("active pen has a contact");
+                    if contact.initial_down != *event {
+                        return Err(duplicate_down_mismatch());
+                    }
+                    if contact.down_written {
+                        return Ok(());
+                    }
+                }
                 Some(_) => {
                     return Err(InputError::new(
                         "contact_capacity",
                         "Linux pen uinput supports one active pen pointer",
                     ));
                 }
-                None => self.pen = Some(event.clone()),
+                None => {
+                    self.pen = Some(TrackedContact {
+                        initial_down: event.clone(),
+                        last_event: event.clone(),
+                        down_written: false,
+                    });
+                }
             },
             PenTouchPhase::Move => {
                 ensure_active_pointer(active_pointer, pointer_id)?;
-                self.pen = Some(event.clone());
+                self.pen
+                    .as_mut()
+                    .expect("active pen has a contact")
+                    .last_event = event.clone();
             }
             PenTouchPhase::Up | PenTouchPhase::Cancel => {
                 ensure_active_pointer(active_pointer, pointer_id)?;
-                self.pen = Some(event.clone());
+                self.pen
+                    .as_mut()
+                    .expect("active pen has a contact")
+                    .last_event = event.clone();
             }
         }
 
         let frame = pen_frame(event)?;
         emit(Target::Pen, &frame)?;
-        if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel) {
-            self.pen = None;
+        match phase {
+            PenTouchPhase::Down => {
+                self.pen
+                    .as_mut()
+                    .expect("successful pen down retains its contact")
+                    .down_written = true;
+            }
+            PenTouchPhase::Move => {}
+            PenTouchPhase::Up | PenTouchPhase::Cancel => self.pen = None,
         }
         Ok(())
     }
@@ -107,43 +150,69 @@ impl ContactTracker {
     ) -> InputResult<()> {
         match phase {
             PenTouchPhase::Down => {
-                if self.touches.contains_key(&pointer_id) {
-                    return Ok(());
+                if let Some(touch) = self.touches.get(&pointer_id) {
+                    if touch.contact.initial_down != *event {
+                        return Err(duplicate_down_mismatch());
+                    }
+                    if touch.contact.down_written {
+                        return Ok(());
+                    }
+                } else {
+                    if self.touches.len() >= usize::from(MAX_TOUCH_SLOTS) {
+                        return Err(InputError::new(
+                            "contact_capacity",
+                            "Linux touchscreen uinput supports at most 10 simultaneous contacts",
+                        ));
+                    }
+                    let slot = self.allocate_touch_slot()?;
+                    // Reserve the exact client identity before writing: a partial
+                    // uinput frame can reach the kernel before write reports failure.
+                    self.touches.insert(
+                        pointer_id,
+                        TrackedTouch {
+                            slot,
+                            contact: TrackedContact {
+                                initial_down: event.clone(),
+                                last_event: event.clone(),
+                                down_written: false,
+                            },
+                        },
+                    );
                 }
-                if self.touches.len() >= usize::from(MAX_TOUCH_SLOTS) {
-                    return Err(InputError::new(
-                        "contact_capacity",
-                        "Linux touchscreen uinput supports at most 10 simultaneous contacts",
-                    ));
-                }
-                let slot = self.allocate_touch_slot()?;
-                // Reserve the exact client identity before writing: a partial
-                // uinput frame can reach the kernel before write reports failure.
-                self.touches.insert(pointer_id, (slot, event.clone()));
             }
             PenTouchPhase::Move => {
-                let Some((_, last_event)) = self.touches.get_mut(&pointer_id) else {
+                let Some(touch) = self.touches.get_mut(&pointer_id) else {
                     return Err(pointer_not_active());
                 };
-                *last_event = event.clone();
+                touch.contact.last_event = event.clone();
             }
             PenTouchPhase::Up | PenTouchPhase::Cancel => {
-                let Some((_, last_event)) = self.touches.get_mut(&pointer_id) else {
+                let Some(touch) = self.touches.get_mut(&pointer_id) else {
                     return Err(pointer_not_active());
                 };
-                *last_event = event.clone();
+                touch.contact.last_event = event.clone();
             }
         }
 
         let slot = self
             .touches
             .get(&pointer_id)
-            .map(|(slot, _)| *slot)
+            .map(|touch| touch.slot)
             .ok_or_else(pointer_not_active)?;
         let frame = touch_frame(event, slot, self.touches.len())?;
         emit(Target::Touch, &frame)?;
-        if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel) {
-            self.touches.remove(&pointer_id);
+        match phase {
+            PenTouchPhase::Down => {
+                self.touches
+                    .get_mut(&pointer_id)
+                    .expect("successful touch down retains its contact")
+                    .contact
+                    .down_written = true;
+            }
+            PenTouchPhase::Move => {}
+            PenTouchPhase::Up | PenTouchPhase::Cancel => {
+                self.touches.remove(&pointer_id);
+            }
         }
         Ok(())
     }
@@ -152,7 +221,7 @@ impl ContactTracker {
         let occupied_slots = self
             .touches
             .values()
-            .map(|(slot, _)| slot.slot)
+            .map(|touch| touch.slot.slot)
             .collect::<Vec<_>>();
         let slot = (0..i32::from(MAX_TOUCH_SLOTS))
             .find(|slot| !occupied_slots.contains(slot))
@@ -178,7 +247,7 @@ impl ContactTracker {
             if self
                 .touches
                 .values()
-                .all(|(slot, _)| slot.tracking_id != candidate)
+                .all(|touch| touch.slot.tracking_id != candidate)
             {
                 return candidate;
             }
@@ -191,8 +260,8 @@ impl ContactTracker {
         mut emit: impl FnMut(Target, &[(u16, u16, i32)]) -> InputResult<()>,
     ) -> InputResult<()> {
         let mut first_error = None;
-        if let Some(last_event) = self.pen.clone() {
-            let cancel_event = with_phase(&last_event, PenTouchPhase::Cancel);
+        if let Some(contact) = self.pen.clone() {
+            let cancel_event = with_phase(&contact.last_event, PenTouchPhase::Cancel);
             let frame = pen_frame(&cancel_event)?;
             match emit(Target::Pen, &frame) {
                 Ok(()) => self.pen = None,
@@ -201,11 +270,11 @@ impl ContactTracker {
         }
 
         for pointer_id in self.touches.keys().copied().collect::<Vec<_>>() {
-            let Some((slot, last_event)) = self.touches.get(&pointer_id).cloned() else {
+            let Some(touch) = self.touches.get(&pointer_id).cloned() else {
                 continue;
             };
-            let cancel_event = with_phase(&last_event, PenTouchPhase::Cancel);
-            let frame = touch_frame(&cancel_event, slot, self.touches.len())?;
+            let cancel_event = with_phase(&touch.contact.last_event, PenTouchPhase::Cancel);
+            let frame = touch_frame(&cancel_event, touch.slot, self.touches.len())?;
             match emit(Target::Touch, &frame) {
                 Ok(()) => {
                     self.touches.remove(&pointer_id);
@@ -317,6 +386,13 @@ fn destroy_device(device: &mut Option<Device>) -> InputResult<()> {
     }
     *device = None;
     Ok(())
+}
+
+fn duplicate_down_mismatch() -> InputError {
+    InputError::new(
+        "invalid_sequence",
+        "duplicate pen/touch down must match the original pointer event",
+    )
 }
 
 fn pointer_id_of(event: &Event) -> Option<u32> {
@@ -553,7 +629,10 @@ mod tests {
         assert_eq!(event_at(cancel, EV_ABS, ABS_MT_TRACKING_ID), Some(-1));
         assert_eq!(event_at(cancel, EV_KEY, BTN_TOUCH), None);
         assert!(!tracker.touches.contains_key(&41));
-        assert_eq!(tracker.touches.get(&99).map(|(slot, _)| slot.slot), Some(1));
+        assert_eq!(
+            tracker.touches.get(&99).map(|touch| touch.slot.slot),
+            Some(1)
+        );
 
         emit(
             &mut tracker,
@@ -597,11 +676,14 @@ mod tests {
             event_at(&writer.frames[2].1, EV_ABS, ABS_MT_TRACKING_ID),
             Some(-1)
         );
-        assert_eq!(tracker.touches.get(&2).map(|(slot, _)| slot.slot), Some(1));
+        assert_eq!(
+            tracker.touches.get(&2).map(|touch| touch.slot.slot),
+            Some(1)
+        );
     }
 
     #[test]
-    fn failed_down_keeps_its_reserved_identity_for_an_exact_cancel_retry() {
+    fn failed_touch_down_retries_the_exact_frame_then_ignores_successful_duplicate() {
         let mut tracker = ContactTracker::default();
         let mut writer = FakeWriter {
             fail_next: true,
@@ -615,19 +697,62 @@ mod tests {
         let original_tracking_id = event_at(&writer.frames[0].1, EV_ABS, ABS_MT_TRACKING_ID);
         assert!(tracker.touches.contains_key(&7));
 
+        emit(&mut tracker, &mut writer, &down).unwrap();
+        assert_eq!(writer.frames[1].1, writer.frames[0].1);
+        emit(&mut tracker, &mut writer, &down).unwrap();
+        assert_eq!(writer.frames.len(), 2, "a successful duplicate is a no-op");
+
+        let mismatched_down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 121, 240);
+        assert_eq!(
+            emit(&mut tracker, &mut writer, &mismatched_down)
+                .unwrap_err()
+                .code,
+            "invalid_sequence"
+        );
+        assert_eq!(writer.frames.len(), 2);
+
         emit(
             &mut tracker,
             &mut writer,
             &event(7, PenTouchDevice::Touch, PenTouchPhase::Cancel, 120, 240),
         )
         .unwrap();
-        assert_eq!(event_at(&writer.frames[1].1, EV_ABS, ABS_MT_SLOT), Some(0));
+        assert_eq!(event_at(&writer.frames[2].1, EV_ABS, ABS_MT_SLOT), Some(0));
         assert_eq!(
-            event_at(&writer.frames[1].1, EV_ABS, ABS_MT_TRACKING_ID),
+            event_at(&writer.frames[2].1, EV_ABS, ABS_MT_TRACKING_ID),
             Some(-1)
         );
         assert!(!tracker.touches.contains_key(&7));
         assert_ne!(original_tracking_id, Some(-1));
+    }
+
+    #[test]
+    fn failed_pen_down_retries_the_exact_frame_then_ignores_successful_duplicate() {
+        let mut tracker = ContactTracker::default();
+        let mut writer = FakeWriter {
+            fail_next: true,
+            ..FakeWriter::default()
+        };
+        let down = event(23, PenTouchDevice::Pen, PenTouchPhase::Down, 301, 702);
+        assert_eq!(
+            emit(&mut tracker, &mut writer, &down).unwrap_err().code,
+            "injection_failed"
+        );
+        assert!(tracker.pen.is_some());
+
+        emit(&mut tracker, &mut writer, &down).unwrap();
+        assert_eq!(writer.frames[1].1, writer.frames[0].1);
+        emit(&mut tracker, &mut writer, &down).unwrap();
+        assert_eq!(writer.frames.len(), 2, "a successful duplicate is a no-op");
+
+        let mismatched_down = event(23, PenTouchDevice::Pen, PenTouchPhase::Down, 302, 702);
+        assert_eq!(
+            emit(&mut tracker, &mut writer, &mismatched_down)
+                .unwrap_err()
+                .code,
+            "invalid_sequence"
+        );
+        assert_eq!(writer.frames.len(), 2);
     }
 
     #[test]
@@ -651,7 +776,10 @@ mod tests {
             .code,
             "injection_failed"
         );
-        assert_eq!(tracker.touches.get(&18).map(|(slot, _)| slot.slot), Some(0));
+        assert_eq!(
+            tracker.touches.get(&18).map(|touch| touch.slot.slot),
+            Some(0)
+        );
 
         emit(
             &mut tracker,
@@ -711,10 +839,11 @@ mod tests {
         assert_eq!(writer.frames.len(), event_count);
         assert_eq!(
             pointer_id_of(
-                tracker
+                &tracker
                     .pen
                     .as_ref()
                     .expect("pen down retained its identity")
+                    .initial_down,
             ),
             Some(10)
         );
@@ -761,7 +890,10 @@ mod tests {
         );
         assert_eq!(writer.frames.len(), frame_count);
         assert_eq!(tracker.touches.len(), usize::from(MAX_TOUCH_SLOTS));
-        assert_eq!(tracker.touches.get(&0).map(|(slot, _)| slot.slot), Some(0));
+        assert_eq!(
+            tracker.touches.get(&0).map(|touch| touch.slot.slot),
+            Some(0)
+        );
     }
 
     #[test]
