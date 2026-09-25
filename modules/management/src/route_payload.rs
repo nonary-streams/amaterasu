@@ -783,6 +783,7 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "gamepad",
             "keyboard",
             "mouse",
+            "native_pen_touch",
         ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
@@ -862,7 +863,7 @@ fn optional_back_button_timeout(overrides: &Object) -> Result<(), &'static str> 
 }
 
 fn optional_input_overrides(overrides: &Object) -> Result<(), &'static str> {
-    for key in ["controller", "keyboard", "mouse"] {
+    for key in ["controller", "keyboard", "mouse", "native_pen_touch"] {
         if overrides
             .get(key)
             .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
@@ -1883,6 +1884,87 @@ mod pairing_override_tests {
     }
 
     #[test]
+    fn native_pen_touch_override_is_sparse_boolean_for_apps_and_clients() {
+        let routes = [
+            Route {
+                service: "amaterasu.catalog/1",
+                action: "update_provider_overrides",
+                scope: Some("catalog.write"),
+                requires_empty_body: false,
+            },
+            Route {
+                service: "amaterasu.pairing/1",
+                action: "update_client_config_overrides",
+                scope: Some("pairing.admin"),
+                requires_empty_body: false,
+            },
+        ];
+
+        for route in routes {
+            for value in [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                Value::Null,
+            ] {
+                let overrides = serde_json::json!({"native_pen_touch":value});
+                let payload = if route.service == "amaterasu.catalog/1" {
+                    serde_json::json!({
+                        "id":"app-0000000000000001", "expected_revision":4,
+                        "config_overrides":overrides,
+                    })
+                } else {
+                    serde_json::json!({
+                        "certificate_id":"a".repeat(64), "expected_revision":4,
+                        "config_overrides":overrides,
+                    })
+                };
+                assert!(
+                    validate(route, payload.as_object().unwrap()).is_ok(),
+                    "{payload}"
+                );
+                assert_eq!(payload["config_overrides"]["native_pen_touch"], value);
+            }
+
+            let payload = if route.service == "amaterasu.catalog/1" {
+                serde_json::json!({
+                    "id":"app-0000000000000001", "expected_revision":4,
+                    "config_overrides":{},
+                })
+            } else {
+                serde_json::json!({
+                    "certificate_id":"a".repeat(64), "expected_revision":4,
+                    "config_overrides":{},
+                })
+            };
+            assert!(validate(route, payload.as_object().unwrap()).is_ok());
+
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!("true"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let overrides = serde_json::json!({"native_pen_touch":value});
+                let payload = if route.service == "amaterasu.catalog/1" {
+                    serde_json::json!({
+                        "id":"app-0000000000000001", "expected_revision":4,
+                        "config_overrides":overrides,
+                    })
+                } else {
+                    serde_json::json!({
+                        "certificate_id":"a".repeat(64), "expected_revision":4,
+                        "config_overrides":overrides,
+                    })
+                };
+                assert!(
+                    validate(route, payload.as_object().unwrap()).is_err(),
+                    "{payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn back_button_timeout_override_accepts_sparse_signed_i32_values() {
         let provider = Route {
             service: "amaterasu.catalog/1",
@@ -2091,6 +2173,7 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
                     "gamepad",
                     "keyboard",
                     "mouse",
+                    "native_pen_touch",
                 ],
             )?;
             if let Some(percentage) = config_overrides.get("fec_percentage")
