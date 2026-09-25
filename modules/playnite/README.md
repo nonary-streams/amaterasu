@@ -66,6 +66,9 @@ When Playnite stops or restarts, previously imported game IDs cannot launch
 against the new extension instance until a snapshot from that instance has
 completed catalog reconciliation. A snapshot or catalog completion from the
 previous instance cannot restore eligibility.
+Discovery changes also cancel an unfinished catalog reconciliation, so entries
+from an earlier Playnite instance are not submitted after a restart. A request
+already accepted by the catalog is drained before the next snapshot starts.
 Vibeshine instead requests a sync when its configuration is applied and
 otherwise reconciles snapshots sent by the Playnite extension, which coalesces
 library changes with a three-second debounce. The 30-second polling interval

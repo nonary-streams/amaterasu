@@ -39,6 +39,7 @@ struct Transaction {
     sync_id: String,
     source_revision: u64,
     settings_epoch: u64,
+    canceled_for_process_change: bool,
     launchable_game_ids: std::collections::BTreeSet<String>,
     entries: Vec<Vec<Value>>,
     remove_source_id_batches: Vec<Vec<String>>,
@@ -643,6 +644,7 @@ impl CatalogSync {
             sync_id: new_sync_id(self.source_revision),
             source_revision: self.source_revision,
             settings_epoch,
+            canceled_for_process_change: false,
             launchable_game_ids,
             entries,
             remove_source_id_batches: Vec::new(),
@@ -689,6 +691,18 @@ impl CatalogSync {
         self.transaction.is_some()
     }
 
+    pub fn cancel_after_process_change(&mut self) {
+        self.completed_launchable_game_ids = None;
+        let Some(mut transaction) = self.transaction.take() else {
+            return;
+        };
+        if matches!(transaction.call, Call::Waiting { .. }) {
+            transaction.canceled_for_process_change = true;
+            self.transaction = Some(transaction);
+        }
+        self.last_error = Some("catalog import canceled after Playnite process changed".into());
+    }
+
     pub fn take_completed_launchable_game_ids(
         &mut self,
     ) -> Option<std::collections::BTreeSet<String>> {
@@ -712,7 +726,10 @@ impl CatalogSync {
         let Some(mut transaction) = self.transaction.take() else {
             return Ok(());
         };
-        if transaction.settings_epoch != current_settings_epoch {
+        if transaction.settings_epoch != current_settings_epoch
+            || transaction.canceled_for_process_change
+        {
+            let canceled_for_process_change = transaction.canceled_for_process_change;
             if let Call::Waiting { request } = transaction.call {
                 match runtime.send_ephemeral(Command::TakeResult { request }) {
                     Ok(Response::Pending) | Err(_) => {
@@ -722,7 +739,14 @@ impl CatalogSync {
                     _ => {}
                 }
             }
-            self.last_error = Some("catalog import canceled after settings changed".into());
+            self.last_error = Some(
+                if canceled_for_process_change {
+                    "catalog import canceled after Playnite process changed"
+                } else {
+                    "catalog import canceled after settings changed"
+                }
+                .into(),
+            );
             return Ok(());
         }
 
@@ -1021,6 +1045,45 @@ mod tests {
         assert_eq!(transaction.payload()["remove_expired"], true);
         assert_eq!(transaction.payload()["remove_selection"], true);
         assert!(transaction.remove_source_id_batches.is_empty());
+    }
+
+    #[test]
+    fn process_change_cancels_unsent_and_in_flight_catalog_reconciliation() {
+        let snapshot = Snapshot {
+            games: vec![game(
+                "a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "Game",
+                r"C:\Games\game.exe",
+            )],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let settings = ProductSettings {
+            sync_all_installed: true,
+            ..ProductSettings::default()
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot, &settings, 7, 0).unwrap();
+        assert!(sync.busy());
+        sync.cancel_after_process_change();
+        assert!(!sync.busy());
+        assert!(sync.take_completed_launchable_game_ids().is_none());
+
+        sync.start(&snapshot, &settings, 7, 0).unwrap();
+        sync.transaction.as_mut().unwrap().call = Call::Waiting { request: 42 };
+        sync.cancel_after_process_change();
+        assert!(sync.busy());
+        assert!(
+            sync.transaction
+                .as_ref()
+                .unwrap()
+                .canceled_for_process_change
+        );
+        assert!(matches!(
+            sync.transaction.as_ref().unwrap().call,
+            Call::Waiting { request: 42 }
+        ));
+        assert!(sync.take_completed_launchable_game_ids().is_none());
     }
 
     #[test]

@@ -278,7 +278,7 @@ impl PlayniteModule {
             false,
             discovery::discover,
         );
-        update_discovery_state(
+        if update_discovery_state(
             &previous_processes,
             &self.last_discovery.processes,
             &mut self.eligible_launch_ids,
@@ -287,7 +287,9 @@ impl PlayniteModule {
                 && self.configuration.settings().enabled
                 && self.configuration.settings().auto_sync,
             Instant::now(),
-        );
+        ) {
+            self.catalog.cancel_after_process_change();
+        }
     }
 
     fn refresh_discovery_now(&mut self) {
@@ -301,7 +303,7 @@ impl PlayniteModule {
             true,
             discovery::discover,
         );
-        update_discovery_state(
+        if update_discovery_state(
             &previous_processes,
             &self.last_discovery.processes,
             &mut self.eligible_launch_ids,
@@ -310,7 +312,9 @@ impl PlayniteModule {
                 && self.configuration.settings().enabled
                 && self.configuration.settings().auto_sync,
             Instant::now(),
-        );
+        ) {
+            self.catalog.cancel_after_process_change();
+        }
     }
 
     fn poll_snapshot(&mut self) {
@@ -660,12 +664,15 @@ fn update_discovery_state(
     next_auto_sync: &mut Option<Instant>,
     auto_sync_enabled: bool,
     now: Instant,
-) {
+) -> bool {
     if previous != current {
         eligible_launch_ids.clear();
         if auto_sync_enabled && !current.is_empty() {
             *next_auto_sync = Some(now);
         }
+        true
+    } else {
+        false
     }
 }
 
