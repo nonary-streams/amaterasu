@@ -155,7 +155,7 @@ impl SessionLogger {
         Some(SessionLog::new(log_path, state_root))
     }
 
-    pub(crate) fn write_record(&mut self, record: &Record) {
+    pub(crate) fn write_record(&mut self, caller: &str, record: &Record) {
         if record.level.numeric() < self.minimum_level {
             return;
         }
@@ -165,7 +165,7 @@ impl SessionLogger {
             self.session = Some(session);
         }
         if let Some(session) = &mut self.session
-            && session.write_record(record).is_err()
+            && session.write_record(caller, record).is_err()
         {
             // Preserve the in-memory caller journal if a disk sink stops working.
             self.session = None;
@@ -256,7 +256,7 @@ impl SessionLog {
         })
     }
 
-    fn write_record(&mut self, record: &Record) -> io::Result<()> {
+    fn write_record(&mut self, caller: &str, record: &Record) -> io::Result<()> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -264,6 +264,7 @@ impl SessionLog {
         let mut line = serde_json::to_vec(&json!({
             "timestamp_unix_ms": timestamp,
             "level": record.level.as_str(),
+            "caller": caller,
             "target": record.target,
             "message": record.message,
             "fields": record.fields,
@@ -638,10 +639,10 @@ mod tests {
         let original_path = logger.session.as_ref().unwrap().active_path.clone();
 
         drop(logger.session.as_mut().unwrap().file.take());
-        logger.write_record(&test_record("lost to closed sink"));
+        logger.write_record("capture", &test_record("lost to closed sink"));
         assert!(logger.session.is_none());
 
-        logger.write_record(&test_record("written after reopening"));
+        logger.write_record("capture", &test_record("written after reopening"));
         let reopened = logger.session.as_ref().unwrap();
         assert_ne!(reopened.active_path, original_path);
         let contents = fs::read_to_string(&reopened.active_path).unwrap();
@@ -666,7 +667,10 @@ mod tests {
         assert!(logger.session.is_none());
 
         fs::remove_file(&blocking_path).unwrap();
-        logger.write_record(&test_record("recovered after initial open failure"));
+        logger.write_record(
+            "capture",
+            &test_record("recovered after initial open failure"),
+        );
 
         let session = logger.session.as_ref().unwrap();
         let contents = fs::read_to_string(&session.active_path).unwrap();

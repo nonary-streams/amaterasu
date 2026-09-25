@@ -185,6 +185,16 @@ fn configured_minimum_level_filters_file_output_but_keeps_caller_records() {
             .unwrap()
     );
     assert_eq!(
+        journal.handle(
+            "bob",
+            json!({
+                "action":"record","level":"debug","target":"capture",
+                "message":"same target, different caller"
+            })
+        )["sequence"],
+        1
+    );
+    assert_eq!(
         journal.handle("alice", json!({"action":"query"}))["records"]
             .as_array()
             .unwrap()
@@ -198,6 +208,15 @@ fn configured_minimum_level_filters_file_output_but_keeps_caller_records() {
         .unwrap()
         .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
         .collect::<String>();
+    let records: Vec<Value> = logged
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["caller"], "alice");
+    assert_eq!(records[0]["target"], "capture");
+    assert_eq!(records[1]["caller"], "bob");
+    assert_eq!(records[1]["target"], "capture");
     assert!(logged.contains("at threshold"));
     assert!(!logged.contains("below threshold"));
     std::fs::remove_dir_all(state_root).unwrap();

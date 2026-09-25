@@ -112,7 +112,7 @@ impl Journal {
                 };
                 validate_record(&record)?;
                 let response = self.caller_mut(caller)?.append(record.clone())?;
-                self.logger.write_record(&record);
+                self.logger.write_record(caller, &record);
                 Ok(response)
             }
             Action::Increment { name, amount } => {

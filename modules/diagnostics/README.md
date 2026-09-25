@@ -78,10 +78,13 @@ session prefix.
 
 Each accepted diagnostic record is still kept in its caller's bounded journal.
 Records at or above the configured level are also written as JSON lines to the
-worker's shared session log. That file combines records from callers, so callers
-must not submit secrets or content they do not intend to make available to the
-host account. Log files roll at 2 MiB, retain up to four rolled files plus the
-active file per session, and startup prunes old sessions to keep at most 30
+worker's shared session log. Each line includes the runtime-supplied caller
+identity alongside the caller-supplied target, so records from different callers
+can be distinguished even when they use the same target. The file combines
+records from callers, so callers must not submit secrets or content they do not
+intend to make available to the host account. Log files roll at 2 MiB, retain
+up to four rolled files plus the active file per session, and startup prunes old
+sessions to keep at most 30
 session groups. If the disk sink cannot be opened or later fails, the volatile
 journal continues to work. The logger retains the current validated policy and
 tries to open a fresh session on the next accepted record at or above the
