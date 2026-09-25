@@ -435,3 +435,16 @@
 - Current-source gates: `cargo fmt --check -p amaterasu-catalog -p amaterasu-launch` passed; catalog tests passed 69/69 and strict Clippy passed; launch tests passed 63 with 2 subprocess tests ignored and strict Clippy passed.
 - Main's launch test harness predates the lane-only override helper. Coordinator commit `344a0d1` added typed AV1 fixture support; the launch retry/status and invalid-input tests now run against the main harness.
 - Both stable IDs remain pending global/client/application resolution, L02 nested video consumer projection, L03 fail-closed backend behavior, management persistence/editor integration, and native AMF qualification.
+
+## Slice 42: pin the inclusive Playnite recent-age cutoff
+
+- Worker base / worker candidate / integrated lane commit: `fa6ffd6552a112bd2be2546edc4af57bf314992e` / `938246c2d600e623202478c45ab4569f4a77aeaf` / `81a2903d69468c5886f5802f1a9da10bcf57e213` (`test(playnite): pin inclusive recent age cutoff`).
+- Stable ID/scope: `global:playnite_recent_max_age_days`, positive cutoff equality; it remains pending full settings, management, runtime, and Windows qualification. Exact path: `modules/playnite/src/snapshot.rs` only.
+- The pinned `select_recent_installed_games` excludes only timestamps strictly below `now - age_days * 86,400`, so equality is included. Amaterasu already uses `last_played >= cutoff`; production behavior is unchanged. The regression selects a game at exactly 30 days before `now` and rejects a game one second older.
+- Worker `playnite_recent_age_boundary` used isolated worktree `D:/sources/worktrees/amaterasu-luna05-playnite-age-boundary-xhigh`, exact base `fa6ffd6552a112bd2be2546edc4af57bf314992e`, and committed `938246c2d600e623202478c45ab4569f4a77aeaf`. The lead reviewed its exact path and diff, then integrated it as lane commit `81a2903d69468c5886f5802f1a9da10bcf57e213`. Independent XHigh review found no findings and confirmed the timestamps isolate equality from the one-second-old case.
+- Worker and lead passed `cargo fmt --check --package amaterasu-playnite` and `git diff --check`. Rust tests/build/Clippy were not run in the lightweight worker.
+
+## Coordinator validation update: Playnite recent-age cutoff
+
+- Lane commit `81a2903d69468c5886f5802f1a9da10bcf57e213` landed on main as `ba20eae7`. Main formatting passed, Playnite tests passed 81/81, and strict Clippy passed. No production behavior changed.
+- `global:playnite_recent_max_age_days` remains pending settings/editor persistence and Windows provider qualification.
