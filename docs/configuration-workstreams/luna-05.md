@@ -415,3 +415,23 @@
 - Platform evidence: parser behavior was compared with pinned Vibeshine commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d`; no native Playnite Windows runtime qualification was run.
 - Remaining: end-to-end editor presentation/persistence and Windows Playnite runtime qualification remain. Amaterasu retains excluded game IDs as strings and does not preserve the reference parser's optional `{id,name}` display metadata. Keep `global:playnite_exclude_games` pending.
 - Next slice: continue an independent assigned application/provider setting while the coordinator resolves the Steam exclusion contract conflict in Outbox 052.
+
+## Slice 40: prove explicit AV1 auto survives provider refresh
+
+- Worker base / worker correction commit / integrated lane correction commit: `5e54f6197e539f548c77eded98b590919ea70eab` / `9e1decf4029944d81d8390279e208478e56b19b1` / `618648eacfcbf3f89b870dd07433cf6ee978e1fe`.
+- Stable IDs/scope: cross-lane `global:amd_av1_latency_mode`; L05 `per_application:config-overrides`. Both remain pending full parity validation.
+- Exact path: `modules/catalog/src/pipeline/tests.rs` only.
+- Correction: the existing `provider_snapshot_preserves_manual_config_overrides_across_later_refreshes` test now stores explicit `amd_av1_latency_mode: "auto"` on the manually edited entry and asserts the same value survives the next provider snapshot refresh. Previous name, exclusion, FEC, audio capture, back-button, provider-marker, finish, and cleanup assertions remain.
+- Worker: `catalog_pipeline_constructor_cleanup`, session `01a0d680-1c87-7212-a809-a32f0aafb875`, verified `gpt-6-luna/xhigh`, committed the test in an isolated worktree. The lead reviewed and cherry-picked it as `618648eacfcbf3f89b870dd07433cf6ee978e1fe` after the AV1 implementation commit `5e54f6197e539f548c77eded98b590919ea70eab`.
+- Independent review: `detached_env_reviewer`, session `01a0d6ac-89ab-71d1-9e02-5a5717568088`, verified `gpt-6-luna/xhigh`, reviewed candidate `9e1decf4029944d81d8390279e208478e56b19b1` against its base `5e54f6197e539f548c77eded98b590919ea70eab`. No findings; the reviewer confirmed the explicit-auto value is asserted after refresh and all prior assertions remain.
+- Checks in the lane: worker and lead ran `cargo fmt --check --package amaterasu-catalog` and `git diff --check`; all passed. Tests/build/Clippy did not run in the lightweight worktree.
+- Platform evidence: no native AV1/AMF runtime or platform qualification was run.
+- Remaining: keep both IDs pending global/client/application resolution, strict NVHTTP consumer and nested video serialization (L02), unsupported-backend side-effect behavior (L03), management persistence/editor integration, and native AMF qualification. This test correction closes the review coverage gap only.
+- Next slice: complete the separately reserved Steam canceled-Finish correction and its independent review; do not mark AV1 or config-overrides verified from this projection-only work.
+
+## Coordinator validation update: AV1 application projection
+
+- Source commits `5e54f6197e539f548c77eded98b590919ea70eab` and `618648eacfcbf3f89b870dd07433cf6ee978e1fe` landed on main as `8aaeb4f` and `f22bc88`. The first conflict was resolved by retaining main's existing models and applying only the AV1 field, validation, tests, and scoped documentation; unrelated lane fields were excluded.
+- Current-source gates: `cargo fmt --check -p amaterasu-catalog -p amaterasu-launch` passed; catalog tests passed 69/69 and strict Clippy passed; launch tests passed 63 with 2 subprocess tests ignored and strict Clippy passed.
+- Main's launch test harness predates the lane-only override helper. Coordinator commit `344a0d1` added typed AV1 fixture support; the launch retry/status and invalid-input tests now run against the main harness.
+- Both stable IDs remain pending global/client/application resolution, L02 nested video consumer projection, L03 fail-closed backend behavior, management persistence/editor integration, and native AMF qualification.
