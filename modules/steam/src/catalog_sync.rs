@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
 const CATALOG_TIMEOUT_MS: u64 = 30_000;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const ARTWORK_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_BATCH_ENTRIES: usize = 8;
 const MAX_BATCH_BYTES: usize = 12_000;
 const MAX_RETRY_TICKS: u32 = 64;
@@ -33,6 +34,7 @@ struct Transaction {
     sync_id: String,
     source_revision: u64,
     settings_epoch: u64,
+    source_fingerprint: SourceFingerprint,
     remove_stale: bool,
     entries: Vec<Vec<Value>>,
     generation: Option<u64>,
@@ -45,6 +47,50 @@ struct Transaction {
     retry_attempt: u32,
     delay_ticks: u32,
     cancel_after_call: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceFingerprint(u64);
+
+struct FingerprintBuilder(u64);
+
+impl FingerprintBuilder {
+    fn new() -> Self {
+        Self(1_469_598_103_934_665_603)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn write_bool(&mut self, value: bool) {
+        self.write_u64(if value { 1 } else { 0 });
+    }
+
+    fn write_optional_string(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.write_u64(1);
+                self.write_bytes(value.as_bytes());
+            }
+            None => self.write_u64(0),
+        }
+    }
+
+    fn finish(self) -> SourceFingerprint {
+        SourceFingerprint(self.0)
+    }
 }
 
 impl Transaction {
@@ -200,6 +246,9 @@ pub(super) struct CatalogSync {
     settings: Option<ProductSettings>,
     settings_epoch: u64,
     observed_provider_revision: u64,
+    observed_source_fingerprint: Option<SourceFingerprint>,
+    last_successful_fingerprint: Option<SourceFingerprint>,
+    next_artwork_retry: Option<Instant>,
     sync_requested: bool,
     next_scan: Option<Instant>,
     transaction: Option<Transaction>,
@@ -213,6 +262,9 @@ impl CatalogSync {
             settings: None,
             settings_epoch: 0,
             observed_provider_revision: 0,
+            observed_source_fingerprint: None,
+            last_successful_fingerprint: None,
+            next_artwork_retry: None,
             sync_requested: false,
             next_scan: None,
             transaction: None,
@@ -228,18 +280,25 @@ impl CatalogSync {
         settings: &ProductSettings,
     ) -> ModuleResult<()> {
         let now = Instant::now();
+        self.tick_at(runtime, provider, settings, now)
+    }
+
+    pub(super) fn tick_at(
+        &mut self,
+        runtime: &RuntimeClient,
+        provider: &mut Provider,
+        settings: &ProductSettings,
+        now: Instant,
+    ) -> ModuleResult<()> {
         self.observe_settings(provider, settings, now);
         self.observe_discovery(provider, settings, now);
 
-        if settings.enabled && settings.auto_sync {
-            if self.next_scan.is_none() {
-                self.next_scan = Some(now);
-            }
-            if self.next_scan.is_some_and(|deadline| now >= deadline)
-                && !provider.scan_in_progress()
-            {
-                provider.start_scan();
-                self.next_scan = Some(now + SYNC_INTERVAL);
+        if self.automatic_scan_due(provider, settings, now) {
+            if provider.start_scan() {
+                self.next_scan = None;
+            } else {
+                self.last_error = Some("Steam discovery could not start an automatic scan".into());
+                self.schedule_next_scan(now);
             }
         }
 
@@ -252,9 +311,33 @@ impl CatalogSync {
         {
             self.last_error = Some(error);
             self.sync_requested = false;
-            self.next_scan = Some(now + SYNC_INTERVAL);
+            self.schedule_next_scan(now);
         }
         self.advance_transaction(runtime, now)
+    }
+
+    fn automatic_scan_due(
+        &self,
+        provider: &Provider,
+        settings: &ProductSettings,
+        now: Instant,
+    ) -> bool {
+        settings.enabled
+            && settings.auto_sync
+            && self.transaction.is_none()
+            && !self.sync_requested
+            && !provider.scan_in_progress()
+            && self.next_scan.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn schedule_next_scan(&mut self, finished_at: Instant) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.enabled && settings.auto_sync)
+        {
+            self.next_scan = Some(finished_at + SYNC_INTERVAL);
+        }
     }
 
     pub(super) fn status(&self) -> Value {
@@ -276,10 +359,16 @@ impl CatalogSync {
         }
         self.settings_epoch = self.settings_epoch.saturating_add(1);
         self.settings = Some(settings.clone());
+        self.observed_source_fingerprint = None;
+        self.last_successful_fingerprint = None;
+        self.next_artwork_retry = None;
         if settings.enabled && settings.auto_sync {
             self.sync_requested = false;
-            self.next_scan = Some(now + SYNC_INTERVAL);
-            provider.start_scan();
+            self.next_scan = if provider.scan_in_progress() {
+                None
+            } else {
+                Some(now)
+            };
         } else {
             self.sync_requested = false;
             self.next_scan = None;
@@ -294,28 +383,69 @@ impl CatalogSync {
             return;
         }
         self.observed_provider_revision = provider.revision;
-        if let Some(transaction) = &mut self.transaction
-            && transaction.source_revision != provider.revision
-        {
-            transaction.cancel_after_call = true;
-        }
         if !settings.enabled || !settings.auto_sync {
+            self.observed_source_fingerprint = None;
             return;
         }
-        if provider.has_complete_snapshot() {
-            if let Some(message) = catalog_source_error(provider, settings) {
-                self.sync_requested = false;
-                self.last_error = Some(message);
-            } else {
-                self.sync_requested = true;
-                self.last_error = None;
-            }
-        } else {
+        if !provider.has_complete_snapshot() {
+            self.cancel_transaction_for_changed_source(None);
+            self.observed_source_fingerprint = None;
             self.sync_requested = false;
             self.last_error =
                 Some("Steam discovery scan was incomplete; catalog was left unchanged".into());
+            self.schedule_next_scan(now);
+            return;
         }
-        self.next_scan.get_or_insert(now + SYNC_INTERVAL);
+        if let Some(message) = catalog_source_error(provider, settings) {
+            self.cancel_transaction_for_changed_source(None);
+            self.observed_source_fingerprint = None;
+            self.sync_requested = false;
+            self.last_error = Some(message);
+            self.schedule_next_scan(now);
+            return;
+        }
+
+        let fingerprint = source_fingerprint(provider);
+        self.observed_source_fingerprint = Some(fingerprint);
+        if self.transaction.as_ref().is_some_and(|transaction| {
+            transaction.settings_epoch == self.settings_epoch
+                && transaction.source_fingerprint == fingerprint
+        }) {
+            if let Some(transaction) = &mut self.transaction {
+                transaction.cancel_after_call = false;
+            }
+            self.sync_requested = false;
+            return;
+        }
+        self.cancel_transaction_for_changed_source(Some(fingerprint));
+
+        if self.fingerprint_requires_sync(fingerprint, now) {
+            self.sync_requested = true;
+            self.last_error = None;
+        } else {
+            self.sync_requested = false;
+            self.last_error = None;
+            self.schedule_next_scan(now);
+        }
+    }
+
+    fn cancel_transaction_for_changed_source(
+        &mut self,
+        current_fingerprint: Option<SourceFingerprint>,
+    ) {
+        if let Some(transaction) = &mut self.transaction
+            && (transaction.settings_epoch != self.settings_epoch
+                || Some(transaction.source_fingerprint) != current_fingerprint)
+        {
+            transaction.cancel_after_call = true;
+        }
+    }
+
+    fn fingerprint_requires_sync(&self, fingerprint: SourceFingerprint, now: Instant) -> bool {
+        self.last_successful_fingerprint != Some(fingerprint)
+            || self
+                .next_artwork_retry
+                .is_none_or(|deadline| now >= deadline)
     }
 
     fn start_transaction(
@@ -336,10 +466,12 @@ impl CatalogSync {
             unix_timestamp_now(),
         )?;
         let batches = chunk_records(records)?;
+        let source_fingerprint = source_fingerprint(provider);
         self.transaction = Some(Transaction {
             sync_id: new_sync_id(provider.revision),
             source_revision: provider.revision,
             settings_epoch: self.settings_epoch,
+            source_fingerprint,
             remove_stale: should_remove_stale(settings),
             entries: batches,
             generation: None,
@@ -355,6 +487,7 @@ impl CatalogSync {
         });
         self.sync_requested = false;
         self.last_error = None;
+        self.next_scan = None;
         Ok(())
     }
 
@@ -448,7 +581,12 @@ impl CatalogSync {
         };
         match transaction.advance_success(&payload) {
             Ok(true) => {
-                self.transaction = None;
+                let Some(transaction) = self.transaction.take() else {
+                    return;
+                };
+                self.last_successful_fingerprint = Some(transaction.source_fingerprint);
+                self.next_artwork_retry = Some(now + ARTWORK_RETRY_INTERVAL);
+                self.schedule_next_scan(now);
                 self.last_error = None;
             }
             Ok(false) => {}
@@ -480,12 +618,51 @@ impl CatalogSync {
     fn fail_transaction(&mut self, message: String, now: Instant) {
         if let Some(transaction) = self.transaction.take()
             && (transaction.settings_epoch != self.settings_epoch
-                || transaction.source_revision != self.observed_provider_revision)
+                || Some(transaction.source_fingerprint) != self.observed_source_fingerprint)
         {
             self.sync_requested = true;
         }
         self.last_error = Some(message);
-        self.next_scan = Some(now + SYNC_INTERVAL);
+        self.schedule_next_scan(now);
+    }
+}
+
+fn source_fingerprint(provider: &Provider) -> SourceFingerprint {
+    let mut fingerprint = FingerprintBuilder::new();
+    fingerprint.write_u64(provider.games.len() as u64);
+    fingerprint.write_bool(provider.appinfo_complete);
+    fingerprint.write_bool(provider.history_complete);
+    for (map_app_id, game) in &provider.games {
+        fingerprint.write_u64(u64::from(*map_app_id));
+        fingerprint.write_u64(u64::from(game.app_id));
+        fingerprint.write_bytes(game.stable_id.as_bytes());
+        fingerprint.write_bytes(game.name.as_bytes());
+        fingerprint.write_bytes(game.install_directory.as_bytes());
+        fingerprint.write_bytes(game.library_directory.as_bytes());
+        fingerprint.write_u64(game.state_flags);
+        fingerprint.write_bool(game.installed);
+        fingerprint.write_u64(game.last_updated);
+        fingerprint.write_optional_string(game.app_type.as_deref());
+        write_optional_u64(&mut fingerprint, game.last_played);
+        fingerprint.write_optional_string(game.artwork_revision.as_deref());
+        fingerprint.write_optional_string(game.artwork_source_path.as_deref());
+        fingerprint.write_bool(game.artwork_is_remote);
+    }
+    let steam_executable = provider
+        .steam_executable
+        .as_deref()
+        .map(|path| path.to_string_lossy());
+    fingerprint.write_optional_string(steam_executable.as_deref());
+    fingerprint.finish()
+}
+
+fn write_optional_u64(fingerprint: &mut FingerprintBuilder, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            fingerprint.write_u64(1);
+            fingerprint.write_u64(value);
+        }
+        None => fingerprint.write_u64(0),
     }
 }
 
@@ -765,6 +942,55 @@ mod tests {
         }
     }
 
+    fn auto_sync_settings() -> ProductSettings {
+        ProductSettings {
+            enabled: true,
+            auto_sync: true,
+            sync_all_installed: true,
+            ..ProductSettings::default()
+        }
+    }
+
+    fn complete_provider() -> Provider {
+        Provider {
+            enabled: true,
+            steam_executable: Some(Path::new("/Steam/steam.exe").to_path_buf()),
+            games: [(42, game(42, "Fingerprint game", true))]
+                .into_iter()
+                .collect(),
+            revision: 1,
+            snapshot_complete: true,
+            appinfo_complete: true,
+            history_complete: true,
+            ..Provider::default()
+        }
+    }
+
+    fn finish_transaction(
+        fingerprint: SourceFingerprint,
+        source_revision: u64,
+        settings_epoch: u64,
+    ) -> Transaction {
+        Transaction {
+            sync_id: "finish-test".into(),
+            source_revision,
+            settings_epoch,
+            source_fingerprint: fingerprint,
+            remove_stale: true,
+            entries: Vec::new(),
+            generation: Some(2),
+            revision: Some(8),
+            next_sequence: 0,
+            batch_index: 0,
+            conflict_restarts: 0,
+            stage: Stage::Finish,
+            call: CallState::Submit,
+            retry_attempt: 0,
+            delay_ticks: 0,
+            cancel_after_call: false,
+        }
+    }
+
     #[test]
     fn records_are_launchable_steam_client_entries_and_apply_explicit_exclusions() {
         let games = [
@@ -906,6 +1132,179 @@ mod tests {
     }
 
     #[test]
+    fn source_fingerprint_tracks_represented_game_artwork_and_client_fields() {
+        let mut provider = complete_provider();
+        let original = source_fingerprint(&provider);
+        assert_eq!(source_fingerprint(&provider), original);
+
+        provider.games.get_mut(&42).unwrap().name = "Renamed game".into();
+        assert_ne!(source_fingerprint(&provider), original);
+        provider.games.get_mut(&42).unwrap().name = "Fingerprint game".into();
+
+        provider.games.get_mut(&42).unwrap().artwork_revision = Some("124".into());
+        assert_ne!(source_fingerprint(&provider), original);
+        provider.games.get_mut(&42).unwrap().artwork_revision = None;
+        provider.games.get_mut(&42).unwrap().artwork_source_path =
+            Some("/Steam/art/portrait.jpg".into());
+        assert_ne!(source_fingerprint(&provider), original);
+        provider.games.get_mut(&42).unwrap().artwork_source_path = None;
+
+        provider.steam_executable = Some(Path::new("/Steam/updated-steam.exe").to_path_buf());
+        assert_ne!(source_fingerprint(&provider), original);
+    }
+
+    #[test]
+    fn unchanged_fingerprint_skips_until_the_artwork_retry_deadline() {
+        let now = Instant::now();
+        let fingerprint = SourceFingerprint(7);
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(auto_sync_settings());
+        sync.last_successful_fingerprint = Some(fingerprint);
+        sync.next_artwork_retry = Some(now + ARTWORK_RETRY_INTERVAL);
+
+        assert!(!sync.fingerprint_requires_sync(fingerprint, now));
+        assert!(!sync.fingerprint_requires_sync(
+            fingerprint,
+            now + ARTWORK_RETRY_INTERVAL - Duration::from_nanos(1)
+        ));
+        assert!(sync.fingerprint_requires_sync(fingerprint, now + ARTWORK_RETRY_INTERVAL));
+    }
+
+    #[test]
+    fn settings_epoch_change_invalidates_cached_fingerprint_and_retry() {
+        let now = Instant::now();
+        let mut provider = complete_provider();
+        let original_settings = auto_sync_settings();
+        let fingerprint = source_fingerprint(&provider);
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(original_settings.clone());
+        sync.settings_epoch = 4;
+        sync.observed_provider_revision = provider.revision;
+        sync.observed_source_fingerprint = Some(fingerprint);
+        sync.last_successful_fingerprint = Some(fingerprint);
+        sync.next_artwork_retry = Some(now + ARTWORK_RETRY_INTERVAL);
+
+        let updated_settings = ProductSettings {
+            recent_games: original_settings.recent_games + 1,
+            ..original_settings
+        };
+        sync.observe_settings(&mut provider, &updated_settings, now);
+
+        assert_eq!(sync.settings_epoch, 5);
+        assert!(sync.observed_source_fingerprint.is_none());
+        assert!(sync.last_successful_fingerprint.is_none());
+        assert!(sync.next_artwork_retry.is_none());
+        assert_eq!(sync.next_scan, Some(now));
+    }
+
+    #[test]
+    fn a_new_revision_with_the_same_fingerprint_keeps_the_active_transaction() {
+        let now = Instant::now();
+        let settings = auto_sync_settings();
+        let mut provider = complete_provider();
+        let fingerprint = source_fingerprint(&provider);
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(settings.clone());
+        sync.settings_epoch = 1;
+        sync.observed_provider_revision = provider.revision;
+        let mut transaction = finish_transaction(fingerprint, provider.revision, 1);
+        transaction.cancel_after_call = true;
+        sync.transaction = Some(transaction);
+
+        provider.revision += 1;
+        sync.observe_discovery(&provider, &settings, now);
+
+        assert!(!sync.transaction.as_ref().unwrap().cancel_after_call);
+        assert!(!sync.sync_requested);
+
+        provider.games.get_mut(&42).unwrap().name = "Changed game".into();
+        provider.revision += 1;
+        sync.observe_discovery(&provider, &settings, now);
+        assert!(sync.transaction.as_ref().unwrap().cancel_after_call);
+        assert!(sync.sync_requested);
+    }
+
+    #[test]
+    fn validated_finish_caches_fingerprint_and_schedules_from_completion() {
+        let finished_at = Instant::now();
+        let settings = auto_sync_settings();
+        let fingerprint = SourceFingerprint(11);
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(settings);
+        sync.settings_epoch = 1;
+        sync.observed_provider_revision = 1;
+        sync.observed_source_fingerprint = Some(fingerprint);
+        sync.transaction = Some(finish_transaction(fingerprint, 1, 1));
+
+        sync.consume_payload(
+            json!({
+                "ok":true,"revision":8,"generation":2,"complete":true,
+                "cleanup_pending":false,"remove_stale":true
+            }),
+            finished_at,
+        );
+
+        assert_eq!(sync.last_successful_fingerprint, Some(fingerprint));
+        assert_eq!(
+            sync.next_artwork_retry,
+            Some(finished_at + ARTWORK_RETRY_INTERVAL)
+        );
+        assert_eq!(sync.next_scan, Some(finished_at + SYNC_INTERVAL));
+        assert!(sync.transaction.is_none());
+    }
+
+    #[test]
+    fn failed_finish_does_not_cache_fingerprint_and_retries_after_the_interval() {
+        let failed_at = Instant::now();
+        let settings = auto_sync_settings();
+        let fingerprint = SourceFingerprint(13);
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(settings);
+        sync.settings_epoch = 1;
+        sync.observed_provider_revision = 1;
+        sync.observed_source_fingerprint = Some(fingerprint);
+        sync.transaction = Some(finish_transaction(fingerprint, 1, 1));
+
+        sync.consume_payload(
+            json!({
+                "ok":true,"revision":8,"generation":2,"complete":true,
+                "cleanup_pending":true,"remove_stale":true
+            }),
+            failed_at,
+        );
+
+        assert!(sync.last_successful_fingerprint.is_none());
+        assert!(sync.next_artwork_retry.is_none());
+        assert_eq!(sync.next_scan, Some(failed_at + SYNC_INTERVAL));
+        assert!(sync.fingerprint_requires_sync(fingerprint, failed_at + SYNC_INTERVAL));
+        assert!(sync.transaction.is_none());
+    }
+
+    #[test]
+    fn periodic_scans_wait_for_reconciliation_and_never_overlap_an_active_scan() {
+        let now = Instant::now();
+        let settings = auto_sync_settings();
+        let mut provider = complete_provider();
+        let mut sync = CatalogSync::new();
+        sync.settings = Some(settings.clone());
+        sync.next_scan = Some(now + SYNC_INTERVAL);
+
+        assert!(!sync.automatic_scan_due(&provider, &settings, now));
+        assert!(!sync.automatic_scan_due(
+            &provider,
+            &settings,
+            now + SYNC_INTERVAL - Duration::from_nanos(1)
+        ));
+        let deadline = now + SYNC_INTERVAL;
+        assert!(sync.automatic_scan_due(&provider, &settings, deadline));
+        sync.transaction = Some(finish_transaction(SourceFingerprint(1), 1, 1));
+        assert!(!sync.automatic_scan_due(&provider, &settings, deadline));
+        sync.transaction = None;
+        provider.scan = Some(crate::discovery::Scan::new(&[]));
+        assert!(!sync.automatic_scan_due(&provider, &settings, deadline));
+    }
+
+    #[test]
     fn including_tools_imports_them_only_when_explicitly_enabled() {
         let mut tool = game(228_980, "Steamworks Common Redistributables", true);
         tool.app_type = Some("tool".into());
@@ -1002,6 +1401,7 @@ mod tests {
             sync_id: "test-sync".into(),
             source_revision: 4,
             settings_epoch: 1,
+            source_fingerprint: SourceFingerprint(1),
             remove_stale: false,
             entries: Vec::new(),
             generation: Some(2),
@@ -1086,6 +1486,7 @@ mod tests {
             sync_id: "sync".into(),
             source_revision: 1,
             settings_epoch: 1,
+            source_fingerprint: SourceFingerprint(1),
             remove_stale: true,
             entries: Vec::new(),
             generation: None,
@@ -1117,6 +1518,7 @@ mod tests {
             sync_id: "sync".into(),
             source_revision: 1,
             settings_epoch: 1,
+            source_fingerprint: SourceFingerprint(1),
             remove_stale: true,
             entries: Vec::new(),
             generation: None,

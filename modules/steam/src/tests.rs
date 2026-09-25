@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{Command, ManagedModule, Response};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 #[test]
 fn product_settings_actions_require_the_management_principal() {
@@ -262,6 +263,7 @@ struct FakeHost {
     catalog_revision: u64,
     catalog_generation: u64,
     catalog_next_sequence: u64,
+    catalog_finish_failures_remaining: u8,
 }
 
 impl FakeHost {
@@ -324,12 +326,22 @@ impl FakeHost {
                                 "next_sequence":self.catalog_next_sequence
                             })
                         }
+                        "provider_snapshot_finish"
+                            if self.catalog_finish_failures_remaining > 0 =>
+                        {
+                            self.catalog_finish_failures_remaining -= 1;
+                            json!({
+                                "ok":false,
+                                "error":{"code":"catalog_unavailable","message":"temporary test failure"}
+                            })
+                        }
                         "provider_snapshot_finish" => json!({
                             "ok":true,
                             "revision":self.catalog_revision,
                             "generation":self.catalog_generation,
                             "complete":true,
-                            "cleanup_pending":false
+                            "cleanup_pending":false,
+                            "remove_stale":payload["remove_stale"]
                         }),
                         _ => {
                             json!({"ok":false,"error":{"code":"invalid_request","message":"unexpected action"}})
@@ -424,6 +436,35 @@ fn persisted_settings_with_auto_sync(exclusions: Value, revision: u64) -> Respon
             "values":{"enabled":true,"auto_sync":true,"exclude_games":exclusions,"sync_all_installed":true}
         }),
     }
+}
+
+fn set_complete_test_snapshot(provider: &mut Provider, revision: u64, name: &str) {
+    provider.scan = None;
+    provider.steam_executable = Some(std::env::current_exe().unwrap());
+    provider.games = [(
+        42,
+        Game {
+            stable_id: "steam:42".into(),
+            app_id: 42,
+            name: name.into(),
+            install_directory: "/Steam/steamapps/common/Game".into(),
+            library_directory: "/Steam".into(),
+            state_flags: 4,
+            installed: true,
+            last_updated: 0,
+            app_type: Some("game".into()),
+            last_played: None,
+            artwork_revision: Some("123".into()),
+            artwork_source_path: Some("/Steam/art/42.jpg".into()),
+            artwork_is_remote: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    provider.revision = revision;
+    provider.snapshot_complete = true;
+    provider.appinfo_complete = true;
+    provider.history_complete = true;
 }
 
 #[test]
@@ -633,6 +674,122 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
     );
     assert_eq!(host.catalog_requests[2]["complete"], true);
     assert_eq!(host.released.len(), 4);
+}
+
+#[test]
+fn automatic_sync_skips_an_identical_new_revision_and_imports_changed_output() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_auto_sync(json!([]), 2));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    let settings = module.configuration.settings().clone();
+    set_complete_test_snapshot(&mut module.provider, 1, "Original name");
+    let now = Instant::now();
+
+    for _ in 0..8 {
+        module
+            .catalog_sync
+            .tick_at(&module.runtime, &mut module.provider, &settings, now)
+            .unwrap();
+    }
+    assert_eq!(host.catalog_requests.len(), 3);
+    assert_eq!(
+        host.catalog_requests[2]["action"],
+        "provider_snapshot_finish"
+    );
+
+    module.provider.revision = 2;
+    module
+        .catalog_sync
+        .tick_at(
+            &module.runtime,
+            &mut module.provider,
+            &settings,
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(host.catalog_requests.len(), 3);
+
+    module.provider.games.get_mut(&42).unwrap().name = "Changed name".into();
+    module.provider.revision = 3;
+    module
+        .catalog_sync
+        .tick_at(
+            &module.runtime,
+            &mut module.provider,
+            &settings,
+            now + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(host.catalog_requests.len(), 4);
+    assert_eq!(
+        host.catalog_requests[3]["action"],
+        "provider_snapshot_begin"
+    );
+}
+
+#[test]
+fn failed_automatic_finish_retries_after_the_interval_without_caching_source() {
+    let mut host = Box::new(FakeHost::default());
+    host.catalog_finish_failures_remaining = 1;
+    host.product_get_results
+        .push_back(persisted_settings_with_auto_sync(json!([]), 2));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    let settings = module.configuration.settings().clone();
+    set_complete_test_snapshot(&mut module.provider, 1, "Retry game");
+    let attempt_at = Instant::now();
+
+    for _ in 0..8 {
+        module
+            .catalog_sync
+            .tick_at(&module.runtime, &mut module.provider, &settings, attempt_at)
+            .unwrap();
+    }
+    assert_eq!(host.catalog_requests.len(), 3);
+    assert_eq!(module.catalog_sync.status()["syncing"], false);
+    assert!(module.catalog_sync.status()["last_error"].is_string());
+
+    module
+        .catalog_sync
+        .tick_at(
+            &module.runtime,
+            &mut module.provider,
+            &settings,
+            attempt_at + Duration::from_secs(29),
+        )
+        .unwrap();
+    assert_eq!(host.catalog_requests.len(), 3);
+
+    module
+        .catalog_sync
+        .tick_at(
+            &module.runtime,
+            &mut module.provider,
+            &settings,
+            attempt_at + Duration::from_secs(30),
+        )
+        .unwrap();
+    assert!(module.provider.scan_in_progress());
+    module.provider.scan = None;
+    module.provider.revision = 2;
+    module
+        .catalog_sync
+        .tick_at(
+            &module.runtime,
+            &mut module.provider,
+            &settings,
+            attempt_at + Duration::from_secs(31),
+        )
+        .unwrap();
+    assert_eq!(host.catalog_requests.len(), 4);
+    assert_eq!(
+        host.catalog_requests[3]["action"],
+        "provider_snapshot_begin"
+    );
 }
 
 #[test]

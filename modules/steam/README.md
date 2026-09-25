@@ -53,15 +53,26 @@ Exclusions are bounded to 256 records of the form
 app ID or printable name is required. When an ID is provided, matching uses
 the ID; a name-only exclusion matches exact names without case sensitivity.
 
-With `auto_sync` enabled, Steam starts discovery when settings are applied and
-then requests another scan every 30 seconds. With `sync_all_installed=false`,
-the provider selects installed games with nonzero local `LastPlayed`, keeps
-those within the configured age, orders newest first (App ID breaks ties), and
-takes at most `recent_games`. With `sync_all_installed=true`, every installed
-game is selected. Exclusions and tool filtering apply before recent-game
-ordering and limits. `include_tools=true` includes every installed app; the
-default filters Steam types `tool`, `config`, `dlc`, `driver`, `music`, and
-`video`, plus known runtime IDs and runtime-name fallbacks.
+With `auto_sync` enabled, Steam starts discovery when settings are applied.
+After each completed scan and its catalog attempt finish, it schedules the next
+automatic scan 30 seconds later. It does not start an automatic scan while a
+catalog snapshot transaction is active. Catalog reconciliation runs for the
+first complete snapshot, when the deterministic fingerprint of represented
+Steam source/output fields changes, or as a five-minute artwork retry. The
+fingerprint includes every currently represented game field, the selected
+artwork revision and source path, and the Steam client executable path. A
+settings change clears the successful fingerprint so the new policy is applied
+even when discovery is unchanged. Failed or incomplete attempts do not cache a
+fingerprint; a new automatic scan is scheduled 30 seconds after the failure.
+
+With `sync_all_installed=false`, the provider selects installed games with
+nonzero local `LastPlayed`, keeps those within the configured age, orders newest
+first (App ID breaks ties), and takes at most `recent_games`. With
+`sync_all_installed=true`, every installed game is selected. Exclusions and
+tool filtering apply before recent-game ordering and limits. `include_tools=true`
+includes every installed app; the default filters Steam types `tool`, `config`,
+`dlc`, `driver`, `music`, and `video`, plus known runtime IDs and runtime-name
+fallbacks.
 
 App types are read from the configured Steam install's binary
 `appcache/appinfo.vdf`; play history is read from every numeric account's
@@ -113,6 +124,12 @@ and replaces low-resolution local art when a full portrait is available; those
 behaviors remain pending. Amaterasu has no Steam-authorized product cache root
 or host service for persistent artwork, so remote images are not persisted or
 converted to PNG and a low-resolution local portrait is not replaced remotely.
+Vibeshine's sync fingerprint also tracks all artwork candidate paths and file
+metadata, session artwork revisions, and playtime. Amaterasu discovery does not
+represent all of those inputs, so changes limited to those unrepresented fields
+cannot independently trigger a fingerprint change. The Steam `refresh` action
+only refreshes discovery; it does not force catalog reconciliation when
+`auto_sync` is false, unlike Vibeshine's authenticated force-sync endpoint.
 Unlike Vibeshine's legacy host config parser, the product API rejects negative
 counts and ages as malformed unsigned values instead of clamping them to zero.
 
