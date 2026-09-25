@@ -1,6 +1,36 @@
 # Luna-04: audio and input configuration parity
 
-## Current bounded slice: active endpoint test correction
+## Coordinator validation: capture-only Console-default pinning landed
+
+- Lane candidate `d4125c364c5fa5c1ee98e1a4eb3bdc51c40dacbb` landed directly on main as `9625a2f6f3ed4ffca27abcdeb573769e02303164`. Coordinator acknowledgement `coordinator-capture-only-contract-ack-20260925` identifies main tip `ca36e432c64ff1956a0b917d79dd19a54e129688` and accepts the policy.
+- Accepted contract: when `capture_sink_without_routing` is true and the regular endpoint selector is empty/default, resolve and pin the Console endpoint once; retain it across later default changes and device-loss retries. With the flag false, an empty/default selector follows Console changes. Explicit endpoint IDs and explicit/automatic virtual endpoint behavior are unchanged. No schema or migration change is needed for this slice.
+- Coordinator validation on the landed candidate passed `cargo fmt --check -p amaterasu-audio`, `cargo test -p amaterasu-audio` (51 passed, 0 failed, 1 hardware test ignored), and strict Clippy. No Windows endpoint-switching hardware qualification was run.
+- The candidate changes only the audio platform policy and README paths recorded in the bounded-slice section below. The next lane handoff update is based on lane HEAD `a9c9e43d56731a8d4a24b980a950a5ed51ba2f5b`; this documentation-only status commit does not alter the landed code.
+- Persistence/default migration, scoped client/application resolution, management authority/UI, end-to-end stream integration, and Windows endpoint-switching qualification remain incomplete. Keep `global:audio_sink_capture_only`, `global:audio_sink`, and `global:virtual_sink` pending until integrated evidence supports closure.
+
+## Current bounded slice: capture-only Console-default pinning
+
+- Lane code commit: `d4125c364c5fa5c1ee98e1a4eb3bdc51c40dacbb`; isolated worker source commit: `795c6e728f3da04f34e044339e714cf6aab43d57`; worker/lane base: `5db314c2cf3e655305ed5b51f0f55b9f430f273b`.
+- Branch: `config-parity/audio-input`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`.
+- Stable IDs in scope: `global:audio_sink_capture_only` and `global:audio_sink`. Both remain pending.
+- Worker session/thread `01a0d615-e356-7ca2-9b30-98cebb377861`, verified `gpt-6-luna`/`xhigh` from the live thread row. The isolated worktree was `D:/sources/worktrees/amaterasu-capture-only-default-pin-xhigh`, branch `codex/luna04-capture-only-default-pin-xhigh`, clean at the required base before edits.
+- Changed paths: `modules/audio/src/platform/mod.rs`, `modules/audio/src/platform/windows.rs`, `modules/audio/README.md`. Lead review confirmed only these paths changed and the worker commit has the required plan trailers.
+- Capture-only opens using an empty/default regular selector now resolve the current Console render endpoint once at open, then disable Console-default following and reopen that same endpoint after device loss. Normal empty/default opens still follow Console changes. Explicit endpoint IDs and explicit/automatic virtual-sink selection remain unchanged. No API fields, launch payloads, persistence/default versions, or foreign-owned paths changed.
+- Added a focused platform-policy test separating initial Console selection from follow behavior. README selection and recovery descriptions now state that capture-only default opens remain pinned.
+- Worker and lane `rustfmt --edition 2024 --check` and `git diff --check` passed. Cargo tests/build/Clippy were not run in the lightweight worktrees; no Windows endpoint-switching hardware qualification was run.
+- The behavior is supported by pinned Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`: its capture-only path selects `set_capture_sink`, opens by the resolved device ID, and disables default-change following. Coordination notice is in outbox `022-capture-only-default-pin-implementation-notice.json`; coordinator/L02 acknowledgement is requested before direct-to-main landing.
+- Persistence/default migration, scoped resolution, management authority, end-to-end stream integration, and platform qualification remain incomplete. Keep all audio IDs pending.
+
+## Previous coordinator validation: active endpoint status contract
+
+- Current main: `a582eee8e05b8a7fa3fc235b95fc1728f88d756e`. Lane branch: `config-parity/audio-input`, current lane base before this handoff update: `184840a84d69fc4d7582d212b2b1fe18bfbef59e`.
+- Direct-main code landings: lane `f753d95f002476f2275a972944827725b2c0a4be` landed as main `5479dda5fe2f357ebd9ae0dce8aeb893487d4b1a`; lane correction `088818e502af98622f7793cbc8bf35df73f1aef4` landed as main `44c8ceb7f074163abfae98323905ccca665a6b08`.
+- Direct-main handoff landings: lane `77076c16bf582d65bff4130e312102c05b2c6d50` landed as main `270847baf7f735f46b7bbc83467f3d54efa2dbb6`; lane `184840a84d69fc4d7582d212b2b1fe18bfbef59e` landed as main `a582eee8e05b8a7fa3fc235b95fc1728f88d756e`.
+- Approved status contract: status reports the currently active capture endpoint; open and lookup keep the immutable initial endpoint for replay and shared-lease identity. The inspected stream-session consumer uses open and does not call audio status.
+- Final coordinator validation on main: `cargo fmt --check -p amaterasu-audio` passed; `cargo test -p amaterasu-audio --target x86_64-pc-windows-msvc` passed (50 passed, 0 failed, 1 hardware test ignored); strict Windows-target Clippy passed (`cargo clippy -p amaterasu-audio --target x86_64-pc-windows-msvc --all-targets -- -D warnings`).
+- Windows capture-endpoint switching/hardware qualification was not performed. All assigned audio IDs remain pending full persistence/default migration, scoped settings, management authority, end-to-end stream integration, and platform evidence.
+
+## Previous bounded slice: active endpoint test correction
 
 - Lane code correction: `088818e502af98622f7793cbc8bf35df73f1aef4`; isolated worker commit: `f7ba78911b348a2698c9625b1b89c8a509df106a`; worker/lane base: `77076c16bf582d65bff4130e312102c05b2c6d50`.
 - Main candidate under correction: `5479dda5fe2f357ebd9ae0dce8aeb893487d4b1a`; source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`; branch: `config-parity/audio-input`.
@@ -8,7 +38,7 @@
 - Worker session `01a0d516-8713-7b83-87f1-d35c0828ae10`, thread `01a0d605-4aee-7e83-b3f2-a2e0bf957e06`, verified `gpt-6-luna`/`xhigh` from the live thread row. Isolated worktree `D:/sources/worktrees/amaterasu-active-endpoint-test-correction-xhigh`, branch `codex/luna04-active-endpoint-test-correction-xhigh`, clean at the required base before edits.
 - Only `modules/audio/src/worker.rs` changed, and only test assertions: pinned `device_loss_retries_open_and_preserves_packet_clock` expects `render.fixed`; `console_default_change_reopens_new_endpoint_without_breaking_packet_clock` expects `render.console-new`. Production behavior and both assertions are preserved. Lead review confirmed the exact path and required plan trailers before cherry-pick.
 - Worker and lane `rustfmt --edition 2024 --check modules/audio/src/worker.rs` and `git diff --check` passed. No Cargo tests/build/Clippy ran in the lightweight lane.
-- Coordinator validation of main `5479dda5`: formatting passed; Windows-target audio tests had one failure in the pinned device-loss test because its assertion expected `render.console-new` while active endpoint correctly remained `render.fixed`. All other tests passed and one hardware test was ignored. Strict Clippy has not been run. After direct-to-main landing of the correction, coordinator will rerun formatting, Windows-target audio tests, and strict Clippy.
+- Initial coordinator validation of main `5479dda5` found the misplaced test assertion described above. The test correction landed directly on main as `44c8ceb7f074163abfae98323905ccca665a6b08`; final formatting, Windows-target test, and strict Clippy results are recorded in the current coordinator-validation section.
 - The coordinator approved the outbox 017 status contract: status reports the currently active capture endpoint, while open and lookup retain the immutable initial endpoint for replay and lease identity. The inspected stream-session consumer uses open and does not call audio status; no management status consumer was found.
 - Persistence/default migration, scoped settings, management authority, complete stream evidence, and platform qualification remain incomplete. Keep all audio IDs pending.
 
@@ -23,7 +53,7 @@
 - Regression coverage updates the followed-default recovery worker test to assert the reopened endpoint and adds controller coverage showing status moves to the new endpoint while repeated open and lookup retain the initial endpoint. Explicit endpoint IDs stay pinned; explicit/automatic virtual sink and capture-only routing policy code is unchanged.
 - Worker and lane checks: `cargo fmt --all -- --check` and `git diff --check` passed. No Cargo tests, build, or Clippy ran in the lightweight lane. Windows endpoint switching/hardware qualification was not performed.
 - Cross-lane status-semantics request was recorded in outbox `017-audio-active-endpoint-status-contract.json`. The coordinator has since approved the distinction between active status and immutable open/lookup identity and confirmed the inspected stream-session path uses open, not audio status.
-- Remaining parity: persistence/default migration, scoped client/application resolution, management edit authority, full stream integration and Windows hardware qualification remain open. The status contract is approved; next, inspect an owned capture-only or virtual-sink gap without editing L02/L05/L06 paths. Keep all audio IDs pending.
+- Remaining parity at that point included persistence/default migration, scoped client/application resolution, management edit authority, full stream integration and Windows hardware qualification. The capture-only default-pinning slice is now recorded above; inspect the remaining virtual-sink gaps next. Keep all audio IDs pending.
 
 ## Current bounded slice: open_selected Clippy correction
 
