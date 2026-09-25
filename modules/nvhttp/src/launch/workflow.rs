@@ -252,13 +252,13 @@ impl Controller {
                 15_000,
             ),
         };
-        if matches!(phase, Phase::OpenRtsp) {
-            if let Some(policy) = record.video_encryption_policy {
-                payload["video_encryption_policy"] = json!({
-                    "lan_mode": policy.lan_mode,
-                    "wan_mode": policy.wan_mode,
-                });
-            }
+        if matches!(phase, Phase::OpenRtsp)
+            && let Some(policy) = record.video_encryption_policy
+        {
+            payload["video_encryption_policy"] = json!({
+                "lan_mode": policy.lan_mode,
+                "wan_mode": policy.wan_mode,
+            });
         }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)

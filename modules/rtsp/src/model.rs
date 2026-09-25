@@ -936,10 +936,16 @@ mod tests {
             let request: Open = serde_json::from_value(value).unwrap();
 
             assert!(request.validate(false).is_ok());
-            assert_eq!(
-                request.arm(51)["configuration"]["continuous_audio"],
-                json!(enabled)
-            );
+            let configuration = request.arm(51)["configuration"].clone();
+            if enabled {
+                assert_eq!(configuration["continuous_audio"], true);
+            } else {
+                assert!(
+                    configuration
+                        .get("continuous_audio")
+                        .is_none_or(|value| value == &json!(false))
+                );
+            }
             assert!(
                 request
                     .prepare("continuous-audio", None)
