@@ -363,6 +363,12 @@ fn native_input_with_plan(event: &Event, plan: KeyboardPlan) -> InputResult<INPU
                 "Windows SendInput does not create virtual gamepads",
             ));
         }
+        Event::PenTouch { .. } => {
+            return Err(InputError::new(
+                "unsupported_event",
+                "Windows native pen/touch injection is not implemented by this backend",
+            ));
+        }
         Event::Key { .. } => unreachable!("keyboard events handled above"),
     }
     Ok(INPUT {
@@ -745,6 +751,25 @@ mod tests {
                 .unwrap_err()
                 .message
                 .contains("ViGEm")
+        );
+    }
+
+    #[test]
+    fn send_input_rejects_pen_touch_until_native_support_is_available() {
+        let event = Event::PenTouch {
+            pointer_id: 1,
+            device: crate::model::PenTouchDevice::Touch,
+            phase: crate::model::PenTouchPhase::Down,
+            x: 0,
+            y: 0,
+            pressure: None,
+            tilt_x: None,
+            tilt_y: None,
+        };
+
+        assert_eq!(
+            native_input(&event).err().unwrap().code,
+            "unsupported_event"
         );
     }
 }

@@ -3064,7 +3064,7 @@ fn disabling_pen_touch_retries_only_the_contact_whose_cancel_failed() {
         .push((22, PenTouchPhase::Cancel));
 
     controller.set_native_pen_touch(false);
-    assert_eq!(controller.native_pen_touch(), false);
+    assert!(!controller.native_pen_touch());
     assert_eq!(controller.pen_touch_contacts.len(), 1);
     assert_eq!(controller.pen_touch_contacts[0].pointer_id, 22);
     assert!(controller.cleanup_required());
