@@ -374,7 +374,7 @@
           "role": "client_override_allowlist"
         }
       ],
-      "type": "integer",
+      "type": "enum",
       "defaults": {
         "web_schema": "auto"
       },
