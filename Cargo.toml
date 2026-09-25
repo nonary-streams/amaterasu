@@ -46,6 +46,7 @@ members = [
     "modules/rtsp",
     "modules/encode",
     "modules/video",
+    "modules/frame-limiter",
 ]
 
 [workspace.package]

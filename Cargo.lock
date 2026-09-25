@@ -196,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-frame-limiter"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-gamestream"
 version = "0.1.0"
 dependencies = [
