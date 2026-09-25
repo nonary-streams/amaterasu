@@ -59,6 +59,8 @@ With `enabled` and `auto_sync` both true, the provider starts a background
 snapshot when settings load or change, then schedules another attempt 30 seconds
 after each start; an active snapshot or catalog transaction can delay the next
 attempt. This polling also retries when Playnite is stopped or a snapshot fails.
+Discovery of a newly started or restarted Playnite process requests an immediate
+retry, subject to an active snapshot or catalog transaction finishing first.
 Launch eligibility is tied to the discovered Playnite process IDs and paths.
 When Playnite stops or restarts, previously imported game IDs cannot launch
 against the new extension instance until a snapshot from that instance has

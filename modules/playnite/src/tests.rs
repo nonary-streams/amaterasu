@@ -247,16 +247,72 @@ fn process_restart_revokes_launch_eligibility_until_a_current_import_completes()
         processes: vec![new_process.clone()],
         executable_paths: vec![new_process.path.clone()],
     };
+    let now = Instant::now();
+    let mut next_auto_sync = Some(now + Duration::from_secs(30));
 
-    retain_eligibility_for_discovery(
+    update_discovery_state(
         std::slice::from_ref(&old_process),
         &discovered.processes,
         &mut eligible,
+        &mut next_auto_sync,
+        true,
+        now,
     );
     assert!(eligible.is_empty());
+    assert_eq!(next_auto_sync, Some(now));
     assert!(!can_publish_eligibility(Some(&[old_process]), &discovered));
     assert!(can_publish_eligibility(Some(&[new_process]), &discovered));
 
     let stopped = discovery::Discovery::default();
     assert!(!can_publish_eligibility(Some(&[]), &stopped));
+}
+
+#[test]
+fn discovery_retries_automatic_sync_immediately_only_for_a_new_running_process() {
+    let now = Instant::now();
+    let next_attempt = Some(now + Duration::from_secs(30));
+    let process = process(73, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let mut eligible = Default::default();
+    let mut next_auto_sync = next_attempt;
+
+    update_discovery_state(
+        &[],
+        std::slice::from_ref(&process),
+        &mut eligible,
+        &mut next_auto_sync,
+        true,
+        now,
+    );
+    assert_eq!(next_auto_sync, Some(now));
+
+    next_auto_sync = next_attempt;
+    update_discovery_state(
+        std::slice::from_ref(&process),
+        std::slice::from_ref(&process),
+        &mut eligible,
+        &mut next_auto_sync,
+        true,
+        now,
+    );
+    assert_eq!(next_auto_sync, next_attempt);
+
+    update_discovery_state(
+        std::slice::from_ref(&process),
+        &[],
+        &mut eligible,
+        &mut next_auto_sync,
+        true,
+        now,
+    );
+    assert_eq!(next_auto_sync, next_attempt);
+
+    update_discovery_state(
+        &[],
+        std::slice::from_ref(&process),
+        &mut eligible,
+        &mut next_auto_sync,
+        false,
+        now,
+    );
+    assert_eq!(next_auto_sync, next_attempt);
 }

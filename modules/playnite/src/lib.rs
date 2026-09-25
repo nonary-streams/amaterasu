@@ -278,10 +278,15 @@ impl PlayniteModule {
             false,
             discovery::discover,
         );
-        retain_eligibility_for_discovery(
+        update_discovery_state(
             &previous_processes,
             &self.last_discovery.processes,
             &mut self.eligible_launch_ids,
+            &mut self.next_auto_sync,
+            self.configuration.ready()
+                && self.configuration.settings().enabled
+                && self.configuration.settings().auto_sync,
+            Instant::now(),
         );
     }
 
@@ -296,10 +301,15 @@ impl PlayniteModule {
             true,
             discovery::discover,
         );
-        retain_eligibility_for_discovery(
+        update_discovery_state(
             &previous_processes,
             &self.last_discovery.processes,
             &mut self.eligible_launch_ids,
+            &mut self.next_auto_sync,
+            self.configuration.ready()
+                && self.configuration.settings().enabled
+                && self.configuration.settings().auto_sync,
+            Instant::now(),
         );
     }
 
@@ -643,13 +653,19 @@ fn refresh_discovery_at(
     }
 }
 
-fn retain_eligibility_for_discovery(
+fn update_discovery_state(
     previous: &[discovery::ProcessImage],
     current: &[discovery::ProcessImage],
     eligible_launch_ids: &mut std::collections::BTreeSet<String>,
+    next_auto_sync: &mut Option<Instant>,
+    auto_sync_enabled: bool,
+    now: Instant,
 ) {
     if previous != current {
         eligible_launch_ids.clear();
+        if auto_sync_enabled && !current.is_empty() {
+            *next_auto_sync = Some(now);
+        }
     }
 }
 
