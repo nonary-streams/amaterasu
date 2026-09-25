@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn audio_policy_keeps_host_disabled_and_explicit_selection_behavior() {
-        let mut endpoints = [
+        let endpoints = [
             endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
             endpoint(
                 "render.virtual",
