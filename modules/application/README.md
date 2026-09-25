@@ -77,10 +77,16 @@ command timeout and null standard handles. Windows URL and associated-file
 launches are not resolved through shell associations. These bounded execution
 rules differ from the reference helper, which waits for raw `do` commands
 without a timeout, sends their output to its configured pipe, and continues
-through undo failures. Preparation output is discarded here, and one failed undo
-blocks older undos until retry. The reference also tolerates a permission-denied
-preparation spawn error for an application without a primary command; this
-module reports the spawn failure.
+through undo failures. Preparation output is discarded here. Cleanup attempts
+each owed undo once per pass in reverse order and continues after spawn errors,
+nonzero exits, and timeouts whose commands have been contained and reaped. It
+retains each failed obligation and reports all failures from the pass; successful
+undos are removed. If a wait or containment error leaves an undo child unsettled,
+cleanup retains that child and defers older undos until an explicit retry can
+observe it again. Status calls do not retry failed undos. An explicit terminate
+request starts a new cleanup pass for the remaining obligations. The reference
+also tolerates a permission-denied preparation spawn error for an application
+without a primary command; this module reports the spawn failure.
 
 Steps run one at a time. A successfully spawned `run` owes its paired `undo` even
 if it later exits unsuccessfully, times out, or is cancelled, because it may have
@@ -118,7 +124,7 @@ Prepared records also contain `preparation` and `cleanup` reports.
 `preparation.completed` counts successful runs and optional `failure` identifies
 the phase, zero-based step, kind, and available exit/OS code. `cleanup.state` is
 `deferred`, `pending`, `failed`, or `complete`; `remaining` counts owed steps and
-optional `failures` describes the current undo/containment failure.
+optional `failures` describes the current undo/containment failures.
 `cleanup_failed` includes the retained intended `outcome` (`exited`,
 `launch_failed`, or `cancelled`). It is not terminal: ownership and pending undo
 remain retained, and another terminate request explicitly retries cleanup.
@@ -231,8 +237,9 @@ the executable directory.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural
 exit reaping, cwd/environment delivery, owner isolation, retries/conflicts,
-ordered preparation, reverse undo, failed-run rollback, cancellation settlement,
-retained/retryable cleanup failure, tree shutdown, child/grandchild cleanup after
+ordered preparation, reverse undo, continuation after undo failure, failed-run
+rollback, cancellation settlement, retained/retryable cleanup failure, tree
+shutdown, child/grandchild cleanup after
 natural root exit, shared shutdown deadlines, retained launch failures, and
 validation/capacity limits.
 The ignored `controlled_child` test is their subprocess entrypoint. Platform-specific

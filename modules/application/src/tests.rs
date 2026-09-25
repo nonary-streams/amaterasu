@@ -1434,30 +1434,51 @@ fn cleanup_failure_is_retained_until_explicit_retry_succeeds() {
     let trace = directory.join("events");
     let mut manager = ProcessManager::default();
     let mut request = launch("retry-cleanup", "sleep");
-    request["preparation"] = json!([{
-        "run":lifecycle_command(&trace, "prepare", "trace"),
-        "undo":lifecycle_command(&trace, "undo-attempt", "trace_fail_once"),
-    }]);
+    request["preparation"] = json!([
+        {
+            "run":lifecycle_command(&trace, "prepare-one", "trace"),
+            "undo":lifecycle_command(&trace, "undo-one", "trace"),
+        },
+        {
+            "run":lifecycle_command(&trace, "prepare-two", "trace"),
+            "undo":lifecycle_command(&trace, "undo-two-attempt", "trace_fail_once"),
+        },
+    ]);
 
     let started = manager.handle("alice", request);
     let id = started["process"]["process_id"].as_u64().unwrap();
-    wait_for_state(&mut manager, "alice", id, "running");
+    let running = wait_for_state(&mut manager, "alice", id, "running");
+    assert_eq!(running["process"]["preparation"]["completed"], 2);
     manager.handle("alice", json!({"action":"terminate","process_id":id}));
     let failed = wait_for_state(&mut manager, "alice", id, "cleanup_failed");
     assert_eq!(failed["process"]["outcome"], "cancelled");
     assert_eq!(failed["process"]["cleanup"]["state"], "failed");
     assert_eq!(failed["process"]["cleanup"]["remaining"], 1);
+    assert_eq!(
+        failed["process"]["cleanup"]["failures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(failed["process"]["cleanup"]["failures"][0]["phase"], "undo");
+    assert_eq!(failed["process"]["cleanup"]["failures"][0]["step"], 1);
     assert_eq!(
         failed["process"]["cleanup"]["failures"][0]["kind"],
         "exit_failed"
     );
-    assert_eq!(trace_events(&trace), ["prepare", "undo-attempt"]);
+    assert_eq!(
+        trace_events(&trace),
+        ["prepare-one", "prepare-two", "undo-two-attempt", "undo-one"]
+    );
 
     for _ in 0..3 {
         assert_eq!(status(&mut manager, "alice", id), failed);
     }
-    assert_eq!(trace_events(&trace), ["prepare", "undo-attempt"]);
+    assert_eq!(
+        trace_events(&trace),
+        ["prepare-one", "prepare-two", "undo-two-attempt", "undo-one"]
+    );
 
     let retry = manager.handle("alice", json!({"action":"terminate","process_id":id}));
     assert_eq!(retry["process"]["state"], "stopping", "{retry}");
@@ -1465,13 +1486,25 @@ fn cleanup_failure_is_retained_until_explicit_retry_succeeds() {
     assert_eq!(cancelled["process"]["cleanup"]["state"], "complete");
     assert_eq!(
         trace_events(&trace),
-        ["prepare", "undo-attempt", "undo-attempt"]
+        [
+            "prepare-one",
+            "prepare-two",
+            "undo-two-attempt",
+            "undo-one",
+            "undo-two-attempt"
+        ]
     );
 
     manager.handle("alice", json!({"action":"terminate","process_id":id}));
     assert_eq!(
         trace_events(&trace),
-        ["prepare", "undo-attempt", "undo-attempt"]
+        [
+            "prepare-one",
+            "prepare-two",
+            "undo-two-attempt",
+            "undo-one",
+            "undo-two-attempt"
+        ]
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

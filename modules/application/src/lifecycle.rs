@@ -742,6 +742,7 @@ enum Phase {
 enum CommandPurpose {
     Preparation(usize),
     Undo(usize),
+    UndoRetry(usize),
 }
 
 struct ActiveCommand {
@@ -763,6 +764,8 @@ pub(crate) struct ApplicationLifecycle {
     next_preparation: usize,
     #[serde(skip)]
     pending_undo: Vec<usize>,
+    #[serde(skip)]
+    attempted_undo: Vec<usize>,
     #[serde(skip)]
     active: Option<ActiveCommand>,
     #[serde(skip)]
@@ -795,6 +798,7 @@ impl ApplicationLifecycle {
             preparation_working_directory,
             next_preparation: 0,
             pending_undo: Vec::new(),
+            attempted_undo: Vec::new(),
             active: None,
             phase: Phase::Preparing,
         })
@@ -819,16 +823,30 @@ impl ApplicationLifecycle {
     /// Advance one command by one nonblocking observation. At most one process is
     /// spawned or signaled per call, keeping the shared managed-module tick short.
     pub(crate) fn tick(&mut self, now: Instant) {
-        if let Some(active) = &mut self.active {
+        if let Some(mut active) = self.active.take() {
             let purpose = active.purpose;
             match active.task.poll(now) {
-                CommandPoll::Running => return,
-                CommandPoll::Blocked(failure) => {
-                    self.block_command(purpose, failure);
+                CommandPoll::Running => {
+                    self.active = Some(active);
                     return;
                 }
+                CommandPoll::Blocked(failure) => match purpose {
+                    CommandPurpose::Preparation(_) => {
+                        self.active = Some(active);
+                        self.block_command(purpose, failure);
+                        return;
+                    }
+                    CommandPurpose::Undo(index) | CommandPurpose::UndoRetry(index) => {
+                        active.task.cancel();
+                        active.purpose = CommandPurpose::UndoRetry(index);
+                        self.active = Some(active);
+                        self.record_undo_failure(index, failure);
+                        self.cleanup.state = CleanupState::Failed;
+                        self.phase = Phase::CleanupFailed;
+                        return;
+                    }
+                },
                 CommandPoll::Finished(result) => {
-                    self.active = None;
                     self.finish_command(purpose, result);
                 }
             }
@@ -878,10 +896,14 @@ impl ApplicationLifecycle {
     }
 
     fn start_next_undo(&mut self, now: Instant) {
-        let Some(&index) = self.pending_undo.last() else {
-            self.phase = Phase::Complete;
-            self.cleanup.state = CleanupState::Complete;
-            self.cleanup.remaining = 0;
+        let Some(index) = self
+            .pending_undo
+            .iter()
+            .rev()
+            .find(|index| !self.attempted_undo.contains(index))
+            .copied()
+        else {
+            self.finish_cleanup_pass();
             return;
         };
         let Some(command) = self.steps[index].undo_command() else {
@@ -901,9 +923,7 @@ impl ApplicationLifecycle {
                 });
             }
             Err(error) => {
-                self.cleanup.failures = vec![CommandFailure::spawn(&error).at("undo", index)];
-                self.cleanup.state = CleanupState::Failed;
-                self.phase = Phase::CleanupFailed;
+                self.record_undo_failure(index, CommandFailure::spawn(&error));
             }
         }
     }
@@ -926,11 +946,14 @@ impl ApplicationLifecycle {
             CommandPurpose::Preparation(_) => {}
             CommandPurpose::Undo(index) => match result {
                 Ok(()) => self.complete_undo(index),
-                Err(failure) => {
-                    self.cleanup.failures = vec![failure.at("undo", index)];
-                    self.cleanup.state = CleanupState::Failed;
-                    self.phase = Phase::CleanupFailed;
-                }
+                Err(failure) => self.record_undo_failure(index, failure),
+            },
+            // A blocked undo is retained with its child handle until an explicit
+            // cleanup retry can observe it again. Once it settles, a failed result
+            // leaves the obligation available for a fresh command attempt.
+            CommandPurpose::UndoRetry(index) => match result {
+                Ok(()) => self.complete_undo(index),
+                Err(_) => {}
             },
         }
     }
@@ -938,7 +961,7 @@ impl ApplicationLifecycle {
     fn block_command(&mut self, purpose: CommandPurpose, failure: CommandFailure) {
         let (phase, index) = match purpose {
             CommandPurpose::Preparation(index) => ("preparation", index),
-            CommandPurpose::Undo(index) => ("undo", index),
+            CommandPurpose::Undo(index) | CommandPurpose::UndoRetry(index) => ("undo", index),
         };
         let failure = failure.at(phase, index);
         if matches!(purpose, CommandPurpose::Preparation(_)) && self.preparation.failure.is_none() {
@@ -952,9 +975,31 @@ impl ApplicationLifecycle {
         self.phase = Phase::CleanupFailed;
     }
 
+    fn record_undo_failure(&mut self, index: usize, failure: CommandFailure) {
+        self.cleanup.failures.push(failure.at("undo", index));
+        self.attempted_undo.push(index);
+    }
+
+    fn finish_cleanup_pass(&mut self) {
+        self.cleanup.remaining = self.pending_undo.len();
+        if self.cleanup.failures.is_empty() {
+            self.phase = Phase::Complete;
+            self.cleanup.state = CleanupState::Complete;
+            self.cleanup.remaining = 0;
+        } else {
+            self.phase = Phase::CleanupFailed;
+            self.cleanup.state = CleanupState::Failed;
+        }
+    }
+
     fn complete_undo(&mut self, index: usize) {
-        debug_assert_eq!(self.pending_undo.last(), Some(&index));
-        self.pending_undo.pop();
+        if let Some(position) = self
+            .pending_undo
+            .iter()
+            .position(|pending_index| *pending_index == index)
+        {
+            self.pending_undo.remove(position);
+        }
         self.cleanup.remaining = self.pending_undo.len();
     }
 
@@ -972,6 +1017,7 @@ impl ApplicationLifecycle {
             active.task.cancel();
         }
         self.cleanup.failures.clear();
+        self.attempted_undo.clear();
         self.cleanup.state = CleanupState::Pending;
         self.cleanup.remaining = self.pending_undo.len();
         self.phase = Phase::Cleaning;
@@ -980,6 +1026,7 @@ impl ApplicationLifecycle {
     pub(crate) fn retry_cleanup(&mut self) {
         if self.phase == Phase::CleanupFailed {
             self.cleanup.failures.clear();
+            self.attempted_undo.clear();
             self.cleanup.state = CleanupState::Pending;
             self.phase = Phase::Cleaning;
         }
