@@ -1,6 +1,8 @@
 //! Validated frame-limiter settings and pure launch-policy decisions.
+mod lease;
 mod model;
 mod policy;
+mod rtss;
 mod runtime;
 mod service;
 
@@ -18,10 +20,10 @@ pub use policy::{
 };
 pub use runtime::FrameLimiterModule;
 pub use service::{
-    ApplyRequest, CONTRACT_VERSION, GameFrameGenerationMode, Operation, OperationResponse,
-    PolicyOnlyPlan, Presence, ProviderAvailability, ProviderCandidate, ResponseState,
-    RestoreRequest, ServiceError, SettingsInput, StatusRequest, build_response, handle_operation,
-    handle_payload, parse_operation,
+    ApplyRequest, CONTRACT_VERSION, GameFrameGenerationMode, LeaseStatus, Operation,
+    OperationResponse, PolicyOnlyPlan, Presence, ProviderAvailability, ProviderCandidate,
+    ResponseState, RestoreRequest, ServiceError, SettingsInput, StatusRequest, build_response,
+    handle_operation, handle_payload, parse_operation,
 };
 
 #[cfg(test)]
