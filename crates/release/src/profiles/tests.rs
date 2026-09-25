@@ -454,6 +454,48 @@ fn authentication_token_ttl_defaults_and_configuration_grant_survive_policy_relo
 }
 
 #[test]
+fn authorization_policy_generations_are_distinct_nonzero_and_survive_reload() {
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-auth-generation-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+
+    let development_generation =
+        development.settings["amaterasu.authentication"]["authorization_policy_generation"]
+            .as_u64()
+            .unwrap();
+    let installer_generation =
+        installer.settings["amaterasu.authentication"]["authorization_policy_generation"]
+            .as_u64()
+            .unwrap();
+    assert_eq!(development_generation, 1);
+    assert_eq!(installer_generation, 2);
+    assert_ne!(development_generation, 0);
+    assert_ne!(installer_generation, 0);
+    assert_ne!(development_generation, installer_generation);
+
+    for (policy, expected_generation) in [(development, 1), (installer, 2)] {
+        let serialized = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            serialized["settings"]["amaterasu.authentication"]["authorization_policy_generation"],
+            expected_generation
+        );
+
+        let reloaded: RuntimeConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            reloaded.settings["amaterasu.authentication"]["authorization_policy_generation"],
+            expected_generation
+        );
+    }
+}
+
+#[test]
 fn input_policy_can_load_durable_settings_and_management_can_edit_them() {
     assert!(INPUT.calls.contains(&"amaterasu.configuration/1"));
     assert!(INPUT.calls.contains(&"amaterasu.state/1"));

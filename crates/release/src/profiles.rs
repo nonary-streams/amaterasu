@@ -712,6 +712,9 @@ impl ComponentDefinition {
     }
 }
 
+// Authorization generations are profile-specific and never reused. Advance a profile's
+// generation whenever its administrator_principals or allowed_scopes change, including a
+// revert; TTL-only edits do not bump it.
 pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     let mut policy = RuntimeConfig::default();
     let mut console = Grants::default();
@@ -814,6 +817,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.console", "amaterasu.management"],
+                "authorization_policy_generation": 1,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
@@ -889,6 +893,7 @@ pub fn installer_policy(
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.management"],
+                "authorization_policy_generation": 2,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
