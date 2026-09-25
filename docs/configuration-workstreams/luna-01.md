@@ -6,7 +6,7 @@
 - Branch: `config-parity/foundation`
 - Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
 - Lane starting/base commit: `30acd5de34ac5548ebf4d46086fc32ccad7b6913`
-- Latest code candidate: `c68378d23b48bcfd41f8a2d32e34516ca5cb8cff` (lane cherry-pick of authentication session TTL/persistence documentation commit `4d96e11fee4ccbbe458dfa4489e7da23b8a59647`); this handoff/outbox update follows the code candidate.
+- Latest code candidate: `44574af629eed41fb75cbc2a519e0b861c3a3cd6` (lane cherry-pick of package legacy-source discovery identity commit `eec8f2e65706d92f089c79613a7cdcbd1e41ed50`); this handoff/outbox update follows the code candidate.
 - Reference: Vibeshine `vibe-test` commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d`; used as behavioral evidence, not copied source.
 - Session: `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, `gpt-6-luna`, reasoning `max`.
 - Lane status: all seven assigned IDs remain `pending`. The coordinator owns the shared coverage ledger and decides when evidence is sufficient to close an ID.
@@ -191,3 +191,15 @@ The isolated worker worktree was `D:/sources/worktrees/amaterasu-auth-session-do
 `rustfmt --edition 2024 --check modules/authentication/src/engine.rs modules/authentication/src/protocol.rs` and `git diff --check` passed in the child. The lane also passed `rustfmt --edition 2024 --check modules/authentication/src/engine.rs modules/authentication/src/protocol.rs modules/authentication/src/pipeline.rs`, `git diff --check HEAD^ HEAD`, and `git show --check HEAD`. No Cargo tests, builds, or Clippy were run for this documentation-only slice; coordinator main validation of the existing authentication code was previously reported as formatting passed, 37/37 tests, and strict Clippy passed. This slice adds no platform evidence.
 
 The session persistence and TTL implementation remains subject to integrated L06 signed settings routes, browser/cookie behavior, and restart qualification. The legacy web default of 86,400 seconds for session token TTL still conflicts with the host default of 7,200 seconds and requires an explicit integration decision. Those gaps remain pending; no shared coverage ledger was edited.
+
+## Package legacy-source discovery identity correction
+
+The package discovery path previously deduplicated predecessor roots by lowercasing `to_string_lossy()` output. That could merge distinct case-sensitive or non-Unicode roots on Unix and did not normalize filesystem aliases such as `nested/../Sunshine`.
+
+The isolated worker verified from session state as `gpt-6-luna/xhigh` was thread `01a0d608-9801-7762-925a-3f5f60fe476a` (`GPT 6-Luna X-High`). It worked in `D:/sources/worktrees/amaterasu-package-discovery-identity` on branch `config-parity/package-discovery-identity`, based on lane HEAD `763a02a682f08f99ea733cb503af90a3107d4639`. It changed only `crates/package/src/migration.rs` and `crates/package/src/migration/tests.rs`, validating existing roots before canonicalization, preserving exact canonical path identity on Unix, and resolving Windows paths with the existing `CompareStringOrdinal` component matcher. Regression cases cover lexical aliases, case-distinct and non-Unicode Unix roots, and Windows ordinal case variants.
+
+The child commit is `eec8f2e65706d92f089c79613a7cdcbd1e41ed50`. The lane lead reviewed its two-file diff and cherry-picked it to `config-parity/foundation` as `44574af629eed41fb75cbc2a519e0b861c3a3cd6`. `rustfmt --edition 2024 --check crates/package/src/migration.rs crates/package/src/migration/tests.rs`, `git diff --check`, and `git show --check` passed in the child and lane. No Cargo tests, builds, Clippy, Unix execution, or Windows execution were run in the lightweight worktrees. The coordinator should run `cargo test -p amaterasu-package` and `cargo clippy -p amaterasu-package --all-targets -- -D warnings` on main, and execute the platform-specific discovery cases on Unix and Windows. The `global:file_state` and `global:vibeshine_file_state` IDs remain pending for observable importer use, signed management editing, complete migration behavior, and full platform qualification.
+
+## Next bounded slice
+
+Continue a self-contained L01-owned host or package migration gap. Keep authentication consumer, pairing/TLS, and management editor integration coordinated with L02/L06, preserve all seven assigned IDs as pending, and leave frame-limiter profile registration blocked on its cross-lane contract.
