@@ -44,6 +44,7 @@ members = [
     "modules/stream-session",
     "modules/session-history",
     "modules/rtsp",
+    "modules/upnp",
     "modules/encode",
     "modules/video",
     "modules/frame-limiter",
