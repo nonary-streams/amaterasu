@@ -70,13 +70,14 @@ impl ManagedModule for DiagnosticsModule {
             }
         }
 
-        if self.host_logging.legacy_bootstrap_authorized() && !self.journal.is_ready() {
-            if let Some(settings) = self.bootstrap_logging.take() {
-                if let Some(warning) = self.journal.configure_logging(settings) {
-                    eprintln!("amaterasu diagnostics: file logging unavailable: {warning}");
-                }
-                self.journal.set_ready(true);
+        if self.host_logging.legacy_bootstrap_authorized()
+            && !self.journal.is_ready()
+            && let Some(settings) = self.bootstrap_logging.take()
+        {
+            if let Some(warning) = self.journal.configure_logging(settings) {
+                eprintln!("amaterasu diagnostics: file logging unavailable: {warning}");
             }
+            self.journal.set_ready(true);
         }
 
         match self.runtime.send(Command::Poll {})? {
