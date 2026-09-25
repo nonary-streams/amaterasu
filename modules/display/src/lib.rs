@@ -1,5 +1,6 @@
 //! Physical display changes guarded by a durable recovery journal.
 pub mod configuration_option;
+pub mod hdr_option;
 pub mod mode_remapping;
 mod model;
 mod pipeline;
@@ -8,6 +9,7 @@ pub mod refresh_rate_option;
 pub mod resolution_option;
 
 pub use configuration_option::DisplayConfigurationOption;
+pub use hdr_option::DisplayHdrOption;
 pub use mode_remapping::{
     DisplayMode, ModeRemapping, ModeRemappingEntry, ModeRemappingError, Resolution, ResolverContext,
 };
