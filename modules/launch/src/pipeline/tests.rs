@@ -67,6 +67,7 @@ struct Harness {
     catalog_audio_sink: Option<String>,
     catalog_audio_sink_capture_only: Option<bool>,
     catalog_back_button_timeout: Option<i32>,
+    catalog_amd_av1_latency_mode: Option<Value>,
     catalog_playnite_game_id: Option<String>,
     catalog_playnite_exit_timeout_seconds: u64,
     provider_launches: Vec<TestProviderLaunch>,
@@ -120,6 +121,7 @@ impl Harness {
             catalog_audio_sink: None,
             catalog_audio_sink_capture_only: None,
             catalog_back_button_timeout: None,
+            catalog_amd_av1_latency_mode: None,
             catalog_playnite_game_id: None,
             catalog_playnite_exit_timeout_seconds: 10,
             provider_launches: Vec::new(),
@@ -564,6 +566,9 @@ impl Harness {
                         if let Some(timeout) = self.catalog_back_button_timeout {
                             overrides.insert("back_button_timeout".into(), json!(timeout));
                         }
+                        if let Some(mode) = &self.catalog_amd_av1_latency_mode {
+                            overrides.insert("amd_av1_latency_mode".into(), mode.clone());
+                        }
                         if !overrides.is_empty() {
                             reply["entry"]["config_overrides"] = json!(overrides);
                         }
@@ -986,7 +991,7 @@ fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
         .enumerate()
     {
         let mut harness = Harness::new();
-        harness.catalog_config_overrides = Some(json!({"amd_av1_latency_mode":mode}));
+        harness.catalog_amd_av1_latency_mode = Some(json!(mode));
         let mut pipeline = pipeline();
         let operation_id = format!("av1-latency-{index}");
 
@@ -999,8 +1004,7 @@ fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
         );
 
         let changed_catalog_mode = if mode == "lowest" { "auto" } else { "lowest" };
-        harness.catalog_config_overrides =
-            Some(json!({"amd_av1_latency_mode":changed_catalog_mode}));
+        harness.catalog_amd_av1_latency_mode = Some(json!(changed_catalog_mode));
         let retry = harness.request(&mut pipeline, "alice", launch(&operation_id));
         assert_eq!(
             retry["launch"]["config_overrides"]["amd_av1_latency_mode"],
@@ -1032,7 +1036,7 @@ fn invalid_amd_av1_latency_mode_fails_before_session_creation() {
     .enumerate()
     {
         let mut harness = Harness::new();
-        harness.catalog_config_overrides = Some(json!({"amd_av1_latency_mode":invalid}));
+        harness.catalog_amd_av1_latency_mode = Some(invalid);
         let mut pipeline = pipeline();
 
         let failed = harness.request(
