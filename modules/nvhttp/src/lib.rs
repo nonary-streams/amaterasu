@@ -11,7 +11,7 @@ mod wire;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use launch::CaptureMode;
 use network_settings::NetworkSettings;
-use product_settings::{AdminAction, FieldUpdate, ProductSettings};
+use product_settings::{AdminAction, FieldUpdate, NetworkTarget, ProductSettings};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use settings::Settings;
@@ -26,6 +26,49 @@ fn should_attempt_listener_rebind(
 ) -> bool {
     server.is_some() && product_settings.listeners_need_application()
 }
+
+fn listener_settings_for_target(
+    startup_settings: &Settings,
+    target: &NetworkTarget,
+) -> Result<Settings, String> {
+    settings::validate_port(target.port).map_err(str::to_owned)?;
+    let mut listener_settings = startup_settings.clone();
+    listener_settings.http_bind.set_port(target.port);
+    listener_settings
+        .https_bind
+        .set_port(settings::https_port(target.port));
+    listener_settings.address_family = target.address_family;
+    listener_settings.bind_address = target.bind_address.clone();
+    listener_settings.validate().map_err(str::to_owned)?;
+    Ok(listener_settings)
+}
+
+fn listener_target_matches_server(
+    server: &server::Server,
+    startup_settings: &Settings,
+    target: &NetworkTarget,
+) -> bool {
+    let Ok(listener_settings) = listener_settings_for_target(startup_settings, target) else {
+        return false;
+    };
+    let Ok(http_addresses) = listener_settings.resolved_http_binds() else {
+        return false;
+    };
+    let Ok(https_addresses) = listener_settings.resolved_https_binds() else {
+        return false;
+    };
+    server.http_addresses() == http_addresses && server.https_addresses() == https_addresses
+}
+
+fn apply_listener_target(
+    server: &mut server::Server,
+    startup_settings: &Settings,
+    target: &NetworkTarget,
+) -> Result<(), String> {
+    let listener_settings = listener_settings_for_target(startup_settings, target)?;
+    server.rebind_settings(&listener_settings)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 // The update variant intentionally carries all typed fields to preserve the
@@ -171,11 +214,13 @@ impl ManagedModule for NvhttpModule {
             if let Some(router) = &mut self.router {
                 router.set_hostname(settings.hostname);
             }
-            if self
-                .server
-                .as_ref()
-                .is_some_and(|server| server.http_address().port() != settings.port)
-            {
+            if self.server.as_ref().is_some_and(|server| {
+                !listener_target_matches_server(
+                    server,
+                    &self.startup_settings,
+                    &self.product_settings.http_target(),
+                )
+            }) {
                 self.next_listener_rebind = Instant::now();
             }
         }
@@ -217,19 +262,13 @@ impl ManagedModule for NvhttpModule {
             && Instant::now() >= self.next_listener_rebind
         {
             let target = self.product_settings.http_target();
-            let mut settings = self.startup_settings.clone();
-            settings.http_bind.set_port(target.port);
-            settings
-                .https_bind
-                .set_port(settings::https_port(target.port));
-            settings.address_family = target.address_family;
-            settings.bind_address = target.bind_address.clone();
-            let result = settings.validate().map_err(str::to_owned).and_then(|()| {
+            let result = apply_listener_target(
                 self.server
                     .as_mut()
-                    .expect("a live listener is required to apply network settings")
-                    .rebind_settings(&settings)
-            });
+                    .expect("a live listener is required to apply network settings"),
+                &self.startup_settings,
+                &target,
+            );
             match result {
                 Ok(()) => {
                     self.product_settings.set_active_http_target(target);
@@ -625,6 +664,40 @@ amaterasu_module_sdk::export_module!(NvhttpModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    fn startup_listener_settings() -> Settings {
+        Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        }
+    }
+
+    fn occupied_valid_http_port() -> (TcpListener, u16) {
+        for _ in 0..32 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if settings::validate_port(port).is_err() {
+                continue;
+            }
+            if let Ok(https_listener) = TcpListener::bind(("127.0.0.1", settings::https_port(port)))
+            {
+                drop(https_listener);
+                return (listener, port);
+            }
+        }
+        panic!("could not reserve an available HTTP/HTTPS port pair");
+    }
+
+    fn target(port: u16) -> NetworkTarget {
+        NetworkTarget {
+            port,
+            address_family: Some(settings::AddressFamily::Ipv4),
+            bind_address: Some("127.0.0.1".into()),
+        }
+    }
 
     #[test]
     fn settings_update_deserializer_distinguishes_omitted_null_and_values() {
@@ -847,5 +920,59 @@ mod tests {
             }
             _ => panic!("preparation list expected"),
         }
+    }
+
+    #[test]
+    fn listener_target_derives_the_https_port_and_applies_bind_policy() {
+        let startup = startup_listener_settings();
+        let configured_target = target(48_000);
+
+        let listener_settings = listener_settings_for_target(&startup, &configured_target).unwrap();
+
+        assert_eq!(listener_settings.http_bind.port(), configured_target.port);
+        assert_eq!(
+            listener_settings.https_bind.port(),
+            settings::https_port(configured_target.port)
+        );
+        assert_eq!(
+            listener_settings.address_family,
+            configured_target.address_family
+        );
+        assert_eq!(
+            listener_settings.bind_address,
+            configured_target.bind_address
+        );
+    }
+
+    #[test]
+    fn invalid_and_occupied_targets_keep_the_old_pair_until_retry_succeeds() {
+        let startup = startup_listener_settings();
+        let mut server = server::Server::bind(&startup).unwrap();
+        let old_http_addresses = server.http_addresses();
+        let old_https_addresses = server.https_addresses();
+
+        assert!(apply_listener_target(&mut server, &startup, &target(0)).is_err());
+        assert_eq!(server.http_addresses(), old_http_addresses);
+        assert_eq!(server.https_addresses(), old_https_addresses);
+
+        let (occupied_http_port, http_port) = occupied_valid_http_port();
+        let configured_target = target(http_port);
+        assert!(apply_listener_target(&mut server, &startup, &configured_target).is_err());
+        assert_eq!(server.http_addresses(), old_http_addresses);
+        assert_eq!(server.https_addresses(), old_https_addresses);
+
+        drop(occupied_http_port);
+        apply_listener_target(&mut server, &startup, &configured_target).unwrap();
+
+        assert!(listener_target_matches_server(
+            &server,
+            &startup,
+            &configured_target
+        ));
+        assert_eq!(server.http_addresses()[0].port(), http_port);
+        assert_eq!(
+            server.https_addresses()[0].port(),
+            settings::https_port(http_port)
+        );
     }
 }
