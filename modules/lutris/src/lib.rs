@@ -20,6 +20,34 @@ use steam_catalog::{Progress as SteamProgress, SteamCatalogRead};
 pub const SERVICE: &str = "amaterasu.lutris/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceSignature {
+    executable: std::path::PathBuf,
+    games: Vec<discovery::Game>,
+}
+
+impl From<&Snapshot> for SourceSignature {
+    fn from(snapshot: &Snapshot) -> Self {
+        Self {
+            executable: snapshot.lutris_executable.clone(),
+            games: snapshot.games.clone(),
+        }
+    }
+}
+
+fn should_reconcile(
+    signature: &SourceSignature,
+    previous: Option<&SourceSignature>,
+    previous_at: Option<Instant>,
+    manual: bool,
+    now: Instant,
+) -> bool {
+    manual
+        || previous != Some(signature)
+        || previous_at.is_none_or(|at| now.duration_since(at) >= RECONCILIATION_RETRY_INTERVAL)
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -76,10 +104,12 @@ struct SnapshotWorker {
     receiver: Option<Receiver<Result<Snapshot, String>>>,
     _thread: Option<JoinHandle<()>>,
     settings: Option<ProductSettings>,
+    manual: bool,
+    settings_epoch: u64,
 }
 
 impl SnapshotWorker {
-    fn start(settings: ProductSettings) -> Self {
+    fn start(settings: ProductSettings, manual: bool, settings_epoch: u64) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let _ = sender.send(discovery::discover());
@@ -88,10 +118,12 @@ impl SnapshotWorker {
             receiver: Some(receiver),
             _thread: Some(worker),
             settings: Some(settings),
+            manual,
+            settings_epoch,
         }
     }
 
-    fn take_result(&mut self) -> Option<(ProductSettings, Result<Snapshot, String>)> {
+    fn take_result(&mut self) -> Option<(ProductSettings, bool, u64, Result<Snapshot, String>)> {
         let result = match self.receiver.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return None,
@@ -105,7 +137,7 @@ impl SnapshotWorker {
             .settings
             .take()
             .expect("an active Lutris scan retains its captured settings");
-        Some((settings, result))
+        Some((settings, self.manual, self.settings_epoch, result))
     }
 
     fn busy(&self) -> bool {
@@ -152,6 +184,9 @@ struct LutrisModule {
     next_source_revision: u64,
     last_snapshot_games: usize,
     last_error: Option<String>,
+    last_reconciled_source: Option<SourceSignature>,
+    last_reconciled_at: Option<Instant>,
+    pending_source: Option<(SourceSignature, u64)>,
 }
 
 impl ManagedModule for LutrisModule {
@@ -172,6 +207,9 @@ impl ManagedModule for LutrisModule {
             next_source_revision: 0,
             last_snapshot_games: 0,
             last_error: None,
+            last_reconciled_source: None,
+            last_reconciled_at: None,
+            pending_source: None,
         })
     }
 
@@ -182,6 +220,7 @@ impl ManagedModule for LutrisModule {
         self.poll_snapshot();
         self.advance_steam_read()?;
         self.catalog.advance(&self.runtime)?;
+        self.finish_catalog_if_ready();
         self.start_scan_if_due();
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -202,6 +241,8 @@ impl LutrisModule {
             return;
         }
         self.observed_settings_epoch = self.settings_epoch;
+        self.last_reconciled_source = None;
+        self.last_reconciled_at = None;
         let settings = self.configuration.settings();
         self.next_auto_sync = if settings.enabled && settings.auto_sync {
             Some(Instant::now())
@@ -211,14 +252,29 @@ impl LutrisModule {
     }
 
     fn poll_snapshot(&mut self) {
-        let Some((settings, result)) = self.snapshot_worker.take_result() else {
+        let Some((settings, manual, settings_epoch, result)) = self.snapshot_worker.take_result()
+        else {
             return;
         };
         match result {
             Ok(snapshot) => {
                 self.last_snapshot_games = snapshot.games.len();
+                let signature = SourceSignature::from(&snapshot);
+                if !should_reconcile(
+                    &signature,
+                    self.last_reconciled_source.as_ref(),
+                    self.last_reconciled_at,
+                    manual,
+                    Instant::now(),
+                ) {
+                    self.schedule_next_auto_sync();
+                    return;
+                }
+                self.pending_source = Some((signature, settings_epoch));
                 let Some(source_revision) = self.next_source_revision.checked_add(1) else {
                     self.last_error = Some("Lutris source revision exhausted".into());
+                    self.pending_source = None;
+                    self.schedule_next_auto_sync();
                     return;
                 };
                 self.next_source_revision = source_revision;
@@ -236,7 +292,10 @@ impl LutrisModule {
                     self.start_catalog_scan(scan, &Default::default());
                 }
             }
-            Err(error) => self.last_error = Some(error),
+            Err(error) => {
+                self.last_error = Some(error);
+                self.schedule_next_auto_sync();
+            }
         }
     }
 
@@ -248,6 +307,10 @@ impl LutrisModule {
             SteamProgress::Pending => self.steam_read = Some(pending),
             SteamProgress::Failed(error) => {
                 self.last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
+                self.pending_source = None;
+                self.last_reconciled_source = None;
+                self.last_reconciled_at = None;
+                self.schedule_next_auto_sync();
             }
             SteamProgress::Complete(steam_ids) => {
                 self.start_catalog_scan(pending.scan, &steam_ids);
@@ -259,9 +322,42 @@ impl LutrisModule {
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
         if let Err(error) = scan.start_catalog(&mut self.catalog, steam_app_ids) {
             self.last_error = Some(error);
+            self.pending_source = None;
+            self.last_reconciled_source = None;
+            self.last_reconciled_at = None;
+            self.schedule_next_auto_sync();
         } else {
             self.last_error = None;
         }
+    }
+
+    fn finish_catalog_if_ready(&mut self) {
+        if self.pending_source.is_none() || self.catalog.busy() {
+            return;
+        }
+        let settings_changed = self
+            .pending_source
+            .as_ref()
+            .is_some_and(|(_, epoch)| *epoch != self.settings_epoch);
+        if let Some((signature, settings_epoch)) = self.pending_source.take() {
+            if self.catalog.succeeded() && settings_epoch == self.settings_epoch {
+                self.last_reconciled_source = Some(signature);
+                self.last_reconciled_at = Some(Instant::now());
+            } else {
+                self.last_reconciled_source = None;
+                self.last_reconciled_at = None;
+            }
+        }
+        self.schedule_next_auto_sync();
+        if settings_changed && self.next_auto_sync.is_some() {
+            self.next_auto_sync = Some(Instant::now());
+        }
+    }
+
+    fn schedule_next_auto_sync(&mut self) {
+        let settings = self.configuration.settings();
+        self.next_auto_sync =
+            (settings.enabled && settings.auto_sync).then(|| Instant::now() + AUTO_SYNC_INTERVAL);
     }
 
     fn start_scan_if_due(&mut self) {
@@ -286,13 +382,10 @@ impl LutrisModule {
         ) {
             return;
         }
+        let manual = self.manual_refresh_pending;
         self.manual_refresh_pending = false;
-        self.next_auto_sync = if settings.auto_sync {
-            Some(Instant::now() + AUTO_SYNC_INTERVAL)
-        } else {
-            None
-        };
-        self.snapshot_worker = SnapshotWorker::start(settings.clone());
+        self.next_auto_sync = None;
+        self.snapshot_worker = SnapshotWorker::start(settings.clone(), manual, self.settings_epoch);
     }
 
     fn handle_request(&mut self, request: u64, caller: &str, payload: Value) -> ModuleResult<()> {
@@ -440,6 +533,8 @@ mod tests {
             receiver: Some(receiver),
             _thread: None,
             settings: Some(settings),
+            manual: true,
+            settings_epoch: 3,
         }
     }
 
@@ -496,6 +591,48 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_automatic_source_skips_catalog_until_retry_but_manual_refresh_runs() {
+        let snapshot = snapshot();
+        let signature = SourceSignature::from(&snapshot);
+        let now = Instant::now();
+        assert!(should_reconcile(&signature, None, None, false, now));
+        assert!(!should_reconcile(
+            &signature,
+            Some(&signature),
+            Some(now),
+            false,
+            now
+        ));
+        assert!(should_reconcile(
+            &signature,
+            Some(&signature),
+            Some(now),
+            true,
+            now
+        ));
+        assert!(should_reconcile(
+            &signature,
+            Some(&signature),
+            Some(now),
+            false,
+            now + RECONCILIATION_RETRY_INTERVAL,
+        ));
+
+        let mut changed = snapshot;
+        changed.games[0].service_id = "changed".into();
+        assert!(should_reconcile(
+            &SourceSignature::from(&changed),
+            Some(&signature),
+            Some(now),
+            false,
+            now,
+        ));
+        changed.games[0].service_id = "9001".into();
+        changed.games[0].config_path = "/new/config.yml".into();
+        assert_ne!(SourceSignature::from(&changed), signature);
+    }
+
+    #[test]
     fn disable_during_scan_keeps_captured_settings_through_steam_dedupe() {
         let scan_start_settings = ProductSettings {
             enabled: true,
@@ -523,8 +660,10 @@ mod tests {
         );
         assert!(worker.busy());
 
-        let (captured_settings, result) = worker.take_result().unwrap();
+        let (captured_settings, manual, settings_epoch, result) = worker.take_result().unwrap();
         assert!(!worker.busy());
+        assert!(manual);
+        assert_eq!(settings_epoch, 3);
         let scan = CapturedScan {
             snapshot: result.unwrap(),
             settings: captured_settings,

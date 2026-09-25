@@ -512,6 +512,10 @@ impl CatalogSync {
         self.transaction.is_some()
     }
 
+    pub fn succeeded(&self) -> bool {
+        self.transaction.is_none() && self.last_error.is_none()
+    }
+
     pub fn status(&self) -> Value {
         json!({
             "busy":self.busy(),
@@ -1139,6 +1143,7 @@ mod tests {
             }),
         );
         assert!(!catalog.busy());
+        assert!(catalog.succeeded());
         assert_eq!(catalog.last_error, None);
         let now = std::time::Instant::now();
         assert!(!crate::scan_is_due(

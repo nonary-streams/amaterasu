@@ -69,6 +69,17 @@ Disabled settings prevent later scans from starting, and disabling alone does no
 remove already imported catalog rows. Stale removal remains governed by the
 captured `autosync_remove_uninstalled` value.
 
+Automatic discovery checks the installed rows every 30 seconds after the
+previous scan and catalog work finish. A catalog snapshot is submitted when the
+source rows or resolved Lutris executable change, after a settings change, or
+at least every five minutes to retry catalog state changes outside Lutris.
+Manual refresh always submits a snapshot. A failed scan or reconciliation is
+retried on the next automatic discovery; only a validated catalog finish records
+the source as reconciled. If settings change during an in-flight scan, that scan
+finishes with its captured values and the new settings trigger another scan.
+Artwork revisions are not represented by the current Lutris snapshot, so this
+periodic retry does not refresh artwork.
+
 Other remaining gaps are trusted per-session discovery for machine services,
 cross-user import, and launch handling for games whose Lutris client cannot be
 resolved.
