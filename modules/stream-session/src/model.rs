@@ -291,6 +291,12 @@ pub struct StartConfig {
     pub controller: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gamepad: Option<String>,
+    /// Optional PLAY snapshot; when present it must match the immutable
+    /// encryption policy accepted during prepare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypt_video: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypt_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,6 +326,14 @@ pub struct StartConfig {
     pub host_audio_enabled: bool,
 }
 impl StartConfig {
+    pub fn matches_prepared_encryption(&self, prepared: &PrepareConfig) -> bool {
+        self.encrypt_video
+            .is_none_or(|encrypt_video| encrypt_video == prepared.encrypt_video)
+            && self
+                .encrypt_audio
+                .is_none_or(|encrypt_audio| encrypt_audio == prepared.encrypt_audio)
+    }
+
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
         if !valid_minimum_fps_target(self.minimum_fps_target) {
             return Err("invalid_minimum_fps_target");

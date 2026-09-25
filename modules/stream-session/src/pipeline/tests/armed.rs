@@ -223,6 +223,30 @@ fn arm_owner_validation_conflicts_and_ordinary_start_semantics_are_preserved() {
 }
 
 #[test]
+fn authenticated_start_accepts_matching_encryption_snapshot_and_rejects_mismatch() {
+    let mut host = Harness::new();
+    let mut preparation = prepare();
+    preparation["encrypt_video"] = json!(false);
+    preparation["encrypt_audio"] = json!(false);
+    let id = host.response(1, preparation)["session"].as_u64().unwrap();
+
+    let mut mismatched = arm(id);
+    mismatched["configuration"]["encrypt_video"] = json!(false);
+    mismatched["configuration"]["encrypt_audio"] = json!(true);
+    assert_eq!(
+        host.response(2, mismatched)["code"],
+        "encryption_configuration_mismatch"
+    );
+    assert_eq!(host.pipeline.records[&id].state, State::Prepared);
+    assert!(host.pipeline.records[&id].start.is_none());
+
+    let mut matching = arm(id);
+    matching["configuration"]["encrypt_video"] = json!(false);
+    matching["configuration"]["encrypt_audio"] = json!(false);
+    assert_eq!(host.response(3, matching)["state"], "armed");
+}
+
+#[test]
 fn cancelled_or_lost_initial_arm_completion_rolls_back_but_retry_does_not() {
     for cancelled in [true, false] {
         let mut host = Harness::new();
