@@ -61,6 +61,8 @@ fn configuration() -> Value {
 #[derive(Default)]
 struct FakePlatform {
     effects: Vec<&'static str>,
+    prepared_mode: Option<(u32, u32, Rational)>,
+    applied_mode: Option<(u32, u32, Rational)>,
     apply_failure: bool,
     restore_failure: bool,
     topology_changed: bool,
@@ -75,12 +77,14 @@ impl Platform for FakePlatform {
     fn enumerate(&mut self, _: Option<&str>, _: usize, _: usize) -> DisplayResult<Value> {
         Ok(json!({"ok":true,"entries":[]}))
     }
-    fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {
+    fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
+        let display = &configuration.displays[0];
+        self.prepared_mode = Some((display.width, display.height, display.refresh));
         Ok(snapshot())
     }
     fn apply(
         &mut self,
-        _: &Configuration,
+        configuration: &Configuration,
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
@@ -89,6 +93,8 @@ impl Platform for FakePlatform {
             return Err(DisplayError::new("topology_changed", "external change"));
         }
         guard()?;
+        let display = &configuration.displays[0];
+        self.applied_mode = Some((display.width, display.height, display.refresh));
         self.effects.push("apply");
         if self.apply_failure {
             return Err(
@@ -210,6 +216,77 @@ fn durable_journal_precedes_effects_and_only_owner_can_restore() {
     );
     assert_eq!(restored["restored"], true);
     assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert!(state.journal.is_none());
+}
+#[test]
+fn remapped_mode_reaches_prepare_and_durable_apply() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"MONITOR.ONE",
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{
+                    "mixed":[{
+                        "requested_resolution":"1280x720",
+                        "requested_fps":"60",
+                        "final_resolution":"1920x1080",
+                        "final_refresh_rate":"120"
+                    }]
+                }
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    let mode = Some((
+        1920,
+        1080,
+        Rational {
+            numerator: 120,
+            denominator: 1,
+        },
+    ));
+    assert_eq!(pipeline.platform.prepared_mode, mode);
+    assert_eq!(pipeline.platform.applied_mode, mode);
+    assert!(state.journal.is_some());
+}
+
+#[test]
+fn invalid_remapped_mode_never_prepares_provider_or_writes_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{"mixed":[{"final_resolution":"0x0"}]}
+            }
+        }),
+    );
+    assert_eq!(result["error"]["code"], "invalid_request");
+    assert!(pipeline.platform.prepared_mode.is_none());
+    assert!(pipeline.platform.applied_mode.is_none());
+    assert!(pipeline.platform.effects.is_empty());
     assert!(state.journal.is_none());
 }
 #[test]

@@ -1,3 +1,4 @@
+use crate::mode_remapping::{DisplayMode, ModeRemapping, Resolution, ResolverContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -14,6 +15,8 @@ pub enum Operation {
     },
     Apply {
         configuration: Configuration,
+        #[serde(default)]
+        mode_policy: Option<ModePolicy>,
     },
     Restore {
         lease: String,
@@ -21,6 +24,15 @@ pub enum Operation {
     Recover {
         lease: String,
     },
+}
+/// Session-selected mode policy for one display in a concrete configuration.
+/// The caller supplies client/launch facts; the provider does not infer them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModePolicy {
+    pub display_id: String,
+    pub remapping: ModeRemapping,
+    pub context: ResolverContext,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +74,43 @@ impl Rational {
     }
 }
 impl Configuration {
+    pub fn resolve_mode_policy(&mut self, policy: &ModePolicy) -> Result<(), DisplayError> {
+        self.validate()?;
+        let display = self
+            .displays
+            .iter_mut()
+            .find(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "invalid_request",
+                    "mode policy display is not in the configuration",
+                )
+            })?;
+        let requested = DisplayMode {
+            resolution: Some(Resolution {
+                width: display.width,
+                height: display.height,
+            }),
+            refresh_rate: Some(display.refresh),
+        };
+        let resolved = policy
+            .remapping
+            .resolve(policy.context, requested)
+            .map_err(|error| {
+                DisplayError::new(
+                    "invalid_request",
+                    format!("invalid display mode remapping: {error}"),
+                )
+            })?;
+        if let Some(resolution) = resolved.resolution {
+            display.width = resolution.width;
+            display.height = resolution.height;
+        }
+        if let Some(refresh_rate) = resolved.refresh_rate {
+            display.refresh = refresh_rate;
+        }
+        self.validate()
+    }
     pub fn validate(&self) -> Result<(), DisplayError> {
         if self.displays.is_empty() || self.displays.len() > MAX_DISPLAYS {
             return Err(DisplayError::new(

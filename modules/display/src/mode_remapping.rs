@@ -41,7 +41,8 @@ pub struct DisplayMode {
 /// Callers must provide these explicitly because option selection, client mode
 /// overrides, and the client's "Optimize game settings" choice are not config
 /// defaults owned by this policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolverContext {
     pub resolution_is_automatic: bool,
     pub refresh_rate_is_automatic: bool,

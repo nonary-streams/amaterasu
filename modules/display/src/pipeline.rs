@@ -271,7 +271,10 @@ impl<P: Platform> Pipeline<P> {
             );
         }
         match operation {
-            Operation::Apply { configuration } => {
+            Operation::Apply {
+                mut configuration,
+                mode_policy,
+            } => {
                 if journal.is_some() {
                     return complete(
                         send,
@@ -281,6 +284,11 @@ impl<P: Platform> Pipeline<P> {
                             "a display lease or recovery journal already exists",
                         ),
                     );
+                }
+                if let Some(policy) = mode_policy
+                    && let Err(error) = configuration.resolve_mode_policy(&policy)
+                {
+                    return complete(send, context.request, error.payload());
                 }
                 self.prepare(context, revision, configuration, send)
             }
