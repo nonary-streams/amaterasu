@@ -662,7 +662,11 @@ impl PreparationLease {
     }
 
     fn prepare_shutdown(&mut self) {
-        self.begin_stop();
+        if !self.stopping {
+            self.begin_stop();
+        } else {
+            self.advance();
+        }
     }
 }
 

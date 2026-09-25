@@ -1272,6 +1272,53 @@ fn prepare_only_failure_rolls_back_started_steps_and_cleanup_can_be_retried() {
 }
 
 #[test]
+fn shutdown_does_not_retry_a_failed_preparation_cleanup() {
+    let directory = test_directory("shutdown-preparation-failure");
+    let trace = directory.join("events");
+    let mut manager = ProcessManager::default();
+    let started = manager.handle(
+        "alice",
+        json!({
+            "action":"prepare",
+            "operation_id":"shutdown-preparation-failure",
+            "preparation":[{
+                "run":lifecycle_command(&trace, "prepare", "trace"),
+                "undo":lifecycle_command(&trace, "undo", "trace_fail_once"),
+            }],
+        }),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "shutdown-preparation-failure",
+        "ready",
+    );
+
+    assert_eq!(manager.shutdown(), Err("process_cleanup_failed"));
+    assert_eq!(trace_events(&trace), ["prepare", "undo"]);
+    let failed = manager.handle(
+        "alice",
+        json!({"action":"preparation_status","operation_id":"shutdown-preparation-failure"}),
+    );
+    assert_eq!(failed["preparation"]["state"], "cleanup_failed");
+
+    let retried = manager.handle(
+        "alice",
+        json!({"action":"preparation_retry","operation_id":"shutdown-preparation-failure"}),
+    );
+    assert_eq!(retried["preparation"]["state"], "cleaning");
+    wait_for_preparation_state(
+        &mut manager,
+        "alice",
+        "shutdown-preparation-failure",
+        "complete",
+    );
+    assert_eq!(trace_events(&trace), ["prepare", "undo", "undo"]);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn prepared_natural_exit_and_application_spawn_failure_both_undo() {
     let directory = test_directory("prepared-outcomes");
     let mut manager = ProcessManager::default();
