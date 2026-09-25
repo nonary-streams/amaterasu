@@ -160,6 +160,24 @@ fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     Ok(files)
 }
 
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
 fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static str> {
     let mut value = None;
     for name in [
@@ -182,7 +200,7 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
         )
         .map_err(|_| "legacy_authentication_layout")?;
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or_default().trim();
+            let line = strip_inline_comment(line).trim();
             if line.is_empty() || line.starts_with(';') {
                 continue;
             }
@@ -227,7 +245,7 @@ fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
         )
         .map_err(|_| "legacy_authentication_layout")?;
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or_default().trim();
+            let line = strip_inline_comment(line).trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -446,6 +464,35 @@ mod tests {
     }
 
     #[test]
+    fn imports_a_configured_credential_file_with_a_quoted_hash_and_trailing_comment() {
+        let source = temporary_directory("configured-credential-hash-source");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::write(
+            source.join("private/legacy#credentials.json"),
+            serde_json::json!({"username":"Admin","password":hash,"salt":salt}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "credentials_file = \"private/legacy#credentials.json\" # selected credentials\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Admin"
+        );
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
     fn imports_custom_primary_state_and_ignores_an_absent_auxiliary_state_file() {
         let source = temporary_directory("configured-state-source");
         let state = temporary_directory("configured-state-target");
@@ -495,6 +542,64 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(source);
         let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn imports_a_file_state_path_with_a_quoted_hash_and_trailing_comment() {
+        let source = temporary_directory("file-state-hash-source");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::write(
+            source.join("private/primary#state.json"),
+            serde_json::json!({"username":"Admin","password":hash,"salt":salt}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = \"private/primary#state.json\" # primary state\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Admin"
+        );
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn imports_a_vibeshine_file_state_path_with_a_quoted_hash_and_trailing_comment() {
+        let source = temporary_directory("vibeshine-file-state-hash-source");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        let salt = "AbCdEfGhIjKlMnOp";
+        let password = "correct horse battery staple";
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        std::fs::write(
+            source.join("private/primary#state.json"),
+            serde_json::json!({"username":"Admin","password":hash,"salt":salt}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = \"private/primary#state.json\" # primary state\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Admin"
+        );
+        let _ = std::fs::remove_dir_all(source);
     }
 
     #[test]
