@@ -2093,6 +2093,7 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
         vec![("playnite:10", playnite_entry("Persistent metadata"))],
     );
     batch["entries"][0]["source_flags"] = json!(8);
+    batch["entries"][0]["entry"]["config_overrides"] = json!({"nvenc_spatial_aq":false});
     let imported = backend.run_for(
         &mut playnite,
         batch,
@@ -2105,6 +2106,7 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
     let first_marker = backend.entries[first_marker_key].clone();
     let first_added_at = first_marker["added_at_unix"].as_i64().unwrap();
     assert_eq!(first_marker["source_flags"], 8);
+    assert_eq!(first_marker["config_overrides"]["nvenc_spatial_aq"], false);
 
     begin = backend.run_for(
         &mut playnite,
@@ -2133,6 +2135,10 @@ fn playnite_marker_keeps_first_import_time_and_legacy_source_flags_on_refresh() 
     let refreshed_marker = &backend.entries[first_marker_key];
     assert_eq!(refreshed_marker["added_at_unix"], first_added_at);
     assert_eq!(refreshed_marker["source_flags"], 8);
+    assert_eq!(
+        refreshed_marker["config_overrides"]["nvenc_spatial_aq"],
+        false
+    );
 }
 
 #[test]

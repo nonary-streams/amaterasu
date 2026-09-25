@@ -137,6 +137,13 @@ Missing or null values inherit; explicit `auto` remains present in the applicati
 snapshot. Launch preserves the catalog value in launch and status records without
 resolving global or client precedence.
 
+`nvenc_spatial_aq` is read as a strict optional boolean: absent or null inherits,
+while explicit `false` remains present in the launch snapshot. Wrong JSON types
+reject the catalog response. Launch, status, and same-operation retries retain the
+value captured from the catalog revision used to start the application. Launch
+does not resolve global or client precedence or project this value into nested
+encode settings; L02 supplies route-aware resolution and projection.
+
 `ok:true` acknowledges a retained lifecycle record, not necessarily a successful
 launch. Inspect `state`: `starting`, `active`, `stopping`, `stopped`, `cancelled`,
 `failed`, or `cleanup_failed`. A normal launch completes its response after

@@ -1024,6 +1024,66 @@ fn amd_av1_latency_mode_is_retained_across_launch_retry_and_status() {
 }
 
 #[test]
+fn nvenc_spatial_aq_is_retained_across_launch_retry_and_status() {
+    let mut harness = Harness::new();
+    harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":false}));
+    let mut pipeline = pipeline();
+
+    let started = harness.request(&mut pipeline, "alice", launch("nvenc-spatial-aq"));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(
+        started["launch"]["config_overrides"],
+        json!({"nvenc_spatial_aq":false})
+    );
+    let launch_id = started["launch"]["launch_id"].as_u64().unwrap();
+
+    // Catalog edits do not replace the settings captured by the launch.
+    harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":true}));
+    let retry = harness.request(&mut pipeline, "alice", launch("nvenc-spatial-aq"));
+    assert_eq!(
+        retry["launch"]["config_overrides"],
+        json!({"nvenc_spatial_aq":false})
+    );
+
+    let status = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"status","launch_id":launch_id}),
+    );
+    assert_eq!(
+        status["launch"]["config_overrides"],
+        json!({"nvenc_spatial_aq":false})
+    );
+}
+
+#[test]
+fn invalid_nvenc_spatial_aq_fails_before_session_creation() {
+    for (index, invalid) in [json!("false"), json!(0), json!([]), json!({})]
+        .into_iter()
+        .enumerate()
+    {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"nvenc_spatial_aq":invalid}));
+        let mut pipeline = pipeline();
+
+        let failed = harness.request(
+            &mut pipeline,
+            "alice",
+            launch(&format!("invalid-nvenc-spatial-aq-{index}")),
+        );
+        assert_eq!(failed["launch"]["state"], "failed", "{failed}");
+        assert_eq!(
+            failed["launch"]["failure"], "invalid_catalog_response",
+            "{failed}"
+        );
+        assert!(harness.sessions.is_empty());
+        assert!(!harness.commands.iter().any(|(service, payload, _)| {
+            service == crate::workflow::SESSION && payload["action"] == "create"
+        }));
+    }
+}
+
+#[test]
 fn invalid_amd_av1_latency_mode_fails_before_session_creation() {
     for (index, invalid) in [
         json!("AUTO"),

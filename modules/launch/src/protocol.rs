@@ -709,6 +709,8 @@ pub struct ApplicationConfigOverrides {
     pub back_button_timeout: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amd_av1_latency_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_spatial_aq: Option<bool>,
 }
 
 impl ApplicationConfigOverrides {
@@ -740,6 +742,7 @@ impl ApplicationConfigOverrides {
             && self.audio_sink_capture_only.is_none()
             && self.back_button_timeout.is_none()
             && self.amd_av1_latency_mode.is_none()
+            && self.nvenc_spatial_aq.is_none()
     }
 }
 
@@ -1141,6 +1144,39 @@ mod tests {
                 }))
                 .is_err(),
                 "accepted non-string mode {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_nvenc_spatial_aq_override_preserves_sparse_boolean() {
+        let missing = ApplicationConfigOverrides::default();
+        let null: ApplicationConfigOverrides =
+            serde_json::from_value(json!({"nvenc_spatial_aq":null})).unwrap();
+        assert!(missing.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(missing.nvenc_spatial_aq, None);
+        assert_eq!(null.nvenc_spatial_aq, None);
+        assert_eq!(serde_json::to_value(missing).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        let disabled: ApplicationConfigOverrides =
+            serde_json::from_value(json!({"nvenc_spatial_aq":false})).unwrap();
+        disabled.validate().unwrap();
+        assert_eq!(disabled.nvenc_spatial_aq, Some(false));
+        assert!(!disabled.is_empty());
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            json!({"nvenc_spatial_aq":false})
+        );
+
+        for invalid in [json!("false"), json!(0), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ApplicationConfigOverrides>(json!({
+                    "nvenc_spatial_aq":invalid
+                }))
+                .is_err(),
+                "accepted non-boolean NVENC spatial AQ value {invalid}"
             );
         }
     }

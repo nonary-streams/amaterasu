@@ -41,8 +41,13 @@ an explicit `auto` remains an application override. Catalog validates, stores,
 and returns this token unchanged; it does not resolve global or client policy.
 Existing entries omit the field, so no catalog migration is needed.
 
+The optional `nvenc_spatial_aq` override is a strict boolean. Omit it or set it
+to null to inherit; explicit `true` and `false` values are stored and returned,
+including through provider-marker refreshes. Existing entries and markers may
+omit this field, so no catalog or marker version bump is needed.
+
 ```json
-{"action":"create","expected_revision":0,"entry":{"name":"AV1 tuned game","config_overrides":{"amd_av1_latency_mode":"power_saving"},"launch":{"kind":"application","path":"/games/example"}}}
+{"action":"create","expected_revision":0,"entry":{"name":"AV1 tuned game","config_overrides":{"amd_av1_latency_mode":"power_saving","nvenc_spatial_aq":false},"launch":{"kind":"application","path":"/games/example"}}}
 ```
 
 Executable entries can include ordered preparation and paired undo commands:

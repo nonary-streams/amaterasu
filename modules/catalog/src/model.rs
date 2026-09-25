@@ -90,6 +90,8 @@ pub struct ConfigOverrides {
     pub mouse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amd_av1_latency_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc_spatial_aq: Option<bool>,
 }
 
 impl ConfigOverrides {
@@ -144,6 +146,7 @@ impl ConfigOverrides {
             && self.keyboard.is_none()
             && self.mouse.is_none()
             && self.amd_av1_latency_mode.is_none()
+            && self.nvenc_spatial_aq.is_none()
     }
 }
 
@@ -783,6 +786,56 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn nvenc_spatial_aq_override_is_sparse_boolean_and_roundtrips_entries() {
+        let absent = ConfigOverrides::default();
+        let null: ConfigOverrides =
+            serde_json::from_value(json!({"nvenc_spatial_aq":null})).unwrap();
+        assert_eq!(absent.nvenc_spatial_aq, None);
+        assert_eq!(null.nvenc_spatial_aq, None);
+        assert!(absent.is_empty());
+        assert!(null.is_empty());
+        assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(null).unwrap(), json!({}));
+
+        for enabled in [true, false] {
+            let overrides: ConfigOverrides = serde_json::from_value(json!({
+                "nvenc_spatial_aq":enabled
+            }))
+            .unwrap();
+            overrides.validate().unwrap();
+            assert_eq!(overrides.nvenc_spatial_aq, Some(enabled));
+            assert!(!overrides.is_empty());
+            assert_eq!(
+                serde_json::to_value(overrides).unwrap(),
+                json!({"nvenc_spatial_aq":enabled})
+            );
+        }
+
+        let entry: Entry = serde_json::from_value(json!({
+            "name":"NVENC spatial AQ disabled",
+            "config_overrides":{"nvenc_spatial_aq":false},
+            "launch":{"kind":"application","path":"/games/example"}
+        }))
+        .unwrap();
+        entry.validate().unwrap();
+        let stored = serde_json::to_value(entry).unwrap();
+        assert_eq!(stored["config_overrides"]["nvenc_spatial_aq"], false);
+        let restored: Entry = serde_json::from_value(stored).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.config_overrides.nvenc_spatial_aq, Some(false));
+
+        for invalid in [json!("false"), json!(0), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ConfigOverrides>(json!({
+                    "nvenc_spatial_aq":invalid
+                }))
+                .is_err(),
+                "accepted non-boolean spatial AQ value {invalid}"
+            );
+        }
     }
 
     #[test]
