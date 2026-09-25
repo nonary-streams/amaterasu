@@ -645,6 +645,13 @@ fn validate_virtual_mix(
     Ok(())
 }
 
+struct OpenSelectedOptions {
+    desired_layout: Option<ChannelLayout>,
+    preferred_valid_bits: Option<u16>,
+    capture_sink_without_routing: bool,
+    follow_console_default: bool,
+}
+
 pub struct Capture {
     capture: IAudioCaptureClient,
     client: IAudioClient,
@@ -736,10 +743,12 @@ impl Capture {
                 &enumerator,
                 device,
                 endpoint,
-                desired_layout,
-                preferred_valid_bits,
-                effective_capture_only,
-                follow_console_default,
+                OpenSelectedOptions {
+                    desired_layout,
+                    preferred_valid_bits,
+                    capture_sink_without_routing: effective_capture_only,
+                    follow_console_default,
+                },
             )
         }
     }
@@ -768,10 +777,12 @@ impl Capture {
                 &enumerator,
                 device,
                 endpoint,
-                desired_layout,
-                config.preferred_valid_bits,
-                config.capture_sink_without_routing,
-                config.follow_console_default,
+                OpenSelectedOptions {
+                    desired_layout,
+                    preferred_valid_bits: config.preferred_valid_bits,
+                    capture_sink_without_routing: config.capture_sink_without_routing,
+                    follow_console_default: config.follow_console_default,
+                },
             )
         }
     }
@@ -785,11 +796,14 @@ impl Capture {
         enumerator: &IMMDeviceEnumerator,
         device: IMMDevice,
         endpoint: String,
-        desired_layout: Option<ChannelLayout>,
-        preferred_valid_bits: Option<u16>,
-        capture_sink_without_routing: bool,
-        follow_console_default: bool,
+        options: OpenSelectedOptions,
     ) -> AudioResult<Self> {
+        let OpenSelectedOptions {
+            desired_layout,
+            preferred_valid_bits,
+            capture_sink_without_routing,
+            follow_console_default,
+        } = options;
         // SAFETY: the caller created this device and enumerator in the live
         // worker apartment; all COM operations remain on that thread.
         unsafe {
