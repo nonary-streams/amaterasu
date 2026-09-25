@@ -674,3 +674,31 @@ The production edit combines the capture-stage, explicit rejection, and `unsuppo
 ### Remaining parity gaps
 
 This is a lint-only correction and adds no persistence, defaults, validation, management authority/editor behavior, host registration, scoped launch projection, provider effect, or platform qualification. Keep `global:capture` pending until those requirements and coordinator validation are reviewed; Windows DXGI/WGC runtime qualification also remains outstanding. No stable ID is marked verified by this slice.
+
+## Slice 19: WGC disabled-smoothing missed-slot regression
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Lane base SHA: `74446f3209ffd6d0280696537e2081bd0cddf1ab`
+- Worker source commit: `8a01b6ec281a671cb03b53f33240864a1c77caf5`
+- Lane code commit: `bc9cf356dd8c285c59838b8849d07a1472d10756`
+- Worker/lane tree: `9cc463d7d0ebf3db147b6b56e4e534b1881b2e58`
+- Current main validation tip: `36c5ab9962f63fdd2a5cd1f231ff49bde63d55b7`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Stable ID and scope: `global:wgc_pacing_smoothing`, global-only boolean, default `true`; the ID remains `pending`.
+- Path reservation: outbox `luna-03-0041-wgc-disabled-smoothing-regression-reservation.json`, published before worker startup. The slice changed only `modules/video/src/pipeline/pacing.rs`.
+
+### Regression and review
+
+The new test, `disabled_smoothing_keeps_raw_source_anchor_after_a_missed_slot`, starts a source-clock mapping at 100,000 microseconds and monotonic time zero, records a missed slot at 16,666,666 nanoseconds, and then delivers source time 133,500 microseconds with an observation delayed to 41,500,000 nanoseconds. With smoothing disabled, it asserts the group anchor remains the raw mapped source time of 33,500,000 nanoseconds and the next slot is 50,166,666 nanoseconds. Existing enabled-mode phase snapping is unchanged. Parent review found the test setup and expected timestamps consistent with the source-clock and pacing calculations; no production behavior changed.
+
+### Worker and checks
+
+- Worker `/root/wgc_disabled_smoothing_regression` used isolated worktree `D:/sources/worktrees/amaterasu-wgc-disabled-smoothing-xhigh`, branch `codex/luna03-wgc-disabled-smoothing-xhigh`, based on the clean lane base above. Its verified session attribution was `gpt-6-luna` / `xhigh`, session `01a0d6d4-ae3a-7143-9b2f-d8bf5004b7e6`. It committed only `modules/video/src/pipeline/pacing.rs` as `8a01b6ec281a671cb03b53f33240864a1c77caf5`, with the required plan trailers and configured Nonary identity.
+- Parent verified the exact worker parent, assigned path, commit trailers, model/effort, and clean worker worktree; reviewed the full test diff; and cherry-picked it into the lane as `bc9cf356dd8c285c59838b8849d07a1472d10756`. Worker and lane trees match.
+- Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/pipeline/pacing.rs`, `git diff --check`, and `git show --check`.
+- Cargo tests, builds, and Clippy were not run in the lightweight worktrees. Before this new test was added, the coordinator reported on main tip `36c5ab9962f63fdd2a5cd1f231ff49bde63d55b7` that `cargo fmt --check -p amaterasu-video` passed, `cargo test -p amaterasu-video` passed 80/80, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings` passed. The coordinator should rerun those three package gates after cherry-picking this regression.
+
+### Remaining parity gaps
+
+This is regression coverage only; it does not add or change WGC pacing behavior. Keep `global:wgc_pacing_smoothing` pending until the new test executes in the coordinator checkout, Windows WGC runtime behavior is qualified, and L02 persistence/defaults plus L05 global launch projection and L06 management readback/editor behavior are complete. No stable ID is marked verified by this slice.
