@@ -2848,7 +2848,7 @@ mod tests {
             .entry("wan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_WAN_ENCRYPTION_MODE));
         values
-            .entry("nvenc_spatial_aq".into())
+            .entry("nvenc_spatial_aq")
             .or_insert_with(|| json!(false));
         payload
     }
@@ -4506,7 +4506,7 @@ mod tests {
         assert_eq!(restarted.lan_encryption_mode(), 2);
         assert_eq!(restarted.wan_encryption_mode(), 0);
         let readback = restarted.settings_payload();
-        assert!(readback["nvenc_spatial_aq"]);
+        assert_eq!(readback["nvenc_spatial_aq"], true);
         assert_eq!(
             readback["configured_legacy_global_preparation"][0]["do"],
             "  echo $(DISPLAY)  "
@@ -4529,7 +4529,10 @@ mod tests {
         assert!(!old_v17_document.nvenc_spatial_aq);
         let mut old_v17_restart = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         old_v17_restart.apply_document(old_v17_document);
-        assert!(!old_v17_restart.settings_payload()["nvenc_spatial_aq"]);
+        assert_eq!(
+            old_v17_restart.settings_payload()["nvenc_spatial_aq"],
+            false
+        );
     }
 
     #[test]
@@ -4593,7 +4596,7 @@ mod tests {
         });
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         restarted.apply_document(parse_document(&persisted).unwrap());
-        assert!(!restarted.settings_payload()["nvenc_spatial_aq"]);
+        assert_eq!(restarted.settings_payload()["nvenc_spatial_aq"], false);
     }
 
     #[test]
