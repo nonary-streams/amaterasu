@@ -73,6 +73,7 @@ impl HistoryStore {
             last_prune: empty_prune_report(),
         };
         store.close_interrupted_sessions(now_unix)?;
+        store.trim_existing_rows()?;
         store.prune_best_effort(now_unix);
         Ok(store)
     }
@@ -491,6 +492,25 @@ impl HistoryStore {
         transaction.commit()?;
         Ok(())
     }
+
+    /// Upgraded databases can contain rows written before per-session caps
+    /// existed. Trim them before the first management read, even when the
+    /// product policy has not loaded or recording is disabled.
+    fn trim_existing_rows(&mut self) -> Result<(), HistoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let overfull_samples = overfull_sessions(&transaction, "samples", MAX_STORED_SAMPLES)?;
+        for session_id in overfull_samples {
+            trim_samples(&transaction, &session_id)?;
+        }
+        let overfull_events = overfull_sessions(&transaction, "events", MAX_STORED_EVENTS)?;
+        for session_id in overfull_events {
+            trim_events(&transaction, &session_id)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 fn apply_schema(connection: &Connection) -> Result<(), HistoryError> {
@@ -694,6 +714,21 @@ fn trim_events(connection: &Connection, session_id: &str) -> Result<(), HistoryE
         params![session_id, MAX_STORED_EVENTS as i64],
     )?;
     Ok(())
+}
+
+fn overfull_sessions(
+    connection: &Connection,
+    table: &str,
+    limit: usize,
+) -> Result<Vec<String>, HistoryError> {
+    let sql = match table {
+        "samples" => "SELECT session_id FROM samples GROUP BY session_id HAVING count(*) > ?1",
+        "events" => "SELECT session_id FROM events GROUP BY session_id HAVING count(*) > ?1",
+        _ => return Err(HistoryError::Invalid("invalid history table")),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map([limit as i64], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn estimate_live_bytes(connection: &Connection) -> Result<u64, HistoryError> {
@@ -1391,5 +1426,90 @@ mod tests {
         assert_eq!(detail.event_count, MAX_STORED_EVENTS);
         assert_eq!(detail.samples.last().unwrap().recorded_at_unix, 10_000);
         assert_eq!(detail.events.last().unwrap().event_type, "stream_ended");
+    }
+
+    #[test]
+    fn reopening_an_overfull_ended_history_trims_it_before_policy_load() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        {
+            let mut store = HistoryStore::open(&path, 100).unwrap();
+            configure(&mut store, HistorySettings::default(), 100);
+            store.begin_session(&metadata("legacy-large"), 100).unwrap();
+            store.end_session("legacy-large", 200).unwrap();
+            store.begin_session(&metadata("small"), 100).unwrap();
+            store.end_session("small", 200).unwrap();
+            let transaction = store.connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO samples (session_id, recorded_at_unix, frames_sent,
+                     bytes_sent, dropped_frames, actual_fps, actual_bitrate_kbps,
+                     encode_latency_ms) VALUES ('legacy-large', ?1, 0, 0, 0, 0, 0, 0)",
+                    )
+                    .unwrap();
+                for timestamp in 1..=MAX_STORED_SAMPLES as i64 + 3 {
+                    insert.execute([timestamp]).unwrap();
+                }
+            }
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO events (session_id, recorded_at_unix, event_type, payload)
+                     VALUES ('legacy-large', ?1, 'marker', NULL)",
+                    )
+                    .unwrap();
+                for timestamp in 1000..=1002 + MAX_STORED_EVENTS as i64 {
+                    insert.execute([timestamp]).unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        let mut reopened = HistoryStore::open(&path, 500).unwrap();
+        assert!(!reopened.status().unwrap().configuration_ready);
+        assert_eq!(
+            reopened
+                .session_detail("legacy-large")
+                .unwrap()
+                .sample_count,
+            MAX_STORED_SAMPLES
+        );
+        assert_eq!(
+            reopened.session_detail("legacy-large").unwrap().event_count,
+            MAX_STORED_EVENTS
+        );
+        let oldest_sample: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT min(recorded_at_unix) FROM samples WHERE session_id = 'legacy-large'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest_sample, 4);
+        let oldest_event: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT min(recorded_at_unix) FROM events WHERE session_id = 'legacy-large'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest_event, 1003);
+        assert_eq!(reopened.session_detail("small").unwrap().event_count, 2);
+
+        configure(
+            &mut reopened,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 0,
+                db_size_limit_mb: 0,
+            },
+            500,
+        );
+        assert!(!reopened.settings().1);
+        assert_eq!(reopened.status().unwrap().samples, MAX_STORED_SAMPLES);
+        assert_eq!(reopened.status().unwrap().events, MAX_STORED_EVENTS + 2);
     }
 }
