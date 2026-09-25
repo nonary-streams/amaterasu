@@ -517,15 +517,6 @@ impl Controller {
         if !peer.paired() {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
-        if self
-            .global_max_bitrate_kbps
-            .is_some_and(|bitrate| bitrate < 100)
-        {
-            return Some(private_error(
-                503,
-                "configured maximum bitrate is below the supported 100 kbps encoder minimum",
-            ));
-        }
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
             || !config.profile.accepts(&request)
