@@ -1,3 +1,4 @@
+use amaterasu_gamestream::network::{NetworkEncryptionPolicy, VideoEncryptionMode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -120,6 +121,13 @@ pub struct Discovery {
     pub audio_ping_payload: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoEncryptionPolicySnapshot {
+    pub lan_mode: i64,
+    pub wan_mode: i64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryTokens {
     pub video: [u8; DISCOVERY_TOKEN_BYTES],
@@ -176,6 +184,8 @@ impl Encryption {
 pub struct Open {
     pub peer_ip: IpAddr,
     #[serde(default)]
+    pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
+    #[serde(default)]
     pub video_port: Option<u16>,
     #[serde(default)]
     pub audio_port: Option<u16>,
@@ -200,6 +210,7 @@ pub struct Open {
 
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> TransportResult<()> {
+        self.validate_video_encryption_policy()?;
         validate_ping_timeout_ms(self.ping_timeout_ms)?;
         if self.peer_ip.is_unspecified()
             || self.peer_ip.is_multicast()
@@ -250,6 +261,27 @@ impl Open {
             encryption.key()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_video_encryption_policy(&self) -> TransportResult<()> {
+        let Some(snapshot) = self.video_encryption_policy else {
+            return Ok(());
+        };
+        let policy = NetworkEncryptionPolicy {
+            lan_mode: VideoEncryptionMode::try_from(snapshot.lan_mode)
+                .map_err(|_| "invalid_encryption")?,
+            wan_mode: VideoEncryptionMode::try_from(snapshot.wan_mode)
+                .map_err(|_| "invalid_encryption")?,
+        };
+        let announced_video_encryption = self
+            .encryption
+            .as_ref()
+            .is_some_and(|encryption| encryption.video);
+        if policy.accepts_video_encryption_for_peer(self.peer_ip, announced_video_encryption) {
+            Ok(())
+        } else {
+            Err("invalid_encryption")
+        }
     }
 
     fn valid_audio_wire_length(&self) -> bool {
@@ -332,6 +364,66 @@ mod tests {
         assert!(request.stream_audio);
         assert!(request.validate(false).is_ok());
         assert_eq!(request.video.max_batch_size_kb, 64);
+    }
+
+    fn open_with_video_policy(
+        peer_ip: &str,
+        lan_mode: i64,
+        wan_mode: i64,
+        encrypted: bool,
+    ) -> Open {
+        serde_json::from_value(json!({
+            "peer_ip":peer_ip,
+            "video_port":50001,
+            "audio_port":50002,
+            "audio":{"packet_ms":10,"channels":2,"wire_payload_bytes":4},
+            "encryption": if encrypted {
+                json!({
+                    "key_hex":"000102030405060708090a0b0c0d0e0f",
+                    "key_id":1,
+                    "video":true,
+                    "audio":false
+                })
+            } else {
+                serde_json::Value::Null
+            },
+            "video_encryption_policy":{"lan_mode":lan_mode,"wan_mode":wan_mode}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mandatory_lan_policy_requires_the_client_to_announce_video_encryption() {
+        let encrypted = open_with_video_policy("192.168.1.20", 2, 0, true);
+        assert!(encrypted.validate(true).is_ok());
+
+        let plaintext = open_with_video_policy("192.168.1.20", 2, 0, false);
+        assert_eq!(plaintext.validate(true), Err("invalid_encryption"));
+    }
+
+    #[test]
+    fn never_wan_policy_requires_plaintext_video() {
+        let plaintext = open_with_video_policy("8.8.8.8", 0, 0, false);
+        assert!(plaintext.validate(true).is_ok());
+
+        let encrypted = open_with_video_policy("8.8.8.8", 0, 0, true);
+        assert_eq!(encrypted.validate(true), Err("invalid_encryption"));
+    }
+
+    #[test]
+    fn opportunistic_policy_accepts_either_video_encryption_choice() {
+        for encrypted in [false, true] {
+            let request = open_with_video_policy("192.168.1.20", 1, 1, encrypted);
+            assert!(request.validate(true).is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_numeric_video_encryption_modes_are_rejected() {
+        for (lan_mode, wan_mode) in [(-1, 0), (0, -1), (3, 0), (0, 3)] {
+            let request = open_with_video_policy("192.168.1.20", lan_mode, wan_mode, false);
+            assert_eq!(request.validate(true), Err("invalid_encryption"));
+        }
     }
 
     #[test]

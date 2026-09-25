@@ -41,6 +41,7 @@ pub struct Stream {
 
 impl Stream {
     pub fn open(owner: &str, request: &Open) -> TransportResult<Self> {
+        request.validate_video_encryption_policy()?;
         let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
         let (video, audio) = packetizers(request)?;
         let (video_sealer, audio_sealer) = ciphers(request)?;

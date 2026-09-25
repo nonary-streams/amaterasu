@@ -15,6 +15,7 @@ pub(crate) fn receivers() -> (UdpSocket, UdpSocket) {
 pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> Open {
     Open {
         peer_ip: "127.0.0.1".parse().unwrap(),
+        video_encryption_policy: None,
         video_port: Some(video.local_addr().unwrap().port()),
         audio_port: Some(audio.local_addr().unwrap().port()),
         discovery: None,
@@ -38,6 +39,22 @@ pub(crate) fn request(video: &UdpSocket, audio: &UdpSocket, encrypted: bool) -> 
         }),
         operation_id: None,
     }
+}
+
+#[test]
+fn open_rejects_policy_mismatch_before_udp_setup() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video_encryption_policy = Some(VideoEncryptionPolicySnapshot {
+        lan_mode: 2,
+        wan_mode: 0,
+    });
+    settings.video_bind = Some(video.local_addr().unwrap());
+
+    assert!(matches!(
+        Stream::open("owner", &settings),
+        Err("invalid_encryption")
+    ));
 }
 
 pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
