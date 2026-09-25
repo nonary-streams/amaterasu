@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
@@ -21,30 +22,95 @@ function sessionReply(bearer, refreshToken, expiry, refreshExpiry, overrides = {
   };
 }
 
-function apiHarness(responder) {
+function memoryStorage(failures = {}) {
+  const values = new Map();
+  return {
+    getItem(key) {
+      if (failures.get) throw new Error("storage get blocked");
+      return values.has(key) ? values.get(key) : null;
+    },
+    setItem(key, value) {
+      if (failures.set) throw new Error("storage set blocked");
+      values.set(key, String(value));
+    },
+    removeItem(key) {
+      if (failures.remove) throw new Error("storage remove blocked");
+      values.delete(key);
+    },
+    values,
+  };
+}
+
+function lockManager() {
+  const queues = new Map();
+  return {
+    request(name, _options, callback) {
+      const previous = queues.get(name) ?? Promise.resolve();
+      let release;
+      const held = new Promise((resolve) => release = resolve);
+      const tail = previous.then(() => held);
+      queues.set(name, tail);
+      return previous.then(async () => {
+        try {
+          return await callback({ name });
+        } finally {
+          release();
+          if (queues.get(name) === tail) queues.delete(name);
+        }
+      });
+    },
+  };
+}
+
+function apiHarness(responder, options = {}) {
   const calls = [];
+  const storage = options.storage ?? memoryStorage();
+  const storageListeners = [];
   const context = vm.createContext({
     Error,
     URL,
     AbortController,
+    crypto: webcrypto,
     clearTimeout,
+    localStorage: storage,
+    navigator: options.locks === null ? undefined : { locks: options.locks ?? lockManager() },
     location: { origin: "http://127.0.0.1:5000" },
-    window: { setTimeout },
+    window: {
+      setTimeout,
+      addEventListener: (name, listener) => {
+        if (name === "storage") storageListeners.push(listener);
+      },
+    },
     fetch: async (url, options) => {
       calls.push({ url, options });
       return responder(url, options);
     },
   });
+  if (options.storageGetterThrows)
+    Object.defineProperty(context, "localStorage", {
+      configurable: true,
+      get() {
+        throw new Error("storage getter blocked");
+      },
+    });
   vm.runInContext(
     ts.transpile(readFileSync("src/api.ts", "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }),
     context,
   );
-  return { api: new context.Amaterasu.Api(""), calls };
+  return {
+    api: new context.Amaterasu.Api(""),
+    calls,
+    storage,
+    dispatchStorage: (key, newValue) => {
+      for (const listener of storageListeners)
+        listener({ key, newValue, storageArea: storage });
+    },
+  };
 }
 
-test("login carries remember choice and protected requests use memory-only bearer auth", async () => {
+test("remembered login carries the choice and protected requests use bearer auth", async () => {
   const bearer = secret("a");
   const refreshToken = secret("b");
   const { api, calls } = apiHarness((url) =>
@@ -231,5 +297,475 @@ test("API token scope failures are surfaced without refresh or retry", async () 
     api.post("catalog/update", { expected_revision: 1 }),
     /changed elsewhere/,
   );
+  assert.equal(calls.length, 1);
+});
+
+test("remembered sessions restore after reload without a network request", async () => {
+  const bearer = secret("a");
+  const refreshToken = secret("b");
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : { ok: true, entries: [] },
+    );
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("admin", "password", true);
+
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const saved = JSON.parse(storage.getItem(storageKey));
+  assert.equal(saved.version, 1);
+  assert.equal(saved.remember_me, true);
+  assert.equal(saved.bearer, bearer);
+  assert.equal(saved.refresh_token, refreshToken);
+
+  const reloaded = apiHarness(responder, { storage, locks });
+  assert.equal(await reloaded.api.restoreSession(), true);
+  assert.equal(reloaded.calls.length, 0);
+  await reloaded.api.post("catalog/list");
+  assert.equal(
+    reloaded.calls[0].options.headers.Authorization,
+    `Bearer ${bearer}`,
+  );
+});
+
+test("expired remembered storage clears without a network request", async () => {
+  const bearer = secret("c");
+  const refreshToken = secret("d");
+  const storage = memoryStorage();
+  const { api, calls } = apiHarness(
+    (url) =>
+      Response.json(
+        url.endsWith("/auth/login")
+          ? sessionReply(bearer, refreshToken, future(-10), future(-5), {
+              remember_me: true,
+            })
+          : { ok: true },
+      ),
+    { storage },
+  );
+  await api.login("admin", "password", true);
+  assert.equal(await api.restoreSession(), false);
+  assert.equal(calls.length, 1);
+  assert.equal(storage.getItem("amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000"), null);
+});
+
+test("restore proactively rotates a remembered session near access expiry", async () => {
+  const oldBearer = secret("e");
+  const oldRefresh = secret("f");
+  const newBearer = secret("1");
+  const newRefresh = secret("2");
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(oldBearer, oldRefresh, future(5), future(600), {
+            remember_me: true,
+          })
+        : url.endsWith("/auth/refresh")
+          ? sessionReply(newBearer, newRefresh, future(3600), future(7200), {
+              remember_me: true,
+            })
+          : { ok: true },
+    );
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("admin", "password", true);
+  const reloaded = apiHarness(responder, { storage, locks });
+
+  assert.equal(await reloaded.api.restoreSession(), true);
+  assert.equal(reloaded.calls.length, 1);
+  assert.equal(reloaded.calls[0].url, "http://127.0.0.1:5000/v1/auth/refresh");
+  assert.deepEqual(JSON.parse(reloaded.calls[0].options.body), {
+    refresh_token: oldRefresh,
+  });
+  const saved = JSON.parse(
+    storage.getItem("amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000"),
+  );
+  assert.equal(saved.bearer, newBearer);
+  assert.equal(saved.refresh_token, newRefresh);
+  assert.equal(saved.refreshing, false);
+});
+
+test("two API instances serialize refresh and adopt the rotated pair", async () => {
+  const oldBearer = secret("3");
+  const oldRefresh = secret("4");
+  const newBearer = secret("5");
+  const newRefresh = secret("6");
+  const storage = memoryStorage();
+  const locks = lockManager();
+  let refreshes = 0;
+  const responder = async (url, options) => {
+    if (url.endsWith("/auth/login"))
+      return Response.json(
+        sessionReply(oldBearer, oldRefresh, future(3600), future(7200), {
+          remember_me: true,
+        }),
+      );
+    if (url.endsWith("/auth/refresh")) {
+      refreshes += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return Response.json(
+        sessionReply(newBearer, newRefresh, future(3600), future(7200), {
+          remember_me: true,
+        }),
+      );
+    }
+    const authorization = options.headers.Authorization;
+    return authorization === `Bearer ${oldBearer}`
+      ? Response.json({ ok: false, code: "unauthorized" }, { status: 401 })
+      : Response.json({ ok: true, entries: [] });
+  };
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("admin", "password", true);
+  const second = apiHarness(responder, { storage, locks });
+  assert.equal(await second.api.restoreSession(), true);
+
+  await Promise.all([
+    first.api.post("catalog/list"),
+    second.api.post("catalog/list"),
+  ]);
+  assert.equal(refreshes, 1);
+  const refreshCalls = [...first.calls, ...second.calls].filter((call) =>
+    call.url.endsWith("/auth/refresh"),
+  );
+  assert.equal(refreshCalls.length, 1);
+  assert.deepEqual(JSON.parse(refreshCalls[0].options.body), {
+    refresh_token: oldRefresh,
+  });
+  for (const harness of [first, second]) {
+    const catalogCalls = harness.calls.filter((item) =>
+      item.url.endsWith("/catalog/list"),
+    );
+    assert.equal(catalogCalls.length, 2);
+    assert.equal(catalogCalls[0].options.headers.Authorization, `Bearer ${oldBearer}`);
+    assert.equal(catalogCalls[1].options.headers.Authorization, `Bearer ${newBearer}`);
+  }
+});
+
+test("logout during refresh prevents a late response restoring the session", async () => {
+  const bearer = secret("7");
+  const refreshToken = secret("8");
+  const rotatedBearer = secret("9");
+  const rotatedRefresh = secret("a");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  let refreshStarted;
+  const started = new Promise((resolve) => refreshStarted = resolve);
+  let releaseRefresh;
+  const responder = (url) => {
+    if (url.endsWith("/auth/login"))
+      return Response.json(
+        sessionReply(bearer, refreshToken, future(5), future(7200), {
+          remember_me: true,
+        }),
+      );
+    if (url.endsWith("/auth/refresh")) {
+      refreshStarted();
+      return new Promise((resolve) => {
+        releaseRefresh = () => resolve(Response.json(
+          sessionReply(rotatedBearer, rotatedRefresh, future(3600), future(7200), {
+            remember_me: true,
+          }),
+        ));
+      });
+    }
+    return Response.json({ ok: true });
+  };
+  const { api, calls } = apiHarness(responder, { storage });
+  await api.login("admin", "password", true);
+  const pendingRequest = api.post("catalog/list").catch(() => undefined);
+  await started;
+  const pendingLogout = api.logout();
+  assert.equal(storage.getItem(storageKey), null);
+  releaseRefresh();
+  await Promise.all([pendingRequest, pendingLogout]);
+
+  assert.equal(api.subject, "");
+  assert.equal(storage.getItem(storageKey), null);
+  const lateRevocations = calls.filter(
+    (call) => call.url.endsWith("/auth/logout") &&
+      JSON.parse(call.options.body).refresh_token === rotatedRefresh,
+  );
+  assert.equal(lateRevocations.length, 1);
+});
+
+test("suspend during refresh leaves a marker that reload clears without replay", async () => {
+  const bearer = secret("b");
+  const refreshToken = secret("c");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  let refreshStarted;
+  const started = new Promise((resolve) => refreshStarted = resolve);
+  const responder = (url, options) => {
+    if (url.endsWith("/auth/login"))
+      return Response.json(
+        sessionReply(bearer, refreshToken, future(5), future(7200), {
+          remember_me: true,
+        }),
+      );
+    if (url.endsWith("/auth/refresh")) {
+      refreshStarted();
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("refresh interrupted by page lifecycle");
+          error.name = "AbortError";
+          reject(error);
+        });
+      });
+    }
+    return Response.json({ ok: true });
+  };
+  const { api, calls } = apiHarness(responder, { storage });
+  await api.login("admin", "password", true);
+  const pendingRequest = api.post("catalog/list").catch(() => undefined);
+  await started;
+
+  api.suspend();
+  await pendingRequest;
+  const interruptedRecord = JSON.parse(storage.getItem(storageKey));
+  assert.equal(interruptedRecord.refreshing, true);
+  assert.equal(api.subject, "");
+
+  const reloaded = apiHarness(responder, { storage });
+  assert.equal(await reloaded.api.restoreSession(), false);
+  assert.equal(reloaded.calls.length, 0);
+  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(
+    calls.filter((call) => call.url.endsWith("/auth/refresh")).length,
+    1,
+  );
+});
+
+test("corrupted remembered storage is cleared without a network request", async () => {
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  storage.setItem(storageKey, "not-json");
+  const { api, calls } = apiHarness(() => Response.json({ ok: true }), {
+    storage,
+  });
+
+  assert.equal(await api.restoreSession(), false);
+  assert.equal(calls.length, 0);
+  assert.equal(storage.getItem(storageKey), null);
+});
+
+test("rejected remembered refresh clears storage and reports lost authentication", async () => {
+  const bearer = secret("b");
+  const refreshToken = secret("c");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const { api, calls } = apiHarness((url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(5), future(600), {
+            remember_me: true,
+          })
+        : { ok: false, code: "forbidden" },
+      { status: url.endsWith("/auth/login") ? 200 : 403 },
+    ),
+  { storage });
+  let lost = 0;
+  api.onAuthenticationLost = () => lost += 1;
+  await api.login("admin", "password", true);
+  await assert.rejects(api.restoreSession(), /account cannot perform that action/);
+
+  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(api.subject, "");
+  assert.equal(lost, 1);
+  assert.equal(calls.filter((call) => call.url.endsWith("/auth/refresh")).length, 1);
+});
+
+test("peer logout clears a remembered session after its storage event", async () => {
+  const bearer = secret("d");
+  const refreshToken = secret("e");
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : { ok: true },
+    );
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("admin", "password", true);
+  const second = apiHarness(responder, { storage, locks });
+  await second.api.restoreSession();
+  let lost = 0;
+  second.api.onAuthenticationLost = () => lost += 1;
+
+  await first.api.logout();
+  second.dispatchStorage(
+    "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000",
+    null,
+  );
+  assert.equal(second.api.subject, "");
+  assert.equal(lost, 1);
+  await assert.rejects(second.api.post("catalog/list"), /Sign in to continue/);
+});
+
+test("delayed cleanup and stale storage events preserve a newer remembered login", async () => {
+  const firstBearer = secret("a");
+  const firstRefresh = secret("b");
+  const secondBearer = secret("c");
+  const secondRefresh = secret("d");
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url, options) => {
+    if (!url.endsWith("/auth/login")) return Response.json({ ok: true });
+    const username = JSON.parse(options.body).username;
+    return Response.json(
+      username === "first"
+        ? sessionReply(firstBearer, firstRefresh, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : sessionReply(secondBearer, secondRefresh, future(3600), future(7200), {
+            remember_me: true,
+          }),
+    );
+  };
+  const first = apiHarness(responder, { storage, locks });
+  await first.api.login("first", "password", true);
+  const second = apiHarness(responder, { storage, locks });
+  await second.api.restoreSession();
+
+  let acquiredLock;
+  const lockAcquired = new Promise((resolve) => acquiredLock = resolve);
+  let releaseLock;
+  const blocker = locks.request(
+    "amaterasu.session.refresh:http://127.0.0.1:5000",
+    { mode: "exclusive" },
+    () => new Promise((resolve) => {
+      releaseLock = resolve;
+      acquiredLock();
+    }),
+  );
+  await lockAcquired;
+  first.api.clear();
+  await second.api.login("second", "password", true);
+  releaseLock();
+  await blocker;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  assert.equal(JSON.parse(storage.getItem(storageKey)).bearer, secondBearer);
+  let lost = 0;
+  second.api.onAuthenticationLost = () => lost += 1;
+  second.dispatchStorage(storageKey, null);
+  assert.equal(second.api.subject, "admin");
+  assert.equal(second.api.scopes.includes("catalog.read"), true);
+  assert.equal(lost, 0);
+});
+
+test("remembered refresh fails closed when Web Locks are unavailable", async () => {
+  const bearer = secret("f");
+  const refreshToken = secret("1");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const { api, calls } = apiHarness((url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : { ok: false, code: "unauthorized" },
+      { status: url.endsWith("/auth/login") ? 200 : 401 },
+    ),
+  { storage, locks: null });
+  await api.login("admin", "password", true);
+
+  await assert.rejects(api.post("catalog/list"), /cannot safely refresh/);
+  assert.equal(calls.filter((call) => call.url.endsWith("/auth/refresh")).length, 0);
+  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(api.subject, "");
+});
+
+test("remember_me=false leaves no persistent session record", async () => {
+  const bearer = secret("2");
+  const refreshToken = secret("3");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const { api } = apiHarness(
+    (url) =>
+      Response.json(
+        url.endsWith("/auth/login")
+          ? sessionReply(bearer, refreshToken, future(3600), future(7200))
+          : { ok: true },
+      ),
+    { storage },
+  );
+  await api.login("admin", "password", false);
+
+  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(await api.restoreSession(), false);
+  assert.equal(api.subject, "");
+});
+
+test("API-token login clears remembered credentials without persisting the token", async () => {
+  const bearer = secret("4");
+  const refreshToken = secret("5");
+  const apiToken = secret("6");
+  const storage = memoryStorage();
+  const storageKey = "amaterasu.session.http%3A%2F%2F127.0.0.1%3A5000";
+  const { api } = apiHarness(
+    (url) =>
+      Response.json(
+        sessionReply(bearer, refreshToken, future(3600), future(7200), {
+          remember_me: true,
+        }),
+      ),
+    { storage },
+  );
+  await api.login("admin", "password", true);
+  api.useToken(apiToken);
+
+  assert.equal(storage.getItem(storageKey), null);
+  assert.equal(api.subject, "API token");
+});
+
+test("unavailable storage rejects remembered login and revokes its issued session", async () => {
+  const bearer = secret("7");
+  const refreshToken = secret("8");
+  const storage = memoryStorage({ set: true });
+  const { api, calls } = apiHarness((url) =>
+    Response.json(
+      url.endsWith("/auth/login")
+        ? sessionReply(bearer, refreshToken, future(3600), future(7200), {
+            remember_me: true,
+          })
+        : { ok: true },
+    ),
+  { storage });
+
+  await assert.rejects(api.login("admin", "password", true), {
+    code: "storage_unavailable",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(api.subject, "");
+  assert.ok(calls.some((call) =>
+    call.url.endsWith("/auth/logout") &&
+    JSON.parse(call.options.body).refresh_token === refreshToken,
+  ));
+});
+
+test("session-only login remains in memory when the localStorage getter is denied", async () => {
+  const bearer = secret("9");
+  const refreshToken = secret("a");
+  const { api, calls } = apiHarness(
+    (url) =>
+      Response.json(
+        sessionReply(bearer, refreshToken, future(3600), future(7200)),
+      ),
+    { storageGetterThrows: true },
+  );
+  await api.login("admin", "password", false);
+
+  assert.equal(api.subject, "admin");
   assert.equal(calls.length, 1);
 });
