@@ -6,7 +6,7 @@
 - Main checkout: `C:\Users\Chase\sources\amaterasu`
 - No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: see the current session snapshot at the end of this file. The latest process check found three live lane leads; L04 and L05 are stopped at explicit cross-lane gates after reporting no safe independent next slice.
+- Status: see the current session snapshot at the end of this file. The latest process check found five live lane leads; L04 completed its native pen/touch policy candidate and stopped after reporting no separate safe input slice.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -388,11 +388,11 @@ This reflects the latest process and worktree check. Lead session IDs remain the
 
 | Lead | Lead process | Latest work evidence |
 | --- | --- | --- |
-| luna-01 | stopped | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. Reservation 0098 covers strict session TTL expiry. The lead ended its latest resume without starting a worker because L06's consumer ACK had not arrived then; the contract ACK request remains open. |
-| luna-02 | PID 52592, live | Network lane retains a 13-file draft across NVHTTP, RTSP, and stream-session. It also submitted reviewed candidate `ecc5c4f1` for LAN/WAN peer-mode boundary regressions; coordinator package validation and L03 review are pending. |
-| luna-03 | PID 27308, live | Manual-resolution parser and selection policy landed as `d66ac2a9` and `1682e708`; 47 display tests and strict Clippy passed. The lead is resumed for another independent slice and has received L02's media peer-mode review request; the display IDs remain pending. |
-| luna-04 | stopped | Outbox 062 found no safe independent input/audio slice. Its reviewed native pen/touch candidate has L05 and L06 contract ACKs; L02's ACK and coordinator release remain. |
-| luna-05 | stopped | Catalog HDR storage landed as `200a4b62`/`a141941`; the elevation README correction landed as `62aad945`. Outbox 123 found no further safe independent code slice under current contracts. |
-| luna-06 | PID 47360, live | Reviewed locale candidate `f80f2a01` landed as `23269ee3`; coordinator build correction and generated bundle are `b7865eb`. Frontend typecheck, 64 tests, and bundle build passed. The locale ID remains pending browser/API-to-DOM sequencing and runtime evidence. L06 still has the session-TTL consumer ACK request and L04 pen/touch ACK request in its inbox. |
+| luna-01 | PID 30660, live | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. L06 outbox 0102 confirmed the exclusive session expiry consumer contract; the coordinator released the reserved TTL worker, and the lead has resumed it. Both TTL IDs remain pending. |
+| luna-02 | PID 52592, live | Network lane retains a 13-file draft across NVHTTP, RTSP, and stream-session. It submitted candidate `ecc5c4f1` for LAN/WAN peer-mode regressions; L03 review and coordinator package validation remain pending. Outbox 0078 also supplies the L02 contract ACK that cleared L04's native pen/touch gate. |
+| luna-03 | PID 27308, live | Manual-resolution parser and selection policy landed as `d66ac2a9` and `1682e708`; 47 display tests and strict Clippy passed. The lead has an X-High worker on the reserved manual-refresh parser slice and has the coordinator's L02 media encryption contract/review request; the display IDs remain pending. |
+| luna-04 | stopped | Reviewed lane candidate `9bf86748` landed directly on main as `590142f0`; coordinator fixture correction `ba25737` added the inherited optional value. Formatting, all 122 input tests, and strict all-target Clippy passed. Global persistence only is implemented; L02 projection, L05 application storage, L06 management/readback, native event transport, and Windows qualification remain pending. |
+| luna-05 | PID 42500, live | Catalog HDR storage landed as `200a4b62`/`a141941`; the elevation README correction landed as `62aad945`. After L02/L06 acknowledgments, the coordinator reserved the three Catalog paths and authorized the per-application `native_pen_touch` storage slice. |
+| luna-06 | PID 47360, live | Reviewed locale candidate `f80f2a01` landed as `23269ee3`; coordinator build correction and generated bundle are `b7865eb`. Frontend typecheck, 64 tests, and bundle build passed. L06 answered L04's pen/touch contract request and L01's session-TTL consumer request. The locale ID remains pending browser/API-to-DOM sequencing and runtime evidence. |
 
-The main checkout remains the direct landing point; do not push. L04 can resume once L02's contract ACK and the coordinator release arrive.
+The main checkout remains the direct landing point; do not push. L04 can resume if a new independent input slice is identified. Its native pen/touch policy candidate remains pending downstream projection, management, and Windows evidence.

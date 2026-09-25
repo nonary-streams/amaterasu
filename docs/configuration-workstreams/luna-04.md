@@ -307,3 +307,9 @@ Record acknowledgements to the coordinator's default-endpoint decision as they a
 - Lane code candidate `a6e116b227038c8653d4c8928eb04ef38fb16f21` landed directly on main as `ce58dfbb`. The zero-timeout Back press now reaches the device before a subsequent timer advancement expires its deadline; the regression covers the initial snapshot, same-time expiry, Guide pulse, held-button suppression, and release/re-press delivery.
 - Main validation passed `cargo fmt --check -p amaterasu-input`, all 119 `amaterasu-input` tests, strict all-target input Clippy, and `git diff --check`.
 - `global:back_button_timeout` remains pending durable defaults/migration, scoped override validation through the actual consumer, management readback, and platform runtime qualification. No stable ID is closed by this slice.
+
+## Coordinator validation update: native pen/touch policy storage (2026-09-25)
+
+- Reviewed L04 lane candidate `9bf86748f42f4f6e691833475c9a372ca148e423` landed directly on main as `590142f0`. Coordinator commit `ba25737` added the new optional field to one older Acquire test initializer as `None`, preserving the inherited global default.
+- Main validation passed `cargo fmt --check -p amaterasu-input`, all 122 input tests, and `cargo clippy -p amaterasu-input --all-targets -- -D warnings`. The candidate's focused tests cover v9-to-v10 migration/default, strict optional Acquire values, retry identity, and lease readback.
+- Only global input persistence and lease snapshot are implemented. Keep `global:native_pen_touch` pending L02 launch projection, L05 application persistence, L06 management/readback, native pen/touch event transport, and Windows 10 1809+ runtime qualification.
