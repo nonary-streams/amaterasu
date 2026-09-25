@@ -121,9 +121,10 @@ connection; exact-image process observation is the fallback. Its session-bound
 exit. The ticket becomes Stopped only after a complete exact FullscreenApp scan
 finds no process for that installation. An unknown scan or any remaining
 same-install fullscreen UI keeps the ticket active, even when the ordinary
-discovery snapshot is empty. Reconnect is allowed for the same live process
-identity, while a restart retires the previous creation-time identity and
-discards its queued events.
+discovery snapshot is empty. This also applies to tickets already in
+CleanupFailed. Reconnect is allowed for the same live process identity, while a
+restart retires the previous creation-time identity and discards its queued
+events.
 Return focuses only the ticket's verified FullscreenApp process, or relaunches
 from the still-validated canonical install when no uncorrelated FullscreenApp
 is present. Exact image/PID/creation-time checks, ambiguous process lists, and

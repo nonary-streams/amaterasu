@@ -248,10 +248,14 @@ impl FullscreenSessions {
                     }
                 }
                 State::CleanupFailed => {
-                    if session.ambiguous_game_ids.is_empty()
+                    if session.playnite_exiting {
+                        if playnite_exit_is_confirmed(session, now, &mut scan_fullscreen_processes)
+                        {
+                            session.transition(State::Stopped, now);
+                        }
+                    } else if session.ambiguous_game_ids.is_empty()
                         && session.stop_requested_at.is_none()
                         && session.active_game.is_none()
-                        && !session.playnite_exiting
                         && tracked_fullscreen_process_is_running(session, processes)
                     {
                         session.transition(State::Running, now);
@@ -1998,6 +2002,106 @@ mod tests {
         );
 
         assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert_eq!(sessions.active_count(), 1);
+    }
+
+    #[test]
+    fn playnite_exiting_releases_cleanup_failed_ticket_after_complete_empty_scan() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| true,
+            |_| panic!("cleanup failure must not relaunch"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::PlayniteExiting, None),
+            extension.clone(),
+        );
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            &[extension],
+            Some(&[]),
+            |_| Some(Vec::new()),
+            |_| true,
+            |_| panic!("intentional exit must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "stopped");
+        assert_eq!(sessions.active_count(), 0);
+    }
+
+    #[test]
+    fn playnite_exiting_with_unknown_scan_retains_cleanup_failed_ticket() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| true,
+            |_| panic!("cleanup failure must not relaunch"),
+        );
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::PlayniteExiting, None),
+            extension.clone(),
+        );
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            &[extension],
+            Some(&[]),
+            |_| None,
+            |_| true,
+            |_| panic!("intentional exit must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+        assert_eq!(sessions.active_count(), 1);
+    }
+
+    #[test]
+    fn playnite_exiting_with_remaining_ui_retains_cleanup_failed_ticket() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| true,
+            |_| panic!("cleanup failure must not relaunch"),
+        );
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::PlayniteExiting, None),
+            extension.clone(),
+        );
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            &[extension],
+            Some(&[]),
+            |_| Some(vec![fullscreen_process(80)]),
+            |_| true,
+            |_| panic!("intentional exit must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
         assert_eq!(sessions.active_count(), 1);
     }
 
