@@ -5,6 +5,7 @@ use crate::{
     platform::RecoveryConfig,
     route_policy::{
         AcquirePlan, DefaultEndpoints, DefaultRole, ReleasePlan, RoleAssignment, RoutePolicy,
+        assignments_reached_target,
     },
     virtual_sink::{
         ChannelLayout, VirtualFormatCandidate, VirtualSampleFormat, channel_layout,
@@ -268,10 +269,7 @@ fn assign_defaults(
     }
 
     let current = default_endpoints(enumerator)?;
-    if assignments
-        .iter()
-        .any(|assignment| current[assignment.role.index()] == original[assignment.role.index()])
-    {
+    if !assignments_reached_target(assignments, &current) {
         return Err("audio_route_change_failed");
     }
     Ok(())

@@ -27,6 +27,18 @@ pub struct RoleAssignment {
     pub endpoint: String,
 }
 
+/// A route lease may only become active when every role it planned to change
+/// actually resolves to the selected endpoint. Another actor can change a
+/// role between the initial snapshot and the final platform query.
+pub fn assignments_reached_target(
+    assignments: &[RoleAssignment],
+    current: &DefaultEndpoints,
+) -> bool {
+    assignments.iter().all(|assignment| {
+        current[assignment.role.index()].as_deref() == Some(assignment.endpoint.as_str())
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum AcquirePlan {
     Unchanged,
@@ -205,6 +217,65 @@ fn restore_assignments(active: &ActiveLease, current: &DefaultEndpoints) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_role_change_rejects_acquire_and_rolls_back_only_owned_roles() {
+        let original = [
+            Some("render.console".into()),
+            Some("render.multimedia".into()),
+            Some("render.communications".into()),
+        ];
+        let mut policy = RoutePolicy::new();
+        let AcquirePlan::Assign(assignments) =
+            policy.acquire("render.selected", &original).unwrap()
+        else {
+            panic!("expected role assignment");
+        };
+        policy
+            .record_assignment("render.selected", DefaultRole::Console)
+            .unwrap();
+        policy
+            .record_assignment("render.selected", DefaultRole::Communications)
+            .unwrap();
+        let concurrent_change = [
+            Some("render.selected".into()),
+            Some("render.other".into()),
+            Some("render.selected".into()),
+        ];
+        assert!(!assignments_reached_target(
+            &assignments,
+            &concurrent_change
+        ));
+        policy.abort_acquire("render.selected").unwrap();
+        assert_eq!(
+            policy
+                .pending_restore_assignments(&concurrent_change)
+                .unwrap(),
+            vec![
+                RoleAssignment {
+                    role: DefaultRole::Console,
+                    endpoint: "render.console".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Communications,
+                    endpoint: "render.communications".into(),
+                },
+            ]
+        );
+        let restored = [
+            Some("render.console".into()),
+            Some("render.other".into()),
+            Some("render.communications".into()),
+        ];
+        assert!(
+            policy
+                .pending_restore_assignments(&restored)
+                .unwrap()
+                .is_empty()
+        );
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
 
     fn endpoints(console: &str, multimedia: &str, communications: &str) -> DefaultEndpoints {
         [console, multimedia, communications].map(|endpoint| Some(endpoint.into()))
