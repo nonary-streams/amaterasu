@@ -6,8 +6,10 @@ param(
     [Parameter(Mandatory)][string]$ExpectedHead,
     [Parameter(Mandatory)][string]$TaskFile,
     [Parameter(Mandatory)][string]$RunDirectory,
-    [string]$Model = 'gpt-6-sol',
-    [string]$ReasoningEffort = 'medium',
+    [string]$Model = 'gpt-6-luna',
+    [string]$ReasoningEffort = 'max',
+    [string]$SubagentModel = 'gpt-6-luna',
+    [string]$SubagentReasoningEffort = 'xhigh',
     [switch]$Coordinator,
     [switch]$PreflightOnly
 )
@@ -108,7 +110,8 @@ $(Get-Content -LiteralPath $taskPath -Raw)
 "@
     $agentSettings = if ($Coordinator) {
         @('-c', 'agents.enabled=true', '-c', 'agents.max_concurrent_threads_per_session=3',
-          '-c', 'agents.default_subagent_model="gpt-6-sol"', '-c', 'agents.default_subagent_reasoning_effort="medium"')
+          '-c', "agents.default_subagent_model=`"$SubagentModel`"",
+          '-c', "agents.default_subagent_reasoning_effort=`"$SubagentReasoningEffort`"")
     } else { @('-c', 'agents.enabled=false') }
     $arguments = @('--ask-for-approval', 'never', 'exec', '--model', $Model,
         '-c', "model_reasoning_effort=`"$ReasoningEffort`"") + $agentSettings + @(

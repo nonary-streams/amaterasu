@@ -58,8 +58,9 @@ Start a team with scripts/run_configuration_worker.ps1 -Coordinator -Slot N.
 The runner accepts slots 1 through 6, checks checkout/base/clean state in code,
 locks the team slot, enables three native workers and writes structured logs.
 Without -Coordinator it remains a non-delegating standalone worker runner.
-The initial coordinator/worker model is GPT-6 Sol Medium; increase effort for a
-specific demanding task instead of running every startup check at Max/XHigh.
+Coordinators default to GPT-6 Luna Max and their native workers default to GPT-6
+Luna X-High. The runner exposes model and effort parameters for deliberate
+overrides while keeping all six sessions on the same requested model setup.
 
 Run local validation with:
 
