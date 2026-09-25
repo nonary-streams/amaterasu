@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 const SERVICE: &str = "amaterasu.frame-limiter/1";
 
-/// Registers the policy service and answers requests without claiming provider effects.
+/// Registers the policy and verified runtime service for frame-limiter requests.
 pub struct FrameLimiterModule {
     runtime: RuntimeClient,
     leases: LeaseManager<RtssProvider>,

@@ -1,34 +1,38 @@
 //! Narrow dynamic binding for RTSS profile control.
 use crate::lease::{FrameLimitProvider, ProfileValues, ProviderError};
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(all(windows, target_pointer_width = "64"))]
 use std::path::{Path, PathBuf};
 
+#[cfg(all(windows, target_pointer_width = "64"))]
 const LIMITER_DISABLED_FLAG: u32 = 1 << 2;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const MAX_PROFILE_SNAPSHOT_BYTES: u64 = 64 * 1024;
 
 pub(crate) struct RtssProvider {
-    #[cfg(windows)]
+    #[cfg(all(windows, target_pointer_width = "64"))]
     api: Option<WindowsRtssApi>,
-    #[cfg(windows)]
+    #[cfg(all(windows, target_pointer_width = "64"))]
     install_path: Option<PathBuf>,
-    #[cfg(not(windows))]
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
     _unsupported: (),
 }
 
 impl RtssProvider {
     pub(crate) fn new() -> Self {
         Self {
-            #[cfg(windows)]
+            #[cfg(all(windows, target_pointer_width = "64"))]
             api: None,
-            #[cfg(windows)]
+            #[cfg(all(windows, target_pointer_width = "64"))]
             install_path: None,
-            #[cfg(not(windows))]
+            #[cfg(not(all(windows, target_pointer_width = "64")))]
             _unsupported: (),
         }
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl FrameLimitProvider for RtssProvider {
     fn select_installation(&mut self, path: &str) -> Result<String, ProviderError> {
         let canonical = resolve_install_path(path)?;
@@ -53,6 +57,23 @@ impl FrameLimitProvider for RtssProvider {
         let api = self.api()?;
         api.load_profile(profile)?;
         api.read_profile_values()
+    }
+
+    fn read_profile_contents(&mut self, profile: &str) -> Result<Vec<u8>, ProviderError> {
+        validate_profile_name(profile)?;
+        let path = self.profile_path(profile)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| ProviderError::ReadFailed("rtss_profile_contents_unavailable"))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_PROFILE_SNAPSHOT_BYTES
+        {
+            return Err(ProviderError::ReadFailed(
+                "rtss_profile_contents_unsupported",
+            ));
+        }
+        std::fs::read(path)
+            .map_err(|_| ProviderError::ReadFailed("rtss_profile_contents_unavailable"))
     }
 
     fn write_profile_verified(
@@ -80,9 +101,16 @@ impl FrameLimitProvider for RtssProvider {
         &mut self,
         profile: &str,
         expected: ProfileValues,
+        expected_contents: &[u8],
     ) -> Result<(), ProviderError> {
         validate_profile_name(profile)?;
         let path = self.profile_path(profile)?;
+        let contents = self.read_profile_contents(profile)?;
+        if contents != expected_contents {
+            return Err(ProviderError::VerifyFailed(
+                "rtss_profile_contents_changed_before_delete",
+            ));
+        }
         let api = self.api()?;
         api.load_profile(profile)?;
         if api.read_profile_values()? != expected {
@@ -109,6 +137,46 @@ impl FrameLimitProvider for RtssProvider {
     }
 }
 
+#[cfg(all(windows, target_pointer_width = "32"))]
+impl FrameLimitProvider for RtssProvider {
+    fn select_installation(&mut self, _path: &str) -> Result<String, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn profile_exists(&mut self, _profile: &str) -> Result<bool, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn read_profile(&mut self, _profile: &str) -> Result<ProfileValues, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn read_profile_contents(&mut self, _profile: &str) -> Result<Vec<u8>, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn write_profile_verified(
+        &mut self,
+        _profile: &str,
+        _values: ProfileValues,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn delete_profile_verified(
+        &mut self,
+        _profile: &str,
+        _expected: ProfileValues,
+        _expected_contents: &[u8],
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+
+    fn limiter_disabled(&mut self) -> Result<bool, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_64_bit_windows_required"))
+    }
+}
+
 #[cfg(not(windows))]
 impl FrameLimitProvider for RtssProvider {
     fn select_installation(&mut self, _path: &str) -> Result<String, ProviderError> {
@@ -120,6 +188,10 @@ impl FrameLimitProvider for RtssProvider {
     }
 
     fn read_profile(&mut self, _profile: &str) -> Result<ProfileValues, ProviderError> {
+        Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
+    }
+
+    fn read_profile_contents(&mut self, _profile: &str) -> Result<Vec<u8>, ProviderError> {
         Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
     }
 
@@ -135,6 +207,7 @@ impl FrameLimitProvider for RtssProvider {
         &mut self,
         _profile: &str,
         _expected: ProfileValues,
+        _expected_contents: &[u8],
     ) -> Result<(), ProviderError> {
         Err(ProviderError::Unavailable("rtss_supported_on_windows_only"))
     }
@@ -144,7 +217,7 @@ impl FrameLimitProvider for RtssProvider {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl RtssProvider {
     fn api(&mut self) -> Result<&mut WindowsRtssApi, ProviderError> {
         let install_path = self
@@ -183,21 +256,21 @@ impl RtssProvider {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const RTSS_SHARED_MEMORY_NAME: &str = "RTSSSharedMemoryV2";
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 type GetProfileProperty = unsafe extern "system" fn(*const i8, *mut u8, u32) -> i32;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 type SetProfileProperty = unsafe extern "system" fn(*const i8, *const u8, u32) -> i32;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 type ProfileOperation = unsafe extern "system" fn(*const i8);
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 type UpdateProfiles = unsafe extern "system" fn();
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 type GetFlags = unsafe extern "system" fn() -> u32;
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 struct WindowsRtssApi {
     library: *mut std::ffi::c_void,
     get_profile_property: GetProfileProperty,
@@ -209,7 +282,7 @@ struct WindowsRtssApi {
     get_flags: GetFlags,
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl WindowsRtssApi {
     fn load(install_path: &Path) -> Result<Self, ProviderError> {
         if !rtss_is_running()? {
@@ -359,7 +432,7 @@ impl WindowsRtssApi {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl Drop for WindowsRtssApi {
     fn drop(&mut self) {
         if !self.library.is_null() {
@@ -370,7 +443,7 @@ impl Drop for WindowsRtssApi {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 fn resolve_install_path(path: &str) -> Result<PathBuf, ProviderError> {
     if path.is_empty() {
         return discover_install_path();
@@ -395,7 +468,7 @@ fn resolve_install_path(path: &str) -> Result<PathBuf, ProviderError> {
     Ok(canonical)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 fn discover_install_path() -> Result<PathBuf, ProviderError> {
     if !rtss_is_running()? {
         return Err(ProviderError::Unavailable("rtss_not_running"));
@@ -457,7 +530,7 @@ fn discover_install_path() -> Result<PathBuf, ProviderError> {
     result
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 fn validate_profile_name(profile: &str) -> Result<(), ProviderError> {
     let safe = profile.ends_with(".exe")
         && profile.len() <= 255
@@ -471,7 +544,7 @@ fn validate_profile_name(profile: &str) -> Result<(), ProviderError> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 fn rtss_is_running() -> Result<bool, ProviderError> {
     let name: Vec<u16> = RTSS_SHARED_MEMORY_NAME
         .encode_utf16()
@@ -488,7 +561,7 @@ fn rtss_is_running() -> Result<bool, ProviderError> {
     Ok(true)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 unsafe fn resolve_symbol<T: Copy>(
     library: *mut std::ffi::c_void,
     symbol_name: &[u8],
@@ -502,20 +575,20 @@ unsafe fn resolve_symbol<T: Copy>(
     Ok(unsafe { std::mem::transmute_copy(&symbol) })
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const FILE_MAP_READ: u32 = 0x0004;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1_isize as *mut std::ffi::c_void;
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ProcessEntry32W {
@@ -531,7 +604,7 @@ struct ProcessEntry32W {
     sz_exe_file: [u16; 260],
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 impl Default for ProcessEntry32W {
     fn default() -> Self {
         Self {
@@ -549,7 +622,7 @@ impl Default for ProcessEntry32W {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_pointer_width = "64"))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryExW(
