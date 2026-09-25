@@ -125,6 +125,31 @@ fn real_udp_video_fec_and_audio_groups_flush_with_no_invented_eos_datagram() {
 }
 
 #[test]
+fn real_udp_video_without_fec_emits_only_the_data_datagram() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.fec_percentage = 0;
+    settings.video.min_parity_shards = 0;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let frame = [0, 0, 0, 1, 0x65, 1, 2, 3];
+
+    // SAFETY: the locally owned encoded buffer remains live through submit.
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&frame, 0)) },
+        STATUS_OK
+    );
+    assert_eq!(stream.delivery.queued(), 1);
+    assert_eq!(stream.drain(), STATUS_OK);
+    assert_eq!(stream.state(), "draining");
+    stream.delivery.tick();
+    assert_eq!(stream.state(), "drained");
+
+    assert!(receive(&video).len() > 32);
+    assert_eq!(stream.delivery.sent_datagrams, 1);
+    assert!(video.recv(&mut [0; 65_507]).is_err());
+}
+
+#[test]
 fn queue_busy_does_not_consume_video_indices_or_crypto_nonces() {
     let (video, audio) = receivers();
     let mut stream = Stream::open("owner", &request(&video, &audio, true)).unwrap();
