@@ -1161,6 +1161,167 @@ mod tests {
     }
 
     #[test]
+    fn resolves_repeated_credentials_files_across_predecessor_config_pairs() {
+        const CONFIG_FILES: [&str; 4] = [
+            "apollo.conf",
+            "sunshine.conf",
+            "vibeshine.conf",
+            "vibepollo.conf",
+        ];
+
+        for first_index in 0..CONFIG_FILES.len() {
+            for second_index in first_index + 1..CONFIG_FILES.len() {
+                let pair_name = format!(
+                    "{}-{}",
+                    CONFIG_FILES[first_index].trim_end_matches(".conf"),
+                    CONFIG_FILES[second_index].trim_end_matches(".conf")
+                );
+                let source = temporary_directory(&format!("credentials-cross-config-{pair_name}"));
+                std::fs::create_dir_all(source.join("private")).unwrap();
+                std::fs::write(
+                    source.join("private/primary.json"),
+                    credential_record("Shared", "shared password", "SharedSalt12345"),
+                )
+                .unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    "primary.json",
+                    source.join("private/primary-alias.json"),
+                )
+                .unwrap();
+                let second_path = if cfg!(unix) {
+                    "private/primary-alias.json"
+                } else {
+                    "private/primary.json"
+                };
+                for (config_file, credentials_path) in [
+                    (CONFIG_FILES[first_index], "private/primary.json"),
+                    (CONFIG_FILES[second_index], second_path),
+                ] {
+                    std::fs::write(
+                        source.join(config_file),
+                        format!("credentials_file = {credentials_path}\n"),
+                    )
+                    .unwrap();
+                }
+
+                let root = canonical_directory(&source).unwrap();
+                let expected = source.join("private/primary.json").canonicalize().unwrap();
+                assert_eq!(
+                    credential_candidates(&root).unwrap(),
+                    vec![expected],
+                    "the {pair_name} declarations should resolve to one canonical candidate"
+                );
+                let imported = import_legacy_authentication(&source).unwrap();
+                assert_eq!(
+                    imported.document.credential.as_ref().unwrap().username,
+                    "Shared",
+                    "the {pair_name} declarations should import the shared credential once"
+                );
+                let _ = std::fs::remove_dir_all(source);
+
+                let distinct =
+                    temporary_directory(&format!("credentials-cross-config-distinct-{pair_name}"));
+                std::fs::create_dir_all(distinct.join("private")).unwrap();
+                std::fs::write(
+                    distinct.join("private/first.json"),
+                    credential_record("First", "first password", "FirstSalt123456"),
+                )
+                .unwrap();
+                std::fs::write(
+                    distinct.join("private/second.json"),
+                    credential_record("Second", "second password", "SecondSalt12345"),
+                )
+                .unwrap();
+                for (config_file, credentials_path) in [
+                    (CONFIG_FILES[first_index], "private/first.json"),
+                    (CONFIG_FILES[second_index], "private/second.json"),
+                ] {
+                    std::fs::write(
+                        distinct.join(config_file),
+                        format!("credentials_file = {credentials_path}\n"),
+                    )
+                    .unwrap();
+                }
+
+                assert!(matches!(
+                    import_legacy_authentication(&distinct),
+                    Err("legacy_authentication_credential_ambiguous")
+                ));
+                std::fs::write(
+                    distinct.join(CONFIG_FILES[second_index]),
+                    "credentials_file = ../outside.json\n",
+                )
+                .unwrap();
+                assert!(matches!(
+                    import_legacy_authentication(&distinct),
+                    Err("legacy_authentication_layout")
+                ));
+                let _ = std::fs::remove_dir_all(distinct);
+            }
+        }
+    }
+
+    #[test]
+    fn credentials_file_overrides_file_state_across_predecessor_config_pairs() {
+        const CONFIG_FILES: [&str; 4] = [
+            "apollo.conf",
+            "sunshine.conf",
+            "vibeshine.conf",
+            "vibepollo.conf",
+        ];
+
+        for first_index in 0..CONFIG_FILES.len() {
+            for second_index in first_index + 1..CONFIG_FILES.len() {
+                for credentials_index in [first_index, second_index] {
+                    let state_index = if credentials_index == first_index {
+                        second_index
+                    } else {
+                        first_index
+                    };
+                    let pair_name = format!(
+                        "{}-{}-credentials-in-{}",
+                        CONFIG_FILES[first_index].trim_end_matches(".conf"),
+                        CONFIG_FILES[second_index].trim_end_matches(".conf"),
+                        CONFIG_FILES[credentials_index].trim_end_matches(".conf")
+                    );
+                    let source =
+                        temporary_directory(&format!("credentials-overrides-state-{pair_name}"));
+                    std::fs::create_dir_all(source.join("private")).unwrap();
+                    std::fs::write(
+                        source.join("private/explicit.json"),
+                        credential_record("Explicit", "explicit password", "ExplicitSalt123"),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        source.join("private/fallback.json"),
+                        credential_record("Fallback", "fallback password", "FallbackSalt12"),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        source.join(CONFIG_FILES[credentials_index]),
+                        "credentials_file = private/explicit.json\n",
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        source.join(CONFIG_FILES[state_index]),
+                        "file_state = private/fallback.json\n",
+                    )
+                    .unwrap();
+
+                    let imported = import_legacy_authentication(&source).unwrap();
+                    assert_eq!(
+                        imported.document.credential.as_ref().unwrap().username,
+                        "Explicit",
+                        "the {pair_name} file_state should defer to credentials_file"
+                    );
+                    let _ = std::fs::remove_dir_all(source);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn configured_primary_credentials_take_precedence_over_auxiliary_state() {
         let source = temporary_directory("ambiguous-configured-state");
         std::fs::write(
