@@ -64,7 +64,7 @@ impl Engine {
         // Never extend a session inside this instance when wall time rolls back.
         self.latest_time = self.latest_time.max(now);
         self.sessions
-            .retain(|_, session| session.refresh_expires_at >= self.latest_time);
+            .retain(|_, session| session.refresh_expires_at > self.latest_time);
         self.refresh_index
             .retain(|_, session_id| self.sessions.contains_key(session_id));
         self.latest_time
@@ -340,7 +340,7 @@ impl Engine {
             self.refresh_index.remove(&refresh_digest);
             return Err("unauthorized");
         };
-        if session.refresh_token_digest != refresh_digest || session.refresh_expires_at < now {
+        if session.refresh_token_digest != refresh_digest || session.refresh_expires_at <= now {
             self.remove_session(&session_id);
             return Err("unauthorized");
         }
@@ -396,7 +396,7 @@ impl Engine {
         for record in &document.sessions {
             if Some(record.credential_digest.as_str()) != credential_digest
                 || record.scope_digest != scope_digest
-                || record.refresh_expires_at < self.latest_time
+                || record.refresh_expires_at <= self.latest_time
             {
                 continue;
             }
@@ -463,7 +463,7 @@ impl Engine {
     ) -> Result<Change, &'static str> {
         let digest = crypto::token_digest(&bearer);
         if let Some(session) = self.sessions.get(&digest) {
-            if session.expires_at < now {
+            if session.expires_at <= now {
                 return Err("unauthorized");
             }
             self.authorize_scopes(&session.scopes, &required_scopes)?;

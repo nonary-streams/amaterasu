@@ -264,9 +264,18 @@ fn credential_persistence_wrong_password_and_frontend_role_boundary() {
             &mut restarted,
             "frontend",
             json!({"action":"verify","bearer":bearer,"required_scopes":[]}),
-            7300
+            7299
         )["ok"],
         true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":bearer,"required_scopes":[]}),
+            7300
+        )["code"],
+        "unauthorized"
     );
     assert_eq!(
         state.request(
@@ -595,8 +604,8 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
             "frontend",
             json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
             220,
-        )["ok"],
-        true,
+        )["code"],
+        "unauthorized",
     );
 
     let rotated = state.request(
@@ -632,8 +641,8 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
             "frontend",
             json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":[]}),
             340,
-        )["ok"],
-        true,
+        )["code"],
+        "unauthorized",
     );
 
     // Refresh remains usable after access expiry, but the new access token is
@@ -664,20 +673,20 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
         )["ok"],
         true
     );
-    let rotated_at_expiry = state.request(
+    let rotated_one_second_before_expiry = state.request(
         &mut pipeline,
         "frontend",
         json!({"action":"refresh","refresh_token":rotated_again["refresh_token"]}),
-        500,
+        499,
     );
-    assert_eq!(rotated_at_expiry["expires_at"], 500);
-    assert_eq!(rotated_at_expiry["refresh_expires_at"], 500);
+    assert_eq!(rotated_one_second_before_expiry["expires_at"], 500);
+    assert_eq!(rotated_one_second_before_expiry["refresh_expires_at"], 500);
     assert_eq!(
         state.request(
             &mut pipeline,
             "frontend",
-            json!({"action":"verify","bearer":rotated_at_expiry["bearer"],"required_scopes":[]}),
-            500,
+            json!({"action":"verify","bearer":rotated_one_second_before_expiry["bearer"],"required_scopes":[]}),
+            499,
         )["ok"],
         true
     );
@@ -685,8 +694,8 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
         state.request(
             &mut pipeline,
             "frontend",
-            json!({"action":"verify","bearer":rotated_at_expiry["bearer"],"required_scopes":[]}),
-            501,
+            json!({"action":"verify","bearer":rotated_one_second_before_expiry["bearer"],"required_scopes":[]}),
+            500,
         )["code"],
         "unauthorized"
     );
@@ -694,10 +703,95 @@ fn remembered_refresh_rotates_without_sliding_absolute_expiry() {
         state.request(
             &mut pipeline,
             "frontend",
-            json!({"action":"refresh","refresh_token":rotated_at_expiry["refresh_token"]}),
-            501,
+            json!({"action":"refresh","refresh_token":rotated_one_second_before_expiry["refresh_token"]}),
+            500,
         )["code"],
         "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({"action":"list_sessions"}),
+            500,
+        )["sessions"],
+        json!([])
+    );
+}
+
+#[test]
+fn session_expiry_boundaries_are_strict_across_restart() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings_with_ttls(10, 20));
+    state.setup(&mut pipeline);
+
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"admin","password":"correct horse battery staple","remember_me":true}),
+        1_000,
+    );
+    assert_eq!(login["expires_at"], 1_010);
+    assert_eq!(login["refresh_expires_at"], 1_020);
+
+    let mut restarted = Pipeline::new(settings_with_ttls(10, 20));
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
+            1_009,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
+            1_010,
+        )["code"],
+        "unauthorized"
+    );
+
+    // The access bearer has expired, but the original refresh deadline is
+    // still one second away, so rotation remains available.
+    let refreshed = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"refresh","refresh_token":login["refresh_token"]}),
+        1_019,
+    );
+    assert_eq!(refreshed["expires_at"], 1_020);
+    assert_eq!(refreshed["refresh_expires_at"], 1_020);
+
+    let mut at_refresh_deadline = Pipeline::new(settings_with_ttls(10, 20));
+    assert_eq!(
+        state.request(
+            &mut at_refresh_deadline,
+            "frontend",
+            json!({"action":"refresh","refresh_token":refreshed["refresh_token"]}),
+            1_020,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut at_refresh_deadline,
+            "frontend",
+            json!({"action":"verify","bearer":refreshed["bearer"],"required_scopes":[]}),
+            1_020,
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut at_refresh_deadline,
+            "console",
+            json!({"action":"list_sessions"}),
+            1_020,
+        )["sessions"],
+        json!([])
     );
 }
 

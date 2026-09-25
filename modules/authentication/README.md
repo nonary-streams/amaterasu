@@ -106,7 +106,16 @@ may renew access expiry but keeps the absolute refresh expiry fixed. The refresh
 token is accepted only by `refresh` and `logout`; either it or the access bearer
 can revoke the entire session pair. Logout is idempotent and does not revoke API
 tokens. Session metadata listings include access and refresh expiration plus the
-remember-me flag, but never either secret.
+remember-me flag, but never either secret. Both administrator session
+expirations are strict: access is valid only while `expires_at > now`, and
+refresh is valid only while `refresh_expires_at > now`; equality returns the
+existing `unauthorized` response. Refresh remains possible after access expiry
+only while the fixed absolute refresh deadline remains in the future. Rotation
+never moves that deadline or issues an access bearer with zero lifetime.
+
+This expiry-boundary behavior does not change the success/error response shape,
+session or credential document fields, state keys, schema versions, or service
+version. API-token expiry semantics are unchanged.
 
 Administrator sessions persist in a separate versioned
 `authentication/sessions/v1` state document (schema version 1), apart from
