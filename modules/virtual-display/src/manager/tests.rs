@@ -1,11 +1,13 @@
 use super::*;
 use crate::backend::Observation;
+use crate::scale::{SUPPORTED_SCALE_VALUES, ScaleResolutionError, ScaleSetting, resolve_scale};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 const ID: &str = "00000000-0000-0000-0000-000000000001";
 #[derive(Default)]
 struct Calls {
+    supported_calls: usize,
     creates: Vec<(u64, u64)>,
     removes: Vec<(u64, u64)>,
     feeds: Vec<u64>,
@@ -17,6 +19,7 @@ struct Calls {
 struct Fake(Rc<RefCell<Calls>>);
 impl Driver for Fake {
     fn supported(&self) -> bool {
+        self.0.borrow_mut().supported_calls += 1;
         true
     }
     fn create(
@@ -75,6 +78,17 @@ fn create() -> Operation {
         height: 1080,
         refresh_millihz: 60000,
         name: "Test display".into(),
+        dd_virtual_display_scale: 0,
+    }
+}
+fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
+    Operation::Create {
+        identity: ID.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Test display".into(),
+        dd_virtual_display_scale,
     }
 }
 fn tick(manager: &mut Manager<Fake>) {
@@ -83,6 +97,133 @@ fn tick(manager: &mut Manager<Fake>) {
     }
     manager.tick();
 }
+
+fn create_payload() -> serde_json::Value {
+    json!({
+        "action": "create",
+        "identity": ID,
+        "width": 1920,
+        "height": 1080,
+        "refresh_millihz": 60000,
+        "name": "Test display"
+    })
+}
+
+#[test]
+fn omitted_create_scale_defaults_to_retain_and_preserves_old_payloads() {
+    let operation = serde_json::from_value::<Operation>(create_payload()).unwrap();
+    let Operation::Create {
+        dd_virtual_display_scale,
+        ..
+    } = &operation
+    else {
+        panic!("create payload should deserialize as Create");
+    };
+    assert_eq!(*dd_virtual_display_scale, 0);
+
+    let (mut manager, calls) = setup(true);
+    assert_eq!(manager.handle("alice", operation)["ok"], true);
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
+fn create_scale_accepts_only_supported_integer_values() {
+    for scale in SUPPORTED_SCALE_VALUES {
+        let mut payload = create_payload();
+        payload["dd_virtual_display_scale"] = json!(scale);
+        let operation = serde_json::from_value::<Operation>(payload).unwrap();
+        let (mut manager, calls) = setup(true);
+        let response = manager.handle("alice", operation);
+
+        if scale == 0 {
+            assert_eq!(response["ok"], true);
+            assert_eq!(calls.borrow().creates.len(), 1);
+        } else {
+            assert_eq!(response["code"], "unsupported_scale");
+            assert_eq!(calls.borrow().supported_calls, 0);
+            assert!(calls.borrow().creates.is_empty());
+        }
+    }
+
+    for scale in [-2, 1, 99, 126, 550, i32::MIN, i32::MAX] {
+        let mut payload = create_payload();
+        payload["dd_virtual_display_scale"] = json!(scale);
+        let operation = serde_json::from_value::<Operation>(payload).unwrap();
+        let (mut manager, calls) = setup(true);
+        let response = manager.handle("alice", operation);
+        assert_eq!(response["code"], "invalid_request");
+        assert_eq!(calls.borrow().supported_calls, 0);
+        assert!(calls.borrow().creates.is_empty());
+    }
+}
+
+#[test]
+fn create_scale_rejects_non_integer_json_types_and_out_of_range_integers() {
+    for scale in [
+        json!(100.0),
+        json!(125.5),
+        json!("100"),
+        json!(true),
+        json!(null),
+        json!(2_147_483_648_u64),
+        json!(-2_147_483_649_i64),
+    ] {
+        let mut payload = create_payload();
+        payload["dd_virtual_display_scale"] = scale;
+        assert!(serde_json::from_value::<Operation>(payload).is_err());
+    }
+}
+
+#[test]
+fn automatic_scale_selects_nearest_percentage_and_breaks_ties_lower() {
+    for (short_edge, expected_percentage) in [
+        (864, 100),
+        (1080, 125),
+        (972, 100),
+        (1188, 125),
+        (2160, 250),
+    ] {
+        let resolution =
+            resolve_scale(ScaleSetting::Automatic, short_edge, Some(2.0), 1.0).unwrap();
+        assert_eq!(resolution.percentage, Some(expected_percentage));
+        assert_eq!(
+            resolution.compositor_factor,
+            f64::from(expected_percentage) / 100.0
+        );
+    }
+    assert_eq!(
+        resolve_scale(ScaleSetting::Automatic, 0, None, 1.0),
+        Err(ScaleResolutionError::ZeroShortEdge)
+    );
+}
+
+#[test]
+fn retain_and_fixed_scale_resolve_compositor_factors() {
+    let retained = resolve_scale(ScaleSetting::Retain, 1080, Some(1.5), 1.25).unwrap();
+    assert_eq!(retained.percentage, None);
+    assert_eq!(retained.compositor_factor, 1.5);
+
+    let current = resolve_scale(ScaleSetting::Retain, 1080, None, 1.25).unwrap();
+    assert_eq!(current.percentage, None);
+    assert_eq!(current.compositor_factor, 1.25);
+
+    let fixed = resolve_scale(ScaleSetting::Fixed(175), 1080, Some(1.5), 1.25).unwrap();
+    assert_eq!(fixed.percentage, Some(175));
+    assert_eq!(fixed.compositor_factor, 1.75);
+}
+
+#[test]
+fn valid_nonzero_scale_fails_before_driver_calls() {
+    let (mut manager, calls) = setup(true);
+
+    assert_eq!(
+        manager.handle("alice", create_with_scale(175))["code"],
+        "unsupported_scale"
+    );
+    assert_eq!(calls.borrow().supported_calls, 0);
+    assert!(calls.borrow().creates.is_empty());
+}
+
 #[test]
 fn disabled_never_touches_driver() {
     let (mut manager, calls) = setup(false);

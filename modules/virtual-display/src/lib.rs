@@ -4,6 +4,7 @@ mod manager;
 mod model;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod protocol;
+mod scale;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeDriver;

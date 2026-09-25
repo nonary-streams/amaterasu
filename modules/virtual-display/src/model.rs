@@ -117,6 +117,8 @@ pub enum Operation {
         height: u32,
         refresh_millihz: u32,
         name: String,
+        #[serde(default)]
+        dd_virtual_display_scale: i32,
     },
     Status {
         identity: Option<String>,

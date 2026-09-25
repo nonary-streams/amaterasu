@@ -1,6 +1,7 @@
 use crate::backend::{Driver, Ready};
 use crate::model::{Operation, Settings, Specification, display_id, failure, valid_identity};
 use crate::protocol::Binding;
+use crate::scale::ScaleSetting;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -96,7 +97,15 @@ impl<D: Driver> Manager<D> {
                 height,
                 refresh_millihz,
                 name,
+                dd_virtual_display_scale,
             } => {
+                let scale = match ScaleSetting::try_from(dd_virtual_display_scale) {
+                    Ok(scale) => scale,
+                    Err(()) => return failure("invalid_request"),
+                };
+                if scale != ScaleSetting::Retain {
+                    return failure("unsupported_scale");
+                }
                 if !self.settings.enabled {
                     return failure("disabled");
                 }
