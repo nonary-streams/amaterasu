@@ -183,6 +183,10 @@ pub enum UpnpError {
         failure: MappingFailure,
         rollback_failures: Vec<MappingFailure>,
     },
+    ReconcileFailed {
+        failure: MappingFailure,
+        rollback_failures: Vec<MappingFailure>,
+    },
     CleanupFailed {
         failures: Vec<MappingFailure>,
     },
@@ -221,6 +225,17 @@ impl fmt::Display for UpnpError {
             } => write!(
                 formatter,
                 "UPnP add failed for {} {:?}: {}; {} rollback failure(s)",
+                failure.mapping.external_port,
+                failure.mapping.protocol,
+                failure.source,
+                rollback_failures.len()
+            ),
+            Self::ReconcileFailed {
+                failure,
+                rollback_failures,
+            } => write!(
+                formatter,
+                "UPnP reconcile failed for {} {:?}: {}; {} rollback failure(s)",
                 failure.mapping.external_port,
                 failure.mapping.protocol,
                 failure.source,
@@ -276,6 +291,23 @@ pub struct MappingManager<G> {
     description: String,
 }
 
+enum PlannedMappingChange {
+    Add {
+        mapping: Mapping,
+        previously_owned: Option<Mapping>,
+    },
+    Replace {
+        previous_mapping: Mapping,
+        desired_mapping: Mapping,
+    },
+}
+
+struct AppliedMappingChange {
+    created_mapping: Mapping,
+    previously_owned: Option<Mapping>,
+    restore_on_rollback: Option<Mapping>,
+}
+
 impl<G: Gateway> MappingManager<G> {
     /// Creates a manager with a unique process-local mapping description.
     pub fn new(gateway: G) -> Self {
@@ -300,17 +332,19 @@ impl<G: Gateway> MappingManager<G> {
         }
     }
 
-    /// Adds desired mappings before removing stale owned mappings.
+    /// Adds or retargets desired mappings before removing stale owned mappings.
     ///
-    /// A failed add rolls back mappings created by this reconcile attempt and
-    /// retains the previous owned set. A pre-existing mapping is never adopted
-    /// or overwritten.
+    /// A failed add or retarget rolls back mappings changed by this reconcile
+    /// attempt where the gateway still matches the recorded values. A mapping is
+    /// retargeted only when this manager owns the current entry and its stable
+    /// attributes still match the recorded prior mapping. Pre-existing or changed
+    /// mappings are never adopted or overwritten.
     pub fn reconcile(
         &mut self,
         endpoints: &[ListenerEndpoint],
     ) -> Result<ReconcileReport, UpnpError> {
         let desired = self.desired_mappings(endpoints)?;
-        let mut additions = Vec::new();
+        let mut planned_changes = Vec::new();
         let mut report = ReconcileReport::default();
 
         for (key, expected_mapping) in &desired {
@@ -322,41 +356,144 @@ impl<G: Gateway> MappingManager<G> {
                 })
             })?;
 
+            let previously_owned = self.owned.get(key).cloned();
             if existing.is_empty() {
-                additions.push(expected_mapping.clone());
-            } else if self.owned.get(key) == Some(expected_mapping)
-                && existing
-                    .iter()
-                    .any(|mapping| mapping.has_same_owned_attributes(expected_mapping))
-            {
-                report.already_active += 1;
-            } else {
+                planned_changes.push(PlannedMappingChange::Add {
+                    mapping: expected_mapping.clone(),
+                    previously_owned,
+                });
+                continue;
+            }
+
+            if existing.len() != 1 {
+                self.owned.remove(key);
                 return Err(UpnpError::ExistingMapping {
                     key: *key,
                     existing,
                 });
             }
-        }
 
-        let mut created_this_reconcile = Vec::new();
-        for mapping in additions {
-            let key = mapping.key();
-            if let Err(source) = self.gateway.create_if_absent(&mapping) {
-                let failure = MappingFailure {
-                    operation: MappingOperation::Add,
-                    mapping: key,
-                    source,
-                };
-                let rollback_failures = self.rollback_created(&created_this_reconcile);
-                return Err(UpnpError::AddFailed {
-                    failure,
-                    rollback_failures,
+            let current_mapping = &existing[0];
+            let Some(previous_mapping) = previously_owned else {
+                return Err(UpnpError::ExistingMapping {
+                    key: *key,
+                    existing,
+                });
+            };
+
+            if !current_mapping.has_same_owned_attributes(&previous_mapping) {
+                self.owned.remove(key);
+                return Err(UpnpError::ExistingMapping {
+                    key: *key,
+                    existing,
                 });
             }
 
-            self.owned.insert(key, mapping.clone());
-            created_this_reconcile.push(mapping);
-            report.created += 1;
+            if previous_mapping.has_same_owned_attributes(expected_mapping) {
+                report.already_active += 1;
+            } else {
+                planned_changes.push(PlannedMappingChange::Replace {
+                    previous_mapping,
+                    desired_mapping: expected_mapping.clone(),
+                });
+            }
+        }
+
+        let mut applied_changes = Vec::new();
+        for planned_change in planned_changes {
+            match planned_change {
+                PlannedMappingChange::Add {
+                    mapping,
+                    previously_owned,
+                } => {
+                    let key = mapping.key();
+                    if let Err(source) = self.gateway.create_if_absent(&mapping) {
+                        let failure = MappingFailure {
+                            operation: MappingOperation::Add,
+                            mapping: key,
+                            source,
+                        };
+                        let mut rollback_failures =
+                            self.reconcile_failed_add(&mapping, previously_owned.as_ref());
+                        rollback_failures.extend(self.rollback_applied_changes(&applied_changes));
+                        return Err(UpnpError::AddFailed {
+                            failure,
+                            rollback_failures,
+                        });
+                    }
+
+                    self.owned.insert(key, mapping.clone());
+                    applied_changes.push(AppliedMappingChange {
+                        created_mapping: mapping,
+                        previously_owned,
+                        restore_on_rollback: None,
+                    });
+                    report.created += 1;
+                }
+                PlannedMappingChange::Replace {
+                    previous_mapping,
+                    desired_mapping,
+                } => {
+                    let key = previous_mapping.key();
+                    match self.gateway.remove_if_matches(&previous_mapping) {
+                        Ok(RemovalOutcome::Removed) => report.removed += 1,
+                        Ok(RemovalOutcome::Missing) => {}
+                        Ok(RemovalOutcome::Changed) => {
+                            self.owned.remove(&key);
+                            let failure = MappingFailure {
+                                operation: MappingOperation::Remove,
+                                mapping: key,
+                                source: GatewayError::new(
+                                    "owned mapping changed before replacement",
+                                ),
+                            };
+                            let rollback_failures = self.rollback_applied_changes(&applied_changes);
+                            return Err(UpnpError::ReconcileFailed {
+                                failure,
+                                rollback_failures,
+                            });
+                        }
+                        Err(source) => {
+                            let failure = MappingFailure {
+                                operation: MappingOperation::Remove,
+                                mapping: key,
+                                source,
+                            };
+                            let mut rollback_failures =
+                                self.restore_interrupted_replacement(&previous_mapping);
+                            rollback_failures
+                                .extend(self.rollback_applied_changes(&applied_changes));
+                            return Err(UpnpError::ReconcileFailed {
+                                failure,
+                                rollback_failures,
+                            });
+                        }
+                    }
+
+                    if let Err(source) = self.gateway.create_if_absent(&desired_mapping) {
+                        let failure = MappingFailure {
+                            operation: MappingOperation::Add,
+                            mapping: key,
+                            source,
+                        };
+                        let mut rollback_failures =
+                            self.restore_interrupted_replacement(&previous_mapping);
+                        rollback_failures.extend(self.rollback_applied_changes(&applied_changes));
+                        return Err(UpnpError::AddFailed {
+                            failure,
+                            rollback_failures,
+                        });
+                    }
+
+                    self.owned.insert(key, desired_mapping.clone());
+                    applied_changes.push(AppliedMappingChange {
+                        created_mapping: desired_mapping,
+                        previously_owned: Some(previous_mapping.clone()),
+                        restore_on_rollback: Some(previous_mapping),
+                    });
+                    report.created += 1;
+                }
+            }
         }
 
         let stale_mappings: Vec<Mapping> = self
@@ -520,23 +657,221 @@ impl<G: Gateway> MappingManager<G> {
         Ok(desired)
     }
 
-    fn rollback_created(&mut self, created: &[Mapping]) -> Vec<MappingFailure> {
-        let mut failures = Vec::new();
+    fn reconcile_failed_add(
+        &mut self,
+        attempted_mapping: &Mapping,
+        previously_owned: Option<&Mapping>,
+    ) -> Vec<MappingFailure> {
+        let candidates: Vec<Mapping> = previously_owned.cloned().into_iter().collect();
+        match self.synchronize_owned_mapping(attempted_mapping.key(), &candidates) {
+            Ok(_) => Vec::new(),
+            Err(source) => vec![MappingFailure {
+                operation: MappingOperation::Inspect,
+                mapping: attempted_mapping.key(),
+                source,
+            }],
+        }
+    }
 
-        for mapping in created.iter().rev() {
-            let key = mapping.key();
-            match self.gateway.remove_if_matches(mapping) {
-                Ok(_) => {
-                    self.owned.remove(&key);
-                }
-                Err(source) => failures.push(MappingFailure {
-                    operation: MappingOperation::Remove,
+    fn restore_interrupted_replacement(
+        &mut self,
+        previous_mapping: &Mapping,
+    ) -> Vec<MappingFailure> {
+        let key = previous_mapping.key();
+        let current_mappings = match self.gateway.find_mappings(key) {
+            Ok(mappings) => mappings,
+            Err(source) => {
+                self.owned.remove(&key);
+                return vec![MappingFailure {
+                    operation: MappingOperation::Inspect,
                     mapping: key,
                     source,
-                }),
+                }];
+            }
+        };
+
+        if current_mappings.len() == 1
+            && current_mappings[0].has_same_owned_attributes(previous_mapping)
+        {
+            self.owned.insert(key, previous_mapping.clone());
+            return Vec::new();
+        }
+
+        if !current_mappings.is_empty() {
+            self.owned.remove(&key);
+            return vec![MappingFailure {
+                operation: MappingOperation::Add,
+                mapping: key,
+                source: GatewayError::new(
+                    "could not restore prior mapping because another entry occupies the key",
+                ),
+            }];
+        }
+
+        let restoration = self.gateway.create_if_absent(previous_mapping);
+        let synchronized =
+            self.synchronize_owned_mapping(key, std::slice::from_ref(previous_mapping));
+        match (restoration, synchronized) {
+            (Ok(()), Ok(Some(_))) | (Err(_), Ok(Some(_))) => Vec::new(),
+            (Ok(()), Ok(None)) => vec![MappingFailure {
+                operation: MappingOperation::Add,
+                mapping: key,
+                source: GatewayError::new("restored mapping did not remain present"),
+            }],
+            (Err(source), Ok(None)) => vec![MappingFailure {
+                operation: MappingOperation::Add,
+                mapping: key,
+                source,
+            }],
+            (restoration, Err(inspect_source)) => {
+                let mut failures = vec![MappingFailure {
+                    operation: MappingOperation::Inspect,
+                    mapping: key,
+                    source: inspect_source,
+                }];
+                if let Err(source) = restoration {
+                    failures.push(MappingFailure {
+                        operation: MappingOperation::Add,
+                        mapping: key,
+                        source,
+                    });
+                }
+                failures
+            }
+        }
+    }
+
+    fn rollback_applied_changes(
+        &mut self,
+        applied_changes: &[AppliedMappingChange],
+    ) -> Vec<MappingFailure> {
+        let mut failures = Vec::new();
+
+        for applied_change in applied_changes.iter().rev() {
+            let key = applied_change.created_mapping.key();
+            let removal = self
+                .gateway
+                .remove_if_matches(&applied_change.created_mapping);
+            let removal_failure = match &removal {
+                Ok(RemovalOutcome::Changed) => Some(GatewayError::new(
+                    "created mapping changed before rollback and was preserved",
+                )),
+                Err(source) => Some(source.clone()),
+                Ok(RemovalOutcome::Removed | RemovalOutcome::Missing) => None,
+            };
+            let may_restore_previous = !matches!(removal, Ok(RemovalOutcome::Changed));
+
+            let restoration = if may_restore_previous {
+                applied_change
+                    .restore_on_rollback
+                    .as_ref()
+                    .map(|previous_mapping| self.gateway.create_if_absent(previous_mapping))
+            } else {
+                None
+            };
+
+            let mut candidates = vec![applied_change.created_mapping.clone()];
+            if let Some(previously_owned) = &applied_change.previously_owned {
+                candidates.push(previously_owned.clone());
+            }
+            let (current_ownership, inspect_failure) =
+                match self.synchronize_owned_mapping(key, &candidates) {
+                    Ok(mapping) => (mapping, None),
+                    Err(source) => (None, Some(source)),
+                };
+
+            if let Some(source) = removal_failure {
+                let prior_mapping_is_present = applied_change
+                    .previously_owned
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        current_ownership
+                            .as_ref()
+                            .is_some_and(|current| current.has_same_owned_attributes(previous))
+                    });
+                if !prior_mapping_is_present {
+                    failures.push(MappingFailure {
+                        operation: MappingOperation::Remove,
+                        mapping: key,
+                        source,
+                    });
+                }
+            }
+
+            if let Some(Err(source)) = restoration.as_ref() {
+                let prior_mapping_is_present = applied_change
+                    .restore_on_rollback
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        current_ownership
+                            .as_ref()
+                            .is_some_and(|current| current.has_same_owned_attributes(previous))
+                    });
+                if !prior_mapping_is_present {
+                    failures.push(MappingFailure {
+                        operation: MappingOperation::Add,
+                        mapping: key,
+                        source: source.clone(),
+                    });
+                }
+            }
+
+            if let Some(source) = inspect_failure {
+                failures.push(MappingFailure {
+                    operation: MappingOperation::Inspect,
+                    mapping: key,
+                    source,
+                });
+            }
+
+            if matches!(restoration.as_ref(), Some(Ok(())))
+                && applied_change
+                    .restore_on_rollback
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        !current_ownership
+                            .as_ref()
+                            .is_some_and(|current| current.has_same_owned_attributes(previous))
+                    })
+            {
+                failures.push(MappingFailure {
+                    operation: MappingOperation::Add,
+                    mapping: key,
+                    source: GatewayError::new("restored mapping did not remain present"),
+                });
             }
         }
 
         failures
+    }
+
+    fn synchronize_owned_mapping(
+        &mut self,
+        key: MappingKey,
+        candidate_mappings: &[Mapping],
+    ) -> Result<Option<Mapping>, GatewayError> {
+        let current_mappings = match self.gateway.find_mappings(key) {
+            Ok(mappings) => mappings,
+            Err(source) => {
+                self.owned.remove(&key);
+                return Err(source);
+            }
+        };
+        let matching_owned_mapping = if current_mappings.len() == 1 {
+            candidate_mappings
+                .iter()
+                .find(|candidate| current_mappings[0].has_same_owned_attributes(candidate))
+                .cloned()
+        } else {
+            None
+        };
+
+        if let Some(mapping) = &matching_owned_mapping {
+            self.owned.insert(key, mapping.clone());
+        } else {
+            self.owned.remove(&key);
+        }
+
+        Ok(matching_owned_mapping)
     }
 }

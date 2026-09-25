@@ -15,8 +15,10 @@ struct FakeGateway(Rc<RefCell<FakeGatewayState>>);
 struct FakeGatewayState {
     mappings: BTreeMap<MappingKey, Mapping>,
     fail_add_for: Option<MappingKey>,
+    fail_add_on_attempt: Option<usize>,
     fail_remove_for: Option<MappingKey>,
     fail_refresh_for: Option<MappingKey>,
+    mapping_after_next_removal: Option<Mapping>,
     add_attempts: usize,
     refresh_attempts: usize,
     refresh_requests: Vec<Mapping>,
@@ -29,6 +31,10 @@ impl FakeGateway {
 
     fn set_add_failure(&self, key: MappingKey) {
         self.0.borrow_mut().fail_add_for = Some(key);
+    }
+
+    fn set_add_failure_on_attempt(&self, attempt: usize) {
+        self.0.borrow_mut().fail_add_on_attempt = Some(attempt);
     }
 
     fn set_remove_failure(&self, key: Option<MappingKey>) {
@@ -57,6 +63,10 @@ impl FakeGateway {
 
     fn change_mapping(&self, mapping: Mapping) {
         self.0.borrow_mut().mappings.insert(mapping.key(), mapping);
+    }
+
+    fn change_mapping_after_next_removal(&self, mapping: Mapping) {
+        self.0.borrow_mut().mapping_after_next_removal = Some(mapping);
     }
 
     fn remove_mapping(&self, key: MappingKey) {
@@ -89,7 +99,9 @@ impl Gateway for FakeGateway {
         let mut state = self.0.borrow_mut();
         state.add_attempts += 1;
 
-        if state.fail_add_for == Some(mapping.key()) {
+        if state.fail_add_for == Some(mapping.key())
+            || state.fail_add_on_attempt == Some(state.add_attempts)
+        {
             return Err(GatewayError::new("injected add failure"));
         }
         if state.mappings.contains_key(&mapping.key()) {
@@ -112,6 +124,9 @@ impl Gateway for FakeGateway {
             None => Ok(RemovalOutcome::Missing),
             Some(current) if current.has_same_owned_attributes(mapping) => {
                 state.mappings.remove(&key);
+                if let Some(replacement) = state.mapping_after_next_removal.take() {
+                    state.mappings.insert(replacement.key(), replacement);
+                }
                 Ok(RemovalOutcome::Removed)
             }
             Some(_) => Ok(RemovalOutcome::Changed),
@@ -250,12 +265,48 @@ fn reconcile_retries_failed_stale_mapping_cleanup() {
 }
 
 #[test]
-fn address_change_on_the_same_external_port_preserves_the_old_mapping() {
+fn address_change_on_the_same_external_port_retargets_owned_mappings() {
     let fake_gateway = FakeGateway::default();
     let mut manager = manager(fake_gateway.clone());
     manager
         .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
         .unwrap();
+
+    let report = manager
+        .reconcile(&[endpoint([192, 168, 1, 20], 47989, true)])
+        .unwrap();
+
+    assert_eq!(
+        report,
+        ReconcileReport {
+            created: 2,
+            removed: 2,
+            already_active: 0,
+            changed_mappings_preserved: 0,
+        }
+    );
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.mappings().len(), 2);
+    assert!(
+        fake_gateway
+            .mappings()
+            .values()
+            .all(|mapping| { mapping.internal_address == Ipv4Addr::new(192, 168, 1, 20) })
+    );
+}
+
+#[test]
+fn same_port_retarget_preflight_preserves_an_externally_changed_entry() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let changed_key = key(47989, Protocol::Tcp);
+    let mut externally_changed_mapping = fake_gateway.mappings()[&changed_key].clone();
+    externally_changed_mapping.internal_address = Ipv4Addr::new(192, 168, 1, 55);
+    externally_changed_mapping.description = "changed by another owner".into();
+    fake_gateway.change_mapping(externally_changed_mapping.clone());
     let mappings_before = fake_gateway.mappings();
 
     let error = manager
@@ -264,7 +315,134 @@ fn address_change_on_the_same_external_port_preserves_the_old_mapping() {
 
     assert!(matches!(error, UpnpError::ExistingMapping { .. }));
     assert_eq!(fake_gateway.mappings(), mappings_before);
+    assert_eq!(
+        fake_gateway.mappings().get(&changed_key),
+        Some(&externally_changed_mapping)
+    );
+    assert_eq!(fake_gateway.add_attempts(), 2);
+    assert_eq!(manager.owned_mappings().count(), 1);
+}
+
+#[test]
+fn same_port_retarget_preserves_a_foreign_mapping_that_appears_during_replacement() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let raced_key = key(47989, Protocol::Tcp);
+    let foreign_mapping = Mapping {
+        external_port: raced_key.external_port,
+        protocol: raced_key.protocol,
+        internal_address: Ipv4Addr::new(192, 168, 1, 88),
+        internal_port: 47989,
+        remote_host: String::new(),
+        enabled: true,
+        description: "created by another writer".into(),
+        lease_duration_seconds: 0,
+    };
+    fake_gateway.change_mapping_after_next_removal(foreign_mapping.clone());
+
+    let error = manager
+        .reconcile(&[endpoint([192, 168, 1, 20], 47989, true)])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        UpnpError::AddFailed {
+            failure,
+            rollback_failures
+        } if failure.mapping == raced_key
+            && rollback_failures.len() == 1
+            && rollback_failures[0].operation == super::MappingOperation::Add
+    ));
+    assert_eq!(
+        fake_gateway.mappings().get(&raced_key),
+        Some(&foreign_mapping)
+    );
+    assert_eq!(fake_gateway.mappings().len(), 2);
+    assert_eq!(manager.owned_mappings().count(), 1);
+}
+
+#[test]
+fn same_port_retarget_does_not_add_after_a_failed_old_mapping_removal() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let mappings_before = fake_gateway.mappings();
+    fake_gateway.set_remove_failure(Some(key(47989, Protocol::Tcp)));
+
+    let error = manager
+        .reconcile(&[endpoint([192, 168, 1, 20], 47989, true)])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        UpnpError::ReconcileFailed {
+            failure,
+            rollback_failures
+        } if failure.operation == super::MappingOperation::Remove
+            && rollback_failures.is_empty()
+    ));
+    assert_eq!(fake_gateway.mappings(), mappings_before);
+    assert_eq!(fake_gateway.add_attempts(), 2);
     assert_eq!(manager.owned_mappings().count(), 2);
+}
+
+#[test]
+fn failed_same_port_retarget_add_restores_the_previous_mapping() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let previous_mappings = fake_gateway.mappings();
+    fake_gateway.set_add_failure_on_attempt(3);
+
+    let error = manager
+        .reconcile(&[endpoint([192, 168, 1, 20], 47989, true)])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        UpnpError::AddFailed {
+            failure,
+            rollback_failures
+        } if failure.operation == super::MappingOperation::Add
+            && rollback_failures.is_empty()
+    ));
+    assert_eq!(fake_gateway.mappings(), previous_mappings);
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.add_attempts(), 4);
+}
+
+#[test]
+fn later_protocol_retarget_failure_rolls_back_the_earlier_protocol() {
+    let fake_gateway = FakeGateway::default();
+    let mut manager = manager(fake_gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let previous_mappings = fake_gateway.mappings();
+    fake_gateway.set_add_failure_on_attempt(4);
+
+    let error = manager
+        .reconcile(&[endpoint([192, 168, 1, 20], 47989, true)])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        UpnpError::AddFailed {
+            failure,
+            rollback_failures
+        } if failure.mapping == key(47989, Protocol::Udp)
+            && rollback_failures.is_empty()
+    ));
+    assert_eq!(fake_gateway.mappings(), previous_mappings);
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(fake_gateway.add_attempts(), 6);
 }
 
 #[test]
