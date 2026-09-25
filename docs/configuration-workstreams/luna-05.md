@@ -448,3 +448,9 @@
 
 - Lane commit `81a2903d69468c5886f5802f1a9da10bcf57e213` landed on main as `ba20eae7`. Main formatting passed, Playnite tests passed 81/81, and strict Clippy passed. No production behavior changed.
 - `global:playnite_recent_max_age_days` remains pending settings/editor persistence and Windows provider qualification.
+
+## Coordinator validation update: detached command environment expansion
+
+- L05's reviewed main-based commits `bdc78031ba9af4eb9f176311f1517e9485d75c60` and `3e6321a15a87f46266ccbca7775a9f55d34c1422` landed directly as `643771552a73dae144ea88c9ef771d4c26ab5e07` and `4bcae0d97acdc13eee2d488bdac8c4bc2a20c99d`. The lane's `28faa9495ff742f7668df4679e4b9fe00b97b165` implementation uses a separate lifecycle API; L05 supplied an equivalent main-based candidate reviewed against the current application API.
+- Main validation passed `cargo fmt --check --package amaterasu-application`, `git diff --check`, 51 application tests (one subprocess entry point ignored), and strict Clippy.
+- `per_application:detached` remains pending full management/editor persistence and signed readback, exact child working-directory/environment parity, and native platform qualification. Output redirection, per-command environment overrides, and elevation remain unimplemented in this slice.
