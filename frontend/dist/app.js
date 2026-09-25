@@ -836,6 +836,68 @@ var Amaterasu;
         return select;
     }
     const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"];
+    const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"];
+    function catalogSavedUnsupportedEnumValueToken(values) {
+        let token = "__amaterasu_keep_saved_unsupported_enum_value__";
+        while (values.includes(token))
+            token += "_";
+        return token;
+    }
+    function catalogFrameLimiterOverrideOptionValues(name, capabilities, current) {
+        const values = capabilities[name];
+        const options = ["", ...values];
+        if (current != null && !values.includes(current))
+            options.push(catalogSavedUnsupportedEnumValueToken(values));
+        return options;
+    }
+    Amaterasu.catalogFrameLimiterOverrideOptionValues = catalogFrameLimiterOverrideOptionValues;
+    function catalogFrameLimiterOverrideIsDisabled(name, capabilities) {
+        return name === "rtss_frame_limit_type" && capabilities.rtss_frame_limit_type.length === 0;
+    }
+    Amaterasu.catalogFrameLimiterOverrideIsDisabled = catalogFrameLimiterOverrideIsDisabled;
+    function catalogFrameLimiterCapabilitySelect(name, current, capabilities) {
+        const values = capabilities[name];
+        const unsupportedCurrent = current != null && !values.includes(current);
+        const savedValueToken = unsupportedCurrent
+            ? catalogSavedUnsupportedEnumValueToken(values)
+            : undefined;
+        const select = Amaterasu.el("select");
+        select.name = name;
+        const inherit = Amaterasu.el("option", "", "Inherit");
+        inherit.value = "";
+        select.append(inherit);
+        for (const value of values) {
+            const option = Amaterasu.el("option", "", value);
+            option.value = value;
+            select.append(option);
+        }
+        if (savedValueToken !== undefined) {
+            const saved = Amaterasu.el("option", "", `Keep saved value: ${current} (unsupported on this host)`);
+            saved.value = savedValueToken;
+            select.append(saved);
+        }
+        select.value = savedValueToken ?? current ?? "";
+        if (!catalogFrameLimiterOverrideIsDisabled(name, capabilities))
+            return select;
+        select.disabled = true;
+        select.removeAttribute("name");
+        const preservedValue = Amaterasu.input(name, savedValueToken ?? "", "hidden");
+        const controls = [
+            select,
+            preservedValue,
+            Amaterasu.el("span", "muted", "Unsupported on this host."),
+        ];
+        if (savedValueToken !== undefined) {
+            const clear = Amaterasu.button("Clear override", () => {
+                preservedValue.value = "";
+                select.value = "";
+                clear.disabled = true;
+            }, "quiet");
+            clear.type = "button";
+            controls.push(clear);
+        }
+        return Amaterasu.el("div", "catalog-enum-override", ...controls);
+    }
     function catalogEnumOverrideSelect(name, current, values) {
         const select = Amaterasu.el("select");
         select.name = name;
@@ -855,6 +917,91 @@ var Amaterasu;
         select.value = current ?? "";
         return select;
     }
+    function catalogFrameLimiterOverrideField(label, control, hint) {
+        if (control instanceof HTMLSelectElement)
+            return Amaterasu.field(label, control, hint);
+        control.querySelector("select")?.setAttribute("aria-label", label);
+        return Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", label), control, Amaterasu.el("small", "muted", hint));
+    }
+    function catalogFrameLimiterOverrideFormValues(overrides) {
+        const text = (value) => value == null ? "" : String(value);
+        return {
+            frame_limiter_enable: text(overrides?.frame_limiter_enable),
+            frame_limiter_fps_limit: text(overrides?.frame_limiter_fps_limit),
+            frame_limiter_provider: text(overrides?.frame_limiter_provider),
+            frame_limiter_disable_vsync: text(overrides?.frame_limiter_disable_vsync),
+            frame_limiter_auto_virtual_framegen: text(overrides?.frame_limiter_auto_virtual_framegen),
+            rtss_frame_limit_type: text(overrides?.rtss_frame_limit_type),
+            ds4_back_as_touchpad_click: text(overrides?.ds4_back_as_touchpad_click),
+        };
+    }
+    Amaterasu.catalogFrameLimiterOverrideFormValues = catalogFrameLimiterOverrideFormValues;
+    function catalogFrameLimiterOverrideFields(overrides, capabilities) {
+        const values = catalogFrameLimiterOverrideFormValues(overrides);
+        const enable = audioOverrideSelect("frame_limiter_enable", values.frame_limiter_enable === "" ? undefined : values.frame_limiter_enable === "true");
+        const fpsLimit = Amaterasu.input("frame_limiter_fps_limit", values.frame_limiter_fps_limit, "number");
+        fpsLimit.min = "0";
+        fpsLimit.max = "1000";
+        fpsLimit.step = "0.001";
+        fpsLimit.placeholder = "Inherit";
+        const provider = catalogFrameLimiterCapabilitySelect("frame_limiter_provider", values.frame_limiter_provider, capabilities);
+        const disableVsync = audioOverrideSelect("frame_limiter_disable_vsync", values.frame_limiter_disable_vsync === ""
+            ? undefined
+            : values.frame_limiter_disable_vsync === "true");
+        const autoVirtualFramegen = catalogEnumOverrideSelect("frame_limiter_auto_virtual_framegen", values.frame_limiter_auto_virtual_framegen, catalogAutoVirtualFramegenModes);
+        const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect("rtss_frame_limit_type", values.rtss_frame_limit_type, capabilities);
+        const ds4BackAsTouchpadClick = audioOverrideSelect("ds4_back_as_touchpad_click", values.ds4_back_as_touchpad_click === ""
+            ? undefined
+            : values.ds4_back_as_touchpad_click === "true");
+        return [
+            Amaterasu.field("Frame limiter", enable, "Blank inherits. Runtime application remains pending."),
+            Amaterasu.field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
+            catalogFrameLimiterOverrideField("Frame limiter provider", provider, "Choose a provider supported by this host; blank inherits."),
+            Amaterasu.field("Disable VSync for RTSS", disableVsync, "Blank inherits the next scope."),
+            Amaterasu.field("Auto virtual frame generation mode", autoVirtualFramegen, "Blank inherits. Choose enabled, vrr, legacy, or disabled."),
+            catalogFrameLimiterOverrideField("RTSS frame limit type", rtssFrameLimitType, "Blank inherits. Available RTSS choices depend on host support."),
+            Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick, "Only applies to a DS4 profile. Blank inherits; explicit false is preserved."),
+        ];
+    }
+    function parseCatalogFrameLimiterEnum(value, allowedValues, currentValue, label) {
+        if (value === "")
+            return null;
+        if (currentValue != null &&
+            !allowedValues.includes(currentValue) &&
+            value === catalogSavedUnsupportedEnumValueToken(allowedValues))
+            return currentValue;
+        if (!allowedValues.includes(value))
+            throw new Error(`${label} must be one of the supported values.`);
+        return value;
+    }
+    function parseCatalogFrameLimiterFpsLimit(value) {
+        const trimmed = value.trim();
+        if (trimmed === "")
+            return null;
+        if (!/^(?:[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(trimmed))
+            throw new Error("Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.");
+        const fpsLimit = Number(trimmed);
+        if (!Number.isFinite(fpsLimit) || fpsLimit < 0 || fpsLimit > 1000)
+            throw new Error("Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.");
+        const millihertz = fpsLimit * 1000;
+        const roundingTolerance = Number.EPSILON * Math.max(Math.abs(millihertz), 1) * 4;
+        if (Math.abs(millihertz - Math.round(millihertz)) > roundingTolerance)
+            throw new Error("Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.");
+        return fpsLimit;
+    }
+    function parseCatalogFrameLimiterOverrides(data, capabilities, currentOverrides) {
+        const text = (name) => String(data.get(name) ?? "");
+        return {
+            frame_limiter_enable: Amaterasu.parseInputBooleanOverride(text("frame_limiter_enable"), "Frame limiter"),
+            frame_limiter_fps_limit: parseCatalogFrameLimiterFpsLimit(text("frame_limiter_fps_limit")),
+            frame_limiter_provider: parseCatalogFrameLimiterEnum(text("frame_limiter_provider"), capabilities.frame_limiter_provider, currentOverrides?.frame_limiter_provider, "Frame limiter provider"),
+            frame_limiter_disable_vsync: Amaterasu.parseInputBooleanOverride(text("frame_limiter_disable_vsync"), "Disable VSync for RTSS"),
+            frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(text("frame_limiter_auto_virtual_framegen"), catalogAutoVirtualFramegenModes, undefined, "Auto virtual frame generation mode"),
+            rtss_frame_limit_type: parseCatalogFrameLimiterEnum(text("rtss_frame_limit_type"), capabilities.rtss_frame_limit_type, currentOverrides?.rtss_frame_limit_type, "RTSS frame limit type"),
+            ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(text("ds4_back_as_touchpad_click"), "DS4 Back as touchpad click"),
+        };
+    }
+    Amaterasu.parseCatalogFrameLimiterOverrides = parseCatalogFrameLimiterOverrides;
     function catalogRefreshRateOptionText(value) {
         return value ?? "";
     }
@@ -969,8 +1116,12 @@ var Amaterasu;
         let cursors = [null];
         let page = 0;
         let generation = 0;
-        const add = Amaterasu.button("+ Add application", () => showEditor(), "primary");
-        add.disabled = !api.allows("catalog.write");
+        let configOverrideCapabilities = null;
+        const add = Amaterasu.button("+ Add application", () => {
+            if (configOverrideCapabilities)
+                showEditor(undefined, configOverrideCapabilities);
+        }, "primary");
+        add.disabled = true;
         content.append(Amaterasu.sectionHeading("Your library", "A durable catalog of the applications on your host.", add), searchForm, status, editor, results);
         async function load() {
             const current = ++generation;
@@ -980,9 +1131,11 @@ var Amaterasu;
                 if (!content.isConnected || current !== generation)
                     return;
                 revision = reply.revision;
+                configOverrideCapabilities = reply.config_override_capabilities;
+                add.disabled = !api.allows("catalog.write");
                 const grid = Amaterasu.el("div", "catalog-grid");
                 for (const row of reply.entries)
-                    grid.append(card(row));
+                    grid.append(card(row, reply.config_override_capabilities));
                 results.replaceChildren(Amaterasu.el("div", "section-meta", Amaterasu.el("span", "", `${reply.entries.length} applications on this page`), Amaterasu.badge(`Revision ${revision}`)), reply.entries.length
                     ? grid
                     : Amaterasu.empty(query
@@ -1023,15 +1176,15 @@ var Amaterasu;
             query = search.value.trim();
             reset();
         });
-        function card(row) {
+        function card(row, capabilities) {
             const providerLaunch = row.entry.launch.kind === "playnite";
-            const edit = Amaterasu.button("Edit", () => showEditor(row));
+            const edit = Amaterasu.button("Edit", () => showEditor(row, capabilities));
             edit.disabled = !api.allows("catalog.write") || providerLaunch;
             if (providerLaunch)
                 edit.title = "Playnite launch targets are managed by the provider.";
             const actions = [edit];
             if (providerLaunch) {
-                const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row), "secondary");
+                const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row, capabilities), "secondary");
                 configure.disabled = !api.allows("catalog.write");
                 actions.unshift(configure);
             }
@@ -1070,11 +1223,11 @@ var Amaterasu;
             }
             return Amaterasu.el("article", "app-card", art, Amaterasu.el("div", "app-details", Amaterasu.el("h2", "", row.entry.name), Amaterasu.el("p", "muted description", row.entry.description || "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(tag))), Amaterasu.el("p", "path", Amaterasu.launchPath(row.entry)), Amaterasu.el("div", "card-footer", ...actions)));
         }
-        function showProviderOverrideEditor(row) {
+        function showProviderOverrideEditor(row, capabilities) {
             editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
             void loadInputRuntimeStatus().then((status) => {
                 if (context.content.isConnected)
-                    renderProviderOverrideEditor(row, status);
+                    renderProviderOverrideEditor(row, status, capabilities);
             });
         }
         async function loadInputRuntimeStatus() {
@@ -1096,7 +1249,7 @@ var Amaterasu;
                 };
             }
         }
-        function renderProviderOverrideEditor(row, runtimeStatus) {
+        function renderProviderOverrideEditor(row, runtimeStatus, capabilities) {
             let editRevision = revision;
             const currentFec = row.entry.config_overrides?.fec_percentage;
             const fec = Amaterasu.input("fec_percentage", currentFec === undefined ? "" : String(currentFec), "number");
@@ -1105,6 +1258,7 @@ var Amaterasu;
             fec.step = "1";
             fec.placeholder = "Inherit";
             fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+            const frameLimiterFields = catalogFrameLimiterOverrideFields(row.entry.config_overrides, capabilities);
             const streamAudio = audioOverrideSelect("stream_audio", row.entry.config_overrides?.stream_audio);
             const audioSink = audioSinkOverrideControls(row.entry.config_overrides?.audio_sink);
             const virtualSink = virtualSinkOverrideControls(row.entry.config_overrides?.virtual_sink);
@@ -1120,7 +1274,7 @@ var Amaterasu;
             const keyboard = audioOverrideSelect("keyboard", row.entry.config_overrides?.keyboard);
             const mouse = audioOverrideSelect("mouse", row.entry.config_overrides?.mouse);
             const refreshRateOptionFields = catalogRefreshRateOptionFields(row.entry.config_overrides?.dd_refresh_rate_option);
-            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
+            const form = Amaterasu.el("form", "editor-form", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."));
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
             save.type = "submit";
@@ -1133,6 +1287,7 @@ var Amaterasu;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const config_overrides = {
                         ...Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
+                        ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row.entry.config_overrides),
                         dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
                     };
                     try {
@@ -1165,15 +1320,15 @@ var Amaterasu;
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
         }
-        function showEditor(row) {
+        function showEditor(row, capabilities) {
             void loadInputRuntimeStatus().then((runtimeStatus) => {
                 if (context.content.isConnected)
-                    renderEditor(row, runtimeStatus);
+                    renderEditor(row, runtimeStatus, capabilities);
             });
         }
-        function renderEditor(row, runtimeStatus) {
+        function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
-            const form = entryForm(row?.entry, runtimeStatus);
+            const form = entryForm(row?.entry, runtimeStatus, capabilities);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
             save.type = "submit";
@@ -1185,6 +1340,10 @@ var Amaterasu;
                     return;
                 void Amaterasu.runAction(save, feedback, async () => {
                     const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
+                    entry.config_overrides = {
+                        ...(entry.config_overrides ?? {}),
+                        ...parseCatalogFrameLimiterOverrides(new FormData(form), capabilities, row?.entry.config_overrides),
+                    };
                     await api.post(row ? "catalog/update" : "catalog/create", {
                         ...(row ? { id: row.id } : {}),
                         entry,
@@ -1202,7 +1361,7 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderCatalog = renderCatalog;
-    function entryForm(entry, runtimeStatus) {
+    function entryForm(entry, runtimeStatus, capabilities) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -1261,6 +1420,7 @@ var Amaterasu;
         fec.min = "1";
         fec.max = "255";
         fec.step = "1";
+        const frameLimiterFields = catalogFrameLimiterOverrideFields(entry?.config_overrides, capabilities);
         const streamAudio = audioOverrideSelect("stream_audio", entry?.config_overrides?.stream_audio);
         const audioSink = audioSinkOverrideControls(entry?.config_overrides?.audio_sink);
         const virtualSink = virtualSinkOverrideControls(entry?.config_overrides?.virtual_sink);
@@ -1305,7 +1465,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
+        form.append(Amaterasu.el("div", "form-grid", Amaterasu.field("Name", name), Amaterasu.field("Launch type", kind)), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas."), Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application."), pathField, Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...frameLimiterFields, ...refreshRateOptionFields, Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."), Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing."), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), steamIdField, steamInstallDirField, fullscreen, executable);
         showKind();
         return form;
     }
