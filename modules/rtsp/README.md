@@ -48,13 +48,14 @@ succeeds.
 This does not alter NVHTTP's HTTP/HTTPS listener or weaken its loopback policy.
 
 Startup settings accept `address_family` (`ipv4` or `both`) and `bind_address`
-(an IP address or empty string). An explicit address replaces the RTSP listener IP
-and supplies the same-family video, control and audio UDP bind addresses while
-preserving configured ports. If either key is omitted, the legacy `bind` address
-remains in effect. An explicit empty address keeps the legacy loopback address when
-`allow_remote` is false, and selects the family wildcard when remote access is
-enabled. For wildcard listeners, RTSP selects a concrete local route for each peer
-and uses it in the returned URL and that stream's UDP binds.
+(an IP address or empty string). A nonempty `bind_address` replaces the RTSP
+listener IP and supplies the same-family video, control and audio UDP bind
+addresses while preserving configured ports. When both policy keys are omitted,
+the legacy `bind` IP remains in effect. An explicit `address_family` supplies
+family defaults when `bind_address` is omitted or empty: loopback addresses when
+remote access is disabled, and family wildcards when remote access is enabled.
+For wildcard listeners, RTSP selects a concrete local route for each peer and
+uses it in the returned URL and that stream's UDP binds.
 
 With an explicit IP, RTSP and derived UDP binds use that one family. With an
 explicit empty address and `both`, RTSP binds separate IPv4 and IPv6 TCP sockets
