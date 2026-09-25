@@ -48,11 +48,7 @@ impl Format {
     }
 
     pub fn code(self) -> u32 {
-        if self.name == "f32" {
-            PCM_F32
-        } else {
-            PCM_I16
-        }
+        if self.name == "f32" { PCM_F32 } else { PCM_I16 }
     }
 
     pub fn block_align(self) -> usize {

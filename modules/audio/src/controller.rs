@@ -4,11 +4,11 @@ use crate::{
     worker::{Backend, NativeBackend, Opened, Source},
 };
 use amaterasu_media::{
-    AudioFrame, AudioSink, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, MEDIA_BACKEND_ERROR,
+    AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, AudioFrame, AudioSink, MEDIA_BACKEND_ERROR,
     MEDIA_CLOSED, MEDIA_PENDING, PCM_F32, PCM_I16,
 };
-use amaterasu_module_sdk::abi::{Status, STATUS_OK};
-use serde_json::{json, Value};
+use amaterasu_module_sdk::abi::{STATUS_OK, Status};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
@@ -44,6 +44,25 @@ struct OperationRecord {
 struct OpenPolicy {
     host_audio_enabled: bool,
     capture_sink_without_routing: bool,
+}
+
+struct OpenRequest {
+    endpoint: String,
+    virtual_sink: Option<String>,
+    channels: Option<u32>,
+    continuous_audio: Option<ContinuousAudio>,
+    policy: OpenPolicy,
+    operation: Option<String>,
+}
+
+struct StreamOpen {
+    requested_endpoint: String,
+    virtual_sink: Option<String>,
+    channels: Option<u32>,
+    continuous_audio: Option<ContinuousAudio>,
+    continuous: Option<ContinuousStream>,
+    policy: OpenPolicy,
+    opened: Opened,
 }
 
 struct ContinuousStream {
@@ -231,12 +250,20 @@ impl ContinuousPacketizer {
 
     fn is_silent(&self, bytes: &[u8]) -> bool {
         match self.format.code() {
-            PCM_F32 => bytes
-                .chunks_exact(4)
-                .all(|sample| f32::from_le_bytes(sample.try_into().unwrap()) == 0.0),
-            PCM_I16 => bytes
-                .chunks_exact(2)
-                .all(|sample| i16::from_le_bytes(sample.try_into().unwrap()) == 0),
+            PCM_F32 => {
+                let (samples, remainder) = bytes.as_chunks::<4>();
+                remainder.is_empty()
+                    && samples
+                        .iter()
+                        .all(|sample| f32::from_le_bytes(*sample) == 0.0)
+            }
+            PCM_I16 => {
+                let (samples, remainder) = bytes.as_chunks::<2>();
+                remainder.is_empty()
+                    && samples
+                        .iter()
+                        .all(|sample| i16::from_le_bytes(*sample) == 0)
+            }
             _ => false,
         }
     }
@@ -294,15 +321,17 @@ impl Controller {
                 capture_sink_without_routing,
             } => self.open(
                 owner,
-                endpoint,
-                virtual_sink,
-                channels,
-                None,
-                OpenPolicy {
-                    host_audio_enabled,
-                    capture_sink_without_routing,
+                OpenRequest {
+                    endpoint,
+                    virtual_sink,
+                    channels,
+                    continuous_audio: None,
+                    policy: OpenPolicy {
+                        host_audio_enabled,
+                        capture_sink_without_routing,
+                    },
+                    operation: operation_id,
                 },
-                operation_id,
             )?,
             Operation::OpenContinuous {
                 endpoint,
@@ -314,19 +343,21 @@ impl Controller {
                 continuous_audio,
             } => self.open(
                 owner,
-                endpoint,
-                virtual_sink.clone(),
-                channels,
-                Some(continuous_audio),
-                OpenPolicy {
-                    host_audio_enabled,
-                    capture_sink_without_routing: if virtual_sink.is_some() {
-                        false
-                    } else {
-                        capture_sink_without_routing
+                OpenRequest {
+                    endpoint,
+                    virtual_sink: virtual_sink.clone(),
+                    channels,
+                    continuous_audio: Some(continuous_audio),
+                    policy: OpenPolicy {
+                        host_audio_enabled,
+                        capture_sink_without_routing: if virtual_sink.is_some() {
+                            false
+                        } else {
+                            capture_sink_without_routing
+                        },
                     },
+                    operation: operation_id,
                 },
-                operation_id,
             )?,
             Operation::Lookup { operation_id } => self.lookup(owner, &operation_id)?,
             Operation::Close { stream } => self.close(owner, stream)?,
@@ -338,16 +369,15 @@ impl Controller {
         })
     }
 
-    fn open(
-        &mut self,
-        owner: &str,
-        endpoint: String,
-        virtual_sink: Option<String>,
-        mut channels: Option<u32>,
-        continuous_audio: Option<ContinuousAudio>,
-        policy: OpenPolicy,
-        operation: Option<String>,
-    ) -> AudioResult<Value> {
+    fn open(&mut self, owner: &str, request: OpenRequest) -> AudioResult<Value> {
+        let OpenRequest {
+            endpoint,
+            virtual_sink,
+            mut channels,
+            continuous_audio,
+            policy,
+            operation,
+        } = request;
         if !self.enabled {
             return Err("disabled");
         }
@@ -409,13 +439,15 @@ impl Controller {
             .transpose()?;
         let id = self.insert(
             owner,
-            endpoint.clone(),
-            virtual_sink.clone(),
-            channels,
-            continuous_audio,
-            continuous,
-            policy,
-            opened,
+            StreamOpen {
+                requested_endpoint: endpoint.clone(),
+                virtual_sink: virtual_sink.clone(),
+                channels,
+                continuous_audio,
+                continuous,
+                policy,
+                opened,
+            },
         )?;
         if let Some(operation) = operation {
             self.operations.insert(
@@ -434,17 +466,16 @@ impl Controller {
         Ok(open_reply(id, &self.streams[&id]))
     }
 
-    fn insert(
-        &mut self,
-        owner: &str,
-        requested_endpoint: String,
-        virtual_sink: Option<String>,
-        channels: Option<u32>,
-        continuous_audio: Option<ContinuousAudio>,
-        continuous: Option<ContinuousStream>,
-        policy: OpenPolicy,
-        opened: Opened,
-    ) -> AudioResult<u64> {
+    fn insert(&mut self, owner: &str, open: StreamOpen) -> AudioResult<u64> {
+        let StreamOpen {
+            requested_endpoint,
+            virtual_sink,
+            channels,
+            continuous_audio,
+            continuous,
+            policy,
+            opened,
+        } = open;
         let id = self.next_stream.checked_add(1).ok_or("stream_limit")?;
         self.streams.insert(
             id,

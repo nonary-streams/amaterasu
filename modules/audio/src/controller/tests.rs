@@ -4,13 +4,13 @@ use crate::{
     worker::{Backend, Opened},
 };
 use amaterasu_media::*;
-use amaterasu_module_sdk::{abi::*, Command, ManagedModule, Response, RuntimeClient};
+use amaterasu_module_sdk::{Command, ManagedModule, Response, RuntimeClient, abi::*};
 use std::{
     collections::VecDeque,
     ffi::c_void,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -159,29 +159,33 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
             .payload,
         opened.payload
     );
-    assert!(controller
-        .handle(
-            "bob",
-            Operation::Lookup {
-                operation_id: "one".into()
-            }
-        )
-        .is_err());
+    assert!(
+        controller
+            .handle(
+                "bob",
+                Operation::Lookup {
+                    operation_id: "one".into()
+                }
+            )
+            .is_err()
+    );
     assert!(controller.close("bob", 1).is_err());
     assert_eq!(controller.status("bob", None)["streams"], json!([]));
-    assert!(controller
-        .handle(
-            "alice",
-            Operation::Open {
-                endpoint: "default".into(),
-                virtual_sink: None,
-                channels: None,
-                host_audio_enabled: true,
-                operation_id: Some("one".into()),
-                capture_sink_without_routing: false
-            }
-        )
-        .is_err());
+    assert!(
+        controller
+            .handle(
+                "alice",
+                Operation::Open {
+                    endpoint: "default".into(),
+                    virtual_sink: None,
+                    channels: None,
+                    host_audio_enabled: true,
+                    operation_id: Some("one".into()),
+                    capture_sink_without_routing: false
+                }
+            )
+            .is_err()
+    );
     controller.close("alice", 1).unwrap();
     assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -799,10 +803,12 @@ fn disabled_controls_do_not_enumerate_or_open_and_limits_are_validated() {
     assert!(observed.opens.lock().unwrap().is_empty());
     assert!(validate_endpoint("invalid\0endpoint").is_err());
     assert!(validate_operation("two words").is_err());
-    assert!(serde_json::from_value::<Operation>(
-        json!({"action":"open","endpoint":"default","owner":"bob"})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<Operation>(
+            json!({"action":"open","endpoint":"default","owner":"bob"})
+        )
+        .is_err()
+    );
 }
 
 struct Sink {
