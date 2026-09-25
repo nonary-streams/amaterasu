@@ -2,11 +2,15 @@ use super::Backend;
 use crate::gamepad_profile::GamepadProfile;
 #[path = "windows_gamepad.rs"]
 mod windows_gamepad;
+#[path = "windows_pen_touch.rs"]
+mod windows_pen_touch;
 use crate::model::{
-    Axis, Button, Event, InputError, InputResult, Key, KeyState, effective_virtual_key,
+    Axis, Button, Event, InputError, InputResult, Key, KeyState, PenTouchDevice,
+    effective_virtual_key,
 };
 use std::collections::HashMap;
 use windows_gamepad::WindowsGamepads;
+use windows_pen_touch::WindowsPenTouch;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub struct WindowsBackend {
@@ -14,6 +18,7 @@ pub struct WindowsBackend {
     key_rightalt_to_key_win: bool,
     held_key_plans: HashMap<u8, KeyboardPlan>,
     gamepads: WindowsGamepads,
+    pen_touch: WindowsPenTouch,
 }
 
 impl WindowsBackend {
@@ -23,6 +28,7 @@ impl WindowsBackend {
             key_rightalt_to_key_win: false,
             held_key_plans: HashMap::new(),
             gamepads: WindowsGamepads::new(),
+            pen_touch: WindowsPenTouch::new(),
         }
     }
 
@@ -81,6 +87,9 @@ impl WindowsBackend {
         if matches!(event, Event::Controller { .. }) {
             return self.gamepads.inject(event);
         }
+        if matches!(event, Event::PenTouch { .. }) {
+            return self.pen_touch.inject(event);
+        }
         let key_identity = match event {
             Event::Key { key, .. } => Self::moonlight_key_identity(key),
             _ => None,
@@ -135,6 +144,14 @@ impl Backend for WindowsBackend {
         self.gamepads.supported()
     }
 
+    fn pen_touch_supported(&self) -> bool {
+        self.pen_touch.supported()
+    }
+
+    fn pen_touch_max_contacts(&self, device: PenTouchDevice) -> Option<usize> {
+        Some(self.pen_touch.max_contacts(device))
+    }
+
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.gamepads.effective_profile()
     }
@@ -149,6 +166,11 @@ impl Backend for WindowsBackend {
 
     fn validate(&self, event: &Event) -> InputResult<()> {
         event.validate()?;
+        if matches!(event, Event::PenTouch { .. }) {
+            // Controller batch validation calls this before any batch event is
+            // injected, so contact lifecycle checks belong in inject instead.
+            return self.pen_touch.validate(event);
+        }
         self.gamepads.validate(event)?;
         if matches!(
             event,
@@ -167,6 +189,7 @@ impl Backend for WindowsBackend {
 
     fn start(&mut self) -> InputResult<()> {
         self.gamepads.start()?;
+        self.pen_touch.start()?;
         self.held_key_plans.clear();
         Ok(())
     }
@@ -199,7 +222,7 @@ impl Backend for WindowsBackend {
 
     fn advance(&mut self, now: std::time::Instant) -> InputResult<()> {
         self.gamepads.advance(now);
-        Ok(())
+        self.pen_touch.advance(now)
     }
 
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
@@ -219,9 +242,11 @@ impl Backend for WindowsBackend {
     }
 
     fn stop(&mut self) -> InputResult<()> {
-        self.gamepads.stop()?;
+        let gamepad_result = self.gamepads.stop();
+        let pen_touch_result = self.pen_touch.stop();
         self.held_key_plans.clear();
-        Ok(())
+        gamepad_result?;
+        pen_touch_result
     }
 }
 
@@ -366,7 +391,7 @@ fn native_input_with_plan(event: &Event, plan: KeyboardPlan) -> InputResult<INPU
         Event::PenTouch { .. } => {
             return Err(InputError::new(
                 "unsupported_event",
-                "Windows native pen/touch injection is not implemented by this backend",
+                "Windows pen/touch events use synthetic pointer injection",
             ));
         }
         Event::Key { .. } => unreachable!("keyboard events handled above"),
