@@ -303,11 +303,11 @@ impl ApplyRequest {
     pub fn policy_context(&self) -> Result<PolicyContext, ServiceError> {
         self.validate()?;
         let client_display_mode_rate = match &self.client_display_mode_override_millihz {
-            Presence::Value(rate) if *rate != 0 => Some(
+            Presence::Value(0) => None,
+            Presence::Value(rate) => Some(
                 crate::FpsLimit::from_millihz(*rate)
                     .map_err(|_| ServiceError::InvalidMillihertz)?,
             ),
-            Presence::Value(0) => None,
             Presence::Missing | Presence::Null => None,
         };
         let lossless_scaling_limit = match &self.lossless_scaling_limit_millihz {
@@ -338,11 +338,12 @@ impl ApplyRequest {
             matches!(self.virtual_display_active, Presence::Value(true));
         context.client_display_mode_rate = client_display_mode_rate;
         context.requested_stream_fps = match &self.requested_stream_fps_millihz {
-            Presence::Value(value) if *value != 0 => Some(
+            Presence::Value(0) => None,
+            Presence::Value(value) => Some(
                 crate::FpsLimit::from_millihz(*value)
                     .map_err(|_| ServiceError::InvalidMillihertz)?,
             ),
-            Presence::Value(0) | Presence::Null | Presence::Missing => None,
+            Presence::Null | Presence::Missing => None,
         };
         context.lossless_scaling_limit = lossless_scaling_limit;
         context.frame_generation_provider = frame_generation_provider;
