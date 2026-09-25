@@ -26,11 +26,22 @@ enum PendingPhase {
 }
 
 /// Polls the host configuration service without blocking diagnostics requests.
-#[derive(Default)]
 pub(crate) struct HostLoggingConfigurationReader {
     pending: Option<PendingPhase>,
     next_attempt: Option<Instant>,
-    last_revision: Option<u64>,
+    discard_first_ready_payload: bool,
+    highest_adopted_revision: Option<u64>,
+}
+
+impl Default for HostLoggingConfigurationReader {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            next_attempt: None,
+            discard_first_ready_payload: true,
+            highest_adopted_revision: None,
+        }
+    }
 }
 
 impl HostLoggingConfigurationReader {
@@ -166,10 +177,26 @@ impl HostLoggingConfigurationReader {
             return None;
         };
 
+        // The stable operation ID may reconnect a restarted reader to an old
+        // completed GET. Release that result, then require a fresh GET before
+        // allowing persisted settings to replace the bootstrap policy.
+        if self.discard_first_ready_payload {
+            self.discard_first_ready_payload = false;
+            self.schedule_retry(now);
+            return None;
+        }
+
         self.next_attempt = Some(now + REFRESH_INTERVAL);
-        let is_new_revision = self.last_revision != Some(revision);
-        self.last_revision = Some(revision);
-        (revision > 0 && is_new_revision).then_some(payload)
+        if revision == 0
+            || self
+                .highest_adopted_revision
+                .is_some_and(|highest_adopted_revision| revision <= highest_adopted_revision)
+        {
+            return None;
+        }
+
+        self.highest_adopted_revision = Some(revision);
+        Some(payload)
     }
 
     fn schedule_retry(&mut self, now: Instant) {
@@ -220,8 +247,50 @@ mod tests {
         })
     }
 
+    fn complete_configuration_read(
+        reader: &mut HostLoggingConfigurationReader,
+        started: Instant,
+        request_id: u64,
+        revision: u64,
+    ) -> Option<Value> {
+        assert!(
+            reader
+                .tick(started, |command| match command {
+                    Command::Request {
+                        service,
+                        payload,
+                        operation_id,
+                        parent,
+                        ..
+                    } => {
+                        assert_eq!(service, HOST_CONFIGURATION_SERVICE);
+                        assert_eq!(payload, json!({"action":"get"}));
+                        assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
+                        assert_eq!(parent, None);
+                        Ok(Response::Accepted { id: request_id })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+
+        reader.tick(started + Duration::from_secs(1), |command| match command {
+            Command::TakeResult { request } => {
+                assert_eq!(request, request_id);
+                Ok(Response::Result {
+                    payload: ready_configuration(revision),
+                })
+            }
+            Command::ReleaseResult { request } => {
+                assert_eq!(request, request_id);
+                Ok(Response::Ok)
+            }
+            unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+        })
+    }
+
     #[test]
-    fn asynchronously_reads_releases_and_refreshes_persisted_settings() {
+    fn releases_startup_result_before_adopting_a_fresh_read_and_refreshing() {
         let started = Instant::now();
         let mut reader = HostLoggingConfigurationReader::default();
         let mut lifecycle = Vec::new();
@@ -277,23 +346,44 @@ mod tests {
             }
             unexpected => panic!("unexpected runtime command: {unexpected:?}"),
         });
-        assert_eq!(loaded, Some(ready_configuration(1)));
+        assert_eq!(
+            loaded, None,
+            "the first ready result after startup is discarded"
+        );
         assert_eq!(
             lifecycle,
             ["request", "take_pending", "take_result", "release"]
         );
 
-        let refreshed = reader.tick(started + Duration::from_secs(32), |command| match command {
-            Command::Request { .. } => Ok(Response::Accepted { id: 11 }),
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(7), |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 11 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+
+        let loaded = reader.tick(started + Duration::from_secs(8), |command| match command {
+            Command::TakeResult { request: 11 } => Ok(Response::Result {
+                payload: ready_configuration(1),
+            }),
+            Command::ReleaseResult { request: 11 } => Ok(Response::Ok),
+            unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+        });
+        assert_eq!(loaded, Some(ready_configuration(1)));
+
+        let refreshed = reader.tick(started + Duration::from_secs(38), |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 12 }),
             unexpected => panic!("unexpected runtime command: {unexpected:?}"),
         });
         assert!(refreshed.is_none());
 
-        let changed = reader.tick(started + Duration::from_secs(33), |command| match command {
-            Command::TakeResult { request: 11 } => Ok(Response::Result {
+        let changed = reader.tick(started + Duration::from_secs(39), |command| match command {
+            Command::TakeResult { request: 12 } => Ok(Response::Result {
                 payload: ready_configuration(2),
             }),
-            Command::ReleaseResult { request: 11 } => Ok(Response::Ok),
+            Command::ReleaseResult { request: 12 } => Ok(Response::Ok),
             unexpected => panic!("unexpected runtime command: {unexpected:?}"),
         });
         assert_eq!(changed, Some(ready_configuration(2)));
@@ -401,11 +491,79 @@ mod tests {
         );
         assert!(
             reader
-                .tick(started + Duration::from_secs(31), |command| match command {
+                .tick(started + Duration::from_secs(6), |command| match command {
                     Command::Request { .. } => Ok(Response::Accepted { id: 31 }),
                     unexpected => panic!("unexpected runtime command: {unexpected:?}"),
                 })
                 .is_none()
+        );
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(7), |command| match command {
+                    Command::TakeResult { request: 31 } => Ok(Response::Result {
+                        payload: ready_configuration(0),
+                    }),
+                    Command::ReleaseResult { request: 31 } => Ok(Response::Ok),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none(),
+            "revision zero must not replace the bootstrap policy"
+        );
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(8), |_| {
+                    panic!("revision zero should schedule the normal refresh interval")
+                })
+                .is_none()
+        );
+
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(37), |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 32 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert_eq!(
+            reader.tick(started + Duration::from_secs(38), |command| match command {
+                Command::TakeResult { request: 32 } => Ok(Response::Result {
+                    payload: ready_configuration(1),
+                }),
+                Command::ReleaseResult { request: 32 } => Ok(Response::Ok),
+                unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+            }),
+            Some(ready_configuration(1))
+        );
+    }
+
+    #[test]
+    fn adopted_logging_revisions_increase_strictly_within_the_process() {
+        let started = Instant::now();
+        let mut reader = HostLoggingConfigurationReader::default();
+
+        assert_eq!(
+            complete_configuration_read(&mut reader, started, 40, 1),
+            None,
+            "startup must drain the possibly retained first ready result"
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(6), 41, 3),
+            Some(ready_configuration(3))
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(37), 42, 3),
+            None,
+            "an equal revision must remain a no-op"
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(68), 43, 2),
+            None,
+            "a lower revision must not be adopted"
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(99), 44, 4),
+            Some(ready_configuration(4))
         );
     }
 
@@ -493,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restarted_single_reader_reuses_a_completion_until_release_then_refreshes() {
+    fn a_restarted_reader_discards_a_retained_ready_result_before_a_fresh_read() {
         let started = Instant::now();
         let mut original_reader = HostLoggingConfigurationReader::default();
         let mut retained_request_id = None;
@@ -533,13 +691,13 @@ mod tests {
                 .is_none()
         );
 
-        let first_configuration = ready_configuration(1);
+        let retained_configuration = ready_configuration(3);
         let loaded =
             restarted_reader.tick(started + Duration::from_secs(2), |command| match command {
                 Command::TakeResult { request } => {
                     assert_eq!(Some(request), retained_request_id);
                     Ok(Response::Result {
-                        payload: first_configuration.clone(),
+                        payload: retained_configuration.clone(),
                     })
                 }
                 Command::ReleaseResult { request } => {
@@ -550,12 +708,25 @@ mod tests {
                 }
                 unexpected => panic!("unexpected runtime command: {unexpected:?}"),
             });
-        assert_eq!(loaded, Some(first_configuration));
+        assert_eq!(
+            loaded, None,
+            "a retained completion may predate this process"
+        );
+        assert_eq!(released_requests, [70]);
+        assert_eq!(retained_request_id, None);
+
+        assert!(
+            restarted_reader
+                .tick(started + Duration::from_secs(6), |_| {
+                    panic!("the fresh GET should respect the retry delay")
+                })
+                .is_none()
+        );
 
         next_request_id += 1;
         assert!(
             restarted_reader
-                .tick(started + Duration::from_secs(32), |command| match command {
+                .tick(started + Duration::from_secs(7), |command| match command {
                     Command::Request { operation_id, .. } => {
                         assert_eq!(operation_id, HOST_LOGGING_OPERATION_ID);
                         assert!(retained_request_id.is_none());
@@ -570,9 +741,9 @@ mod tests {
                 .is_none()
         );
 
-        let refreshed_configuration = ready_configuration(2);
+        let refreshed_configuration = ready_configuration(4);
         let refreshed =
-            restarted_reader.tick(started + Duration::from_secs(33), |command| match command {
+            restarted_reader.tick(started + Duration::from_secs(8), |command| match command {
                 Command::TakeResult { request } => {
                     assert_eq!(Some(request), retained_request_id);
                     Ok(Response::Result {

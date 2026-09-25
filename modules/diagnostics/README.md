@@ -79,20 +79,46 @@ must not submit secrets or content they do not intend to make available to the
 host account. Log files roll at 2 MiB, retain up to four rolled files plus the
 active file per session, and startup prunes old sessions to keep at most 30
 session groups. If the disk sink cannot be opened or later fails, the volatile
-journal continues to work; disk logging remains unavailable until worker
-restart.
+journal continues to work. The logger retains the current validated policy and
+tries to open a fresh session on the next accepted record at or above the
+configured level. Each attempt repeats the trusted path checks. Records missed
+by the sink during an outage are not backfilled; if opening continues to fail,
+later qualifying records trigger another attempt. A positive persisted settings
+revision reconfigures the sink only when it exceeds the highest revision adopted
+by this worker.
 
 This is a host diagnostics sink, not a capture of all host or native-library
 logs. Service supervisor messages on stderr and worker protocol lines on stdout
 remain outside this file sink. The host-provided logging policy opens an initial
 sink while the diagnostics module asynchronously reads the persisted
-`amaterasu.host-configuration/1` document. A ready document with revision above
-zero replaces the bootstrap policy, and the module polls every 30 seconds to
-apply later path or level revisions. An absent revision-zero document, an
-unavailable provider, or an invalid response keeps the trusted bootstrap policy
-active and retries without blocking diagnostics requests. The host release
-profile must grant diagnostics read access to the host-configuration service;
-until that profile is integrated, only the bootstrap policy is available.
+`amaterasu.host-configuration/1` document. After startup, the reader releases
+and discards its first valid ready document, then schedules a fresh GET after
+the retry delay before any persisted settings can replace the bootstrap
+policy. This prevents a restarted reader from adopting an older completed GET
+retained under its stable operation ID. A fresh valid document with a positive
+revision replaces the bootstrap policy; later documents reconfigure the sink
+only when their positive revision exceeds the highest revision adopted by this
+worker. Revision zero, an unavailable provider, or an invalid response keeps
+the trusted bootstrap policy active and retries without blocking diagnostics
+requests. The module polls every 30 seconds after a valid read. The host
+release-profile grant and diagnostics dependency landed on main in commits
+`687f72a2` and `b084b0e7`, so the host-configuration service call is available.
+
+The diagnostics reader uses the caller-scoped operation ID
+`diagnostics.host-configuration.logging.read` for each serialized GET cycle.
+If the diagnostics module restarts while its broker request is still retained,
+the new reader resubmits the same service, payload, and parent and reattaches to
+the pending request or unreleased result. It releases every terminal result;
+failed releases remain pending for retry. The first valid ready document after
+startup is discarded after release, and the reader retries the same operation
+ID to start a fresh GET. `ReleaseResult` removes the broker retry record, so
+the same ID can start that new GET. The broker keeps completed records for up
+to 300 seconds. Its request table is in memory, so restarting the broker itself
+starts a fresh GET. This relies on one diagnostics reader per broker caller;
+simultaneous readers would share this ID and could race to consume or release a
+result. A retained request created by an older version's numbered IDs cannot
+be recovered with the new stable ID and expires under the broker's normal
+retention policy.
 
 This sink does not capture all host or native-library logs, inspect process
 state, credentials, or network traffic, capture crashes, implement tracing
