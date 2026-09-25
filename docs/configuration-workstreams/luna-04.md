@@ -134,6 +134,12 @@ Validation: `rustfmt --edition 2024 --check` passed on the changed Rust files. `
 
 The coordinator's landing policy is direct lane-commit cherry-picks into `main`; no integration branch is used. The coordinator owns those cherry-picks. This correction leaves `global:ds4_back_as_touchpad_click` pending until management/client/app resolution and Windows device qualification are reviewed.
 
+### Expanded acquire and retry contract acknowledgement
+
+- `Lease.ds4_back_as_touchpad_click` snapshots the effective value at acquisition using the explicit request when present or the current durable ProductSettings v9 global default otherwise. The lease stores the sparse request separately: `Some(false)` remains false, while `None` falls through to the durable default. Status reads the lease snapshot, and cleanup restores the latest global policy after releasing the lease.
+- Input acquire callers send `Some(value)` only for an explicit client/application override; absent overrides send `None`. The session retry identity freezes that optional value so retries preserve the original scope decision. The mapping applies only to DS4; X360 behavior is unchanged.
+- The source currently checked on local `main` contains the lease field and snapshot code in commit `3d1fa5ac09ff1411434767679c238bc7459127cd`; the earlier missing-field compile error is absent from that checked tree. No Cargo validation was run in this lightweight lane, so coordinator package validation remains authoritative.
+
 ## Initial DS4 profile and settings wire-up
 
 - Candidate code commit: `50163b7dff4eefc4e4de14638d2861940c1f849e`
