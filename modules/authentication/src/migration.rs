@@ -33,18 +33,17 @@ pub fn import_legacy_authentication(
 ) -> Result<LegacyAuthenticationImport, &'static str> {
     let root = canonical_directory(source_root)?;
     let candidates = credential_candidates(&root)?;
+    for path in token_validation_candidates(&root)? {
+        if !candidates.contains(&path) {
+            reject_unsupported_api_tokens_in_file(&path)?;
+        }
+    }
     let mut documents = Vec::new();
     for path in candidates {
         let bytes = read_bounded(&path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "legacy_authentication_invalid_credential")?;
-        if value
-            .pointer("/root/api_tokens")
-            .and_then(Value::as_array)
-            .is_some_and(|tokens| !tokens.is_empty())
-        {
-            return Err("legacy_authentication_tokens_unsupported");
-        }
+        reject_unsupported_api_tokens(&value)?;
         if !["username", "password", "salt"]
             .iter()
             .any(|key| value.get(key).is_some())
@@ -135,10 +134,29 @@ impl LegacyCredential {
 }
 
 fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
-    let configured = configured_credential_file(root)?;
-    if let Some(path) = configured {
+    if let Some(path) = configured_credential_file(root)? {
         return Ok(vec![path]);
     }
+    let configured_state = configured_state_paths(root)?;
+    match &configured_state.primary_file_state {
+        ConfiguredPrimaryState::Configured(path) => return Ok(vec![path.clone()]),
+        ConfiguredPrimaryState::Missing => return Ok(Vec::new()),
+        ConfiguredPrimaryState::NotConfigured => legacy_state_candidates(root, &configured_state),
+    }
+}
+
+fn token_validation_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    if configured_credential_file(root)?.is_some() {
+        return Ok(Vec::new());
+    }
+    let configured_state = configured_state_paths(root)?;
+    legacy_state_candidates(root, &configured_state)
+}
+
+fn legacy_state_candidates(
+    root: &Path,
+    configured_state: &ConfiguredStatePaths,
+) -> Result<Vec<PathBuf>, &'static str> {
     let mut files = Vec::new();
     for name in STATE_FILES {
         if root
@@ -152,12 +170,35 @@ fn credential_candidates(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
             }
         }
     }
-    for path in configured_state_paths(root)? {
-        if !files.contains(&path) {
-            files.push(path);
+    if let ConfiguredPrimaryState::Configured(path) = &configured_state.primary_file_state
+        && !files.contains(path)
+    {
+        files.push(path.clone());
+    }
+    for path in &configured_state.auxiliary_paths {
+        if !files.contains(path) {
+            files.push(path.clone());
         }
     }
     Ok(files)
+}
+
+fn reject_unsupported_api_tokens(value: &Value) -> Result<(), &'static str> {
+    if value
+        .pointer("/root/api_tokens")
+        .and_then(Value::as_array)
+        .is_some_and(|tokens| !tokens.is_empty())
+    {
+        return Err("legacy_authentication_tokens_unsupported");
+    }
+    Ok(())
+}
+
+fn reject_unsupported_api_tokens_in_file(path: &Path) -> Result<(), &'static str> {
+    let bytes = read_bounded(path, 1024 * 1024).map_err(|_| "legacy_authentication_layout")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "legacy_authentication_invalid_credential")?;
+    reject_unsupported_api_tokens(&value)
 }
 
 fn strip_inline_comment(line: &str) -> &str {
@@ -176,6 +217,17 @@ fn strip_inline_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+enum ConfiguredPrimaryState {
+    NotConfigured,
+    Configured(PathBuf),
+    Missing,
+}
+
+struct ConfiguredStatePaths {
+    primary_file_state: ConfiguredPrimaryState,
+    auxiliary_paths: Vec<PathBuf>,
 }
 
 fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static str> {
@@ -208,8 +260,11 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
                 continue;
             };
             if key.trim().eq_ignore_ascii_case("credentials_file") {
-                let candidate =
-                    regular_contained_file(root, Path::new(candidate.trim().trim_matches('"')))?;
+                let candidate = candidate.trim().trim_matches('"').trim();
+                if candidate.is_empty() {
+                    continue;
+                }
+                let candidate = regular_contained_file(root, Path::new(candidate))?;
                 if value
                     .replace(candidate.clone())
                     .is_some_and(|previous| previous != candidate)
@@ -222,10 +277,9 @@ fn configured_credential_file(root: &Path) -> Result<Option<PathBuf>, &'static s
     Ok(value)
 }
 
-fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
+fn configured_state_paths(root: &Path) -> Result<ConfiguredStatePaths, &'static str> {
     let mut configured_primary_file_state = None::<(PathBuf, Option<PathBuf>)>;
     let mut configured_vibeshine_file_state = None::<(PathBuf, Option<PathBuf>)>;
-    let mut paths = Vec::new();
     for name in [
         "apollo.conf",
         "sunshine.conf",
@@ -269,7 +323,7 @@ fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
             {
                 return Err("legacy_authentication_layout");
             }
-            let path = match key.as_str() {
+            match key.as_str() {
                 "file_state" => {
                     let path = optional_regular_contained_file(root, relative)?;
                     if let Some((previous_relative, previous_path)) = &configured_primary_file_state
@@ -281,8 +335,7 @@ fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
                     {
                         return Err("legacy_authentication_credential_ambiguous");
                     }
-                    configured_primary_file_state = Some((relative.to_path_buf(), path.clone()));
-                    path
+                    configured_primary_file_state = Some((relative.to_path_buf(), path));
                 }
                 "vibeshine_file_state" => {
                     let path = optional_regular_contained_file(root, relative)?;
@@ -296,19 +349,25 @@ fn configured_state_paths(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
                     {
                         return Err("legacy_authentication_credential_ambiguous");
                     }
-                    configured_vibeshine_file_state = Some((relative.to_path_buf(), path.clone()));
-                    path
+                    configured_vibeshine_file_state = Some((relative.to_path_buf(), path));
                 }
                 _ => unreachable!("only supported state keys reach this point"),
-            };
-            if let Some(path) = path
-                && !paths.contains(&path)
-            {
-                paths.push(path);
             }
         }
     }
-    Ok(paths)
+    let primary_file_state = match configured_primary_file_state {
+        Some((_, Some(path))) => ConfiguredPrimaryState::Configured(path),
+        Some((_, None)) => ConfiguredPrimaryState::Missing,
+        None => ConfiguredPrimaryState::NotConfigured,
+    };
+    let auxiliary_paths = configured_vibeshine_file_state
+        .and_then(|(_, path)| path)
+        .into_iter()
+        .collect();
+    Ok(ConfiguredStatePaths {
+        primary_file_state,
+        auxiliary_paths,
+    })
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, &'static str> {
@@ -442,6 +501,14 @@ mod tests {
         path
     }
 
+    fn credential_record(username: &str, password: &str, salt: &str) -> String {
+        let hash = format!(
+            "{:x}",
+            Sha256::digest(format!("{password}{salt}").as_bytes())
+        );
+        serde_json::json!({"username":username,"password":hash,"salt":salt}).to_string()
+    }
+
     #[test]
     fn imports_only_a_supported_verifier_and_preserves_existing_namespace() {
         let source = temporary_directory("source");
@@ -515,6 +582,127 @@ mod tests {
         assert_eq!(
             imported.document.credential.as_ref().unwrap().username,
             "Admin"
+        );
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn inherits_primary_file_state_when_credentials_file_is_absent_or_empty() {
+        for (name, credentials_line) in [
+            ("omitted-credentials-file", ""),
+            ("empty-credentials-file", "credentials_file = \"\"\n"),
+        ] {
+            let source = temporary_directory(name);
+            std::fs::create_dir_all(source.join("private")).unwrap();
+            std::fs::write(
+                source.join("private/primary.json"),
+                credential_record("Current", "current password", "PrimarySalt12345"),
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("sunshine_state.json"),
+                credential_record("Stale", "stale password", "StaleSalt1234567"),
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("sunshine.conf"),
+                format!("{credentials_line}file_state = private/primary.json\n"),
+            )
+            .unwrap();
+
+            let imported = import_legacy_authentication(&source).unwrap();
+            assert_eq!(
+                imported.document.credential.as_ref().unwrap().username,
+                "Current"
+            );
+            let _ = std::fs::remove_dir_all(source);
+        }
+    }
+
+    #[test]
+    fn missing_inherited_file_state_does_not_fall_back_to_a_default_state_file() {
+        let source = temporary_directory("missing-inherited-file-state");
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            credential_record("Stale", "stale password", "StaleSalt1234567"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = private/not-created.json\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            import_legacy_authentication(&source),
+            Err("legacy_authentication_credential_ambiguous")
+        ));
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn nonempty_credentials_file_overrides_primary_file_state() {
+        let source = temporary_directory("credentials-file-override");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("private/primary.json"),
+            credential_record("Primary", "primary password", "PrimarySalt12345"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("private/override.json"),
+            credential_record("Override", "override password", "OverrideSalt1234"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            credential_record("Stale", "stale password", "StaleSalt1234567"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "file_state = private/primary.json\ncredentials_file = private/override.json\n",
+        )
+        .unwrap();
+
+        let imported = import_legacy_authentication(&source).unwrap();
+        assert_eq!(
+            imported.document.credential.as_ref().unwrap().username,
+            "Override"
+        );
+        let _ = std::fs::remove_dir_all(source);
+    }
+
+    #[test]
+    fn unconfigured_primary_state_keeps_default_and_auxiliary_discovery() {
+        let source = temporary_directory("unconfigured-primary-state-discovery");
+        std::fs::create_dir_all(source.join("private")).unwrap();
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            credential_record("Legacy", "legacy password", "LegacySalt123456"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("private/auxiliary.json"),
+            credential_record("Auxiliary", "auxiliary password", "AuxiliarySalt12"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("sunshine.conf"),
+            "vibeshine_file_state = private/auxiliary.json\n",
+        )
+        .unwrap();
+        let root = canonical_directory(&source).unwrap();
+
+        let candidates = credential_candidates(&root).unwrap();
+        assert!(candidates.contains(&source.join("sunshine_state.json").canonicalize().unwrap()));
+        assert!(
+            candidates.contains(
+                &source
+                    .join("private/auxiliary.json")
+                    .canonicalize()
+                    .unwrap()
+            )
         );
         let _ = std::fs::remove_dir_all(source);
     }
