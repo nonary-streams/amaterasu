@@ -435,3 +435,76 @@ The zero, null, missing, and validated nonzero rate handling from Slice 9 remain
 All 12 frame-limiter IDs remain pending for product persistence/defaults, the single v16-to-v17 migration, host registration, management edit authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification. The service remains policy-only. L02 owns the sole v17 migration and NVHTTP projection; L03 did not modify those paths.
 
 Next action: continue independent L03-owned encoder/video parity. Keep the frame-limiter IDs pending until product persistence/defaults and the v17 migration, host registration, management authority, scoped launch projection, provider apply/restore behavior, and Windows/Linux qualification are complete. The package gate is green on main; the policy-only runtime and its platform effects remain incomplete.
+
+
+## Slice 11: NVENC preset request boundary
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `74d5afdfefa561cb6851007807d05682f7bde62a`
+- Worker source commit: `c8992d8840cbc3568ff8554429f4768eaa247ce3`
+- Lane code commit: `ed5f316473c0862631eb345817c9758a96d4978a`
+- Source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b`
+- Pinned behavioral reference: Vibeshine `457237db7e57f9c4be21c35bb07e28d1c100eb7d`
+- Session: `01a0d516-85d0-7261-b883-4dddf4473f99` (`gpt-6-luna`, `max`)
+
+### ID and scope
+
+This bounded slice covers `global:nvenc_preset`, a global-only numeric setting. The pinned Vibeshine config documents default `1`, choices `1..=7` mapped to P1 through P7, and application only when the selected encoder is NVENC (`docs/configuration.md`, `nvenc_preset`; `src/config.cpp` range validation). The ID remains `pending`: Amaterasu's current encode module opens Media Foundation hardware transforms and has no native NVENC backend.
+
+### Changed paths
+
+- `modules/encode/README.md`
+- `modules/encode/src/model.rs`
+- `modules/encode/src/platform/windows.rs`
+- `modules/encode/src/sessions/tests.rs`
+
+### Behavior and evidence
+
+The encode request model now represents P1 through P7 as numeric JSON values and rejects values outside that range. An omitted optional `nvenc_preset` remains absent through serialization, preserving existing request payloads. If a caller supplies this NVENC-only option to the current MFT-only backend, configuration and the direct Windows open boundary return `nvenc_preset_unsupported` before a session is opened. The service does not silently ignore the option or fall back to another encoder. No NVENC preset is applied by this slice.
+
+The product global default remains `1` and range `1..=7`; the coordinator confirmed that L02 owns its canonical persisted field/default, the existing v16-to-v17 migration, and launch projection. The generic `modules/configuration` module is per-caller configuration, not the product-wide settings store. The product setting is global-only and must be projected only when the resolved encoder is NVENC. No extra migration or settings version is requested.
+
+### Review and validation
+
+- Implementation worker: `/root/nvenc_preset_slice`, verified `gpt-6-luna` / `xhigh` with the attribution script before editing. The isolated worktree was based on the clean lane SHA above and changed only the four paths listed above; source commit `c8992d8840cbc3568ff8554429f4768eaa247ce3` uses the configured Nonary identity and required provenance lines.
+- Parent reviewed the worker diff, confirmed its parent and exact path set, and cherry-picked it as `ed5f316473c0862631eb345817c9758a96d4978a`. The worker and lane code commits have the same tree.
+- Focused tests cover numeric P1..P7 roundtrip, rejected out-of-range forms, omitted-field compatibility, and rejection at the session-open boundary before an encoder session is created. Tests were added but not run in this lightweight worktree.
+- Passed `rustfmt --edition 2024 --check` on the three Rust files and `git diff --check` in both worker and lane; the lane code commit passed `git show --check`.
+- Cargo tests/build/Clippy were not run. Coordinator validation can use `cargo test -p amaterasu-encode` and `cargo clippy -p amaterasu-encode --all-targets -- -D warnings` in the clean source checkout.
+- No NVENC hardware or Windows/Linux provider qualification was run. The existing ignored Windows hardware-MFT test is not evidence of NVENC preset support.
+
+### Remaining mismatches and next slice
+
+`global:nvenc_preset` remains pending until L02's global default/persistence and launch projection, L06's signed editor/readback, and a native NVENC backend with hardware qualification are complete. The current code rejects explicit NVENC preset requests because the only backend is MFT. Do not claim the configured preset is applied while that provider is absent.
+
+Next action: coordinate L02's product field/projection and L06's editor against the accepted contract; continue a separate encoder/video candidate only when its behavior has an observable effect in an owned module. Keep this ID pending in the meantime.
+
+## Slice 12: NVENC preset main validation and ownership decision
+
+- Repository: `D:/sources/worktrees/amaterasu-config-video-display`
+- Branch: `config-parity/video-display`
+- Base SHA: `34b27f3f479b2440d15c9bb53c85b139e1626930`
+- Source code commit: `ed5f316473c0862631eb345817c9758a96d4978a`
+- Direct-to-main commit: `0b8d73070a245ce31e3315fa64fd362ad8945ce4`
+- Stable ID: `global:nvenc_preset` (remains `pending`)
+
+### Coordinator validation
+
+The coordinator reports these checks passed on main at `0b8d73070a245ce31e3315fa64fd362ad8945ce4`:
+
+- `cargo fmt --check -p amaterasu-encode`
+- `cargo test -p amaterasu-encode`: 18 passed; one hardware-only MFT test ignored
+- `cargo clippy -p amaterasu-encode --all-targets -- -D warnings`
+
+These gates validate the fail-closed request boundary only. There is no native NVENC preset effect or NVENC hardware qualification.
+
+### Accepted settings and ownership contract
+
+The coordinator confirmed `nvenc_preset` is global-only, an integer with default `1` and range `1..=7` (P1 through P7), with no application or client override. The configured value must not be reported as applied while the native NVENC provider is absent; explicit encode requests continue to fail closed.
+
+L02 owns the canonical product-wide field/default, the existing v16-to-v17 persistence migration, and launch projection. The generic `modules/configuration` API is per-caller configuration and is not the product-wide settings source. L06 owns the signed global editor/readback path and should present the provider-unavailable state without claiming application. No additional settings version or migration is allocated.
+
+### Remaining parity gaps and next slice
+
+The stable ID remains pending until L02 persistence/projection, L06 management authority/UI, a native NVENC provider effect, and hardware qualification are complete. The next independent L03 slice is automatic capture-provider fallback for canonical `capture=auto`/empty mode: the current request adapter preserves its bootstrap provider but the video pipeline does not try another configured provider after an availability failure. This work stays in L03-owned video/capture paths and does not depend on L02 persistence or L06 UI.
