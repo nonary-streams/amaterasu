@@ -1,10 +1,10 @@
 # Configuration parity run coordination
 
-> **2026-09-25 workflow transition:** The user approved replacing the six-lead
-> topology with one coordinator and at most three direct build-enabled feature
-> workers. Follow `configuration-execution-plan.md`. Historical snapshots below
-> do not authorize new legacy dispatch. Preserve pending commits and dirty work;
-> drain existing writers before allocating their paths to a new worker.
+> **2026-09-25 corrected topology:** The user requires six autonomous
+> coordinators with up to three workers each. Follow `configuration-execution-plan.md`.
+> Teams own local builds, repairs and review; the central integrator lands ready
+> commits. The temporary three-direct-worker cap is superseded. Preserve historical
+> branches, candidates and logs. Use fresh build-enabled team sessions.
 
 - Run: `f220bcaa-20260924-152010`
 - Clean source baseline: `f220bcaa4a9d4c28e410a877b0809c14d08bb88b` on `main`

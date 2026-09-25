@@ -1,143 +1,137 @@
 # Configuration parity execution workflow
 
-## Active policy (2026-09-25)
+## Active policy: six coordinators, three workers each
 
-The user approved replacing the six-lead hierarchy to remove delivery bottlenecks.
-This policy supersedes the old lane topology, per-file approval round trips,
-startup-only model-verification sessions, and mandatory cross-lead review queue.
-Historical lane handoffs remain evidence, not dispatch instructions.
+The user's clarification on 2026-09-25 requires MULTIPLE coordinators. Preserve
+six autonomous feature coordinators, each with up to three implementation/review
+workers (up to 18 workers total). The temporary three-direct-worker topology was
+an incorrect interpretation and is superseded. Do not reduce coordinator count
+without asking the user. Keep teams supplied with concrete implementation work.
 
-Use one coordinator and at most three direct implementation workers. Workers do
-not delegate. Prefer two workers plus available review capacity when features
-share contracts. The coordinator schedules complete behavior, reviews ready
-changes, and integrates them as they arrive. Do not wait for a batch barrier.
-The three-worker limit includes surviving legacy implementation workers during
-transition. Do not run both the old and new dispatch systems concurrently.
+One central integrator manages the short Git landing queue and actual cross-team
+collisions. It does not author every task, act as the build server, repeat every
+team's review, or approve routine path edits. All six coordinators run independent
+CLI sessions so each has its own native worker capacity. Workers do not delegate.
+Use fresh coordinator sessions and concise task state; do not replay the old
+20-hour coordination history or restart the old non-buildable-lane scripts.
 
-## Feature ownership and completion
+## Ownership and feature delivery
 
-Assign one observable behavior with an acceptance test, stable IDs, a base SHA,
-and its full set of paths across storage, management/editor and runtime. Establish
-the interface before dispatch when another task depends on it. Avoid assigning
-one worker a field and another its consumer. Use disjoint feature assignments;
-serialize overlapping features instead of spreading one feature across leads.
-Workers may edit tests and supporting code within their assigned directories
-without another approval. Escalate only a real overlap or scope expansion.
+Give a team a complete observable behavior, acceptance tests, stable IDs, an exact
+base and all required paths across layers. Keep assignments disjoint across teams.
+Within that feature the coordinator can freely assign supporting code and tests
+to its workers, without requesting each file from the central integrator.
 
-Keep at most three features in progress. Finish existing partial features before
-opening unrelated settings. If hardware or another platform prevents final
-qualification, finish executable local behavior and record the precise remaining
-gate, then move to another feature. Do not repeatedly rescan all 242 IDs.
+Have one worker own a behavior across layers whenever practical. Use the remaining
+workers for other independent increments and review. Do not require all three to
+finish before publishing ready work. Teams review, repair and validate their own
+changes and keep coding while another team's commits land.
 
-Track each active feature as implementing, validating, ready, landed, or blocked.
-Record local checks and platform qualification separately. The existing coverage
-ledger still reserves verified for full parity; do not weaken that standard.
+If teams need the same file, agree on an interface or transfer that scope once;
+only the conflicting work waits. Do not use permanent directory ownership to
+split a single setting across five coordinators. Shared schemas are explicit
+prerequisites and have one current owner. Existing source boundaries are initial
+reservations, not requirements to parcel a feature into disconnected fields.
 
-## Worker environment and validation
+Prefer completing existing partial features. A blocked platform gate must name
+the missing hardware or environment; it does not prevent finishing local behavior
+or other independent features. Keep coverage verified reserved for complete parity.
+Track implementation, local validation, review, landing and platform qualification
+separately so real progress remains visible without overstating completion.
 
-The user approved build-enabled worktrees for this workflow. Use branches and
-directories ending in _large and the Worktree skill's provisioner. Keep three
-worker slots with isolated manifest-recorded build directories. Share Cargo's
-immutable download cache, never a mutable target directory. Set CARGO_BUILD_JOBS=2
-per worker initially. Reuse a worker worktree/cache for successive features only
-after its prior commits have landed and its branch has been synchronized cleanly.
-Preserve all old branches and dirty work; no reset, cleanup, or history rewrite
-is part of this transition.
+## Build-enabled teams and workers
 
-Use scripts/run_configuration_worker.ps1 for direct CLI workers. It checks the
-branch, exact base, clean state and provisioned build directory in one invocation,
-locks the slot/worktree, configures the isolated Cargo target, disables nested
-agents, and writes logs/results outside the worktree. Startup failure is a normal
-error to repair, not a task for another agent. The initial model is GPT-6 Sol
-Medium; use higher effort only when a concrete implementation or review requires
-it. The coordinator can continue its current session while draining old work;
-it no longer creates domain leads.
+The user approved build-enabled worktrees. Team and child worktrees use _large
+branch/directory names and manifest-recorded isolated build directories. The
+Worktree provisioner creates them. Each child gets its own checkout and
+CARGO_TARGET_DIR=<manifest BuildDirectory>/cargo-target, with CARGO_BUILD_JOBS=2.
+Children must not inherit their coordinator's target directory for compilation.
+Use Cargo's common download cache; never share mutable target directories.
 
-Each worker runs rustfmt, meaningful focused tests, and strict all-target Clippy
-for changed packages and relevant consumers before handoff. Use:
+The current machine has 24 logical processors and about 64 GB RAM. The check
+helper allows six simultaneous validation jobs (two Cargo jobs each); further
+checks wait automatically. This limits build contention while all teams continue
+implementation. There is no single global build queue serviced by a model.
+Host-global device/port/service tests remain explicitly serialized.
+
+Start a team with scripts/run_configuration_worker.ps1 -Coordinator -Slot N.
+The runner accepts slots 1 through 6, checks checkout/base/clean state in code,
+locks the team slot, enables three native workers and writes structured logs.
+Without -Coordinator it remains a non-delegating standalone worker runner.
+The initial coordinator/worker model is GPT-6 Sol Medium; increase effort for a
+specific demanding task instead of running every startup check at Max/XHigh.
+
+Run local validation with:
 
 ```powershell
 ./scripts/check_configuration_slice.ps1 -Packages amaterasu-catalog,amaterasu-launch
-# Add -Frontend when the feature changes the editor.
+# Add -Frontend when changing the editor.
 ```
 
-Workers fix their own compile, test, typecheck and lint errors. Never submit an
-untested candidate as ready because it came from a lightweight worktree. Legacy
-candidates must first be validated in a build-enabled checkout. Device/port/service
-tests that mutate host-global state remain serialized by the coordinator.
+Workers run focused tests, rustfmt and strict all-target Clippy before handoff.
+Failures stay with the owning worker/team. No identity-only bootstrap agent,
+SQLite model-verification round trip, or lightweight-worktree test prohibition.
+The coordinator verifies checkout state as part of normal dispatch and validates
+its integrated team branch after changes interact or conflict.
 
-## Commits, review and integration
+## Review and continuous landing
 
-Commit coherent, locally validated increments as they become ready. A prerequisite
-commit is allowed when it has an actual consumer in the assigned feature; do not
-inflate throughput with status-only commits or unconnected scaffolding. Use
-Commitlog with actual session attribution. New direct-worker commits are not
-attributed to retired Luna domain leads. Preserve existing historical attribution.
+Use Commitlog with actual session attribution. Commit coherent validated increments
+as they finish. Preserve historical attribution; new work names its actual team
+and model when appropriate. Do not manufacture status-only commits for throughput.
 
-One independent diff review is required per feature; the coordinator can provide
-it for worker-authored changes. Security-sensitive interfaces need focused review,
-not a second management layer. Review coordinator-authored product changes with a
-worker. Do not launch a separate reviewer for every mechanical correction; inspect
-the correction and rerun the relevant failing checks.
+One independent review within the team is sufficient for ordinary changes. The
+coordinator can review worker-authored code; a worker reviews coordinator-authored
+code. Use a focused independent review for security-sensitive contracts. Publish
+READY.json in the team's external mailbox with base/head, commit SHAs, changed
+paths, test commands/results, reviewer and remaining platform gates.
 
-Main has one integrator. Land ready commits promptly and report their SHAs. Main
-may merge a validated worker branch (fast-forward when possible, otherwise a
-reviewed merge) so worker history remains reusable. Cherry-pick legacy candidates
-when appropriate, preserving dependencies. Synchronize only idle clean worktrees;
-never rewrite another writer's branch. Recheck affected consumers after integration
-or conflict resolution. Run full workspace/platform gates at a coherent integration
-checkpoint or shared-contract change, not for every helper or documentation edit.
+The central integrator checks dependencies, ownership, clean Git state, and the
+team's evidence, then lands ready commits promptly. Do not re-run the same review
+and unchanged package tests at main. Revalidate when integration changes code,
+when consumers changed since the tested base, or when a shared contract requires
+it. Run full workspace gates at coherent checkpoints. A failure returns to its
+team; it does not force all six teams to wait.
 
-## Progress and stalled work
+Main has one Git writer. Merge a validated branch (fast-forward when possible)
+or cherry-pick a reviewed legacy candidate. Preserve all old branches and dirty
+work. Synchronize only idle clean worktrees; never reset an active writer. Serial
+Git updates are short and must not serialize implementation, builds or reviews.
 
-The coordinator reports changed behavior, worker commits, main commits, current
-validation and blockers. Keep one short active queue, not six cumulative status
-narratives. After 15 minutes without implementation progress, a worker must name
-the blocker. After 30 minutes without a ready/landed increment, inspect the actual
-critical path (build, dependency, review or oversized task), then unblock or split
-it. These are intervention thresholds, not guarantees or permission to commit
-broken code. Do not leave completed workers idle waiting for every peer.
+## Progress and operating thresholds
 
-## Transition and continued operation
+Each team publishes ready commits directly and maintains one concise status in
+its external mailbox. The integrator reports newly landed SHAs and blocked teams.
+Use scripts/show_configuration_progress.ps1 -RunDirectory <team-run-directory>
+to show all six coordinators, activity and unlanded team commits.
 
-1. Drain the six old leads. Reconcile candidate SHAs, dirty paths and active writers.
-   Finish in-flight Git operations. Preserve existing branches and logs.
-2. Stop old dispatch and acknowledge the transition in the existing run directory.
-3. Validate pending candidates first; use one owner to finish their whole behavior.
-4. Dispatch at most three complete features into the build-enabled worker slots.
-5. Keep landing work and replenishing the queue while the user's parity task is
-   active. Never claim unattended continuation unless a coordinator is running.
+After 15 minutes without implementation progress, identify the concrete blocker.
+After 30 minutes without a ready or landed increment, inspect the dependency,
+validation or review queue and unblock it. These are intervention thresholds,
+not an excuse to commit broken code. Idle workers take another useful bounded
+slice or review; do not keep rediscovering the complete inventory.
 
-The old run's mailboxes and handoff documents are retained for recovery. Their
-six-way directory ownership is retired once those writers acknowledge stopping.
-The pinned behavioral reference remains Vibeshine
-457237db7e57f9c4be21c35bb07e28d1c100eb7d; do not copy or translate its source.
+## Prepared team roots and dispatch
 
-## Provisioned worker slots
+Team roots are D:/sources/worktrees/amaterasu-feature-N_large with branch
+config-throughput/feature-N_large, N=1..6. Child worktrees are
+D:/sources/worktrees/amaterasu-team-N-worker-M_large, M=1..3, with branch
+config-throughput/team-N-worker-M_large. Their manifests are under
+D:/sources/worktrees/.large-manifests. Build directories are the matching names
+under D:/sources/builds. Reuse these checkouts/caches after clean synchronization.
 
-The 2026-09-25 transition drained the old leads and preserved their work. The
-original coordinator acknowledged no pending candidates at main c4b7c779.
+All teams use D:/sources/worktrees/amaterasu-config-runs/teams-20260925 for
+coordinator locks and logs. Each gets a team-N mailbox and its own task file with
+current reservations, child paths and acceptance criteria. Publish readiness to
+that mailbox without waiting for the central integrator to approve local progress.
 
-| Slot | Worktree | Branch | Build directory |
-| --- | --- | --- | --- |
-| 1 | D:/sources/worktrees/amaterasu-feature-1_large | config-throughput/feature-1_large | D:/sources/builds/amaterasu-feature-1_large |
-| 2 | D:/sources/worktrees/amaterasu-feature-2_large | config-throughput/feature-2_large | D:/sources/builds/amaterasu-feature-2_large |
-| 3 | D:/sources/worktrees/amaterasu-feature-3_large | config-throughput/feature-3_large | D:/sources/builds/amaterasu-feature-3_large |
+The prior direct worker's pairing correction remains valid and should land after
+review. Historical lane sessions, handoffs and worktrees are preserved. The old
+run/resume scripts remain disabled because they enforce the obsolete centralized
+validation workflow; launch six NEW build-enabled coordinator sessions instead.
 
-Use one run directory for all three slot locks and logs:
-D:/sources/worktrees/amaterasu-config-runs/direct-20260925.
-Workers inherit CARGO_TARGET_DIR from the runner. Synchronize idle slots with
-main before dispatch; supply the resulting full HEAD to the startup check.
-
-Inspect live activity and unlanded commits with:
-
-```powershell
-./scripts/show_configuration_progress.ps1 -RunDirectory D:/sources/worktrees/amaterasu-config-runs/direct-20260925
-```
-
-The legacy run/resume scripts now refuse new dispatch while their
-throughput-transition.json marker exists; backup scripts and old sessions remain
-available for recovery. This prevents accidental reactivation of the old topology.
+Pinned reference: Vibeshine 457237db7e57f9c4be21c35bb07e28d1c100eb7d.
+Use it as behavioral evidence without copying or translating its source.
 
 ## Existing implementation notes
 

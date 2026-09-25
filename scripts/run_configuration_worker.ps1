@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateRange(1, 3)][int]$Slot,
+    [Parameter(Mandatory)][ValidateRange(1, 6)][int]$Slot,
     [Parameter(Mandatory)][string]$Worktree,
     [Parameter(Mandatory)][string]$ExpectedBranch,
     [Parameter(Mandatory)][string]$ExpectedHead,
@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory)][string]$RunDirectory,
     [string]$Model = 'gpt-6-sol',
     [string]$ReasoningEffort = 'medium',
+    [switch]$Coordinator,
     [switch]$PreflightOnly
 )
 
@@ -15,6 +16,9 @@ $ErrorActionPreference = 'Stop'
 $worktreePath = (Resolve-Path -LiteralPath $Worktree).Path
 $taskPath = (Resolve-Path -LiteralPath $TaskFile).Path
 $runPath = [IO.Path]::GetFullPath($RunDirectory)
+if (!$Coordinator -and (Test-Path -LiteralPath (Join-Path $runPath 'coordinators-required.json'))) {
+    throw 'This run now requires six coordinators with three workers each. Read the current configuration-execution-plan.md and use the team run directory with -Coordinator.'
+}
 if (!(Split-Path -Leaf $worktreePath).EndsWith('_large') -or !$ExpectedBranch.EndsWith('_large')) {
     throw 'Workers require an explicitly provisioned _large worktree and branch.'
 }
@@ -42,7 +46,8 @@ if (Read-Git @('status', '--porcelain')) { throw 'Worker worktree has uncommitte
 if (!(Test-Path -LiteralPath (Join-Path $worktreePath 'AGENTS.md'))) { throw 'AGENTS.md is missing.' }
 
 $targetPath = Join-Path $buildPath 'cargo-target'
-$identity = [ordered]@{ slot = $Slot; worktree = $worktreePath; branch = $ExpectedBranch; base = $ExpectedHead; cargo_target_dir = $targetPath; model = $Model; effort = $ReasoningEffort }
+$role = if ($Coordinator) { 'coordinator' } else { 'worker' }
+$identity = [ordered]@{ slot = $Slot; role = $role; worktree = $worktreePath; branch = $ExpectedBranch; base = $ExpectedHead; cargo_target_dir = $targetPath; model = $Model; effort = $ReasoningEffort }
 if ($PreflightOnly) { $identity | ConvertTo-Json; return }
 
 New-Item -ItemType Directory -Path $runPath -Force | Out-Null
@@ -60,9 +65,32 @@ try {
     $identity['started_utc'] = [DateTime]::UtcNow.ToString('o')
     $identity['runner_pid'] = $PID
     $identity | ConvertTo-Json | Set-Content -LiteralPath "$prefix.started.json" -Encoding utf8
-    $instructions = @"
+    $roleInstructions = if ($Coordinator) { @"
+You are one of SIX autonomous feature coordinators. The user explicitly wants
+each coordinator to manage up to THREE implementation/review workers. Delegate
+bounded work using your native subagent tools; workers must not delegate further.
+Own complete feature delivery, local testing, repairs, and independent review.
+Use the prepared build-enabled child worktrees in your assignment. Give each
+worker its own manifest BuildDirectory/cargo-target and CARGO_BUILD_JOBS=2.
+Assign disjoint paths and a feature-level acceptance test. No startup-only
+sessions or model verification approval round trips. Verify checkout state in
+the same command that starts useful work. You may act on all reserved feature
+paths without per-file approval. Escalate only an actual cross-team collision.
+Keep your workers doing useful work; do not become a mailbox-only manager.
+Review worker changes locally, integrate into your team branch, and publish
+READY.json in your assigned team mailbox after checks pass. Include base/head,
+commit SHAs, exact checks/results, changed paths, independent reviewer, and
+remaining platform gates. Worker commits should appear as increments complete.
+The central integrator lands ready work; it does not repeat your routine review
+or act as your build server. Continue independent feature work while it lands.
+Never write main or another team's checkout. Do not push. Preserve old branches.
+"@ } else { @"
 You are a direct implementation worker. Complete the feature in the task below.
 Do not delegate, spawn agents, or launch other Codex processes. Read AGENTS.md.
+"@ }
+    $instructions = @"
+$roleInstructions
+Read AGENTS.md and docs/configuration-execution-plan.md.
 The user approved this build-enabled worktree. Run focused tests, rustfmt and
 strict Clippy locally before submitting. CARGO_TARGET_DIR is already isolated;
 keep it and CARGO_BUILD_JOBS. Fix your own compile/test/lint failures.
@@ -78,8 +106,12 @@ do not spend the batch on repeated inventory scans or status documents.
 
 $(Get-Content -LiteralPath $taskPath -Raw)
 "@
+    $agentSettings = if ($Coordinator) {
+        @('-c', 'agents.enabled=true', '-c', 'agents.max_concurrent_threads_per_session=3',
+          '-c', 'agents.default_subagent_model="gpt-6-sol"', '-c', 'agents.default_subagent_reasoning_effort="medium"')
+    } else { @('-c', 'agents.enabled=false') }
     $arguments = @('--ask-for-approval', 'never', 'exec', '--model', $Model,
-        '-c', "model_reasoning_effort=`"$ReasoningEffort`"", '-c', 'agents.enabled=false',
+        '-c', "model_reasoning_effort=`"$ReasoningEffort`"") + $agentSettings + @(
         '--sandbox', 'danger-full-access', '--cd', $worktreePath, '--json',
         '--output-last-message', "$prefix.result.md", '-')
     $instructions | & codex @arguments 1> "$prefix.events.jsonl" 2> "$prefix.stderr.log"

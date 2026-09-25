@@ -17,8 +17,10 @@
 ## Configuration parity execution
 
 - For the active parity task, follow `docs/configuration-execution-plan.md`.
-- Use one coordinator and no more than three direct feature workers; no domain
-  lead hierarchy or nested delegation. Assign complete behavior across layers.
+- Use six autonomous feature coordinators, each with up to three workers.
+  Coordinators may delegate; workers may not. Assign complete behavior across
+  layers and disjoint worker paths. The integrator only lands ready changes and
+  resolves actual cross-team overlaps; team coordinators own review and tests.
 - Workers use approved build-enabled worktrees and run focused tests, rustfmt,
   and Clippy before handoff. Fix validation failures in the owning worker.
 - Commit coherent validated increments and integrate ready work promptly; do not
