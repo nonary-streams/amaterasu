@@ -453,12 +453,15 @@ var Amaterasu;
         persistenceGeneration = 0;
         tokenGeneration = 0;
         refreshInFlight = null;
+        logoutInFlight = null;
         requests = new Set();
+        refreshRequests = new Set();
         base;
         storageKey;
         refreshLockName;
         remembered = false;
         sessionId = null;
+        loggingOut = false;
         onAuthenticationLost = null;
         subject = "";
         scopes = null;
@@ -479,6 +482,9 @@ var Amaterasu;
             }
         }
         async login(username, password, rememberMe = false) {
+            if (this.loggingOut) {
+                throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+            }
             if (rememberMe && !this.webLocks())
                 throw this.rememberedRefreshLockError();
             const generation = this.authGeneration;
@@ -486,6 +492,8 @@ var Amaterasu;
             await this.installSession(reply, generation, true, rememberMe);
         }
         async restoreSession() {
+            if (this.loggingOut)
+                return false;
             this.resetMemory(true);
             const generation = this.authGeneration;
             const persistenceGeneration = this.persistenceGeneration;
@@ -511,6 +519,9 @@ var Amaterasu;
             this.resetMemory(false);
         }
         async useToken(token) {
+            if (this.loggingOut) {
+                throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+            }
             if (!/^ama_[a-f0-9]{64}$/.test(token))
                 throw new Error("Enter an Amaterasu token beginning with ama_ followed by 64 hexadecimal characters.");
             await this.clear();
@@ -520,11 +531,39 @@ var Amaterasu;
             this.tokenGeneration += 1;
         }
         async logout() {
+            if (this.logoutInFlight)
+                return this.logoutInFlight;
+            this.loggingOut = true;
+            this.subject = "";
+            this.scopes = null;
+            this.abortRequests(true);
+            const pendingLogout = this.finishLogout();
+            this.logoutInFlight = pendingLogout;
+            try {
+                await pendingLogout;
+            }
+            finally {
+                if (this.logoutInFlight === pendingLogout)
+                    this.logoutInFlight = null;
+                this.loggingOut = false;
+            }
+        }
+        async finishLogout() {
             const sessionId = this.remembered ? this.sessionId : null;
             const refreshTokens = new Set();
-            const bearerToken = this.refreshToken ? "" : this.bearer;
-            if (this.refreshToken)
+            const originalRefreshToken = this.refreshToken;
+            const originalBearerToken = originalRefreshToken ? "" : this.bearer;
+            if (originalRefreshToken)
+                refreshTokens.add(originalRefreshToken);
+            const pendingRefresh = this.refreshInFlight;
+            if (pendingRefresh)
+                await pendingRefresh.catch(() => undefined);
+            const sameSession = sessionId === null
+                ? !this.remembered
+                : this.remembered && this.sessionId === sessionId;
+            if (sameSession && this.refreshToken)
                 refreshTokens.add(this.refreshToken);
+            const bearerToken = sameSession && !this.refreshToken ? this.bearer : originalBearerToken;
             this.resetMemory(true);
             const locks = this.webLocks();
             if (locks) {
@@ -558,6 +597,9 @@ var Amaterasu;
             return this.scopes === null || this.scopes.includes(scope);
         }
         async post(route, payload = {}, protectedRoute = true) {
+            if (this.loggingOut) {
+                throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+            }
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             if (protectedRoute &&
@@ -571,12 +613,17 @@ var Amaterasu;
             const authGeneration = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                return await this.send(route, payload, protectedRoute, bearerUsed);
+                const response = await this.send(route, payload, protectedRoute, bearerUsed);
+                if (this.loggingOut) {
+                    throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+                }
+                return response;
             }
             catch (error) {
                 if (!protectedRoute ||
                     !(error instanceof ApiError) ||
                     error.code !== "unauthorized" ||
+                    this.loggingOut ||
                     !this.refreshToken ||
                     authGeneration !== this.authGeneration) {
                     throw error;
@@ -585,7 +632,11 @@ var Amaterasu;
                     await this.refreshOrClear();
                 if (authGeneration !== this.authGeneration || !this.bearer)
                     throw error;
-                return this.send(route, payload, true, this.bearer);
+                const response = await this.send(route, payload, true, this.bearer);
+                if (this.loggingOut) {
+                    throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+                }
+                return response;
             }
         }
         async refreshOrClear(expectedGeneration = this.authGeneration, expectedToken = this.refreshToken, expectedPersistenceGeneration = this.persistenceGeneration) {
@@ -593,7 +644,8 @@ var Amaterasu;
                 await this.refreshSession();
             }
             catch (error) {
-                if (this.refreshToken &&
+                if (!this.loggingOut &&
+                    this.refreshToken &&
                     expectedGeneration === this.authGeneration &&
                     expectedToken === this.refreshToken &&
                     expectedPersistenceGeneration === this.persistenceGeneration) {
@@ -760,8 +812,8 @@ var Amaterasu;
             this.bearer = session.bearer;
             this.refreshToken = session.refresh_token;
             this.accessExpiresAt = session.expires_at;
-            this.subject = session.subject;
-            this.scopes = [...session.scopes];
+            this.subject = this.loggingOut ? "" : session.subject;
+            this.scopes = this.loggingOut ? null : [...session.scopes];
             this.remembered = remembered;
             this.sessionId = remembered ? sessionId : null;
             this.tokenGeneration += 1;
@@ -1014,6 +1066,8 @@ var Amaterasu;
             return new ApiError("Browser storage is unavailable. Sign in again when storage is enabled.", "storage_access_unavailable", 503);
         }
         handleStorageChange(event) {
+            if (this.loggingOut)
+                return;
             if (event.key !== this.storageKey)
                 return;
             let currentRaw;
@@ -1061,14 +1115,23 @@ var Amaterasu;
             this.remembered = false;
             this.sessionId = null;
             this.refreshInFlight = null;
-            for (const request of this.requests)
-                request.abort();
-            this.requests.clear();
+            this.abortRequests();
+        }
+        abortRequests(preserveRefresh = false) {
+            for (const request of this.requests) {
+                if (!preserveRefresh || !this.refreshRequests.has(request)) {
+                    request.abort();
+                    this.requests.delete(request);
+                    this.refreshRequests.delete(request);
+                }
+            }
         }
         async send(route, payload, protectedRoute, bearer) {
             const controller = new AbortController();
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
+            if (route === "auth/refresh")
+                this.refreshRequests.add(controller);
             try {
                 const headers = {
                     "Content-Type": "application/json",
@@ -1099,6 +1162,7 @@ var Amaterasu;
             finally {
                 clearTimeout(timer);
                 this.requests.delete(controller);
+                this.refreshRequests.delete(controller);
             }
         }
         failure(body, status) {

@@ -42,12 +42,15 @@ namespace Amaterasu {
     private persistenceGeneration = 0;
     private tokenGeneration = 0;
     private refreshInFlight: Promise<void> | null = null;
+    private logoutInFlight: Promise<void> | null = null;
     private requests = new Set<AbortController>();
+    private refreshRequests = new Set<AbortController>();
     private readonly base: string;
     private readonly storageKey: string;
     private readonly refreshLockName: string;
     private remembered = false;
     private sessionId: string | null = null;
+    private loggingOut = false;
     onAuthenticationLost: (() => void) | null = null;
     subject = "";
     scopes: string[] | null = null;
@@ -80,6 +83,13 @@ namespace Amaterasu {
       password: string,
       rememberMe = false,
     ): Promise<void> {
+      if (this.loggingOut) {
+        throw new ApiError(
+          "Sign out is already in progress.",
+          "unauthorized",
+          401,
+        );
+      }
       if (rememberMe && !this.webLocks())
         throw this.rememberedRefreshLockError();
       const generation = this.authGeneration;
@@ -92,6 +102,7 @@ namespace Amaterasu {
     }
 
     async restoreSession(): Promise<boolean> {
+      if (this.loggingOut) return false;
       this.resetMemory(true);
       const generation = this.authGeneration;
       const persistenceGeneration = this.persistenceGeneration;
@@ -125,6 +136,13 @@ namespace Amaterasu {
     }
 
     async useToken(token: string): Promise<void> {
+      if (this.loggingOut) {
+        throw new ApiError(
+          "Sign out is already in progress.",
+          "unauthorized",
+          401,
+        );
+      }
       if (!/^ama_[a-f0-9]{64}$/.test(token))
         throw new Error(
           "Enter an Amaterasu token beginning with ama_ followed by 64 hexadecimal characters.",
@@ -137,10 +155,43 @@ namespace Amaterasu {
     }
 
     async logout(): Promise<void> {
+      if (this.logoutInFlight) return this.logoutInFlight;
+
+      this.loggingOut = true;
+      this.subject = "";
+      this.scopes = null;
+      this.abortRequests(true);
+
+      const pendingLogout = this.finishLogout();
+      this.logoutInFlight = pendingLogout;
+      try {
+        await pendingLogout;
+      } finally {
+        if (this.logoutInFlight === pendingLogout) this.logoutInFlight = null;
+        this.loggingOut = false;
+      }
+    }
+
+    private async finishLogout(): Promise<void> {
       const sessionId = this.remembered ? this.sessionId : null;
       const refreshTokens = new Set<string>();
-      const bearerToken = this.refreshToken ? "" : this.bearer;
-      if (this.refreshToken) refreshTokens.add(this.refreshToken);
+      const originalRefreshToken = this.refreshToken;
+      const originalBearerToken = originalRefreshToken ? "" : this.bearer;
+      if (originalRefreshToken) refreshTokens.add(originalRefreshToken);
+
+      // A rotating refresh can already have committed on the server. Let its
+      // response settle so logout can revoke the replacement token too.
+      const pendingRefresh = this.refreshInFlight;
+      if (pendingRefresh) await pendingRefresh.catch(() => undefined);
+
+      const sameSession =
+        sessionId === null
+          ? !this.remembered
+          : this.remembered && this.sessionId === sessionId;
+      if (sameSession && this.refreshToken)
+        refreshTokens.add(this.refreshToken);
+      const bearerToken =
+        sameSession && !this.refreshToken ? this.bearer : originalBearerToken;
 
       this.resetMemory(true);
 
@@ -191,6 +242,13 @@ namespace Amaterasu {
       payload: Payload = {},
       protectedRoute = true,
     ): Promise<T> {
+      if (this.loggingOut) {
+        throw new ApiError(
+          "Sign out is already in progress.",
+          "unauthorized",
+          401,
+        );
+      }
       if (protectedRoute && !this.bearer)
         throw new ApiError("Sign in to continue.", "unauthorized", 401);
 
@@ -208,12 +266,26 @@ namespace Amaterasu {
       const authGeneration = this.authGeneration;
       const tokenGeneration = this.tokenGeneration;
       try {
-        return await this.send<T>(route, payload, protectedRoute, bearerUsed);
+        const response = await this.send<T>(
+          route,
+          payload,
+          protectedRoute,
+          bearerUsed,
+        );
+        if (this.loggingOut) {
+          throw new ApiError(
+            "Sign out is already in progress.",
+            "unauthorized",
+            401,
+          );
+        }
+        return response;
       } catch (error) {
         if (
           !protectedRoute ||
           !(error instanceof ApiError) ||
           error.code !== "unauthorized" ||
+          this.loggingOut ||
           !this.refreshToken ||
           authGeneration !== this.authGeneration
         ) {
@@ -224,7 +296,15 @@ namespace Amaterasu {
         // Reuse its pair instead of replaying a stale refresh token.
         if (tokenGeneration === this.tokenGeneration) await this.refreshOrClear();
         if (authGeneration !== this.authGeneration || !this.bearer) throw error;
-        return this.send<T>(route, payload, true, this.bearer);
+        const response = await this.send<T>(route, payload, true, this.bearer);
+        if (this.loggingOut) {
+          throw new ApiError(
+            "Sign out is already in progress.",
+            "unauthorized",
+            401,
+          );
+        }
+        return response;
       }
     }
 
@@ -237,6 +317,7 @@ namespace Amaterasu {
         await this.refreshSession();
       } catch (error) {
         if (
+          !this.loggingOut &&
           this.refreshToken &&
           expectedGeneration === this.authGeneration &&
           expectedToken === this.refreshToken &&
@@ -476,8 +557,8 @@ namespace Amaterasu {
       this.bearer = session.bearer;
       this.refreshToken = session.refresh_token;
       this.accessExpiresAt = session.expires_at;
-      this.subject = session.subject;
-      this.scopes = [...session.scopes];
+      this.subject = this.loggingOut ? "" : session.subject;
+      this.scopes = this.loggingOut ? null : [...session.scopes];
       this.remembered = remembered;
       this.sessionId = remembered ? sessionId : null;
       this.tokenGeneration += 1;
@@ -802,6 +883,7 @@ namespace Amaterasu {
     }
 
     private handleStorageChange(event: StorageEvent): void {
+      if (this.loggingOut) return;
       if (event.key !== this.storageKey) return;
       let currentRaw: string | null;
       try {
@@ -846,8 +928,17 @@ namespace Amaterasu {
       this.remembered = false;
       this.sessionId = null;
       this.refreshInFlight = null;
-      for (const request of this.requests) request.abort();
-      this.requests.clear();
+      this.abortRequests();
+    }
+
+    private abortRequests(preserveRefresh = false): void {
+      for (const request of this.requests) {
+        if (!preserveRefresh || !this.refreshRequests.has(request)) {
+          request.abort();
+          this.requests.delete(request);
+          this.refreshRequests.delete(request);
+        }
+      }
     }
 
     private async send<T>(
@@ -859,6 +950,7 @@ namespace Amaterasu {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 12_000);
       this.requests.add(controller);
+      if (route === "auth/refresh") this.refreshRequests.add(controller);
       try {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -889,6 +981,7 @@ namespace Amaterasu {
       } finally {
         clearTimeout(timer);
         this.requests.delete(controller);
+        this.refreshRequests.delete(controller);
       }
     }
 

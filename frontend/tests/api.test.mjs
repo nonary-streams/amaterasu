@@ -486,7 +486,7 @@ test("two API instances serialize refresh and adopt the rotated pair", async () 
   }
 });
 
-test("logout during refresh prevents a late response restoring the session", async () => {
+test("logout waits for rotation and revokes the committed replacement pair", async () => {
   const bearer = secret("7");
   const refreshToken = secret("8");
   const rotatedBearer = secret("9");
@@ -496,7 +496,9 @@ test("logout during refresh prevents a late response restoring the session", asy
   let refreshStarted;
   const started = new Promise((resolve) => refreshStarted = resolve);
   let releaseRefresh;
-  const responder = (url) => {
+  let refreshSignal;
+  let rotationCommitted = false;
+  const responder = (url, options) => {
     if (url.endsWith("/auth/login"))
       return Response.json(
         sessionReply(bearer, refreshToken, future(5), future(7200), {
@@ -505,12 +507,19 @@ test("logout during refresh prevents a late response restoring the session", asy
       );
     if (url.endsWith("/auth/refresh")) {
       refreshStarted();
-      return new Promise((resolve) => {
-        releaseRefresh = () => resolve(Response.json(
-          sessionReply(rotatedBearer, rotatedRefresh, future(3600), future(7200), {
-            remember_me: true,
-          }),
-        ));
+      refreshSignal = options.signal;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          reject(new Error("refresh response was aborted after rotation"));
+        });
+        releaseRefresh = () => {
+          rotationCommitted = true;
+          resolve(Response.json(
+            sessionReply(rotatedBearer, rotatedRefresh, future(3600), future(7200), {
+              remember_me: true,
+            }),
+          ));
+        };
       });
     }
     return Response.json({ ok: true });
@@ -521,10 +530,14 @@ test("logout during refresh prevents a late response restoring the session", asy
   await started;
   const pendingLogout = api.logout();
   assert.equal(api.subject, "");
+  assert.equal(refreshSignal.aborted, false);
   assert.notEqual(storage.getItem(storageKey), null);
+  await assert.rejects(api.post("catalog/list"), /Sign out is already in progress/);
   releaseRefresh();
   await Promise.all([pendingRequest, pendingLogout]);
 
+  assert.equal(rotationCommitted, true);
+  assert.equal(refreshSignal.aborted, false);
   assert.equal(api.subject, "");
   assert.equal(storage.getItem(storageKey), null);
   const lateRevocations = calls.filter(
