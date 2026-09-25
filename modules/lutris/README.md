@@ -62,9 +62,15 @@ setting, or shadowed by a direct Steam entry are selectively removed after the
 complete scan. Catalog revision changes during inventory restart the inventory
 before cleanup is submitted.
 
+Each enabled scan captures its complete settings at scan start. Disabling Lutris
+while discovery, Steam deduplication, or catalog reconciliation is in flight does
+not cancel that scan: it completes one snapshot using the captured settings.
+Disabled settings prevent later scans from starting, and disabling alone does not
+remove already imported catalog rows. Stale removal remains governed by the
+captured `autosync_remove_uninstalled` value.
+
 Other remaining gaps are trusted per-session discovery for machine services,
-cross-user import, launch handling for games whose Lutris client cannot be
-resolved, and immediate removal of already imported entries when the provider is
-disabled.
+cross-user import, and launch handling for games whose Lutris client cannot be
+resolved.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.

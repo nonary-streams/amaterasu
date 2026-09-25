@@ -41,8 +41,7 @@ enum Call {
 struct Transaction {
     sync_id: String,
     source_revision: u64,
-    settings_epoch: u64,
-    remove_stale: bool,
+    settings: ProductSettings,
     base_batches: Vec<SnapshotBatch>,
     batches: Vec<SnapshotBatch>,
     name_exclusions: Vec<String>,
@@ -97,8 +96,7 @@ struct CatalogInventoryEntry {
 impl Transaction {
     fn new(
         source_revision: u64,
-        settings_epoch: u64,
-        remove_stale: bool,
+        settings: ProductSettings,
         batches: Vec<SnapshotBatch>,
         name_exclusions: Vec<String>,
     ) -> Self {
@@ -111,8 +109,7 @@ impl Transaction {
         let mut transaction = Self {
             sync_id,
             source_revision,
-            settings_epoch,
-            remove_stale,
+            settings,
             base_batches: batches.clone(),
             batches,
             name_exclusions,
@@ -171,7 +168,7 @@ impl Transaction {
                 "expected_revision":self.catalog_revision.expect("begin supplies revision"),
                 "next_sequence":self.sequence,
                 "complete":true,
-                "remove_stale":self.remove_stale,
+                "remove_stale":self.settings.autosync_remove_uninstalled,
                 "remove_selection":true,
             }),
         }
@@ -290,7 +287,7 @@ impl Transaction {
                     || response.get("complete").and_then(Value::as_bool) != Some(true)
                     || response.get("cleanup_pending").and_then(Value::as_bool) != Some(false)
                     || response.get("remove_stale").and_then(Value::as_bool)
-                        != Some(self.remove_stale)
+                        != Some(self.settings.autosync_remove_uninstalled)
                     || response.get("remove_selection").and_then(Value::as_bool) != Some(true)
                 {
                     return Err("catalog finish response is inconsistent".into());
@@ -451,7 +448,6 @@ impl CatalogSync {
         snapshot: &Snapshot,
         settings: &ProductSettings,
         steam_app_ids: &BTreeSet<u32>,
-        settings_epoch: u64,
         source_revision: u64,
     ) -> Result<usize, String> {
         if self.transaction.is_some() {
@@ -485,39 +481,17 @@ impl CatalogSync {
         self.last_error = None;
         self.transaction = Some(Transaction::new(
             source_revision,
-            settings_epoch,
-            settings.autosync_remove_uninstalled,
+            settings.clone(),
             batches,
             name_exclusions,
         ));
         Ok(count)
     }
 
-    pub fn advance(&mut self, runtime: &RuntimeClient, settings_epoch: u64) -> ModuleResult<()> {
+    pub fn advance(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         let Some(mut transaction) = self.transaction.take() else {
             return Ok(());
         };
-        if transaction.settings_epoch != settings_epoch {
-            if let Call::Waiting { request } = transaction.call {
-                match runtime.send(Command::TakeResult { request }) {
-                    Ok(Response::Pending) | Err(_) => {
-                        transaction.call = Call::Waiting { request };
-                        self.transaction = Some(transaction);
-                    }
-                    Ok(response) => {
-                        let released =
-                            release_terminal_child_result(request, response, |request| {
-                                runtime.send(Command::ReleaseResult { request })
-                            });
-                        if released.is_none() {
-                            transaction.call = Call::Waiting { request };
-                            self.transaction = Some(transaction);
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
         match transaction.call {
             Call::Delay { ticks } if ticks > 1 => {
                 transaction.call = Call::Delay { ticks: ticks - 1 };
@@ -962,6 +936,14 @@ mod tests {
         }
     }
 
+    fn respond_to_catalog(catalog: &mut CatalogSync, payload: Value) {
+        let transaction = catalog
+            .transaction
+            .take()
+            .expect("catalog response requires an in-flight transaction");
+        catalog.consume_response(transaction, payload).unwrap();
+    }
+
     #[test]
     fn creates_native_lutris_uri_launch_entries_and_skips_steam_by_default() {
         let games = vec![
@@ -1050,7 +1032,11 @@ mod tests {
 
     #[test]
     fn catalog_finish_honors_stale_removal_setting() {
-        let mut transaction = Transaction::new(2, 1, false, Vec::new(), Vec::new());
+        let captured_settings = ProductSettings {
+            autosync_remove_uninstalled: false,
+            ..ProductSettings::default()
+        };
+        let mut transaction = Transaction::new(2, captured_settings, Vec::new(), Vec::new());
         transaction.generation = Some(3);
         transaction.catalog_revision = Some(8);
         transaction.stage = Stage::Finish;
@@ -1058,6 +1044,109 @@ mod tests {
         assert_eq!(payload["complete"], true);
         assert_eq!(payload["remove_stale"], false);
         assert_eq!(payload["remove_selection"], true);
+    }
+
+    #[test]
+    fn in_flight_snapshot_finishes_once_after_disable_without_stale_cleanup() {
+        let scan_start_settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            autosync_remove_uninstalled: false,
+            include_steam: true,
+            exclude_games: Vec::new(),
+        };
+        let settings_after_disable = ProductSettings {
+            enabled: false,
+            auto_sync: true,
+            autosync_remove_uninstalled: true,
+            include_steam: false,
+            exclude_games: vec![Exclusion::Id("10".into())],
+        };
+        assert!(!settings_after_disable.enabled);
+        assert!(settings_after_disable.autosync_remove_uninstalled);
+        assert!(!settings_after_disable.include_steam);
+        assert_eq!(
+            settings_after_disable.exclude_games,
+            vec![Exclusion::Id("10".into())]
+        );
+
+        let mut catalog = CatalogSync::default();
+        assert_eq!(
+            catalog
+                .start(
+                    &snapshot(vec![
+                        game(7, "Direct Steam copy", "steam", "steam", "9001"),
+                        game(8, "Unshadowed Steam", "steam", "steam", "9002"),
+                        game(10, "Native Lutris", "wine", "", ""),
+                    ]),
+                    &scan_start_settings,
+                    &[9001].into(),
+                    5,
+                )
+                .unwrap(),
+            2
+        );
+
+        let transaction = catalog.transaction.as_ref().unwrap();
+        assert_eq!(transaction.settings, scan_start_settings);
+        assert_eq!(transaction.source_revision, 5);
+        assert_eq!(transaction.stage, Stage::Begin);
+        assert_eq!(transaction.batches.len(), 1);
+        assert_eq!(
+            transaction.batches[0]
+                .entries
+                .iter()
+                .map(|entry| entry["source_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["8", "10"]
+        );
+        assert_eq!(transaction.batches[0].selection_remove_source_ids, ["7"]);
+        assert!(
+            !transaction.batches[0]
+                .selection_remove_source_ids
+                .iter()
+                .any(|source_id| source_id == "99" || source_id == "10")
+        );
+
+        respond_to_catalog(
+            &mut catalog,
+            json!({"ok":true,"revision":8,"generation":3,"next_sequence":0}),
+        );
+        let batch = catalog.transaction.as_ref().unwrap().payload();
+        assert_eq!(batch["action"], "provider_snapshot_batch");
+        assert_eq!(batch["remove_source_ids"], json!([]));
+        assert_eq!(batch["expire_source_ids"], json!([]));
+        assert_eq!(batch["selection_remove_source_ids"], json!(["7"]));
+        respond_to_catalog(
+            &mut catalog,
+            json!({"ok":true,"revision":9,"generation":3,"next_sequence":1}),
+        );
+        let finish = catalog.transaction.as_ref().unwrap().payload();
+        assert_eq!(finish["complete"], true);
+        assert_eq!(finish["remove_stale"], false);
+        assert_eq!(finish["remove_selection"], true);
+
+        respond_to_catalog(
+            &mut catalog,
+            json!({
+                "ok":true,
+                "revision":10,
+                "generation":3,
+                "complete":true,
+                "cleanup_pending":false,
+                "remove_stale":false,
+                "remove_selection":true,
+            }),
+        );
+        assert!(!catalog.busy());
+        assert_eq!(catalog.last_error, None);
+        let now = std::time::Instant::now();
+        assert!(!crate::scan_is_due(
+            &settings_after_disable,
+            true,
+            Some(now),
+            now,
+        ));
     }
 
     #[test]
@@ -1081,6 +1170,7 @@ mod tests {
     #[test]
     fn disabled_stale_removal_emits_selection_cleanup_but_preserves_absent_source_ids() {
         let settings = ProductSettings {
+            autosync_remove_uninstalled: false,
             exclude_games: vec![Exclusion::Id("2".into())],
             ..ProductSettings::default()
         };
@@ -1114,7 +1204,7 @@ mod tests {
         assert_eq!(submitted_selection_removals, ["2", "3"]);
         assert!(!submitted_selection_removals.contains(&"88"));
 
-        let mut transaction = Transaction::new(2, 1, false, batches, Vec::new());
+        let mut transaction = Transaction::new(2, settings, batches, Vec::new());
         transaction.generation = Some(3);
         transaction.catalog_revision = Some(8);
         transaction.stage = Stage::Batch;
@@ -1147,6 +1237,7 @@ mod tests {
     #[test]
     fn direct_steam_shadow_is_a_selection_removal_and_retries_are_stable() {
         let settings = ProductSettings {
+            autosync_remove_uninstalled: false,
             include_steam: true,
             ..ProductSettings::default()
         };
@@ -1164,7 +1255,7 @@ mod tests {
         assert_eq!(prepared.entries[0]["source_id"], "5");
 
         let batches = batch_snapshot(prepared).unwrap();
-        let mut transaction = Transaction::new(7, 1, false, batches, Vec::new());
+        let mut transaction = Transaction::new(7, settings, batches, Vec::new());
         transaction.generation = Some(2);
         transaction.catalog_revision = Some(9);
         transaction.stage = Stage::Batch;
@@ -1218,7 +1309,6 @@ mod tests {
                 &snapshot(vec![game(1, "Renamed title", "wine", "", "")]),
                 &settings,
                 &BTreeSet::new(),
-                4,
                 9,
             )
             .unwrap();
@@ -1275,7 +1365,6 @@ mod tests {
                 &snapshot(vec![game(1, "Current", "wine", "", "")]),
                 &settings,
                 &BTreeSet::new(),
-                1,
                 2,
             )
             .unwrap();

@@ -11,6 +11,7 @@ use discovery::Snapshot;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::{Exclusion, ProductSettings};
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -74,11 +75,11 @@ impl SettingsPatch {
 struct SnapshotWorker {
     receiver: Option<Receiver<Result<Snapshot, String>>>,
     _thread: Option<JoinHandle<()>>,
-    settings_epoch: u64,
+    settings: Option<ProductSettings>,
 }
 
 impl SnapshotWorker {
-    fn start(settings_epoch: u64) -> Self {
+    fn start(settings: ProductSettings) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let _ = sender.send(discovery::discover());
@@ -86,11 +87,11 @@ impl SnapshotWorker {
         Self {
             receiver: Some(receiver),
             _thread: Some(worker),
-            settings_epoch,
+            settings: Some(settings),
         }
     }
 
-    fn take_result(&mut self) -> Option<Result<Snapshot, String>> {
+    fn take_result(&mut self) -> Option<(ProductSettings, Result<Snapshot, String>)> {
         let result = match self.receiver.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return None,
@@ -100,7 +101,11 @@ impl SnapshotWorker {
         };
         self.receiver = None;
         self._thread = None;
-        Some(result)
+        let settings = self
+            .settings
+            .take()
+            .expect("an active Lutris scan retains its captured settings");
+        Some((settings, result))
     }
 
     fn busy(&self) -> bool {
@@ -108,10 +113,29 @@ impl SnapshotWorker {
     }
 }
 
-struct PendingSteamRead {
+struct CapturedScan {
     snapshot: Snapshot,
-    settings_epoch: u64,
+    settings: ProductSettings,
     source_revision: u64,
+}
+
+impl CapturedScan {
+    fn start_catalog(
+        self,
+        catalog: &mut catalog_sync::CatalogSync,
+        steam_app_ids: &BTreeSet<u32>,
+    ) -> Result<usize, String> {
+        catalog.start(
+            &self.snapshot,
+            &self.settings,
+            steam_app_ids,
+            self.source_revision,
+        )
+    }
+}
+
+struct PendingSteamRead {
+    scan: CapturedScan,
     reader: SteamCatalogRead,
 }
 
@@ -157,7 +181,7 @@ impl ManagedModule for LutrisModule {
         self.observe_settings();
         self.poll_snapshot();
         self.advance_steam_read()?;
-        self.catalog.advance(&self.runtime, self.settings_epoch)?;
+        self.catalog.advance(&self.runtime)?;
         self.start_scan_if_due();
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -184,19 +208,12 @@ impl LutrisModule {
         } else {
             None
         };
-        if let Some(read) = &mut self.steam_read {
-            read.reader.cancel();
-        }
     }
 
     fn poll_snapshot(&mut self) {
-        let Some(result) = self.snapshot_worker.take_result() else {
+        let Some((settings, result)) = self.snapshot_worker.take_result() else {
             return;
         };
-        if self.snapshot_worker.settings_epoch != self.settings_epoch {
-            self.last_error = Some("discarded a Lutris snapshot after settings changed".into());
-            return;
-        }
         match result {
             Ok(snapshot) => {
                 self.last_snapshot_games = snapshot.games.len();
@@ -205,23 +222,18 @@ impl LutrisModule {
                     return;
                 };
                 self.next_source_revision = source_revision;
-                if self.configuration.settings().include_steam {
+                let scan = CapturedScan {
+                    snapshot,
+                    settings,
+                    source_revision,
+                };
+                if scan.settings.include_steam {
                     self.steam_read = Some(PendingSteamRead {
-                        snapshot,
-                        settings_epoch: self.settings_epoch,
-                        source_revision,
+                        scan,
                         reader: SteamCatalogRead::new(),
                     });
-                } else if let Err(error) = self.catalog.start(
-                    &snapshot,
-                    self.configuration.settings(),
-                    &Default::default(),
-                    self.settings_epoch,
-                    source_revision,
-                ) {
-                    self.last_error = Some(error);
                 } else {
-                    self.last_error = None;
+                    self.start_catalog_scan(scan, &Default::default());
                 }
             }
             Err(error) => self.last_error = Some(error),
@@ -232,33 +244,24 @@ impl LutrisModule {
         let Some(mut pending) = self.steam_read.take() else {
             return Ok(());
         };
-        if pending.settings_epoch != self.settings_epoch {
-            pending.reader.cancel();
-        }
         match pending.reader.advance(&self.runtime)? {
             SteamProgress::Pending => self.steam_read = Some(pending),
             SteamProgress::Failed(error) => {
-                if pending.settings_epoch == self.settings_epoch {
-                    self.last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
-                }
+                self.last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
             }
             SteamProgress::Complete(steam_ids) => {
-                if pending.settings_epoch == self.settings_epoch {
-                    if let Err(error) = self.catalog.start(
-                        &pending.snapshot,
-                        self.configuration.settings(),
-                        &steam_ids,
-                        self.settings_epoch,
-                        pending.source_revision,
-                    ) {
-                        self.last_error = Some(error);
-                    } else {
-                        self.last_error = None;
-                    }
-                }
+                self.start_catalog_scan(pending.scan, &steam_ids);
             }
         }
         Ok(())
+    }
+
+    fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
+        if let Err(error) = scan.start_catalog(&mut self.catalog, steam_app_ids) {
+            self.last_error = Some(error);
+        } else {
+            self.last_error = None;
+        }
     }
 
     fn start_scan_if_due(&mut self) {
@@ -275,11 +278,12 @@ impl LutrisModule {
             self.next_auto_sync = None;
             return;
         }
-        let automatic_due = settings.auto_sync
-            && self
-                .next_auto_sync
-                .is_some_and(|deadline| Instant::now() >= deadline);
-        if !self.manual_refresh_pending && !automatic_due {
+        if !scan_is_due(
+            settings,
+            self.manual_refresh_pending,
+            self.next_auto_sync,
+            Instant::now(),
+        ) {
             return;
         }
         self.manual_refresh_pending = false;
@@ -288,7 +292,7 @@ impl LutrisModule {
         } else {
             None
         };
-        self.snapshot_worker = SnapshotWorker::start(self.settings_epoch);
+        self.snapshot_worker = SnapshotWorker::start(settings.clone());
     }
 
     fn handle_request(&mut self, request: u64, caller: &str, payload: Value) -> ModuleResult<()> {
@@ -381,9 +385,63 @@ impl LutrisModule {
     }
 }
 
+fn scan_is_due(
+    settings: &ProductSettings,
+    manual_refresh_pending: bool,
+    next_auto_sync: Option<Instant>,
+    now: Instant,
+) -> bool {
+    settings.enabled
+        && (manual_refresh_pending
+            || (settings.auto_sync && next_auto_sync.is_some_and(|deadline| now >= deadline)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{Game, Snapshot};
+    use crate::settings::Exclusion;
+    use std::path::PathBuf;
+
+    fn game(id: i64, runner: &str, service: &str, service_id: &str) -> Game {
+        Game {
+            id,
+            name: format!("Lutris Game {id}"),
+            slug: format!("lutris-game-{id}"),
+            runner: runner.into(),
+            platform: "linux".into(),
+            directory: "/games/example".into(),
+            config_path: "/games/example.yml".into(),
+            service: service.into(),
+            service_id: service_id.into(),
+        }
+    }
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            database_path: PathBuf::from("/home/user/.local/share/lutris/pga.db"),
+            lutris_executable: if cfg!(target_os = "windows") {
+                std::env::temp_dir().join("lutris.exe")
+            } else {
+                PathBuf::from("/usr/bin/lutris")
+            },
+            games: vec![
+                game(7, "steam", "steam", "9001"),
+                game(8, "steam", "steam", "9002"),
+                game(10, "wine", "", ""),
+            ],
+        }
+    }
+
+    fn completed_snapshot_worker(settings: ProductSettings, snapshot: Snapshot) -> SnapshotWorker {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _ = sender.send(Ok(snapshot));
+        SnapshotWorker {
+            receiver: Some(receiver),
+            _thread: None,
+            settings: Some(settings),
+        }
+    }
 
     #[test]
     fn settings_updates_are_flat_patch_compatible_and_caller_bound() {
@@ -435,6 +493,87 @@ mod tests {
     #[test]
     fn auto_sync_interval_matches_pinned_host_policy() {
         assert_eq!(AUTO_SYNC_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn disable_during_scan_keeps_captured_settings_through_steam_dedupe() {
+        let scan_start_settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            autosync_remove_uninstalled: false,
+            include_steam: true,
+            exclude_games: Vec::new(),
+        };
+        let mut worker = completed_snapshot_worker(scan_start_settings.clone(), snapshot());
+
+        let disabled_settings = SettingsPatch {
+            enabled: false,
+            auto_sync: Some(true),
+            autosync_remove_uninstalled: Some(true),
+            include_steam: Some(false),
+            exclude_games: Some(vec![Exclusion::Id("10".into())]),
+        }
+        .apply(&scan_start_settings);
+        assert!(!disabled_settings.enabled);
+        assert!(disabled_settings.autosync_remove_uninstalled);
+        assert!(!disabled_settings.include_steam);
+        assert_eq!(
+            disabled_settings.exclude_games,
+            vec![Exclusion::Id("10".into())]
+        );
+        assert!(worker.busy());
+
+        let (captured_settings, result) = worker.take_result().unwrap();
+        assert!(!worker.busy());
+        let scan = CapturedScan {
+            snapshot: result.unwrap(),
+            settings: captured_settings,
+            source_revision: 1,
+        };
+        assert_eq!(scan.settings, scan_start_settings);
+        assert!(scan.settings.include_steam);
+
+        let pending = PendingSteamRead {
+            scan,
+            reader: SteamCatalogRead::new(),
+        };
+        assert_eq!(pending.scan.settings, scan_start_settings);
+        assert!(!disabled_settings.include_steam);
+
+        let mut catalog = catalog_sync::CatalogSync::default();
+        let count = pending
+            .scan
+            .start_catalog(&mut catalog, &[9001].into())
+            .unwrap();
+        assert_eq!(count, 2);
+        let transaction = catalog.transaction.as_ref().unwrap();
+        let submitted_entries = transaction
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry["source_id"].as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(submitted_entries, ["8", "10"]);
+        let selection_removals = transaction
+            .batches
+            .iter()
+            .flat_map(|batch| batch.selection_remove_source_ids.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(selection_removals, ["7"]);
+        assert!(!selection_removals.contains(&"10"));
+        assert_eq!(transaction.payload()["action"], "provider_snapshot_begin");
+
+        let now = Instant::now();
+        assert!(!scan_is_due(
+            &disabled_settings,
+            true,
+            Some(now - Duration::from_secs(1)),
+            now,
+        ));
     }
 }
 
