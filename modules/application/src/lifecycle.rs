@@ -364,14 +364,14 @@ fn resolve_preparation_executable(
         })
         .map(|(_, value)| std::ffi::OsString::from(value));
     let search_path = configured_path.clone().or_else(|| std::env::var_os("PATH"));
-    if let Some(search_path) = search_path {
-        if let Some(resolved) = find_preparation_executable(
+    if let Some(search_path) = search_path
+        && let Some(resolved) = find_preparation_executable(
             executable_path,
             &search_path,
             application_working_directory,
-        ) {
-            return Ok(resolved);
-        }
+        )
+    {
+        return Ok(resolved);
     }
 
     if configured_path.is_some() {
@@ -770,6 +770,7 @@ pub(crate) struct ApplicationLifecycle {
 }
 
 impl ApplicationLifecycle {
+    #[cfg(test)]
     pub(crate) fn new(steps: Vec<PreparationStep>) -> Option<Self> {
         Self::new_with_context(steps, BTreeMap::new(), None)
     }

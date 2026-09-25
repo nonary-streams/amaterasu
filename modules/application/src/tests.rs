@@ -583,17 +583,6 @@ fn detached_command_for_current_test_with_arguments(arguments: &[&str]) -> Strin
     command_arguments.join(" ")
 }
 
-fn quote_raw_command_argument(argument: &str) -> String {
-    #[cfg(windows)]
-    {
-        format!("\"{argument}\"")
-    }
-    #[cfg(not(windows))]
-    {
-        format!("'{}'", argument.replace('\'', "'\\''"))
-    }
-}
-
 #[cfg(windows)]
 unsafe extern "system" fn graceful_window_procedure(
     window: windows_sys::Win32::Foundation::HWND,

@@ -223,6 +223,7 @@ impl LaunchTarget {
         Self::from_catalog_entry_with_environment(entry, global_preparation, &BTreeMap::new())
     }
 
+    #[cfg(test)]
     pub fn from_catalog_entry_with_environment(
         entry: &Value,
         global_preparation: &[PreparationStep],
@@ -996,6 +997,13 @@ impl ApplicationConfigOverrides {
         {
             return Err("invalid_catalog_response");
         }
+        if self
+            .gamepad
+            .as_deref()
+            .is_some_and(|profile| profile.len() > 32 || !valid_gamepad_profile(profile))
+        {
+            return Err("invalid_catalog_response");
+        }
         if self.amd_av1_latency_mode.as_deref().is_some_and(|mode| {
             !matches!(
                 mode,
@@ -1670,7 +1678,7 @@ mod tests {
             serde_json::to_value(configured).unwrap(),
             json!({
                 "frame_limiter_enable":false,
-                "frame_limiter_fps_limit":0,
+                "frame_limiter_fps_limit":0.0,
                 "frame_limiter_provider":"auto",
                 "frame_limiter_disable_vsync":false,
                 "frame_limiter_auto_virtual_framegen":"enabled",
@@ -1994,10 +2002,10 @@ mod tests {
         let global = preparation_step(&executable, "global");
         let app = preparation_step(&executable, "app");
         let entry = json!({
-            "working_directory":application_directory,
             "launch": {
                 "kind":"executable",
                 "program":executable,
+                "working_directory":application_directory,
                 "preparation":[app],
             },
         });
@@ -2171,21 +2179,29 @@ mod tests {
         });
         let prepared =
             LaunchTarget::from_catalog_entry(&playnite, std::slice::from_ref(&global)).unwrap();
-        assert!(matches!(
-            prepared,
-            LaunchTarget::Playnite { preparation, .. }
-                if preparation == [PlannedPreparationStep::Structured(global.clone())]
-        ));
+        let LaunchTarget::Playnite { preparation, .. } = prepared else {
+            panic!("expected Playnite target");
+        };
+        assert_eq!(preparation.len(), 1);
+        assert_eq!(structured_step(&preparation[0]).run.args, ["global"]);
+        assert_eq!(
+            structured_step(&preparation[0]).run.cwd.as_deref(),
+            Path::new(&executable).parent().and_then(Path::to_str)
+        );
         let fullscreen = json!({
             "launch":{"kind":"playnite_fullscreen"}
         });
         let prepared_fullscreen =
             LaunchTarget::from_catalog_entry(&fullscreen, std::slice::from_ref(&global)).unwrap();
-        assert!(matches!(
-            prepared_fullscreen,
-            LaunchTarget::PlayniteFullscreen { preparation, .. }
-                if preparation == [PlannedPreparationStep::Structured(global.clone())]
-        ));
+        let LaunchTarget::PlayniteFullscreen { preparation, .. } = prepared_fullscreen else {
+            panic!("expected Playnite Fullscreen target");
+        };
+        assert_eq!(preparation.len(), 1);
+        assert_eq!(structured_step(&preparation[0]).run.args, ["global"]);
+        assert_eq!(
+            structured_step(&preparation[0]).run.cwd.as_deref(),
+            Path::new(&executable).parent().and_then(Path::to_str)
+        );
         let excluded = json!({
             "exclude_global_prep_cmd":true,
             "launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab"}

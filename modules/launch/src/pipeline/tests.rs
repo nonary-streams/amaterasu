@@ -1048,11 +1048,15 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     let mut harness = Harness::new();
     let mut frame_limiter_overrides = json!({
         "frame_limiter_enable":false,
-        "frame_limiter_fps_limit":0,
+        "frame_limiter_fps_limit":0.0,
         "frame_limiter_provider":"auto",
         "frame_limiter_disable_vsync":false,
         "frame_limiter_auto_virtual_framegen":"vrr",
         "ds4_back_as_touchpad_click":false,
+        "controller":false,
+        "gamepad":"auto",
+        "keyboard":false,
+        "mouse":true,
     });
     if cfg!(windows) {
         frame_limiter_overrides["rtss_frame_limit_type"] = json!("nvidia reflex");
@@ -1115,10 +1119,6 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     harness.catalog_audio_sink = Some("later-endpoint".into());
     harness.catalog_audio_sink_capture_only = Some(true);
     harness.catalog_back_button_timeout = Some(300);
-    harness.catalog_controller = Some(true);
-    harness.catalog_gamepad = Some("auto".into());
-    harness.catalog_keyboard = Some(true);
-    harness.catalog_mouse = Some(false);
     harness.catalog_config_overrides = Some(json!({
         "frame_limiter_enable":true,
         "frame_limiter_fps_limit":120.5,
@@ -1126,6 +1126,10 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         "frame_limiter_disable_vsync":true,
         "frame_limiter_auto_virtual_framegen":"disabled",
         "ds4_back_as_touchpad_click":true,
+        "controller":true,
+        "gamepad":"auto",
+        "keyboard":true,
+        "mouse":false,
     }));
     let replayed = harness.request(&mut pipeline, "nvhttp", launch_export(operation_id));
     assert_eq!(replayed["launch"]["launch_id"], original_launch_id);

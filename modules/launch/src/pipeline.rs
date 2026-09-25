@@ -1,7 +1,7 @@
 use crate::{
     SERVICE,
     protocol::*,
-    records::{CatalogSelection, Records},
+    records::{CatalogSelection, GlobalPreparation, Records},
     responses,
     workflow::{Step, Workflow, first_cleanup_step},
 };
@@ -129,8 +129,10 @@ impl Pipeline {
                 operation_id,
                 app_id,
                 CatalogSelection::Initiator,
-                global_preparation,
-                legacy_global_preparation,
+                GlobalPreparation {
+                    structured_steps: global_preparation,
+                    legacy_commands: legacy_global_preparation,
+                },
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
@@ -150,8 +152,10 @@ impl Pipeline {
                 operation_id,
                 app_id,
                 CatalogSelection::Exported,
-                global_preparation,
-                legacy_global_preparation,
+                GlobalPreparation {
+                    structured_steps: global_preparation,
+                    legacy_commands: legacy_global_preparation,
+                },
             ) {
                 Ok((id, true)) => {
                     self.job = Some(Workflow::launch(id, request, remaining_ms));

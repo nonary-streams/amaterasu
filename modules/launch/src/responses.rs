@@ -225,7 +225,7 @@ pub fn provider_launch(payload: &Value, record: &Record) -> Result<ProviderLaunc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::{CatalogSelection, Records};
+    use crate::records::{CatalogSelection, GlobalPreparation, Records};
     use serde_json::json;
 
     fn record() -> (Records, u64) {
@@ -237,7 +237,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
-                Vec::new(),
+                GlobalPreparation::default(),
             )
             .unwrap();
         records.values.get_mut(&id).unwrap().process_id = Some(3);

@@ -13,6 +13,12 @@ pub enum CatalogSelection {
     Exported,
 }
 
+#[derive(Clone, Default, PartialEq)]
+pub struct GlobalPreparation {
+    pub structured_steps: Vec<PreparationStep>,
+    pub legacy_commands: Vec<LegacyPreparationCommand>,
+}
+
 #[derive(Serialize)]
 pub struct Record {
     pub launch_id: u64,
@@ -95,9 +101,12 @@ impl Records {
         operation_id: String,
         app_id: String,
         catalog_selection: CatalogSelection,
-        global_preparation: Vec<PreparationStep>,
-        legacy_global_preparation: Vec<LegacyPreparationCommand>,
+        global_preparation: GlobalPreparation,
     ) -> Result<(u64, bool), &'static str> {
+        let GlobalPreparation {
+            structured_steps: global_preparation,
+            legacy_commands: legacy_global_preparation,
+        } = global_preparation;
         if let Some(record) = self
             .values
             .values()

@@ -289,7 +289,7 @@ pub fn first_cleanup_step(record: &Record) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::Records;
+    use crate::records::{GlobalPreparation, Records};
     use std::collections::BTreeMap;
 
     #[test]
@@ -302,7 +302,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
-                Vec::new(),
+                GlobalPreparation::default(),
             )
             .unwrap();
         let record = records.values.get_mut(&launch_id).unwrap();
@@ -331,7 +331,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
-                Vec::new(),
+                GlobalPreparation::default(),
             )
             .unwrap();
         let directory = std::env::current_dir()
@@ -395,7 +395,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
-                Vec::new(),
+                GlobalPreparation::default(),
             )
             .unwrap();
         let record = records.values.get_mut(&launch_id).unwrap();
@@ -437,7 +437,7 @@ mod tests {
                 "operation".into(),
                 "app-0000000000000001".into(),
                 CatalogSelection::Initiator,
-                Vec::new(),
+                GlobalPreparation::default(),
             )
             .unwrap();
         let record = records.values.get_mut(&launch_id).unwrap();

@@ -455,7 +455,7 @@ fn frame_limiter_overrides_are_sparse_normalized_and_platform_validated() {
         "launch":{"kind":"executable","program":"/games/configured"},
         "config_overrides":{
             "frame_limiter_enable":false,
-            "frame_limiter_fps_limit":0,
+            "frame_limiter_fps_limit":0.0,
             "frame_limiter_provider":"auto",
             "frame_limiter_disable_vsync":false,
             "frame_limiter_auto_virtual_framegen":true,
@@ -476,7 +476,7 @@ fn frame_limiter_overrides_are_sparse_normalized_and_platform_validated() {
         persisted["config_overrides"],
         json!({
             "frame_limiter_enable":false,
-            "frame_limiter_fps_limit":0,
+            "frame_limiter_fps_limit":0.0,
             "frame_limiter_provider":"auto",
             "frame_limiter_disable_vsync":false,
             "frame_limiter_auto_virtual_framegen":"enabled",
@@ -542,7 +542,7 @@ fn frame_limiter_overrides_are_sparse_normalized_and_platform_validated() {
 
 #[test]
 fn raw_preparation_alias_preserves_command_text_and_uses_bounded_defaults() {
-    let mut entry: Entry = serde_json::from_value(json!({
+    let entry: Entry = serde_json::from_value(json!({
         "name":"Legacy prepared game",
         "prep-cmd":[{
             "do":"  configure --profile=\"two words\"  ",

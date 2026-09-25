@@ -356,15 +356,19 @@ mod tests {
     #[test]
     fn launch_preparation_accepts_raw_defaults_and_existing_structured_steps() {
         let raw_text = "tool  --literal=$HOME \"quoted value\"  ";
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let action: Action = serde_json::from_value(serde_json::json!({
             "action":"launch",
             "operation_id":"raw-preparation",
-            "executable":"/bin/example",
+            "executable":executable,
             "preparation":[
                 {"do":raw_text},
                 {
-                    "run":{"executable":"/bin/setup","args":["--safe"]},
-                    "undo":{"executable":"/bin/cleanup"}
+                    "run":{"executable":executable,"args":["--safe"]},
+                    "undo":{"executable":executable}
                 }
             ]
         }))
@@ -382,14 +386,14 @@ mod tests {
         let PreparationStep::Structured(structured) = &preparation[1] else {
             panic!("existing structured fields must keep their wire shape")
         };
-        assert_eq!(structured.run.executable, "/bin/setup");
+        assert_eq!(structured.run.executable, executable);
         assert_eq!(structured.run.args, ["--safe"]);
         assert_eq!(
             structured
                 .undo
                 .as_ref()
                 .map(|command| command.executable.as_str()),
-            Some("/bin/cleanup")
+            Some(executable.as_str())
         );
         PreparationStep::validate_all(&preparation).unwrap();
 
