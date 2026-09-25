@@ -378,7 +378,7 @@ fn extract_session_label(filename: &str, base_name: &str) -> Option<String> {
     if !rollover.is_empty() {
         let rollover_index = rollover.strip_prefix('.')?.parse::<usize>().ok()?;
         if !(1..=ROLLOVER_COUNT).contains(&rollover_index)
-            || rollover_index.to_string() != &rollover[1..]
+            || rollover_index.to_string() != rollover[1..]
         {
             return None;
         }
