@@ -283,6 +283,7 @@ pub fn preflight_legacy_configuration_with_pairing(
     sources: &[LegacyConfigSource],
     validated_pairing: &[ValidatedPairingSource],
 ) -> PackageResult<ImportPlan> {
+    reject_ambiguous_sensitive_sources(sources)?;
     let mut plan = analyze_legacy_configuration(sources)?;
     let products: BTreeSet<_> = validated_pairing.iter().map(|item| item.product).collect();
     plan.critical_items.retain(|item| {
@@ -304,6 +305,7 @@ pub fn preflight_legacy_configuration_with_sensitive_sources(
     sources: &[LegacyConfigSource],
     validated: &[ValidatedSensitiveSource],
 ) -> PackageResult<ImportPlan> {
+    reject_ambiguous_sensitive_sources(sources)?;
     let mut plan = analyze_legacy_configuration(sources)?;
     for item in &mut plan.critical_items {
         if let Some(source) = validated
@@ -335,6 +337,34 @@ pub fn preflight_legacy_configuration_with_sensitive_sources(
         );
     }
     Ok(plan)
+}
+
+fn reject_ambiguous_sensitive_sources(sources: &[LegacyConfigSource]) -> PackageResult<()> {
+    let mut counts = BTreeMap::<LegacyProduct, (usize, usize)>::new();
+    for source in sources {
+        let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
+        let pairing = plan.critical_items.iter().any(|item| {
+            matches!(
+                item.item.as_str(),
+                "pairing_identity_state" | "pairing_credentials" | "pkey" | "cert"
+            )
+        });
+        let authentication = plan.critical_items.iter().any(|item| {
+            matches!(
+                item.item.as_str(),
+                "credentials_file" | "legacy_administrator_credential"
+            )
+        });
+        let counts = counts.entry(source.product).or_default();
+        counts.0 += usize::from(pairing);
+        counts.1 += usize::from(authentication);
+        if counts.0 > 1 || counts.1 > 1 {
+            return Err(
+                "multiple sensitive predecessor sources cannot share one destination".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Copies supported files from explicit predecessor roots into `data_root`.

@@ -468,6 +468,40 @@ file_state = credentials/custom_state.json\n",
 }
 
 #[test]
+fn approved_product_cannot_import_two_distinct_credential_roots() {
+    let fixture = TemporaryDirectory::new();
+    let sources: Vec<_> = ["profile", "installation"]
+        .into_iter()
+        .map(|name| {
+            let root = fixture.path().join(name);
+            write(
+                &root.join("sunshine.conf"),
+                b"credentials_file = credentials/login.json\n",
+            );
+            write(
+                &root.join("credentials/login.json"),
+                br#"{"username":"admin","password":"verifier","salt":"salt"}"#,
+            );
+            source(LegacyProduct::Sunshine, &root)
+        })
+        .collect();
+    let approved = [ValidatedSensitiveSource {
+        product: LegacyProduct::Sunshine,
+        pairing: false,
+        authentication: true,
+    }];
+    assert!(preflight_legacy_configuration_with_sensitive_sources(&sources, &approved).is_err());
+    assert!(
+        import_legacy_configuration_with_sensitive_sources(
+            &fixture.path().join("Amaterasu"),
+            &sources,
+            &approved,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn empty_credentials_file_inherits_configured_file_state() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");

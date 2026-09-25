@@ -315,43 +315,88 @@ fn run() -> Result<(), String> {
 fn validate_sensitive_sources(
     sources: &[LegacyConfigSource],
 ) -> Result<Vec<ValidatedSensitiveSource>, String> {
-    let plan = analyze_legacy_configuration(sources)?;
-    sources
-        .iter()
-        .map(|source| {
-            let needs_pairing = plan.critical_items.iter().any(|item| {
-                item.product == source.product
-                    && matches!(
-                        item.item.as_str(),
-                        "pairing_identity_state" | "pairing_credentials" | "pkey" | "cert"
-                    )
-            });
-            let needs_authentication = plan.critical_items.iter().any(|item| {
-                item.product == source.product
-                    && matches!(
-                        item.item.as_str(),
-                        "credentials_file" | "legacy_administrator_credential"
-                    )
-            });
-            Ok(ValidatedSensitiveSource {
-                product: source.product,
-                pairing: needs_pairing
-                    && helper_succeeds(
-                        &helper_path("amaterasu-pairing-import")?,
-                        "validate",
-                        &source.root,
-                        None,
-                    )?,
-                authentication: needs_authentication
-                    && helper_succeeds(
-                        &helper_path("amaterasu-authentication-import")?,
-                        "validate",
-                        &source.root,
-                        None,
-                    )?,
-            })
-        })
+    let mut checks = Vec::new();
+    for source in sources {
+        let (needs_pairing, needs_authentication) = sensitive_needs(source)?;
+        checks.push(SourceValidation {
+            product: source.product,
+            pairing_needed: needs_pairing,
+            authentication_needed: needs_authentication,
+            pairing_valid: !needs_pairing
+                || helper_succeeds(
+                    &helper_path("amaterasu-pairing-import")?,
+                    "validate",
+                    &source.root,
+                    None,
+                )?,
+            authentication_valid: !needs_authentication
+                || helper_succeeds(
+                    &helper_path("amaterasu-authentication-import")?,
+                    "validate",
+                    &source.root,
+                    None,
+                )?,
+        });
+    }
+    Ok(aggregate_sensitive_approvals(&checks))
+}
+
+struct SourceValidation {
+    product: LegacyProduct,
+    pairing_needed: bool,
+    authentication_needed: bool,
+    pairing_valid: bool,
+    authentication_valid: bool,
+}
+
+fn aggregate_sensitive_approvals(checks: &[SourceValidation]) -> Vec<ValidatedSensitiveSource> {
+    let mut by_product =
+        std::collections::BTreeMap::<LegacyProduct, (usize, usize, bool, bool)>::new();
+    for check in checks {
+        let entry = by_product
+            .entry(check.product)
+            .or_insert((0, 0, true, true));
+        if check.pairing_needed {
+            entry.0 += 1;
+            entry.2 &= check.pairing_valid;
+        }
+        if check.authentication_needed {
+            entry.1 += 1;
+            entry.3 &= check.authentication_valid;
+        }
+    }
+    by_product
+        .into_iter()
+        .map(
+            |(
+                product,
+                (pairing_count, authentication_count, pairing_valid, authentication_valid),
+            )| ValidatedSensitiveSource {
+                product,
+                // A single destination identity/verifier cannot preserve two distinct
+                // sensitive sources, even if both helpers validate independently.
+                pairing: pairing_count == 1 && pairing_valid,
+                authentication: authentication_count == 1 && authentication_valid,
+            },
+        )
         .collect()
+}
+
+fn sensitive_needs(source: &LegacyConfigSource) -> Result<(bool, bool), String> {
+    let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
+    let pairing = plan.critical_items.iter().any(|item| {
+        matches!(
+            item.item.as_str(),
+            "pairing_identity_state" | "pairing_credentials" | "pkey" | "cert"
+        )
+    });
+    let authentication = plan.critical_items.iter().any(|item| {
+        matches!(
+            item.item.as_str(),
+            "credentials_file" | "legacy_administrator_credential"
+        )
+    });
+    Ok((pairing, authentication))
 }
 
 fn seed_sensitive_sources(
@@ -363,6 +408,7 @@ fn seed_sensitive_sources(
     let pairing = helper_path("amaterasu-pairing-import")?;
     let authentication = helper_path("amaterasu-authentication-import")?;
     for source in sources {
+        let (needs_pairing, needs_authentication) = sensitive_needs(source)?;
         let validated = validated
             .iter()
             .find(|item| item.product == source.product)
@@ -370,10 +416,14 @@ fn seed_sensitive_sources(
         let copied = destination
             .join(amaterasu_package::migration::LEGACY_IMPORT_DIRECTORY)
             .join(source.product.directory_name());
-        if validated.pairing && !helper_succeeds(&pairing, "seed", &copied, Some(state))? {
+        if needs_pairing
+            && validated.pairing
+            && !helper_succeeds(&pairing, "seed", &copied, Some(state))?
+        {
             return Err("validated pairing migration could not be committed".into());
         }
-        if validated.authentication
+        if needs_authentication
+            && validated.authentication
             && !helper_succeeds(&authentication, "seed", &copied, Some(state))?
         {
             return Err("validated authentication migration could not be committed".into());
@@ -1292,6 +1342,60 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod handoff_cli_tests {
     use super::*;
+
+    #[test]
+    fn one_approved_root_cannot_clear_another_roots_credential_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-credential-source-binding-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let sources: Vec<_> = ["valid", "unapproved"]
+            .into_iter()
+            .map(|name| {
+                let source_root = root.join(name);
+                fs::create_dir_all(source_root.join("credentials")).unwrap();
+                fs::write(
+                    source_root.join("sunshine.conf"),
+                    b"credentials_file = credentials/login.json\n",
+                )
+                .unwrap();
+                fs::write(
+                    source_root.join("credentials/login.json"),
+                    b"{\"username\":\"admin\",\"password\":\"hash\",\"salt\":\"salt\"}",
+                )
+                .unwrap();
+                LegacyConfigSource {
+                    product: LegacyProduct::Sunshine,
+                    root: source_root,
+                }
+            })
+            .collect();
+        for source in &sources {
+            assert!(sensitive_needs(source).unwrap().1);
+        }
+        let approvals = aggregate_sensitive_approvals(&[
+            SourceValidation {
+                product: LegacyProduct::Sunshine,
+                pairing_needed: false,
+                authentication_needed: true,
+                pairing_valid: true,
+                authentication_valid: true,
+            },
+            SourceValidation {
+                product: LegacyProduct::Sunshine,
+                pairing_needed: false,
+                authentication_needed: true,
+                pairing_valid: true,
+                authentication_valid: false,
+            },
+        ]);
+        assert!(!approvals[0].authentication);
+        assert!(
+            preflight_legacy_configuration_with_sensitive_sources(&sources, &approvals).is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[cfg(unix)]
     #[test]
