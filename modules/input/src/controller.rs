@@ -1,9 +1,9 @@
 use crate::backend::Backend;
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{
-    DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS, MAX_PRESSED,
-    Operation, Pressed, is_temporary_modifier, lease_duration, repeat_modifiers,
-    validate_operation_id,
+    DevicePolicy, Event, InputError, InputResult, KeyEncoding, KeyState, MAX_EVENTS,
+    MAX_PEN_TOUCH_CONTACTS, MAX_PRESSED, Operation, PenTouchDevice, PenTouchPhase, Pressed,
+    is_temporary_modifier, lease_duration, repeat_modifiers, validate_operation_id,
 };
 use serde_json::{Value, json};
 use std::{
@@ -93,6 +93,56 @@ struct RepeatingKey {
     period: Duration,
 }
 
+struct ActivePenTouch {
+    device: PenTouchDevice,
+    pointer_id: u32,
+    last_event: Event,
+    last_move: Option<Event>,
+}
+
+impl ActivePenTouch {
+    fn new(event: &Event) -> Self {
+        let Event::PenTouch {
+            pointer_id, device, ..
+        } = event
+        else {
+            unreachable!("active pen/touch contacts are created from pen/touch events")
+        };
+        Self {
+            device: *device,
+            pointer_id: *pointer_id,
+            last_event: event.clone(),
+            last_move: None,
+        }
+    }
+
+    fn cancel_event(&self) -> Event {
+        let Event::PenTouch {
+            pointer_id,
+            device,
+            x,
+            y,
+            pressure,
+            tilt_x,
+            tilt_y,
+            ..
+        } = &self.last_event
+        else {
+            unreachable!("active pen/touch contacts retain pen/touch events")
+        };
+        Event::PenTouch {
+            pointer_id: *pointer_id,
+            device: *device,
+            phase: PenTouchPhase::Cancel,
+            x: *x,
+            y: *y,
+            pressure: *pressure,
+            tilt_x: *tilt_x,
+            tilt_y: *tilt_y,
+        }
+    }
+}
+
 pub struct Controller<B: Backend> {
     backend: B,
     enabled: bool,
@@ -114,6 +164,8 @@ pub struct Controller<B: Backend> {
     lease: Option<Lease>,
     // Preserve press order so cleanup releases chords in reverse order.
     pressed: Vec<Pressed>,
+    // Pen and touch contacts have independent pointer identities and cancel paths.
+    pen_touch_contacts: Vec<ActivePenTouch>,
     retry_at: Instant,
     terminal_acquires: VecDeque<TerminalAcquire>,
 }
@@ -139,6 +191,7 @@ impl<B: Backend> Controller<B> {
             horizontal_scroll_remainder: 0,
             lease: None,
             pressed: Vec::new(),
+            pen_touch_contacts: Vec::new(),
             retry_at: Instant::now(),
             terminal_acquires: VecDeque::new(),
         }
@@ -393,7 +446,25 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_native_pen_touch(&mut self, enabled: bool) {
+        let was_enabled = self.effective_native_pen_touch();
         self.native_pen_touch = enabled;
+        if was_enabled
+            && !self.effective_native_pen_touch()
+            && self.cancel_pen_touch_contacts().is_some()
+        {
+            if let Some(lease) = &mut self.lease {
+                lease.cleanup_required = true;
+                lease.termination_reason.get_or_insert("policy_changed");
+            }
+            self.retry_at = Instant::now() + Duration::from_millis(100);
+        }
+    }
+
+    fn effective_native_pen_touch(&self) -> bool {
+        self.lease
+            .as_ref()
+            .and_then(|lease| lease.requested_native_pen_touch)
+            .unwrap_or(self.native_pen_touch)
     }
 
     pub fn controller_enabled(&self) -> bool {
@@ -558,6 +629,7 @@ impl<B: Backend> Controller<B> {
                     self.backend.name(),
                     self.backend.absolute_pointer(),
                     self.backend.controller_input_supported(),
+                    self.backend.pen_touch_supported(),
                 ));
             }
             if let Some(terminal) = self
@@ -696,6 +768,7 @@ impl<B: Backend> Controller<B> {
             self.backend.name(),
             self.backend.absolute_pointer(),
             self.backend.controller_input_supported(),
+            self.backend.pen_touch_supported(),
         ))
     }
 
@@ -710,6 +783,7 @@ impl<B: Backend> Controller<B> {
                 self.backend.name(),
                 self.backend.absolute_pointer(),
                 self.backend.controller_input_supported(),
+                self.backend.pen_touch_supported(),
             ));
         }
         if let Some(terminal) = self
@@ -827,13 +901,68 @@ impl<B: Backend> Controller<B> {
             ));
         }
         let mut pressed = self.pressed.clone();
+        let mut pen_touch_contacts = self
+            .pen_touch_contacts
+            .iter()
+            .map(|contact| (contact.device, contact.pointer_id))
+            .collect::<Vec<_>>();
         let mut key_encoding = self.lease.as_ref().and_then(|lease| lease.key_encoding);
         for event in events {
             event.validate()?;
             if !self.event_enabled(event, self.effective_device_policy()) {
                 continue;
             }
+            if matches!(event, Event::PenTouch { .. }) && !self.backend.pen_touch_supported() {
+                return Err(InputError::new(
+                    "unsupported_event",
+                    "native pen/touch input is unavailable on this backend",
+                ));
+            }
             self.backend.validate(event)?;
+            if let Event::PenTouch {
+                pointer_id,
+                device,
+                phase,
+                ..
+            } = event
+            {
+                let identity = (*device, *pointer_id);
+                let held_index = pen_touch_contacts.iter().position(|held| *held == identity);
+                match phase {
+                    PenTouchPhase::Down => {
+                        if held_index.is_some() {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "pen/touch down duplicates a pointer already owned by this lease",
+                            ));
+                        }
+                        if pen_touch_contacts.len() >= MAX_PEN_TOUCH_CONTACTS {
+                            return Err(InputError::new(
+                                "resource_exhausted",
+                                "at most 16 pen/touch contacts may be held",
+                            ));
+                        }
+                        pen_touch_contacts.push(identity);
+                    }
+                    PenTouchPhase::Move => {
+                        if held_index.is_none() {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "pen/touch move requires a pointer held by this lease",
+                            ));
+                        }
+                    }
+                    PenTouchPhase::Up | PenTouchPhase::Cancel => {
+                        let Some(held_index) = held_index else {
+                            return Err(InputError::new(
+                                "invalid_sequence",
+                                "pen/touch terminal event requires a pointer held by this lease",
+                            ));
+                        };
+                        pen_touch_contacts.remove(held_index);
+                    }
+                }
+            }
             if let Event::Key { key, state } = event {
                 match state {
                     KeyState::Down => {
@@ -910,6 +1039,63 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
+        if let Event::PenTouch {
+            pointer_id,
+            device,
+            phase,
+            ..
+        } = event
+        {
+            let identity = (*device, *pointer_id);
+            let contact_index = self
+                .pen_touch_contacts
+                .iter()
+                .position(|contact| (contact.device, contact.pointer_id) == identity);
+            match phase {
+                PenTouchPhase::Down => {
+                    if contact_index.is_some() {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "pen/touch down duplicates a pointer already owned by this lease",
+                        ));
+                    }
+                    // A failed native call can still have delivered the down.
+                    self.pen_touch_contacts.push(ActivePenTouch::new(event));
+                }
+                PenTouchPhase::Move => {
+                    let Some(index) = contact_index else {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "pen/touch move requires a pointer held by this lease",
+                        ));
+                    };
+                    let contact = &mut self.pen_touch_contacts[index];
+                    if contact.last_move.as_ref() == Some(event) {
+                        return Ok(());
+                    }
+                    // Keep the latest sample for cancellation if injection is
+                    // accepted by the OS but its acknowledgement is lost.
+                    contact.last_event = event.clone();
+                    contact.last_move = Some(event.clone());
+                }
+                PenTouchPhase::Up | PenTouchPhase::Cancel => {
+                    let Some(index) = contact_index else {
+                        return Err(InputError::new(
+                            "invalid_sequence",
+                            "pen/touch terminal event requires a pointer held by this lease",
+                        ));
+                    };
+                    self.pen_touch_contacts[index].last_event = event.clone();
+                }
+            }
+
+            self.backend.inject(event)?;
+            if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel) {
+                self.pen_touch_contacts
+                    .retain(|contact| (contact.device, contact.pointer_id) != identity);
+            }
+            return Ok(());
+        }
         if let Event::Key { key, .. } = event
             && let Some(lease) = &mut self.lease
         {
@@ -960,8 +1146,13 @@ impl<B: Backend> Controller<B> {
 
     fn event_enabled(&self, event: &Event, policy: DevicePolicy) -> bool {
         event.enabled_by(policy)
-            && (!matches!(event, Event::Controller { .. })
-                || (self.effective_controller_enabled() && !self.controller_cleanup_pending))
+            && match event {
+                Event::PenTouch { .. } => self.effective_native_pen_touch(),
+                Event::Controller { .. } => {
+                    self.effective_controller_enabled() && !self.controller_cleanup_pending
+                }
+                _ => true,
+            }
     }
 
     fn update_repeat_after_event(&mut self, event: &Event, now: Instant) -> InputResult<()> {
@@ -1071,6 +1262,21 @@ impl<B: Backend> Controller<B> {
             Pressed::Button(_) => false,
         })
     }
+
+    fn cancel_pen_touch_contacts(&mut self) -> Option<InputError> {
+        let mut failure = None;
+        for index in (0..self.pen_touch_contacts.len()).rev() {
+            let cancel_event = self.pen_touch_contacts[index].cancel_event();
+            match self.backend.inject(&cancel_event) {
+                Ok(()) => {
+                    self.pen_touch_contacts.remove(index);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        failure
+    }
+
     fn finish_lease(&mut self, now: Instant, reason: &'static str) -> InputResult<()> {
         self.repeating_key = None;
         if let Some(lease) = &mut self.lease {
@@ -1086,6 +1292,9 @@ impl<B: Backend> Controller<B> {
                     failure = Some(error);
                 }
             }
+        }
+        if let Some(error) = self.cancel_pen_touch_contacts() {
+            failure = Some(error);
         }
         if let Some(error) = failure {
             if let Some(lease) = &mut self.lease {
@@ -1160,7 +1369,7 @@ impl<B: Backend> Controller<B> {
                 "operation_id":if owned { lease.operation_id.as_deref() } else { None },
                 "token":owned.then_some(&lease.token),
                 "expires_in_ms":lease.expires.saturating_duration_since(now).as_millis() as u64,
-                "pressed_count":self.pressed.len(),"cleanup_required":lease.cleanup_required,
+                "pressed_count":self.pressed.len(),"pen_touch_contact_count":self.pen_touch_contacts.len(),"cleanup_required":lease.cleanup_required,
                 "back_button_timeout":lease.back_button_timeout_ms,
                 "controller_enabled":lease.requested_controller.unwrap_or(self.controller_enabled),
                 "keyboard":lease.requested_keyboard.unwrap_or(self.device_policy.keyboard),
@@ -1177,7 +1386,7 @@ impl<B: Backend> Controller<B> {
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();
@@ -1206,6 +1415,7 @@ fn active_lease(
     backend: &str,
     absolute_pointer: bool,
     controller_input: bool,
+    pen_touch_supported: bool,
 ) -> Value {
     json!({
         "ok": true,
@@ -1223,6 +1433,7 @@ fn active_lease(
         "backend": backend,
         "absolute_pointer": absolute_pointer,
         "controller_input": controller_input,
+        "pen_touch_supported": pen_touch_supported,
         "gamepad_profile": lease.gamepad_profile.as_str(),
         "ds4_back_as_touchpad_click": lease.ds4_back_as_touchpad_click,
         "native_pen_touch": lease.native_pen_touch,

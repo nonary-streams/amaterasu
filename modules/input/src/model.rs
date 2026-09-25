@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 pub const MAX_EVENTS: usize = 64;
 pub const MAX_PRESSED: usize = 128;
+pub const MAX_PEN_TOUCH_CONTACTS: usize = 16;
 pub const MAX_QUEUED_REQUESTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +194,23 @@ pub enum Axis {
     Horizontal,
     Vertical,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PenTouchDevice {
+    Pen,
+    Touch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PenTouchPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Key {
@@ -220,6 +237,19 @@ pub enum Event {
         axis: Axis,
         amount: i16,
     },
+    PenTouch {
+        pointer_id: u32,
+        device: PenTouchDevice,
+        phase: PenTouchPhase,
+        x: u16,
+        y: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pressure: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tilt_x: Option<i16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tilt_y: Option<i16>,
+    },
     Controller {
         number: u16,
         active_mask: u16,
@@ -241,6 +271,7 @@ impl Event {
             | Self::Absolute { .. }
             | Self::Scroll { .. }
             | Self::ScrollUnits { .. } => policy.mouse,
+            Self::PenTouch { .. } => true,
             // Route controller records through the backend capability check;
             // unsupported native backends reject the batch before it is applied.
             Self::Controller { .. } => true,
@@ -300,6 +331,48 @@ impl Event {
                 "invalid_event",
                 "controller number must be in the range 0..16",
             )),
+            Self::PenTouch { pressure, .. }
+                if pressure
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) =>
+            {
+                Err(InputError::new(
+                    "invalid_event",
+                    "pen/touch pressure must be finite and normalized to 0..1",
+                ))
+            }
+            Self::PenTouch {
+                device: PenTouchDevice::Touch,
+                tilt_x: Some(_),
+                ..
+            }
+            | Self::PenTouch {
+                device: PenTouchDevice::Touch,
+                tilt_y: Some(_),
+                ..
+            } => Err(InputError::new(
+                "invalid_event",
+                "tilt is supported only for pen events",
+            )),
+            Self::PenTouch {
+                device: PenTouchDevice::Pen,
+                tilt_x,
+                tilt_y,
+                ..
+            } if tilt_x.is_some() != tilt_y.is_some() => Err(InputError::new(
+                "invalid_event",
+                "pen tilt_x and tilt_y must be provided together",
+            )),
+            Self::PenTouch {
+                device: PenTouchDevice::Pen,
+                tilt_x: Some(tilt_x),
+                tilt_y: Some(tilt_y),
+                ..
+            } if !(-90..=90).contains(tilt_x) || !(-90..=90).contains(tilt_y) => {
+                Err(InputError::new(
+                    "invalid_event",
+                    "pen tilt must be in the range -90..90 degrees",
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -770,5 +843,127 @@ mod tests {
         .unwrap();
 
         assert_eq!(event.validate().unwrap_err().code, "invalid_event");
+    }
+
+    #[test]
+    fn pen_touch_event_round_trips_identity_and_supported_samples() {
+        let payload = json!({
+            "kind":"pen_touch",
+            "pointer_id":4294967295u32,
+            "device":"pen",
+            "phase":"move",
+            "x":65535,
+            "y":0,
+            "pressure":0.75,
+            "tilt_x":-90,
+            "tilt_y":90,
+        });
+        let event: Event = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(
+            event,
+            Event::PenTouch {
+                pointer_id: u32::MAX,
+                device: PenTouchDevice::Pen,
+                phase: PenTouchPhase::Move,
+                x: u16::MAX,
+                y: 0,
+                pressure: Some(0.75),
+                tilt_x: Some(-90),
+                tilt_y: Some(90),
+            }
+        );
+        assert!(event.validate().is_ok());
+        assert_eq!(serde_json::to_value(event).unwrap(), payload);
+    }
+
+    #[test]
+    fn pen_touch_rejects_out_of_range_coordinates_and_type_specific_fields() {
+        for coordinate in [-1, 65_536] {
+            assert!(
+                serde_json::from_value::<Event>(json!({
+                    "kind":"pen_touch",
+                    "pointer_id":1,
+                    "device":"touch",
+                    "phase":"down",
+                    "x":coordinate,
+                    "y":0
+                }))
+                .is_err()
+            );
+        }
+
+        let touch_tilt: Event = serde_json::from_value(json!({
+            "kind":"pen_touch",
+            "pointer_id":1,
+            "device":"touch",
+            "phase":"down",
+            "x":0,
+            "y":0,
+            "tilt_x":0
+        }))
+        .unwrap();
+        assert_eq!(touch_tilt.validate().unwrap_err().code, "invalid_event");
+
+        let one_sided_pen_tilt: Event = serde_json::from_value(json!({
+            "kind":"pen_touch",
+            "pointer_id":1,
+            "device":"pen",
+            "phase":"down",
+            "x":0,
+            "y":0,
+            "tilt_x":0
+        }))
+        .unwrap();
+        assert_eq!(
+            one_sided_pen_tilt.validate().unwrap_err().code,
+            "invalid_event"
+        );
+
+        let out_of_range_tilt: Event = serde_json::from_value(json!({
+            "kind":"pen_touch",
+            "pointer_id":1,
+            "device":"pen",
+            "phase":"down",
+            "x":0,
+            "y":0,
+            "tilt_x":91,
+            "tilt_y":0
+        }))
+        .unwrap();
+        assert_eq!(
+            out_of_range_tilt.validate().unwrap_err().code,
+            "invalid_event"
+        );
+    }
+
+    #[test]
+    fn pen_touch_rejects_non_finite_and_out_of_range_pressure() {
+        for pressure in [-0.01, 1.01] {
+            let event: Event = serde_json::from_value(json!({
+                "kind":"pen_touch",
+                "pointer_id":1,
+                "device":"touch",
+                "phase":"down",
+                "x":0,
+                "y":0,
+                "pressure":pressure
+            }))
+            .unwrap();
+            assert_eq!(event.validate().unwrap_err().code, "invalid_event");
+        }
+
+        for pressure in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let event = Event::PenTouch {
+                pointer_id: 1,
+                device: PenTouchDevice::Pen,
+                phase: PenTouchPhase::Down,
+                x: 0,
+                y: 0,
+                pressure: Some(pressure),
+                tilt_x: None,
+                tilt_y: None,
+            };
+            assert_eq!(event.validate().unwrap_err().code, "invalid_event");
+        }
     }
 }

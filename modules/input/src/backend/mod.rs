@@ -6,6 +6,9 @@ pub trait Backend {
     fn name(&self) -> &'static str;
     fn supported(&self) -> bool;
     fn absolute_pointer(&self) -> bool;
+    fn pen_touch_supported(&self) -> bool {
+        false
+    }
     fn controller_input_supported(&self) -> bool {
         false
     }

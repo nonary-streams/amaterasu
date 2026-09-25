@@ -96,8 +96,10 @@ The live global policy includes `keyboard`, `mouse`, `controller`,
 `key_rightalt_to_key_win`, `key_repeat_delay`,
 `key_repeat_frequency`, `back_button_timeout`, `gamepad`,
 `ds4_back_as_touchpad_click`, and `native_pen_touch`. Native pen/touch defaults
-to enabled. The input module stores and snapshots this setting; native pen/touch
-event transport and platform integration are not implemented here. Setting
+to enabled. The input module stores and snapshots this setting, which gates the
+typed native pen/touch event path independently from backend capability.
+Disabling it cancels lease-owned contacts and retains failed cancellations for
+cleanup retry. Setting
 `controller:false` suppresses controller snapshots and removes active owned
 virtual gamepad slots while leaving keyboard and mouse delivery available. If
 slot removal fails, controller snapshots remain suppressed and slot cleanup is
@@ -250,17 +252,18 @@ passes its resolved scoped value as `Some(true)` or `Some(false)`. The effective
 value is snapshotted for the lease and returned by Acquire, active status, and
 operation lookup; callers use this lease value for capability behavior. Acquire
 retries must keep the same optional value.
-This setting does not enable native pen/touch event transport: that transport
-and platform integration are not implemented in this module yet.
+When enabled and supported, a lease can send `pen_touch` events through the
+native backend. `pen_touch_supported` reports the backend capability separately
+from this saved policy value.
 
 Active acquire and lookup responses include the backend's `absolute_pointer`
-capability and the effective `native_pen_touch` value. Callers must require the
-pointer capability before sending absolute events; terminal tombstones omit
-backend capabilities.
+and `pen_touch_supported` capabilities and the effective `native_pen_touch`
+value. Callers must require the relevant capability before sending those event
+types; terminal tombstones omit backend capabilities.
 
 Batches contain 1–64 events. The entire batch is validated against backend
 capabilities and a simulated pressed state before its first native event.
-At most 128 keys/buttons may be held. Supported events:
+At most 128 keys/buttons and 16 pen/touch contacts may be held. Supported events:
 
 - `key`: Windows requires `windows_scan` with a set-1 scan code from 1–127 and
   optional `extended`; Linux requires `linux_evdev` with a keyboard code from
@@ -291,6 +294,17 @@ At most 128 keys/buttons may be held. Supported events:
   signed 16-bit wheel-unit delta. This preserves Moonlight's raw fractional
   scrolling. When the global high-resolution option is disabled, the controller
   accumulates each axis and emits `scroll` detents instead.
+- `pen_touch`: carries a `pointer_id` (`u32`), `device` (`pen` or `touch`),
+  `phase` (`down`, `move`, `up`, or `cancel`), and normalized absolute `x`/`y`
+  coordinates (`u16`, 0–65535). Optional pressure is finite and normalized to
+  0–1. Optional pen tilt must provide both `tilt_x` and `tilt_y`, each from
+  -90 to 90 degrees; touch tilt is rejected. Contact ownership is keyed by
+  (`device`, `pointer_id`): Down must create a free identity, and Move, Up, and
+  Cancel must refer to an identity held by this lease. A duplicate Down or
+  unowned event is rejected before injection. Repeated identical Move samples
+  are coalesced. Disable, lease finish, release, expiry, failure, and shutdown
+  cancel only the exact contacts owned by that lease; failed cancellations stay
+  owned and retry through the lease cleanup path.
 
 Linux key example:
 
@@ -384,7 +398,7 @@ to open the configured uinput device. No permissions/udev rules are changed by
 this module. Device creation does not acknowledge compositor readiness; udev and
 libinput discovery are asynchronous, and delivery during device activation needs
 native acceptance testing. Seat selection, captured-monitor coordinate mapping,
-Wayland absolute-pointer integration, touch/pen, DS4/DS5/Switch reports, VHF/UMDF
+Wayland absolute-pointer integration, DS4/DS5/Switch reports, VHF/UMDF
 and Inputtino integrations, rumble/LED feedback, and crash-surviving Windows
 keyboard/mouse cleanup remain unimplemented.
 
@@ -392,10 +406,13 @@ keyboard/mouse cleanup remain unimplemented.
 
 Tests use a fake backend for ownership, stale tokens, batch admission, chord
 release order, cancellation, partial failure, expiry, retained failed releases,
-retry and shutdown. Windows encoding tests inspect INPUT records without calling
-SendInput. Windows and Linux native sources cross-compile from macOS. **No test
+retry and shutdown, including pen/touch identity and contact cleanup. Windows
+encoding tests inspect INPUT records without calling SendInput. Windows and Linux
+native sources cross-compile from macOS. **No test
 injects input or creates a uinput device on the developer desktop.** Native
-Windows/KDE Wayland delivery and failure behavior remain hardware gates.
+pen/touch delivery, Windows and KDE Wayland behavior, and device-loss handling
+remain hardware gates. Network ingress mapping remains the responsibility of
+the protocol adapter.
 
 Vibeshine commit `aa292c4cb097f22beab19d6ebf0307367f9bf449` was a behavioral
 reference, including its keyboard/mouse interfaces and history concerning
