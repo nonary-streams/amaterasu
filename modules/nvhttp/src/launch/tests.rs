@@ -1438,21 +1438,85 @@ fn global_wgc_pacing_smoothing_reaches_rtsp_open_and_is_snapshotted_at_admission
 }
 
 #[test]
-fn maximum_bitrate_below_encoder_minimum_fails_before_launch_work() {
+fn global_bitrate_below_encoder_minimum_can_be_overridden_by_client_cap() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.set_global_max_bitrate_kbps(Some(99));
+    let client = peer_with_stream_overrides(1, Some(5_000), None, None);
+    let mut broker = Broker::default();
 
-    let reply = controller
-        .launch(10, request(1), peer(1), now)
-        .expect("unsupported configured cap rejects launch");
-    assert_eq!(reply.status, 503);
-    assert!(
-        String::from_utf8(reply.body)
-            .unwrap()
-            .contains("below the supported 100 kbps encoder minimum")
+    assert!(controller.launch(10, request(1), client, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(opened_rtsp_payload(&broker)["max_bitrate_kbps"], 5_000);
+}
+
+#[test]
+fn global_bitrate_below_encoder_minimum_can_be_overridden_by_application_cap() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(99));
+    let mut broker = Broker {
+        application_max_bitrate: Some(6_000),
+        ..Default::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(opened_rtsp_payload(&broker)["max_bitrate_kbps"], 6_000);
+}
+
+#[test]
+fn global_bitrate_below_encoder_minimum_can_be_cleared_by_client_override() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(99));
+    let client = peer_with_stream_overrides(1, Some(0), None, None);
+    let mut broker = Broker {
+        application_max_bitrate: Some(6_000),
+        ..Default::default()
+    };
+
+    assert!(controller.launch(10, request(1), client, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        opened_rtsp_payload(&broker)["max_bitrate_kbps"],
+        Value::Null
     );
-    assert!(!controller.busy());
+}
+
+#[test]
+fn effective_client_bitrate_below_encoder_minimum_fails_before_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(5_000));
+    let client = peer_with_stream_overrides(1, Some(99), None, None);
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(1), client, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn global_bitrate_below_encoder_minimum_without_override_fails_before_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_max_bitrate_kbps(Some(99));
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
 }
 
 #[test]
