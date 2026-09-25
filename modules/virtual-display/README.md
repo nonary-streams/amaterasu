@@ -68,6 +68,9 @@ validated Windows monitor `device_path` and whether CCD reports the path active.
 Readiness means the exact returned adapter/target has a published monitor identity;
 it does not mean capture, encoding, streaming, or topology activation is ready.
 Creation waits up to five seconds for that identity before cleanup starts.
+If a published identity disappears while its lease still exists, status immediately
+clears the stale device path and starts a new five-second readiness window. The
+same owned lease may become ready again; otherwise exact cleanup begins.
 
 Each caller sees/removes only its own records. Repeating create with identical
 caller, identity, and specification returns the existing record without replaying

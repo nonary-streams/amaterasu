@@ -19,7 +19,7 @@ struct Monitor {
     ready: Option<Ready>,
     state: &'static str,
     error: Option<&'static str>,
-    created: Instant,
+    readiness_started: Instant,
     next_poll: Instant,
     next_feed: Instant,
     remove_attempts: u8,
@@ -212,7 +212,7 @@ impl<D: Driver> Manager<D> {
             ready: None,
             state: "creating",
             error: None,
-            created: now,
+            readiness_started: now,
             next_poll: now,
             next_feed: now + FEED_INTERVAL,
             remove_attempts: 0,
@@ -297,10 +297,16 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
             monitor.state = "ready";
         }
         Ok(observation) if !observation.exists => monitor.begin_cleanup(Some("monitor_departed")),
-        Ok(_) if now.duration_since(monitor.created) >= READINESS_TIMEOUT => {
-            monitor.begin_cleanup(Some("readiness_timeout"))
+        Ok(_) => {
+            if monitor.ready.take().is_some() {
+                // CCD can withdraw a published target while the driver lease still
+                // exists. Stop advertising the stale path and allow it to settle.
+                monitor.state = "creating";
+                monitor.readiness_started = now;
+            } else if now.duration_since(monitor.readiness_started) >= READINESS_TIMEOUT {
+                monitor.begin_cleanup(Some("readiness_timeout"));
+            }
         }
-        Ok(_) => {}
         Err(code) => monitor.begin_cleanup(Some(code)),
     }
 }

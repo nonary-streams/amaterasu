@@ -459,7 +459,12 @@ fn ambiguous_create_is_not_replayed_and_cleanup_waits_for_departure() {
 fn unpublished_monitor_expires_into_cleanup_and_identity_can_be_recreated() {
     let (mut manager, calls) = setup(true);
     let first = manager.handle("alice", create());
-    manager.monitors.values_mut().next().unwrap().created = Instant::now() - READINESS_TIMEOUT;
+    manager
+        .monitors
+        .values_mut()
+        .next()
+        .unwrap()
+        .readiness_started = Instant::now() - READINESS_TIMEOUT;
     tick(&mut manager);
     assert_eq!(
         manager.monitors.values().next().unwrap().error,
@@ -473,6 +478,55 @@ fn unpublished_monitor_expires_into_cleanup_and_identity_can_be_recreated() {
         second["monitor"]["display_id"]
     );
     assert_ne!(calls.borrow().creates[0].0, calls.borrow().creates[1].0);
+}
+
+#[test]
+fn published_identity_loss_clears_stale_path_and_can_recover() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create());
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
+
+    calls.borrow_mut().ready = false;
+    tick(&mut manager);
+    let status = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(status["monitors"][0]["state"], "creating");
+    assert!(status["monitors"][0]["ready"].is_null());
+    assert!(calls.borrow().removes.is_empty());
+
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let status = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(status["monitors"][0]["state"], "ready");
+    assert_eq!(
+        status["monitors"][0]["ready"]["device_path"],
+        "owned-device"
+    );
+    assert!(calls.borrow().removes.is_empty());
+}
+
+#[test]
+fn prolonged_published_identity_loss_cleans_only_the_owned_lease() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create());
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    calls.borrow_mut().ready = false;
+    tick(&mut manager);
+    manager
+        .monitors
+        .values_mut()
+        .next()
+        .unwrap()
+        .readiness_started = Instant::now() - READINESS_TIMEOUT;
+    tick(&mut manager);
+    let monitor = manager.monitors.values().next().unwrap();
+    assert_eq!(monitor.state, "removing");
+    assert_eq!(monitor.error, Some("readiness_timeout"));
+    assert!(monitor.ready.is_none());
+    tick(&mut manager);
+    assert_eq!(calls.borrow().removes, calls.borrow().creates);
 }
 
 #[test]
