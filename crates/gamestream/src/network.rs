@@ -153,6 +153,16 @@ impl NetworkEncryptionPolicy {
             PeerNetwork::Wan => self.wan_mode,
         }
     }
+
+    /// Returns whether the peer's announced video-encryption choice is accepted.
+    pub fn accepts_video_encryption_for_peer(
+        self,
+        address: IpAddr,
+        announced_video_encryption_choice: bool,
+    ) -> bool {
+        self.mode_for_peer(address)
+            .accepts_client_announced_video_encryption_choice(announced_video_encryption_choice)
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +277,37 @@ mod tests {
             policy.mode_for_peer(address("8.8.8.8")),
             VideoEncryptionMode::Opportunistic
         );
+    }
+
+    #[test]
+    fn accepts_announced_video_encryption_choices_for_each_peer_network() {
+        let policy = NetworkEncryptionPolicy {
+            lan_mode: VideoEncryptionMode::Mandatory,
+            wan_mode: VideoEncryptionMode::Never,
+        };
+        let cases = [
+            ("127.0.0.1", false, false),
+            ("127.0.0.1", true, true),
+            ("10.1.2.3", false, false),
+            ("10.1.2.3", true, true),
+            ("8.8.8.8", false, true),
+            ("8.8.8.8", true, false),
+            ("2001:4860:4860::8888", false, true),
+            ("2001:4860:4860::8888", true, false),
+            ("::ffff:8.8.8.8", false, true),
+            ("::ffff:8.8.8.8", true, false),
+        ];
+
+        for (peer_address, announced_video_encryption_choice, expected) in cases {
+            assert_eq!(
+                policy.accepts_video_encryption_for_peer(
+                    address(peer_address),
+                    announced_video_encryption_choice,
+                ),
+                expected,
+                "peer {peer_address}, announced choice {announced_video_encryption_choice}"
+            );
+        }
     }
 
     #[test]
