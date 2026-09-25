@@ -40,7 +40,7 @@ pub enum Operation {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
-    /// Export only Steam IDs from the single owner selected by export_principals.
+    /// Export only Steam IDs from the owner selected by steam_id_export_principals.
     ExportSteamIds {
         cursor: Option<Cursor>,
         limit: Option<usize>,

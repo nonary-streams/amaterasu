@@ -195,19 +195,24 @@ sanitized public application list. Missing either authority returns
 ## Read-only streaming export
 
 Startup `export_principals` maps each authorized consumer to one fixed catalog
-owner. It defaults to `{}`. Both sides must be 1–128 ASCII letters, digits, dots,
-underscores or hyphens; at most 16 mappings are accepted. Example settings:
+owner for the sanitized `export_list` action. It defaults to `{}`. Both sides
+must be 1–128 ASCII letters, digits, dots, underscores or hyphens; at most 16
+mappings are accepted. Example settings:
 
 ```json
-{"export_principals":{"amaterasu.nvhttp":"amaterasu.management"}}
+{
+  "export_principals":{"amaterasu.nvhttp":"amaterasu.management"},
+  "steam_id_export_principals":{"amaterasu.lutris":"amaterasu.management"}
+}
 ```
 
-`export_steam_ids` uses the same immediate-caller authorization and fixed owner
-mapping as `export_list`. Profiles must map a consumer to the catalog owner that
-contains the direct Steam rows it needs to check. The action returns only
-canonical nonzero numeric `steam_id` values, the catalog revision, and an opaque
-continuation cursor. It accepts no owner selector and never returns catalog
-entry data:
+`steam_id_export_principals` is a separate startup map for
+`export_steam_ids`. It follows the same identifier validation and size bound as
+`export_principals`, but grants no `export_list` authority. Profiles map a
+consumer to the catalog owner that contains the direct Steam rows it needs to
+check. The action returns only canonical nonzero numeric `steam_id` values, the
+catalog revision, and an opaque continuation cursor. It accepts no owner
+selector and never returns catalog entry data:
 
 ```json
 {"action":"export_steam_ids","limit":32,"cursor":null}
@@ -224,13 +229,14 @@ cursor with `revision_conflict`.
 {"action":"export_list","limit":32,"cursor":null}
 ```
 
-The authenticated **immediate caller** selects this mapping, independently of the
-request initiator. An unmapped caller receives `permission_denied` before state
-access. The payload cannot supply an owner, initiator or search query. Call grants
-for catalog and delegated state access are still required. The mapping grants
-the sanitized `export_list` and `export_steam_ids` operations and, only when
-combined with an authorized launch provider, exported launch resolution.
-Ordinary CRUD remains caller-scoped.
+The authenticated **immediate caller** selects the applicable mapping,
+independently of the request initiator. An unmapped caller receives
+`permission_denied` before state access. The payload cannot supply an owner,
+initiator or search query. Call grants for catalog and delegated state access
+are still required. `export_principals` grants only `export_list` and anchors
+exported launch resolution when combined with an authorized launch provider;
+`steam_id_export_principals` grants only `export_steam_ids`. Ordinary CRUD
+remains caller-scoped.
 
 Success is `{"ok":true,"revision":7,"entries":[{"id":"app-0000000000000001","name":"Example Game"}],"next_cursor":null}`.
 Rows contain exactly `id` and `name`; launch paths, arguments, descriptions and

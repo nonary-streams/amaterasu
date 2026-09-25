@@ -175,6 +175,7 @@ struct Scan {
 pub struct Pipeline {
     launch_principals: BTreeSet<String>,
     export_principals: BTreeMap<String, String>,
+    steam_id_export_principals: BTreeMap<String, String>,
     import_principals: BTreeMap<String, String>,
     provider_sessions: BTreeMap<String, ProviderSession>,
     queued: VecDeque<Incoming>,
@@ -187,9 +188,24 @@ impl Pipeline {
         export_principals: BTreeMap<String, String>,
         import_principals: BTreeMap<String, String>,
     ) -> Self {
+        Self::new_with_steam_id_export_principals(
+            launch_principals,
+            export_principals,
+            BTreeMap::new(),
+            import_principals,
+        )
+    }
+
+    pub fn new_with_steam_id_export_principals(
+        launch_principals: BTreeSet<String>,
+        export_principals: BTreeMap<String, String>,
+        steam_id_export_principals: BTreeMap<String, String>,
+        import_principals: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             launch_principals,
             export_principals,
+            steam_id_export_principals,
             import_principals,
             ..Self::default()
         }
@@ -232,11 +248,20 @@ impl Pipeline {
                 }
                 Ok((format!("principal/{caller}"), None, operation))
             }
-            operation @ (Operation::ExportList { .. } | Operation::ExportSteamIds { .. }) => {
+            operation @ Operation::ExportList { .. } => {
                 let owner = self.export_principals.get(caller).ok_or_else(|| {
                     error(
                         "permission_denied",
                         "caller is not an authorized catalog consumer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
+            }
+            operation @ Operation::ExportSteamIds { .. } => {
+                let owner = self.steam_id_export_principals.get(caller).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "caller is not authorized for Steam-ID catalog export",
                     )
                 })?;
                 Ok((format!("principal/{owner}"), None, operation))

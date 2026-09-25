@@ -15,6 +15,7 @@ const STATE_SERVICE: &str = "amaterasu.state/1";
 struct Settings {
     launch_principals: std::collections::BTreeSet<String>,
     export_principals: std::collections::BTreeMap<String, String>,
+    steam_id_export_principals: std::collections::BTreeMap<String, String>,
     import_principals: std::collections::BTreeMap<String, String>,
 }
 
@@ -28,6 +29,11 @@ impl Settings {
             || self.export_principals.len() > 16
             || self
                 .export_principals
+                .iter()
+                .any(|(consumer, owner)| !valid_principal(consumer) || !valid_principal(owner))
+            || self.steam_id_export_principals.len() > 16
+            || self
+                .steam_id_export_principals
                 .iter()
                 .any(|(consumer, owner)| !valid_principal(consumer) || !valid_principal(owner))
             || self.import_principals.len() > 16
@@ -68,9 +74,10 @@ impl ManagedModule for CatalogModule {
         })?;
         Ok(Self {
             runtime,
-            pipeline: Pipeline::new(
+            pipeline: Pipeline::new_with_steam_id_export_principals(
                 settings.launch_principals,
                 settings.export_principals,
+                settings.steam_id_export_principals,
                 settings.import_principals,
             ),
         })
@@ -92,7 +99,22 @@ mod tests {
     fn export_settings_validate_both_sides_and_capacity() {
         let defaults: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaults.export_principals.is_empty());
+        assert!(defaults.steam_id_export_principals.is_empty());
         assert!(defaults.import_principals.is_empty());
+        let configured_steam_export: Settings = serde_json::from_value(serde_json::json!({
+            "steam_id_export_principals": {
+                "amaterasu.lutris": "amaterasu.management"
+            }
+        }))
+        .unwrap();
+        assert!(configured_steam_export.validate().is_ok());
+        assert_eq!(
+            configured_steam_export.steam_id_export_principals,
+            std::collections::BTreeMap::from([(
+                "amaterasu.lutris".into(),
+                "amaterasu.management".into()
+            )])
+        );
         for (consumer, owner) in [
             ("", "owner"),
             ("consumer", "../owner"),
@@ -116,6 +138,30 @@ mod tests {
             .export_principals
             .insert("extra".into(), "owner".into());
         assert!(settings.validate().is_err());
+
+        let mut steam_id_exports = Settings {
+            steam_id_export_principals: (0..16)
+                .map(|id| (format!("steam-consumer-{id}"), "owner.valid".into()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(steam_id_exports.validate().is_ok());
+        steam_id_exports
+            .steam_id_export_principals
+            .insert("extra".into(), "owner".into());
+        assert!(steam_id_exports.validate().is_err());
+        for (consumer, owner) in [
+            ("", "owner"),
+            ("consumer", "../owner"),
+            ("consumer", ""),
+            ("bad/name", "owner"),
+        ] {
+            let settings = Settings {
+                steam_id_export_principals: [(consumer.into(), owner.into())].into(),
+                ..Default::default()
+            };
+            assert!(settings.validate().is_err());
+        }
 
         let mut imports = Settings {
             import_principals: std::collections::BTreeMap::from([(

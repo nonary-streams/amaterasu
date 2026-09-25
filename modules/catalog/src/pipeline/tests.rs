@@ -1184,8 +1184,9 @@ fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
 
 #[test]
 fn steam_id_export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
         BTreeMap::from([("consumer".into(), "steam-owner".into())]),
         BTreeMap::new(),
     );
@@ -1221,17 +1222,50 @@ fn steam_id_export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
     );
     assert_eq!(backend.revision, 0);
 
+    let export_list_denied = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_list"}),
+        "consumer",
+        "unrelated",
+        "steam-owner",
+    );
+    assert_eq!(export_list_denied["error"]["code"], "permission_denied");
+
+    let generic_export_cannot_export_steam_ids = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_steam_ids"}),
+        "nvhttp",
+        "unrelated",
+        "management",
+    );
+    assert_eq!(
+        generic_export_cannot_export_steam_ids["error"]["code"],
+        "permission_denied"
+    );
+
+    let existing_export_authority_is_unchanged = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_list"}),
+        "nvhttp",
+        "unrelated",
+        "management",
+    );
+    assert_eq!(
+        existing_export_authority_is_unchanged["ok"], true,
+        "the Steam-ID map must not replace existing export_principals"
+    );
+
     let (key, _, _) = pipeline
         .select_catalog(
             "consumer",
-            "steam-owner",
-            Operation::List {
+            "unrelated",
+            Operation::ExportSteamIds {
                 cursor: None,
                 limit: None,
             },
         )
         .unwrap();
-    assert_eq!(key, "principal/consumer");
+    assert_eq!(key, "principal/steam-owner");
 }
 
 #[test]
@@ -1270,8 +1304,9 @@ fn steam_id_export_pages_only_numeric_ids_and_rejects_stale_or_invalid_cursors()
             }
         };
         let initial_state_revision = backend.revision;
-        let mut pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new_with_steam_id_export_principals(
             BTreeSet::new(),
+            BTreeMap::new(),
             BTreeMap::from([("consumer".into(), "steam-owner".into())]),
             BTreeMap::new(),
         );

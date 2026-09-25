@@ -35,9 +35,11 @@ list is limited to 256 unique entries and 12,000 encoded bytes.
 
 When `include_steam` is enabled, Lutris asks `amaterasu.catalog/1` for a
 revision-paged `export_steam_ids` projection. The request contains no owner
-selector; trusted startup policy must authorize Lutris for the catalog owner
-that stores direct Steam rows. The response contains only numeric Steam IDs,
-the catalog revision, and a continuation cursor. Lutris deduplicates repeated
+selector; startup policy must grant the separate
+`steam_id_export_principals` capability from `amaterasu.lutris` to the fixed
+`amaterasu.management` owner that stores direct Steam rows. This capability does
+not grant `export_list`. The response contains only numeric Steam IDs, the
+catalog revision, and a continuation cursor. Lutris deduplicates repeated
 IDs and abandons the scan if a page is malformed, the catalog revision changes,
 or the export is unavailable or exceeds its bounds. Profiles must grant this
 catalog export before the setting can reconcile successfully. A Lutris Steam
