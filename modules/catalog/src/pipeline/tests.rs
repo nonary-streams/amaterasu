@@ -160,16 +160,18 @@ fn entry(name: &str) -> Value {
 }
 
 fn steam_importer() -> Pipeline {
-    Pipeline::new(
+    Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([("steam".into(), "management".into())]),
     )
 }
 
 fn steam_artwork_importer() -> Pipeline {
-    Pipeline::new(
+    Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([("amaterasu.steam".into(), "amaterasu.management".into())]),
     )
@@ -244,16 +246,18 @@ fn run_steam_artwork_snapshot(
 }
 
 fn playnite_importer() -> Pipeline {
-    Pipeline::new(
+    Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([("amaterasu.playnite".into(), "amaterasu.management".into())]),
     )
 }
 
 fn lutris_importer() -> Pipeline {
-    Pipeline::new(
+    Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([("amaterasu.lutris".into(), "amaterasu.management".into())]),
     )
@@ -1097,8 +1101,9 @@ fn cancelled_or_malformed_state_replies_complete_without_stalling() {
 
 #[test]
 fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority() {
-    let pipeline = Pipeline::new(
+    let pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::from(["launch".into()]),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
     );
@@ -1136,9 +1141,10 @@ fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority()
 
 #[test]
 fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
         BTreeMap::from([("consumer".into(), "owner".into())]),
+        BTreeMap::new(),
         BTreeMap::new(),
     );
     let mut backend = Backend::default();
@@ -1387,9 +1393,10 @@ fn steam_id_export_pages_only_numeric_ids_and_rejects_stale_or_invalid_cursors()
 
 #[test]
 fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner() {
-    let pipeline = Pipeline::new(
+    let pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::from(["launch".into()]),
         BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
         BTreeMap::new(),
     );
     let resolve = || Operation::ResolveExportedLaunch {
@@ -1485,9 +1492,10 @@ fn export_pages_are_sanitized_revision_bound_and_read_only() {
             }
         };
         let initial_revision = backend.revision;
-        let mut pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new_with_steam_id_export_principals(
             BTreeSet::new(),
             BTreeMap::from([("consumer".into(), "owner".into())]),
+            BTreeMap::new(),
             BTreeMap::new(),
         );
         let mut cursor = Value::Null;
@@ -3346,8 +3354,9 @@ fn finish_policy_retains_then_cleans_only_unchanged_provider_entries_and_replays
 #[test]
 fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id() {
     let mut backend = Backend::default();
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([
             ("amaterasu.steam".into(), "amaterasu.management".into()),
@@ -3406,8 +3415,9 @@ fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id
 #[test]
 fn steam_runtime_metadata_requires_matching_importer_identity_but_manual_crud_can_set_it() {
     let mut backend = Backend::default();
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
+        BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::from([
             ("amaterasu.steam".into(), "amaterasu.management".into()),

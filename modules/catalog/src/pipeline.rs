@@ -183,19 +183,6 @@ pub struct Pipeline {
     sequence: u64,
 }
 impl Pipeline {
-    pub fn new(
-        launch_principals: BTreeSet<String>,
-        export_principals: BTreeMap<String, String>,
-        import_principals: BTreeMap<String, String>,
-    ) -> Self {
-        Self::new_with_steam_id_export_principals(
-            launch_principals,
-            export_principals,
-            BTreeMap::new(),
-            import_principals,
-        )
-    }
-
     pub fn new_with_steam_id_export_principals(
         launch_principals: BTreeSet<String>,
         export_principals: BTreeMap<String, String>,
