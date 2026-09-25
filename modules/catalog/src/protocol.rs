@@ -15,6 +15,9 @@ pub enum Operation {
     ResolveLaunch {
         id: String,
     },
+    /// Launch uses this authorized, read-only resolution for preflight. Its
+    /// returned entry and revision must be captured together before launch;
+    /// a later catalog read may refer to a different application revision.
     ResolveExportedLaunch {
         id: String,
     },

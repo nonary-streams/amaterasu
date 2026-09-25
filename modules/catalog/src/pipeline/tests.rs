@@ -1625,6 +1625,155 @@ fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner(
 }
 
 #[test]
+fn exported_launch_resolution_returns_sparse_revisioned_preflight_rows() {
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let id = "app-0000000000000001";
+    let mut backend = Backend {
+        revision: 4,
+        metadata: json!({"revision":2,"next_id":2}),
+        entries: BTreeMap::from([(
+            id.into(),
+            json!({
+                "name":"First game",
+                "launch":{"kind":"executable","program":"/games/first"},
+                "config_overrides":{"frame_limiter_enable":false,"frame_limiter_fps_limit":0.0}
+            }),
+        )]),
+        ..Default::default()
+    };
+    let resolve = json!({"action":"resolve_exported_launch","id":id});
+    let first = backend.run_for(
+        &mut pipeline,
+        resolve.clone(),
+        "launch",
+        "nvhttp",
+        "management",
+    );
+    assert_eq!(first["ok"], true);
+    assert_eq!(first["revision"], 2);
+    assert_eq!(first["id"], id);
+    assert_eq!(first["catalog_owner"], "management");
+    assert_eq!(
+        first["entry"]["config_overrides"],
+        json!({
+            "frame_limiter_enable":false,
+            "frame_limiter_fps_limit":0.0
+        })
+    );
+
+    backend.entries.insert(
+        id.into(),
+        json!({
+            "name":"Second game",
+            "launch":{"kind":"executable","program":"/games/second"},
+            "config_overrides":{"frame_limiter_enable":true}
+        }),
+    );
+    backend.metadata["revision"] = json!(3);
+    backend.revision += 1;
+    let second = backend.run_for(&mut pipeline, resolve, "launch", "nvhttp", "management");
+    assert_eq!(second["revision"], 3);
+    assert_eq!(second["entry"]["launch"]["program"], "/games/second");
+    assert_eq!(
+        second["entry"]["config_overrides"],
+        json!({"frame_limiter_enable":true})
+    );
+    assert_eq!(first["entry"]["launch"]["program"], "/games/first");
+    assert_eq!(
+        first["entry"]["config_overrides"]["frame_limiter_enable"],
+        false
+    );
+}
+
+#[test]
+fn exported_launch_resolution_rejects_malformed_stored_frame_limiter() {
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let id = "app-0000000000000001";
+    let mut backend = Backend {
+        revision: 1,
+        metadata: json!({"revision":1,"next_id":2}),
+        entries: BTreeMap::from([(
+            id.into(),
+            json!({
+                "name":"Bad game",
+                "launch":{"kind":"executable","program":"/games/bad"},
+                "config_overrides":{"frame_limiter_enable":"false"}
+            }),
+        )]),
+        ..Default::default()
+    };
+    let result = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_exported_launch","id":id}),
+        "launch",
+        "nvhttp",
+        "management",
+    );
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "invalid_state_response");
+}
+
+#[cfg(windows)]
+#[test]
+fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let id = "app-0000000000000001";
+    let mut backend = Backend {
+        revision: 1,
+        metadata: json!({"revision":1,"next_id":2}),
+        ..Default::default()
+    };
+    for override_value in [
+        json!({}),
+        json!({"rtss_frame_limit_type":null}),
+        json!({"rtss_frame_limit_type":"async"}),
+        json!({"rtss_frame_limit_type":"front edge sync"}),
+        json!({"rtss_frame_limit_type":"back edge sync"}),
+        json!({"rtss_frame_limit_type":"nvidia reflex"}),
+    ] {
+        backend.entries.insert(
+            id.into(),
+            json!({
+                "name":"RTSS game",
+                "launch":{"kind":"executable","program":"C:/games/rtss.exe"},
+                "config_overrides":override_value
+            }),
+        );
+        let result = backend.run_for(
+            &mut pipeline,
+            json!({"action":"resolve_exported_launch","id":id}),
+            "launch",
+            "nvhttp",
+            "management",
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["entry"]["config_overrides"]["rtss_frame_limit_type"],
+            override_value["rtss_frame_limit_type"]
+        );
+        assert_eq!(
+            result["entry"]["config_overrides"].is_null(),
+            override_value["rtss_frame_limit_type"].is_null()
+        );
+    }
+}
+
+#[test]
 fn export_pages_are_sanitized_revision_bound_and_read_only() {
     for legacy in [false, true] {
         let entries: BTreeMap<String, Value> = (1..=70).map(|id| {
