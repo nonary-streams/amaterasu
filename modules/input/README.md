@@ -98,8 +98,10 @@ The live global policy includes `keyboard`, `mouse`, `controller`,
 `ds4_back_as_touchpad_click`, and `native_pen_touch`. Native pen/touch defaults
 to enabled. The input module stores and snapshots this setting, which gates the
 typed native pen/touch event path independently from backend capability.
-Disabling it cancels lease-owned contacts and retains failed cancellations for
-cleanup retry. Setting
+Each active lease keeps its resolved value when global settings change, so an
+update applies to future leases. Release, expiry, failure, and shutdown cancel
+lease-owned contacts; failed cancellations remain owned for cleanup retry.
+Setting
 `controller:false` suppresses controller snapshots and removes active owned
 virtual gamepad slots while leaving keyboard and mouse delivery available. If
 slot removal fails, controller snapshots remain suppressed and slot cleanup is

@@ -2887,7 +2887,16 @@ fn pen_touch_tracks_identity_and_deduplicates_only_identical_moves() {
     );
     let token = acquire(&mut controller, Instant::now());
     let down_touch = pen_touch(5, PenTouchDevice::Touch, PenTouchPhase::Down, 100, 200);
-    let down_pen = pen_touch(5, PenTouchDevice::Pen, PenTouchPhase::Down, 300, 400);
+    let down_pen = Event::PenTouch {
+        pointer_id: 5,
+        device: PenTouchDevice::Pen,
+        phase: PenTouchPhase::Down,
+        x: 300,
+        y: 400,
+        pressure: Some(0.75),
+        tilt_x: Some(-25),
+        tilt_y: Some(60),
+    };
     let repeated_move = pen_touch(5, PenTouchDevice::Touch, PenTouchPhase::Move, 120, 220);
     let events = vec![
         down_touch,
@@ -3016,6 +3025,119 @@ fn pen_touch_limit_is_enforced_and_capability_is_reported_separately_from_policy
 }
 
 #[test]
+fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override() {
+    let mut disabled = Controller::new(
+        FakeBackend {
+            supports_pen_touch: true,
+            ..Default::default()
+        },
+        true,
+    );
+    disabled.set_native_pen_touch(false);
+    let disabled_token = acquire(&mut disabled, Instant::now());
+    let suppressed = batch(
+        &mut disabled,
+        &disabled_token,
+        vec![pen_touch(
+            41,
+            PenTouchDevice::Touch,
+            PenTouchPhase::Down,
+            1,
+            2,
+        )],
+    );
+    assert_eq!(suppressed["ok"], true);
+    assert_eq!(suppressed["suppressed"], 1);
+    assert!(disabled.backend.trace.borrow().is_empty());
+    assert!(disabled.pen_touch_contacts.is_empty());
+    assert_eq!(
+        disabled.status("owner", Instant::now())["lease"]["native_pen_touch"],
+        false
+    );
+    disabled.set_native_pen_touch(true);
+    assert_eq!(
+        batch(
+            &mut disabled,
+            &disabled_token,
+            vec![pen_touch(
+                41,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                1,
+                2,
+            )]
+        )["suppressed"],
+        1
+    );
+    assert!(disabled.backend.trace.borrow().is_empty());
+
+    let mut scoped = Controller::new(
+        FakeBackend {
+            supports_pen_touch: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let acquired = scoped.handle(
+        "owner",
+        Operation::Acquire {
+            operation_id: None,
+            ttl_ms: Some(1000),
+            back_button_timeout: None,
+            controller: None,
+            gamepad: None,
+            ds4_back_as_touchpad_click: None,
+            native_pen_touch: Some(true),
+            keyboard: None,
+            mouse: None,
+            high_resolution_scrolling: None,
+            always_send_scancodes: None,
+            key_rightalt_to_key_win: None,
+            key_repeat_delay: None,
+            key_repeat_frequency: None,
+        },
+        Instant::now(),
+        &mut || Ok(()),
+    );
+    let scoped_token = acquired["lease"].as_str().unwrap();
+    assert_eq!(
+        batch(
+            &mut scoped,
+            scoped_token,
+            vec![pen_touch(
+                42,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                3,
+                4,
+            )]
+        )["ok"],
+        true
+    );
+    scoped.set_native_pen_touch(false);
+    assert_eq!(scoped.native_pen_touch(), false);
+    assert_eq!(scoped.pen_touch_contacts.len(), 1);
+    assert_eq!(
+        batch(
+            &mut scoped,
+            scoped_token,
+            vec![pen_touch(
+                42,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Move,
+                5,
+                6,
+            )]
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        scoped.status("owner", Instant::now())["lease"]["native_pen_touch"],
+        true
+    );
+}
+
+#[test]
 fn failed_pen_touch_down_is_conservatively_cancelled() {
     let mut controller = Controller::new(
         FakeBackend {
@@ -3043,7 +3165,7 @@ fn failed_pen_touch_down_is_conservatively_cancelled() {
 }
 
 #[test]
-fn disabling_pen_touch_retries_only_the_contact_whose_cancel_failed() {
+fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
     let mut controller = Controller::new(
         FakeBackend {
             supports_pen_touch: true,
@@ -3063,8 +3185,16 @@ fn disabling_pen_touch_retries_only_the_contact_whose_cancel_failed() {
         .failed_pen_touch_events
         .push((22, PenTouchPhase::Cancel));
 
-    controller.set_native_pen_touch(false);
-    assert!(!controller.native_pen_touch());
+    let release = controller.handle(
+        "owner",
+        Operation::Release {
+            lease: token.clone(),
+        },
+        Instant::now(),
+        &mut || Ok(()),
+    );
+    assert_eq!(release["ok"], false);
+    assert_eq!(release["error"]["code"], "release_failed");
     assert_eq!(controller.pen_touch_contacts.len(), 1);
     assert_eq!(controller.pen_touch_contacts[0].pointer_id, 22);
     assert!(controller.cleanup_required());

@@ -446,24 +446,13 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn set_native_pen_touch(&mut self, enabled: bool) {
-        let was_enabled = self.effective_native_pen_touch();
         self.native_pen_touch = enabled;
-        if was_enabled
-            && !self.effective_native_pen_touch()
-            && self.cancel_pen_touch_contacts().is_some()
-        {
-            if let Some(lease) = &mut self.lease {
-                lease.cleanup_required = true;
-                lease.termination_reason.get_or_insert("policy_changed");
-            }
-            self.retry_at = Instant::now() + Duration::from_millis(100);
-        }
     }
 
     fn effective_native_pen_touch(&self) -> bool {
         self.lease
             .as_ref()
-            .and_then(|lease| lease.requested_native_pen_touch)
+            .map(|lease| lease.native_pen_touch)
             .unwrap_or(self.native_pen_touch)
     }
 
