@@ -2029,6 +2029,7 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
         json!({"frame_limiter_provider":[]}),
         json!({"frame_limiter_disable_vsync":1}),
         json!({"frame_limiter_auto_virtual_framegen":"invalid"}),
+        json!({"rtss_frame_limit_type":false}),
         json!({"ds4_back_as_touchpad_click":"false"}),
         json!({"unrecognized_override":true}),
     ];
@@ -2061,6 +2062,71 @@ fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values(
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn application_rtss_frame_limit_type_decodes_windows_domain_values() {
+    for frame_limit_type in [
+        "async",
+        "front edge sync",
+        "back edge sync",
+        "nvidia reflex",
+    ] {
+        let payload = json!({
+            "launch": {
+                "config_overrides": {
+                    "rtss_frame_limit_type":frame_limit_type
+                }
+            }
+        });
+        let decoded = super::workflow::application_config_overrides(&payload).unwrap();
+        assert_eq!(
+            decoded
+                .frame_limiter_settings()
+                .rtss_frame_limit_type
+                .as_deref(),
+            Some(frame_limit_type)
+        );
+    }
+
+    let invalid_payload = json!({
+        "launch": {
+            "config_overrides": {
+                "rtss_frame_limit_type":"sync"
+            }
+        }
+    });
+    assert!(super::workflow::application_config_overrides(&invalid_payload).is_err());
+    assert_eq!(
+        FrameLimiterSettings {
+            rtss_frame_limit_type: Some("sync".into()),
+            ..Default::default()
+        }
+        .validate(),
+        Err("invalid_rtss_frame_limit_type")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn application_rtss_frame_limit_type_rejects_windows_domain_values_off_windows() {
+    let payload = json!({
+        "launch": {
+            "config_overrides": {
+                "rtss_frame_limit_type":"async"
+            }
+        }
+    });
+    assert!(super::workflow::application_config_overrides(&payload).is_err());
+    assert_eq!(
+        FrameLimiterSettings {
+            rtss_frame_limit_type: Some("async".into()),
+            ..Default::default()
+        }
+        .validate(),
+        Err("unsupported_frame_limiter_setting")
+    );
+}
+
 #[test]
 fn frame_limiter_fields_resolve_client_then_application_then_global_independently() {
     let global = FrameLimiterSettings {
@@ -2085,6 +2151,7 @@ fn frame_limiter_fields_resolve_client_then_application_then_global_independentl
         frame_limiter_provider: Some("none".into()),
         frame_limiter_disable_vsync: Some(true),
         frame_limiter_auto_virtual_framegen: Some("vrr".into()),
+        ..Default::default()
     };
     let resolved = super::workflow::resolve_frame_limiter_settings(&global, &application, &client);
     assert_eq!(resolved.frame_limiter_enable, Some(false));
@@ -2147,6 +2214,106 @@ fn frame_limiter_fields_resolve_client_then_application_then_global_independentl
     assert_eq!(defaults.frame_limiter_provider, None);
     assert_eq!(defaults.frame_limiter_disable_vsync, None);
     assert_eq!(defaults.frame_limiter_auto_virtual_framegen, None);
+}
+
+#[cfg(windows)]
+#[test]
+fn rtss_frame_limit_type_resolves_client_then_application_then_global_then_default() {
+    let global = FrameLimiterSettings {
+        rtss_frame_limit_type: Some("async".into()),
+        ..Default::default()
+    };
+    let application = FrameLimiterSettings {
+        rtss_frame_limit_type: Some("front edge sync".into()),
+        ..Default::default()
+    };
+    let client = FrameLimiterSettings {
+        rtss_frame_limit_type: Some("nvidia reflex".into()),
+        ..Default::default()
+    };
+
+    let client_resolved =
+        super::workflow::resolve_frame_limiter_settings(&global, &application, &client);
+    assert_eq!(
+        client_resolved.rtss_frame_limit_type.as_deref(),
+        Some("nvidia reflex")
+    );
+
+    let application_resolved = super::workflow::resolve_frame_limiter_settings(
+        &global,
+        &application,
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(
+        application_resolved.rtss_frame_limit_type.as_deref(),
+        Some("front edge sync")
+    );
+
+    let global_resolved = super::workflow::resolve_frame_limiter_settings(
+        &global,
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(
+        global_resolved.rtss_frame_limit_type.as_deref(),
+        Some("async")
+    );
+
+    let defaults = super::workflow::resolve_frame_limiter_settings(
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(defaults.rtss_frame_limit_type, None);
+    assert_eq!(defaults.effective().rtss_frame_limit_type, "async");
+}
+
+#[cfg(windows)]
+#[test]
+fn application_rtss_frame_limit_type_is_exported_in_launch_snapshot() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let global_settings = FrameLimiterSettings {
+        rtss_frame_limit_type: Some("async".into()),
+        ..Default::default()
+    };
+    controller.set_global_frame_limiter_settings(&global_settings);
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "rtss_frame_limit_type":"back edge sync"
+        })),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+
+    let record = controller.records.values().next().expect("launch record");
+    assert_eq!(
+        record
+            .application_frame_limiter_settings
+            .rtss_frame_limit_type
+            .as_deref(),
+        Some("back edge sync")
+    );
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export request");
+    assert_eq!(
+        launch_payload["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"],
+        "back edge sync"
+    );
+    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
 }
 
 #[test]

@@ -759,6 +759,7 @@ pub(super) struct ApplicationConfigOverrides {
     frame_limiter_provider: Option<String>,
     frame_limiter_disable_vsync: Option<bool>,
     frame_limiter_auto_virtual_framegen: Option<String>,
+    rtss_frame_limit_type: Option<String>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
@@ -774,6 +775,7 @@ impl ApplicationConfigOverrides {
             frame_limiter_provider: self.frame_limiter_provider.clone(),
             frame_limiter_disable_vsync: self.frame_limiter_disable_vsync,
             frame_limiter_auto_virtual_framegen: self.frame_limiter_auto_virtual_framegen.clone(),
+            rtss_frame_limit_type: self.rtss_frame_limit_type.clone(),
             ..FrameLimiterSettings::default()
         }
     }
@@ -934,16 +936,11 @@ fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
 }
 
 fn frame_limiter_launch_snapshot(record: &Record) -> Value {
-    let mut settings = resolve_frame_limiter_settings(
+    let settings = resolve_frame_limiter_settings(
         &record.global_frame_limiter_settings,
         &record.application_frame_limiter_settings,
         &record.client_frame_limiter_settings,
     );
-    settings.rtss_frame_limit_type = record
-        .client_frame_limiter_settings
-        .rtss_frame_limit_type
-        .clone()
-        .or(settings.rtss_frame_limit_type);
     let requested_stream_fps_millihz = record
         .request
         .fps
@@ -992,6 +989,11 @@ pub(super) fn resolve_frame_limiter_settings(
         .clone()
         .or(application.frame_limiter_auto_virtual_framegen.clone())
         .or(settings.frame_limiter_auto_virtual_framegen);
+    settings.rtss_frame_limit_type = client
+        .rtss_frame_limit_type
+        .clone()
+        .or(application.rtss_frame_limit_type.clone())
+        .or(settings.rtss_frame_limit_type);
     settings
 }
 
