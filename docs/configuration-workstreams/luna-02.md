@@ -214,3 +214,96 @@ Continue the independent NVHTTP and stream-session candidate work on its assigne
 - `modules/rtsp/README.md` now documents the explicit-family default behavior. Lane `rustfmt --edition 2024 --check modules/rtsp/src/model.rs` and `git diff --check` passed. Cargo tests, builds, and Clippy were not run; platform listener qualification remains pending.
 - Coordinator validation should run `cargo test -p amaterasu-rtsp` and `cargo clippy -p amaterasu-rtsp --all-targets` in the reserved clean source checkout, then qualify IPv4 and IPv6 listener behavior on supported platforms. Both IDs remain pending full NVHTTP/RTSP listener, persistence, management authority, and platform review.
 - The `db14b28e` scoped stream-control candidate remains unlanded until Luna03's independent read-only review is returned, findings are resolved, and coordinator integration tests pass. `modules/pairing/src/migration.rs` was not changed.
+## Effective max-bitrate precedence correction (2026-09-25)
+
+- Stable ID: global:max_bitrate; remains pending full parity review. This
+  correction removes the premature rejection based only on a global cap below
+  100 kbps. The existing effective-cap validation still rejects a selected
+  positive cap below the encoder minimum before RTSP opens.
+- XHigh child commit: 3804271025196509b8631b63acc83e3603fb5046, based on lane
+  bd5baf2db995dfb82acb62e0fb4a3992f31d5b0d. Reviewed lane candidate:
+  be11030282ae9b067c3511819c65037719161b2a. Only
+  modules/nvhttp/src/launch.rs and modules/nvhttp/src/launch/tests.rs are in
+  the code commit. The child persisted CLI session
+  01a0d5f6-7a9d-7342-be4a-b5ee6477c90d confirms gpt-6-luna/xhigh,
+  isolated worktree, and Nonary identity.
+- Focused cases now cover global 99 with client cap, application cap, explicit
+  client no-cap, low effective client cap rejection before RTSP open, and global
+  99 without a scoped override rejection. Lead review confirmed precedence is
+  resolved before the effective-cap minimum check and before RTSP opens.
+- Child rustfmt and git diff --check passed. Lane
+  rustfmt --edition 2024 --check modules/nvhttp/src/launch.rs modules/nvhttp/src/launch/tests.rs
+  and git diff --check passed. Cargo tests/build/Clippy were not run in the
+  lightweight worktree. Coordinator validation should run
+  cargo test -p amaterasu-nvhttp and
+  cargo clippy -p amaterasu-nvhttp --all-targets -- -D warnings.
+- Outbox 0018-bitrate-precedence-p2.json sends source and lane SHAs to the
+  coordinator and Luna03 for independent re-review. Keep the scoped stream
+  candidate db14b28e unlanded until Luna03's review findings are resolved and
+  coordinator integration tests pass.
+- The previously dirty launch projection/frame-limiter hunks were path-stashed
+  during cherry-pick and restored without conflicts. All remaining dirty NVHTTP,
+  pairing, RTSP, and stream-session edits remain uncommitted and preserved.
+
+## Listener target apply and retry candidate (2026-09-25)
+
+- Stable IDs: `global:address_family`, `global:bind_address`, and `global:port`; all remain pending full parity review. This candidate adds runtime application/retry logic for the complete persisted HTTP/HTTPS target. It wakes on any resolved-address change, preserves the active listener pair after a failed bind, and completes the apply only after RTSP confirms the same target.
+- Isolated XHigh source commit: `88705593e615b14b8cf1f9d9b6cbf285d6e2a9dc`, based on lane SHA `ce99275ce422a60408aa1f6ef3af891592e5066a`. Reviewed lane commit: `620f93a23120f9ec57d968e8b347c792f5b34199`.
+- Code commit path: `modules/nvhttp/src/lib.rs`. Worker CLI thread `01a0d605-fc13-70b0-80c9-923c6c67e5dd`; persisted startup and resumed turn contexts confirm `gpt-6-luna/xhigh`, isolated worktree, and clean base. The lead reviewed the source diff and cherry-picked the source commit without changing its code.
+- Focused cases in the candidate cover IPv4 and dual-stack target derivation, invalid or occupied-bind failure retaining the listener pair, and retry success. Existing NVHTTP and RTSP endpoint owners perform the actual bind and target confirmation; the candidate does not qualify cross-platform behavior.
+- Lane checks: `rustfmt --edition 2024 --check modules/nvhttp/src/lib.rs` and `git diff --check` passed. The entire remaining dirty Rust set also passes `rustfmt --edition 2024 --check`; its edits remain uncommitted. Cargo tests/build/Clippy were not run in this lightweight worktree. Coordinator validation should run `cargo test -p amaterasu-nvhttp` and `cargo clippy -p amaterasu-nvhttp --all-targets -- -D warnings`, then qualify IPv4/IPv6 listener rebind and occupied-bind recovery on supported platforms.
+- Persistence, management edit authority/UI, and supported-platform behavior are still outstanding for these IDs. Do not mark them verified. Outbox `0021-nvhttp-port-rebind.json` sends the exact source and lane SHAs to the coordinator.
+- The `db14b28e` scoped stream-control candidate remains unlanded pending Luna03's independent review, resolution of findings, and coordinator integration tests.
+
+## Bitrate candidate integration dependency (2026-09-25)
+
+- Coordinator inbox `coordinator-bitrate-candidate-rework.json` reports that main cherry-picked `be110302` without its parent feature support, the focused NVHTTP tests failed to compile because `peer_with_stream_overrides` and `Broker.application_max_bitrate` were absent, and that main reverted the attempt as `ca36e432`.
+- The XHigh P2 source commit `3804271025196509b8631b63acc83e3603fb5046` is based on `bd5baf2db995dfb82acb62e0fb4a3992f31d5b0d`, which contains scoped client/application bitrate support and its peer/broker fixtures from `db14b28e5b0d1da50382f02b02052c4ebc67feb4`. Lane P2 commit `be11030282ae9b067c3511819c65037719161b2a` changes only `modules/nvhttp/src/launch.rs` and `modules/nvhttp/src/launch/tests.rs`.
+- Do not apply `be110302` alone to main. The proposed integration order is `db14b28e` (the scoped-control dependency and fixtures), followed by `be110302` (the effective-cap validation correction). Validate the combined final tree after both commits; do not land the first commit while its reviewed P2 finding remains unresolved. The exact child/lane commits and required package checks are sent in outbox `0022-bitrate-dependency-sequence.json`.
+- Luna03's immutable review of `db14b28e` found only the P2 bitrate issue. Its separate XHigh rereview of `be110302` found no behavioral findings. Coordinator compile/test validation of the ordered candidate is still required, so `global:max_bitrate` remains pending and the `db14b28e` candidate remains unlanded.
+
+## RTSP ANNOUNCE encryption snapshot to PLAY (2026-09-25)
+
+- Related stable IDs: `global:lan_encryption_mode` and `global:wan_encryption_mode`; both remain pending. This runtime handoff preserves the exact video/audio encryption booleans from an accepted ANNOUNCE through the later authenticated PLAY start. It does not select LAN/WAN policy, change media/audio policy, or add settings persistence.
+- Lane base: `5e7f5a56813481fcf8ca2f5a9f4c781fb83db7d7`. The isolated XHigh RTSP source commit is `8bd5da26d79a7d5f9976752c00137ce486976f8a`, based on child HEAD `2d2ef8a44abfc4dd06ee89aaf64ba1ac992d8460`; reviewed lane cherry-pick: `c30b409253564602f07fa5f3a2b3b4857a96b2f6`. The lead-owned stream-session consumer commit is `8f45871b5365ad4a7548a92c24c75870567815e4`, based on lane commit `c30b409253564602f07fa5f3a2b3b4857a96b2f6`. Current code candidate: `8f45871b5365ad4a7548a92c24c75870567815e4`.
+- Changed paths across the two code commits: `modules/rtsp/src/model.rs`, `modules/rtsp/src/controller/actions.rs`, `modules/rtsp/src/controller/record.rs`, `modules/rtsp/src/controller/network.rs`, `modules/rtsp/src/controller/tests.rs`, `modules/stream-session/src/model.rs`, `modules/stream-session/src/pipeline/actions.rs`, and `modules/stream-session/src/pipeline/tests/armed.rs`.
+- The RTSP record retains flags only after the configured profile accepts ANNOUNCE; PLAY fails closed if that snapshot is absent and otherwise sends `configuration.encrypt_video` and `configuration.encrypt_audio`. Legacy `Open::arm` payloads remain unchanged. Strict stream-session `StartConfig` now accepts these fields optionally for older callers and rejects a provided value that differs from the immutable prepared encryption policy.
+- Integration must apply the stream-session consumer commit `8f45871b5365ad4a7548a92c24c75870567815e4` before the RTSP producer commit `c30b409253564602f07fa5f3a2b3b4857a96b2f6`, then validate the combined tree. Both commits must be present before landing this feature.
+- RTSP worker CLI thread `01a0d646-f94e-74a0-b638-d05a0b2d6d72` persisted `gpt-6-luna/xhigh`; its isolated worktree was clean at base and after commit. The lead's StartConfig contract change and test were completed in the lane's `gpt-6-luna/max` session `01a0d516-8616-7270-a509-547be018f212`. The worker changed only the five RTSP paths listed above.
+- Focused tests cover accepted ANNOUNCE values flowing to the authenticated start payload, rejection clearing a stale snapshot and preventing that payload, backward-compatible legacy `Open::arm`, matching false/false StartConfig values, and mismatch rejection before arming. Tests were added but not run in this lightweight worktree. Rustfmt and `git diff --check` passed. Cargo tests/build/Clippy and supported-platform qualification were not run.
+- Coordinator integration checks: `cargo test -p amaterasu-rtsp`, `cargo clippy -p amaterasu-rtsp --all-targets -- -D warnings`, `cargo test -p amaterasu-stream-session`, and `cargo clippy -p amaterasu-stream-session --all-targets -- -D warnings`. Runtime platform qualification remains outstanding.
+- Remaining parity work for the two IDs includes persisted mode defaults/validation under the reserved NVHTTP v17 batch, selecting the LAN/WAN policy for each peer, enforcing policy support during negotiation while preserving current audio handling, and the signed management editor contract. These IDs are not verified by this slice. The existing `db14b28e` scoped stream-control candidate remains unlanded pending Luna03's independent review and coordinator integration tests. `modules/pairing/src/migration.rs` was not changed.
+
+### Next slice
+
+Continue the reserved NVHTTP v17 work using the coordinated field names and default contracts. Keep the stream-control dependency sequence and all remaining dirty frame-limiter, preparation, and DS4 work separated into independently reviewable commits.
+
+## Pairing video batch-size semantic-validation correction (2026-09-25)
+
+- Coordinator request `coordinator-luna02-pairing-override-test-fix-20260925` identified a failing pairing test that expected JSON deserialization to reject numeric `video_max_batch_size_kb=65`. This value deserializes into the field type; the configuration's semantic `validate()` rejects it.
+- Isolated XHigh source commit: `2eb939dd4743bc6b185da1685ed0110db016251c`, based on lane HEAD `23355612bde78e19234d9ca6b1182e3f11508d7a`. Reviewed lane cherry-pick: `2d90b0319da825fcebf6718ca5b67b0e3b576294`. Only `modules/pairing/src/protocol.rs` changed. The test now parses `65` and asserts validation rejects it; wrong-type and signed bitrate-overflow deserialization checks remain.
+- Worker CLI session `01a0d65d-d6a5-78a3-8c76-2a02f90181ee` persisted `gpt-6-luna/xhigh`, isolated worktree `D:/sources/worktrees/amaterasu-config-network-xhigh-pairing-override-test-child`, clean base `23355612bde78e19234d9ca6b1182e3f11508d7a`. Commit uses configured Nonary identity and required orchestration/planning footers.
+- Worker checks `rustfmt --edition 2024 --check modules/pairing/src/protocol.rs` and `git diff --check` passed; the lane repeated both checks after cherry-pick and restoring the pre-existing frame-limiter override edits. Cargo tests/build/Clippy were not run in this lightweight worktree. `modules/pairing/src/migration.rs` was not changed.
+- Coordinator validation: rerun `cargo test -p amaterasu-pairing` and `cargo clippy -p amaterasu-pairing --all-targets -- -D warnings` in the reserved clean source checkout, then continue the previously coordinated combined candidate checks as applicable. The test correction is ready for integration validation; no stable ID is marked verified here.
+- The `db14b28e` scoped stream-control candidate remains unlanded pending the Luna03 read-only review resolution and coordinator integration validation. Existing dirty NVHTTP, pairing protocol frame-limiter, RTSP, and stream-session work remains preserved and uncommitted.
+## LAN/WAN video-encryption ANNOUNCE policy helper (2026-09-25)
+
+- Stable IDs `global:lan_encryption_mode` and `global:wan_encryption_mode` remain pending. This bounded GameStream slice validates the client's parsed ANNOUNCE video-encryption choice against a selected mode: never accepts only unencrypted, opportunistic accepts either choice, and mandatory accepts only encrypted video. It does not change audio negotiation or select the peer mode at runtime.
+- Isolated XHigh source commit: `e9f367414f855172721bb566f359fabac74898fb`, based on `4416a5a645a4e6e3c2548103b14c82c575e18481`. Independent read-only XHigh review session `01a0d672-1bd6-7f21-95d2-3b755871eb0c` reported no findings. Reviewed lane cherry-pick: `cbcb00ffb7c703a09f04a01a34342bcb97aeaa84`. Only `crates/gamestream/src/network.rs` changed.
+- Child and lane `rustfmt --edition 2024 --check crates/gamestream/src/network.rs` and `git diff --check` passed. Cargo tests/build/Clippy and platform runtime qualification were not run in this lightweight worktree.
+- The coordinator's later decision `coordinator-v17-combined-batch-decision-01` reserves exactly one NVHTTP v16-to-v17 migration for frame-limiter globals and raw global preparation; `coordinator-nvhttp-v17-reservation-confirmation-20260924-01` also explicitly includes LAN/WAN encryption modes in that same migration. This supersedes the earlier v18 request in outbox `0010`; do not allocate or implement a separate v18 migration. The current dirty v17 settings candidate has not yet added encryption persistence.
+- Remaining work: persist validated LAN/WAN modes with defaults 0/1 in the reserved v17 document; resolve LAN/WAN mode for the authenticated peer; apply this helper during RTSP ANNOUNCE matching; retain ANNOUNCE's selected video/audio booleans through PLAY and media startup; and coordinate the signed editor. IDs remain pending. The separate `db14b28e` scoped stream-control candidate remains unlanded until Luna03's independent review issue is resolved and coordinator integration checks pass. Existing dirty NVHTTP, pairing, RTSP, and stream-session changes remain preserved; `modules/pairing/src/migration.rs` remains untouched.
+
+## Stream-session encryption-status test fixture correction (2026-09-25)
+
+- Coordinator request `coordinator-stream-encryption-test-fixture-failure-20260925` reported that the test prepares video and audio encryption as false, so the media-open request carries `encryption: null`; the test broker indexed that null object and returned null status fields. The media status contract requires explicit booleans.
+- Stable IDs related to this test: `global:lan_encryption_mode` and `global:wan_encryption_mode`; both remain pending. This slice changes only the test mock and does not change production behavior or weaken the immutable encryption mismatch guard.
+- Isolated XHigh source commit: `b2f762e9bd985c529a7e2ccfc45ca4c9ccab029d`, based on lane SHA `397a068be58c015fd1da2dfc6f7194ed58ff73f7`. Reviewed lane cherry-pick: `0b2993014c3ccc3fad121c23b71cfd3c5952792f`.
+- Only changed path: `modules/stream-session/src/pipeline/tests/harness.rs`. The mock now converts each optional encryption status to a boolean and defaults absent/null values to false. The existing matching/mismatch test in `pipeline/tests/armed.rs` is unchanged.
+- Worker CLI session `01a0d67d-9a7a-7f72-9b1c-1cf0701b81f0` persisted `gpt-6-luna/xhigh`; process cwd and Git root were verified as the isolated worktree `D:/sources/worktrees/amaterasu-stream-session-fixture-xhigh-verified`, branch `codex/luna02-stream-session-fixture-xhigh-verified`, clean at base and after commit. Configured Nonary identity and required orchestration/planning commit footers were verified.
+- Worker and lane `rustfmt --edition 2024 --check modules/stream-session/src/pipeline/tests/harness.rs` and `git diff --check` passed. Cargo tests/build/Clippy were not run in this lightweight worktree. Coordinator validation requested: `cargo test -p amaterasu-stream-session`, `cargo test -p amaterasu-rtsp`, and `cargo clippy -p amaterasu-stream-session -p amaterasu-rtsp --all-targets -- -D warnings` in the reserved clean source checkout. No platform runtime qualification was run.
+- This exact fixture correction is ready for coordinator cherry-pick and integration validation. Keep the encryption IDs pending. The `db14b28e` scoped stream-control candidate remains unlanded pending Luna03's independent review resolution and coordinator integration tests. Existing dirty NVHTTP, pairing-protocol, RTSP, and stream-session work is preserved; `modules/pairing/src/migration.rs` remains untouched.
+
+### Next slice
+
+Continue an independent network-owned RTSP/media runtime slice while the coordinator validates this fixture and the NVHTTP v17 dependencies remain coordinated.
