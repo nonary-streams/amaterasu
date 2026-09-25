@@ -60,6 +60,8 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         "focus_timeout_secs":45,
         "focus_exit_on_first":true,
         "fullscreen_entry_enabled":true,
+        "sync_plugins":["included-plugin","second-plugin"],
+        "exclude_plugins":["blocked-plugin"],
         "expected_revision":3
     }))
     .unwrap();
@@ -69,6 +71,8 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         focus_timeout_secs,
         focus_exit_on_first,
         fullscreen_entry_enabled,
+        sync_plugins,
+        exclude_plugins,
         ..
     } = action
     else {
@@ -78,6 +82,11 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     assert_eq!(focus_timeout_secs, Some(45));
     assert_eq!(focus_exit_on_first, Some(true));
     assert_eq!(fullscreen_entry_enabled, Some(true));
+    assert_eq!(
+        sync_plugins,
+        Some(vec!["included-plugin".into(), "second-plugin".into()])
+    );
+    assert_eq!(exclude_plugins, Some(vec!["blocked-plugin".into()]));
 
     let legacy_update: Action = serde_json::from_value(json!({
         "action":"settings_update",
@@ -91,6 +100,8 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
         focus_timeout_secs,
         focus_exit_on_first,
         fullscreen_entry_enabled,
+        sync_plugins,
+        exclude_plugins,
         ..
     } = legacy_update
     else {
@@ -101,6 +112,8 @@ fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     assert_eq!(focus_timeout_secs, None);
     assert_eq!(focus_exit_on_first, None);
     assert_eq!(fullscreen_entry_enabled, None);
+    assert_eq!(sync_plugins, None);
+    assert_eq!(exclude_plugins, None);
 
     assert!(
         serde_json::from_value::<Action>(json!({

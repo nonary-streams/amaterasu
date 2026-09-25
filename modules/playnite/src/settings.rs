@@ -116,11 +116,11 @@ impl ProductSettings {
         {
             return Err("Playnite numeric settings exceed their supported bounds");
         }
-        validate_filter_values(&self.sync_categories, "category")?;
-        validate_filter_values(&self.exclude_categories, "category")?;
-        validate_filter_values(&self.sync_plugins, "plugin ID")?;
-        validate_filter_values(&self.exclude_plugins, "plugin ID")?;
-        validate_filter_values(&self.exclude_games, "game ID")?;
+        validate_filter_values(&self.sync_categories, "category", true)?;
+        validate_filter_values(&self.exclude_categories, "category", true)?;
+        validate_filter_values(&self.sync_plugins, "plugin ID", false)?;
+        validate_filter_values(&self.exclude_plugins, "plugin ID", false)?;
+        validate_filter_values(&self.exclude_games, "game ID", true)?;
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > MAX_SETTINGS_BYTES) {
             return Err("Playnite product settings exceed the 12000 byte limit");
         }
@@ -192,7 +192,11 @@ impl ProductSettings {
     }
 }
 
-fn validate_filter_values(values: &[String], label: &'static str) -> Result<(), &'static str> {
+fn validate_filter_values(
+    values: &[String],
+    label: &'static str,
+    require_unique: bool,
+) -> Result<(), &'static str> {
     if values.len() > MAX_FILTERS {
         return Err("Playnite filter list exceeds 256 entries");
     }
@@ -202,11 +206,11 @@ fn validate_filter_values(values: &[String], label: &'static str) -> Result<(), 
         if value.trim().is_empty()
             || value.len() > MAX_FILTER_BYTES
             || value.chars().any(char::is_control)
-            || !unique.insert(normalized)
+            || (require_unique && !unique.insert(normalized))
         {
             return Err(match label {
                 "category" => "category filters must be unique nonempty text of at most 512 bytes",
-                "plugin ID" => "plugin filters must be unique nonempty text of at most 512 bytes",
+                "plugin ID" => "plugin filters must be nonempty text of at most 512 bytes",
                 _ => "game filters must be unique nonempty text of at most 512 bytes",
             });
         }
@@ -233,6 +237,8 @@ mod tests {
         assert_eq!(settings.focus_timeout_secs, 15);
         assert!(!settings.focus_exit_on_first);
         assert!(!settings.fullscreen_entry_enabled);
+        assert!(settings.sync_plugins.is_empty());
+        assert!(settings.exclude_plugins.is_empty());
     }
 
     #[test]
@@ -240,6 +246,8 @@ mod tests {
         let settings = ProductSettings {
             enabled: true,
             sync_categories: vec!["Arcade".into()],
+            sync_plugins: vec!["plugin-id".into(), "PLUGIN-ID".into()],
+            exclude_plugins: vec!["excluded-id".into(), "EXCLUDED-ID".into()],
             ..ProductSettings::default()
         };
         let payload = json!({
@@ -279,6 +287,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("fullscreen_entry_enabled");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("sync_plugins");
+        legacy_values
+            .as_object_mut()
+            .unwrap()
+            .remove("exclude_plugins");
         assert!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":true,"version":1,"revision":6,
@@ -300,6 +316,8 @@ mod tests {
         assert_eq!(old_settings.focus_timeout_secs, 15);
         assert!(!old_settings.focus_exit_on_first);
         assert!(!old_settings.fullscreen_entry_enabled);
+        assert!(old_settings.sync_plugins.is_empty());
+        assert!(old_settings.exclude_plugins.is_empty());
         assert_eq!(
             ProductSettings::from_product_document(&json!({
                 "ok":true,"found":false,"version":null,"revision":0,"values":{}
@@ -320,7 +338,11 @@ mod tests {
 
     #[test]
     fn product_update_uses_complete_versioned_values() {
-        let settings = ProductSettings::default();
+        let settings = ProductSettings {
+            sync_plugins: vec!["included-plugin".into()],
+            exclude_plugins: vec!["excluded-plugin".into()],
+            ..ProductSettings::default()
+        };
         assert_eq!(
             settings.product_update_payload(3),
             json!({"action":"product_update","expected_revision":3,"version":1,"values":settings})
@@ -425,6 +447,31 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_filters_preserve_reference_duplicate_acceptance() {
+        assert!(
+            ProductSettings {
+                sync_plugins: vec!["Platform.Plugin".into(), "platform.plugin".into()],
+                exclude_plugins: vec!["Platform.Plugin".into(), "platform.plugin".into()],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn plugin_filter_validation_message_does_not_claim_uniqueness() {
+        assert_eq!(
+            ProductSettings {
+                sync_plugins: vec![String::new()],
+                ..ProductSettings::default()
+            }
+            .validate(),
+            Err("plugin filters must be nonempty text of at most 512 bytes")
         );
     }
 
