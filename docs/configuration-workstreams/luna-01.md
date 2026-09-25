@@ -251,3 +251,9 @@ The isolated lightweight child worktree was `D:/sources/worktrees/amaterasu-auth
 Regression cases cover Windows case-insensitive existing-file aliases importing as one candidate, distinct case-sensitive Unix paths remaining conflicting, and differently spelled missing aliases remaining conflicting. Rustfmt and `rustfmt --edition 2024 --check modules/authentication/src/migration.rs`, `git diff --check`, and `git show --check` passed in the child and lane. No Cargo tests, builds, or Clippy ran in the lightweight worktrees. No Windows or Unix test execution is claimed; coordinator source-checkout validation is required.
 
 All seven assigned IDs remain `pending`; this slice does not close `global:file_state`. Remaining work includes the signed management editor and authorization, broader state migration/runtime behavior, platform execution, and integrated end-to-end validation. The next slice should use a separate pending L01-owned ID and exact paths after this candidate is reviewed by the coordinator, without touching current L06/L02-owned consumers or Luna05-reserved release profile files.
+
+### Coordinator validation on main
+
+- Lane code candidate `f99de6d565355156bc2d1f44d9d46ba5dde3862f` landed as `dc2b8532`; its handoff landed as `821bf252`, with main's cumulative notes preserved.
+- `cargo fmt --check -p amaterasu-authentication` passed; `cargo test -p amaterasu-authentication` passed 42/42, including the Windows case-insensitive file-state alias regression; strict Clippy passed.
+- The Unix case-sensitive regression still needs execution on a Unix runner. Broader migration, signed editor, and runtime qualification remain pending; no stable ID is closed.
