@@ -273,8 +273,16 @@ impl ManagedModule for NvhttpModule {
             router.set_audio_sink_settings(self.product_settings.configured_audio_sink());
             router.set_virtual_sink_settings(self.product_settings.configured_virtual_sink());
             router.set_global_preparation(self.product_settings.global_preparation());
+            router.set_legacy_global_preparation(self.product_settings.legacy_global_preparation());
+            router.set_global_frame_limiter_settings(
+                self.product_settings.configured_frame_limiter(),
+            );
             router.set_audio_sink_capture_only(self.product_settings.audio_sink_capture_only());
             router.set_global_stream_audio(self.product_settings.stream_audio());
+            router.set_global_video_encryption_modes(
+                self.product_settings.lan_encryption_mode(),
+                self.product_settings.wan_encryption_mode(),
+            );
             router.set_global_ping_timeout_ms(self.product_settings.effective_ping_timeout_ms());
             router.set_capture_mode(self.product_settings.configured_capture());
             router.set_global_video_max_batch_size_kb(

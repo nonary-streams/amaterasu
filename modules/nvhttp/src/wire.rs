@@ -174,12 +174,31 @@ impl Router {
         self.launches.set_global_preparation(preparation);
     }
 
+    pub fn set_legacy_global_preparation(
+        &mut self,
+        preparation: &[crate::preparation::LegacyPreparationStep],
+    ) {
+        self.launches.set_legacy_global_preparation(preparation);
+    }
+
+    pub fn set_global_frame_limiter_settings(
+        &mut self,
+        settings: &crate::frame_limiter::FrameLimiterSettings,
+    ) {
+        self.launches.set_global_frame_limiter_settings(settings);
+    }
+
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
         self.launches.set_audio_sink_capture_only(enabled);
     }
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.launches.set_global_stream_audio(stream_audio);
+    }
+
+    pub fn set_global_video_encryption_modes(&mut self, lan_mode: u8, wan_mode: u8) {
+        self.launches
+            .set_global_video_encryption_modes(lan_mode, wan_mode);
     }
 
     pub fn set_global_ping_timeout_ms(&mut self, ping_timeout_ms: u32) {
@@ -565,11 +584,18 @@ pub(super) struct ClientConfigOverrides {
     pub(super) gamepad: Option<String>,
     pub(super) keyboard: Option<bool>,
     pub(super) mouse: Option<bool>,
+    pub(super) native_pen_touch: Option<bool>,
     pub(super) high_resolution_scrolling: Option<bool>,
     pub(super) always_send_scancodes: Option<bool>,
     pub(super) key_rightalt_to_key_win: Option<bool>,
     pub(super) key_repeat_delay: Option<u32>,
     pub(super) key_repeat_frequency: Option<f64>,
+    pub(super) frame_limiter_enable: Option<bool>,
+    pub(super) frame_limiter_fps_limit: Option<f64>,
+    pub(super) frame_limiter_provider: Option<String>,
+    pub(super) frame_limiter_disable_vsync: Option<bool>,
+    pub(super) frame_limiter_auto_virtual_framegen: Option<String>,
+    pub(super) rtss_frame_limit_type: Option<String>,
 }
 
 #[cfg(test)]

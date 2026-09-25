@@ -38,6 +38,27 @@ fn configured_ping_timeout_reaches_media_discovery_and_control() {
 }
 
 #[test]
+fn video_encryption_policy_snapshot_reaches_media_open() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["video_encryption_policy"] = json!({"lan_mode":2,"wan_mode":0});
+    let prepared = host.response(1, request);
+    assert_eq!(prepared["state"], "prepared");
+
+    let media_open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Media.service() && call.payload["action"] == "open")
+        .expect("media open request");
+    assert_eq!(media_open.payload["peer_ip"], "127.0.0.1");
+    assert_eq!(
+        media_open.payload["video_encryption_policy"],
+        json!({"lan_mode":2,"wan_mode":0})
+    );
+}
+
+#[test]
 fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());
@@ -67,7 +88,6 @@ fn prepare_start_stop_uses_actual_packet_size_and_canonical_shared_leases() {
         })
         .expect("audio capture open");
     assert_eq!(audio_open.payload["host_audio_enabled"], false);
-    assert!(audio_open.payload.get("continuous_audio").is_none());
     assert_eq!(
         record.audio_endpoint.as_deref(),
         Some("resolved-canonical-endpoint")
@@ -133,17 +153,25 @@ fn host_audio_policy_snapshot_reaches_audio_capture_open() {
 }
 
 #[test]
-fn continuous_audio_open_is_opt_in_and_uses_the_prepared_packet_duration() {
-    for packet_ms in [5, 10] {
+fn continuous_audio_open_uses_prepared_packet_duration_and_stays_opt_in() {
+    for (setting, packet_ms) in [
+        (None, 10),
+        (Some(false), 5),
+        (Some(true), 5),
+        (Some(true), 10),
+    ] {
         let mut host = Harness::new();
         let mut prepare_request = prepare();
-        prepare_request["audio"] = json!({"packet_ms": packet_ms});
-        let prepared = host.response(1, prepare_request);
-        let id = prepared["session"].as_u64().unwrap();
-        let mut request = start(id);
-        request["configuration"]["continuous_audio"] = json!(true);
+        prepare_request["audio"] = json!({"packet_ms":packet_ms,"bitrate":128000});
+        let id = host.response(1, prepare_request)["session"]
+            .as_u64()
+            .unwrap();
+        let mut start_request = start(id);
+        if let Some(enabled) = setting {
+            start_request["configuration"]["continuous_audio"] = json!(enabled);
+        }
 
-        assert_eq!(host.response(2, request)["state"], "active");
+        assert_eq!(host.response(2, start_request)["state"], "active");
         let audio_open = host
             .broker
             .calls
@@ -151,28 +179,31 @@ fn continuous_audio_open_is_opt_in_and_uses_the_prepared_packet_duration() {
             .find(|call| {
                 call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
             })
-            .expect("continuous audio capture open");
-        assert_eq!(
-            audio_open.payload["continuous_audio"]["packet_ms"],
-            packet_ms
-        );
+            .expect("audio capture open");
+        if setting == Some(true) {
+            assert_eq!(
+                audio_open.payload["continuous_audio"],
+                json!({"packet_ms":packet_ms})
+            );
+        } else {
+            assert!(audio_open.payload.get("continuous_audio").is_none());
+        }
     }
 }
 
 #[test]
-fn continuous_audio_is_rejected_when_prepared_stream_audio_is_disabled() {
+fn continuous_audio_is_rejected_when_the_prepared_stream_disables_audio() {
     let mut host = Harness::new();
     let mut prepare_request = prepare();
     prepare_request["stream_audio"] = json!(false);
-    let prepared = host.response(1, prepare_request);
-    let id = prepared["session"].as_u64().unwrap();
-    let mut request = start(id);
-    request["configuration"]["continuous_audio"] = json!(true);
+    let id = host.response(1, prepare_request)["session"]
+        .as_u64()
+        .unwrap();
+    let mut start_request = start(id);
+    start_request["configuration"]["continuous_audio"] = json!(true);
 
-    assert_eq!(
-        host.response(2, request)["code"],
-        "continuous_audio_requires_stream_audio"
-    );
+    let reply = host.response(2, start_request);
+    assert_eq!(reply["code"], "continuous_audio_requires_stream_audio");
     assert!(
         host.broker
             .calls

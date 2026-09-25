@@ -84,6 +84,7 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     start_request["configuration"]["key_rightalt_to_key_win"] = json!(true);
     start_request["configuration"]["key_repeat_delay"] = json!(0);
     start_request["configuration"]["key_repeat_frequency"] = json!(0.0);
+    start_request["configuration"]["ds4_back_as_touchpad_click"] = json!(true);
 
     assert_eq!(host.response(2, start_request)["state"], "active");
     let acquire = host
@@ -102,6 +103,91 @@ fn stream_start_snapshots_scoped_input_policy_into_input_acquire() {
     assert_eq!(acquire.payload["key_rightalt_to_key_win"], true);
     assert_eq!(acquire.payload["key_repeat_delay"], 0);
     assert_eq!(acquire.payload["key_repeat_frequency"], 0.0);
+    assert_eq!(acquire.payload["ds4_back_as_touchpad_click"], true);
+}
+
+#[test]
+fn native_pen_touch_acquire_preserves_explicit_values_and_none() {
+    for selected in [None, Some(false), Some(true)] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let mut start_request = start(id);
+        if let Some(enabled) = selected {
+            start_request["configuration"]["native_pen_touch"] = json!(enabled);
+        }
+
+        assert_eq!(host.response(2, start_request)["state"], "active");
+        let acquire = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "acquire")
+            .expect("input lease acquisition");
+        assert_eq!(acquire.payload["native_pen_touch"], json!(selected));
+    }
+}
+
+#[test]
+fn explicit_ds4_profiles_preserve_touchpad_click_option_values() {
+    let mut profiles = Vec::new();
+    #[cfg(any(windows, target_os = "linux"))]
+    profiles.push("ds4");
+    #[cfg(windows)]
+    profiles.push("vhf_ds4");
+
+    for profile in profiles {
+        for setting in [Some(true), Some(false), None] {
+            let mut host = Harness::new();
+            enable_input(&mut host);
+            let id = host.response(1, prepare())["session"].as_u64().unwrap();
+            let mut start_request = start(id);
+            start_request["configuration"]["gamepad"] = json!(profile);
+            if let Some(value) = setting {
+                start_request["configuration"]["ds4_back_as_touchpad_click"] = json!(value);
+            }
+
+            assert_eq!(host.response(2, start_request)["state"], "active");
+            let acquire = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.input/1" && call.payload["action"] == "acquire"
+                })
+                .expect("input lease acquisition");
+            match setting {
+                Some(value) => {
+                    assert_eq!(
+                        acquire.payload.get("ds4_back_as_touchpad_click"),
+                        Some(&json!(value))
+                    );
+                }
+                None => assert!(acquire.payload.get("ds4_back_as_touchpad_click").is_none()),
+            }
+        }
+    }
+}
+
+#[test]
+fn input_policy_override_is_forwarded_for_implicitly_selected_gamepad() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut start_request = start(id);
+    start_request["configuration"]["ds4_back_as_touchpad_click"] = json!(false);
+
+    assert_eq!(host.response(2, start_request)["state"], "active");
+    let acquire = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "acquire")
+        .expect("input lease acquisition");
+    assert_eq!(
+        acquire.payload.get("ds4_back_as_touchpad_click"),
+        Some(&json!(false))
+    );
 }
 
 fn controller_packet(sequence: u64) -> crate::plane::ControlRecord {

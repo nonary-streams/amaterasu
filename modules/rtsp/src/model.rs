@@ -413,11 +413,20 @@ impl Profile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoEncryptionPolicySnapshot {
+    pub lan_mode: i64,
+    pub wan_mode: i64,
+}
+
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
     pub peer_ip: IpAddr,
+    #[serde(default)]
+    pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     #[serde(default)]
@@ -433,8 +442,8 @@ pub struct Open {
     pub ping_timeout_ms: u32,
     #[serde(default = "default_stream_audio")]
     pub stream_audio: bool,
-    #[serde(default)]
-    pub continuous_audio: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous_audio: Option<bool>,
     #[serde(default = "default_minimum_fps_target")]
     pub minimum_fps_target: f64,
     #[serde(default = "default_wgc_pacing_smoothing")]
@@ -447,6 +456,18 @@ pub struct Open {
     pub channels: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back_button_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamepad: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ds4_back_as_touchpad_click: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_pen_touch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_resolution_scrolling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,7 +489,7 @@ impl Open {
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
-        if self.continuous_audio && !self.stream_audio {
+        if self.continuous_audio == Some(true) && !self.stream_audio {
             return Err("continuous_audio_requires_stream_audio");
         }
         self.validate_operation_id()?;
@@ -620,11 +641,17 @@ impl Open {
             payload["control_bind"] = serde_json::json!(binds.control);
             payload["audio_bind"] = serde_json::json!(binds.audio);
         }
+        if let Some(policy) = self.video_encryption_policy {
+            payload["video_encryption_policy"] = serde_json::json!({
+                "lan_mode": policy.lan_mode,
+                "wan_mode": policy.wan_mode,
+            });
+        }
         payload
     }
 
     pub fn arm(&self, session: u64) -> serde_json::Value {
-        let mut payload = serde_json::json!({
+        serde_json::json!({
             "action": "start_when_authenticated",
             "session": session,
             "configuration": {
@@ -640,6 +667,12 @@ impl Open {
                 "virtual_sink": self.virtual_sink,
                 "channels": self.channels,
                 "back_button_timeout": self.back_button_timeout,
+                "controller": self.controller,
+                "gamepad": self.gamepad,
+                "ds4_back_as_touchpad_click": self.ds4_back_as_touchpad_click,
+                "keyboard": self.keyboard,
+                "mouse": self.mouse,
+                "native_pen_touch": self.native_pen_touch,
                 "high_resolution_scrolling": self.high_resolution_scrolling,
                 "always_send_scancodes": self.always_send_scancodes,
                 "key_rightalt_to_key_win": self.key_rightalt_to_key_win,
@@ -654,11 +687,7 @@ impl Open {
                     "max_reference_frames": self.profile.max_reference_frames,
                 },
             },
-        });
-        if self.continuous_audio && self.stream_audio {
-            payload["configuration"]["continuous_audio"] = serde_json::json!(true);
-        }
-        payload
+        })
     }
 
     pub(crate) fn arm_with_encryption(
@@ -808,6 +837,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_video_encryption_policy_and_peer_reach_stream_session_prepare() {
+        let mut value = open_json();
+        value["peer_ip"] = json!("198.51.100.42");
+        value["video_encryption_policy"] = json!({"lan_mode":2,"wan_mode":0});
+        let request: Open = serde_json::from_value(value).unwrap();
+        assert!(request.validate(true).is_ok());
+
+        let prepare = request.prepare("configured", None);
+        assert_eq!(prepare["peer_ip"], "198.51.100.42");
+        assert_eq!(
+            prepare["video_encryption_policy"],
+            json!({"lan_mode":2,"wan_mode":0})
+        );
+
+        let legacy = open().prepare("legacy", None);
+        assert!(legacy.get("video_encryption_policy").is_none());
+    }
+
+    #[test]
+    fn native_pen_touch_scope_value_reaches_stream_session_start() {
+        for selected in [None, Some(false), Some(true)] {
+            let mut value = open_json();
+            if let Some(enabled) = selected {
+                value["native_pen_touch"] = json!(enabled);
+            }
+            let request: Open = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                request.arm(51)["configuration"]["native_pen_touch"],
+                json!(selected)
+            );
+        }
+    }
+
+    #[test]
     fn configured_device_name_reaches_the_authenticated_session_start() {
         let mut value = open_json();
         value["device_name"] = json!("Studio PC");
@@ -824,41 +887,69 @@ mod tests {
     }
 
     #[test]
-    fn continuous_audio_is_session_only_and_requires_stream_audio() {
-        let defaulted = open();
-        assert!(!defaulted.continuous_audio);
-        assert!(defaulted.validate(false).is_ok());
-        assert!(
-            defaulted.arm(51)["configuration"]
-                .get("continuous_audio")
-                .is_none()
-        );
-        assert!(
-            defaulted
-                .prepare("default", None)
-                .get("continuous_audio")
-                .is_none()
-        );
+    fn input_settings_default_to_absent_for_older_open_payloads() {
+        let request = open();
+        assert_eq!(request.controller, None);
+        assert_eq!(request.gamepad, None);
+        assert_eq!(request.ds4_back_as_touchpad_click, None);
+        assert_eq!(request.keyboard, None);
+        assert_eq!(request.mouse, None);
 
-        let mut enabled = open_json();
-        enabled["continuous_audio"] = json!(true);
-        let enabled: Open = serde_json::from_value(enabled).unwrap();
-        assert!(enabled.validate(false).is_ok());
-        assert_eq!(enabled.arm(52)["configuration"]["continuous_audio"], true);
-        assert!(
-            enabled
-                .prepare("enabled", None)
-                .get("continuous_audio")
-                .is_none()
-        );
+        let configuration = request.arm(51)["configuration"].clone();
+        assert!(configuration["controller"].is_null());
+        assert!(configuration["gamepad"].is_null());
+        assert!(configuration["ds4_back_as_touchpad_click"].is_null());
+        assert!(configuration["keyboard"].is_null());
+        assert!(configuration["mouse"].is_null());
+    }
 
-        let mut disabled_audio = open_json();
-        disabled_audio["stream_audio"] = json!(false);
-        disabled_audio["continuous_audio"] = json!(true);
-        let disabled_audio: Open = serde_json::from_value(disabled_audio).unwrap();
+    #[test]
+    fn input_settings_preserve_explicit_false_and_true_values_in_arm() {
+        for selected in [false, true] {
+            let mut value = open_json();
+            value["controller"] = json!(selected);
+            value["gamepad"] = json!("auto");
+            value["ds4_back_as_touchpad_click"] = json!(selected);
+            value["keyboard"] = json!(selected);
+            value["mouse"] = json!(selected);
+            let request: Open = serde_json::from_value(value).unwrap();
+
+            assert!(request.validate(false).is_ok());
+            let configuration = request.arm(51)["configuration"].clone();
+            assert_eq!(configuration["controller"], selected);
+            assert_eq!(configuration["gamepad"], "auto");
+            assert_eq!(configuration["ds4_back_as_touchpad_click"], selected);
+            assert_eq!(configuration["keyboard"], selected);
+            assert_eq!(configuration["mouse"], selected);
+        }
+    }
+
+    #[test]
+    fn continuous_audio_flag_reaches_stream_session_and_requires_stream_audio() {
+        for enabled in [false, true] {
+            let mut value = open_json();
+            value["continuous_audio"] = json!(enabled);
+            let request: Open = serde_json::from_value(value).unwrap();
+
+            assert!(request.validate(false).is_ok());
+            assert_eq!(
+                request.arm(51)["configuration"]["continuous_audio"],
+                enabled
+            );
+            assert!(
+                request
+                    .prepare("continuous-audio", None)
+                    .get("continuous_audio")
+                    .is_none()
+            );
+        }
+
+        let mut disabled_audio = open();
+        disabled_audio.stream_audio = false;
+        disabled_audio.continuous_audio = Some(true);
         assert_eq!(
-            disabled_audio.validate(false),
-            Err("continuous_audio_requires_stream_audio")
+            disabled_audio.validate(false).unwrap_err(),
+            "continuous_audio_requires_stream_audio"
         );
     }
 

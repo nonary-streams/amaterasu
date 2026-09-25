@@ -10,7 +10,8 @@ mod workflow;
 #[cfg(test)]
 mod tests;
 
-use crate::preparation::PreparationStep;
+use crate::frame_limiter::FrameLimiterSettings;
+use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use record::{Record, Stage, State};
@@ -31,6 +32,12 @@ const INITIAL_DEADLINE: Duration = Duration::from_secs(40);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(20);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoEncryptionPolicySnapshot {
+    pub(crate) lan_mode: i64,
+    pub(crate) wan_mode: i64,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub app_id: u32,
@@ -39,7 +46,7 @@ pub struct LaunchRequest {
     pub fps: u32,
     /// Moonlight's localAudioPlayMode bit selecting ordinary host audio.
     pub host_audio_enabled: bool,
-    /// Immutable Moonlight continuousAudio request for this session.
+    /// Moonlight's optional continuousAudio request for silence-padded capture.
     pub continuous_audio: bool,
     /// Moonlight's optional per-launch device-name override (`clientName`).
     pub device_name: Option<String>,
@@ -66,11 +73,13 @@ pub struct PeerIdentity {
     client_gamepad: Option<String>,
     client_keyboard: Option<bool>,
     client_mouse: Option<bool>,
+    client_native_pen_touch: Option<bool>,
     client_high_resolution_scrolling: Option<bool>,
     client_always_send_scancodes: Option<bool>,
     client_key_rightalt_to_key_win: Option<bool>,
     client_key_repeat_delay: Option<u32>,
     client_key_repeat_frequency: Option<f64>,
+    client_frame_limiter_settings: FrameLimiterSettings,
 }
 
 impl PeerIdentity {
@@ -99,11 +108,13 @@ impl PeerIdentity {
             client_gamepad: None,
             client_keyboard: None,
             client_mouse: None,
+            client_native_pen_touch: None,
             client_high_resolution_scrolling: None,
             client_always_send_scancodes: None,
             client_key_rightalt_to_key_win: None,
             client_key_repeat_delay: None,
             client_key_repeat_frequency: None,
+            client_frame_limiter_settings: FrameLimiterSettings::default(),
         })
     }
 
@@ -127,12 +138,28 @@ impl PeerIdentity {
             gamepad,
             keyboard,
             mouse,
+            native_pen_touch,
             high_resolution_scrolling,
             always_send_scancodes,
             key_rightalt_to_key_win,
             key_repeat_delay,
             key_repeat_frequency,
+            frame_limiter_enable,
+            frame_limiter_fps_limit,
+            frame_limiter_provider,
+            frame_limiter_disable_vsync,
+            frame_limiter_auto_virtual_framegen,
+            rtss_frame_limit_type,
         } = config_overrides;
+        let client_frame_limiter_settings = FrameLimiterSettings {
+            frame_limiter_enable,
+            frame_limiter_fps_limit,
+            frame_limiter_provider,
+            frame_limiter_disable_vsync,
+            frame_limiter_auto_virtual_framegen,
+            rtss_frame_limit_type,
+            ..FrameLimiterSettings::default()
+        };
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
             || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
@@ -152,6 +179,7 @@ impl PeerIdentity {
             || key_repeat_delay.is_some_and(|delay| delay > i32::MAX as u32)
             || key_repeat_frequency
                 .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+            || client_frame_limiter_settings.validate().is_err()
         {
             return Err("invalid_paired_identity");
         }
@@ -170,11 +198,13 @@ impl PeerIdentity {
         self.client_gamepad = gamepad;
         self.client_keyboard = keyboard;
         self.client_mouse = mouse;
+        self.client_native_pen_touch = native_pen_touch;
         self.client_high_resolution_scrolling = high_resolution_scrolling;
         self.client_always_send_scancodes = always_send_scancodes;
         self.client_key_rightalt_to_key_win = key_rightalt_to_key_win;
         self.client_key_repeat_delay = key_repeat_delay;
         self.client_key_repeat_frequency = key_repeat_frequency;
+        self.client_frame_limiter_settings = client_frame_limiter_settings;
         Ok(self)
     }
 
@@ -391,10 +421,13 @@ pub struct Controller {
     configured_audio_sink: Option<String>,
     configured_virtual_sink: Option<String>,
     global_preparation: Vec<PreparationStep>,
+    legacy_global_preparation: Vec<LegacyPreparationStep>,
+    global_frame_limiter_settings: FrameLimiterSettings,
     global_audio_sink_capture_only: bool,
     configured_capture: CaptureMode,
     output_settings_ready: bool,
     global_stream_audio: bool,
+    global_video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     global_ping_timeout_ms: u32,
     global_video_max_batch_size_kb: u8,
     global_max_bitrate_kbps: Option<u32>,
@@ -421,10 +454,13 @@ impl Controller {
             configured_audio_sink: None,
             configured_virtual_sink: None,
             global_preparation: Vec::new(),
+            legacy_global_preparation: Vec::new(),
+            global_frame_limiter_settings: FrameLimiterSettings::default(),
             global_audio_sink_capture_only: false,
             configured_capture: CaptureMode::Auto,
             output_settings_ready: true,
             global_stream_audio: true,
+            global_video_encryption_policy: None,
             global_ping_timeout_ms: 10_000,
             global_video_max_batch_size_kb: 64,
             global_max_bitrate_kbps: None,
@@ -460,6 +496,14 @@ impl Controller {
         self.global_preparation = preparation.to_vec();
     }
 
+    pub fn set_legacy_global_preparation(&mut self, preparation: &[LegacyPreparationStep]) {
+        self.legacy_global_preparation = preparation.to_vec();
+    }
+
+    pub fn set_global_frame_limiter_settings(&mut self, settings: &FrameLimiterSettings) {
+        self.global_frame_limiter_settings = settings.clone();
+    }
+
     pub fn set_audio_sink_capture_only(&mut self, enabled: bool) {
         self.global_audio_sink_capture_only = enabled;
     }
@@ -470,6 +514,13 @@ impl Controller {
 
     pub fn set_global_stream_audio(&mut self, stream_audio: bool) {
         self.global_stream_audio = stream_audio;
+    }
+
+    pub fn set_global_video_encryption_modes(&mut self, lan_mode: u8, wan_mode: u8) {
+        self.global_video_encryption_policy = Some(VideoEncryptionPolicySnapshot {
+            lan_mode: i64::from(lan_mode),
+            wan_mode: i64::from(wan_mode),
+        });
     }
 
     pub fn set_global_ping_timeout_ms(&mut self, ping_timeout_ms: u32) {
@@ -537,8 +588,12 @@ impl Controller {
             .to_owned();
         let global_fec_percentage = config.profile.fec_percentage;
         let global_stream_audio = self.global_stream_audio;
+        let global_video_encryption_policy = self.global_video_encryption_policy;
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
         let global_preparation = self.global_preparation.clone();
+        let legacy_global_preparation = self.legacy_global_preparation.clone();
+        let global_frame_limiter_settings = self.global_frame_limiter_settings.clone();
+        let client_frame_limiter_settings = peer.client_frame_limiter_settings.clone();
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
@@ -604,10 +659,14 @@ impl Controller {
             connect_data,
             global_fec_percentage,
             global_stream_audio,
+            global_video_encryption_policy,
             global_audio_sink_capture_only,
             self.configured_audio_sink.clone(),
             self.configured_virtual_sink.clone(),
             global_preparation,
+            legacy_global_preparation,
+            global_frame_limiter_settings,
+            client_frame_limiter_settings,
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,

@@ -271,6 +271,12 @@ impl Record {
                         json!({"key_hex":config.key_hex,"key_id":config.key_id,"video":config.encrypt_video,
                             "audio":audio_encrypted,"permit_legacy_audio_iv_wrap":permit_legacy_audio_iv_wrap})
                     } else { Value::Null }});
+                if let Some(policy) = &config.video_encryption_policy {
+                    payload["video_encryption_policy"] = json!({
+                        "lan_mode": policy.lan_mode,
+                        "wan_mode": policy.wan_mode,
+                    });
+                }
                 if let Some(discovery) = &config.discovery {
                     payload["discovery"] = json!(discovery);
                 } else {
@@ -298,10 +304,8 @@ impl Record {
                     "virtual_sink":start.virtual_sink,
                     "channels":start.channels,
                     "host_audio_enabled":start.host_audio_enabled});
-                if self.config.stream_audio && start.continuous_audio {
-                    payload["continuous_audio"] = json!({
-                        "packet_ms": self.config.audio.packet_ms,
-                    });
+                if self.config.stream_audio && start.continuous_audio == Some(true) {
+                    payload["continuous_audio"] = json!({"packet_ms":config.audio.packet_ms});
                 }
                 payload
             }

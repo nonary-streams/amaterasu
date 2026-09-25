@@ -141,6 +141,10 @@ impl Controller {
                         "operation_id": record.application_operation,
                         "app_id": app_id(record.request.app_id),
                         "global_preparation": record.global_preparation,
+                        "legacy_global_preparation": record.legacy_global_preparation,
+                        "frame_limiter_settings": frame_limiter_launch_snapshot(record),
+                        "client_frame_limiter_overrides":
+                            client_frame_limiter_overrides(record),
                     }),
                     30_000,
                 )
@@ -193,6 +197,8 @@ impl Controller {
                         "key_id": record.request.key_id,
                         "connect_data": record.connect_data,
                         "stream_audio": record.effective_stream_audio,
+                        "continuous_audio":
+                            record.request.continuous_audio && record.effective_stream_audio,
                         "capture_sink_without_routing": record.capture_sink_without_routing,
                         "virtual_sink": record.resolved_virtual_sink,
                         "channels": record.resolved_virtual_sink.as_ref().map(|_| 2),
@@ -201,6 +207,7 @@ impl Controller {
                         "gamepad": record.scoped_gamepad,
                         "keyboard": record.scoped_keyboard,
                         "mouse": record.scoped_mouse,
+                        "native_pen_touch": record.scoped_native_pen_touch,
                         "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
                         "always_send_scancodes": record.scoped_always_send_scancodes,
                         "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
@@ -242,11 +249,13 @@ impl Controller {
                 15_000,
             ),
         };
-        if matches!(phase, Phase::OpenRtsp)
-            && record.request.continuous_audio
-            && record.effective_stream_audio
-        {
-            payload["continuous_audio"] = json!(true);
+        if matches!(phase, Phase::OpenRtsp) {
+            if let Some(policy) = record.video_encryption_policy {
+                payload["video_encryption_policy"] = json!({
+                    "lan_mode": policy.lan_mode,
+                    "wan_mode": policy.wan_mode,
+                });
+            }
         }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)
@@ -363,6 +372,10 @@ impl Controller {
                                     .or(application_overrides.keyboard);
                                 record.scoped_mouse =
                                     record.peer.client_mouse.or(application_overrides.mouse);
+                                record.scoped_native_pen_touch = record
+                                    .peer
+                                    .client_native_pen_touch
+                                    .or(application_overrides.native_pen_touch);
                                 record.scoped_high_resolution_scrolling = record
                                     .peer
                                     .client_high_resolution_scrolling
@@ -732,6 +745,7 @@ struct ApplicationConfigOverrides {
     gamepad: Option<String>,
     keyboard: Option<bool>,
     mouse: Option<bool>,
+    native_pen_touch: Option<bool>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
@@ -887,6 +901,65 @@ fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
     application_response(record, payload).is_ok_and(|(_, state, healthy)| {
         healthy && matches!(state, "stopped" | "cancelled" | "failed")
     }) && payload["cleanup_error"].is_null()
+}
+
+fn frame_limiter_launch_snapshot(record: &Record) -> Value {
+    let mut settings = record.global_frame_limiter_settings.clone();
+    settings.frame_limiter_enable = record
+        .client_frame_limiter_settings
+        .frame_limiter_enable
+        .or(settings.frame_limiter_enable);
+    settings.frame_limiter_fps_limit = record
+        .client_frame_limiter_settings
+        .frame_limiter_fps_limit
+        .or(settings.frame_limiter_fps_limit);
+    settings.frame_limiter_provider = record
+        .client_frame_limiter_settings
+        .frame_limiter_provider
+        .clone()
+        .or(settings.frame_limiter_provider);
+    settings.frame_limiter_disable_vsync = record
+        .client_frame_limiter_settings
+        .frame_limiter_disable_vsync
+        .or(settings.frame_limiter_disable_vsync);
+    settings.frame_limiter_auto_virtual_framegen = record
+        .client_frame_limiter_settings
+        .frame_limiter_auto_virtual_framegen
+        .clone()
+        .or(settings.frame_limiter_auto_virtual_framegen);
+    settings.rtss_frame_limit_type = record
+        .client_frame_limiter_settings
+        .rtss_frame_limit_type
+        .clone()
+        .or(settings.rtss_frame_limit_type);
+    let requested_stream_fps_millihz = record
+        .request
+        .fps
+        .checked_mul(1_000)
+        .filter(|rate| *rate <= 1_000_000)
+        .expect("admitted stream FPS must fit the frame-limiter service range");
+
+    json!({
+        "version":1,
+        "settings":settings.effective(),
+        "requested_stream_fps_millihz":requested_stream_fps_millihz,
+        "client_display_mode_override_millihz":null,
+        "lossless_scaling_limit_millihz":null,
+        "virtual_display_active":null,
+        "physical_framegen_capture":null,
+        "game_frame_generation_mode":null,
+        "rtss_frame_limit_type_explicit_override":null
+    })
+}
+
+fn client_frame_limiter_overrides(record: &Record) -> Value {
+    let mut overrides = serde_json::to_value(&record.client_frame_limiter_settings)
+        .expect("client frame-limiter overrides serialize");
+    overrides
+        .as_object_mut()
+        .expect("client frame-limiter overrides serialize to an object")
+        .retain(|_, value| !value.is_null());
+    overrides
 }
 
 fn take_job(job: &mut Job) -> Job {

@@ -60,6 +60,26 @@ fn peer_with_stream_overrides(
         .unwrap()
 }
 
+fn peer_with_frame_limiter_overrides(
+    marker: u8,
+    enable: Option<bool>,
+    fps_limit: Option<f64>,
+) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                frame_limiter_enable: enable,
+                frame_limiter_fps_limit: fps_limit,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn peer_with_overrides(
     marker: u8,
     fec_percentage: Option<u8>,
@@ -178,6 +198,21 @@ fn peer_with_input_overrides(
                 gamepad: gamepad.map(str::to_owned),
                 keyboard,
                 mouse,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+fn peer_with_native_pen_touch(marker: u8, native_pen_touch: Option<bool>) -> PeerIdentity {
+    let certificate = vec![marker; 32];
+    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            format!("client-{marker}"),
+            fingerprint(&certificate),
+            ClientConfigOverrides {
+                native_pen_touch,
                 ..Default::default()
             },
         )
@@ -1237,14 +1272,15 @@ fn global_app_and_verified_client_audio_values_apply_in_precedence_order() {
 }
 
 #[test]
-fn continuous_audio_is_snapshotted_and_gated_by_effective_audio_precedence() {
-    for (global, app, client, expected_stream_audio) in [
-        (true, None, None, true),
-        (false, None, None, false),
-        (false, Some(true), None, true),
-        (true, Some(false), None, false),
-        (true, Some(false), Some(true), true),
-        (false, Some(true), Some(false), false),
+fn continuous_audio_is_requested_per_launch_and_requires_effective_stream_audio() {
+    for (requested, global, app, client, expected) in [
+        (false, true, None, None, false),
+        (true, true, None, None, true),
+        (true, false, None, None, false),
+        (true, true, Some(false), None, false),
+        (true, false, Some(true), None, true),
+        (true, true, Some(false), Some(true), true),
+        (true, false, Some(true), Some(false), false),
     ] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
@@ -1253,24 +1289,26 @@ fn continuous_audio_is_snapshotted_and_gated_by_effective_audio_precedence() {
             application_stream_audio: app,
             ..Default::default()
         };
-        let mut launch = request(1);
-        launch.continuous_audio = true;
+        let mut launch_request = request(1);
+        launch_request.continuous_audio = requested;
 
         assert!(
             controller
-                .launch(10, launch, peer_with_overrides(1, None, client), now)
+                .launch(
+                    10,
+                    launch_request,
+                    peer_with_overrides(1, None, client),
+                    now,
+                )
                 .is_none()
         );
-        controller.set_global_stream_audio(!global);
         let _ = poll_until_reply(&mut controller, &mut broker, now);
 
         let rtsp_open = opened_rtsp_payload(&broker);
-        assert_eq!(rtsp_open["stream_audio"], expected_stream_audio);
-        if expected_stream_audio {
-            assert_eq!(rtsp_open["continuous_audio"], true);
-        } else {
-            assert!(rtsp_open.get("continuous_audio").is_none());
-        }
+        assert_eq!(
+            rtsp_open["continuous_audio"], expected,
+            "requested={requested}, global={global}, app={app:?}, client={client:?}"
+        );
     }
 }
 
@@ -1324,6 +1362,66 @@ fn global_ping_timeout_reaches_rtsp_open_and_is_snapshotted_at_admission() {
             .expect("RTSP open request");
         assert_eq!(rtsp_open["ping_timeout_ms"], configured);
     }
+}
+
+#[test]
+fn native_pen_touch_resolves_client_before_application_and_preserves_inheritance() {
+    for (marker, client, application, expected) in [
+        (51, Some(false), Some(true), Some(false)),
+        (52, Some(true), Some(false), Some(true)),
+        (53, None, Some(false), Some(false)),
+        (54, None, None, None),
+    ] {
+        let now = Instant::now();
+        let mut broker = Broker {
+            application_input_overrides: Some(json!({"native_pen_touch":application})),
+            ..Broker::default()
+        };
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(
+            controller
+                .launch(
+                    10,
+                    request(marker),
+                    peer_with_native_pen_touch(marker, client),
+                    now,
+                )
+                .is_none()
+        );
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = opened_rtsp_payload(&broker);
+        assert_eq!(rtsp_open["native_pen_touch"], json!(expected));
+    }
+}
+
+#[test]
+fn encryption_modes_and_authenticated_peer_ip_are_snapshotted_into_rtsp_open() {
+    let now = Instant::now();
+    let remote = "198.51.100.42".parse().unwrap();
+    let certificate = vec![42; 32];
+    let peer = PeerIdentity::new(remote, certificate.clone())
+        .unwrap()
+        .with_paired_identity(
+            "trusted-policy-peer".into(),
+            fingerprint(&certificate),
+            ClientConfigOverrides::default(),
+        )
+        .unwrap();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_video_encryption_modes(2, 0);
+    let mut broker = Broker::default();
+
+    assert!(controller.launch(10, request(1), peer, now).is_none());
+    controller.set_global_video_encryption_modes(0, 2);
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let rtsp_open = opened_rtsp_payload(&broker);
+    assert_eq!(rtsp_open["peer_ip"], "198.51.100.42");
+    assert_eq!(
+        rtsp_open["video_encryption_policy"],
+        json!({"lan_mode":2,"wan_mode":0})
+    );
 }
 
 #[test]
@@ -1704,6 +1802,113 @@ fn launch_export_uses_the_preparation_snapshot_captured_at_admission() {
     assert_eq!(
         launch_payload["global_preparation"][0]["run"]["args"],
         json!(["original"])
+    );
+}
+
+#[test]
+fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let original = FrameLimiterSettings {
+        frame_limiter_enable: Some(true),
+        frame_limiter_fps_limit: Some(144.0),
+        frame_limiter_provider: Some("none".into()),
+        ..Default::default()
+    };
+    let changed = FrameLimiterSettings {
+        frame_limiter_enable: Some(false),
+        frame_limiter_fps_limit: Some(72.0),
+        frame_limiter_provider: Some("auto".into()),
+        ..Default::default()
+    };
+    controller.set_global_frame_limiter_settings(&original);
+    let mut launch_request = request(1);
+    launch_request.fps = 75;
+    let mut broker = Broker::default();
+
+    assert!(
+        controller
+            .launch(10, launch_request, peer(1), now)
+            .is_none()
+    );
+    controller.set_global_frame_limiter_settings(&changed);
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export request");
+    let expected_settings = json!({
+        "version":1,
+        "settings":serde_json::to_value(original.effective()).unwrap(),
+        "requested_stream_fps_millihz":75000,
+        "client_display_mode_override_millihz":null,
+        "lossless_scaling_limit_millihz":null,
+        "virtual_display_active":null,
+        "physical_framegen_capture":null,
+        "game_frame_generation_mode":null,
+        "rtss_frame_limit_type_explicit_override":null
+    });
+
+    assert_eq!(launch_payload["frame_limiter_settings"], expected_settings);
+    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
+}
+
+#[test]
+fn paired_frame_limiter_values_override_global_settings_and_keep_sparse_presence() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let global_settings = FrameLimiterSettings {
+        frame_limiter_enable: Some(true),
+        frame_limiter_fps_limit: Some(120.0),
+        ..Default::default()
+    };
+    controller.set_global_frame_limiter_settings(&global_settings);
+    let mut broker = Broker::default();
+
+    assert!(
+        controller
+            .launch(
+                10,
+                request(1),
+                peer_with_frame_limiter_overrides(1, Some(false), Some(0)),
+                now,
+            )
+            .is_none()
+    );
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export request");
+    assert_eq!(
+        launch_payload["frame_limiter_settings"]["settings"]["frame_limiter_enable"],
+        false
+    );
+    assert_eq!(
+        launch_payload["frame_limiter_settings"]["settings"]["frame_limiter_fps_limit_millihz"],
+        0
+    );
+    assert_eq!(
+        launch_payload["client_frame_limiter_overrides"],
+        json!({"frame_limiter_enable":false,"frame_limiter_fps_limit":0.0})
     );
 }
 

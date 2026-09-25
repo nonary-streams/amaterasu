@@ -17,12 +17,12 @@ const LAUNCH_FIELDS: &[&str] = &[
     "clientHdrCapMetaDataId",
     "clientHdrCapDisplayData",
     "localAudioPlayMode",
-    "continuousAudio",
     "surroundAudioInfo",
     "remoteControllersBitmap",
     "gcmap",
     "gcpersist",
     "corever",
+    "continuousAudio",
 ];
 
 pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static str> {
@@ -39,7 +39,6 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         .map_err(|_| "remote input key must contain 16 bytes")?;
     let key_id = key_id(query.required("rikeyid")?)?;
     let host_audio_enabled = query.get("localAudioPlayMode") == Some("1");
-    let continuous_audio = query.get("continuousAudio") == Some("1");
     let device_name = query.get("clientName").unwrap_or_default();
     if !device_name.is_empty()
         && (device_name.len() > 128 || device_name.chars().any(char::is_control))
@@ -52,7 +51,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         height,
         fps,
         host_audio_enabled,
-        continuous_audio,
+        continuous_audio: query.get("continuousAudio") == Some("1"),
         device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
         remote_input_key,
         key_id,
@@ -73,7 +72,6 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         return Err("invalid request identifier");
     }
     optional_boolean(query, "additionalStates")?;
-    optional_boolean(query, "continuousAudio")?;
     require_optional_value(query, "sops", "0", "display optimization is unsupported")?;
     require_optional_value(query, "hdrMode", "0", "HDR streaming is unsupported")?;
     require_optional_value(
@@ -101,6 +99,7 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
         "HDR streaming is unsupported",
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
+    optional_boolean(query, "continuousAudio")?;
     require_optional_value(
         query,
         "surroundAudioInfo",
@@ -319,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_audio_defaults_off_accepts_only_zero_or_one() {
+    fn continuous_audio_defaults_off_and_accepts_only_zero_or_one() {
         let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
         assert!(!parse(base).unwrap().continuous_audio);
         assert!(

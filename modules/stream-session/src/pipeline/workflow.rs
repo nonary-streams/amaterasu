@@ -139,20 +139,28 @@ impl Job {
                 Resource::Session.service(),
                 json!({"action":"activate","session_id":session()}),
             ),
-            Step::AcquireInput => (
-                "amaterasu.input/1".into(),
-                json!({"action":"acquire","operation_id":record.input_operation(),"ttl_ms":record.input_ttl_ms,
-                    "back_button_timeout":record.start.as_ref().expect("validated start configuration").back_button_timeout,
-                    "controller":record.start.as_ref().expect("validated start configuration").controller,
-                    "gamepad":record.start.as_ref().expect("validated start configuration").gamepad,
-                    "keyboard":record.start.as_ref().expect("validated start configuration").keyboard,
-                    "mouse":record.start.as_ref().expect("validated start configuration").mouse,
-                    "high_resolution_scrolling":record.start.as_ref().expect("validated start configuration").high_resolution_scrolling,
-                    "always_send_scancodes":record.start.as_ref().expect("validated start configuration").always_send_scancodes,
-                    "key_rightalt_to_key_win":record.start.as_ref().expect("validated start configuration").key_rightalt_to_key_win,
-                    "key_repeat_delay":record.start.as_ref().expect("validated start configuration").key_repeat_delay,
-                    "key_repeat_frequency":record.start.as_ref().expect("validated start configuration").key_repeat_frequency}),
-            ),
+            Step::AcquireInput => {
+                let start = record
+                    .start
+                    .as_ref()
+                    .expect("validated start configuration");
+                let mut payload = json!({"action":"acquire","operation_id":record.input_operation(),"ttl_ms":record.input_ttl_ms,
+                    "back_button_timeout":start.back_button_timeout,
+                    "controller":start.controller,
+                    "gamepad":start.gamepad,
+                    "keyboard":start.keyboard,
+                    "mouse":start.mouse,
+                    "native_pen_touch":start.native_pen_touch,
+                    "high_resolution_scrolling":start.high_resolution_scrolling,
+                    "always_send_scancodes":start.always_send_scancodes,
+                    "key_rightalt_to_key_win":start.key_rightalt_to_key_win,
+                    "key_repeat_delay":start.key_repeat_delay,
+                    "key_repeat_frequency":start.key_repeat_frequency});
+                if let Some(back_as_touchpad_click) = start.ds4_back_as_touchpad_click {
+                    payload["ds4_back_as_touchpad_click"] = json!(back_as_touchpad_click);
+                }
+                ("amaterasu.input/1".into(), payload)
+            }
             Step::FindInput => (
                 "amaterasu.input/1".into(),
                 json!({"action":"lookup","operation_id":record.input_operation()}),

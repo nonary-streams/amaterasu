@@ -1,6 +1,7 @@
-use super::{CaptureProvider, LaunchRequest, PeerIdentity};
+use super::{CaptureProvider, LaunchRequest, PeerIdentity, VideoEncryptionPolicySnapshot};
+use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{CLEANUP_DEADLINE, MONITOR_INTERVAL};
-use crate::preparation::PreparationStep;
+use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use std::{collections::VecDeque, time::Instant};
 
 use super::{call::Call, workflow::Phase};
@@ -44,10 +45,14 @@ pub struct Record {
     pub connect_data: u32,
     pub global_fec_percentage: u8,
     pub global_stream_audio: bool,
+    pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     pub global_audio_sink_capture_only: bool,
     pub global_configured_audio_sink: Option<String>,
     pub global_configured_virtual_sink: Option<String>,
     pub global_preparation: Vec<PreparationStep>,
+    pub legacy_global_preparation: Vec<LegacyPreparationStep>,
+    pub global_frame_limiter_settings: FrameLimiterSettings,
+    pub client_frame_limiter_settings: FrameLimiterSettings,
     pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
     /// Sparse client-over-application timeout override captured for this launch.
@@ -58,6 +63,7 @@ pub struct Record {
     pub scoped_gamepad: Option<String>,
     pub scoped_keyboard: Option<bool>,
     pub scoped_mouse: Option<bool>,
+    pub scoped_native_pen_touch: Option<bool>,
     pub scoped_high_resolution_scrolling: Option<bool>,
     pub scoped_always_send_scancodes: Option<bool>,
     pub scoped_key_rightalt_to_key_win: Option<bool>,
@@ -117,10 +123,14 @@ impl Record {
         connect_data: u32,
         global_fec_percentage: u8,
         global_stream_audio: bool,
+        video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
         global_audio_sink_capture_only: bool,
         global_configured_audio_sink: Option<String>,
         global_configured_virtual_sink: Option<String>,
         global_preparation: Vec<PreparationStep>,
+        legacy_global_preparation: Vec<LegacyPreparationStep>,
+        global_frame_limiter_settings: FrameLimiterSettings,
+        client_frame_limiter_settings: FrameLimiterSettings,
         global_ping_timeout_ms: u32,
         global_video_max_batch_size_kb: u8,
         global_max_bitrate_kbps: Option<u32>,
@@ -144,10 +154,14 @@ impl Record {
             connect_data,
             global_fec_percentage,
             global_stream_audio,
+            video_encryption_policy,
             global_audio_sink_capture_only,
             global_configured_audio_sink,
             global_configured_virtual_sink,
             global_preparation,
+            legacy_global_preparation,
+            global_frame_limiter_settings,
+            client_frame_limiter_settings,
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,
             scoped_back_button_timeout: None,
@@ -155,6 +169,7 @@ impl Record {
             scoped_gamepad: None,
             scoped_keyboard: None,
             scoped_mouse: None,
+            scoped_native_pen_touch: None,
             scoped_high_resolution_scrolling: None,
             scoped_always_send_scancodes: None,
             scoped_key_rightalt_to_key_win: None,
