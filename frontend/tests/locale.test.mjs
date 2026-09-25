@@ -114,7 +114,7 @@ function mountLocaleSelector(api) {
 }
 
 async function flushMicrotasks() {
-  for (let index = 0; index < 12; index += 1) await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 test("locale validation accepts every exact supported token", () => {
@@ -331,7 +331,7 @@ test("locale selector saves with the loaded revision and applies authoritative r
         return ordinary(serverDocument);
       }
       if (path === "configuration/update") {
-        assert.deepEqual(payload, {
+        assert.deepEqual(ordinary(payload), {
           values: { locale: "pt_BR" },
           expected_revision: 12,
         });
