@@ -491,10 +491,7 @@ mod tests {
         let health = health.lock().unwrap();
         assert!(!health.recovering);
         assert_eq!(health.failure, None);
-        assert_eq!(
-            health.active_endpoint.as_deref(),
-            Some("render.console-new")
-        );
+        assert_eq!(health.active_endpoint.as_deref(), Some("render.fixed"));
         assert_eq!(health.discontinuities, 1);
     }
 
@@ -615,6 +612,10 @@ mod tests {
         let health = health.lock().unwrap();
         assert!(!health.recovering);
         assert_eq!(health.failure, None);
+        assert_eq!(
+            health.active_endpoint.as_deref(),
+            Some("render.console-new")
+        );
         assert_eq!(health.discontinuities, 1);
     }
 
