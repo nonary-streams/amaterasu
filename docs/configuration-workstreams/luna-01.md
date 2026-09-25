@@ -307,3 +307,9 @@ Lane handoff commit `41f00213aeecc757463ff2cb4c22d9d175ebb63a` was integrated af
 - Main validation found one old test still expected primary and auxiliary records to be ambiguous, contrary to the agreed primary-state precedence. Coordinator commit `bef498e3a6ee3231c4e06540f7d602a8ea304936` updates the fixture to assert primary selection and removes two needless returns reported by strict Clippy. Auxiliary files remain checked for unsupported API tokens.
 - `cargo fmt --check -p amaterasu-authentication -p amaterasu-package` passed. Authentication passed 48 tests; package passed 51 library tests and 4 CLI tests. Strict Clippy passed for both crates.
 - `global:credentials_file` remains pending signed management editing and authorization, identity consumer integration, migration approval flow, and Windows/Unix execution evidence. No stable ID is closed by this update.
+
+### Coordinator validation update: missing primary does not promote auxiliary state (2026-09-25)
+
+- L01 worker source `db88ee190f6ce51d26ec6fa9cf2ab6e9b6bc4713` and lane code `b075224e104aa13081d8ceb9a0ac4f412f96bae6` landed directly on main as `8c244607`. The regression uses a valid auxiliary credential with a 16-character salt and verifies it is not promoted when configured primary `file_state` is missing.
+- `cargo fmt --check -p amaterasu-authentication -p amaterasu-package` and `git diff --check` passed. Authentication passed 49 tests; package passed 51 library tests and 4 CLI tests. Strict Clippy passed for both crates.
+- The test complements the primary-over-auxiliary selection and fail-closed auxiliary API-token behavior. `global:credentials_file` remains pending management authorization/UI, identity consumer integration, migration approval flow, and Windows/Unix execution evidence; no stable ID is closed.
