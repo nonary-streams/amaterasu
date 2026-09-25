@@ -11,6 +11,7 @@ Strict JSON controls:
 ```json
 {"action":"enumerate"}
 {"action":"open","endpoint":"default","host_audio_enabled":false,"operation_id":"living-room-audio"}
+{"action":"open","endpoint":"default","operation_id":"continuous-audio","continuous_audio":{"packet_ms":5}}
 {"action":"open","endpoint":"","virtual_sink":"","channels":6,"operation_id":"surround-audio"}
 {"action":"lookup","operation_id":"living-room-audio"}
 {"action":"status"}
@@ -89,7 +90,7 @@ sink present, no configured virtual sink, and the selected sink equal to that
 configured sink. The audio module receives this per-open policy snapshot; it does
 not derive eligibility from product settings.
 
-Open/lookup return `{ok:true,stream,endpoint,requested_endpoint,virtual_sink,channels,host_audio_enabled,capture_sink_without_routing,format}`.
+Open/lookup return `{ok:true,stream,endpoint,requested_endpoint,virtual_sink,channels,host_audio_enabled,capture_sink_without_routing,continuous_audio,format}`.
 `endpoint` is the selected endpoint ID, `requested_endpoint` is the caller's
 regular selector, `virtual_sink` is the requested virtual selector, `channels`
 is the resolved requested virtual layout, and `host_audio_enabled` echoes the
@@ -124,7 +125,15 @@ Driver error strings and PCM samples are never placed in control replies.
 
 The optional operation ID is 1–128 ASCII graphic bytes. Same-caller retry with
 that ID, requested endpoint, virtual selector, layout, and routing policy reuses
-the original stream; changing any of those values conflicts. After close, retry returns
+the original stream; changing any of those values conflicts. The optional
+`continuous_audio` object accepts `packet_ms` values of 5 or 10. Missing or null
+keeps legacy capture packet sizes and returns `MEDIA_PENDING` when capture is
+idle. An enabled stream combines short capture packets and splits long ones into
+fixed-duration frames without changing captured PCM. At the idle deadline, it
+zero-pads a partial frame or produces a full zero frame. It sets `AUDIO_SILENT`
+only when every sample in the complete output frame is zero. Output sequence and
+timestamps advance per frame, and capture discontinuity flags are retained.
+The packet duration participates in operation retry identity. After close, retry returns
 `stream_closed` and lookup returns `stream_not_found`. Up to 128 operation
 records remain in memory per module instance. There are at most four live
 streams, two per caller. Open
@@ -169,8 +178,9 @@ Packets longer than 100 ms or larger than 1 MiB fail with
 `AUDIO_SILENT` produces an initialized zero-filled PCM packet without reading the
 WASAPI silent buffer pointer. `AUDIO_DISCONTINUITY` reports engine glitches,
 including an initial discontinuity if WASAPI marks it. It increments the status
-counter and does not automatically terminate capture. No packets are synthesized
-when a silent endpoint produces no WASAPI packets. Normal timestamps are QPC
+counter and does not automatically terminate capture. Legacy opens do not
+synthesize packets when a silent endpoint produces no WASAPI packets; enabled
+continuous opens synthesize the configured frame cadence. Normal timestamps are QPC
 100ns positions normalized to the first valid packet and converted to relative
 microseconds. Timestamp-error packets use elapsed monotonic stream time with
 `AUDIO_TIMESTAMP_ESTIMATED`; timestamp regression is clamped and marked estimated.
@@ -185,12 +195,14 @@ releasing module-owned code. Driver activation, GetBuffer, Stop or COM teardown
 can still block indefinitely. A hung driver therefore needs external host
 supervision; no hard teardown deadline or crash recovery is claimed.
 
-Vibeshine `src/audio.h` and the Windows audio policy/capture behavior were used as
-behavioral references without copying or translating source. The pinned
-selected-endpoint capture-only case is represented by the per-open policy above.
-Opus encoding, configured speaker remapping, resampling, continuous silent audio,
-process-specific loopback, microphone capture, Linux/macOS backends, and full
-streaming audio parity remain unimplemented.
+The Windows audio policy/capture behavior and audio capture contract in pinned
+Vibeshine commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d` were used as
+behavioral references without copying or translating source. The selected-endpoint
+capture-only case is represented by the per-open policy above. Continuous audio
+is opt-in per open; product setting persistence, management UI, and hardware
+qualification remain unimplemented. Opus encoding, configured speaker remapping,
+resampling, process-specific loopback, microphone capture, Linux/macOS backends,
+and full streaming audio parity remain unimplemented.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
 for selection, ownership, idempotency, cancellation rollback, silent packets,

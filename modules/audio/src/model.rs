@@ -1,5 +1,5 @@
 use amaterasu_media::{PCM_F32, PCM_I16};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub type AudioResult<T> = Result<T, &'static str>;
 
@@ -24,7 +24,6 @@ pub struct Format {
 }
 
 impl Format {
-    #[cfg(any(windows, test))]
     pub fn new(sample_rate: u32, channels: u32, format: u32) -> AudioResult<Self> {
         if !(8_000..=192_000).contains(&sample_rate) || !(1..=8).contains(&channels) {
             return Err("unsupported_format");
@@ -49,15 +48,17 @@ impl Format {
     }
 
     pub fn code(self) -> u32 {
-        if self.name == "f32" { PCM_F32 } else { PCM_I16 }
+        if self.name == "f32" {
+            PCM_F32
+        } else {
+            PCM_I16
+        }
     }
 
-    #[cfg(any(windows, test))]
     pub fn block_align(self) -> usize {
         self.channels as usize * if self.code() == PCM_F32 { 4 } else { 2 }
     }
 
-    #[cfg(any(windows, test))]
     pub fn packet_bytes(self, frames: u32) -> AudioResult<usize> {
         if frames == 0 || frames > self.sample_rate / 10 {
             return Err("unsupported_packet_size");
@@ -90,9 +91,55 @@ pub struct Health {
     pub dropped_packets: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuousAudio {
+    pub packet_ms: u32,
+}
+
+impl ContinuousAudio {
+    pub fn validate(self) -> AudioResult<()> {
+        if matches!(self.packet_ms, 5 | 10) {
+            Ok(())
+        } else {
+            Err("invalid_continuous_audio_packet_size")
+        }
+    }
+}
+
+pub enum Operation {
+    Enumerate,
+    Open {
+        endpoint: String,
+        virtual_sink: Option<String>,
+        channels: Option<u32>,
+        host_audio_enabled: bool,
+        operation_id: Option<String>,
+        capture_sink_without_routing: bool,
+    },
+    OpenContinuous {
+        endpoint: String,
+        virtual_sink: Option<String>,
+        channels: Option<u32>,
+        host_audio_enabled: bool,
+        operation_id: Option<String>,
+        capture_sink_without_routing: bool,
+        continuous_audio: ContinuousAudio,
+    },
+    Lookup {
+        operation_id: String,
+    },
+    Close {
+        stream: u64,
+    },
+    Status {
+        stream: Option<u64>,
+    },
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Operation {
+enum OperationInput {
     Enumerate,
     Open {
         endpoint: String,
@@ -106,6 +153,8 @@ pub enum Operation {
         operation_id: Option<String>,
         #[serde(default)]
         capture_sink_without_routing: bool,
+        #[serde(default)]
+        continuous_audio: Option<ContinuousAudio>,
     },
     Lookup {
         operation_id: String,
@@ -117,6 +166,47 @@ pub enum Operation {
         #[serde(default)]
         stream: Option<u64>,
     },
+}
+
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match OperationInput::deserialize(deserializer)? {
+            OperationInput::Enumerate => Self::Enumerate,
+            OperationInput::Open {
+                endpoint,
+                virtual_sink,
+                channels,
+                host_audio_enabled,
+                operation_id,
+                capture_sink_without_routing,
+                continuous_audio,
+            } => match continuous_audio {
+                Some(continuous_audio) => Self::OpenContinuous {
+                    endpoint,
+                    virtual_sink,
+                    channels,
+                    host_audio_enabled,
+                    operation_id,
+                    capture_sink_without_routing,
+                    continuous_audio,
+                },
+                None => Self::Open {
+                    endpoint,
+                    virtual_sink,
+                    channels,
+                    host_audio_enabled,
+                    operation_id,
+                    capture_sink_without_routing,
+                },
+            },
+            OperationInput::Lookup { operation_id } => Self::Lookup { operation_id },
+            OperationInput::Close { stream } => Self::Close { stream },
+            OperationInput::Status { stream } => Self::Status { stream },
+        })
+    }
 }
 
 pub fn validate_endpoint(endpoint: &str) -> AudioResult<()> {

@@ -4,14 +4,15 @@ use crate::{
     worker::{Backend, Opened},
 };
 use amaterasu_media::*;
-use amaterasu_module_sdk::{Command, ManagedModule, Response, RuntimeClient, abi::*};
+use amaterasu_module_sdk::{abi::*, Command, ManagedModule, Response, RuntimeClient};
 use std::{
     collections::VecDeque,
     ffi::c_void,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 type OpenCall = (String, Option<String>, Option<u32>, bool);
 
@@ -121,6 +122,17 @@ fn open() -> Operation {
     }
 }
 
+fn continuous_open(packet_ms: u32, operation_id: &str) -> Operation {
+    serde_json::from_value(json!({
+        "action":"open",
+        "endpoint":"render.explicit",
+        "host_audio_enabled":true,
+        "operation_id":operation_id,
+        "continuous_audio":{"packet_ms":packet_ms}
+    }))
+    .unwrap()
+}
+
 #[test]
 fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
     let (mut controller, observed) = controller(true);
@@ -147,33 +159,29 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
             .payload,
         opened.payload
     );
-    assert!(
-        controller
-            .handle(
-                "bob",
-                Operation::Lookup {
-                    operation_id: "one".into()
-                }
-            )
-            .is_err()
-    );
+    assert!(controller
+        .handle(
+            "bob",
+            Operation::Lookup {
+                operation_id: "one".into()
+            }
+        )
+        .is_err());
     assert!(controller.close("bob", 1).is_err());
     assert_eq!(controller.status("bob", None)["streams"], json!([]));
-    assert!(
-        controller
-            .handle(
-                "alice",
-                Operation::Open {
-                    endpoint: "default".into(),
-                    virtual_sink: None,
-                    channels: None,
-                    host_audio_enabled: true,
-                    operation_id: Some("one".into()),
-                    capture_sink_without_routing: false
-                }
-            )
-            .is_err()
-    );
+    assert!(controller
+        .handle(
+            "alice",
+            Operation::Open {
+                endpoint: "default".into(),
+                virtual_sink: None,
+                channels: None,
+                host_audio_enabled: true,
+                operation_id: Some("one".into()),
+                capture_sink_without_routing: false
+            }
+        )
+        .is_err());
     controller.close("alice", 1).unwrap();
     assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -249,6 +257,227 @@ fn omitted_open_policy_defaults_to_host_audio_off_and_routing_enabled() {
             ..
         }
     ));
+}
+
+#[test]
+fn missing_or_null_continuous_audio_keeps_pending_on_idle_behavior() {
+    let requests = [
+        json!({
+            "action":"open",
+            "endpoint":"render.explicit",
+            "operation_id":"missing-continuous"
+        }),
+        json!({
+            "action":"open",
+            "endpoint":"render.explicit",
+            "operation_id":"null-continuous",
+            "continuous_audio":null
+        }),
+    ];
+
+    for request in requests {
+        let operation: Operation = serde_json::from_value(request).unwrap();
+        assert!(matches!(&operation, Operation::Open { .. }));
+        let (mut controller, _) = controller(true);
+        controller.handle("alice", operation).unwrap();
+        let mut sink = Sink {
+            reject: false,
+            packets: Vec::new(),
+        };
+        let audio_sink = AudioSink {
+            context: (&mut sink as *mut Sink).cast(),
+            write,
+        };
+
+        // SAFETY: the sink callback context remains live for both synchronous reads.
+        assert_eq!(
+            unsafe { controller.read("alice", 1, audio_sink) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { controller.read("alice", 1, audio_sink) },
+            MEDIA_PENDING
+        );
+        assert_eq!(sink.packets.len(), 1);
+        assert_eq!(sink.packets[0].1, 1);
+    }
+}
+
+#[test]
+fn continuous_idle_emits_silent_fixed_frames_with_advancing_clock() {
+    let (mut controller, _) = controller(true);
+    controller
+        .handle("alice", continuous_open(5, "continuous-idle"))
+        .unwrap();
+
+    let mut sink = Sink {
+        reject: false,
+        packets: Vec::new(),
+    };
+    let audio_sink = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // SAFETY: the sink callback context remains live for both synchronous reads.
+    assert_eq!(
+        unsafe { controller.read("alice", 1, audio_sink) },
+        MEDIA_PENDING
+    );
+    assert!(sink.packets.is_empty());
+    controller
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .continuous
+        .as_mut()
+        .unwrap()
+        .deadline = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        unsafe { controller.read("alice", 1, audio_sink) },
+        STATUS_OK
+    );
+    let first = sink.packets[0].clone();
+    assert_eq!(first.0 & AUDIO_SILENT, AUDIO_SILENT);
+    assert_eq!(first.1, 240);
+    assert_eq!(first.3, 0);
+    assert_eq!(first.4, vec![0; 240 * 2 * 4]);
+
+    controller
+        .streams
+        .get_mut(&1)
+        .unwrap()
+        .continuous
+        .as_mut()
+        .unwrap()
+        .deadline = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        unsafe { controller.read("alice", 1, audio_sink) },
+        STATUS_OK
+    );
+    let second = &sink.packets[1];
+    assert_eq!(second.0 & AUDIO_SILENT, AUDIO_SILENT);
+    assert_eq!(second.1, 240);
+    assert_eq!(second.3, 1);
+    assert!(second.2 > first.2);
+    assert_eq!(second.4, vec![0; 240 * 2 * 4]);
+}
+
+#[test]
+fn continuous_packetizer_pads_partial_pcm_only_when_idle_and_preserves_it() {
+    let format = Format::new(48_000, 2, PCM_F32).unwrap();
+    let mut packetizer = ContinuousPacketizer::new(format, 240).unwrap();
+    let captured = [0, 0, 128, 63, 0, 0, 0, 64];
+    let ready = packetizer
+        .push(Packet {
+            frames: 1,
+            flags: AUDIO_DISCONTINUITY,
+            bytes: captured.to_vec(),
+            timestamp_us: 2_000,
+            sequence: 9,
+        })
+        .unwrap();
+    assert!(ready.is_empty());
+
+    let padded = packetizer.idle(5_000).unwrap();
+    assert_eq!(padded.frames, 240);
+    assert_eq!(&padded.bytes[..captured.len()], &captured);
+    assert!(padded.bytes[captured.len()..].iter().all(|byte| *byte == 0));
+    assert_eq!(padded.flags & AUDIO_SILENT, 0);
+    assert_ne!(padded.flags & AUDIO_DISCONTINUITY, 0);
+    assert_eq!((padded.timestamp_us, padded.sequence), (2_000, 0));
+}
+
+#[test]
+fn continuous_packetizer_splits_large_capture_into_fixed_monotonic_frames() {
+    let format = Format::new(48_000, 2, PCM_F32).unwrap();
+    let mut packetizer = ContinuousPacketizer::new(format, 240).unwrap();
+    let captured: Vec<u8> = (0..format.packet_bytes(480).unwrap())
+        .map(|index| (index % 251 + 1) as u8)
+        .collect();
+    let frames = packetizer
+        .push(Packet {
+            frames: 480,
+            flags: AUDIO_DISCONTINUITY,
+            bytes: captured.clone(),
+            timestamp_us: 1_000,
+            sequence: 7,
+        })
+        .unwrap();
+
+    assert_eq!(frames.len(), 2);
+    assert!(frames.iter().all(|frame| frame.frames == 240));
+    assert_eq!(frames[0].bytes, captured[..1_920]);
+    assert_eq!(frames[1].bytes, captured[1_920..]);
+    assert_ne!(frames[0].flags & AUDIO_DISCONTINUITY, 0);
+    assert_eq!(frames[1].flags & AUDIO_DISCONTINUITY, 0);
+    assert_eq!((frames[0].sequence, frames[1].sequence), (0, 1));
+    assert_eq!(
+        (frames[0].timestamp_us, frames[1].timestamp_us),
+        (1_000, 6_000)
+    );
+}
+
+#[test]
+fn continuous_packet_size_is_part_of_retry_identity() {
+    let (mut controller, observed) = controller(true);
+    let opened = controller
+        .handle("alice", continuous_open(5, "continuous-retry"))
+        .unwrap();
+    let retried = controller
+        .handle("alice", continuous_open(5, "continuous-retry"))
+        .unwrap();
+    assert_eq!(opened.created, Some(1));
+    assert_eq!(retried.created, None);
+    assert_eq!(opened.payload, retried.payload);
+    assert_eq!(opened.payload["continuous_audio"]["packet_ms"], 5);
+    assert_eq!(
+        controller
+            .handle("alice", continuous_open(10, "continuous-retry"))
+            .err(),
+        Some("operation_conflict")
+    );
+    assert_eq!(
+        controller
+            .handle("alice", continuous_open(20, "invalid-continuous"))
+            .err(),
+        Some("invalid_continuous_audio_packet_size")
+    );
+    assert_eq!(observed.opens.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn continuous_stream_emission_stops_after_close_and_shutdown() {
+    let (mut controller, observed) = controller(true);
+    controller
+        .handle("alice", continuous_open(5, "continuous-close"))
+        .unwrap();
+    controller.close("alice", 1).unwrap();
+
+    let mut sink = Sink {
+        reject: false,
+        packets: Vec::new(),
+    };
+    let audio_sink = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // SAFETY: the sink callback context remains live for the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", 1, audio_sink) },
+        MEDIA_CLOSED
+    );
+
+    controller
+        .handle("alice", continuous_open(5, "continuous-shutdown"))
+        .unwrap();
+    controller.shutdown();
+    // SAFETY: the sink callback context remains live for the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", 2, audio_sink) },
+        MEDIA_CLOSED
+    );
+    assert!(sink.packets.is_empty());
+    assert_eq!(observed.drops.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -559,17 +788,15 @@ fn disabled_controls_do_not_enumerate_or_open_and_limits_are_validated() {
     assert!(observed.opens.lock().unwrap().is_empty());
     assert!(validate_endpoint("invalid\0endpoint").is_err());
     assert!(validate_operation("two words").is_err());
-    assert!(
-        serde_json::from_value::<Operation>(
-            json!({"action":"open","endpoint":"default","owner":"bob"})
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_value::<Operation>(
+        json!({"action":"open","endpoint":"default","owner":"bob"})
+    )
+    .is_err());
 }
 
 struct Sink {
     reject: bool,
-    packets: Vec<(u32, u64, Vec<u8>)>,
+    packets: Vec<(u32, u32, u64, u64, Vec<u8>)>,
 }
 
 unsafe extern "C" fn write(context: *mut c_void, frame: *const AudioFrame) -> Status {
@@ -581,6 +808,8 @@ unsafe extern "C" fn write(context: *mut c_void, frame: *const AudioFrame) -> St
     let frame = unsafe { &*frame };
     sink.packets.push((
         frame.flags,
+        frame.frames,
+        frame.timestamp_us,
         frame.sequence,
         unsafe { frame.bytes().unwrap() }.to_vec(),
     ));
@@ -645,7 +874,7 @@ fn native_owner_isolation_sink_retry_pending_and_close_are_real_callbacks() {
         );
         assert_eq!(
             sink.packets,
-            [(AUDIO_SILENT | AUDIO_DISCONTINUITY, 7, vec![0; 8])]
+            [(AUDIO_SILENT | AUDIO_DISCONTINUITY, 1, 100, 7, vec![0; 8])]
         );
         assert_eq!(
             (alice.read_audio)(alice.base.context, 1, callback),
@@ -725,7 +954,7 @@ fn cancelled_open_completion_closes_only_newly_created_streams() {
         remaining_ms: 1000,
     };
     runtime.request = Some(request(
-        json!({"action":"open","endpoint":"render.explicit","operation_id":"one"}),
+        json!({"action":"open","endpoint":"render.explicit","operation_id":"one","continuous_audio":{"packet_ms":5}}),
     ));
     module.tick().unwrap();
     assert!(shared.lock().unwrap().streams.is_empty());
