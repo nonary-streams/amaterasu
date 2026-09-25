@@ -24,7 +24,7 @@ struct Pending {
     stage: Stage,
 }
 enum Stage {
-    Loading(Operation),
+    Loading(Box<Operation>),
     Saving {
         response: Value,
         snapshot: Option<Arc<Snapshot>>,
@@ -249,7 +249,7 @@ impl Pipeline {
                 };
                 self.submit(
                     request,
-                    Stage::Loading(operation),
+                    Stage::Loading(Box::new(operation)),
                     json!({"action":"get","key":STATE_KEY}),
                     &mut send,
                 )
@@ -342,7 +342,7 @@ impl Pipeline {
                             };
                         self.apply_loaded(
                             pending.request,
-                            operation,
+                            *operation,
                             document,
                             payload["revision"].as_u64().unwrap(),
                             now,
