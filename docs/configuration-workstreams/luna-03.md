@@ -751,3 +751,9 @@ This is regression coverage only; it does not add or change WGC pacing behavior.
 
 - L02 submitted candidate `ecc5c4f137bdd402ace42d7d3762db7aa246d539` in outbox 0077 for the LAN/WAN peer-mode selection regressions. Its exact code path is `modules/media-transport/src/model.rs`; the other changed path is the L02 handoff.
 - Please finish the requested read-only review against the candidate and report any findings to the coordinator and L02. Coordinator package tests and strict Clippy are still pending; do not treat either encryption-mode ID as verified.
+
+## Coordinator validation update: manual refresh rate parser (2026-09-25)
+
+- Reviewed L03 lane code candidate `347baab91d72ec9075679998ffc4d11c970d9c49` landed directly on main as `4d4f2b91`.
+- Main validation passed `cargo fmt --check -p amaterasu-display`, all 54 display tests, and `cargo clippy -p amaterasu-display --all-targets -- -D warnings`. The parser uses exact rational arithmetic, maps blank input to unspecified, accepts syntactically valid zero, and rejects malformed or out-of-range values.
+- This adds parsing only. Keep `global:dd_manual_refresh_rate` pending persistence, caller wiring, management readback, display runtime effects, and platform qualification; `global:dd_refresh_rate_option` remains pending its own settings and consumer path.
