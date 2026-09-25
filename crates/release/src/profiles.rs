@@ -824,6 +824,9 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             }),
         ),
     ]);
+    policy
+        .principals
+        .insert("amaterasu.pairing".into(), PLATFORM_PAIRING.grants());
     Ok(policy)
 }
 
