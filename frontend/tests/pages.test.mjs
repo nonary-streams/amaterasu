@@ -107,7 +107,13 @@ function syncStatus(overrides = {}) {
   };
 }
 
-function createHarness({ allowsRefresh, allowsRead = true, forceReply, statuses }) {
+function createHarness({
+  allowsRefresh,
+  allowsRead = true,
+  forceReply,
+  statuses,
+  listReplies = [],
+}) {
   const content = new FakeElement("main");
   content.setConnected(true);
   const calls = [];
@@ -119,7 +125,7 @@ function createHarness({ allowsRefresh, allowsRead = true, forceReply, statuses 
     async post(route, payload = {}) {
       calls.push({ route, payload });
       if (route === "steam/list") {
-        return {
+        return listReplies.shift() ?? {
           revision: 3,
           games: [],
           next_after: null,
@@ -192,7 +198,7 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
     force_sync_pending: true,
     catalog_sync: { syncing: true, force_sync_pending: true },
   });
-  const succeeded = syncStatus();
+  const succeeded = syncStatus({ revision: 4 });
   const accepted = {
     ...pending,
     ok: true,
@@ -202,7 +208,37 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
   const harness = createHarness({
     allowsRefresh: true,
     forceReply: accepted,
-    statuses: [syncStatus(), pending, succeeded, succeeded],
+    statuses: [syncStatus(), syncStatus(), pending, succeeded],
+    listReplies: [
+      {
+        revision: 3,
+        games: [],
+        next_after: 42,
+        scanning: false,
+        complete: true,
+      },
+      {
+        revision: 3,
+        games: [],
+        next_after: null,
+        scanning: false,
+        complete: true,
+      },
+      {
+        revision: 3,
+        games: [],
+        next_after: 55,
+        scanning: true,
+        complete: true,
+      },
+      {
+        revision: 4,
+        games: [],
+        next_after: null,
+        scanning: false,
+        complete: true,
+      },
+    ],
   });
 
   await waitFor(
@@ -212,12 +248,30 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
   const forceSync = findButton(harness.content, "Force catalog sync");
   assert.ok(forceSync);
   assert.equal(forceSync.disabled, false);
+  findButton(harness.content, "Next →").click();
+  await waitFor(
+    () =>
+      harness.calls.filter((call) => call.route === "steam/list").length >= 2 &&
+      harness.content.textContent.includes("Page 2"),
+    "the rendered second Steam list page",
+  );
+  assert.deepEqual(
+    harness.calls.filter((call) => call.route === "steam/list")[1].payload,
+    { revision: 3, after: 42, limit: 16 },
+  );
+
   forceSync.click();
 
   await waitFor(
-    () => harness.timers.size === 1,
-    "the locally accepted request to begin polling",
+    () =>
+      harness.timers.size === 1 &&
+      harness.calls.filter((call) => call.route === "steam/list").length >= 3,
+    "the accepted request to reload and begin polling",
   );
+  const listCallsAfterAcceptance = harness.calls.filter(
+    (call) => call.route === "steam/list",
+  );
+  assert.deepEqual(listCallsAfterAcceptance[2].payload, { limit: 16 });
   const forceCall = harness.calls.find(
     (call) => call.route === "steam/force_sync",
   );
@@ -235,13 +289,17 @@ test("Steam force sync uses its route and stops polling at confirmed terminal st
     "the confirmed successful terminal status",
   );
   await waitFor(
-    () => harness.calls.filter((call) => call.route === "steam/list").length >= 2,
+    () => harness.calls.filter((call) => call.route === "steam/list").length >= 4,
     "the post-sync Steam list refresh",
   );
+  const listCallsAfterSync = harness.calls.filter(
+    (call) => call.route === "steam/list",
+  );
+  assert.deepEqual(listCallsAfterSync[3].payload, { limit: 16 });
   assert.equal(harness.timers.size, 0);
   assert.equal(
     harness.calls.filter((call) => call.route === "steam/status").length,
-    3,
+    4,
   );
   assert.equal(pages.steamForceSyncOutcome(succeeded), "success");
   assert.equal(

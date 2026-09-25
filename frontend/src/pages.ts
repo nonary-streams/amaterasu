@@ -484,14 +484,19 @@ namespace Amaterasu {
     let forceSyncPollGeneration = 0;
     let forceSyncControl: HTMLButtonElement | undefined;
     const history: (number | undefined)[] = [undefined];
+
+    function resetPagination(): void {
+      revision = undefined;
+      after = undefined;
+      history.splice(0, history.length, undefined);
+    }
+
     const scan = button(
       "Scan libraries",
       () =>
         runAction(scan, status, async () => {
           await context.api.post("steam/refresh");
-          revision = undefined;
-          after = undefined;
-          history.splice(0, history.length, undefined);
+          resetPagination();
           context.notify(
             "Steam scan requested. Refresh to see completed discoveries.",
           );
@@ -586,7 +591,10 @@ namespace Amaterasu {
         providerStatus = provider;
         finishForceSync(provider);
         updateForceSyncControl();
-        if (!forceSyncPending && context.content.isConnected) await load(false);
+        if (!forceSyncPending && context.content.isConnected) {
+          resetPagination();
+          await load(false);
+        }
       } catch (error) {
         if (
           generation !== forceSyncPollGeneration ||
@@ -664,6 +672,7 @@ namespace Amaterasu {
           stopUnobservableForceSync();
           return;
         }
+        resetPagination();
         await load();
         startForceSyncPolling();
       });
@@ -684,9 +693,7 @@ namespace Amaterasu {
         "Steam library",
         "Discover local Steam games and optionally sync a complete scan into the catalog.",
         button("Refresh", () => {
-          revision = undefined;
-          after = undefined;
-          history.splice(0, history.length, undefined);
+          resetPagination();
           return load();
         }),
         scan,
