@@ -291,6 +291,12 @@ L01 workspace-registration lane commit `7472c8e67fa30ab5056bcf238887aa7f52b7438d
 
 All seven L01 IDs remain pending. The credentials-file slice does not close `global:credentials_file`; signed management editing and authorization, identity consumer integration, migration approval/user flow, and platform qualification remain.
 
+### Coordinator validation update: custom identity migration coverage
+
+Lane code commit `b36c9aa708f2fdf7e4023ccc9d6ef9a1d96815c0` landed on main as `9d603eba`. The added migration regression verifies that approved imports preserve custom `pkey` and `cert` bytes for Apollo, Sunshine, Vibeshine, and Vibepollo. No production behavior or migration schema changed.
+
+`cargo fmt --check -p amaterasu-package` passed; the package test suite passed 51 library tests and 4 CLI tests; strict Clippy passed. The regression ran on this Windows checkout. Unix execution, signed management editing and authorization, the migration approval workflow, and broader platform qualification remain pending; all seven L01 IDs remain pending.
+
 ### Coordinator handoff reconciliation
 
 Lane handoff commit `41f00213aeecc757463ff2cb4c22d9d175ebb63a` was integrated after the package candidate completed main validation. Its original pending-gate note predates code commit `45b48244`; the package gates above supersede that note. The handoff remains cumulative, and all assigned IDs stay pending.
