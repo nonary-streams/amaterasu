@@ -1,5 +1,8 @@
 use super::*;
-use crate::model::{Axis, Button, DevicePolicy, Key, PenTouchDevice, PenTouchPhase};
+use crate::model::{
+    Axis, Button, DevicePolicy, Key, PEN_BUTTON_MASK, PEN_POINTER_ID, PenTool, PenTouchDevice,
+    PenTouchPhase,
+};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -182,8 +185,12 @@ fn pen_touch(
         x,
         y,
         pressure: None,
-        tilt_x: None,
-        tilt_y: None,
+        contact_area_major: None,
+        contact_area_minor: None,
+        rotation_degrees: None,
+        pen_tool: None,
+        pen_buttons: None,
+        tilt: None,
     }
 }
 fn moonlight_key(code: u8, state: KeyState, repeat_modifiers: u8, temporary: bool) -> Event {
@@ -2896,14 +2903,18 @@ fn pen_touch_tracks_identity_and_deduplicates_only_identical_moves() {
     let token = acquire(&mut controller, Instant::now());
     let down_touch = pen_touch(5, PenTouchDevice::Touch, PenTouchPhase::Down, 100, 200);
     let down_pen = Event::PenTouch {
-        pointer_id: 5,
+        pointer_id: PEN_POINTER_ID,
         device: PenTouchDevice::Pen,
         phase: PenTouchPhase::Down,
         x: 300,
         y: 400,
         pressure: Some(0.75),
-        tilt_x: Some(-25),
-        tilt_y: Some(60),
+        contact_area_major: Some(0.8),
+        contact_area_minor: Some(0.3),
+        rotation_degrees: Some(90),
+        pen_tool: Some(PenTool::Eraser),
+        pen_buttons: Some(PEN_BUTTON_MASK),
+        tilt: Some(45),
     };
     let repeated_move = pen_touch(5, PenTouchDevice::Touch, PenTouchPhase::Move, 120, 220);
     let events = vec![
@@ -2911,7 +2922,13 @@ fn pen_touch_tracks_identity_and_deduplicates_only_identical_moves() {
         down_pen,
         repeated_move.clone(),
         repeated_move,
-        pen_touch(5, PenTouchDevice::Pen, PenTouchPhase::Up, 300, 400),
+        pen_touch(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Up,
+            300,
+            400,
+        ),
         pen_touch(5, PenTouchDevice::Touch, PenTouchPhase::Cancel, 120, 220),
     ];
 
@@ -3018,7 +3035,13 @@ fn pen_touch_limit_is_enforced_and_capability_is_reported_separately_from_policy
         batch(
             &mut unsupported,
             &unsupported_lease,
-            vec![pen_touch(1, PenTouchDevice::Pen, PenTouchPhase::Down, 0, 0)]
+            vec![pen_touch(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                0,
+                0
+            )]
         )["error"]["code"],
         "unsupported_event"
     );
@@ -3165,7 +3188,7 @@ fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override()
             &mut scoped,
             scoped_token,
             vec![pen_touch(
-                42,
+                PEN_POINTER_ID,
                 PenTouchDevice::Pen,
                 PenTouchPhase::Down,
                 3,
@@ -3182,7 +3205,7 @@ fn pen_touch_policy_suppresses_global_disable_but_honors_scoped_lease_override()
             &mut scoped,
             scoped_token,
             vec![pen_touch(
-                42,
+                PEN_POINTER_ID,
                 PenTouchDevice::Pen,
                 PenTouchPhase::Move,
                 5,
@@ -3202,26 +3225,38 @@ fn failed_pen_touch_down_is_conservatively_cancelled() {
     let mut controller = Controller::new(
         FakeBackend {
             supports_pen_touch: true,
-            failed_pen_touch_events: vec![(12, PenTouchPhase::Down)],
+            failed_pen_touch_events: vec![(PEN_POINTER_ID, PenTouchPhase::Down)],
             ..Default::default()
         },
         true,
     );
     let token = acquire(&mut controller, Instant::now());
-    let down = pen_touch(12, PenTouchDevice::Pen, PenTouchPhase::Down, 50, 60);
+    let down = Event::PenTouch {
+        pointer_id: PEN_POINTER_ID,
+        device: PenTouchDevice::Pen,
+        phase: PenTouchPhase::Down,
+        x: 50,
+        y: 60,
+        pressure: Some(0.6),
+        contact_area_major: Some(0.7),
+        contact_area_minor: Some(0.4),
+        rotation_degrees: Some(270),
+        pen_tool: Some(PenTool::Pen),
+        pen_buttons: Some(0b101),
+        tilt: Some(35),
+    };
 
     let reply = batch(&mut controller, &token, vec![down.clone()]);
     assert_eq!(reply["ok"], false);
     assert_eq!(reply["accepted"], 0);
     assert!(controller.lease.is_none());
     assert!(controller.pen_touch_contacts.is_empty());
-    assert_eq!(
-        *controller.backend.trace.borrow(),
-        [
-            down,
-            pen_touch(12, PenTouchDevice::Pen, PenTouchPhase::Cancel, 50, 60),
-        ]
-    );
+    let mut cancel = down.clone();
+    let Event::PenTouch { phase, .. } = &mut cancel else {
+        unreachable!();
+    };
+    *phase = PenTouchPhase::Cancel;
+    assert_eq!(*controller.backend.trace.borrow(), [down, cancel]);
 }
 
 #[test]
@@ -3234,16 +3269,35 @@ fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
         true,
     );
     let token = acquire(&mut controller, Instant::now());
-    let down_one = pen_touch(21, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 11);
-    let down_two = pen_touch(22, PenTouchDevice::Pen, PenTouchPhase::Down, 20, 21);
+    let down_one = pen_touch(
+        PEN_POINTER_ID,
+        PenTouchDevice::Touch,
+        PenTouchPhase::Down,
+        10,
+        11,
+    );
+    let down_two = Event::PenTouch {
+        pointer_id: PEN_POINTER_ID,
+        device: PenTouchDevice::Pen,
+        phase: PenTouchPhase::Down,
+        x: 20,
+        y: 21,
+        pressure: Some(0.9),
+        contact_area_major: Some(0.6),
+        contact_area_minor: Some(0.2),
+        rotation_degrees: Some(0),
+        pen_tool: Some(PenTool::Unknown),
+        pen_buttons: Some(0b010),
+        tilt: Some(20),
+    };
     assert_eq!(
-        batch(&mut controller, &token, vec![down_one, down_two])["ok"],
+        batch(&mut controller, &token, vec![down_one, down_two.clone()])["ok"],
         true
     );
     controller
         .backend
         .failed_pen_touch_events
-        .push((22, PenTouchPhase::Cancel));
+        .push((PEN_POINTER_ID, PenTouchPhase::Cancel));
 
     let release = controller.handle(
         "owner",
@@ -3256,7 +3310,7 @@ fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
     assert_eq!(release["ok"], false);
     assert_eq!(release["error"]["code"], "release_failed");
     assert_eq!(controller.pen_touch_contacts.len(), 1);
-    assert_eq!(controller.pen_touch_contacts[0].pointer_id, 22);
+    assert_eq!(controller.pen_touch_contacts[0].pointer_id, PEN_POINTER_ID);
     assert!(controller.cleanup_required());
 
     let retry_at = Instant::now() + Duration::from_millis(101);
@@ -3271,13 +3325,56 @@ fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
         .filter_map(|event| match event {
             Event::PenTouch {
                 pointer_id,
+                device,
                 phase: PenTouchPhase::Cancel,
                 ..
-            } => Some(*pointer_id),
+            } => Some((*device, *pointer_id)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(cancels, [22, 21, 22]);
+    assert_eq!(
+        cancels,
+        [
+            (PenTouchDevice::Pen, PEN_POINTER_ID),
+            (PenTouchDevice::Touch, PEN_POINTER_ID),
+            (PenTouchDevice::Pen, PEN_POINTER_ID),
+        ]
+    );
+    let mut expected_pen_cancel = down_two;
+    let Event::PenTouch { phase, .. } = &mut expected_pen_cancel else {
+        unreachable!();
+    };
+    *phase = PenTouchPhase::Cancel;
+    let cancel_events = controller
+        .backend
+        .trace
+        .borrow()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Event::PenTouch {
+                    phase: PenTouchPhase::Cancel,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cancel_events,
+        [
+            expected_pen_cancel.clone(),
+            pen_touch(
+                PEN_POINTER_ID,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                10,
+                11
+            ),
+            expected_pen_cancel,
+        ]
+    );
 }
 
 #[test]
@@ -3299,7 +3396,13 @@ fn pen_touch_shutdown_cancels_each_owned_pointer() {
                 &token,
                 vec![
                     pen_touch(31, PenTouchDevice::Touch, PenTouchPhase::Down, 1, 2),
-                    pen_touch(32, PenTouchDevice::Pen, PenTouchPhase::Down, 3, 4),
+                    pen_touch(
+                        PEN_POINTER_ID,
+                        PenTouchDevice::Pen,
+                        PenTouchPhase::Down,
+                        3,
+                        4
+                    ),
                 ]
             )["ok"],
             true

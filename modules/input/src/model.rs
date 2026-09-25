@@ -6,6 +6,13 @@ pub const MAX_EVENTS: usize = 64;
 pub const MAX_PRESSED: usize = 128;
 pub const MAX_PEN_TOUCH_CONTACTS: usize = 16;
 pub const MAX_QUEUED_REQUESTS: usize = 128;
+/// Pen packets do not carry a pointer ID, so the ingress maps them to this
+/// stable identity in the separate `Pen` device namespace.
+pub const PEN_POINTER_ID: u32 = 1;
+pub const PEN_BUTTON_PRIMARY: u8 = 1 << 0;
+pub const PEN_BUTTON_SECONDARY: u8 = 1 << 1;
+pub const PEN_BUTTON_TERTIARY: u8 = 1 << 2;
+pub const PEN_BUTTON_MASK: u8 = PEN_BUTTON_PRIMARY | PEN_BUTTON_SECONDARY | PEN_BUTTON_TERTIARY;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DevicePolicy {
@@ -210,6 +217,41 @@ pub enum PenTouchPhase {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PenTool {
+    Unknown,
+    Pen,
+    Eraser,
+}
+
+/// Converts the protocol's polar tilt and clockwise rotation to native axis
+/// tilt angles. Unknown or out-of-range samples produce no derived axes.
+pub fn pen_tilt_axes(
+    tilt_degrees: Option<u8>,
+    rotation_degrees: Option<u16>,
+) -> Option<(f32, f32)> {
+    let (Some(tilt_degrees), Some(rotation_degrees)) = (tilt_degrees, rotation_degrees) else {
+        return None;
+    };
+    if tilt_degrees > 90 || rotation_degrees > 359 {
+        return None;
+    }
+
+    let rotation_radians = f32::from(rotation_degrees).to_radians();
+    let tilt_radians = f32::from(tilt_degrees).to_radians();
+    let radial = tilt_radians.sin();
+    let vertical = tilt_radians.cos();
+    Some((
+        ((-rotation_radians).sin() * radial)
+            .atan2(vertical)
+            .to_degrees(),
+        ((-rotation_radians).cos() * radial)
+            .atan2(vertical)
+            .to_degrees(),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
@@ -246,9 +288,21 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pressure: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        tilt_x: Option<i16>,
+        contact_area_major: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        tilt_y: Option<i16>,
+        contact_area_minor: Option<f32>,
+        /// None means rotation was not reported; known values are 0..359.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_degrees: Option<u16>,
+        /// Pen-only tool metadata. `Unknown` preserves an unrecognized tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pen_tool: Option<PenTool>,
+        /// Pen-only primary/secondary/tertiary button bit mask.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pen_buttons: Option<u8>,
+        /// Raw polar tilt magnitude in degrees from perpendicular (0..90).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tilt: Option<u8>,
     },
     Controller {
         number: u16,
@@ -331,48 +385,7 @@ impl Event {
                 "invalid_event",
                 "controller number must be in the range 0..16",
             )),
-            Self::PenTouch { pressure, .. }
-                if pressure
-                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) =>
-            {
-                Err(InputError::new(
-                    "invalid_event",
-                    "pen/touch pressure must be finite and normalized to 0..1",
-                ))
-            }
-            Self::PenTouch {
-                device: PenTouchDevice::Touch,
-                tilt_x: Some(_),
-                ..
-            }
-            | Self::PenTouch {
-                device: PenTouchDevice::Touch,
-                tilt_y: Some(_),
-                ..
-            } => Err(InputError::new(
-                "invalid_event",
-                "tilt is supported only for pen events",
-            )),
-            Self::PenTouch {
-                device: PenTouchDevice::Pen,
-                tilt_x,
-                tilt_y,
-                ..
-            } if tilt_x.is_some() != tilt_y.is_some() => Err(InputError::new(
-                "invalid_event",
-                "pen tilt_x and tilt_y must be provided together",
-            )),
-            Self::PenTouch {
-                device: PenTouchDevice::Pen,
-                tilt_x: Some(tilt_x),
-                tilt_y: Some(tilt_y),
-                ..
-            } if !(-90..=90).contains(tilt_x) || !(-90..=90).contains(tilt_y) => {
-                Err(InputError::new(
-                    "invalid_event",
-                    "pen tilt must be in the range -90..90 degrees",
-                ))
-            }
+            Self::PenTouch { .. } => validate_pen_touch(self),
             _ => Ok(()),
         }
     }
@@ -390,6 +403,79 @@ impl Event {
             _ => None,
         }
     }
+}
+
+fn validate_pen_touch(event: &Event) -> InputResult<()> {
+    let Event::PenTouch {
+        pointer_id,
+        device,
+        pressure,
+        contact_area_major,
+        contact_area_minor,
+        rotation_degrees,
+        pen_tool,
+        pen_buttons,
+        tilt,
+        ..
+    } = event
+    else {
+        unreachable!("pen/touch validation is called only for pen/touch events")
+    };
+    if *device == PenTouchDevice::Pen && *pointer_id != PEN_POINTER_ID {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen pointer_id must use the stable pen identity",
+        ));
+    }
+    if (*pressure).is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen/touch pressure must be finite and normalized to 0..1",
+        ));
+    }
+    if contact_area_major.is_some() != contact_area_minor.is_some() {
+        return Err(InputError::new(
+            "invalid_event",
+            "contact area major and minor must be provided together",
+        ));
+    }
+    if [*contact_area_major, *contact_area_minor]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen/touch contact area must be finite and normalized to 0..1",
+        ));
+    }
+    if (*rotation_degrees).is_some_and(|rotation| rotation > 359) {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen/touch rotation must be in the range 0..359 degrees",
+        ));
+    }
+    if (*pen_buttons).is_some_and(|buttons| buttons & !PEN_BUTTON_MASK != 0) {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen button mask may contain only primary, secondary, and tertiary bits",
+        ));
+    }
+    if (*tilt).is_some_and(|tilt| tilt > 90) {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen tilt must be in the range 0..90 degrees",
+        ));
+    }
+    if *device == PenTouchDevice::Touch
+        && (pen_tool.is_some() || pen_buttons.is_some() || tilt.is_some())
+    {
+        return Err(InputError::new(
+            "invalid_event",
+            "pen tool, buttons, and tilt are supported only for pen events",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_key_metadata(key: &Key, state: KeyState) -> InputResult<()> {
@@ -849,27 +935,95 @@ mod tests {
     fn pen_touch_event_round_trips_identity_and_supported_samples() {
         let payload = json!({
             "kind":"pen_touch",
-            "pointer_id":4294967295u32,
+            "pointer_id":PEN_POINTER_ID,
             "device":"pen",
             "phase":"move",
             "x":65535,
             "y":0,
             "pressure":0.75,
-            "tilt_x":-90,
-            "tilt_y":90,
+            "contact_area_major":0.8,
+            "contact_area_minor":0.3,
+            "rotation_degrees":359,
+            "pen_tool":"unknown",
+            "pen_buttons":PEN_BUTTON_PRIMARY | PEN_BUTTON_TERTIARY,
+            "tilt":90,
+        });
+        let event: Event = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(
+            event,
+            Event::PenTouch {
+                pointer_id: PEN_POINTER_ID,
+                device: PenTouchDevice::Pen,
+                phase: PenTouchPhase::Move,
+                x: u16::MAX,
+                y: 0,
+                pressure: Some(0.75),
+                contact_area_major: Some(0.8),
+                contact_area_minor: Some(0.3),
+                rotation_degrees: Some(359),
+                pen_tool: Some(PenTool::Unknown),
+                pen_buttons: Some(PEN_BUTTON_PRIMARY | PEN_BUTTON_TERTIARY),
+                tilt: Some(90),
+            }
+        );
+        assert!(event.validate().is_ok());
+        assert_eq!(serde_json::to_value(event).unwrap(), payload);
+
+        let mut known_zero = serde_json::from_value::<Event>(json!({
+            "kind":"pen_touch",
+            "pointer_id":PEN_POINTER_ID,
+            "device":"pen",
+            "phase":"move",
+            "x":0,
+            "y":0,
+            "rotation_degrees":0
+        }))
+        .unwrap();
+        assert!(known_zero.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&known_zero).unwrap()["rotation_degrees"],
+            0
+        );
+        if let Event::PenTouch {
+            rotation_degrees, ..
+        } = &mut known_zero
+        {
+            *rotation_degrees = None;
+        }
+        assert!(
+            serde_json::to_value(known_zero)
+                .unwrap()
+                .get("rotation_degrees")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pen_touch_preserves_unknown_optional_samples_and_touch_pointer_identity() {
+        let payload = json!({
+            "kind":"pen_touch",
+            "pointer_id":4294967295u32,
+            "device":"touch",
+            "phase":"down",
+            "x":0,
+            "y":65535
         });
         let event: Event = serde_json::from_value(payload.clone()).unwrap();
         assert_eq!(
             event,
             Event::PenTouch {
                 pointer_id: u32::MAX,
-                device: PenTouchDevice::Pen,
-                phase: PenTouchPhase::Move,
-                x: u16::MAX,
-                y: 0,
-                pressure: Some(0.75),
-                tilt_x: Some(-90),
-                tilt_y: Some(90),
+                device: PenTouchDevice::Touch,
+                phase: PenTouchPhase::Down,
+                x: 0,
+                y: u16::MAX,
+                pressure: None,
+                contact_area_major: None,
+                contact_area_minor: None,
+                rotation_degrees: None,
+                pen_tool: None,
+                pen_buttons: None,
+                tilt: None,
             }
         );
         assert!(event.validate().is_ok());
@@ -877,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn pen_touch_rejects_out_of_range_coordinates_and_type_specific_fields() {
+    fn pen_touch_rejects_out_of_range_coordinates_and_non_pen_identity() {
         for coordinate in [-1, 65_536] {
             assert!(
                 serde_json::from_value::<Event>(json!({
@@ -892,78 +1046,167 @@ mod tests {
             );
         }
 
-        let touch_tilt: Event = serde_json::from_value(json!({
-            "kind":"pen_touch",
-            "pointer_id":1,
-            "device":"touch",
-            "phase":"down",
-            "x":0,
-            "y":0,
-            "tilt_x":0
-        }))
-        .unwrap();
-        assert_eq!(touch_tilt.validate().unwrap_err().code, "invalid_event");
+        assert!(
+            serde_json::from_value::<Event>(json!({
+                "kind":"pen_touch",
+                "pointer_id":4294967296u64,
+                "device":"pen",
+                "phase":"down",
+                "x":0,
+                "y":0
+            }))
+            .is_err()
+        );
 
-        let one_sided_pen_tilt: Event = serde_json::from_value(json!({
+        let wrong_pen_id: Event = serde_json::from_value(json!({
             "kind":"pen_touch",
-            "pointer_id":1,
+            "pointer_id":2,
             "device":"pen",
             "phase":"down",
             "x":0,
-            "y":0,
-            "tilt_x":0
+            "y":0
         }))
         .unwrap();
-        assert_eq!(
-            one_sided_pen_tilt.validate().unwrap_err().code,
-            "invalid_event"
-        );
-
-        let out_of_range_tilt: Event = serde_json::from_value(json!({
-            "kind":"pen_touch",
-            "pointer_id":1,
-            "device":"pen",
-            "phase":"down",
-            "x":0,
-            "y":0,
-            "tilt_x":91,
-            "tilt_y":0
-        }))
-        .unwrap();
-        assert_eq!(
-            out_of_range_tilt.validate().unwrap_err().code,
-            "invalid_event"
-        );
+        assert_eq!(wrong_pen_id.validate().unwrap_err().code, "invalid_event");
     }
 
     #[test]
-    fn pen_touch_rejects_non_finite_and_out_of_range_pressure() {
-        for pressure in [-0.01, 1.01] {
-            let event: Event = serde_json::from_value(json!({
+    fn pen_touch_rejects_invalid_rotation_tilt_buttons_and_touch_pen_fields() {
+        for (field, value) in [
+            ("rotation_degrees", json!(360)),
+            ("tilt", json!(91)),
+            ("pen_buttons", json!(PEN_BUTTON_MASK | 0b1000)),
+        ] {
+            let mut payload = json!({
+                "kind":"pen_touch",
+                "pointer_id":PEN_POINTER_ID,
+                "device":"pen",
+                "phase":"down",
+                "x":0,
+                "y":0
+            });
+            payload[field] = value;
+            let event: Event = serde_json::from_value(payload).unwrap();
+            assert_eq!(
+                event.validate().unwrap_err().code,
+                "invalid_event",
+                "{field}"
+            );
+        }
+
+        for field_value in [
+            ("pen_tool", json!("eraser")),
+            ("pen_buttons", json!(PEN_BUTTON_PRIMARY)),
+            ("tilt", json!(0)),
+        ] {
+            let mut payload = json!({
                 "kind":"pen_touch",
                 "pointer_id":1,
                 "device":"touch",
                 "phase":"down",
                 "x":0,
-                "y":0,
-                "pressure":pressure
-            }))
-            .unwrap();
+                "y":0
+            });
+            payload[field_value.0] = field_value.1;
+            let event: Event = serde_json::from_value(payload).unwrap();
             assert_eq!(event.validate().unwrap_err().code, "invalid_event");
         }
 
-        for pressure in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(
+            serde_json::from_value::<Event>(json!({
+                "kind":"pen_touch",
+                "pointer_id":PEN_POINTER_ID,
+                "device":"pen",
+                "phase":"down",
+                "x":0,
+                "y":0,
+                "rotation_degrees":-1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Event>(json!({
+                "kind":"pen_touch",
+                "pointer_id":PEN_POINTER_ID,
+                "device":"pen",
+                "phase":"down",
+                "x":0,
+                "y":0,
+                "pen_tool":"brush"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pen_touch_rejects_malformed_contact_area_and_pressure() {
+        for (major, minor) in [(Some(0.2), None), (None, Some(0.2))] {
             let event = Event::PenTouch {
                 pointer_id: 1,
-                device: PenTouchDevice::Pen,
+                device: PenTouchDevice::Touch,
                 phase: PenTouchPhase::Down,
                 x: 0,
                 y: 0,
-                pressure: Some(pressure),
-                tilt_x: None,
-                tilt_y: None,
+                pressure: None,
+                contact_area_major: major,
+                contact_area_minor: minor,
+                rotation_degrees: None,
+                pen_tool: None,
+                pen_buttons: None,
+                tilt: None,
             };
             assert_eq!(event.validate().unwrap_err().code, "invalid_event");
         }
+
+        for sample in [
+            ("pressure", f32::NAN),
+            ("pressure", f32::INFINITY),
+            ("pressure", f32::NEG_INFINITY),
+            ("pressure", -0.01),
+            ("pressure", 1.01),
+            ("contact area", f32::NAN),
+            ("contact area", f32::INFINITY),
+            ("contact area", -0.01),
+            ("contact area", 1.01),
+        ] {
+            let event = Event::PenTouch {
+                pointer_id: 1,
+                device: PenTouchDevice::Touch,
+                phase: PenTouchPhase::Down,
+                x: 0,
+                y: 0,
+                pressure: (sample.0 == "pressure").then_some(sample.1),
+                contact_area_major: (sample.0 == "contact area").then_some(sample.1),
+                contact_area_minor: (sample.0 == "contact area").then_some(sample.1),
+                rotation_degrees: None,
+                pen_tool: None,
+                pen_buttons: None,
+                tilt: None,
+            };
+            assert_eq!(
+                event.validate().unwrap_err().code,
+                "invalid_event",
+                "{}",
+                sample.0
+            );
+        }
+    }
+
+    #[test]
+    fn pen_tilt_axes_use_polar_rotation_and_require_known_valid_samples() {
+        let assert_axes = |rotation: u16, expected_x: f32, expected_y: f32| {
+            let (x, y) = pen_tilt_axes(Some(45), Some(rotation)).unwrap();
+            assert!((x - expected_x).abs() < 0.001, "rotation {rotation}: x={x}");
+            assert!((y - expected_y).abs() < 0.001, "rotation {rotation}: y={y}");
+        };
+        assert_axes(0, 0.0, 45.0);
+        assert_axes(90, -45.0, 0.0);
+        assert_axes(180, 0.0, -45.0);
+        assert_axes(270, 45.0, 0.0);
+        assert_eq!(pen_tilt_axes(None, Some(90)), None);
+        assert_eq!(pen_tilt_axes(Some(45), None), None);
+        assert_eq!(pen_tilt_axes(Some(91), Some(0)), None);
+        assert_eq!(pen_tilt_axes(Some(45), Some(360)), None);
+        assert_eq!(pen_tilt_axes(Some(0), Some(359)), Some((0.0, 0.0)));
     }
 }

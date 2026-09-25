@@ -117,29 +117,12 @@ impl ActivePenTouch {
     }
 
     fn cancel_event(&self) -> Event {
-        let Event::PenTouch {
-            pointer_id,
-            device,
-            x,
-            y,
-            pressure,
-            tilt_x,
-            tilt_y,
-            ..
-        } = &self.last_event
-        else {
+        let mut event = self.last_event.clone();
+        let Event::PenTouch { phase, .. } = &mut event else {
             unreachable!("active pen/touch contacts retain pen/touch events")
         };
-        Event::PenTouch {
-            pointer_id: *pointer_id,
-            device: *device,
-            phase: PenTouchPhase::Cancel,
-            x: *x,
-            y: *y,
-            pressure: *pressure,
-            tilt_x: *tilt_x,
-            tilt_y: *tilt_y,
-        }
+        *phase = PenTouchPhase::Cancel;
+        event
     }
 }
 
