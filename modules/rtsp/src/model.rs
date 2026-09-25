@@ -313,6 +313,13 @@ pub struct Profile {
     pub encrypt_audio: bool,
     pub permit_legacy_audio_iv_wrap: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EncryptionSnapshot {
+    pub video: bool,
+    pub audio: bool,
+}
+
 impl Default for Profile {
     fn default() -> Self {
         Self {
@@ -643,6 +650,17 @@ impl Open {
                 },
             },
         })
+    }
+
+    pub(crate) fn arm_with_encryption(
+        &self,
+        session: u64,
+        encryption: EncryptionSnapshot,
+    ) -> serde_json::Value {
+        let mut payload = self.arm(session);
+        payload["configuration"]["encrypt_video"] = serde_json::json!(encryption.video);
+        payload["configuration"]["encrypt_audio"] = serde_json::json!(encryption.audio);
+        payload
     }
 }
 

@@ -1,5 +1,8 @@
 use super::*;
-use amaterasu_gamestream::rtsp::Method;
+use amaterasu_gamestream::{
+    rtsp::Method,
+    sdp::{Announce, parse_announce},
+};
 use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
 use std::{
     ffi::c_void,
@@ -92,6 +95,7 @@ fn record(state: State) -> Record {
         state,
         session: Some(23),
         negotiation: None,
+        negotiated_encryption: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -120,6 +124,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         state: State::Preparing,
         session: None,
         negotiation: None,
+        negotiated_encryption: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -760,6 +765,71 @@ fn pending_play(record: &Record) -> (Negotiation, u64) {
         panic!("play action");
     };
     (negotiation, ticket)
+}
+
+fn announced_profile_record() -> (Record, Announce) {
+    let announcement =
+        include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp").replace(
+            "x-ss-general.encryptionEnabled:0",
+            "x-ss-general.encryptionEnabled:7",
+        );
+    let announce = parse_announce(announcement.as_bytes()).expect("valid encrypted ANNOUNCE");
+    let mut record = record(State::Ready);
+    let profile = &mut record.config.profile;
+    profile.width = announce.video.width;
+    profile.height = announce.video.height;
+    profile.fps = announce.video.fps;
+    profile.bitrate_kbps = announce.video.bitrate_kbps;
+    profile.max_reference_frames = announce.video.max_reference_frames;
+    profile.packet_size = announce.packet_size as usize;
+    profile.packet_ms = announce.audio.packet_duration_ms;
+    profile.min_parity_shards = announce.fec.minimum_packets as u8;
+    profile.encrypt_video = announce.encryption.video;
+    profile.encrypt_audio = announce.encryption.audio;
+    if let Some(repair_percent) = announce.fec.repair_percent {
+        profile.fec_percentage = repair_percent as u8;
+    }
+    (record, announce)
+}
+
+#[test]
+fn accepted_announce_encryption_flows_into_authenticated_play_start() {
+    let (mut record, announce) = announced_profile_record();
+    assert!(record.accept_announce(&announce));
+
+    let payload = record
+        .authenticated_start_payload(23)
+        .expect("accepted ANNOUNCE enables authenticated start");
+
+    assert_eq!(payload["action"], "start_when_authenticated");
+    assert_eq!(payload["session"], 23);
+    assert_eq!(
+        payload["configuration"]["encrypt_video"],
+        announce.encryption.video
+    );
+    assert_eq!(
+        payload["configuration"]["encrypt_audio"],
+        announce.encryption.audio
+    );
+    assert!(
+        record.config.arm(23)["configuration"]
+            .get("encrypt_video")
+            .is_none()
+    );
+}
+
+#[test]
+fn rejected_announce_cannot_produce_an_authenticated_play_start() {
+    let (mut record, announce) = announced_profile_record();
+    record.config.profile.encrypt_audio = false;
+    record.negotiated_encryption = Some(crate::model::EncryptionSnapshot {
+        video: true,
+        audio: true,
+    });
+
+    assert!(!record.accept_announce(&announce));
+    assert!(record.negotiated_encryption.is_none());
+    assert!(record.authenticated_start_payload(23).is_none());
 }
 
 #[test]

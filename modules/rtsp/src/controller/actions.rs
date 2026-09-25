@@ -137,6 +137,7 @@ impl Controller {
             state: State::Preparing,
             session: None,
             negotiation: None,
+            negotiated_encryption: None,
             url,
             session_token,
             udp_discovery,

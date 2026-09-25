@@ -26,6 +26,7 @@ pub(super) struct Record {
     pub state: State,
     pub session: Option<u64>,
     pub negotiation: Option<Negotiation>,
+    pub negotiated_encryption: Option<crate::model::EncryptionSnapshot>,
     pub url: String,
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
@@ -43,6 +44,23 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub(super) fn accept_announce(
+        &mut self,
+        announce: &amaterasu_gamestream::sdp::Announce,
+    ) -> bool {
+        let accepted = self.config.effective_profile().matches(announce);
+        self.negotiated_encryption = accepted.then_some(crate::model::EncryptionSnapshot {
+            video: announce.encryption.video,
+            audio: announce.encryption.audio,
+        });
+        accepted
+    }
+
+    pub(super) fn authenticated_start_payload(&self, session: u64) -> Option<Value> {
+        let encryption = self.negotiated_encryption?;
+        Some(self.config.arm_with_encryption(session, encryption))
+    }
+
     pub fn operation(&self) -> String {
         format!("rtsp-{:016x}", self.id)
     }

@@ -73,14 +73,17 @@ impl Controller {
                 ticket: action_ticket,
                 action: Action::Announce(announce),
             }) => {
-                let success = record.config.effective_profile().matches(&announce);
-                self.finish_immediate_action(
+                let success = record.accept_announce(&announce);
+                let completed = self.finish_immediate_action(
                     &mut record,
                     connection,
                     action_ticket,
                     success,
                     "configuration_mismatch",
                 );
+                if !completed {
+                    record.negotiated_encryption = None;
+                }
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
@@ -96,12 +99,18 @@ impl Controller {
                     self.records.insert(ticket, record);
                     return;
                 };
+                let Some(payload) = record.authenticated_start_payload(session) else {
+                    self.fail_network_action(
+                        &mut record,
+                        connection,
+                        action_ticket,
+                        "negotiation_failed",
+                    );
+                    self.records.insert(ticket, record);
+                    return;
+                };
                 record.state = State::Arming;
-                let call = Call::new(
-                    record.config.arm(session),
-                    self.operation_id(&record, "arm"),
-                    None,
-                );
+                let call = Call::new(payload, self.operation_id(&record, "arm"), None);
                 self.job = Some(Job {
                     ticket,
                     phase: Phase::Arm,
@@ -146,7 +155,7 @@ impl Controller {
         action_ticket: u64,
         success: bool,
         failure: &'static str,
-    ) {
+    ) -> bool {
         let reply = record
             .negotiation
             .as_mut()
@@ -155,17 +164,19 @@ impl Controller {
             if !self.reply_bytes(connection, &reply) {
                 record.close(Some("response_unavailable"));
                 self.revoke_ticket(record.id);
-                return;
+                return false;
             }
         } else {
             record.close(Some("negotiation_failed"));
             self.revoke_ticket(record.id);
-            return;
+            return false;
         }
         if !success {
             record.close(Some(failure));
             record.revoke_after = Some(connection);
+            return false;
         }
+        true
     }
 
     pub(super) fn fail_network_action(
