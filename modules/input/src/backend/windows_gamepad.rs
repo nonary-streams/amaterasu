@@ -488,6 +488,7 @@ impl WindowsGamepads {
         }
     }
 
+    #[cfg(test)]
     fn start_with(
         &mut self,
         probe: impl FnOnce() -> InputResult<VigemConnection>,
