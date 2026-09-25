@@ -96,9 +96,12 @@ every five seconds. Retry delays are cancelled by close or module shutdown. A
 reopened capture must keep the published PCM format; an incompatible format
 fails the stream with `audio_format_changed`. The first packet after recovery
 is marked discontinuous, and sequence/timestamp values continue across the new
-capture's timeline. `endpoint` remains the initial selected endpoint snapshot
-for the stream, so the stream-session shared lease keeps its existing identity
-even after a followed Console-default change.
+capture's timeline. In status, `endpoint` reports the active capture endpoint
+and updates after a followed Console-default change successfully reopens capture;
+while recovery is in progress, it remains the last successfully opened capture
+endpoint. `requested_endpoint` remains the initial selector. Open/lookup keep
+`endpoint` as the initial selected endpoint snapshot, so the stream-session
+shared lease keeps its existing identity after a followed Console-default change.
 Close returns `{ok:true}`. Missing/foreign lookup or close returns
 `{ok:false,code:"stream_not_found"}`; absent status returns an empty list.
 Driver error strings and PCM samples are never placed in control replies.

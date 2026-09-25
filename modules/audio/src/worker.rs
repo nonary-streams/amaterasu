@@ -238,6 +238,12 @@ fn set_recovering(health: &Mutex<Health>, recovering: bool) {
     }
 }
 
+fn set_active_endpoint(health: &Mutex<Health>, endpoint: &str) {
+    if let Ok(mut health) = health.lock() {
+        health.active_endpoint = Some(endpoint.to_owned());
+    }
+}
+
 fn run_capture_loop<F>(
     mut capture: Box<dyn CaptureDevice>,
     mut reopen: F,
@@ -249,6 +255,7 @@ fn run_capture_loop<F>(
     F: FnMut() -> AudioResult<Box<dyn CaptureDevice>>,
 {
     let mut continuity = Continuity::new();
+    set_active_endpoint(health, capture.endpoint());
     while !stop.load(Ordering::Acquire) {
         match capture.read() {
             Ok(Some(mut packet)) => {
@@ -292,6 +299,9 @@ fn run_capture_loop<F>(
                             if reopened.format() != recovery_policy.expected_format {
                                 fail(health, "audio_format_changed");
                                 return;
+                            }
+                            if recovery_policy.follow_console_default {
+                                set_active_endpoint(health, reopened.endpoint());
                             }
                             capture = reopened;
                             break;
@@ -481,6 +491,10 @@ mod tests {
         let health = health.lock().unwrap();
         assert!(!health.recovering);
         assert_eq!(health.failure, None);
+        assert_eq!(
+            health.active_endpoint.as_deref(),
+            Some("render.console-new")
+        );
         assert_eq!(health.discontinuities, 1);
     }
 

@@ -249,7 +249,8 @@ impl Controller {
     fn status(&self, owner: &str, requested: Option<u64>) -> Value {
         let streams: Vec<_> = self.streams.iter().filter(|(id,stream)| stream.owner == owner && requested.is_none_or(|requested| requested == **id)).map(|(id,stream)| {
             let health = stream.source.health();
-            json!({"stream":id,"endpoint":stream.endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"format":stream.format,"state":if health.failure.is_some() { "failed" } else if health.recovering { "recovering" } else { "capturing" },"failure":health.failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
+            let endpoint = health.active_endpoint.as_deref().unwrap_or(&stream.endpoint);
+            json!({"stream":id,"endpoint":endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"format":stream.format,"state":if health.failure.is_some() { "failed" } else if health.recovering { "recovering" } else { "capturing" },"failure":health.failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
         }).collect();
         json!({"ok":true,"enabled":self.enabled,"audio_route_restore_pending":platform::route_restore_pending(),"streams":streams})
     }

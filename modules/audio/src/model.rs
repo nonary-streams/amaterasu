@@ -84,6 +84,8 @@ pub struct Packet {
 pub struct Health {
     pub failure: Option<&'static str>,
     pub recovering: bool,
+    #[serde(skip)]
+    pub active_endpoint: Option<String>,
     pub discontinuities: u64,
     pub dropped_packets: u64,
 }

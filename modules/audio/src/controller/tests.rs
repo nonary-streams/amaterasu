@@ -295,6 +295,59 @@ fn empty_ordinary_sink_uses_default_endpoint_and_host_audio_policy_is_idempotent
 }
 
 #[test]
+fn status_tracks_followed_default_while_open_and_lookup_keep_initial_endpoint() {
+    let (mut controller, observed) = controller(true);
+    let open = Operation::Open {
+        endpoint: String::new(),
+        virtual_sink: None,
+        channels: None,
+        host_audio_enabled: false,
+        operation_id: Some("follow-default".into()),
+        capture_sink_without_routing: false,
+    };
+    let opened = controller.handle("alice", open).unwrap();
+    assert_eq!(opened.payload["endpoint"], "render.default");
+    assert_eq!(opened.payload["requested_endpoint"], "");
+
+    assert_eq!(
+        controller.status("alice", Some(1))["streams"][0]["endpoint"],
+        "render.default"
+    );
+    observed.health.lock().unwrap().active_endpoint = Some("render.console-new".into());
+
+    let status = controller.status("alice", Some(1));
+    assert_eq!(status["streams"][0]["endpoint"], "render.console-new");
+    assert_eq!(status["streams"][0]["requested_endpoint"], "");
+
+    let repeated_open = controller
+        .handle(
+            "alice",
+            Operation::Open {
+                endpoint: String::new(),
+                virtual_sink: None,
+                channels: None,
+                host_audio_enabled: false,
+                operation_id: Some("follow-default".into()),
+                capture_sink_without_routing: false,
+            },
+        )
+        .unwrap();
+    let lookup = controller
+        .handle(
+            "alice",
+            Operation::Lookup {
+                operation_id: "follow-default".into(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(repeated_open.payload["endpoint"], "render.default");
+    assert_eq!(lookup.payload["endpoint"], "render.default");
+    assert_eq!(repeated_open.payload["requested_endpoint"], "");
+    assert_eq!(lookup.payload["requested_endpoint"], "");
+}
+
+#[test]
 fn enabled_host_audio_policy_is_forwarded_and_reported_in_status() {
     let (mut controller, observed) = controller(true);
     let opened = controller
