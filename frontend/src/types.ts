@@ -41,6 +41,20 @@ namespace Amaterasu {
     cwd?: string | null;
     timeout_ms?: number;
   }
+  export type CatalogFrameLimiterProvider =
+    | "auto"
+    | "rtss"
+    | "nvidia-control-panel"
+    | "mangohud"
+    | "proton"
+    | "mangohud-proton"
+    | "none";
+  export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
+  export type CatalogRtssFrameLimitType =
+    | "async"
+    | "front edge sync"
+    | "back edge sync"
+    | "nvidia reflex";
   export interface Entry {
     name: string;
     description: string;
@@ -61,6 +75,13 @@ namespace Amaterasu {
       gamepad?: string;
       keyboard?: boolean;
       mouse?: boolean;
+      frame_limiter_enable?: boolean | null;
+      frame_limiter_fps_limit?: number | null;
+      frame_limiter_provider?: CatalogFrameLimiterProvider | null;
+      frame_limiter_disable_vsync?: boolean | null;
+      frame_limiter_auto_virtual_framegen?: CatalogAutoVirtualFramegenMode | null;
+      rtss_frame_limit_type?: CatalogRtssFrameLimitType | null;
+      ds4_back_as_touchpad_click?: boolean | null;
       dd_refresh_rate_option?: RefreshRateOption | null;
       prefer_10bit_sdr?: boolean | null;
     };

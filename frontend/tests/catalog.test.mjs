@@ -50,6 +50,123 @@ test("catalog reads back 10-bit SDR overrides without collapsing false or accept
   }
 });
 
+test("Catalog frame limiter editor round-trips inherited values, explicit false, and zero", () => {
+  const readback = context.Amaterasu.catalogFrameLimiterOverrideFormValues;
+  const parse = context.Amaterasu.parseCatalogFrameLimiterOverrides;
+  const inheritedValues = JSON.parse(JSON.stringify(readback(undefined)));
+  assert.deepEqual(inheritedValues, {
+    frame_limiter_enable: "",
+    frame_limiter_fps_limit: "",
+    frame_limiter_provider: "",
+    frame_limiter_disable_vsync: "",
+    frame_limiter_auto_virtual_framegen: "",
+    rtss_frame_limit_type: "",
+    ds4_back_as_touchpad_click: "",
+  });
+
+  const existingOverrides = {
+    frame_limiter_enable: false,
+    frame_limiter_fps_limit: 0,
+    frame_limiter_provider: "auto",
+    frame_limiter_disable_vsync: null,
+    frame_limiter_auto_virtual_framegen: null,
+    rtss_frame_limit_type: null,
+    ds4_back_as_touchpad_click: false,
+  };
+  const editorValues = JSON.parse(JSON.stringify(readback(existingOverrides)));
+  assert.deepEqual(editorValues, {
+    frame_limiter_enable: "false",
+    frame_limiter_fps_limit: "0",
+    frame_limiter_provider: "auto",
+    frame_limiter_disable_vsync: "",
+    frame_limiter_auto_virtual_framegen: "",
+    rtss_frame_limit_type: "",
+    ds4_back_as_touchpad_click: "false",
+  });
+
+  const form = new FormData();
+  for (const [name, value] of Object.entries(editorValues)) form.set(name, value);
+  const savedPayload = JSON.parse(JSON.stringify(parse(form)));
+  assert.deepEqual(savedPayload, {
+    frame_limiter_enable: false,
+    frame_limiter_fps_limit: 0,
+    frame_limiter_provider: "auto",
+    frame_limiter_disable_vsync: null,
+    frame_limiter_auto_virtual_framegen: null,
+    rtss_frame_limit_type: null,
+    ds4_back_as_touchpad_click: false,
+  });
+  assert.equal(Object.hasOwn(savedPayload, "dd_refresh_rate_option"), false);
+  assert.equal(Object.hasOwn(savedPayload, "prefer_10bit_sdr"), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(readback(savedPayload))), editorValues);
+});
+
+test("Catalog frame limiter controls enforce the current override types and domains", () => {
+  const parse = context.Amaterasu.parseCatalogFrameLimiterOverrides;
+  const fields = new FormData();
+  assert.deepEqual(JSON.parse(JSON.stringify(parse(fields))), {
+    frame_limiter_enable: null,
+    frame_limiter_fps_limit: null,
+    frame_limiter_provider: null,
+    frame_limiter_disable_vsync: null,
+    frame_limiter_auto_virtual_framegen: null,
+    rtss_frame_limit_type: null,
+    ds4_back_as_touchpad_click: null,
+  });
+
+  for (const provider of [
+    "auto",
+    "rtss",
+    "nvidia-control-panel",
+    "mangohud",
+    "proton",
+    "mangohud-proton",
+    "none",
+  ]) {
+    fields.set("frame_limiter_provider", provider);
+    assert.equal(parse(fields).frame_limiter_provider, provider);
+  }
+  for (const name of [
+    "frame_limiter_enable",
+    "frame_limiter_disable_vsync",
+    "ds4_back_as_touchpad_click",
+  ]) {
+    fields.set(name, "true");
+    assert.equal(parse(fields)[name], true);
+  }
+  for (const mode of ["enabled", "vrr", "legacy", "disabled"]) {
+    fields.set("frame_limiter_auto_virtual_framegen", mode);
+    assert.equal(parse(fields).frame_limiter_auto_virtual_framegen, mode);
+  }
+  for (const limitType of ["async", "front edge sync", "back edge sync", "nvidia reflex"]) {
+    fields.set("rtss_frame_limit_type", limitType);
+    assert.equal(parse(fields).rtss_frame_limit_type, limitType);
+  }
+  for (const fpsLimit of ["0", "59.94", "1000", "1.2300"]) {
+    fields.set("frame_limiter_fps_limit", fpsLimit);
+    assert.equal(parse(fields).frame_limiter_fps_limit, Number(fpsLimit));
+  }
+
+  for (const [name, value] of [
+    ["frame_limiter_enable", "yes"],
+    ["frame_limiter_disable_vsync", "0"],
+    ["ds4_back_as_touchpad_click", "FALSE"],
+    ["frame_limiter_fps_limit", "1.0001"],
+    ["frame_limiter_fps_limit", "1.2345"],
+    ["frame_limiter_fps_limit", "1000.001"],
+    ["frame_limiter_fps_limit", "-0.001"],
+    ["frame_limiter_fps_limit", "60hz"],
+    ["frame_limiter_provider", "unknown"],
+    ["frame_limiter_auto_virtual_framegen", "true"],
+    ["frame_limiter_auto_virtual_framegen", "automatic"],
+    ["rtss_frame_limit_type", "invalid"],
+  ]) {
+    const invalidFields = new FormData();
+    invalidFields.set(name, value);
+    assert.throws(() => parse(invalidFields), /Frame limiter|VSync|DS4 Back|Auto virtual|RTSS frame limit/);
+  }
+});
+
 test("Steam artwork chunks assemble into the expected image without a local path", async () => {
   const source = Buffer.alloc(8195, 0x5a);
   const offsets = [];

@@ -784,6 +784,13 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
             "keyboard",
             "mouse",
             "native_pen_touch",
+            "frame_limiter_enable",
+            "frame_limiter_fps_limit",
+            "frame_limiter_provider",
+            "frame_limiter_disable_vsync",
+            "frame_limiter_auto_virtual_framegen",
+            "rtss_frame_limit_type",
+            "ds4_back_as_touchpad_click",
         ],
     )?;
     if let Some(fec) = overrides.get("fec_percentage")
@@ -805,7 +812,98 @@ fn catalog_config_overrides(value: &Value) -> Result<(), &'static str> {
     optional_audio_sink_capture_only(overrides)?;
     optional_back_button_timeout(overrides)?;
     optional_input_overrides(overrides)?;
+    optional_catalog_frame_limiter_overrides(overrides)?;
     Ok(())
+}
+
+fn optional_catalog_frame_limiter_overrides(overrides: &Object) -> Result<(), &'static str> {
+    for key in [
+        "frame_limiter_enable",
+        "frame_limiter_disable_vsync",
+        "ds4_back_as_touchpad_click",
+    ] {
+        if overrides
+            .get(key)
+            .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+        {
+            return Err(INVALID);
+        }
+    }
+
+    if overrides
+        .get("frame_limiter_fps_limit")
+        .is_some_and(|value| {
+            !value.is_null()
+                && !value
+                    .as_f64()
+                    .is_some_and(valid_catalog_frame_limiter_fps_limit)
+        })
+        || overrides
+            .get("frame_limiter_provider")
+            .is_some_and(|value| {
+                !value.is_null()
+                    && value
+                        .as_str()
+                        .is_none_or(|provider| !valid_catalog_frame_limiter_provider(provider))
+            })
+        || overrides
+            .get("frame_limiter_auto_virtual_framegen")
+            .is_some_and(|value| {
+                !value.is_null()
+                    && match value {
+                        Value::Bool(_) => false,
+                        Value::String(mode) => !matches!(
+                            mode.as_str(),
+                            "true" | "false" | "enabled" | "vrr" | "legacy" | "disabled"
+                        ),
+                        _ => true,
+                    }
+            })
+        || overrides.get("rtss_frame_limit_type").is_some_and(|value| {
+            !value.is_null()
+                && (!cfg!(windows)
+                    || value.as_str().is_none_or(|limit_type| {
+                        !matches!(
+                            limit_type,
+                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
+                        )
+                    }))
+        })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn valid_catalog_frame_limiter_fps_limit(value: f64) -> bool {
+    if !value.is_finite() || !(0.0..=1000.0).contains(&value) {
+        return false;
+    }
+    let millihertz = value * 1000.0;
+    let rounding_tolerance = f64::EPSILON * millihertz.abs().max(1.0) * 4.0;
+    (millihertz - millihertz.round()).abs() <= rounding_tolerance
+}
+
+fn valid_catalog_frame_limiter_provider(provider: &str) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            provider,
+            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        provider == "auto"
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        provider == "auto"
+    }
 }
 
 fn optional_audio_sink(overrides: &Object) -> Result<(), &'static str> {
@@ -2582,6 +2680,17 @@ mod catalog_tests {
         }
     }
 
+    fn catalog_create_with_overrides(config_overrides: Value) -> Value {
+        serde_json::json!({
+            "expected_revision": 4,
+            "entry": {
+                "name": "Game",
+                "launch": {"kind": "application", "path": "/game"},
+                "config_overrides": config_overrides,
+            },
+        })
+    }
+
     #[test]
     fn catalog_editor_accepts_sparse_fec_and_supported_executable_policy() {
         let create = serde_json::json!({
@@ -2678,6 +2787,133 @@ mod catalog_tests {
                 validate(route, value.as_object().unwrap()).is_err(),
                 "accepted invalid patch: {}",
                 String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_frame_limiter_overrides_preserve_sparse_inheritance_and_field_domains() {
+        let route = route("create");
+        let empty = catalog_create_with_overrides(serde_json::json!({}));
+        assert!(validate(route, empty.as_object().unwrap()).is_ok());
+
+        for key in [
+            "frame_limiter_enable",
+            "frame_limiter_fps_limit",
+            "frame_limiter_provider",
+            "frame_limiter_disable_vsync",
+            "frame_limiter_auto_virtual_framegen",
+            "rtss_frame_limit_type",
+            "ds4_back_as_touchpad_click",
+        ] {
+            let mut inherited_overrides = serde_json::Map::new();
+            inherited_overrides.insert(key.to_owned(), Value::Null);
+            let inherited = catalog_create_with_overrides(Value::Object(inherited_overrides));
+            assert!(
+                validate(route, inherited.as_object().unwrap()).is_ok(),
+                "rejected inherited Catalog override {key}"
+            );
+        }
+
+        let explicit = catalog_create_with_overrides(serde_json::json!({
+            "frame_limiter_enable": false,
+            "frame_limiter_fps_limit": 0,
+            "frame_limiter_provider": "auto",
+            "frame_limiter_disable_vsync": false,
+            "frame_limiter_auto_virtual_framegen": "disabled",
+            "ds4_back_as_touchpad_click": false,
+        }));
+        assert!(validate(route, explicit.as_object().unwrap()).is_ok());
+        assert_eq!(
+            explicit["entry"]["config_overrides"]["frame_limiter_enable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            explicit["entry"]["config_overrides"]["frame_limiter_fps_limit"].as_f64(),
+            Some(0.0)
+        );
+        assert_eq!(
+            explicit["entry"]["config_overrides"]["ds4_back_as_touchpad_click"].as_bool(),
+            Some(false)
+        );
+
+        let valid_providers = {
+            let mut providers = vec!["auto"];
+            if cfg!(windows) {
+                providers.extend(["rtss", "nvidia-control-panel", "none"]);
+            } else if cfg!(target_os = "linux") {
+                providers.extend(["mangohud", "proton", "mangohud-proton", "none"]);
+            }
+            providers
+        };
+        for provider in valid_providers {
+            let overrides = serde_json::json!({"frame_limiter_provider": provider});
+            assert!(
+                catalog_config_overrides(&overrides).is_ok(),
+                "rejected Catalog frame limiter provider {provider}"
+            );
+        }
+        for mode in ["enabled", "vrr", "legacy", "disabled", "true", "false"] {
+            let overrides = serde_json::json!({"frame_limiter_auto_virtual_framegen": mode});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+        for enabled in [true, false] {
+            let overrides = serde_json::json!({"frame_limiter_auto_virtual_framegen": enabled});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+        if cfg!(windows) {
+            for limit_type in [
+                "async",
+                "front edge sync",
+                "back edge sync",
+                "nvidia reflex",
+            ] {
+                let overrides = serde_json::json!({"rtss_frame_limit_type": limit_type});
+                assert!(catalog_config_overrides(&overrides).is_ok());
+            }
+        }
+        for fps_limit in [0.0, 59.94, 1000.0] {
+            let overrides = serde_json::json!({"frame_limiter_fps_limit": fps_limit});
+            assert!(catalog_config_overrides(&overrides).is_ok());
+        }
+
+        let unsupported_provider = if cfg!(windows) {
+            "mangohud"
+        } else if cfg!(target_os = "linux") {
+            "rtss"
+        } else {
+            "proton"
+        };
+        let mut invalid_overrides = vec![
+            serde_json::json!({"frame_limiter_enable":"false"}),
+            serde_json::json!({"frame_limiter_fps_limit":"60"}),
+            serde_json::json!({"frame_limiter_fps_limit":-0.001}),
+            serde_json::json!({"frame_limiter_fps_limit":1000.001}),
+            serde_json::json!({"frame_limiter_fps_limit":1.0001}),
+            serde_json::json!({"frame_limiter_fps_limit":true}),
+            serde_json::json!({"frame_limiter_provider":"unknown"}),
+            serde_json::json!({"frame_limiter_provider":false}),
+            serde_json::json!({"frame_limiter_provider":unsupported_provider}),
+            serde_json::json!({"frame_limiter_disable_vsync":0}),
+            serde_json::json!({"frame_limiter_auto_virtual_framegen":"vrrr"}),
+            serde_json::json!({"frame_limiter_auto_virtual_framegen":1}),
+            serde_json::json!({"frame_limiter_auto_virtual_framegen":[]}),
+            serde_json::json!({"rtss_frame_limit_type":"unknown"}),
+            serde_json::json!({"rtss_frame_limit_type":false}),
+            serde_json::json!({"ds4_back_as_touchpad_click":"false"}),
+            serde_json::json!({"ds4_back_as_touchpad_click":0}),
+            serde_json::json!({"unrelated_override":true}),
+            serde_json::json!({"dd_refresh_rate_option":"auto"}),
+            serde_json::json!({"prefer_10bit_sdr":false}),
+        ];
+        if !cfg!(windows) {
+            invalid_overrides.push(serde_json::json!({"rtss_frame_limit_type":"async"}));
+        }
+        for overrides in invalid_overrides {
+            let request = catalog_create_with_overrides(overrides.clone());
+            assert!(
+                validate(route, request.as_object().unwrap()).is_err(),
+                "accepted invalid Catalog frame limiter override: {overrides}"
             );
         }
     }

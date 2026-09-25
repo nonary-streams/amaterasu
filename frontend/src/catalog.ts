@@ -78,6 +78,22 @@ namespace Amaterasu {
   }
 
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
+  const catalogFrameLimiterProviderValues: readonly CatalogFrameLimiterProvider[] = [
+    "auto",
+    "rtss",
+    "nvidia-control-panel",
+    "mangohud",
+    "proton",
+    "mangohud-proton",
+    "none",
+  ];
+  const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"] as const;
+  const catalogRtssFrameLimitTypes = [
+    "async",
+    "front edge sync",
+    "back edge sync",
+    "nvidia reflex",
+  ] as const;
 
   function catalogEnumOverrideSelect(
     name: string,
@@ -101,6 +117,174 @@ namespace Amaterasu {
     }
     select.value = current ?? "";
     return select;
+  }
+
+  export type CatalogFrameLimiterOverrides = Pick<
+    NonNullable<Entry["config_overrides"]>,
+    | "frame_limiter_enable"
+    | "frame_limiter_fps_limit"
+    | "frame_limiter_provider"
+    | "frame_limiter_disable_vsync"
+    | "frame_limiter_auto_virtual_framegen"
+    | "rtss_frame_limit_type"
+    | "ds4_back_as_touchpad_click"
+  >;
+
+  type CatalogFrameLimiterOverrideControlValues = Record<
+    keyof CatalogFrameLimiterOverrides,
+    string
+  >;
+
+  export function catalogFrameLimiterOverrideFormValues(
+    overrides: Entry["config_overrides"] | undefined,
+  ): CatalogFrameLimiterOverrideControlValues {
+    const text = (value: boolean | number | string | null | undefined) =>
+      value == null ? "" : String(value);
+    return {
+      frame_limiter_enable: text(overrides?.frame_limiter_enable),
+      frame_limiter_fps_limit: text(overrides?.frame_limiter_fps_limit),
+      frame_limiter_provider: text(overrides?.frame_limiter_provider),
+      frame_limiter_disable_vsync: text(overrides?.frame_limiter_disable_vsync),
+      frame_limiter_auto_virtual_framegen: text(overrides?.frame_limiter_auto_virtual_framegen),
+      rtss_frame_limit_type: text(overrides?.rtss_frame_limit_type),
+      ds4_back_as_touchpad_click: text(overrides?.ds4_back_as_touchpad_click),
+    };
+  }
+
+  function catalogFrameLimiterOverrideFields(
+    overrides: Entry["config_overrides"] | undefined,
+  ): HTMLElement[] {
+    const values = catalogFrameLimiterOverrideFormValues(overrides);
+    const enable = audioOverrideSelect(
+      "frame_limiter_enable",
+      values.frame_limiter_enable === "" ? undefined : values.frame_limiter_enable === "true",
+    );
+    const fpsLimit = input("frame_limiter_fps_limit", values.frame_limiter_fps_limit, "number");
+    fpsLimit.min = "0";
+    fpsLimit.max = "1000";
+    fpsLimit.step = "0.001";
+    fpsLimit.placeholder = "Inherit";
+    const provider = catalogEnumOverrideSelect(
+      "frame_limiter_provider",
+      values.frame_limiter_provider,
+      catalogFrameLimiterProviderValues,
+    );
+    const disableVsync = audioOverrideSelect(
+      "frame_limiter_disable_vsync",
+      values.frame_limiter_disable_vsync === ""
+        ? undefined
+        : values.frame_limiter_disable_vsync === "true",
+    );
+    const autoVirtualFramegen = catalogEnumOverrideSelect(
+      "frame_limiter_auto_virtual_framegen",
+      values.frame_limiter_auto_virtual_framegen,
+      catalogAutoVirtualFramegenModes,
+    );
+    const rtssFrameLimitType = catalogEnumOverrideSelect(
+      "rtss_frame_limit_type",
+      values.rtss_frame_limit_type,
+      catalogRtssFrameLimitTypes,
+    );
+    const ds4BackAsTouchpadClick = audioOverrideSelect(
+      "ds4_back_as_touchpad_click",
+      values.ds4_back_as_touchpad_click === ""
+        ? undefined
+        : values.ds4_back_as_touchpad_click === "true",
+    );
+    return [
+      field("Frame limiter", enable, "Blank inherits. Runtime application remains pending."),
+      field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
+      field("Frame limiter provider", provider, "Choose a provider supported by this host; blank inherits."),
+      field("Disable VSync for RTSS", disableVsync, "Blank inherits the next scope."),
+      field(
+        "Auto virtual frame generation mode",
+        autoVirtualFramegen,
+        "Blank inherits. Choose enabled, vrr, legacy, or disabled.",
+      ),
+      field(
+        "RTSS frame limit type",
+        rtssFrameLimitType,
+        "Blank inherits. RTSS frame limit types are available on Windows.",
+      ),
+      field(
+        "DS4 Back as touchpad click",
+        ds4BackAsTouchpadClick,
+        "Only applies to a DS4 profile. Blank inherits; explicit false is preserved.",
+      ),
+    ];
+  }
+
+  function parseCatalogFrameLimiterEnum<T extends string>(
+    value: string,
+    allowedValues: readonly T[],
+    label: string,
+  ): T | null {
+    if (value === "") return null;
+    if (!allowedValues.includes(value as T))
+      throw new Error(`${label} must be one of the supported values.`);
+    return value as T;
+  }
+
+  function parseCatalogFrameLimiterFpsLimit(value: string): number | null {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    if (
+      !/^(?:[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(trimmed)
+    )
+      throw new Error(
+        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
+      );
+    const fpsLimit = Number(trimmed);
+    if (!Number.isFinite(fpsLimit) || fpsLimit < 0 || fpsLimit > 1000)
+      throw new Error(
+        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
+      );
+    const millihertz = fpsLimit * 1000;
+    const roundingTolerance = Number.EPSILON * Math.max(Math.abs(millihertz), 1) * 4;
+    if (Math.abs(millihertz - Math.round(millihertz)) > roundingTolerance)
+      throw new Error(
+        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
+      );
+    return fpsLimit;
+  }
+
+  export function parseCatalogFrameLimiterOverrides(
+    data: FormData,
+  ): CatalogFrameLimiterOverrides {
+    const text = (name: keyof CatalogFrameLimiterOverrides) =>
+      String(data.get(name) ?? "");
+    return {
+      frame_limiter_enable: Amaterasu.parseInputBooleanOverride(
+        text("frame_limiter_enable"),
+        "Frame limiter",
+      ),
+      frame_limiter_fps_limit: parseCatalogFrameLimiterFpsLimit(
+        text("frame_limiter_fps_limit"),
+      ),
+      frame_limiter_provider: parseCatalogFrameLimiterEnum(
+        text("frame_limiter_provider"),
+        catalogFrameLimiterProviderValues,
+        "Frame limiter provider",
+      ),
+      frame_limiter_disable_vsync: Amaterasu.parseInputBooleanOverride(
+        text("frame_limiter_disable_vsync"),
+        "Disable VSync for RTSS",
+      ),
+      frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(
+        text("frame_limiter_auto_virtual_framegen"),
+        catalogAutoVirtualFramegenModes,
+        "Auto virtual frame generation mode",
+      ),
+      rtss_frame_limit_type: parseCatalogFrameLimiterEnum(
+        text("rtss_frame_limit_type"),
+        catalogRtssFrameLimitTypes,
+        "RTSS frame limit type",
+      ),
+      ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(
+        text("ds4_back_as_touchpad_click"),
+        "DS4 Back as touchpad click",
+      ),
+    };
   }
 
   export function catalogRefreshRateOptionText(
@@ -468,6 +652,7 @@ namespace Amaterasu {
       fec.step = "1";
       fec.placeholder = "Inherit";
       fec.setAttribute("aria-label", `FEC percentage override for ${row.entry.name}`);
+      const frameLimiterFields = catalogFrameLimiterOverrideFields(row.entry.config_overrides);
       const streamAudio = audioOverrideSelect(
         "stream_audio",
         row.entry.config_overrides?.stream_audio,
@@ -503,6 +688,7 @@ namespace Amaterasu {
           fec,
           "Leave blank to inherit the global setting. Supported values are 1–255.",
         ),
+        ...frameLimiterFields,
         ...refreshRateOptionFields,
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
         audioSink.controls,
@@ -525,13 +711,26 @@ namespace Amaterasu {
         void runAction(save, feedback, async () => {
           const config_overrides = {
             ...providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
+            ...parseCatalogFrameLimiterOverrides(new FormData(form)),
             dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
           };
           try {
             const reply = await api.post<{
               id: string;
               revision: number;
-              config_overrides: { fec_percentage?: number; stream_audio?: boolean; audio_sink?: string; virtual_sink?: string; audio_sink_capture_only?: boolean; back_button_timeout?: number; controller?: boolean; gamepad?: string; keyboard?: boolean; mouse?: boolean; dd_refresh_rate_option?: RefreshRateOption | null };
+              config_overrides: {
+                fec_percentage?: number;
+                stream_audio?: boolean;
+                audio_sink?: string;
+                virtual_sink?: string;
+                audio_sink_capture_only?: boolean;
+                back_button_timeout?: number;
+                controller?: boolean;
+                gamepad?: string;
+                keyboard?: boolean;
+                mouse?: boolean;
+                dd_refresh_rate_option?: RefreshRateOption | null;
+              } & CatalogFrameLimiterOverrides;
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -601,6 +800,10 @@ namespace Amaterasu {
         if (!form.reportValidity()) return;
         void runAction(save, feedback, async () => {
           const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
+          entry.config_overrides = {
+            ...(entry.config_overrides ?? {}),
+            ...parseCatalogFrameLimiterOverrides(new FormData(form)),
+          };
           await api.post(row ? "catalog/update" : "catalog/create", {
             ...(row ? { id: row.id } : {}),
             entry,
@@ -703,6 +906,7 @@ namespace Amaterasu {
     fec.min = "1";
     fec.max = "255";
     fec.step = "1";
+    const frameLimiterFields = catalogFrameLimiterOverrideFields(entry?.config_overrides);
     const streamAudio = audioOverrideSelect(
       "stream_audio",
       entry?.config_overrides?.stream_audio,
@@ -795,6 +999,7 @@ namespace Amaterasu {
       ),
       pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
+      ...frameLimiterFields,
       ...refreshRateOptionFields,
       field(
         "10-bit SDR preference",
