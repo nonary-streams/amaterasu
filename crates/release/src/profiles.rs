@@ -791,7 +791,11 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
         ("amaterasu.input-probe".into(), json!({"enabled": false})),
         (
             "amaterasu.pairing".into(),
-            json!({"administrator_principals": ["amaterasu.console", "amaterasu.management"], "transport_principals": ["amaterasu.nvhttp"]}),
+            json!({
+                "administrator_principals": ["amaterasu.console", "amaterasu.management"],
+                "transport_principals": ["amaterasu.nvhttp"],
+                "host_configuration": true,
+            }),
         ),
         ("amaterasu.display".into(), json!({"allow_mutation": false})),
         (
