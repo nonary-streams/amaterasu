@@ -15,6 +15,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
     }
     match route.service {
         "amaterasu.authentication/1" => authentication(route.action, object),
+        "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
@@ -26,6 +27,77 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.input/1" => input(route.action, object),
         "amaterasu.session-history/1" => history(route.action, object),
         _ => Ok(()),
+    }
+}
+
+fn host_configuration(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "get" => fields(object, &[], &[]),
+        "update" => {
+            fields(
+                object,
+                &[
+                    "expected_revision",
+                    "file_state",
+                    "vibeshine_file_state",
+                    "credentials_file",
+                    "pkey",
+                    "cert",
+                    "log_path",
+                    "min_log_level",
+                ],
+                &[],
+            )?;
+            if object
+                .get("expected_revision")
+                .and_then(Value::as_u64)
+                .is_none()
+                || !matches!(
+                    text(object, "min_log_level")?,
+                    "product_default"
+                        | "verbose"
+                        | "debug"
+                        | "info"
+                        | "warning"
+                        | "error"
+                        | "fatal"
+                        | "none"
+                )
+            {
+                return Err(INVALID);
+            }
+            for key in [
+                "file_state",
+                "vibeshine_file_state",
+                "credentials_file",
+                "pkey",
+                "cert",
+                "log_path",
+            ] {
+                let path = text(object, key)?;
+                if (path.is_empty() && key != "credentials_file")
+                    || path.len() > 4096
+                    || path.chars().any(char::is_control)
+                    || Path::new(path)
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                    || (cfg!(windows)
+                        && !Path::new(path).is_absolute()
+                        && Path::new(path)
+                            .components()
+                            .any(|component| matches!(component, std::path::Component::Prefix(_))))
+                    || (!path.is_empty()
+                        && !Path::new(path).is_absolute()
+                        && Path::new(path)
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::CurDir)))
+                {
+                    return Err(INVALID);
+                }
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
     }
 }
 

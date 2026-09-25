@@ -122,6 +122,92 @@ test("authentication editor reports conflicts and unconfirmed writes", async () 
   }
 });
 
+function hostConfiguration(revision = 6) {
+  return {
+    ok: true,
+    ready: true,
+    version: 1,
+    revision,
+    values: {
+      file_state: "existing/state.json",
+      vibeshine_file_state: "old/state.json",
+      credentials_file: "",
+      pkey: "credentials/key.pem",
+      cert: "credentials/cert.pem",
+      log_path: "amaterasu.log",
+      min_log_level: "product_default",
+    },
+    effective: { log_path: "C:/state/amaterasu.log", min_log_level: "info" },
+  };
+}
+
+test("host logging editor preserves other paths under CAS and confirms signed readback", async () => {
+  const original = hostConfiguration();
+  const calls = [];
+  let stored = original;
+  const api = {
+    async post(route, body = {}) {
+      calls.push([route, ordinary(body)]);
+      if (route === "host-configuration/get") return ordinary(stored);
+      assert.equal(route, "host-configuration/update");
+      assert.deepEqual(ordinary(body), {
+        ...original.values,
+        expected_revision: 6,
+        log_path: "logs/diagnostics.log",
+        min_log_level: "warning",
+      });
+      stored = {
+        ...original,
+        revision: 7,
+        values: { ...original.values, log_path: body.log_path, min_log_level: body.min_log_level },
+        effective: { log_path: "C:/state/logs/diagnostics.log", min_log_level: "warning" },
+      };
+      return { ok: true };
+    },
+  };
+  const current = context.Amaterasu.parseHostConfigurationReply(await api.post("host-configuration/get"));
+  const saved = await context.Amaterasu.saveHostLoggingSettings(api, current, "warning", "logs/diagnostics.log");
+  assert.deepEqual(ordinary(saved), stored);
+  assert.deepEqual(calls.map(([route]) => route), [
+    "host-configuration/get", "host-configuration/update", "host-configuration/get",
+  ]);
+  assert.deepEqual(await api.post("host-configuration/get"), stored);
+});
+
+test("host logging editor rejects invalid values, stale revisions and changed unrelated paths", async () => {
+  const parse = context.Amaterasu.parseHostLoggingSettings;
+  assert.deepEqual(ordinary(parse("none", "logs/service.log")), {
+    min_log_level: "none", log_path: "logs/service.log",
+  });
+  assert.equal(parse("info", "/").log_path, "/");
+  for (const [level, path] of [
+    ["trace", "service.log"], ["info", ""], ["info", "../escape.log"],
+    ["info", "bad\npath"], ["info", "é".repeat(2049)],
+    ["info", "./"], ["info", ".\\."], ["info", "C:relative.log"],
+  ]) assert.throws(() => parse(level, path));
+  for (const malformed of [
+    null, { ...hostConfiguration(), ready: false },
+    { ...hostConfiguration(), version: 2 },
+    { ...hostConfiguration(), revision: "6" },
+    { ...hostConfiguration(), values: { ...hostConfiguration().values, log_path: 5 } },
+  ]) assert.throws(() => context.Amaterasu.parseHostConfigurationReply(malformed));
+  for (const changed of [
+    hostConfiguration(),
+    { ...hostConfiguration(7), values: { ...hostConfiguration().values, log_path: "other.log" } },
+    { ...hostConfiguration(7), values: { ...hostConfiguration().values, cert: "changed.pem", log_path: "new.log" } },
+  ]) {
+    const api = {
+      async post(route) {
+        return route === "host-configuration/get" ? changed : { ok: true };
+      },
+    };
+    await assert.rejects(
+      context.Amaterasu.saveHostLoggingSettings(api, hostConfiguration(), "product_default", "new.log"),
+      /could not be confirmed/,
+    );
+  }
+});
+
 test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
   const parseSelection = context.Amaterasu.parseVirtualSinkSelection;
   assert.equal(parseSelection(false, "unused value"), null);

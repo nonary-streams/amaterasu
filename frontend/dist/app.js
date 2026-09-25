@@ -1554,6 +1554,61 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveAuthTokenLifetimes = saveAuthTokenLifetimes;
+    const hostLogLevels = [
+        "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
+    ];
+    function parseHostLoggingSettings(level, path) {
+        if (!hostLogLevels.includes(level))
+            throw new Error("Choose a supported logging level.");
+        const pathComponents = path.split(/[\\/]/u).filter(Boolean);
+        if (!path ||
+            new TextEncoder().encode(path).length > 4096 ||
+            /[\u0000-\u001f\u007f-\u009f]/u.test(path) ||
+            path.split(/[\\/]/u).includes("..") ||
+            (pathComponents.length > 0 && pathComponents.every((component) => component === ".")) ||
+            /^[a-zA-Z]:(?![\\/])/u.test(path))
+            throw new Error("Enter a log path of at most 4096 UTF-8 bytes without controls or parent traversal.");
+        return { min_log_level: level, log_path: path };
+    }
+    Amaterasu.parseHostLoggingSettings = parseHostLoggingSettings;
+    function parseHostConfigurationReply(reply) {
+        if (!reply || typeof reply !== "object" || Array.isArray(reply))
+            throw new Error("Host configuration reply is invalid.");
+        const document = reply;
+        if (document.ok !== true || document.ready !== true || document.version !== 1 ||
+            !Number.isSafeInteger(document.revision) || document.revision < 0)
+            throw new Error("Host configuration version or revision is invalid.");
+        if (!document.values || typeof document.values !== "object" || Array.isArray(document.values) ||
+            !document.effective || typeof document.effective !== "object" || Array.isArray(document.effective))
+            throw new Error("Host configuration values are invalid.");
+        const values = document.values;
+        const effective = document.effective;
+        for (const key of ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert", "log_path"])
+            if (typeof values[key] !== "string")
+                throw new Error(`Host configuration ${key} is invalid.`);
+        if (typeof effective.log_path !== "string" ||
+            !hostLogLevels.includes(effective.min_log_level) ||
+            !hostLogLevels.includes(values.min_log_level))
+            throw new Error("Effective host logging settings are invalid.");
+        return document;
+    }
+    Amaterasu.parseHostConfigurationReply = parseHostConfigurationReply;
+    async function saveHostLoggingSettings(api, current, level, path) {
+        const logging = parseHostLoggingSettings(level, path);
+        await api.post("host-configuration/update", {
+            ...current.values,
+            ...logging,
+            expected_revision: current.revision,
+        });
+        const saved = parseHostConfigurationReply(await api.post("host-configuration/get"));
+        if (saved.revision !== current.revision + 1 ||
+            saved.values.log_path !== logging.log_path ||
+            saved.values.min_log_level !== logging.min_log_level ||
+            ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert"].some((key) => saved.values[key] !== current.values[key]))
+            throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveHostLoggingSettings = saveHostLoggingSettings;
     function parseInputPolicy(keyboard, mouse, highResolutionScrolling, alwaysSendScancodes, keyRightAltToKeyWin, keyRepeatDelay, keyRepeatFrequency, backButtonTimeout = -1, gamepadProfile = "auto", selectableGamepadProfiles = ["auto"], controllerEnabled = true, nativePenTouch = true) {
         if (typeof keyboard !== "boolean" ||
             typeof mouse !== "boolean" ||
@@ -2105,6 +2160,7 @@ var Amaterasu;
     function renderSettings(context) {
         const area = Amaterasu.el("div");
         const authArea = Amaterasu.el("div");
+        const hostLoggingArea = Amaterasu.el("div");
         const hostArea = Amaterasu.el("div");
         const steamArea = Amaterasu.el("div");
         const lutrisArea = Amaterasu.el("div");
@@ -2115,6 +2171,7 @@ var Amaterasu;
         context.content.append(Amaterasu.sectionHeading("Settings", "Edit host options and values registered for this management console.", Amaterasu.button("Refresh", () => {
             void load();
             void loadAuth();
+            void loadHostLogging();
             void loadHost();
             void loadSteam();
             void loadLutris();
@@ -2122,7 +2179,7 @@ var Amaterasu;
             void loadInput();
             void loadHistorySettings();
             void loadPairing();
-        })), area, authArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
+        })), area, authArea, hostLoggingArea, hostArea, steamArea, lutrisArea, playniteArea, inputArea, historyArea, pairingArea);
         async function loadAuth() {
             authArea.replaceChildren(Amaterasu.el("p", "muted", "Loading authentication lifetimes…"));
             try {
@@ -2168,6 +2225,56 @@ var Amaterasu;
             catch (error) {
                 if (context.content.isConnected)
                     authArea.replaceChildren(Amaterasu.errorPanel(error, loadAuth));
+            }
+        }
+        async function loadHostLogging() {
+            hostLoggingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host logging policy…"));
+            try {
+                const settings = parseHostConfigurationReply(await context.api.post("host-configuration/get"));
+                if (!context.content.isConnected)
+                    return;
+                const form = Amaterasu.el("form", "settings-form");
+                const level = Amaterasu.el("select");
+                level.name = "min_log_level";
+                for (const optionValue of hostLogLevels) {
+                    const option = Amaterasu.el("option", "", optionValue.replaceAll("_", " "));
+                    option.value = optionValue;
+                    level.append(option);
+                }
+                level.value = settings.values.min_log_level;
+                const path = Amaterasu.input("log_path", settings.values.log_path);
+                path.required = true;
+                path.maxLength = 4096;
+                const status = Amaterasu.el("div");
+                const save = Amaterasu.el("button", "button primary", "Save host logging settings");
+                save.type = "submit";
+                save.disabled = !context.api.allows("configuration.write");
+                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records after the reader refreshes its policy."), Amaterasu.el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`), Amaterasu.el("p", "muted", "The diagnostics reader applies saved changes asynchronously. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.addEventListener("submit", (event) => {
+                    event.preventDefault();
+                    if (!form.reportValidity())
+                        return;
+                    void Amaterasu.runAction(save, status, async () => {
+                        try {
+                            await saveHostLoggingSettings(context.api, settings, level.value, path.value);
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                await loadHostLogging();
+                                context.notify("Host configuration changed elsewhere. Review the latest logging settings and save again.");
+                                return;
+                            }
+                            throw error;
+                        }
+                        await loadHostLogging();
+                        context.notify("Host logging settings saved and confirmed.");
+                    });
+                });
+                hostLoggingArea.replaceChildren(Amaterasu.panel("Host logging", form));
+            }
+            catch (error) {
+                if (context.content.isConnected)
+                    hostLoggingArea.replaceChildren(Amaterasu.errorPanel(error, loadHostLogging));
             }
         }
         async function loadSteam() {
@@ -3127,6 +3234,7 @@ var Amaterasu;
         }
         void load();
         void loadAuth();
+        void loadHostLogging();
         void loadHost();
         void loadSteam();
         void loadLutris();

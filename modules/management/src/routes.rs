@@ -54,6 +54,16 @@ pub fn resolve(path: &str) -> Option<Route> {
             "migrate",
             Some("configuration.write"),
         ),
+        ("host-configuration", "get") => (
+            "amaterasu.host-configuration/1",
+            "get",
+            Some("configuration.read"),
+        ),
+        ("host-configuration", "update") => (
+            "amaterasu.host-configuration/1",
+            "update",
+            Some("configuration.write"),
+        ),
         ("nvhttp", "settings") => (
             "amaterasu.nvhttp/1",
             "settings_get",
@@ -638,6 +648,74 @@ mod tests {
         ] {
             assert!(payload(update, rejected).is_err());
         }
+    }
+
+    #[test]
+    fn host_configuration_routes_require_signed_scopes_and_full_typed_updates() {
+        let get = resolve("/v1/host-configuration/get").unwrap();
+        assert_eq!(get.service, "amaterasu.host-configuration/1");
+        assert_eq!(get.scope, Some("configuration.read"));
+        assert_eq!(payload(get, br#"{}"#).unwrap()["action"], "get");
+        assert!(payload(get, br#"{"owner":"other"}"#).is_err());
+
+        let update = resolve("/v1/host-configuration/update").unwrap();
+        assert_eq!(update.service, "amaterasu.host-configuration/1");
+        assert_eq!(update.scope, Some("configuration.write"));
+        let mut valid = serde_json::json!({
+            "expected_revision":4,
+            "file_state":"sunshine_state.json",
+            "vibeshine_file_state":"vibeshine_state.json",
+            "credentials_file":"",
+            "pkey":"credentials/cakey.pem",
+            "cert":"credentials/cacert.pem",
+            "log_path":"logs/service.log",
+            "min_log_level":"warning"
+        });
+        assert_eq!(
+            payload(update, &serde_json::to_vec(&valid).unwrap()).unwrap()["action"],
+            "update"
+        );
+        for level in [
+            "product_default",
+            "verbose",
+            "debug",
+            "info",
+            "warning",
+            "error",
+            "fatal",
+            "none",
+        ] {
+            valid["min_log_level"] = serde_json::json!(level);
+            assert!(payload(update, &serde_json::to_vec(&valid).unwrap()).is_ok());
+        }
+        for (key, value) in [
+            ("expected_revision", serde_json::json!(-1)),
+            ("min_log_level", serde_json::json!("trace")),
+            ("log_path", serde_json::json!("../escape.log")),
+            ("log_path", serde_json::json!("./")),
+            ("log_path", serde_json::json!("")),
+            ("log_path", serde_json::json!("bad\npath")),
+            ("cert", serde_json::json!(null)),
+            ("pkey", serde_json::json!("x".repeat(4097))),
+        ] {
+            let mut rejected = valid.clone();
+            rejected[key] = value;
+            assert!(
+                payload(update, &serde_json::to_vec(&rejected).unwrap()).is_err(),
+                "accepted {key}"
+            );
+        }
+        if cfg!(windows) {
+            let mut drive_relative = valid.clone();
+            drive_relative["log_path"] = serde_json::json!("C:relative.log");
+            assert!(payload(update, &serde_json::to_vec(&drive_relative).unwrap()).is_err());
+        }
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("file_state");
+        assert!(payload(update, &serde_json::to_vec(&missing).unwrap()).is_err());
+        valid["owner"] = serde_json::json!("other");
+        assert!(payload(update, &serde_json::to_vec(&valid).unwrap()).is_err());
+        assert!(resolve("/v1/host-configuration/readiness").is_none());
     }
 
     #[test]

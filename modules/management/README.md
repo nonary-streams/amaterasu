@@ -56,6 +56,8 @@ the remember-me setting controls refresh lifetime, not browser-storage persisten
 | `/v1/catalog/` | create, update, delete | `catalog.write` |
 | `/v1/configuration/` | get | `configuration.read` |
 | `/v1/configuration/` | register, update, migrate | `configuration.write` |
+| `/v1/host-configuration/` | get | `configuration.read` |
+| `/v1/host-configuration/` | update | `configuration.write` |
 | `/v1/session/` | list, snapshot | `session.read` |
 | `/v1/session/` | create, activate, stop, finish_stop, cancel, fail, forget, acquire, release | `session.write` |
 | `/v1/application/` | list, status | `application.read` |
@@ -71,6 +73,16 @@ the remember-me setting controls refresh lifetime, not browser-storage persisten
 | `/v1/launch/` | start | `application.launch` |
 | `/v1/launch/` | status, list | `application.read` |
 | `/v1/launch/` | stop | `application.terminate` |
+
+Host-configuration `update` forwards the provider's complete version-1 document:
+`expected_revision`, `file_state`, `vibeshine_file_state`, `credentials_file`,
+`pkey`, `cert`, `log_path`, and `min_log_level`. The management route requires
+`configuration.write`; the provider also restricts updates to the management
+principal. The logging editor changes only `log_path` and `min_log_level`, sends
+the other fields verbatim from the signed `get` response, and confirms the new
+revision and values through another signed read. A caller with
+`configuration.write` can intentionally change the other host-configuration
+paths through this API.
 
 Example authenticated request body for `/v1/catalog/create`:
 

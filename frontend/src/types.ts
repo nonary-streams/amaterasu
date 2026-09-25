@@ -235,6 +235,25 @@ namespace Amaterasu {
       remember_me_refresh_token_ttl_seconds: number;
     };
   }
+  export type HostLogLevel =
+    | "product_default" | "verbose" | "debug" | "info"
+    | "warning" | "error" | "fatal" | "none";
+  export interface HostConfiguration {
+    ok: true;
+    ready: true;
+    version: 1;
+    revision: number;
+    values: {
+      file_state: string;
+      vibeshine_file_state: string;
+      credentials_file: string;
+      pkey: string;
+      cert: string;
+      log_path: string;
+      min_log_level: HostLogLevel;
+    };
+    effective: { log_path: string; min_log_level: HostLogLevel };
+  }
   export interface PairingClient {
     certificate_id: string;
     client_id: string;
