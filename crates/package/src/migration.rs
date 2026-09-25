@@ -806,6 +806,27 @@ fn collect_configuration_files(root: &Path) -> PackageResult<Option<CollectedCon
     }))
 }
 
+fn strip_unquoted_comment(line: &str) -> &str {
+    let mut inside_double_quotes = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if inside_double_quotes && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '"' => inside_double_quotes = !inside_double_quotes,
+            '#' if !inside_double_quotes => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Preserve only configured identity/credential files whose canonical regular
 /// file remains inside the predecessor root. This makes an approved custom
 /// `pkey`, `cert`, or `credentials_file` usable after copy without allowing a
@@ -830,7 +851,7 @@ fn collect_configured_sensitive_files(
             "predecessor configuration contains a non-text settings file".to_owned()
         })?;
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or_default().trim();
+            let line = strip_unquoted_comment(line).trim();
             if line.is_empty() || line.starts_with(';') {
                 continue;
             }
@@ -899,7 +920,7 @@ fn collect_configured_state_files(
             "predecessor configuration contains a non-text settings file".to_owned()
         })?;
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or_default().trim();
+            let line = strip_unquoted_comment(line).trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }

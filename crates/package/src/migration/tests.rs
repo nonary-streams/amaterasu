@@ -282,6 +282,82 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
     );
 }
 
+#[test]
+fn snapshots_configured_paths_with_hashes_inside_quoted_values() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"pkey = \"credentials/key#identity.pem\" # identity key\n\
+cert = \"credentials/cert#chain.pem\" # identity certificate\n\
+credentials_file = \"credentials/auth#store.json\" # authentication file\n\
+file_state = \"private/primary#state.json\" # primary state\n\
+vibeshine_file_state = \"private/auxiliary#state.json\" # auxiliary state\n",
+    );
+
+    let preserved_files = [
+        (
+            PathBuf::from("credentials/key#identity.pem"),
+            b"private key bytes\x00".as_slice(),
+        ),
+        (
+            PathBuf::from("credentials/cert#chain.pem"),
+            b"certificate bytes\x01".as_slice(),
+        ),
+        (
+            PathBuf::from("credentials/auth#store.json"),
+            b"authentication bytes\x02".as_slice(),
+        ),
+        (
+            PathBuf::from("private/primary#state.json"),
+            b"primary state bytes\x03".as_slice(),
+        ),
+        (
+            PathBuf::from("private/auxiliary#state.json"),
+            b"auxiliary state bytes\x04".as_slice(),
+        ),
+    ];
+    for (relative, bytes) in &preserved_files {
+        write(&predecessor.join(relative), bytes);
+    }
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    for (relative, _) in &preserved_files {
+        assert!(collected.files.contains(relative));
+    }
+    for relative in [
+        PathBuf::from("private/primary#state.json"),
+        PathBuf::from("private/auxiliary#state.json"),
+    ] {
+        assert!(collected.configured_state_files.contains(&relative));
+    }
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Sunshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: true,
+        }],
+    )
+    .unwrap();
+
+    for (relative, expected_bytes) in preserved_files {
+        let imported = destination
+            .join(LEGACY_IMPORT_DIRECTORY)
+            .join("sunshine")
+            .join(&relative);
+        assert_eq!(
+            fs::read(imported).unwrap().as_slice(),
+            expected_bytes,
+            "imported bytes changed for {}",
+            relative.display()
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn configured_identity_path_case_variants_share_one_snapshot_entry() {
