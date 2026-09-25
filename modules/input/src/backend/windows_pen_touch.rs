@@ -119,14 +119,10 @@ impl WindowsPenTouch {
                     format!("Windows supports at most {MAX_TOUCH_CONTACTS} active touch pointers"),
                 ))
             }
-            PenTouchPhase::Move | PenTouchPhase::Up | PenTouchPhase::Cancel
-                if !pointer_is_active =>
-            {
-                Err(InputError::new(
-                    "unknown_pointer",
-                    "pointer transition requires a matching active pointer ID",
-                ))
-            }
+            PenTouchPhase::Move | PenTouchPhase::Up if !pointer_is_active => Err(InputError::new(
+                "unknown_pointer",
+                "pointer transition requires a matching active pointer ID",
+            )),
             _ => Ok(()),
         }
     }
@@ -152,6 +148,17 @@ impl WindowsPenTouch {
         else {
             return Ok(());
         };
+
+        if *phase == PenTouchPhase::Cancel
+            && !self
+                .device_state(*device)
+                .is_some_and(|state| state.contacts.contains_key(pointer_id))
+        {
+            // Cleanup can cancel a down whose native setup failed before the
+            // backend owned a device/contact. Ignore only this exact ID; do not
+            // create a device or emit a cancel that could affect another ID.
+            return Ok(());
+        }
 
         let virtual_desktop = self.api.virtual_desktop()?;
         if self.device_state(*device).is_none() {
@@ -637,6 +644,7 @@ mod tests {
         frames: Vec<(PenTouchDevice, Vec<POINTER_TYPE_INFO>)>,
         destroyed: Vec<usize>,
         fail_next_injection: bool,
+        fail_next_device_creation: bool,
     }
 
     struct FakePointerApi {
@@ -656,6 +664,13 @@ mod tests {
 
         fn create_device(&mut self, device: PenTouchDevice) -> InputResult<SyntheticPointerHandle> {
             let mut state = self.state.borrow_mut();
+            if state.fail_next_device_creation {
+                state.fail_next_device_creation = false;
+                return Err(InputError::new(
+                    "device_creation_failed",
+                    "simulated synthetic-pointer device creation failure",
+                ));
+            }
             let handle_id = state.created.len() + 1;
             let max_count = match device {
                 PenTouchDevice::Pen => PEN_MAX_CONTACTS,
@@ -868,11 +883,7 @@ mod tests {
             backend.inject(&down).unwrap_err().code,
             "duplicate_pointer_down"
         );
-        for phase in [
-            PenTouchPhase::Move,
-            PenTouchPhase::Up,
-            PenTouchPhase::Cancel,
-        ] {
+        for phase in [PenTouchPhase::Move, PenTouchPhase::Up] {
             assert_eq!(
                 backend
                     .inject(&event(6, PenTouchDevice::Touch, phase, 1, 2))
@@ -881,6 +892,18 @@ mod tests {
                 "unknown_pointer"
             );
         }
+        let frame_count = state.borrow().frames.len();
+        backend
+            .inject(&event(
+                6,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                1,
+                2,
+            ))
+            .unwrap();
+        assert_eq!(state.borrow().frames.len(), frame_count);
+        assert!(backend.touch.as_ref().unwrap().contacts.contains_key(&5));
         backend
             .inject(&event(5, PenTouchDevice::Touch, PenTouchPhase::Up, 1, 2))
             .unwrap();
@@ -891,7 +914,66 @@ mod tests {
                 .code,
             "unknown_pointer"
         );
+        backend
+            .inject(&event(
+                5,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                1,
+                2,
+            ))
+            .unwrap();
         assert_eq!(state.borrow().frames.len(), 2);
+    }
+
+    #[test]
+    fn cleanup_cancel_after_virtual_desktop_failure_is_a_noop() {
+        let (mut backend, state) = backend();
+        state.borrow_mut().desktop = None;
+        let down = event(5, PenTouchDevice::Touch, PenTouchPhase::Down, 1, 2);
+        assert_eq!(
+            backend.inject(&down).unwrap_err().code,
+            "desktop_unavailable"
+        );
+
+        backend
+            .inject(&event(
+                5,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                1,
+                2,
+            ))
+            .unwrap();
+
+        let state = state.borrow();
+        assert!(state.created.is_empty());
+        assert!(state.frames.is_empty());
+    }
+
+    #[test]
+    fn cleanup_cancel_after_device_creation_failure_is_a_noop() {
+        let (mut backend, state) = backend();
+        state.borrow_mut().fail_next_device_creation = true;
+        let down = event(5, PenTouchDevice::Touch, PenTouchPhase::Down, 1, 2);
+        assert_eq!(
+            backend.inject(&down).unwrap_err().code,
+            "device_creation_failed"
+        );
+
+        backend
+            .inject(&event(
+                5,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                1,
+                2,
+            ))
+            .unwrap();
+
+        let state = state.borrow();
+        assert!(state.created.is_empty());
+        assert!(state.frames.is_empty());
     }
 
     #[test]
