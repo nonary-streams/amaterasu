@@ -242,7 +242,7 @@ fn configured_tls_identity_refreshes_on_provider_revision_and_restart_without_pa
         ConfiguredIdentity::load(&first_certificate_path, &first_key_path, 10, current_time())
             .unwrap();
 
-    let mut persisted_document = document();
+    let persisted_document = document();
     let persisted_host_id = persisted_document
         .identity
         .as_ref()

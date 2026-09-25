@@ -1484,8 +1484,12 @@ fn configured_initialize_persists_only_generated_identity_and_returns_effective_
         configured.private_key_pem
     );
     assert_eq!(harness.state_writes, 1);
+    let identity_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     assert_eq!(
-        pipeline.identity.get(now()).unwrap().certificate(),
+        pipeline.identity.get(identity_time).unwrap().certificate(),
         crypto_certificate_der(&configured.certificate_pem)
     );
     fs::remove_dir_all(directory).unwrap();
