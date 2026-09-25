@@ -39,6 +39,17 @@ test("application refresh rate option editor reads back and writes sparse exact 
     assert.equal(context.Amaterasu.catalogManualRefreshRateCompanionVisible(value), false);
 });
 
+test("catalog reads back 10-bit SDR overrides without collapsing false or accepting malformed values", () => {
+  const read = context.Amaterasu.catalogPrefer10BitSdrOverrideValue;
+  assert.equal(read(undefined), null);
+  assert.equal(read(null), null);
+  assert.equal(read(true), true);
+  assert.equal(read(false), false);
+  for (const value of ["false", 0, 1, {}, []]) {
+    assert.throws(() => read(value), /boolean or null/);
+  }
+});
+
 test("Steam artwork chunks assemble into the expected image without a local path", async () => {
   const source = Buffer.alloc(8195, 0x5a);
   const offsets = [];

@@ -8,6 +8,10 @@ namespace Amaterasu {
     throw new Error("Refresh rate option must be auto, disabled, manual, or prefer_highest.");
   }
 
+  export function parsePrefer10BitSdrOverride(value: string): boolean | null {
+    return parseInputBooleanOverride(value, "10-bit SDR preference");
+  }
+
   export function usesManualRefreshRateCompanion(value: string | null | undefined): boolean {
     return value === "manual";
   }
@@ -326,6 +330,9 @@ namespace Amaterasu {
     const refreshRateOption = parseRefreshRateOptionOverride(
       String(data.get("dd_refresh_rate_option") ?? ""),
     );
+    const prefer10BitSdr = parsePrefer10BitSdrOverride(
+      String(data.get("prefer_10bit_sdr") ?? ""),
+    );
     const steamId = kind === "playnite_fullscreen" ? null : parseSteamId(String(data.get("steam_id") ?? ""));
     const steamInstallDir = kind === "playnite_fullscreen" ? null : parseSteamInstallDir(String(data.get("steam_install_dir") ?? ""));
     const configOverrides =
@@ -339,7 +346,8 @@ namespace Amaterasu {
       gamepad === null &&
       keyboard === null &&
       mouse === null &&
-      refreshRateOption === null
+      refreshRateOption === null &&
+      prefer10BitSdr === null
         ? undefined
         : {
             ...(fecPercentage === null ? {} : { fec_percentage: fecPercentage }),
@@ -353,6 +361,7 @@ namespace Amaterasu {
             ...(keyboard === null ? {} : { keyboard }),
             ...(mouse === null ? {} : { mouse }),
             ...(refreshRateOption === null ? {} : { dd_refresh_rate_option: refreshRateOption }),
+            ...(prefer10BitSdr === null ? {} : { prefer_10bit_sdr: prefer10BitSdr }),
           };
     const exitTimeoutSeconds = kind === "executable" ? parseExitTimeout(text("exit_timeout_seconds")) : null;
     const detached = kind === "executable" ? parseDetachedCommands(text("detached")) : [];

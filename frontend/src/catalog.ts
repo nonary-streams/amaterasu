@@ -121,6 +121,13 @@ namespace Amaterasu {
     return Amaterasu.usesManualRefreshRateCompanion(value);
   }
 
+  export function catalogPrefer10BitSdrOverrideValue(value: unknown): boolean | null {
+    if (value == null) return null;
+    if (typeof value !== "boolean")
+      throw new Error("Saved 10-bit SDR preference must be a boolean or null.");
+    return value;
+  }
+
   function catalogRefreshRateOptionFields(
     current: RefreshRateOption | null | undefined,
   ): HTMLElement[] {
@@ -722,6 +729,10 @@ namespace Amaterasu {
     const refreshRateOptionFields = catalogRefreshRateOptionFields(
       entry?.config_overrides?.dd_refresh_rate_option,
     );
+    const prefer10BitSdr = audioOverrideSelect(
+      "prefer_10bit_sdr",
+      catalogPrefer10BitSdrOverrideValue(entry?.config_overrides?.prefer_10bit_sdr),
+    );
     const steamId = input("steam_id", entry?.steam_id ?? "");
     steamId.maxLength = 10;
     const steamInstallDir = input("steam_install_dir", entry?.steam_install_dir ?? "");
@@ -785,6 +796,11 @@ namespace Amaterasu {
       pathField,
       field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
       ...refreshRateOptionFields,
+      field(
+        "10-bit SDR preference",
+        prefer10BitSdr,
+        "Inherit the next setting scope, or set an explicit preference for this application.",
+      ),
       field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
       audioSink.controls,
       virtualSink.controls,

@@ -62,6 +62,7 @@ namespace Amaterasu {
       keyboard?: boolean;
       mouse?: boolean;
       dd_refresh_rate_option?: RefreshRateOption | null;
+      prefer_10bit_sdr?: boolean | null;
     };
   }
   export type RefreshRateOption = "auto" | "disabled" | "manual" | "prefer_highest";

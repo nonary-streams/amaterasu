@@ -186,6 +186,44 @@ test("application refresh rate option keeps exact values and sparse inheritance"
   });
 });
 
+test("application editor preserves explicit 10-bit SDR booleans and sparse inheritance", () => {
+  const parse = model.parsePrefer10BitSdrOverride;
+  assert.equal(parse(""), null);
+  assert.equal(parse("true"), true);
+  assert.equal(parse("false"), false);
+  for (const value of ["null", "False", "yes", "0"]) {
+    assert.throws(() => parse(value), /10-bit SDR preference/);
+  }
+
+  const form = new FormData();
+  form.set("name", "10-bit SDR app");
+  form.set("kind", "application");
+  form.set("path", "/opt/sdr-app");
+  assert.equal(Object.hasOwn(model.entryFromForm(form), "config_overrides"), false);
+
+  form.set("fec_percentage", "37");
+  form.set("stream_audio", "false");
+  form.set("prefer_10bit_sdr", "true");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {
+    fec_percentage: 37,
+    stream_audio: false,
+    prefer_10bit_sdr: true,
+  });
+
+  form.set("prefer_10bit_sdr", "false");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {
+    fec_percentage: 37,
+    stream_audio: false,
+    prefer_10bit_sdr: false,
+  });
+
+  form.set("prefer_10bit_sdr", "");
+  assert.deepEqual(ordinary(model.entryFromForm(form).config_overrides), {
+    fec_percentage: 37,
+    stream_audio: false,
+  });
+});
+
 test("blank FEC and timeout retain sparse inheritance and explicit bounds", () => {
   assert.equal(model.parseFecOverride("  "), null);
   assert.deepEqual(ordinary(model.providerConfigOverrides("")), {
