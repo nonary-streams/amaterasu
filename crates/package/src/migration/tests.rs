@@ -346,9 +346,11 @@ fn configured_credentials_file_is_authentication_input_not_pairing_credentials()
         pairing: false,
         authentication: true,
     }];
-    let plan =
-        preflight_legacy_configuration_with_sensitive_sources(&[legacy_source.clone()], &validated)
-            .unwrap();
+    let plan = preflight_legacy_configuration_with_sensitive_sources(
+        std::slice::from_ref(&legacy_source),
+        &validated,
+    )
+    .unwrap();
     assert_eq!(plan.schema, 1);
     assert!(plan.critical_items.is_empty());
 
