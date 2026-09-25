@@ -1131,6 +1131,26 @@ mod tests {
     }
 
     #[test]
+    fn recent_max_age_cutoff_includes_game_played_exactly_at_boundary() {
+        let now = 1_000_000;
+        let max_age_seconds = 24 * 60 * 60;
+        let mut cutoff_game = game(70, "At age cutoff", true);
+        cutoff_game.last_played = Some(now - max_age_seconds);
+        let games = [(70, cutoff_game)].into_iter().collect();
+        let settings = ProductSettings {
+            recent_games: 1,
+            recent_max_age_days: 1,
+            ..ProductSettings::default()
+        };
+        let executable = std::env::current_exe().unwrap();
+
+        let records = catalog_records(&games, &settings, &executable, now).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["source_id"], "steam:70");
+    }
+
+    #[test]
     fn zero_recent_max_age_days_does_not_filter_future_timestamps() {
         let mut future_game = game(70, "Future timestamp", true);
         future_game.last_played = Some(1_000_001);
