@@ -127,33 +127,33 @@ struct PendingCall {
 }
 
 enum Purpose {
-    Load {
-        followup: Option<Followup>,
-    },
-    Update {
-        request: u64,
-        hostname: String,
-        target: NetworkTarget,
-        output_name: Option<String>,
-        audio_sink: Option<String>,
-        virtual_sink: Option<String>,
-        audio_sink_capture_only: bool,
-        external_ip: Option<String>,
-        stream_audio: bool,
-        capture: CaptureMode,
-        video_max_batch_size_kb: Option<u8>,
-        max_bitrate: Option<i32>,
-        minimum_fps_target: Option<f64>,
-        wgc_pacing_smoothing: Option<bool>,
-        ping_timeout_ms: Option<i32>,
-        global_preparation: Vec<PreparationStep>,
-        legacy_global_preparation: Vec<LegacyPreparationStep>,
-        frame_limiter: FrameLimiterSettings,
-        lan_encryption_mode: u8,
-        wan_encryption_mode: u8,
-        expected_revision: u64,
-        require_listener_apply: bool,
-    },
+    Load { followup: Option<Followup> },
+    Update(Box<UpdatePurpose>),
+}
+
+struct UpdatePurpose {
+    request: u64,
+    hostname: String,
+    target: NetworkTarget,
+    output_name: Option<String>,
+    audio_sink: Option<String>,
+    virtual_sink: Option<String>,
+    audio_sink_capture_only: bool,
+    external_ip: Option<String>,
+    stream_audio: bool,
+    capture: CaptureMode,
+    video_max_batch_size_kb: Option<u8>,
+    max_bitrate: Option<i32>,
+    minimum_fps_target: Option<f64>,
+    wgc_pacing_smoothing: Option<bool>,
+    ping_timeout_ms: Option<i32>,
+    global_preparation: Vec<PreparationStep>,
+    legacy_global_preparation: Vec<LegacyPreparationStep>,
+    frame_limiter: FrameLimiterSettings,
+    lan_encryption_mode: u8,
+    wan_encryption_mode: u8,
+    expected_revision: u64,
+    require_listener_apply: bool,
 }
 
 enum Followup {
@@ -1300,7 +1300,7 @@ impl ProductSettings {
                     ),
                     Some(request.request),
                     remaining_ms.min(CONFIGURATION_TIMEOUT.as_millis() as u64),
-                    Purpose::Update {
+                    Purpose::Update(Box::new(UpdatePurpose {
                         request: request.request,
                         hostname,
                         target,
@@ -1323,7 +1323,7 @@ impl ProductSettings {
                         wan_encryption_mode,
                         expected_revision,
                         require_listener_apply,
-                    },
+                    })),
                 );
             }
         }
@@ -1351,8 +1351,8 @@ impl ProductSettings {
                 Purpose::Load { .. } => {
                     self.record_load_failure("configuration operation identifier exhausted".into())
                 }
-                Purpose::Update { request, .. } => self.queue_completion(
-                    request,
+                Purpose::Update(update) => self.queue_completion(
+                    update.request,
                     failure(
                         "resource_exhausted",
                         "configuration operation identifier exhausted",
@@ -1383,8 +1383,8 @@ impl ProductSettings {
                 self.record_load_failure(description.clone());
                 self.fail_queued(&description);
             }
-            Purpose::Update { request, .. } => {
-                self.queue_completion(request, error_response(&error));
+            Purpose::Update(update) => {
+                self.queue_completion(update.request, error_response(&error));
             }
         }
     }
@@ -1427,119 +1427,122 @@ impl ProductSettings {
                     }
                 }
             }
-            Purpose::Update {
-                request,
-                hostname,
-                target,
-                output_name,
-                audio_sink,
-                virtual_sink,
-                audio_sink_capture_only,
-                external_ip,
-                stream_audio,
-                capture,
-                video_max_batch_size_kb,
-                max_bitrate,
-                minimum_fps_target,
-                wgc_pacing_smoothing,
-                ping_timeout_ms,
-                global_preparation,
-                legacy_global_preparation,
-                frame_limiter,
-                lan_encryption_mode,
-                wan_encryption_mode,
-                expected_revision,
-                require_listener_apply,
-            } => match outcome {
-                CallOutcome::Payload(payload) => {
-                    let expected = UpdateExpectation {
-                        revision: expected_revision,
-                        hostname: &hostname,
-                        target: &target,
-                        output_name: output_name.as_deref(),
-                        audio_sink: audio_sink.as_deref(),
-                        virtual_sink: virtual_sink.as_deref(),
-                        audio_sink_capture_only,
-                        external_ip: external_ip.as_deref(),
-                        stream_audio,
-                        capture,
-                        video_max_batch_size_kb,
-                        max_bitrate,
-                        minimum_fps_target,
-                        wgc_pacing_smoothing,
-                        ping_timeout_ms,
-                        global_preparation: &global_preparation,
-                        legacy_global_preparation: &legacy_global_preparation,
-                        frame_limiter: &frame_limiter,
-                        lan_encryption_mode,
-                        wan_encryption_mode,
-                    };
-                    match update_result(&payload, &expected) {
-                        Ok(document) if self.validate_document(&document).is_ok() => {
-                            let previous_http_target = self.http_target();
-                            let previous_rtsp_target = self.rtsp_target();
-                            self.apply_document(document);
-                            let desired_http_target = self.http_target();
-                            let desired_rtsp_target = self.rtsp_target();
-                            let network_changed = previous_http_target != desired_http_target
-                                || previous_rtsp_target != desired_rtsp_target;
-                            self.record_load_success();
-                            if !require_listener_apply && network_changed {
-                                self.listener_error = Some(
-                                    "NVHTTP listener is disabled; stored network settings are not active".into(),
-                                );
-                                self.queue_completion(
+            Purpose::Update(update) => {
+                let UpdatePurpose {
+                    request,
+                    hostname,
+                    target,
+                    output_name,
+                    audio_sink,
+                    virtual_sink,
+                    audio_sink_capture_only,
+                    external_ip,
+                    stream_audio,
+                    capture,
+                    video_max_batch_size_kb,
+                    max_bitrate,
+                    minimum_fps_target,
+                    wgc_pacing_smoothing,
+                    ping_timeout_ms,
+                    global_preparation,
+                    legacy_global_preparation,
+                    frame_limiter,
+                    lan_encryption_mode,
+                    wan_encryption_mode,
+                    expected_revision,
+                    require_listener_apply,
+                } = *update;
+                match outcome {
+                    CallOutcome::Payload(payload) => {
+                        let expected = UpdateExpectation {
+                            revision: expected_revision,
+                            hostname: &hostname,
+                            target: &target,
+                            output_name: output_name.as_deref(),
+                            audio_sink: audio_sink.as_deref(),
+                            virtual_sink: virtual_sink.as_deref(),
+                            audio_sink_capture_only,
+                            external_ip: external_ip.as_deref(),
+                            stream_audio,
+                            capture,
+                            video_max_batch_size_kb,
+                            max_bitrate,
+                            minimum_fps_target,
+                            wgc_pacing_smoothing,
+                            ping_timeout_ms,
+                            global_preparation: &global_preparation,
+                            legacy_global_preparation: &legacy_global_preparation,
+                            frame_limiter: &frame_limiter,
+                            lan_encryption_mode,
+                            wan_encryption_mode,
+                        };
+                        match update_result(&payload, &expected) {
+                            Ok(document) if self.validate_document(&document).is_ok() => {
+                                let previous_http_target = self.http_target();
+                                let previous_rtsp_target = self.rtsp_target();
+                                self.apply_document(document);
+                                let desired_http_target = self.http_target();
+                                let desired_rtsp_target = self.rtsp_target();
+                                let network_changed = previous_http_target != desired_http_target
+                                    || previous_rtsp_target != desired_rtsp_target;
+                                self.record_load_success();
+                                if !require_listener_apply && network_changed {
+                                    self.listener_error = Some(
+                                        "NVHTTP listener is disabled; stored network settings are not active".into(),
+                                    );
+                                    self.queue_completion(
+                                        request,
+                                        json!({
+                                            "ok":false,
+                                            "code":"listener_not_active",
+                                            "message":"settings were persisted, but NVHTTP is disabled",
+                                            "persisted":true,
+                                        }),
+                                    );
+                                } else {
+                                    self.queue_listener_update_completion(
+                                        request,
+                                        self.settings_payload(),
+                                        (require_listener_apply
+                                            && self.active_http_target.as_ref()
+                                                != Some(&desired_http_target))
+                                        .then_some(desired_http_target),
+                                        (require_listener_apply
+                                            && self.active_rtsp_target.as_ref()
+                                                != Some(&desired_rtsp_target))
+                                        .then_some(desired_rtsp_target),
+                                    );
+                                }
+                            }
+                            Ok(_) => {
+                                self.start_load(Some(Followup::Unknown {
                                     request,
-                                    json!({
-                                        "ok":false,
-                                        "code":"listener_not_active",
-                                        "message":"settings were persisted, but NVHTTP is disabled",
-                                        "persisted":true,
-                                    }),
-                                );
-                            } else {
-                                self.queue_listener_update_completion(
+                                    reason: "product_update committed invalid settings".into(),
+                                }));
+                            }
+                            Err(error) if error.code == "revision_conflict" => {
+                                let revision = error.current_revision;
+                                self.start_load(Some(Followup::Conflict { request, revision }));
+                            }
+                            Err(error) if known_precommit_error(&error.code) => {
+                                self.queue_completion(request, error_response(&error));
+                            }
+                            Err(error) => {
+                                self.start_load(Some(Followup::Unknown {
                                     request,
-                                    self.settings_payload(),
-                                    (require_listener_apply
-                                        && self.active_http_target.as_ref()
-                                            != Some(&desired_http_target))
-                                    .then_some(desired_http_target),
-                                    (require_listener_apply
-                                        && self.active_rtsp_target.as_ref()
-                                            != Some(&desired_rtsp_target))
-                                    .then_some(desired_rtsp_target),
-                                );
+                                    reason: format!("{}: {}", error.code, error.message),
+                                }));
                             }
                         }
-                        Ok(_) => {
-                            self.start_load(Some(Followup::Unknown {
-                                request,
-                                reason: "product_update committed invalid settings".into(),
-                            }));
-                        }
-                        Err(error) if error.code == "revision_conflict" => {
-                            let revision = error.current_revision;
-                            self.start_load(Some(Followup::Conflict { request, revision }));
-                        }
-                        Err(error) if known_precommit_error(&error.code) => {
-                            self.queue_completion(request, error_response(&error));
-                        }
-                        Err(error) => {
-                            self.start_load(Some(Followup::Unknown {
-                                request,
-                                reason: format!("{}: {}", error.code, error.message),
-                            }));
-                        }
+                    }
+                    CallOutcome::Failure { code, message } => {
+                        self.start_load(Some(Followup::Unknown {
+                            request,
+                            reason: format!("{code}: {message}"),
+                        }));
                     }
                 }
-                CallOutcome::Failure { code, message } => {
-                    self.start_load(Some(Followup::Unknown {
-                        request,
-                        reason: format!("{code}: {message}"),
-                    }));
-                }
-            },
+            }
         }
     }
 
@@ -4245,7 +4248,10 @@ mod tests {
                 "global_preparation":[structured]}
         });
         let migrated_document = parse_document(&version_16).unwrap();
-        assert_eq!(migrated_document.global_preparation, [structured.clone()]);
+        assert_eq!(
+            migrated_document.global_preparation.as_slice(),
+            std::slice::from_ref(&structured)
+        );
         assert!(migrated_document.legacy_global_preparation.is_empty());
         assert_eq!(
             migrated_document.frame_limiter,
@@ -4262,7 +4268,10 @@ mod tests {
 
         let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         product.apply_document(migrated_document);
-        assert_eq!(product.global_preparation(), [structured.clone()]);
+        assert_eq!(
+            product.global_preparation(),
+            std::slice::from_ref(&structured)
+        );
         assert_eq!(product.legacy_global_preparation(), []);
         assert_eq!(
             product.settings_payload()["effective_frame_limiter"]["frame_limiter_fps_limit_millihz"],
@@ -4359,8 +4368,14 @@ mod tests {
             "values":payload["values"].clone()
         }));
         let document = parse_document(&reply).unwrap();
-        assert_eq!(document.global_preparation, [structured.clone()]);
-        assert_eq!(document.legacy_global_preparation, [raw.clone()]);
+        assert_eq!(
+            document.global_preparation.as_slice(),
+            std::slice::from_ref(&structured)
+        );
+        assert_eq!(
+            document.legacy_global_preparation.as_slice(),
+            std::slice::from_ref(&raw)
+        );
         assert_eq!(document.frame_limiter, frame_limiter);
         assert_eq!(document.lan_encryption_mode, 2);
         assert_eq!(document.wan_encryption_mode, 0);
@@ -4660,7 +4675,7 @@ mod tests {
         assert!(!crate::should_attempt_listener_rebind(None, &settings));
 
         settings.finish_call(
-            Purpose::Update {
+            Purpose::Update(Box::new(UpdatePurpose {
                 request: 12,
                 hostname: "New Host".into(),
                 target: NetworkTarget {
@@ -4687,7 +4702,7 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
                 require_listener_apply: false,
-            },
+            })),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,
                 "found":true,
@@ -4729,7 +4744,7 @@ mod tests {
             Some(vec!["127.0.0.1:48010".into()]),
         );
         settings.finish_call(
-            Purpose::Update {
+            Purpose::Update(Box::new(UpdatePurpose {
                 request: 12,
                 hostname: "New Host".into(),
                 target: NetworkTarget {
@@ -4756,7 +4771,7 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
                 require_listener_apply: true,
-            },
+            })),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,"found":true,"version":16,"revision":2,
                 "values":{"hostname":"New Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
@@ -4911,7 +4926,7 @@ mod tests {
         );
 
         product.finish_call(
-            Purpose::Update {
+            Purpose::Update(Box::new(UpdatePurpose {
                 request: 21,
                 hostname: "Host".into(),
                 target: NetworkTarget {
@@ -4938,7 +4953,7 @@ mod tests {
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 3,
                 require_listener_apply: true,
-            },
+            })),
             CallOutcome::Payload(v17_update_confirmation(json!({
                 "ok":true,"found":true,"version":16,"revision":4,
                 "values":{"hostname":"Host","port":47989,"address_family":null,"bind_address":null,"output_name":null,"audio_sink":null,"virtual_sink":null,"external_ip":null,"stream_audio":true,"capture":"auto","video_max_batch_size_kb":null,"max_bitrate":null,"minimum_fps_target":null,"wgc_pacing_smoothing":null,"ping_timeout_ms":null,"audio_sink_capture_only":false,"global_preparation":[]}
