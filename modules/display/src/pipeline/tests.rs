@@ -290,6 +290,148 @@ fn invalid_remapped_mode_never_prepares_provider_or_writes_journal() {
     assert!(state.journal.is_none());
 }
 #[test]
+fn manual_mode_options_reach_provider_before_journaled_apply() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{},
+                "resolution_option":"manual",
+                "manual_resolution":"1920x1080",
+                "refresh_rate_option":"manual",
+                "manual_refresh_rate":"59.94"
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    let mode = Some((
+        1920,
+        1080,
+        Rational {
+            numerator: 2997,
+            denominator: 50,
+        },
+    ));
+    assert_eq!(pipeline.platform.prepared_mode, mode);
+    assert_eq!(pipeline.platform.applied_mode, mode);
+    assert!(state.journal.is_some());
+}
+
+#[test]
+fn explicit_client_mode_override_preserves_concrete_configuration() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":true,
+                    "optimize_game_settings":true
+                },
+                "remapping":{"mixed":[{"final_resolution":"1920x1080"}]},
+                "resolution_option":"manual",
+                "manual_resolution":"bad",
+                "refresh_rate_option":"prefer_highest"
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    let mode = Some((
+        1280,
+        720,
+        Rational {
+            numerator: 60,
+            denominator: 1,
+        },
+    ));
+    assert_eq!(pipeline.platform.prepared_mode, mode);
+    assert_eq!(pipeline.platform.applied_mode, mode);
+}
+
+#[test]
+fn unsupported_highest_refresh_cannot_start_provider_or_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":false,
+                    "refresh_rate_is_automatic":false,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{},
+                "refresh_rate_option":"prefer_highest"
+            }
+        }),
+    );
+    assert_eq!(result["error"]["code"], "unsupported_policy");
+    assert!(pipeline.platform.prepared_mode.is_none());
+    assert!(state.journal.is_none());
+}
+#[test]
+fn disabled_optimization_keeps_concrete_resolution() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
+                    "resolution_is_automatic":false,
+                    "refresh_rate_is_automatic":false,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":false
+                },
+                "remapping":{},
+                "resolution_option":"manual",
+                "manual_resolution":"malformed"
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    assert_eq!(
+        pipeline.platform.applied_mode,
+        Some((
+            1280,
+            720,
+            Rational {
+                numerator: 60,
+                denominator: 1
+            }
+        ))
+    );
+}
+#[test]
 fn failed_persistence_or_cancelled_ack_cannot_change_displays() {
     for state in [
         State {

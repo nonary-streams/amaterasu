@@ -1,4 +1,6 @@
 use crate::mode_remapping::{DisplayMode, ModeRemapping, Resolution, ResolverContext};
+use crate::refresh_rate_option::{RefreshRateOption, parse_manual_refresh_rate};
+use crate::resolution_option::{ManualResolution, ResolutionOption, select_additional_resolution};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -33,6 +35,14 @@ pub struct ModePolicy {
     pub display_id: String,
     pub remapping: ModeRemapping,
     pub context: ResolverContext,
+    #[serde(default)]
+    pub resolution_option: Option<ResolutionOption>,
+    #[serde(default)]
+    pub manual_resolution: Option<String>,
+    #[serde(default)]
+    pub refresh_rate_option: Option<RefreshRateOption>,
+    #[serde(default)]
+    pub manual_refresh_rate: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -93,9 +103,63 @@ impl Configuration {
             }),
             refresh_rate: Some(display.refresh),
         };
+        let mut selected = requested;
+        let mut context = policy.context;
+        if !context.client_display_mode_override {
+            if let Some(option) = policy.resolution_option {
+                context.resolution_is_automatic = option.is_automatic();
+                let manual = if context.optimize_game_settings {
+                    ManualResolution::parse(policy.manual_resolution.as_deref().unwrap_or_default())
+                        .map_err(|error| DisplayError::new("invalid_request", error.to_string()))?
+                } else {
+                    ManualResolution::Unspecified
+                };
+                if let Some(resolution) = select_additional_resolution(
+                    option,
+                    manual,
+                    requested.resolution,
+                    context.optimize_game_settings,
+                )
+                .map_err(|error| DisplayError::new("invalid_request", error.to_string()))?
+                {
+                    selected.resolution = Some(resolution);
+                }
+            }
+            if let Some(option) = policy.refresh_rate_option {
+                context.refresh_rate_is_automatic = option.is_automatic();
+                match option {
+                    RefreshRateOption::Auto | RefreshRateOption::Disabled => {}
+                    RefreshRateOption::Manual => {
+                        selected.refresh_rate = Some(
+                            parse_manual_refresh_rate(
+                                policy.manual_refresh_rate.as_deref().unwrap_or_default(),
+                            )
+                            .map_err(|error| {
+                                DisplayError::new(
+                                    "invalid_request",
+                                    format!("invalid manual refresh rate: {error:?}"),
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                DisplayError::new(
+                                    "invalid_request",
+                                    "manual refresh rate must be specified",
+                                )
+                            })?,
+                        );
+                    }
+                    RefreshRateOption::PreferHighest => {
+                        return Err(DisplayError::new(
+                            "unsupported_policy",
+                            "highest refresh rate requires provider mode enumeration",
+                        ));
+                    }
+                }
+            }
+        }
         let resolved = policy
             .remapping
-            .resolve(policy.context, requested)
+            .resolve(context, selected)
             .map_err(|error| {
                 DisplayError::new(
                     "invalid_request",
