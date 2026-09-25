@@ -430,6 +430,12 @@ tilt when those values are known. Native pointer ranges and contact geometry
 still need qualification on supported operating-system versions and input
 stacks.
 
+The current GameStream decoder still treats `SS_TOUCH` and `SS_PEN` packets as
+unsupported, so remote clients cannot reach this event path yet. The protocol
+adapter must add event decoding, lifecycle mapping, capability checks, and the
+client-to-desktop coordinate/contact-area transforms before end-to-end input is
+available.
+
 ## Validation and reference
 
 Tests use fake backends for ownership, stale tokens, batch admission, chord
@@ -439,8 +445,8 @@ events, device loss, and contact cleanup. Platform mapping tests inspect native
 event records without injecting input or creating a uinput device. **No test
 injects input or creates a uinput device on the developer desktop.** Native
 pen/touch delivery, Windows and Linux compositor behavior, and hardware device
-loss remain qualification gates. The GameStream protocol adapter owns network
-ingress mapping and client-to-desktop coordinate transforms.
+loss remain qualification gates. GameStream ingress and its client-to-desktop
+coordinate transform remain pending in the protocol adapter.
 
 Vibeshine commit `aa292c4cb097f22beab19d6ebf0307367f9bf449` was a behavioral
 reference, including its keyboard/mouse interfaces and history concerning
