@@ -3371,6 +3371,110 @@ mod tests {
     }
 
     #[test]
+    fn external_ip_admin_update_persists_and_reads_back_exact_text() {
+        let target = NetworkTarget::from(settings::DEFAULT_PORT);
+        let initial_update = product_update_payload(
+            4,
+            "Host",
+            &target,
+            None,
+            ProductStreamingSettings {
+                audio_sink: None,
+                virtual_sink: None,
+                audio_sink_capture_only: false,
+                external_ip: Some("198.51.100.7".into()),
+                stream_audio: true,
+                capture: CaptureMode::Auto,
+                video_max_batch_size_kb: None,
+                max_bitrate: None,
+                minimum_fps_target: None,
+                wgc_pacing_smoothing: None,
+                ping_timeout_ms: None,
+                global_preparation: Vec::new(),
+                legacy_global_preparation: Vec::new(),
+                frame_limiter: FrameLimiterSettings::default(),
+                lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
+                wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
+            },
+        );
+        let initial_document = json!({
+            "ok":true,
+            "found":true,
+            "version":SETTINGS_VERSION,
+            "revision":4,
+            "values":initial_update["values"].clone()
+        });
+        assert_eq!(initial_document["version"], SETTINGS_VERSION);
+
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&initial_document).unwrap());
+        let external_ip = " 203.0.113.42 ";
+        product
+            .enqueue(
+                72,
+                5_000,
+                AdminAction::Update {
+                    hostname: "Host".into(),
+                    port: settings::DEFAULT_PORT,
+                    address_family: FieldUpdate::Omitted,
+                    bind_address: FieldUpdate::Omitted,
+                    output_name: FieldUpdate::Omitted,
+                    audio_sink: FieldUpdate::Omitted,
+                    virtual_sink: FieldUpdate::Omitted,
+                    audio_sink_capture_only: FieldUpdate::Omitted,
+                    external_ip: FieldUpdate::Value(external_ip.into()),
+                    stream_audio: FieldUpdate::Omitted,
+                    capture: FieldUpdate::Omitted,
+                    video_max_batch_size_kb: FieldUpdate::Omitted,
+                    max_bitrate: FieldUpdate::Omitted,
+                    minimum_fps_target: FieldUpdate::Omitted,
+                    wgc_pacing_smoothing: FieldUpdate::Omitted,
+                    ping_timeout_ms: FieldUpdate::Omitted,
+                    global_preparation: FieldUpdate::Omitted,
+                    legacy_global_preparation: FieldUpdate::Omitted,
+                    frame_limiter: FrameLimiterUpdate::default(),
+                    encryption_modes: EncryptionModeUpdate::default(),
+                    expected_revision: 4,
+                    require_listener_apply: false,
+                },
+            )
+            .unwrap();
+        product.start_next();
+
+        let pending = product.pending.take().expect("product update request");
+        assert_eq!(pending.payload["version"], SETTINGS_VERSION);
+        assert_eq!(pending.payload["version"], initial_document["version"]);
+        assert_eq!(pending.payload["expected_revision"], 4);
+        assert_eq!(pending.payload["values"]["external_ip"], external_ip);
+
+        let confirmation = v17_update_confirmation(json!({
+            "ok":true,
+            "found":true,
+            "version":SETTINGS_VERSION,
+            "revision":5,
+            "values":pending.payload["values"].clone()
+        }));
+        assert_eq!(confirmation["version"], initial_document["version"]);
+        assert_eq!(confirmation["values"]["external_ip"], external_ip);
+        product.finish_call(pending.purpose, CallOutcome::Payload(confirmation.clone()));
+
+        let readback = &product
+            .completions
+            .front()
+            .expect("settings response")
+            .payload;
+        assert_eq!(readback["configured_external_ip"], external_ip);
+        assert_eq!(readback["revision"], 5);
+
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&confirmation).unwrap());
+        assert_eq!(
+            restarted.settings_payload()["configured_external_ip"],
+            external_ip
+        );
+    }
+
+    #[test]
     fn v13_ping_timeout_migrates_with_default_and_persists_signed_values() {
         let version_twelve = json!({
             "ok":true,"found":true,"version":12,"revision":4,
