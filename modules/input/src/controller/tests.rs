@@ -464,6 +464,10 @@ fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
     );
     assert_eq!(key_down["ok"], true);
     assert_eq!(trace.borrow().as_slice(), &[key(30, KeyState::Down)]);
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        key_down_at + Duration::from_millis(100)
+    );
 
     controller.expire(key_down_at + Duration::from_millis(99));
     assert_eq!(trace.borrow().len(), 1);
@@ -471,6 +475,10 @@ fn acquired_key_repeat_frequency_controls_cadence_and_retry_identity() {
     assert_eq!(
         trace.borrow().as_slice(),
         &[key(30, KeyState::Down), key(30, KeyState::Repeat)]
+    );
+    assert_eq!(
+        controller.repeating_key.as_ref().unwrap().next_due,
+        key_down_at + Duration::from_millis(150)
     );
 
     controller.expire(key_down_at + Duration::from_millis(149));

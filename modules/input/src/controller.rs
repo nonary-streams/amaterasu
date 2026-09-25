@@ -182,7 +182,9 @@ impl<B: Backend> Controller<B> {
             ),
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id, now),
             Operation::Renew { lease, ttl_ms } => self.renew(caller, &lease, ttl_ms, now, guard),
-            Operation::Batch { lease, events } => return self.batch(caller, &lease, events, guard),
+            Operation::Batch { lease, events } => {
+                return self.batch(caller, &lease, events, now, guard);
+            }
             Operation::Release { lease } => self.authorize(caller, &lease, true).and_then(|()| {
                 self.finish_lease(now, "released")?;
                 Ok(json!({"ok":true,"released":true}))
@@ -745,6 +747,7 @@ impl<B: Backend> Controller<B> {
         caller: &str,
         token: &str,
         events: Vec<Event>,
+        now: Instant,
         guard: &mut impl FnMut() -> InputResult<()>,
     ) -> Value {
         if let Err(error) = self
@@ -769,7 +772,7 @@ impl<B: Backend> Controller<B> {
                 }
                 if self.event_enabled(event, policy) {
                     self.inject_batch_event(event)
-                        .and_then(|()| self.update_repeat_after_event(event, Instant::now()))
+                        .and_then(|()| self.update_repeat_after_event(event, now))
                 } else {
                     suppressed += 1;
                     Ok(())
