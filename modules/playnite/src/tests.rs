@@ -50,6 +50,27 @@ fn settings_are_fixed_to_the_management_principal() {
 }
 
 #[test]
+fn settings_update_preserves_duplicate_game_exclusions() {
+    let duplicate_game_ids = vec!["Game-ID", "game-id", "Game-ID"];
+    let action: Action = serde_json::from_value(json!({
+        "action":"settings_update",
+        "enabled":true,
+        "exclude_games":duplicate_game_ids,
+        "expected_revision":3
+    }))
+    .unwrap();
+
+    let Action::SettingsUpdate { exclude_games, .. } = action else {
+        panic!("expected settings update")
+    };
+
+    assert_eq!(
+        exclude_games,
+        Some(vec!["Game-ID".into(), "game-id".into(), "Game-ID".into()])
+    );
+}
+
+#[test]
 fn settings_update_is_flat_and_cannot_retarget_a_product_owner() {
     let action: Action = serde_json::from_value(json!({
         "action":"settings_update",

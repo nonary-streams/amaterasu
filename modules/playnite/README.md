@@ -22,9 +22,11 @@ reference parser; matching folds the lists into sets, so duplicates do not
 change selection.
 
 `exclude_games` applies the same bytewise comparison to Playnite IDs. Filter
-validation uses ASCII case folding for uniqueness, so Unicode case equivalents
-remain distinct. Repeated ASCII category and game filters are rejected, while
-plugin filter lists preserve the reference's duplicate acceptance.
+validation uses ASCII case folding for category uniqueness, so Unicode case
+equivalents remain distinct. Repeated ASCII category filters are rejected.
+Repeated game IDs remain accepted and retained as in the reference parser;
+matching folds exclusions into a set, so duplicates do not change selection.
+Plugin filter lists also preserve the reference's duplicate acceptance.
 
 `auto_sync` controls membership reconciliation. When it is enabled together with
 `autosync_remove_uninstalled`, the provider sends tombstones only for explicit

@@ -120,7 +120,7 @@ impl ProductSettings {
         validate_filter_values(&self.exclude_categories, "category", true)?;
         validate_filter_values(&self.sync_plugins, "plugin ID", false)?;
         validate_filter_values(&self.exclude_plugins, "plugin ID", false)?;
-        validate_filter_values(&self.exclude_games, "game ID", true)?;
+        validate_filter_values(&self.exclude_games, "game ID", false)?;
         if serde_json::to_vec(self).map_or(true, |bytes| bytes.len() > MAX_SETTINGS_BYTES) {
             return Err("Playnite product settings exceed the 12000 byte limit");
         }
@@ -211,7 +211,7 @@ fn validate_filter_values(
             return Err(match label {
                 "category" => "category filters must be unique nonempty text of at most 512 bytes",
                 "plugin ID" => "plugin filters must be nonempty text of at most 512 bytes",
-                _ => "game filters must be unique nonempty text of at most 512 bytes",
+                _ => "game filters must be nonempty text of at most 512 bytes",
             });
         }
     }
@@ -341,6 +341,7 @@ mod tests {
         let settings = ProductSettings {
             sync_plugins: vec!["included-plugin".into()],
             exclude_plugins: vec!["excluded-plugin".into()],
+            exclude_games: vec!["Game-ID".into(), "game-id".into(), "Game-ID".into()],
             ..ProductSettings::default()
         };
         assert_eq!(
@@ -416,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_are_bounded_unique_and_case_insensitive() {
+    fn filters_are_bounded_and_category_values_are_unique_case_insensitively() {
         for sync_categories in [
             vec!["".into()],
             vec!["Arcade".into(), "arcade".into()],
@@ -448,6 +449,78 @@ mod tests {
             .validate()
             .is_err()
         );
+        assert!(
+            ProductSettings {
+                exclude_categories: vec!["Arcade".into(), "arcade".into()],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn game_exclusion_filters_preserve_duplicates_and_value_bounds() {
+        let duplicate_game_ids = vec!["Game-ID".into(), "game-id".into(), "Game-ID".into()];
+        assert!(
+            ProductSettings {
+                exclude_games: duplicate_game_ids,
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+
+        assert_eq!(
+            ProductSettings {
+                exclude_games: vec![String::new()],
+                ..ProductSettings::default()
+            }
+            .validate(),
+            Err("game filters must be nonempty text of at most 512 bytes")
+        );
+
+        for exclude_games in [
+            vec!["   ".into()],
+            vec!["x".repeat(MAX_FILTER_BYTES + 1)],
+            vec!["invalid\ngame ID".into()],
+        ] {
+            assert!(
+                ProductSettings {
+                    exclude_games,
+                    ..ProductSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+
+        assert!(
+            ProductSettings {
+                exclude_games: vec!["game-id".into(); MAX_FILTERS + 1],
+                ..ProductSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn game_exclusion_duplicates_survive_persisted_document_roundtrip() {
+        let duplicate_game_ids = vec!["Game-ID".into(), "game-id".into(), "Game-ID".into()];
+        let settings = ProductSettings {
+            exclude_games: duplicate_game_ids.clone(),
+            ..ProductSettings::default()
+        };
+        let payload = json!({
+            "ok":true,"found":true,"version":PRODUCT_SETTINGS_VERSION,"revision":7,
+            "values":serde_json::to_value(&settings).unwrap()
+        });
+
+        let (loaded_settings, revision) = ProductSettings::from_product_document(&payload).unwrap();
+
+        assert_eq!(revision, 7);
+        assert_eq!(loaded_settings.exclude_games, duplicate_game_ids);
     }
 
     #[test]
