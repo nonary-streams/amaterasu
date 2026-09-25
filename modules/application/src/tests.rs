@@ -44,7 +44,21 @@ fn wait_for_preparation_state(
 #[test]
 #[ignore = "subprocess entry point invoked by process lifecycle tests"]
 fn controlled_child() {
-    let mode = if std::env::args().any(|argument| argument == "--detached-child") {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if let Some(argument_index) = arguments
+        .iter()
+        .position(|argument| argument == "--detached-arguments")
+    {
+        let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
+        let expanded_arguments = arguments[argument_index + 1..].join("\n");
+        std::fs::write(marker, expanded_arguments).unwrap();
+        return;
+    }
+
+    let mode = if arguments
+        .iter()
+        .any(|argument| argument == "--detached-child")
+    {
         "detached-marker".into()
     } else {
         std::env::var("AMATERASU_TEST_CHILD").unwrap_or_default()
@@ -510,15 +524,38 @@ fn auto_detach_does_not_retain_a_failed_launcher() {
 }
 
 fn detached_command_for_current_test() -> String {
+    detached_command_for_current_test_with_arguments(&["--detached-child"])
+}
+
+fn detached_command_for_current_test_with_arguments(arguments: &[&str]) -> String {
     let executable = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
         .into_owned();
+    let mut command_arguments = vec![
+        quote_raw_command_argument(&executable),
+        quote_raw_command_argument("--exact"),
+        quote_raw_command_argument("tests::controlled_child"),
+        quote_raw_command_argument("--ignored"),
+        quote_raw_command_argument("--"),
+    ];
+    command_arguments.extend(
+        arguments
+            .iter()
+            .map(|argument| quote_raw_command_argument(argument)),
+    );
+    command_arguments.join(" ")
+}
+
+fn quote_raw_command_argument(argument: &str) -> String {
     #[cfg(windows)]
-    let executable = format!("\"{executable}\"");
+    {
+        format!("\"{argument}\"")
+    }
     #[cfg(not(windows))]
-    let executable = format!("'{}'", executable.replace('\'', "'\\''"));
-    format!("{executable} --exact tests::controlled_child --ignored -- --detached-child")
+    {
+        format!("'{}'", argument.replace('\'', "'\\''"))
+    }
 }
 
 #[cfg(windows)]
@@ -648,6 +685,63 @@ fn detached_commands_outlive_the_primary_application_and_are_reaped() {
         std::thread::sleep(Duration::from_millis(5));
     }
     manager.reap_exited().unwrap();
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn detached_commands_expand_configured_values_before_platform_parsing() {
+    const CONFIGURED_VARIABLE: &str = "AMATERASU_TEST_DETACHED_EXPANSION_VALUE";
+    const MISSING_VARIABLE: &str = "AMATERASU_TEST_DETACHED_EXPANSION_MISSING_20260925";
+
+    let directory = test_directory("detached-environment-expansion");
+    let marker = directory.join("expanded-arguments");
+    assert!(std::env::var_os(MISSING_VARIABLE).is_none());
+
+    let detached_arguments = [
+        "--detached-arguments".to_owned(),
+        format!("configured=$({CONFIGURED_VARIABLE})"),
+        format!("escaped=$$({CONFIGURED_VARIABLE})"),
+        format!("missing=$({MISSING_VARIABLE})"),
+    ];
+    let detached_argument_refs = detached_arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    let mut manager = ProcessManager::default();
+    let mut request = launch("detached-environment-expansion", "sleep");
+    request["detached"] = json!([detached_command_for_current_test_with_arguments(
+        &detached_argument_refs
+    )]);
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["environment"][CONFIGURED_VARIABLE] = json!("Desk Mode");
+
+    let started = manager.handle("alice", request);
+    assert_eq!(started["process"]["state"], "running", "{started}");
+
+    let escaped_argument = format!("escaped=$({CONFIGURED_VARIABLE})");
+    let expected_arguments = [
+        "configured=Desk Mode",
+        escaped_argument.as_str(),
+        "missing=",
+    ]
+    .join("\n");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(&marker).ok().as_deref() != Some(expected_arguments.as_str()) {
+        assert!(
+            Instant::now() < deadline,
+            "detached child did not record expanded argv: {:?}",
+            std::fs::read_to_string(&marker)
+        );
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        expected_arguments
+    );
     manager.shutdown().unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
