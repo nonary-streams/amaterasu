@@ -3,8 +3,9 @@
 mod implementation {
     use crate::backend::CaptureSession;
     use crate::model::{CaptureError, CaptureResult, Frame};
-    use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
     use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     pub trait FrameSource {
         fn poll(&mut self) -> CaptureResult<Option<Frame>>;
@@ -70,7 +71,7 @@ mod implementation {
     }
 
     impl CaptureSession for Worker {
-        fn read(&mut self, _: u32) -> CaptureResult<Option<Frame>> {
+        fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
             if !self.waiting {
                 self.requests
                     .as_ref()
@@ -79,13 +80,22 @@ mod implementation {
                     .map_err(|_| worker_ended())?;
                 self.waiting = true;
             }
-            match self.replies.try_recv() {
+            let reply = if wait_ms == 0 {
+                self.replies.try_recv().map_err(|error| match error {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
+            } else {
+                self.replies
+                    .recv_timeout(Duration::from_millis(u64::from(wait_ms)))
+            };
+            match reply {
                 Ok(result) => {
                     self.waiting = false;
                     result
                 }
-                Err(TryRecvError::Empty) => Ok(None),
-                Err(TryRecvError::Disconnected) => Err(worker_ended()),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => Err(worker_ended()),
             }
         }
     }
@@ -120,6 +130,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, ThreadId};
+    use std::time::Duration;
 
     struct ThreadBoundSource {
         trace: Arc<Mutex<Vec<(String, ThreadId)>>>,
@@ -200,6 +211,39 @@ mod tests {
         );
         assert_ne!(trace[0].1, thread::current().id());
         assert!(trace.iter().all(|(_, id)| *id == trace[0].1));
+    }
+
+    #[test]
+    fn bounded_read_waits_for_existing_poll_without_requesting_another_frame() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let worker_trace = trace.clone();
+        let (gate, gate_receiver) = mpsc::channel();
+        let mut worker = Worker::start(move || {
+            Ok(ThreadBoundSource {
+                trace: worker_trace,
+                gate: gate_receiver,
+                _thread_bound: Rc::new(()),
+            })
+        })
+        .unwrap();
+
+        assert!(worker.read(1).unwrap().is_none());
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            gate.send(()).unwrap();
+        });
+        let frame = worker.read(1_000).unwrap().unwrap();
+        release.join().unwrap();
+        assert_eq!(frame.bytes.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(operation, _)| operation == "poll")
+                .count(),
+            1
+        );
     }
 
     #[test]
