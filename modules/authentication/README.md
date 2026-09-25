@@ -57,9 +57,9 @@ Setup, lifetime settings, password rotation, session administration, token
 issuance, listing, and revocation require the immediate runtime caller to appear
 in administrator settings. Lifetime updates are persisted before acknowledgment
 and use compare-and-swap revisions; login and refresh load the committed values
-before issuing tokens. A changed lifetime applies to subsequently issued or
-renewed tokens. Existing sessions keep their original access and absolute refresh
-expiries. Setup succeeds only once. A caller
+before issuing tokens. TTL edits affect subsequently issued tokens but do not
+extend an existing session's absolute refresh expiry; refresh rotation also
+retains that original expiry. Setup succeeds only once. A caller
 can list/revoke only tokens that caller issued; missing and foreign token IDs
 both return `token_not_found`. An administrator login does not grant its frontend
 runtime principal permission to administer credentials or tokens. API token
@@ -94,25 +94,32 @@ call `validate` before takeover and call `seed` only on the copied
 
 Successful login returns `ok`, access `bearer`, `refresh_token`,
 `kind:"administrator_session"`, `subject` (the administrator username), `scopes`,
-`expires_at`, `refresh_expires_at`, and `remember_me`. Access lifetime uses
-`session_token_ttl_seconds`. A non-remembered refresh token lasts 86,400 seconds;
-a remembered refresh token uses `remember_me_refresh_token_ttl_seconds`. Refresh
-rotates both tokens and never extends the original absolute refresh expiry. Access
-tokens can expire earlier and be renewed while their refresh token remains valid.
-The refresh token is accepted only by `refresh` and `logout`; either a refresh
-token or access bearer can revoke its entire session pair. Logout is idempotent
-and does not revoke API tokens. Session metadata listings include access and
-refresh expiration plus the remember-me flag, but never either secret.
+`expires_at`, `refresh_expires_at`, and `remember_me`. At login, select the
+configured `remember_me_refresh_token_ttl_seconds` for remembered sessions or
+the fixed 86,400 seconds otherwise. The absolute refresh expiry is login time
+plus the larger of that selected refresh TTL and `session_token_ttl_seconds`.
+Access expiry is login time plus `session_token_ttl_seconds`, capped at the
+absolute refresh expiry. Refresh rotates both tokens and sets a new access
+expiry using the current access TTL, capped at the session's unchanged absolute
+refresh expiry. TTL edits alone leave stored expiries unchanged; refresh rotation
+may renew access expiry but keeps the absolute refresh expiry fixed. The refresh
+token is accepted only by `refresh` and `logout`; either it or the access bearer
+can revoke the entire session pair. Logout is idempotent and does not revoke API
+tokens. Session metadata listings include access and refresh expiration plus the
+remember-me flag, but never either secret.
 
-Sessions and refresh-token digests are held only in memory. Module restart and
-browser reload lose active authentication; login is then required again. The
-administrator token lifetime settings remain durable across module restarts.
-Browser clients should keep both secrets in tab memory rather than durable browser
-storage. The packaged runtime profile supplies default TTL settings, and the
-management API and settings editor expose administrator-facing lifetime controls.
-Remember-me refresh tokens remain in-memory and do not survive restart.
-There are at most 128 active sessions. Verify returns identity/scope/expiry
-metadata without the bearer, with kind `administrator_session` or `api_token`; a
+Administrator sessions persist in a separate versioned
+`authentication/sessions/v1` state document (schema version 1), apart from
+credential and API-token state at `authentication/v1`. The session document is
+bounded to 16 records and 12,000 serialized bytes. It stores bearer digests,
+credential and scope digests, and session metadata; it never stores raw bearer or
+refresh-token secrets. On module restart, sessions restore only when their
+credential and configured-scope digests still match and their absolute refresh
+expiry has not passed. The administrator token lifetime settings remain durable
+across module restarts. The packaged runtime profile supplies default TTL
+settings, and the management API and settings editor expose administrator-facing
+lifetime controls. Verify returns identity/scope/expiry metadata without the
+bearer, with kind `administrator_session` or `api_token`; a
 token's subject is its issuing runtime principal. All required scopes must match.
 Removing a configured scope denies any session/token that still grants it,
 including otherwise valid requests for a smaller subset.
@@ -138,10 +145,13 @@ passwords, hashes, tokens, or untrusted transport error text. Secrets necessaril
 exist transiently in native/runtime memory; this module does not promise memory
 zeroization or protection against trusted native modules or memory dumps.
 
-Each operation serially loads the caller-isolated state document
-`authentication/v1`. Setup/issue/revoke then use a revision-checked state write
-and complete successfully only after persistence acknowledgment. There is no
-internal password request backlog; the runtime applies bounded backpressure.
+Credential, token, and session operations serially load the caller-isolated
+credential/API-token state document `authentication/v1` and session state
+document `authentication/sessions/v1`. Setup/issue/revoke use revision-checked
+state writes and complete successfully only after persistence acknowledgment.
+Session document updates use revision-checked writes to that separate key.
+There is no internal password request backlog; the runtime applies bounded
+backpressure.
 Cancelled writes may already be durable, even if delivery of the response fails.
 A token bearer lost to cancellation is unrecoverable; use owned token metadata
 listing to revoke it and issue a new token. Issuance is not idempotent across
