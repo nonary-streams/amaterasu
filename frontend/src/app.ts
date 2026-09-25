@@ -304,6 +304,7 @@ namespace Amaterasu {
             this.api.subject.slice(0, 1).toUpperCase(),
           ),
           el("span", "account-name", this.api.subject),
+          mountLocaleSelector(this.api),
           logout,
         ),
       );
