@@ -295,3 +295,9 @@ Record acknowledgements to the coordinator's default-endpoint decision as they a
 - Tests: none run or added for capture recovery in that attempt; Windows capture/device qualification is unavailable here.
 - Worker request: `recovery_timeline` was requested as `gpt-6-luna`/`xhigh`, with exclusive ownership of `modules/audio/src/packet.rs` and a requirement to confirm settings before edits. Its runtime attribution reported session `01a0d516-8713-7b83-87f1-d35c0828ae10` as `gpt-6-luna`/`max`, so it made no changes and this recovery attempt stopped before code edits. The DS4 lease correction separately confirmed a native XHigh worker can start, but audio recovery was not assigned in that slice.
 - That attempt was superseded by the current verified XHigh worker slice above. It did not modify the current implementation.
+
+## Coordinator validation update: continuous audio receiver
+
+- The continuous-framing receiver commits `80d3548355dde55978799eb6429f8792d3ec6879` and `0c0942782eff83553695144b47bb0fa89ea4cff6` landed directly as `f439a922217a11307014d4fac690726968553d0b` and `d30fb2ca21276e1b2aa2c79358c09a3af5284747`. Main commit `ad1fba3` groups the request fields and fixed-width sample checks after strict Clippy identified lint findings.
+- The accepted `amaterasu.audio/1` Open contract accepts optional 5 or 10 ms packet framing; missing or null retains legacy pending-on-idle behavior. Main validation passed `cargo fmt --check -p amaterasu-audio`, `git diff --check`, 62 audio tests (one hardware test ignored), and strict Clippy.
+- This is the receiver half of L02's session-only `continuousAudio` path. Its producer remains isolated in L02's lane and must pass consumer and coordinator package tests before the feature is verified. No stable ID is closed here; management, persistence and Windows capture qualification remain pending for the assigned IDs.
