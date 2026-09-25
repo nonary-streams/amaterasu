@@ -662,7 +662,14 @@ The production edit combines the capture-stage, explicit rejection, and `unsuppo
 - Worker `/root/video_strict_clippy_correction` used isolated worktree `D:/sources/worktrees/amaterasu-video-strict-clippy-correction-xhigh`, branch `codex/luna03-video-strict-clippy-correction-xhigh`, based on the clean lane base above. Its actual session attribution was verified as `gpt-6-luna` / `xhigh` (thread `01a0d6b7-e0f7-72e2-9fbc-923a5a5209b9`). It committed only the two paths as `b58f89365fcb21f1eb302c9eac93af749f1cae4e`, with the required plan trailers and configured Nonary identity.
 - Parent verified the worker parent SHA, exact changed paths, commit trailers, model attribution, and clean worktree; reviewed the complete diff; and cherry-picked the commit as lane code commit `21a994e903bf0e83e8ae8092d666b6ff84bd1728`. The worker and lane trees match.
 - Worker and lane passed `rustfmt --edition 2024 --check --config skip_children=true modules/video/src/pipeline.rs modules/video/src/pipeline/tests.rs`, `git diff --check`, and `git show --check`.
-- Lane code commit `21a994e903bf0e83e8ae8092d666b6ff84bd1728` was directly cherry-picked to main as `d58139c7`. The coordinator is rerunning `cargo fmt --check -p amaterasu-video`, `cargo test -p amaterasu-video`, and `cargo clippy -p amaterasu-video --all-targets -- -D warnings`; results remain pending.
+- Lane code commit `21a994e903bf0e83e8ae8092d666b6ff84bd1728` was directly cherry-picked to main as `d58139c7`. Coordinator validation on main passed formatting, all 80 video tests, and strict Clippy.
+
+### Coordinator validation on main
+
+- `cargo fmt --check -p amaterasu-video`: passed.
+- `cargo test -p amaterasu-video`: 80 passed, 0 failed.
+- `cargo clippy -p amaterasu-video --all-targets -- -D warnings`: passed.
+- The source lane and branch remain available for the ongoing parity work.
 
 ### Remaining parity gaps
 
