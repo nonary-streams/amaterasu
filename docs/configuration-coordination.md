@@ -6,7 +6,7 @@
 - Main checkout: `C:\Users\Chase\sources\amaterasu`
 - No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: see the current session snapshot at the end of this file. The latest process check found all six lane leads live; L03 and L04 were resumed after completing a slice or reaching a gate.
+- Status: see the current session snapshot at the end of this file. The latest process check found five live lane leads; L04 reported no safe independent slice and stopped at the native pen/touch contract gate.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -388,8 +388,8 @@ This reflects the latest process and worktree check. Lead session IDs remain the
 | luna-01 | PID 47792, live | Cross-config credentials tests landed on main as `d82277d7`; coordinator fixture and Clippy correction `dcebf41` passed 52 authentication tests and strict Clippy. The lead is resumed for the next independent slice. |
 | luna-02 | PID 52592, live | Network lane has a 13-file draft across NVHTTP, RTSP, and stream-session. |
 | luna-03 | PID 4472, live | Manual-resolution parser landed on main as `d66ac2a9`; coordinator formatting, 40 tests, and strict Clippy passed. The lead is resumed for another unblocked slice; the ID remains pending. |
-| luna-04 | PID 56892, live | Native pen/touch worker candidate is reviewed but held pending L02/L05 contract acknowledgements and coordinator release. The lead is resumed for another independent input slice. |
+| luna-04 | stopped | Outbox 062 found no safe independent input/audio slice. Its reviewed native pen/touch candidate awaits L02/L05 contract acknowledgements and coordinator release; follow-up requests were sent. |
 | luna-05 | PID 50380, live | Catalog HDR storage landed as `200a4b62` and formatter cleanup as `a141941`; 80 tests and strict Clippy passed. The next reservation is an application README correction for `per_application:elevated`. |
 | luna-06 | PID 33088, live | The locale worker session ended at its clean reserved base without a code candidate. The coordinator corrected the conflicting topology instruction and asked the lead to inspect the session and continue the authorized slice. |
 
-The main checkout remains the direct landing point; do not push.
+The main checkout remains the direct landing point; do not push. L04 can resume once its contract gate is resolved.
