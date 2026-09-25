@@ -411,6 +411,24 @@ mod tests {
     }
 
     #[test]
+    fn open_consumer_selects_wan_encryption_mode_for_public_ipv6_peer() {
+        let encrypted = open_with_video_policy("2001:4860:4860::8888", 0, 2, true);
+        assert!(encrypted.validate(true).is_ok());
+
+        let plaintext = open_with_video_policy("2001:4860:4860::8888", 0, 2, false);
+        assert_eq!(plaintext.validate(true), Err("invalid_encryption"));
+    }
+
+    #[test]
+    fn open_consumer_selects_lan_encryption_mode_for_private_ipv4_peer() {
+        let plaintext = open_with_video_policy("192.168.1.20", 0, 2, false);
+        assert!(plaintext.validate(true).is_ok());
+
+        let encrypted = open_with_video_policy("192.168.1.20", 0, 2, true);
+        assert_eq!(encrypted.validate(true), Err("invalid_encryption"));
+    }
+
+    #[test]
     fn opportunistic_policy_accepts_either_video_encryption_choice() {
         for encrypted in [false, true] {
             let request = open_with_video_policy("192.168.1.20", 1, 1, encrypted);
