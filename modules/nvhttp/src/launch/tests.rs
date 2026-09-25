@@ -2433,6 +2433,34 @@ fn changed_application_policy_after_preflight_never_opens_rtsp() {
 }
 
 #[test]
+fn expired_preflight_settles_without_scheduling_application_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    assert!(
+        controller
+            .poll(now, &mut |command| broker.send(command))
+            .is_empty()
+    );
+    let expired = now + std::time::Duration::from_secs(41);
+    assert!(
+        controller
+            .poll(expired, &mut |command| broker.send(command))
+            .is_empty()
+    );
+    let replies = controller.poll(expired, &mut |command| broker.send(command));
+    assert_eq!(replies.len(), 1);
+    assert_ne!(replies[0].1.status, 200);
+    assert!(
+        !broker
+            .actions()
+            .contains(&("amaterasu.launch/1", "launch_export"))
+    );
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "lookup")));
+}
+
+#[test]
 fn response_loss_before_first_flush_stops_rtsp_and_application() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
