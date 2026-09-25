@@ -396,6 +396,17 @@ fn stop_and_join_route_restore_worker(worker: thread::JoinHandle<()>) {
     let _ = worker.join();
 }
 
+fn stop_worker_then_restore_once(
+    worker: Option<thread::JoinHandle<()>>,
+    restore_once: impl FnOnce(),
+) {
+    if let Some(worker) = worker {
+        // Finish any in-flight COM operation before the final restore attempt.
+        stop_and_join_route_restore_worker(worker);
+    }
+    restore_once();
+}
+
 pub fn shutdown() {
     ROUTE_RESTORE_SHUTTING_DOWN.store(true, Ordering::Release);
     let worker = ROUTE_RESTORE_WORKER.get().and_then(|worker_state| {
@@ -405,11 +416,21 @@ pub fn shutdown() {
             .take()
     });
 
-    if let Some(worker) = worker {
-        // Do not hold either policy state or worker state while waiting for
-        // the worker to leave its COM apartment and terminate.
-        stop_and_join_route_restore_worker(worker);
-    }
+    // Do not hold either policy state or worker state while joining. Shutdown
+    // needs a final attempt because the retry worker exits when its stop flag
+    // is set, potentially before it next examines pending route restoration.
+    stop_worker_then_restore_once(worker, || {
+        if route_restore_pending() {
+            // Shutdown may run on a caller's incompatible COM apartment.
+            // Open a fresh STA for the final, bounded restoration attempt.
+            if let Ok(final_worker) = thread::Builder::new()
+                .name("audio-route-final-restore".to_owned())
+                .spawn(retry_pending_route_restore_once)
+            {
+                let _ = final_worker.join();
+            }
+        }
+    });
 }
 
 fn retry_pending_route_restore_once() -> bool {
@@ -1165,6 +1186,22 @@ mod tests {
         stop_and_join_route_restore_worker(worker);
 
         assert!(exited_receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn shutdown_restores_after_retry_worker_exits_even_without_a_worker() {
+        let (exited_sender, exited_receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread::park();
+            let _ = exited_sender.send(());
+        });
+        let mut attempts = 0;
+        stop_worker_then_restore_once(Some(worker), || {
+            assert!(exited_receiver.try_recv().is_ok());
+            attempts += 1;
+        });
+        stop_worker_then_restore_once(None, || attempts += 1);
+        assert_eq!(attempts, 2);
     }
 
     #[test]
