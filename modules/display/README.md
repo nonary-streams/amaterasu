@@ -36,12 +36,13 @@ Its default is `Auto`, and its exact serialized tokens are `auto` and
 `disabled`. The legacy token parser maps unknown values to `Disabled`. The
 pinned meanings are:
 
-- `auto` selects HDR automatically according to the surrounding HDR policy.
-- `disabled` prefers SDR output.
+- `auto` changes display HDR to the state requested by the client when the
+  display supports it.
+- `disabled` performs no additional HDR configuration.
 
 This model does not persist settings, project scoped values into a runtime
-request, or perform provider/native HDR effects. Platform behavior and the
-surrounding automatic HDR policy are not qualified here.
+request, or perform provider/native HDR effects. Platform behavior remains
+unqualified.
 
 ## Display configuration option model
 
