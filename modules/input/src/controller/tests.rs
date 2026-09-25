@@ -634,14 +634,33 @@ fn active_lease_keeps_the_profile_selected_at_acquire_time() {
         now,
         &mut || Ok(()),
     );
-    let selected_profile = selected_supported_profile();
-    controller.set_gamepad_profile(selected_profile);
+    let updated_global_profile = selected_supported_profile();
+    controller.set_gamepad_profile(updated_global_profile);
 
     let status = controller.handle("owner", Operation::Status, now, &mut || Ok(()));
     assert_eq!(acquired["gamepad_profile"], "auto");
-    assert_eq!(status["gamepad"], selected_profile.as_str());
+    assert_eq!(status["gamepad"], updated_global_profile.as_str());
+    assert_eq!(controller.backend.gamepad_profile, GamepadProfile::Auto);
     assert_eq!(status["lease"]["gamepad_profile"], "auto");
-    assert_eq!(status["lease"]["effective_gamepad_profile"], "x360");
+    assert_eq!(
+        status["effective_gamepad_profile"],
+        acquired["effective_gamepad_profile"]
+    );
+    assert_eq!(
+        status["lease"]["effective_gamepad_profile"],
+        acquired["effective_gamepad_profile"]
+    );
+
+    let released = controller.handle(
+        "owner",
+        Operation::Release {
+            lease: acquired["lease"].as_str().unwrap().into(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(released["released"], true);
+    assert_eq!(controller.backend.gamepad_profile, updated_global_profile);
 }
 
 #[test]

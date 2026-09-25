@@ -254,7 +254,7 @@ impl<B: Backend> Controller<B> {
     fn effective_gamepad_profile(&self) -> GamepadProfile {
         self.lease
             .as_ref()
-            .and_then(|lease| lease.requested_gamepad)
+            .map(|lease| lease.gamepad_profile)
             .unwrap_or(self.gamepad_profile)
     }
 
