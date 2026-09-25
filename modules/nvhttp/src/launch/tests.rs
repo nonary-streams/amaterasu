@@ -1016,12 +1016,21 @@ impl Broker {
         }
         if service == "amaterasu.launch/1" {
             if action == "preflight_export" {
+                let launch = self.response(
+                    service,
+                    &json!({
+                        "action":"launch_export",
+                        "operation_id":payload["operation_id"],
+                        "app_id":payload["app_id"],
+                    }),
+                );
                 return json!({
                     "ok":true,
                     "preflight_token":"fixture-preflight-token",
                     "app_id":payload["app_id"],
                     "catalog_revision":1,
-                    "config_overrides":self.application_input_overrides.clone().unwrap_or_else(|| json!({})),
+                    "config_overrides":launch["launch"]["config_overrides"].as_object()
+                        .map(|overrides| json!(overrides)).unwrap_or_else(|| json!({})),
                     "executable_path":self.application_executable_path,
                 });
             }
@@ -1912,6 +1921,9 @@ fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
 
     assert_eq!(launch_payload["frame_limiter_settings"], expected_settings);
     assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
+    let rtsp_open = opened_rtsp_payload(&broker);
+    assert!(rtsp_open["frame_limiter_settings"].is_null());
+    assert!(rtsp_open["frame_limiter_executable_path"].is_null());
 }
 
 #[test]
@@ -2344,6 +2356,10 @@ fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
         "back edge sync"
     );
     assert_eq!(
+        launch_payload["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"],
+        true
+    );
+    assert_eq!(
         opened_rtsp_payload(&broker)["frame_limiter_settings"],
         launch_payload["frame_limiter_settings"]
     );
@@ -2383,6 +2399,37 @@ fn malformed_preflight_override_fails_before_application_launch() {
             .actions()
             .contains(&("amaterasu.launch/1", "launch_export"))
     );
+}
+
+#[test]
+fn changed_application_policy_after_preflight_never_opens_rtsp() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_fec_percentage: Some(31),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for _ in 0..8 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if controller
+            .records
+            .values()
+            .any(|record| record.stage == Stage::LaunchApplication)
+        {
+            break;
+        }
+    }
+    assert!(
+        controller
+            .records
+            .values()
+            .any(|record| record.stage == Stage::LaunchApplication)
+    );
+    broker.application_fec_percentage = Some(32);
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
 }
 
 #[test]

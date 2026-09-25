@@ -490,18 +490,13 @@ pub struct Open {
 }
 impl Open {
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
-        if let Some(snapshot) = &self.frame_limiter_settings {
-            let requested_fps = self
-                .profile
-                .fps
-                .checked_mul(1_000)
-                .ok_or("invalid_frame_limiter_snapshot")?;
-            if snapshot["version"] != 1
-                || !snapshot["settings"].is_object()
-                || snapshot["requested_stream_fps_millihz"] != requested_fps
-            {
-                return Err("invalid_frame_limiter_snapshot");
-            }
+        if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
+            return Err("invalid_frame_limiter_snapshot");
+        }
+        if let Some(snapshot) = &self.frame_limiter_settings
+            && !valid_frame_limiter_snapshot(snapshot, self.profile.fps)
+        {
+            return Err("invalid_frame_limiter_snapshot");
         }
         if self
             .frame_limiter_executable_path
@@ -738,6 +733,100 @@ impl Open {
     }
 }
 
+fn valid_frame_limiter_snapshot(snapshot: &serde_json::Value, stream_fps: u32) -> bool {
+    let Some(fields) = snapshot.as_object() else {
+        return false;
+    };
+    let Some(settings) = snapshot["settings"].as_object() else {
+        return false;
+    };
+    let Some(requested_fps) = stream_fps.checked_mul(1_000) else {
+        return false;
+    };
+    if fields.len() != 9
+        || settings.len() != 11
+        || snapshot["version"] != 1
+        || snapshot["requested_stream_fps_millihz"] != requested_fps
+        || !matches!(settings["frame_limiter_enable"], serde_json::Value::Bool(_))
+        || settings["frame_limiter_fps_limit_millihz"]
+            .as_u64()
+            .is_none_or(|fps| fps > 1_000_000)
+        || !matches!(
+            settings["frame_limiter_disable_vsync"],
+            serde_json::Value::Bool(_)
+        )
+        || !matches!(
+            settings["rtss_allow_virtual_display_override"],
+            serde_json::Value::Bool(_)
+        )
+        || !matches!(
+            settings["mangohud_always_show_graph"],
+            serde_json::Value::Bool(_)
+        )
+        || !matches!(
+            settings["frame_limiter_provider"].as_str(),
+            Some(
+                "auto"
+                    | "rtss"
+                    | "nvidia-control-panel"
+                    | "mangohud"
+                    | "proton"
+                    | "mangohud-proton"
+                    | "none"
+            )
+        )
+        || !matches!(
+            settings["frame_limiter_auto_virtual_framegen"].as_str(),
+            Some("enabled" | "vrr" | "legacy" | "disabled")
+        )
+        || !matches!(
+            settings["rtss_frame_limit_type"].as_str(),
+            Some("async" | "front edge sync" | "back edge sync" | "nvidia reflex")
+        )
+        || !matches!(
+            settings["mangohud_preset"].as_str(),
+            Some("custom" | "1" | "2" | "3" | "4")
+        )
+        || !matches!(
+            settings["mangohud_limiter_method"].as_str(),
+            Some("early" | "late")
+        )
+        || settings["rtss_install_path"].as_str().is_none()
+    {
+        return false;
+    }
+    for rate in [
+        "client_display_mode_override_millihz",
+        "lossless_scaling_limit_millihz",
+    ] {
+        if !fields.contains_key(rate)
+            || (!snapshot[rate].is_null()
+                && snapshot[rate].as_u64().is_none_or(|rate| rate > 1_000_000))
+        {
+            return false;
+        }
+    }
+    for flag in [
+        "virtual_display_active",
+        "physical_framegen_capture",
+        "rtss_frame_limit_type_explicit_override",
+    ] {
+        if !fields.contains_key(flag) || (!snapshot[flag].is_null() && !snapshot[flag].is_boolean())
+        {
+            return false;
+        }
+    }
+    fields.contains_key("game_frame_generation_mode")
+        && matches!(
+            snapshot["game_frame_generation_mode"].as_str(),
+            None | Some(
+                "none" | "lossless-scaling" | "game-provided" | "nvidia-smooth-motion" | "other"
+            )
+        )
+        && (snapshot["game_frame_generation_mode"].is_null()
+            || snapshot["game_frame_generation_mode"].is_string())
+}
+
 fn default_stream_audio() -> bool {
     true
 }
@@ -896,8 +985,26 @@ mod tests {
         let mut value = open_json();
         value["frame_limiter_settings"] = json!({
             "version":1,
-            "settings":{"rtss_frame_limit_type":"back edge sync"},
-            "requested_stream_fps_millihz":60000
+            "settings":{
+                "frame_limiter_enable":true,
+                "frame_limiter_fps_limit_millihz":60000,
+                "frame_limiter_provider":"auto",
+                "frame_limiter_disable_vsync":false,
+                "frame_limiter_auto_virtual_framegen":"enabled",
+                "rtss_frame_limit_type":"back edge sync",
+                "rtss_allow_virtual_display_override":false,
+                "rtss_install_path":"",
+                "mangohud_limiter_method":"late",
+                "mangohud_preset":"custom",
+                "mangohud_always_show_graph":false
+            },
+            "requested_stream_fps_millihz":60000,
+            "client_display_mode_override_millihz":null,
+            "lossless_scaling_limit_millihz":null,
+            "virtual_display_active":null,
+            "physical_framegen_capture":null,
+            "game_frame_generation_mode":null,
+            "rtss_frame_limit_type_explicit_override":true
         });
         value["frame_limiter_executable_path"] = json!("C:\\Games\\Example.exe");
         let request: Open = serde_json::from_value(value.clone()).unwrap();
@@ -916,6 +1023,13 @@ mod tests {
         let mismatched: Open = serde_json::from_value(value).unwrap();
         assert_eq!(
             mismatched.validate(false),
+            Err("invalid_frame_limiter_snapshot")
+        );
+        let mut missing_path = open_json();
+        missing_path["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
+        let missing_path: Open = serde_json::from_value(missing_path).unwrap();
+        assert_eq!(
+            missing_path.validate(false),
             Err("invalid_frame_limiter_snapshot")
         );
     }

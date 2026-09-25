@@ -93,7 +93,7 @@ impl Controller {
             Outcome::Waiting => self.job = Some(take_job(job)),
             Outcome::Result(payload) => self.consume(job, payload, now, replies),
             Outcome::Rejected => self.rejected(job, now, replies),
-            Outcome::Settled => self.settled(job, now),
+            Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
                 let record = self.records.get_mut(&job.record).expect("workflow record");
                 let entering_cleanup =
@@ -234,7 +234,7 @@ impl Controller {
                         "max_bitrate_kbps": record.effective_max_bitrate_kbps,
                         "minimum_fps_target": record.effective_minimum_fps_target,
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
-                        "frame_limiter_settings": record.frame_limiter_snapshot,
+                        "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
                         "capture": capture,
                         "profile": profile,
@@ -297,6 +297,7 @@ impl Controller {
                     record.executable_path = executable_path;
                     record.application_frame_limiter_settings =
                         application_overrides.frame_limiter_settings();
+                    record.application_preflight_overrides = Some(application_overrides);
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     record.stage = Stage::LaunchApplication;
                 }
@@ -309,6 +310,13 @@ impl Controller {
                         record.application_launch = Some(launch_id);
                         match application_config_overrides(&payload) {
                             Ok(application_overrides) => {
+                                if record.application_preflight_overrides.as_ref()
+                                    != Some(&application_overrides)
+                                {
+                                    fail_record(record, "application_policy_mismatch", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
                                 record.application_frame_limiter_settings =
                                     application_overrides.frame_limiter_settings();
                                 if record.frame_limiter_snapshot.as_ref()
@@ -591,7 +599,7 @@ impl Controller {
         self.finish_or_retain(job.record, now, replies);
     }
 
-    fn settled(&mut self, job: &Job, now: Instant) {
+    fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         let record = self.records.get_mut(&job.record).expect("workflow record");
         record.stage = Stage::Cleanup;
         match job.phase {
@@ -632,6 +640,9 @@ impl Controller {
         }
         if record.state == State::Starting && now >= record.deadline {
             record.request_cleanup(Some("launch_deadline_exceeded"), now + CLEANUP_DEADLINE);
+        }
+        if job.phase == Phase::PreflightApplication {
+            self.finish_or_retain(job.record, now, replies);
         }
     }
 
@@ -793,7 +804,7 @@ fn application_response<'a>(
     Ok((id, state, launch["cleanup_error"].is_null()))
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
@@ -1041,6 +1052,14 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         .checked_mul(1_000)
         .filter(|rate| *rate <= 1_000_000)
         .expect("admitted stream FPS must fit the frame-limiter service range");
+    let explicit_rtss_override = record
+        .client_frame_limiter_settings
+        .rtss_frame_limit_type
+        .is_some()
+        || record
+            .application_frame_limiter_settings
+            .rtss_frame_limit_type
+            .is_some();
 
     json!({
         "version":1,
@@ -1051,7 +1070,7 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         "virtual_display_active":null,
         "physical_framegen_capture":null,
         "game_frame_generation_mode":null,
-        "rtss_frame_limit_type_explicit_override":null
+        "rtss_frame_limit_type_explicit_override":explicit_rtss_override.then_some(true)
     })
 }
 

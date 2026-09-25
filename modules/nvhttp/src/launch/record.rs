@@ -5,7 +5,10 @@ use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use serde_json::Value;
 use std::{collections::VecDeque, time::Instant};
 
-use super::{call::Call, workflow::Phase};
+use super::{
+    call::Call,
+    workflow::{ApplicationConfigOverrides, Phase},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -56,6 +59,7 @@ pub struct Record {
     pub global_frame_limiter_settings: FrameLimiterSettings,
     pub client_frame_limiter_settings: FrameLimiterSettings,
     pub application_frame_limiter_settings: FrameLimiterSettings,
+    pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
     pub application_preflight_token: Option<String>,
     pub frame_limiter_snapshot: Option<Value>,
     pub executable_path: Option<String>,
@@ -170,6 +174,7 @@ impl Record {
             global_frame_limiter_settings,
             client_frame_limiter_settings,
             application_frame_limiter_settings: FrameLimiterSettings::default(),
+            application_preflight_overrides: None,
             application_preflight_token: None,
             frame_limiter_snapshot: None,
             executable_path: None,
