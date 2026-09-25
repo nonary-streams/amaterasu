@@ -13,17 +13,12 @@ const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_EXECUTABLE_PATH_BYTES: usize = 4096;
 
 /// Distinguishes an omitted nullable request field from an explicit JSON null.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Presence<T> {
+    #[default]
     Missing,
     Null,
     Value(T),
-}
-
-impl<T> Default for Presence<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 
 impl<T> Presence<T> {
@@ -332,27 +327,30 @@ impl ApplyRequest {
             }
             Presence::Value(GameFrameGenerationMode::Other) => FrameGenerationProvider::Other,
         };
-        let mut context = PolicyContext::default();
-        context.platform = current_platform();
-        context.virtual_display_active =
-            matches!(self.virtual_display_active, Presence::Value(true));
-        context.client_display_mode_rate = client_display_mode_rate;
-        context.requested_stream_fps = match &self.requested_stream_fps_millihz {
-            Presence::Value(0) => None,
-            Presence::Value(value) => Some(
-                crate::FpsLimit::from_millihz(*value)
-                    .map_err(|_| ServiceError::InvalidMillihertz)?,
+        let context = PolicyContext {
+            platform: current_platform(),
+            virtual_display_active: matches!(self.virtual_display_active, Presence::Value(true)),
+            client_display_mode_rate,
+            requested_stream_fps: match &self.requested_stream_fps_millihz {
+                Presence::Value(0) => None,
+                Presence::Value(value) => Some(
+                    crate::FpsLimit::from_millihz(*value)
+                        .map_err(|_| ServiceError::InvalidMillihertz)?,
+                ),
+                Presence::Null | Presence::Missing => None,
+            },
+            lossless_scaling_limit,
+            frame_generation_provider,
+            physical_framegen_capture: matches!(
+                self.physical_framegen_capture,
+                Presence::Value(true)
             ),
-            Presence::Null | Presence::Missing => None,
+            scoped_rtss_type_override: matches!(
+                self.rtss_frame_limit_type_explicit_override,
+                Presence::Value(true)
+            ),
+            ..PolicyContext::default()
         };
-        context.lossless_scaling_limit = lossless_scaling_limit;
-        context.frame_generation_provider = frame_generation_provider;
-        context.physical_framegen_capture =
-            matches!(self.physical_framegen_capture, Presence::Value(true));
-        context.scoped_rtss_type_override = matches!(
-            self.rtss_frame_limit_type_explicit_override,
-            Presence::Value(true)
-        );
         // Missing provider context is mapped to conservative policy defaults
         // for calculation only. The response carries unknown/null outcomes.
         Ok(context)
@@ -793,6 +791,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("requested_stream_fps_millihz");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("virtual_display_active");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("physical_framegen_capture");
         let parsed = parse_operation(&value.to_string()).unwrap();
         let Operation::Apply(request) = parsed else {
             panic!("expected apply operation");
