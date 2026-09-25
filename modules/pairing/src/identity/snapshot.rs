@@ -343,10 +343,9 @@ fn open_identity_file(path: &Path) -> std::io::Result<File> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const O_NOFOLLOW: i32 = 0x0002_0000;
         #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
             target_os = "macos",
             target_os = "ios",
             target_os = "freebsd",
@@ -354,10 +353,21 @@ fn open_identity_file(path: &Path) -> std::io::Result<File> {
             target_os = "netbsd",
             target_os = "dragonfly"
         ))]
-        const O_NOFOLLOW: i32 = 0x0000_0100;
-        // The standard library has no portable no-follow flag for every Unix
-        // target. Component metadata is still revalidated around open; known
-        // Unix targets above use the native final-component no-follow flag.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const O_NOFOLLOW: i32 = 0x0002_0000;
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            options.custom_flags(O_NOFOLLOW);
+        }
         #[cfg(not(any(
             target_os = "linux",
             target_os = "android",
@@ -368,8 +378,12 @@ fn open_identity_file(path: &Path) -> std::io::Result<File> {
             target_os = "netbsd",
             target_os = "dragonfly"
         )))]
-        const O_NOFOLLOW: i32 = 0;
-        options.custom_flags(O_NOFOLLOW);
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "final-component no-follow is unsupported on this Unix target",
+            ));
+        }
     }
     options.open(path)
 }
