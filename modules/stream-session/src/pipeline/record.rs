@@ -119,7 +119,7 @@ impl Record {
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         Self {
             id,
-            history: super::history::SessionHistory::new(),
+            history: super::history::SessionHistory::new(id),
             owner,
             config,
             start: None,

@@ -20,15 +20,28 @@ pub struct Handles {
     pub stream_audio: bool,
 }
 
+#[derive(Debug)]
 pub struct ControlRecord {
     pub message_type: u16,
     pub payload: Vec<u8>,
     pub sequence: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Progress {
     pub controls: Vec<ControlRecord>,
+    /// Complete non-EOS access units admitted to the local transport queue.
+    pub accepted_video_access_units: u64,
+    /// Encoded audio and video payload bytes admitted to the local transport queue.
+    pub accepted_media_payload_bytes: u64,
+    /// Forward sequence gaps between accepted video access units.
+    pub observed_video_sequence_gaps: u64,
+}
+
+#[derive(Debug)]
+pub struct TickFailure {
+    pub code: &'static str,
+    pub progress: Progress,
 }
 
 pub struct Plane {
@@ -45,7 +58,7 @@ impl Plane {
         })
     }
 
-    pub fn tick(&mut self, media_active: bool) -> PlaneResult<Progress> {
+    pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
         self.pump.tick(media_active)
     }
 
@@ -85,6 +98,7 @@ struct Pump<B> {
     audio_ended: bool,
     transport_draining: bool,
     failure: Option<&'static str>,
+    last_accepted_video_sequence: Option<u64>,
 }
 
 impl<B: Backend> Pump<B> {
@@ -106,26 +120,36 @@ impl<B: Backend> Pump<B> {
             audio_ended: false,
             transport_draining: false,
             failure: None,
+            last_accepted_video_sequence: None,
         }
     }
 
-    fn tick(&mut self, media_active: bool) -> PlaneResult<Progress> {
-        if let Some(error) = self.failure {
-            return Err(error);
+    fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+        if let Some(code) = self.failure {
+            return Err(TickFailure {
+                code,
+                progress: Progress::default(),
+            });
         }
         let result = self.advance(media_active);
-        if let Err(error) = result {
-            self.failure = Some(error);
+        if let Err(failure) = &result {
+            self.failure = Some(failure.code);
         }
         result
     }
 
-    fn advance(&mut self, media_active: bool) -> PlaneResult<Progress> {
+    fn advance(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
         for _ in 0..READ_BUDGET {
-            let Some(message) = self.backend.control()? else {
+            let message = match self.backend.control() {
+                Ok(message) => message,
+                Err(code) => {
+                    return Err(TickFailure { code, progress });
+                }
+            };
+            let Some(message) = message else {
                 break;
             };
             progress.controls.push(message);
@@ -133,15 +157,22 @@ impl<B: Backend> Pump<B> {
         if !media_active {
             return Ok(progress);
         }
-        self.pump_video()?;
-        self.pump_audio()?;
+        if let Err(code) = self.pump_video(&mut progress) {
+            return Err(TickFailure { code, progress });
+        }
+        if let Err(code) = self.pump_audio(&mut progress) {
+            return Err(TickFailure { code, progress });
+        }
         if self.video_ended && self.audio_ended && !self.transport_draining {
-            self.transport_draining = self.backend.drain_transport()?;
+            self.transport_draining = match self.backend.drain_transport() {
+                Ok(draining) => draining,
+                Err(code) => return Err(TickFailure { code, progress }),
+            };
         }
         Ok(progress)
     }
 
-    fn pump_video(&mut self) -> PlaneResult<()> {
+    fn pump_video(&mut self, progress: &mut Progress) -> PlaneResult<()> {
         for _ in 0..READ_BUDGET {
             if self.video_ended {
                 break;
@@ -151,6 +182,7 @@ impl<B: Backend> Pump<B> {
                 if !self.backend.submit_video(&header)? {
                     return Ok(());
                 }
+                self.record_video_admission(&header, progress);
                 self.video_ended = header.flags == FLAG_END_OF_STREAM;
                 self.video.clear();
                 if self.video_ended {
@@ -167,6 +199,7 @@ impl<B: Backend> Pump<B> {
         if self.video.ready() && !self.video_ended {
             let header = self.video.header().expect("ready assembly");
             if self.backend.submit_video(&header)? {
+                self.record_video_admission(&header, progress);
                 self.video_ended = header.flags == FLAG_END_OF_STREAM;
                 self.video.clear();
             }
@@ -174,7 +207,34 @@ impl<B: Backend> Pump<B> {
         Ok(())
     }
 
-    fn pump_audio(&mut self) -> PlaneResult<()> {
+    fn record_video_admission(&mut self, packet: &EncodedPacket, progress: &mut Progress) {
+        if packet.flags == FLAG_END_OF_STREAM {
+            return;
+        }
+        progress.accepted_video_access_units =
+            progress.accepted_video_access_units.saturating_add(1);
+        progress.accepted_media_payload_bytes = progress
+            .accepted_media_payload_bytes
+            .saturating_add(u64::try_from(packet.len).unwrap_or(u64::MAX));
+        if let Some(previous) = self.last_accepted_video_sequence
+            && packet.sequence > previous.saturating_add(1)
+        {
+            progress.observed_video_sequence_gaps = progress
+                .observed_video_sequence_gaps
+                .saturating_add(packet.sequence - previous - 1);
+        }
+        self.last_accepted_video_sequence = Some(packet.sequence);
+    }
+
+    fn record_audio_admission(&self, packet: &EncodedAudioPacket, progress: &mut Progress) {
+        if packet.flags != AUDIO_PACKET_END_OF_STREAM {
+            progress.accepted_media_payload_bytes = progress
+                .accepted_media_payload_bytes
+                .saturating_add(u64::try_from(packet.len).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn pump_audio(&mut self, progress: &mut Progress) -> PlaneResult<()> {
         if !self.stream_audio {
             if !self.audio_ended {
                 let end = EncodedAudioPacket {
@@ -203,6 +263,7 @@ impl<B: Backend> Pump<B> {
                 if !self.backend.submit_audio(&header)? {
                     return Ok(());
                 }
+                self.record_audio_admission(&header, progress);
                 self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
                 self.pending_audio = None;
             }
@@ -219,6 +280,7 @@ impl<B: Backend> Pump<B> {
             if !self.backend.submit_audio(&header)? {
                 return Ok(());
             }
+            self.record_audio_admission(&header, progress);
             self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
             self.pending_audio = None;
         }

@@ -13,6 +13,7 @@ struct Fake {
     audio_busy: bool,
     pcm_busy: bool,
     control_failed: bool,
+    video_failure_after_submit: bool,
     videos_sent: Vec<(u32, Vec<u8>)>,
     audio_sent: Vec<Vec<u8>>,
     audio_flags: Vec<u32>,
@@ -31,6 +32,9 @@ impl Backend for Fake {
     }
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         self.video_reads += 1;
+        if self.video_failure_after_submit && !self.videos_sent.is_empty() {
+            return Err("video_failed_after_admission");
+        }
         Ok(self.videos.pop_front())
     }
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>> {
@@ -140,6 +144,78 @@ fn fragments_form_one_access_unit_without_waiting_for_a_later_frame() {
             vec![0, 0, 0, 1, 0x65, 1, 2, 3]
         )]
     );
+}
+
+#[test]
+fn accepted_media_counters_count_complete_units_once_and_ignore_busy_retries_and_eos() {
+    let mut backend = Fake::default();
+    backend.videos.extend([
+        video(&[1, 2], FLAG_KEYFRAME, 7),
+        video(&[3, 4, 5], FLAG_END_OF_ACCESS_UNIT, 7),
+        video(&[6], FLAG_END_OF_ACCESS_UNIT, 9),
+        video(&[], FLAG_END_OF_STREAM, 10),
+    ]);
+    let mut pump = Pump::new(backend);
+
+    let progress = pump.tick(true).unwrap();
+    assert_eq!(progress.accepted_video_access_units, 2);
+    assert_eq!(progress.accepted_media_payload_bytes, 6);
+    assert_eq!(progress.observed_video_sequence_gaps, 1);
+}
+
+#[test]
+fn busy_video_admission_is_counted_once_only_after_acceptance() {
+    let mut backend = Fake {
+        video_busy: true,
+        ..Fake::default()
+    };
+    backend
+        .videos
+        .push_back(video(&[1, 2, 3], FLAG_END_OF_ACCESS_UNIT, 1));
+    let mut pump = Pump::new(backend);
+
+    for _ in 0..2 {
+        let progress = pump.tick(true).unwrap();
+        assert_eq!(progress.accepted_video_access_units, 0);
+        assert_eq!(progress.accepted_media_payload_bytes, 0);
+    }
+
+    pump.backend.video_busy = false;
+    let accepted = pump.tick(true).unwrap();
+    assert_eq!(accepted.accepted_video_access_units, 1);
+    assert_eq!(accepted.accepted_media_payload_bytes, 3);
+}
+
+#[test]
+fn later_backend_error_preserves_media_accepted_earlier_in_the_same_tick() {
+    let mut backend = Fake {
+        video_failure_after_submit: true,
+        ..Fake::default()
+    };
+    backend
+        .videos
+        .push_back(video(&[1, 2, 3], FLAG_END_OF_ACCESS_UNIT, 1));
+    let mut pump = Pump::new(backend);
+
+    let failure = pump.tick(true).unwrap_err();
+
+    assert_eq!(failure.code, "video_failed_after_admission");
+    assert_eq!(failure.progress.accepted_video_access_units, 1);
+    assert_eq!(failure.progress.accepted_media_payload_bytes, 3);
+    assert_eq!(failure.progress.observed_video_sequence_gaps, 0);
+}
+
+#[test]
+fn audio_payload_bytes_are_counted_after_admission_but_audio_eos_is_not() {
+    let mut backend = Fake::default();
+    backend.audios.extend([audio(false), audio(true)]);
+    let mut pump = Pump::new(backend);
+
+    let progress = pump.tick(true).unwrap();
+
+    assert_eq!(progress.accepted_video_access_units, 0);
+    assert_eq!(progress.accepted_media_payload_bytes, 3);
+    assert_eq!(progress.observed_video_sequence_gaps, 0);
 }
 
 #[test]
@@ -259,9 +335,15 @@ fn missing_access_unit_boundary_is_a_sticky_failure_never_a_guessed_frame() {
         let mut backend = Fake::default();
         backend.videos.extend([video(&[1], 0, 1), next]);
         let mut pump = Pump::new(backend);
-        assert_eq!(pump.tick(true).err(), Some("video_access_unit_incomplete"));
+        assert_eq!(
+            pump.tick(true).err().map(|failure| failure.code),
+            Some("video_access_unit_incomplete")
+        );
         let reads = pump.backend.video_reads;
-        assert_eq!(pump.tick(true).err(), Some("video_access_unit_incomplete"));
+        assert_eq!(
+            pump.tick(true).err().map(|failure| failure.code),
+            Some("video_access_unit_incomplete")
+        );
         assert_eq!(pump.backend.video_reads, reads);
         assert!(pump.backend.videos_sent.is_empty());
     }
@@ -273,7 +355,10 @@ fn control_failure_prevents_all_media_polling() {
         control_failed: true,
         ..Fake::default()
     });
-    assert_eq!(pump.tick(true).err(), Some("control_failed"));
+    assert_eq!(
+        pump.tick(true).err().map(|failure| failure.code),
+        Some("control_failed")
+    );
     assert_eq!(
         pump.backend.video_reads + pump.backend.audio_reads + pump.backend.pcm_reads,
         0

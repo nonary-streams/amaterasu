@@ -69,11 +69,16 @@ pub struct Broker {
     pub history_available: bool,
     pub history_storage_degraded: bool,
     pub history_recording_disabled: bool,
+    pub history_failed_actions: BTreeSet<String>,
     pub history_pending_polls: usize,
+    pub history_release_failures: usize,
     pub history_requests: BTreeSet<u64>,
     pub history_released: usize,
+    pub history_release_attempts: usize,
     pub history_begins: Vec<Value>,
     pub history_ends: Vec<Value>,
+    pub history_samples: Vec<Value>,
+    pub history_events: Vec<Value>,
 }
 
 impl Broker {
@@ -112,6 +117,13 @@ impl Broker {
             .values()
             .map(|value| value.leases.len())
             .sum()
+    }
+
+    pub fn history_calls(&self) -> usize {
+        self.calls
+            .iter()
+            .filter(|call| call.service == "amaterasu.session-history/1")
+            .count()
     }
 
     pub fn send(&mut self, command: Command) -> ModuleResult<Response> {
@@ -228,6 +240,13 @@ impl Broker {
                 Ok(Response::Ok)
             }
             Command::ReleaseResult { request } => {
+                if self.history_requests.contains(&request) {
+                    self.history_release_attempts += 1;
+                }
+                if self.history_requests.contains(&request) && self.history_release_failures > 0 {
+                    self.history_release_failures -= 1;
+                    return Err("history result release unavailable".into());
+                }
                 self.requests.remove(&request);
                 self.operations.retain(|_, id| *id != request);
                 if self.history_requests.remove(&request) {
@@ -260,6 +279,24 @@ impl Broker {
                         json!({"ok":false,"code":"storage_unavailable"})
                     } else {
                         json!({"ok":true,"recorded":true})
+                    }
+                }
+                "record_sample" => {
+                    self.history_samples.push(call.payload["sample"].clone());
+                    if self.history_storage_degraded || self.history_failed_actions.contains(action)
+                    {
+                        json!({"ok":false,"error":{"code":"storage_unavailable","message":"storage unavailable"}})
+                    } else {
+                        json!({"ok":true,"recorded":!self.history_recording_disabled})
+                    }
+                }
+                "record_event" => {
+                    self.history_events.push(call.payload["event"].clone());
+                    if self.history_storage_degraded || self.history_failed_actions.contains(action)
+                    {
+                        json!({"ok":false,"error":{"code":"storage_unavailable","message":"storage unavailable"}})
+                    } else {
+                        json!({"ok":true,"recorded":!self.history_recording_disabled})
                     }
                 }
                 _ => panic!("unexpected session history action"),
@@ -570,19 +607,26 @@ pub struct PlaneState {
     pub dropped: usize,
     pub failure: Option<&'static str>,
     pub controls: Vec<crate::plane::ControlRecord>,
+    pub accepted_video_access_units: u64,
+    pub accepted_media_payload_bytes: u64,
+    pub observed_video_sequence_gaps: u64,
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, &'static str> {
+    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         let mut state = self.0.borrow_mut();
         state.ticks += 1;
         state.media_ticks += usize::from(media_active);
-        if let Some(code) = state.failure {
-            return Err(code);
-        }
-        Ok(PlaneProgress {
+        let progress = PlaneProgress {
             controls: std::mem::take(&mut state.controls),
-        })
+            accepted_video_access_units: std::mem::take(&mut state.accepted_video_access_units),
+            accepted_media_payload_bytes: std::mem::take(&mut state.accepted_media_payload_bytes),
+            observed_video_sequence_gaps: std::mem::take(&mut state.observed_video_sequence_gaps),
+        };
+        if let Some(code) = state.failure {
+            return Err(PlaneFailure { code, progress });
+        }
+        Ok(progress)
     }
     fn stop(&mut self) {
         let mut state = self.0.borrow_mut();

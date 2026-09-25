@@ -248,6 +248,7 @@ impl Pipeline {
             now + self.settings.drain_timeout_ms,
         );
         record.outcome = State::Stopped;
+        record.history.stopping("stop_requested");
         record.state = State::Stopping;
         record.cleanup_error = None;
         if let Some(plane) = record.plane.as_mut() {

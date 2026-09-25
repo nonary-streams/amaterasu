@@ -8,6 +8,7 @@ impl Pipeline {
         record: &mut Record,
         job: &mut Job,
         payload: Value,
+        now: u64,
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
@@ -83,7 +84,12 @@ impl Pipeline {
                 }) {
                     return self.cleanup_rejected(record, job, send);
                 }
-                record.history.teardown_confirmed();
+                let (outcome, reason) = match record.outcome {
+                    State::Stopped => ("stopped", None),
+                    State::Cancelled => ("cancelled", record.error),
+                    _ => ("failed", record.error),
+                };
+                record.history.teardown_confirmed(now, outcome, reason);
                 record.resources.remove(&Resource::Session);
                 record.attempted.remove(&Resource::Session);
             }

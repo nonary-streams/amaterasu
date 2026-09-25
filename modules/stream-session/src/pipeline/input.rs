@@ -102,6 +102,7 @@ pub(super) fn queue_control_input(
 pub(super) fn stop_for_input_failure(record: &mut Record, code: &'static str) {
     record.error.get_or_insert(code);
     record.outcome = State::Failed;
+    record.history.stopping(code);
     record.state = State::Stopping;
     if let Some(plane) = record.plane.as_mut() {
         plane.stop();

@@ -11,6 +11,7 @@ pub(super) type Send<'a> = dyn FnMut(Command) -> ModuleResult<Response> + 'a;
 pub(super) struct Pending {
     command: Command,
     request: Option<u64>,
+    completed: Option<Value>,
     attempts: u8,
     settling: bool,
     first_sent_at: Option<u64>,
@@ -34,6 +35,7 @@ impl Pending {
                 parent,
             },
             request: None,
+            completed: None,
             attempts: 0,
             settling: false,
             first_sent_at: None,
@@ -48,15 +50,35 @@ impl Pending {
     pub fn shutdown(&mut self, send: &mut Send<'_>) -> bool {
         self.cancel();
         if self.request.is_none() {
-            // An unsent command has no effect. An admission whose response was
-            // lost cannot be recreated safely during unload.
-            return self.first_sent_at.is_none();
+            if self.first_sent_at.is_none() {
+                return true;
+            }
+            // Reuse the exact operation ID to recover a lost admission before
+            // attempting cancellation and release during unload.
+            for _ in 0..4 {
+                match send(self.command.clone()) {
+                    Ok(Response::Accepted { id }) => {
+                        self.request = Some(id);
+                        break;
+                    }
+                    Ok(Response::Error { .. }) => return true,
+                    _ => {}
+                }
+            }
+            if self.request.is_none() {
+                return false;
+            }
         }
         for _ in 0..4 {
             match self.poll(send, u64::MAX) {
                 Progress::Failed => return true,
                 Progress::Waiting => {}
-                Progress::Result(_) | Progress::Unresolved => return false,
+                Progress::Result(_) => {
+                    if self.release_result(send) {
+                        return true;
+                    }
+                }
+                Progress::Unresolved => return false,
             }
         }
         false
@@ -64,6 +86,14 @@ impl Pending {
 
     pub fn retry(&mut self) {
         self.attempts = 0;
+    }
+
+    pub fn was_admitted(&self) -> bool {
+        self.request.is_some()
+    }
+
+    pub fn was_sent(&self) -> bool {
+        self.first_sent_at.is_some()
     }
 
     /// Releases a result already retrieved by `poll`. Result ownership belongs
@@ -75,10 +105,12 @@ impl Pending {
         match send(Command::ReleaseResult { request }) {
             Ok(Response::Ok) => {
                 self.request = None;
+                self.completed = None;
                 true
             }
             Ok(Response::Error { code, .. }) if code == "not_found" => {
                 self.request = None;
+                self.completed = None;
                 true
             }
             _ => false,
@@ -86,6 +118,9 @@ impl Pending {
     }
 
     pub fn poll(&mut self, send: &mut Send<'_>, now: u64) -> Progress {
+        if let Some(result) = &self.completed {
+            return Progress::Result(result.clone());
+        }
         if self.attempts >= 3 {
             return Progress::Unresolved;
         }
@@ -120,7 +155,10 @@ impl Pending {
         }
         match send(Command::TakeResult { request }) {
             Ok(Response::Pending) => Progress::Waiting,
-            Ok(Response::Result { payload }) => Progress::Result(payload),
+            Ok(Response::Result { payload }) => {
+                self.completed = Some(payload.clone());
+                Progress::Result(payload)
+            }
             _ => {
                 self.settling = true;
                 Progress::Waiting

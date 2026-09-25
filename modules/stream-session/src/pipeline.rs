@@ -13,7 +13,7 @@ mod workflow;
 use crate::{
     SERVICE,
     model::{Operation, Settings},
-    plane::{Handles, Plane, Progress as PlaneProgress},
+    plane::{Handles, Plane, Progress as PlaneProgress, TickFailure as PlaneFailure},
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use record::{Record, Resource, State, error};
@@ -23,13 +23,13 @@ use std::{collections::BTreeMap, time::Instant};
 use workflow::{Job, Step};
 
 trait Drive {
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, &'static str>;
+    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
 }
 
 impl Drive for Plane {
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, &'static str> {
+    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
     }
     fn stop(&mut self) {
@@ -167,6 +167,11 @@ impl Pipeline {
     }
 
     fn progress_history(&mut self, now: u64, send: &mut Send<'_>) {
+        for record in self.records.values_mut() {
+            if record.state == State::Active {
+                record.history.sample_if_due(now);
+            }
+        }
         let eligible = |record: &&Record| record.history.has_work();
         let selected = self
             .records
@@ -181,13 +186,13 @@ impl Pipeline {
         self.history_after = id;
         let queued = {
             let record = self.records.get(&id).expect("selected history record");
-            let start = record
-                .start
-                .as_ref()
-                .expect("history begins after activation");
-            record
-                .history
-                .queued_request(record.id, &record.owner, start)
+            record.history.queued_request(
+                &record.owner,
+                record
+                    .start
+                    .as_ref()
+                    .expect("history begins after activation"),
+            )
         };
         self.records
             .get_mut(&id)
@@ -279,6 +284,11 @@ impl Pipeline {
             let result = plane.tick(media_active);
             match result {
                 Ok(progress) => {
+                    record.history.observe_media(
+                        progress.accepted_video_access_units,
+                        progress.accepted_media_payload_bytes,
+                        progress.observed_video_sequence_gaps,
+                    );
                     for event in progress.controls {
                         record.control_messages = record.control_messages.saturating_add(1);
                         record.last_control_sequence = Some(event.sequence);
@@ -316,9 +326,15 @@ impl Pipeline {
                         }
                     }
                 }
-                Err(code) => {
-                    record.error = Some(code);
+                Err(failure) => {
+                    record.history.observe_media(
+                        failure.progress.accepted_video_access_units,
+                        failure.progress.accepted_media_payload_bytes,
+                        failure.progress.observed_video_sequence_gaps,
+                    );
+                    record.error = Some(failure.code);
                     record.outcome = State::Failed;
+                    record.history.stopping(failure.code);
                     record.state = State::Stopping;
                     record.plane = None;
                 }

@@ -91,6 +91,35 @@ The optional `device_name` start field supplies session-history display metadata
 it is independent from the `output` capture source. Older callers that omit it
 continue to record the capture output as the device name.
 
+Session history is an optional asynchronous side path. Each session retains at
+most one in-flight history request and eight queued updates. Active sampling runs
+once per second; confirmed teardown also queues a final cumulative sample when
+counters changed since the last scheduled sample, so short streams retain their
+media totals. If no monotonic millisecond elapsed, the sample reports finite
+zero rates because the schema has no unknown representation; the
+`telemetry_limits` event records that rate limitation. An unsent sample is
+replaced by the latest cumulative sample if the history service is slow. At the
+eight-update bound, a lifecycle event can evict a queued sample; a new update is
+dropped only when all slots hold non-coalescible events. Lifecycle events remain
+ordered and are sent between session_begin and session_end. A timeout,
+unavailable service, result failure, or storage error
+does not affect media activation, pumping, or teardown. Stopping settles any
+outstanding history request before advancing its queued transition events and end
+operation. Shutdown makes a bounded cancellation and result-release attempt; if
+teardown was already confirmed, it also makes a bounded best-effort flush of
+queued updates in order followed by the stable session_end operation.
+
+Sample frame counts are complete non-EOS video access units accepted by the
+media transport's bounded local queue. bytes_sent counts encoded video and
+audio payload bytes accepted at that same boundary; it excludes wire framing,
+FEC, encryption overhead, and client delivery. dropped_frames counts only
+forward sequence gaps observed between accepted video access units, not
+end-to-end loss. FPS and bitrate use cumulative accepted counters and
+monotonic-time deltas. The video ABI exposes no encode timing, so
+encode_latency_ms is the schema's numeric zero; a one-time telemetry_limits
+event marks this and end-to-end drops as unavailable and explicitly says local
+transport acceptance does not prove client delivery.
+
 ## Current limits
 
 The initial path requires H.264 SDR, 48 kHz stereo capture, and 5 or 10 ms Opus.

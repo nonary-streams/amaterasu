@@ -142,7 +142,7 @@ impl Pipeline {
         factory: &mut Factory<'_>,
     ) -> bool {
         if job.cleanup {
-            return self.consume_cleanup(record, job, payload, send);
+            return self.consume_cleanup(record, job, payload, now, send);
         }
         if payload["ok"] != true {
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
@@ -242,14 +242,14 @@ impl Pipeline {
                     Ok(true)
                 } else {
                     record.state = State::Active;
-                    record.history.activated();
+                    record.history.activated(now);
                     Ok(self.deliver_success(record, job, now, send))
                 }
             }
             Step::AcquireInput => {
                 accept_input_lease(record, &payload, now)?;
                 record.state = State::Active;
-                record.history.activated();
+                record.history.activated(now);
                 Ok(self.deliver_success(record, job, now, send))
             }
             Step::RenewInput => {

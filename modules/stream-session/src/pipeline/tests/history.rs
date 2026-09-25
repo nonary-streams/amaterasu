@@ -17,6 +17,18 @@ fn history_call_index(host: &Harness, action: &str) -> usize {
         .expect("history request was admitted")
 }
 
+fn history_event_call_index(host: &Harness, event_type: &str) -> usize {
+    host.broker
+        .calls
+        .iter()
+        .position(|call| {
+            call.service == HISTORY_SERVICE
+                && call.payload["action"] == "record_event"
+                && call.payload["event"]["event_type"] == event_type
+        })
+        .expect("history lifecycle event was admitted")
+}
+
 #[test]
 fn active_session_is_recorded_once_with_bounded_metadata_and_ended_after_teardown() {
     let mut host = Harness::new();
@@ -71,9 +83,20 @@ fn active_session_is_recorded_once_with_bounded_metadata_and_ended_after_teardow
         })
         .expect("confirmed FinishSession request");
     let end_call = history_call_index(&host, "session_end");
-    assert!(begin_call < finish_call && finish_call < end_call);
-    assert_eq!(host.broker.history_released, 2);
+    let limits_call = history_event_call_index(&host, "telemetry_limits");
+    let stopping_call = history_event_call_index(&host, "stream_stopping");
+    let stopped_call = history_event_call_index(&host, "stream_stopped");
+    assert!(begin_call < limits_call);
+    assert!(stopping_call < finish_call && finish_call < stopped_call && stopped_call < end_call);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
     assert!(host.broker.history_requests.is_empty());
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.service == HISTORY_SERVICE)
+            .all(|call| call.parent.is_none())
+    );
 }
 
 #[test]
@@ -126,14 +149,7 @@ fn slow_begin_result_does_not_hold_finish_session_or_send_end_out_of_order() {
     );
     assert_eq!(host.broker.live_components(), 0);
     assert!(host.broker.history_ends.is_empty());
-    assert_eq!(
-        host.broker
-            .calls
-            .iter()
-            .filter(|call| call.service == HISTORY_SERVICE)
-            .count(),
-        1
-    );
+    assert_eq!(host.broker.history_begins.len(), 0);
 
     host.broker.history_pending_polls = 0;
     host.idle();
@@ -141,12 +157,12 @@ fn slow_begin_result_does_not_hold_finish_session_or_send_end_out_of_order() {
     assert_eq!(host.broker.history_begins.len(), 1);
     assert_eq!(host.broker.history_ends.len(), 1);
     assert!(history_call_index(&host, "session_begin") < history_call_index(&host, "session_end"));
-    assert_eq!(host.broker.history_released, 2);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
     assert!(host.broker.history_requests.is_empty());
 }
 
 #[test]
-fn unresolved_begin_is_abandoned_after_its_deadline_without_delaying_cleanup() {
+fn timed_out_begin_is_settled_then_reconciled_with_an_ordered_end_without_delaying_stop() {
     let mut host = Harness::new();
     host.broker.history_available = true;
     host.broker.history_pending_polls = usize::MAX;
@@ -163,9 +179,23 @@ fn unresolved_begin_is_abandoned_after_its_deadline_without_delaying_cleanup() {
     assert!(host.now.saturating_sub(stop_started_at) < 100);
 
     host.now = host.now.saturating_add(6_000);
+    host.tick(); // Observe the timeout and cancel the same Begin operation.
+    host.tick(); // Settle and release the outstanding Begin request.
+    assert!(host.broker.history_requests.is_empty());
+
+    host.broker.history_pending_polls = 0;
     host.idle();
 
-    assert!(host.broker.history_ends.is_empty());
+    assert_eq!(host.broker.history_begins.len(), 0);
+    assert_eq!(host.broker.history_ends.len(), 1);
+    assert!(
+        history_call_index(&host, "session_begin")
+            < history_event_call_index(&host, "stream_stopping")
+    );
+    assert!(
+        history_event_call_index(&host, "stream_stopped")
+            < history_call_index(&host, "session_end")
+    );
     assert!(host.broker.history_requests.is_empty());
     assert_eq!(host.broker.live_components(), 0);
 }
@@ -187,13 +217,49 @@ fn storage_error_result_is_released_and_does_not_stop_stream_or_send_end() {
     host.idle();
 
     assert!(host.broker.history_ends.is_empty());
-    assert_eq!(host.broker.history_released, 1);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
     assert!(host.broker.history_requests.is_empty());
     assert_eq!(host.broker.live_components(), 0);
 }
 
 #[test]
-fn lost_begin_result_is_not_retried_or_ended_as_known_success() {
+fn failed_sample_and_event_results_are_released_without_stopping_streaming() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.broker
+        .history_failed_actions
+        .extend(["record_event".into(), "record_sample".into()]);
+    let session = prepare_and_start(&mut host);
+    host.idle();
+    assert_eq!(host.pipeline.records[&session].state, State::Active);
+    {
+        let mut plane = host.plane.borrow_mut();
+        plane.accepted_video_access_units = 2;
+        plane.accepted_media_payload_bytes = 640;
+        plane.observed_video_sequence_gaps = 1;
+    }
+    host.now = host.now.saturating_add(1_000);
+    host.tick();
+    host.idle();
+
+    assert_eq!(host.pipeline.records[&session].state, State::Active);
+    assert_eq!(
+        host.broker.history_events[0]["event_type"],
+        "telemetry_limits"
+    );
+    assert_eq!(host.broker.history_samples.len(), 1);
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    host.idle();
+    assert_eq!(host.broker.history_ends.len(), 1);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
+    assert!(host.broker.history_requests.is_empty());
+}
+
+#[test]
+fn lost_begin_result_is_not_replayed_and_uncertain_commit_is_ended_after_stop() {
     let mut host = Harness::new();
     host.broker.history_available = true;
     host.broker.fault = Some((HISTORY_SERVICE.into(), Fault::AfterMutation));
@@ -218,7 +284,271 @@ fn lost_begin_result_is_not_retried_or_ended_as_known_success() {
         "stopped"
     );
     host.idle();
-    assert!(host.broker.history_ends.is_empty());
-    assert_eq!(host.broker.history_released, 1);
+    assert_eq!(host.broker.history_ends.len(), 1);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
     assert!(host.broker.history_requests.is_empty());
+}
+
+#[test]
+fn sample_payload_uses_exact_contract_fields_and_local_admission_counter_rates() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let session = prepare_and_start(&mut host);
+    let activation_at = host.now;
+    host.tick(); // Admit session_begin.
+    host.tick(); // Complete session_begin.
+    host.tick(); // Admit the telemetry limits event.
+    {
+        let mut plane = host.plane.borrow_mut();
+        plane.accepted_video_access_units = 4;
+        plane.accepted_media_payload_bytes = 1_200;
+        plane.observed_video_sequence_gaps = 1;
+    }
+    host.now = activation_at.saturating_add(999);
+    host.tick(); // Consume counters and complete the telemetry limits event.
+    host.tick();
+    host.idle();
+
+    assert_eq!(host.broker.history_samples.len(), 1);
+    let sample = &host.broker.history_samples[0];
+    let expected_fields = [
+        "session_id",
+        "recorded_at_unix",
+        "frames_sent",
+        "bytes_sent",
+        "dropped_frames",
+        "actual_fps",
+        "actual_bitrate_kbps",
+        "encode_latency_ms",
+    ];
+    let mut actual_fields = sample
+        .as_object()
+        .expect("sample object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual_fields.sort_unstable();
+    let mut expected_fields = expected_fields.to_vec();
+    expected_fields.sort_unstable();
+    assert_eq!(actual_fields, expected_fields);
+    assert_eq!(
+        sample["session_id"],
+        json!(format!("stream-session-{session:016x}"))
+    );
+    assert!(sample["recorded_at_unix"].as_i64().is_some());
+    assert_eq!(sample["frames_sent"], 4);
+    assert_eq!(sample["bytes_sent"], 1_200);
+    assert_eq!(sample["dropped_frames"], 1);
+    assert!(sample["actual_fps"].as_f64().unwrap().is_finite());
+    assert!((sample["actual_fps"].as_f64().unwrap() - 4.0).abs() < 0.01);
+    assert!((sample["actual_bitrate_kbps"].as_f64().unwrap() - 9.6).abs() < 0.02);
+    assert_eq!(sample["encode_latency_ms"], 0.0);
+    assert_eq!(
+        host.broker.history_events[0]["event_type"],
+        "telemetry_limits"
+    );
+    assert_eq!(
+        host.broker.history_events[0]["payload"]["transport_acceptance_is_client_delivery"],
+        false
+    );
+    assert!(history_call_index(&host, "session_begin") < history_call_index(&host, "record_event"));
+    assert!(history_call_index(&host, "record_event") < history_call_index(&host, "record_sample"));
+}
+
+#[test]
+fn delayed_sample_completion_preserves_a_newer_coalesced_snapshot() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let _session = prepare_and_start(&mut host);
+    host.idle();
+    host.now = 0;
+
+    host.plane.borrow_mut().accepted_video_access_units = 4;
+    host.tick(); // Consume the first counter delta.
+    host.broker.history_pending_polls = usize::MAX;
+    host.now = 2_000;
+    host.tick(); // Admit sample one and leave its result pending.
+    assert_eq!(host.broker.history_samples.len(), 0);
+    assert_eq!(host.broker.history_requests.len(), 1);
+
+    host.plane.borrow_mut().accepted_video_access_units = 3;
+    host.tick(); // The second delta arrives while sample one is in flight.
+    host.now = 3_100;
+    host.tick(); // Queue the newer cumulative sample behind sample one.
+    assert_eq!(host.broker.history_samples.len(), 0);
+
+    host.broker.history_pending_polls = 0;
+    host.idle();
+
+    assert_eq!(host.broker.history_samples.len(), 2);
+    assert_eq!(host.broker.history_samples[0]["frames_sent"], 4);
+    assert_eq!(host.broker.history_samples[1]["frames_sent"], 7);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
+    assert!(host.broker.history_requests.is_empty());
+}
+
+#[test]
+fn confirmed_short_stream_records_final_counters_with_finite_rates() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let session = prepare_and_start(&mut host);
+    host.now = 0;
+    {
+        let mut plane = host.plane.borrow_mut();
+        plane.accepted_video_access_units = 1;
+        plane.accepted_media_payload_bytes = 321;
+        plane.observed_video_sequence_gaps = 1;
+    }
+    host.tick();
+
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    host.idle();
+
+    assert_eq!(host.broker.history_samples.len(), 1);
+    let sample = &host.broker.history_samples[0];
+    assert_eq!(sample["frames_sent"], 1);
+    assert_eq!(sample["bytes_sent"], 321);
+    assert_eq!(sample["dropped_frames"], 1);
+    assert!(sample["actual_fps"].as_f64().unwrap().is_finite());
+    assert!(sample["actual_bitrate_kbps"].as_f64().unwrap().is_finite());
+    assert_eq!(host.broker.history_ends.len(), 1);
+}
+
+#[test]
+fn shutdown_after_confirmed_stop_flushes_queued_events_and_end() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let session = prepare_and_start(&mut host);
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.history_ends.is_empty());
+
+    let settled = {
+        let (pipeline, broker) = (&mut host.pipeline, &mut host.broker);
+        pipeline.shutdown_with(&mut |command| broker.send(command))
+    };
+
+    assert!(settled);
+    assert_eq!(host.broker.history_ends.len(), 1);
+    assert!(
+        history_call_index(&host, "session_begin")
+            < history_event_call_index(&host, "stream_stopping")
+    );
+    assert!(
+        history_event_call_index(&host, "stream_stopping")
+            < history_event_call_index(&host, "stream_stopped")
+    );
+    assert!(
+        history_event_call_index(&host, "stream_stopped")
+            < history_call_index(&host, "session_end")
+    );
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
+    assert!(host.broker.history_requests.is_empty());
+}
+
+#[test]
+fn media_admitted_before_a_plane_error_is_kept_in_history_counters() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let session = prepare_and_start(&mut host);
+    host.idle();
+    {
+        let mut plane = host.plane.borrow_mut();
+        plane.accepted_video_access_units = 1;
+        plane.accepted_media_payload_bytes = 321;
+        plane.observed_video_sequence_gaps = 2;
+        plane.failure = Some("video_failed_after_admission");
+    }
+
+    host.tick();
+
+    let history = &host.pipeline.records[&session].history;
+    assert_eq!(history.observed_counters(), (1, 321, 2));
+    assert_eq!(host.pipeline.records[&session].state, State::Stopping);
+}
+
+#[test]
+fn repeated_start_and_stop_do_not_duplicate_history_lifecycle_requests() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let session = prepare_and_start(&mut host);
+    host.idle();
+    assert_eq!(host.response(3, start(session))["state"], "active");
+    assert_eq!(host.broker.history_begins.len(), 1);
+    host.idle();
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    assert_eq!(
+        host.response(5, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    host.idle();
+    assert_eq!(host.broker.history_begins.len(), 1);
+    assert_eq!(host.broker.history_ends.len(), 1);
+    assert_eq!(
+        host.broker
+            .history_events
+            .iter()
+            .filter(|event| event["event_type"] == "stream_stopping")
+            .count(),
+        1
+    );
+    assert_eq!(
+        host.broker
+            .history_events
+            .iter()
+            .filter(|event| event["event_type"] == "stream_stopped")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_result_release_retries_the_same_history_operation_without_replaying_mutation() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.broker.history_release_failures = 1;
+    let _session = prepare_and_start(&mut host);
+    host.idle();
+
+    assert_eq!(host.broker.history_begins.len(), 1);
+    assert!(host.broker.history_release_attempts > host.broker.history_released);
+    assert_eq!(host.broker.history_released, host.broker.history_calls());
+    assert!(host.broker.history_requests.is_empty());
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| {
+                call.service == HISTORY_SERVICE && call.payload["action"] == "session_begin"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn shutdown_recovers_a_lost_history_admission_then_cancels_and_releases_it() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.broker.fault = Some((HISTORY_SERVICE.into(), Fault::Admission));
+    let _session = prepare_and_start(&mut host);
+    host.tick();
+    assert_eq!(host.broker.history_requests.len(), 1);
+
+    let settled = {
+        let (pipeline, broker) = (&mut host.pipeline, &mut host.broker);
+        pipeline.shutdown_with(&mut |command| broker.send(command))
+    };
+
+    assert!(settled);
+    assert!(host.broker.history_requests.is_empty());
+    assert_eq!(host.broker.history_calls(), 1);
 }

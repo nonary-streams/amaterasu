@@ -65,6 +65,7 @@ impl Job {
         } else {
             State::Failed
         };
+        record.history.stopping(code);
         record.state = State::Stopping;
         record.plane = None;
         if let Some(pending) = self.pending.as_mut() {
