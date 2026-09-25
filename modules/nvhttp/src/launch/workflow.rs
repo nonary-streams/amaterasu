@@ -5,6 +5,7 @@ use super::{
     record::{Record, Stage, State},
     success_reply,
 };
+use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -208,6 +209,8 @@ impl Controller {
                         "keyboard": record.scoped_keyboard,
                         "mouse": record.scoped_mouse,
                         "native_pen_touch": record.scoped_native_pen_touch,
+                        "ds4_back_as_touchpad_click": record
+                            .scoped_ds4_back_as_touchpad_click,
                         "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
                         "always_send_scancodes": record.scoped_always_send_scancodes,
                         "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
@@ -276,6 +279,10 @@ impl Controller {
                         record.application_launch = Some(launch_id);
                         match application_config_overrides(&payload) {
                             Ok(application_overrides) => {
+                                record.application_frame_limiter_settings =
+                                    application_overrides.frame_limiter_settings();
+                                record.scoped_ds4_back_as_touchpad_click =
+                                    application_overrides.ds4_back_as_touchpad_click;
                                 let application_fec_percentage =
                                     application_overrides.fec_percentage;
                                 record.application_fec_percentage = application_fec_percentage;
@@ -731,7 +738,7 @@ fn application_response<'a>(
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct ApplicationConfigOverrides {
+pub(super) struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
@@ -746,6 +753,12 @@ struct ApplicationConfigOverrides {
     keyboard: Option<bool>,
     mouse: Option<bool>,
     native_pen_touch: Option<bool>,
+    ds4_back_as_touchpad_click: Option<bool>,
+    frame_limiter_enable: Option<bool>,
+    frame_limiter_fps_limit: Option<f64>,
+    frame_limiter_provider: Option<String>,
+    frame_limiter_disable_vsync: Option<bool>,
+    frame_limiter_auto_virtual_framegen: Option<String>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
@@ -753,7 +766,20 @@ struct ApplicationConfigOverrides {
     key_repeat_frequency: Option<f64>,
 }
 
-fn application_config_overrides(
+impl ApplicationConfigOverrides {
+    pub(super) fn frame_limiter_settings(&self) -> FrameLimiterSettings {
+        FrameLimiterSettings {
+            frame_limiter_enable: self.frame_limiter_enable,
+            frame_limiter_fps_limit: self.frame_limiter_fps_limit,
+            frame_limiter_provider: self.frame_limiter_provider.clone(),
+            frame_limiter_disable_vsync: self.frame_limiter_disable_vsync,
+            frame_limiter_auto_virtual_framegen: self.frame_limiter_auto_virtual_framegen.clone(),
+            ..FrameLimiterSettings::default()
+        }
+    }
+}
+
+pub(super) fn application_config_overrides(
     payload: &Value,
 ) -> Result<ApplicationConfigOverrides, &'static str> {
     let launch = payload
@@ -800,6 +826,10 @@ fn application_config_overrides(
         || config_overrides
             .key_repeat_frequency
             .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
+        || config_overrides
+            .frame_limiter_settings()
+            .validate()
+            .is_err()
     {
         return Err("invalid_application_response");
     }
@@ -904,29 +934,11 @@ fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
 }
 
 fn frame_limiter_launch_snapshot(record: &Record) -> Value {
-    let mut settings = record.global_frame_limiter_settings.clone();
-    settings.frame_limiter_enable = record
-        .client_frame_limiter_settings
-        .frame_limiter_enable
-        .or(settings.frame_limiter_enable);
-    settings.frame_limiter_fps_limit = record
-        .client_frame_limiter_settings
-        .frame_limiter_fps_limit
-        .or(settings.frame_limiter_fps_limit);
-    settings.frame_limiter_provider = record
-        .client_frame_limiter_settings
-        .frame_limiter_provider
-        .clone()
-        .or(settings.frame_limiter_provider);
-    settings.frame_limiter_disable_vsync = record
-        .client_frame_limiter_settings
-        .frame_limiter_disable_vsync
-        .or(settings.frame_limiter_disable_vsync);
-    settings.frame_limiter_auto_virtual_framegen = record
-        .client_frame_limiter_settings
-        .frame_limiter_auto_virtual_framegen
-        .clone()
-        .or(settings.frame_limiter_auto_virtual_framegen);
+    let mut settings = resolve_frame_limiter_settings(
+        &record.global_frame_limiter_settings,
+        &record.application_frame_limiter_settings,
+        &record.client_frame_limiter_settings,
+    );
     settings.rtss_frame_limit_type = record
         .client_frame_limiter_settings
         .rtss_frame_limit_type
@@ -950,6 +962,37 @@ fn frame_limiter_launch_snapshot(record: &Record) -> Value {
         "game_frame_generation_mode":null,
         "rtss_frame_limit_type_explicit_override":null
     })
+}
+
+pub(super) fn resolve_frame_limiter_settings(
+    global: &FrameLimiterSettings,
+    application: &FrameLimiterSettings,
+    client: &FrameLimiterSettings,
+) -> FrameLimiterSettings {
+    let mut settings = global.clone();
+    settings.frame_limiter_enable = client
+        .frame_limiter_enable
+        .or(application.frame_limiter_enable)
+        .or(settings.frame_limiter_enable);
+    settings.frame_limiter_fps_limit = client
+        .frame_limiter_fps_limit
+        .or(application.frame_limiter_fps_limit)
+        .or(settings.frame_limiter_fps_limit);
+    settings.frame_limiter_provider = client
+        .frame_limiter_provider
+        .clone()
+        .or(application.frame_limiter_provider.clone())
+        .or(settings.frame_limiter_provider);
+    settings.frame_limiter_disable_vsync = client
+        .frame_limiter_disable_vsync
+        .or(application.frame_limiter_disable_vsync)
+        .or(settings.frame_limiter_disable_vsync);
+    settings.frame_limiter_auto_virtual_framegen = client
+        .frame_limiter_auto_virtual_framegen
+        .clone()
+        .or(application.frame_limiter_auto_virtual_framegen.clone())
+        .or(settings.frame_limiter_auto_virtual_framegen);
+    settings
 }
 
 fn client_frame_limiter_overrides(record: &Record) -> Value {

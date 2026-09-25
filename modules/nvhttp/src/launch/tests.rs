@@ -1396,6 +1396,39 @@ fn native_pen_touch_resolves_client_before_application_and_preserves_inheritance
 }
 
 #[test]
+fn application_ds4_touchpad_override_reaches_rtsp_open_including_false() {
+    for (marker, application_value, expected) in [
+        (61, Some(true), json!(true)),
+        (62, Some(false), json!(false)),
+        (63, None, Value::Null),
+    ] {
+        let now = Instant::now();
+        let application_overrides = application_value
+            .map(|value| json!({"ds4_back_as_touchpad_click":value}))
+            .unwrap_or_else(|| json!({}));
+        let mut broker = Broker {
+            application_input_overrides: Some(application_overrides),
+            ..Broker::default()
+        };
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(
+            controller
+                .launch(
+                    10,
+                    request(marker),
+                    peer_with_native_pen_touch(marker, None),
+                    now,
+                )
+                .is_none()
+        );
+        let _ = poll_until_reply(&mut controller, &mut broker, now);
+
+        let rtsp_open = opened_rtsp_payload(&broker);
+        assert_eq!(rtsp_open["ds4_back_as_touchpad_click"], expected);
+    }
+}
+
+#[test]
 fn encryption_modes_and_authenticated_peer_ip_are_snapshotted_into_rtsp_open() {
     let now = Instant::now();
     let remote = "198.51.100.42".parse().unwrap();
@@ -1910,6 +1943,210 @@ fn paired_frame_limiter_values_override_global_settings_and_keep_sparse_presence
         launch_payload["client_frame_limiter_overrides"],
         json!({"frame_limiter_enable":false,"frame_limiter_fps_limit":0.0})
     );
+}
+
+#[test]
+fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values() {
+    let payload = json!({
+        "launch": {
+            "config_overrides": {
+                "frame_limiter_enable":false,
+                "frame_limiter_fps_limit":72.0,
+                "frame_limiter_provider":"auto"
+            }
+        }
+    });
+    let decoded = super::workflow::application_config_overrides(&payload).unwrap();
+    assert_eq!(
+        decoded.frame_limiter_settings(),
+        FrameLimiterSettings {
+            frame_limiter_enable: Some(false),
+            frame_limiter_fps_limit: Some(72.0),
+            frame_limiter_provider: Some("auto".into()),
+            ..Default::default()
+        }
+    );
+
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "frame_limiter_fps_limit":72.0,
+            "frame_limiter_provider":"auto"
+        })),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let record = controller.records.values().next().expect("launch record");
+    assert_eq!(
+        record.application_frame_limiter_settings,
+        FrameLimiterSettings {
+            frame_limiter_fps_limit: Some(72.0),
+            frame_limiter_provider: Some("auto".into()),
+            ..Default::default()
+        }
+    );
+    let launch_payload = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .expect("launch export");
+    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
+
+    #[cfg(windows)]
+    {
+        let windows_payload = json!({
+            "launch": {
+                "config_overrides": {
+                    "frame_limiter_disable_vsync":false,
+                    "frame_limiter_auto_virtual_framegen":"legacy"
+                }
+            }
+        });
+        let decoded = super::workflow::application_config_overrides(&windows_payload).unwrap();
+        assert_eq!(
+            decoded.frame_limiter_settings(),
+            FrameLimiterSettings {
+                frame_limiter_disable_vsync: Some(false),
+                frame_limiter_auto_virtual_framegen: Some("legacy".into()),
+                ..Default::default()
+            }
+        );
+    }
+
+    let malformed_values = [
+        json!({"frame_limiter_enable":"false"}),
+        json!({"frame_limiter_fps_limit":"60"}),
+        json!({"frame_limiter_fps_limit":1000.001}),
+        json!({"frame_limiter_provider":[]}),
+        json!({"frame_limiter_disable_vsync":1}),
+        json!({"frame_limiter_auto_virtual_framegen":"invalid"}),
+        json!({"ds4_back_as_touchpad_click":"false"}),
+        json!({"unrecognized_override":true}),
+    ];
+    for application_overrides in malformed_values.iter() {
+        let payload = json!({"launch":{"config_overrides":application_overrides}});
+        assert!(super::workflow::application_config_overrides(&payload).is_err());
+    }
+
+    for (offset, application_overrides) in malformed_values.into_iter().enumerate() {
+        let now = Instant::now();
+        let marker = 70 + offset as u8;
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker {
+            application_input_overrides: Some(application_overrides),
+            ..Broker::default()
+        };
+
+        assert!(
+            controller
+                .launch(10, request(marker), peer(marker), now)
+                .is_none()
+        );
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 503);
+        assert!(!broker.commands.iter().any(|command| matches!(
+            command,
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.rtsp/1" && payload["action"] == "open"
+        )));
+    }
+}
+
+#[test]
+fn frame_limiter_fields_resolve_client_then_application_then_global_independently() {
+    let global = FrameLimiterSettings {
+        frame_limiter_enable: Some(true),
+        frame_limiter_fps_limit: Some(60.0),
+        frame_limiter_provider: Some("auto".into()),
+        frame_limiter_disable_vsync: Some(true),
+        frame_limiter_auto_virtual_framegen: Some("enabled".into()),
+        ..Default::default()
+    };
+    let application = FrameLimiterSettings {
+        frame_limiter_enable: Some(true),
+        frame_limiter_fps_limit: Some(90.0),
+        frame_limiter_provider: Some("rtss".into()),
+        frame_limiter_disable_vsync: Some(false),
+        frame_limiter_auto_virtual_framegen: Some("legacy".into()),
+        ..Default::default()
+    };
+    let client = FrameLimiterSettings {
+        frame_limiter_enable: Some(false),
+        frame_limiter_fps_limit: Some(144.0),
+        frame_limiter_provider: Some("none".into()),
+        frame_limiter_disable_vsync: Some(true),
+        frame_limiter_auto_virtual_framegen: Some("vrr".into()),
+    };
+    let resolved = super::workflow::resolve_frame_limiter_settings(&global, &application, &client);
+    assert_eq!(resolved.frame_limiter_enable, Some(false));
+    assert_eq!(resolved.frame_limiter_fps_limit, Some(144.0));
+    assert_eq!(resolved.frame_limiter_provider.as_deref(), Some("none"));
+    assert_eq!(resolved.frame_limiter_disable_vsync, Some(true));
+    assert_eq!(
+        resolved.frame_limiter_auto_virtual_framegen.as_deref(),
+        Some("vrr")
+    );
+
+    let application_resolved = super::workflow::resolve_frame_limiter_settings(
+        &global,
+        &application,
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(application_resolved.frame_limiter_enable, Some(true));
+    assert_eq!(application_resolved.frame_limiter_fps_limit, Some(90.0));
+    assert_eq!(
+        application_resolved.frame_limiter_provider.as_deref(),
+        Some("rtss")
+    );
+    assert_eq!(
+        application_resolved.frame_limiter_disable_vsync,
+        Some(false)
+    );
+    assert_eq!(
+        application_resolved
+            .frame_limiter_auto_virtual_framegen
+            .as_deref(),
+        Some("legacy")
+    );
+
+    let global_resolved = super::workflow::resolve_frame_limiter_settings(
+        &global,
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(global_resolved.frame_limiter_enable, Some(true));
+    assert_eq!(global_resolved.frame_limiter_fps_limit, Some(60.0));
+    assert_eq!(
+        global_resolved.frame_limiter_provider.as_deref(),
+        Some("auto")
+    );
+    assert_eq!(global_resolved.frame_limiter_disable_vsync, Some(true));
+    assert_eq!(
+        global_resolved
+            .frame_limiter_auto_virtual_framegen
+            .as_deref(),
+        Some("enabled")
+    );
+
+    let defaults = super::workflow::resolve_frame_limiter_settings(
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+        &FrameLimiterSettings::default(),
+    );
+    assert_eq!(defaults.frame_limiter_enable, None);
+    assert_eq!(defaults.frame_limiter_fps_limit, None);
+    assert_eq!(defaults.frame_limiter_provider, None);
+    assert_eq!(defaults.frame_limiter_disable_vsync, None);
+    assert_eq!(defaults.frame_limiter_auto_virtual_framegen, None);
 }
 
 #[test]
