@@ -835,6 +835,28 @@ fn snapshots_repeated_vibeshine_state_spellings_when_they_resolve_to_one_file() 
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn snapshots_case_variant_vibeshine_state_spellings_on_windows() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Vibeshine");
+    let state_path = PathBuf::from("private/state.json");
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"vibeshine_file_state = private/state.json\nvibeshine_file_state = PRIVATE/STATE.JSON\n",
+    );
+    write(&predecessor.join(&state_path), br#"{"root":{}}"#);
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    let canonical_state = predecessor.join(&state_path).canonicalize().unwrap();
+    assert!(collected.files.contains(&state_path));
+    assert!(collected.configured_state_files.contains(&state_path));
+    assert_eq!(
+        collected.copy_sources.get(&state_path),
+        Some(&canonical_state)
+    );
+}
+
 #[test]
 fn rejects_repeated_vibeshine_state_spellings_for_distinct_or_missing_targets() {
     let fixture = TemporaryDirectory::new();
