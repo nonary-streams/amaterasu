@@ -17,6 +17,18 @@ or recover. Windows has a native CCD implementation. Linux (including KDE Waylan
 and macOS return `unsupported_platform` for enumeration/mutation; no simulated
 platform data, shell fallback, or `kscreen-doctor` adapter is used.
 
+## Refresh-rate option model
+
+The library also exposes `RefreshRateOption` as a reusable typed configuration
+model. Its default is `Auto`, and its serialized tokens are `auto`, `disabled`,
+`manual`, and `prefer_highest`. The legacy token parser maps unknown values to
+`Disabled`. The variants describe using client FPS, doing no additional refresh-rate
+configuration, using the separate `dd_manual_refresh_rate` setting, or preferring the
+highest refresh rate for the selected resolution, respectively.
+
+This model does not persist settings, project scoped values into a runtime
+request, or perform provider/native display effects.
+
 ## API
 
 ```json

@@ -3,11 +3,13 @@ pub mod mode_remapping;
 mod model;
 mod pipeline;
 mod platform;
+pub mod refresh_rate_option;
 
 pub use mode_remapping::{
     DisplayMode, ModeRemapping, ModeRemappingEntry, ModeRemappingError, Resolution, ResolverContext,
 };
 pub use model::Rational;
+pub use refresh_rate_option::RefreshRateOption;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use pipeline::Pipeline;
