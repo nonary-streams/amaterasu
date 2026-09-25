@@ -750,6 +750,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
                 "video_max_batch_size_kb":0,
                 "stream_audio":false,
                 "native_pen_touch":false,
+                "nvenc_spatial_aq":false,
                 "audio_sink_capture_only":false,
                 "back_button_timeout":-1
             }
@@ -787,6 +788,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(
         certificate_readback["config_overrides"]["native_pen_touch"],
+        false
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["nvenc_spatial_aq"],
         false
     );
     assert_eq!(
@@ -834,6 +839,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(
         persisted["clients"][0]["config_overrides"]["native_pen_touch"],
+        false
+    );
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["nvenc_spatial_aq"],
         false
     );
     assert_eq!(
