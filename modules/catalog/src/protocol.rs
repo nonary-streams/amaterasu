@@ -40,6 +40,11 @@ pub enum Operation {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
+    /// Export only Steam IDs from the single owner selected by export_principals.
+    ExportSteamIds {
+        cursor: Option<Cursor>,
+        limit: Option<usize>,
+    },
     Search {
         query: String,
         cursor: Option<Cursor>,
@@ -139,6 +144,9 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         }
         Operation::List { cursor, limit } => return page(&document, "", cursor, limit, false),
         Operation::ExportList { cursor, limit } => return page(&document, "", cursor, limit, true),
+        Operation::ExportSteamIds { cursor, limit } => {
+            return page_steam_ids(&document, cursor, limit);
+        }
         Operation::Search {
             query,
             cursor,
@@ -313,6 +321,72 @@ fn page(
     Ok(Change::Read(
         json!({"ok":true,"revision":document.revision,"entries":entries,"next_cursor":next_cursor}),
     ))
+}
+
+fn page_steam_ids(
+    document: &Document,
+    cursor: Option<Cursor>,
+    limit: Option<usize>,
+) -> Result<Change, Value> {
+    const CURSOR_QUERY: &str = "steam_ids";
+
+    let limit = limit.unwrap_or(20);
+    if !(1..=32).contains(&limit) {
+        return Err(error(
+            "invalid_request",
+            "page limit must be between 1 and 32",
+        ));
+    }
+    let after = if let Some(cursor) = &cursor {
+        check_revision(document, cursor.revision)?;
+        if cursor.query != CURSOR_QUERY
+            || !document.entries.contains_key(&cursor.after)
+            || crate::model::parse_id(&cursor.after).is_none()
+        {
+            return Err(error(
+                "invalid_cursor",
+                "cursor does not match this query or catalog",
+            ));
+        }
+        cursor.after.as_str()
+    } else {
+        ""
+    };
+
+    let mut matching = document.entries.iter().filter_map(|(entry_id, entry)| {
+        if entry_id.as_str() <= after {
+            return None;
+        }
+        let steam_id_text = entry.steam_id.as_deref()?;
+        if !crate::model::valid_steam_id(steam_id_text) {
+            return None;
+        }
+        let steam_id = steam_id_text.parse::<u32>().ok()?;
+        (steam_id != 0).then_some((entry_id, steam_id))
+    });
+    let mut selected = matching.by_ref().take(limit + 1).collect::<Vec<_>>();
+    let has_more = selected.len() > limit;
+    selected.truncate(limit);
+    let next_cursor = has_more.then(|| Cursor {
+        revision: document.revision,
+        after: selected
+            .last()
+            .expect("a full ID page has at least one item")
+            .0
+            .clone(),
+        query: CURSOR_QUERY.into(),
+    });
+    let steam_ids = selected
+        .into_iter()
+        .map(|(_, steam_id)| steam_id)
+        .collect::<Vec<_>>();
+
+    Ok(Change::Read(json!({
+        "ok":true,
+        "revision":document.revision,
+        "steam_ids":steam_ids,
+        "next_cursor":next_cursor
+    })))
 }
 
 pub fn project_entry(id: &str, entry: &Entry, export: bool) -> Value {

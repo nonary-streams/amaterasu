@@ -152,11 +152,19 @@ struct ProviderFinish {
     remove_expired: bool,
     remove_selection: bool,
 }
+#[derive(Clone, Copy)]
+enum ScanProjection {
+    List,
+    ExportList,
+    SteamIds,
+}
+
 struct Scan {
-    export: bool,
+    projection: ScanProjection,
     state_revision: u64,
     revision: u64,
     query: String,
+    cursor_query: String,
     limit: usize,
     entries: Vec<Value>,
     bytes: usize,
@@ -224,7 +232,7 @@ impl Pipeline {
                 }
                 Ok((format!("principal/{caller}"), None, operation))
             }
-            operation @ Operation::ExportList { .. } => {
+            operation @ (Operation::ExportList { .. } | Operation::ExportSteamIds { .. }) => {
                 let owner = self.export_principals.get(caller).ok_or_else(|| {
                     error(
                         "permission_denied",
@@ -2263,7 +2271,9 @@ impl Pipeline {
         if payload["found"] == false {
             if matches!(
                 operation,
-                Operation::ExportList { .. } | Operation::ResolveExportedLaunch { .. }
+                Operation::ExportList { .. }
+                    | Operation::ExportSteamIds { .. }
+                    | Operation::ResolveExportedLaunch { .. }
             ) {
                 return complete_read(send, context, operation, Document::default());
             }
@@ -2279,7 +2289,9 @@ impl Pipeline {
         // Export must remain read-only even when ordinary reads would migrate legacy data.
         if matches!(
             operation,
-            Operation::ExportList { .. } | Operation::ResolveExportedLaunch { .. }
+            Operation::ExportList { .. }
+                | Operation::ExportSteamIds { .. }
+                | Operation::ResolveExportedLaunch { .. }
         ) {
             return complete_read(send, context, operation, document);
         }
@@ -2302,11 +2314,28 @@ impl Pipeline {
         document: Document,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        let export = matches!(operation, Operation::ExportList { .. });
-        let (query, cursor, limit) = match operation {
-            Operation::List { cursor, limit } | Operation::ExportList { cursor, limit } => {
-                (String::new(), cursor, limit)
-            }
+        let (query, cursor_query, cursor, limit, projection) = match operation {
+            Operation::List { cursor, limit } => (
+                String::new(),
+                String::new(),
+                cursor,
+                limit,
+                ScanProjection::List,
+            ),
+            Operation::ExportList { cursor, limit } => (
+                String::new(),
+                String::new(),
+                cursor,
+                limit,
+                ScanProjection::ExportList,
+            ),
+            Operation::ExportSteamIds { cursor, limit } => (
+                String::new(),
+                "steam_ids".into(),
+                cursor,
+                limit,
+                ScanProjection::SteamIds,
+            ),
             Operation::Search {
                 query,
                 cursor,
@@ -2322,7 +2351,14 @@ impl Pipeline {
                         ),
                     );
                 }
-                (query.to_lowercase(), cursor, limit)
+                let normalized_query = query.to_lowercase();
+                (
+                    normalized_query.clone(),
+                    normalized_query,
+                    cursor,
+                    limit,
+                    ScanProjection::List,
+                )
             }
             operation => {
                 return match apply(operation, Some(document)) {
@@ -2352,7 +2388,7 @@ impl Pipeline {
                     json!({"ok":false,"error":{"code":"revision_conflict","message":"catalog revision differs","current_revision":document.revision}}),
                 );
             }
-            if cursor.query != query || !valid_collection_cursor(&cursor.after) {
+            if cursor.query != cursor_query || !valid_collection_cursor(&cursor.after) {
                 return complete(
                     send,
                     context.request_id,
@@ -2364,10 +2400,11 @@ impl Pipeline {
             }
         }
         let scan = Scan {
-            export,
+            projection,
             state_revision,
             revision: document.revision,
             query,
+            cursor_query,
             limit,
             entries: Vec::new(),
             bytes: 0,
@@ -2421,8 +2458,22 @@ impl Pipeline {
             {
                 return complete(send, context.request_id, malformed());
             }
-            if matches_query(&entry, &scan.query) {
-                let row = project_entry(id, &entry, scan.export);
+            let projected_row = match scan.projection {
+                ScanProjection::List if matches_query(&entry, &scan.query) => {
+                    Some(project_entry(id, &entry, false))
+                }
+                ScanProjection::ExportList if matches_query(&entry, &scan.query) => {
+                    Some(project_entry(id, &entry, true))
+                }
+                ScanProjection::SteamIds => entry
+                    .steam_id
+                    .as_deref()
+                    .filter(|steam_id| crate::model::valid_steam_id(steam_id))
+                    .and_then(|steam_id| steam_id.parse::<u32>().ok())
+                    .map(Value::from),
+                _ => None,
+            };
+            if let Some(row) = projected_row {
                 let size = serde_json::to_vec(&row).expect("JSON value").len();
                 if scan.entries.len() >= scan.limit || scan.bytes + size > PAGE_BYTES {
                     return complete(send, context.request_id, scan.reply(true));
@@ -2450,12 +2501,19 @@ impl Scan {
             self.after.map(|after| Cursor {
                 revision: self.revision,
                 after,
-                query: self.query,
+                query: self.cursor_query,
             })
         } else {
             None
         };
-        json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor})
+        match self.projection {
+            ScanProjection::SteamIds => {
+                json!({"ok":true,"revision":self.revision,"steam_ids":self.entries,"next_cursor":cursor})
+            }
+            ScanProjection::List | ScanProjection::ExportList => {
+                json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor})
+            }
+        }
     }
 }
 fn complete_read(

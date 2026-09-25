@@ -1183,6 +1183,174 @@ fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
 }
 
 #[test]
+fn steam_id_export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
+    let mut pipeline = Pipeline::new(
+        BTreeSet::new(),
+        BTreeMap::from([("consumer".into(), "steam-owner".into())]),
+        BTreeMap::new(),
+    );
+    let mut backend = Backend::default();
+    let denied = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_steam_ids"}),
+        "stranger",
+        "consumer",
+        "steam-owner",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+
+    let spoofed = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_steam_ids","owner":"victim"}),
+        "consumer",
+        "owner",
+        "steam-owner",
+    );
+    assert_eq!(spoofed["error"]["code"], "invalid_request");
+
+    let empty = backend.run_for(
+        &mut pipeline,
+        json!({"action":"export_steam_ids"}),
+        "consumer",
+        "unrelated",
+        "steam-owner",
+    );
+    assert_eq!(
+        empty,
+        json!({"ok":true,"revision":0,"steam_ids":[],"next_cursor":null})
+    );
+    assert_eq!(backend.revision, 0);
+
+    let (key, _, _) = pipeline
+        .select_catalog(
+            "consumer",
+            "steam-owner",
+            Operation::List {
+                cursor: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(key, "principal/consumer");
+}
+
+#[test]
+fn steam_id_export_pages_only_numeric_ids_and_rejects_stale_or_invalid_cursors() {
+    for legacy in [false, true] {
+        let mut entries = BTreeMap::new();
+        for entry_number in 1..=70 {
+            let mut value = entry(&format!("Steam game {entry_number}"));
+            value["description"] = "private description".into();
+            value["tags"] = json!(["private tag"]);
+            if entry_number % 2 == 0 {
+                let steam_id = if entry_number == 4 {
+                    "2".to_owned()
+                } else {
+                    entry_number.to_string()
+                };
+                value["steam_id"] = steam_id.into();
+            }
+            entries.insert(format!("app-{entry_number:016x}"), value);
+        }
+        let mut backend = if legacy {
+            Backend {
+                legacy: Some(json!({
+                    "revision":7,
+                    "next_id":71,
+                    "entries":entries
+                })),
+                ..Default::default()
+            }
+        } else {
+            Backend {
+                revision: 3,
+                metadata: json!({"revision":7,"next_id":71}),
+                entries,
+                ..Default::default()
+            }
+        };
+        let initial_state_revision = backend.revision;
+        let mut pipeline = Pipeline::new(
+            BTreeSet::new(),
+            BTreeMap::from([("consumer".into(), "steam-owner".into())]),
+            BTreeMap::new(),
+        );
+        let mut cursor = Value::Null;
+        let mut first_cursor = Value::Null;
+        let mut steam_ids = Vec::new();
+        loop {
+            let page = backend.run_for(
+                &mut pipeline,
+                json!({"action":"export_steam_ids","limit":32,"cursor":cursor}),
+                "consumer",
+                "unrelated",
+                "steam-owner",
+            );
+            assert_eq!(page["ok"], true);
+            assert_eq!(page["revision"], 7);
+            assert_eq!(page.as_object().unwrap().len(), 4);
+            assert!(page.get("entries").is_none());
+            let page_ids = page["steam_ids"].as_array().unwrap();
+            assert!(page_ids.len() <= 32);
+            for steam_id in page_ids {
+                assert!(steam_id.as_u64().is_some_and(|id| id > 0));
+                steam_ids.push(steam_id.as_u64().unwrap());
+            }
+            cursor = page["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+            assert_eq!(cursor["revision"], 7);
+            assert_eq!(cursor["query"], "steam_ids");
+            if first_cursor.is_null() {
+                first_cursor = cursor.clone();
+            }
+        }
+        let expected = (2_u64..=70)
+            .step_by(2)
+            .map(|number| if number == 4 { 2 } else { number })
+            .collect::<Vec<_>>();
+        assert_eq!(steam_ids, expected);
+        assert_eq!(backend.revision, initial_state_revision);
+
+        if legacy {
+            backend.legacy.as_mut().unwrap()["revision"] = 8.into();
+        } else {
+            backend.metadata["revision"] = 8.into();
+        }
+        let stale = backend.run_for(
+            &mut pipeline,
+            json!({"action":"export_steam_ids","cursor":first_cursor}),
+            "consumer",
+            "unrelated",
+            "steam-owner",
+        );
+        assert_eq!(stale["error"]["code"], "revision_conflict");
+
+        let invalid_query = backend.run_for(
+            &mut pipeline,
+            json!({
+                "action":"export_steam_ids",
+                "cursor":{"revision":8,"after":"app-0000000000000040","query":""}
+            }),
+            "consumer",
+            "unrelated",
+            "steam-owner",
+        );
+        assert_eq!(invalid_query["error"]["code"], "invalid_cursor");
+
+        let invalid_limit = backend.run_for(
+            &mut pipeline,
+            json!({"action":"export_steam_ids","limit":33}),
+            "consumer",
+            "unrelated",
+            "steam-owner",
+        );
+        assert_eq!(invalid_limit["error"]["code"], "invalid_request");
+    }
+}
+
+#[test]
 fn exported_launch_resolution_requires_both_authorities_and_returns_fixed_owner() {
     let pipeline = Pipeline::new(
         BTreeSet::from(["launch".into()]),

@@ -202,6 +202,24 @@ underscores or hyphens; at most 16 mappings are accepted. Example settings:
 {"export_principals":{"amaterasu.nvhttp":"amaterasu.management"}}
 ```
 
+`export_steam_ids` uses the same immediate-caller authorization and fixed owner
+mapping as `export_list`. Profiles must map a consumer to the catalog owner that
+contains the direct Steam rows it needs to check. The action returns only
+canonical nonzero numeric `steam_id` values, the catalog revision, and an opaque
+continuation cursor. It accepts no owner selector and never returns catalog
+entry data:
+
+```json
+{"action":"export_steam_ids","limit":32,"cursor":null}
+```
+
+Success is `{"ok":true,"revision":7,"steam_ids":[730,440],"next_cursor":null}`.
+Steam IDs can repeat when separate catalog entries carry the same ID; consumers
+that need membership should treat the values as a set. Cursors use the same
+revision check and page limit as `export_list`, with the query tag `steam_ids`
+and the last scanned catalog key as `after`. Catalog changes invalidate a
+cursor with `revision_conflict`.
+
 ```json
 {"action":"export_list","limit":32,"cursor":null}
 ```
@@ -210,8 +228,9 @@ The authenticated **immediate caller** selects this mapping, independently of th
 request initiator. An unmapped caller receives `permission_denied` before state
 access. The payload cannot supply an owner, initiator or search query. Call grants
 for catalog and delegated state access are still required. The mapping grants
-the sanitized list operation and, only when combined with an authorized launch
-provider, exported launch resolution. Ordinary CRUD remains caller-scoped.
+the sanitized `export_list` and `export_steam_ids` operations and, only when
+combined with an authorized launch provider, exported launch resolution.
+Ordinary CRUD remains caller-scoped.
 
 Success is `{"ok":true,"revision":7,"entries":[{"id":"app-0000000000000001","name":"Example Game"}],"next_cursor":null}`.
 Rows contain exactly `id` and `name`; launch paths, arguments, descriptions and
