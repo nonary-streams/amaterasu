@@ -46,8 +46,17 @@ to null to inherit; explicit `true` and `false` values are stored and returned,
 including through provider-marker refreshes. Existing entries and markers may
 omit this field, so no catalog or marker version bump is needed.
 
+The optional `prefer_10bit_sdr` override is also a strict boolean. Catalog stores
+and returns it, including through provider-marker refreshes; absent or null
+means inherit, while explicit `true` and `false` remain distinct values.
+Existing entries and version-1 provider markers may omit this field, so no
+catalog schema or marker version bump is needed. This documents Catalog storage
+only: L02 effective application-over-paired-client resolution and runtime
+projection remain pending. L03 outbox item 0071 records that there is no current
+video/encode field to project this setting to.
+
 ```json
-{"action":"create","expected_revision":0,"entry":{"name":"AV1 tuned game","config_overrides":{"amd_av1_latency_mode":"power_saving","nvenc_spatial_aq":false},"launch":{"kind":"application","path":"/games/example"}}}
+{"action":"create","expected_revision":0,"entry":{"name":"AV1 and 10-bit SDR preferences","config_overrides":{"amd_av1_latency_mode":"power_saving","nvenc_spatial_aq":false,"prefer_10bit_sdr":true},"launch":{"kind":"application","path":"/games/example"}}}
 ```
 
 Executable entries can include ordered preparation and paired undo commands:

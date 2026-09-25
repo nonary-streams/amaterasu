@@ -3245,6 +3245,78 @@ fn provider_refresh_rate_option_override_is_strict_and_survives_playnite_refresh
 }
 
 #[test]
+fn provider_prefer_10bit_sdr_override_survives_playnite_refresh() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let finished = import_playnite_entry(
+        &mut backend,
+        &mut pipeline,
+        "playnite-prefer-10bit-1",
+        1,
+        0,
+        "playnite:10",
+        "Imported title",
+    );
+    assert_eq!(finished["ok"], true);
+
+    let id = "app-0000000000000001";
+    let marker_key = "~provider.entry:amaterasu.playnite:playnite:10";
+    let mut expected_revision = finished["revision"].as_u64().unwrap();
+
+    for (index, prefer_10bit_sdr) in [true, false].into_iter().enumerate() {
+        let updated = backend.run_for(
+            &mut pipeline,
+            update_provider_config_overrides(
+                id,
+                expected_revision,
+                json!({"prefer_10bit_sdr":prefer_10bit_sdr}),
+            ),
+            "amaterasu.management",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(updated["ok"], true, "{updated}");
+        assert_eq!(
+            updated["config_overrides"]["prefer_10bit_sdr"],
+            prefer_10bit_sdr
+        );
+        assert_eq!(
+            backend.entries[id]["config_overrides"]["prefer_10bit_sdr"],
+            prefer_10bit_sdr
+        );
+        assert_eq!(backend.entries[marker_key]["version"], 1);
+        assert_eq!(
+            backend.entries[marker_key]["config_overrides"]["prefer_10bit_sdr"],
+            prefer_10bit_sdr
+        );
+        expected_revision = updated["revision"].as_u64().unwrap();
+
+        let source_revision = (index + 2) as u64;
+        let refreshed = import_playnite_entry(
+            &mut backend,
+            &mut pipeline,
+            &format!("playnite-prefer-10bit-{}", index + 2),
+            source_revision,
+            expected_revision,
+            "playnite:10",
+            "Provider renamed title",
+        );
+        assert_eq!(refreshed["ok"], true, "{refreshed}");
+        assert_eq!(backend.entries[id]["name"], "Provider renamed title");
+        assert_eq!(
+            backend.entries[id]["config_overrides"]["prefer_10bit_sdr"],
+            prefer_10bit_sdr
+        );
+        assert_eq!(backend.entries[marker_key]["version"], 1);
+        assert_eq!(
+            backend.entries[marker_key]["config_overrides"]["prefer_10bit_sdr"],
+            prefer_10bit_sdr
+        );
+        expected_revision = refreshed["revision"].as_u64().unwrap();
+    }
+}
+
+#[test]
 fn provider_override_enforces_management_and_fixed_playnite_identity() {
     let mut backend = Backend::default();
     let mut pipeline = playnite_importer();

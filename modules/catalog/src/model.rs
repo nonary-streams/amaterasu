@@ -116,6 +116,8 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvenc_spatial_aq: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_10bit_sdr: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_enable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_fps_limit: Option<f64>,
@@ -268,6 +270,7 @@ impl ConfigOverrides {
             && self.mouse.is_none()
             && self.amd_av1_latency_mode.is_none()
             && self.nvenc_spatial_aq.is_none()
+            && self.prefer_10bit_sdr.is_none()
             && self.frame_limiter_enable.is_none()
             && self.frame_limiter_fps_limit.is_none()
             && self.frame_limiter_provider.is_none()
