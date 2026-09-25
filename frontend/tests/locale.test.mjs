@@ -5,12 +5,10 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const context = vm.createContext({});
-vm.runInContext(
-  ts.transpile(readFileSync("src/locale.ts", "utf8"), {
-    target: ts.ScriptTarget.ES2022,
-  }),
-  context,
-);
+const localeSource = ts.transpile(readFileSync("src/locale.ts", "utf8"), {
+  target: ts.ScriptTarget.ES2022,
+});
+vm.runInContext(localeSource, context);
 const locale = context.Amaterasu;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const expectedLocales = [
@@ -50,6 +48,73 @@ function configuration(values = {}) {
     },
     values,
   };
+}
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.className = "";
+    this.textContent = "";
+    this.value = "";
+    this.disabled = false;
+    this.id = "";
+    this.htmlFor = "";
+  }
+
+  append(...children) {
+    this.children.push(...children);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, value);
+  }
+
+  addEventListener(name, listener) {
+    const listeners = this.listeners.get(name) ?? [];
+    listeners.push(listener);
+    this.listeners.set(name, listeners);
+  }
+
+  dispatch(name) {
+    for (const listener of this.listeners.get(name) ?? [])
+      listener({ target: this });
+  }
+
+  findById(id) {
+    if (this.id === id) return this;
+    for (const child of this.children) {
+      const match = child.findById?.(id);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  findByClass(className) {
+    if (this.className === className) return this;
+    for (const child of this.children) {
+      const match = child.findByClass?.(className);
+      if (match) return match;
+    }
+    return null;
+  }
+}
+
+function mountLocaleSelector(api) {
+  const document = {
+    documentElement: { lang: "en" },
+    createElement: (tagName) => new FakeElement(tagName),
+  };
+  const selectorContext = vm.createContext({ document });
+  vm.runInContext(localeSource, selectorContext);
+  const container = selectorContext.Amaterasu.mountLocaleSelector(api);
+  return { container, document };
+}
+
+async function flushMicrotasks() {
+  for (let index = 0; index < 12; index += 1) await Promise.resolve();
 }
 
 test("locale validation accepts every exact supported token", () => {
@@ -149,4 +214,187 @@ test("locale migration adds its field while preserving unrelated definitions and
   assert.deepEqual(ordinary(extended.values), before.values);
   assert.deepEqual(ordinary(original), before);
   assert.throws(() => locale.extendLocaleConfiguration(configuration()));
+});
+
+test("locale selector registers a missing caller configuration and reads it back", async () => {
+  const calls = [];
+  let registered = false;
+  const api = {
+    allows: (scope) =>
+      ["configuration.read", "configuration.write"].includes(scope),
+    async post(path, payload = {}) {
+      calls.push({ path, payload: ordinary(payload) });
+      if (path === "configuration/get") {
+        if (!registered) {
+          throw Object.assign(new Error("not registered"), {
+            code: "not_registered",
+          });
+        }
+        return configuration();
+      }
+      if (path === "configuration/register") {
+        registered = true;
+        return { ok: true, revision: 1 };
+      }
+      throw new Error(`Unexpected configuration route: ${path}`);
+    },
+  };
+
+  const { container, document } = mountLocaleSelector(api);
+  await flushMicrotasks();
+
+  assert.deepEqual(calls.map(({ path }) => path), [
+    "configuration/get",
+    "configuration/register",
+    "configuration/get",
+  ]);
+  assert.deepEqual(calls[1].payload, {
+    fields: {
+      locale: { type: "enum", default: "en", options: expectedLocales },
+    },
+  });
+  assert.equal(container.findById("global-locale").value, "en");
+  assert.equal(container.findById("global-locale").disabled, false);
+  assert.equal(document.documentElement.lang, "en");
+});
+
+test("locale selector migrates the existing schema without replacing unrelated values", async () => {
+  const calls = [];
+  let serverDocument = {
+    revision: 7,
+    fields: {
+      host_name: { type: "string", default: "Host", min_length: 1 },
+      logging: { type: "boolean", default: true },
+    },
+    values: { host_name: "Saved host", logging: false },
+  };
+  const api = {
+    allows: () => true,
+    async post(path, payload = {}) {
+      calls.push({ path, payload: ordinary(payload) });
+      if (path === "configuration/get") return ordinary(serverDocument);
+      if (path === "configuration/migrate") {
+        assert.equal(payload.expected_revision, 7);
+        assert.equal(Object.hasOwn(payload, "values"), false);
+        assert.equal(Object.hasOwn(payload, "renames"), false);
+        assert.equal(Object.hasOwn(payload, "removed_fields"), false);
+        serverDocument = {
+          revision: 8,
+          fields: payload.fields,
+          values: { ...serverDocument.values, locale: "en" },
+        };
+        return { ok: true, revision: 8 };
+      }
+      throw new Error(`Unexpected configuration route: ${path}`);
+    },
+  };
+
+  const { container, document } = mountLocaleSelector(api);
+  await flushMicrotasks();
+
+  assert.deepEqual(calls.map(({ path }) => path), [
+    "configuration/get",
+    "configuration/migrate",
+    "configuration/get",
+  ]);
+  assert.deepEqual(ordinary(serverDocument.fields.host_name), {
+    type: "string",
+    default: "Host",
+    min_length: 1,
+  });
+  assert.deepEqual(serverDocument.values, {
+    host_name: "Saved host",
+    logging: false,
+    locale: "en",
+  });
+  assert.equal(container.findById("global-locale").value, "en");
+  assert.equal(document.documentElement.lang, "en");
+});
+
+test("locale selector saves with the loaded revision and applies authoritative readback", async () => {
+  const calls = [];
+  let serverDocument = configuration({ locale: "en" });
+  let updateSucceeded = false;
+  const api = {
+    allows: () => true,
+    async post(path, payload = {}) {
+      calls.push({ path, payload: ordinary(payload) });
+      if (path === "configuration/get") {
+        if (updateSucceeded) {
+          serverDocument = {
+            ...serverDocument,
+            revision: 14,
+            values: { ...serverDocument.values, locale: "en_GB" },
+          };
+          updateSucceeded = false;
+        }
+        return ordinary(serverDocument);
+      }
+      if (path === "configuration/update") {
+        assert.deepEqual(payload, {
+          values: { locale: "pt_BR" },
+          expected_revision: 12,
+        });
+        serverDocument = {
+          ...serverDocument,
+          revision: 13,
+          values: { ...serverDocument.values, ...payload.values },
+        };
+        updateSucceeded = true;
+        return { ok: true, revision: 13 };
+      }
+      throw new Error(`Unexpected configuration route: ${path}`);
+    },
+  };
+
+  const { container, document } = mountLocaleSelector(api);
+  await flushMicrotasks();
+  const select = container.findById("global-locale");
+  select.value = "pt_BR";
+  select.dispatch("change");
+  await flushMicrotasks();
+
+  assert.deepEqual(calls.map(({ path }) => path), [
+    "configuration/get",
+    "configuration/update",
+    "configuration/get",
+  ]);
+  assert.equal(calls[1].payload.expected_revision, 12);
+  assert.deepEqual(calls[1].payload.values, { locale: "pt_BR" });
+  assert.equal(select.value, "en_GB");
+  assert.equal(document.documentElement.lang, "en-GB");
+  assert.equal(serverDocument.revision, 14);
+});
+
+test("locale selector keeps service and missing-scope failures nonfatal", async () => {
+  const unavailableApi = {
+    allows: (scope) => scope === "configuration.read",
+    async post() {
+      throw new Error("service unavailable");
+    },
+  };
+  const unavailable = mountLocaleSelector(unavailableApi);
+  await flushMicrotasks();
+  assert.ok(unavailable.container.findById("global-locale"));
+  assert.match(
+    unavailable.container.findByClass("locale-error").textContent,
+    /service unavailable/,
+  );
+
+  let calls = 0;
+  const noReadScopeApi = {
+    allows: () => false,
+    async post() {
+      calls += 1;
+      throw new Error("must not make an unsigned/unscoped request");
+    },
+  };
+  const readOnly = mountLocaleSelector(noReadScopeApi);
+  await flushMicrotasks();
+  assert.equal(calls, 0);
+  assert.equal(readOnly.container.findById("global-locale").disabled, true);
+  assert.match(
+    readOnly.container.findByClass("locale-error").textContent,
+    /configuration.read/,
+  );
 });
