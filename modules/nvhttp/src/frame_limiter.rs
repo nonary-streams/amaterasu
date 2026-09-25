@@ -251,17 +251,17 @@ mod tests {
         assert_eq!(persisted, expected_null_fields);
 
         let effective = settings.effective();
-        assert_eq!(effective.frame_limiter_enable, false);
+        assert!(!effective.frame_limiter_enable);
         assert_eq!(effective.frame_limiter_fps_limit_millihz, 0);
         assert_eq!(effective.frame_limiter_provider, "auto");
-        assert_eq!(effective.frame_limiter_disable_vsync, false);
+        assert!(!effective.frame_limiter_disable_vsync);
         assert_eq!(effective.frame_limiter_auto_virtual_framegen, "enabled");
         assert_eq!(effective.rtss_frame_limit_type, "async");
-        assert_eq!(effective.rtss_allow_virtual_display_override, false);
+        assert!(!effective.rtss_allow_virtual_display_override);
         assert_eq!(effective.rtss_install_path, "");
         assert_eq!(effective.mangohud_limiter_method, "late");
         assert_eq!(effective.mangohud_preset, "custom");
-        assert_eq!(effective.mangohud_always_show_graph, false);
+        assert!(!effective.mangohud_always_show_graph);
         assert_eq!(serde_json::to_value(&settings).unwrap(), persisted);
     }
 
