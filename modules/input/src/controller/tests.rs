@@ -3093,18 +3093,32 @@ fn pen_touch_backend_capacity_rejects_an_overfull_batch_before_injection() {
         true
     );
     assert_eq!(controller.backend.trace.borrow().len(), 3);
+    assert_eq!(controller.backend.trace.borrow().len(), 3);
+
+    let mut unavailable_pen = Controller::new(
+        FakeBackend {
+            supports_pen_touch: true,
+            max_pen_contacts: Some(0),
+            ..Default::default()
+        },
+        true,
+    );
+    let unavailable_pen_token = acquire(&mut unavailable_pen, Instant::now());
     assert_eq!(
         batch(
-            &mut controller,
-            &token,
-            vec![
-                pen_touch(2, PenTouchDevice::Pen, PenTouchPhase::Down, 40, 40),
-                pen_touch(3, PenTouchDevice::Pen, PenTouchPhase::Down, 50, 50),
-            ]
+            &mut unavailable_pen,
+            &unavailable_pen_token,
+            vec![pen_touch(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                40,
+                40,
+            )]
         )["error"]["code"],
         "resource_exhausted"
     );
-    assert_eq!(controller.backend.trace.borrow().len(), 3);
+    assert!(unavailable_pen.backend.trace.borrow().is_empty());
 }
 
 #[test]
@@ -3421,5 +3435,5 @@ fn pen_touch_shutdown_cancels_each_owned_pointer() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(cancellations, [32, 31]);
+    assert_eq!(cancellations, [PEN_POINTER_ID, 31]);
 }
