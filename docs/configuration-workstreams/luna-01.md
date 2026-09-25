@@ -257,3 +257,14 @@ All seven assigned IDs remain `pending`; this slice does not close `global:file_
 - Lane code candidate `f99de6d565355156bc2d1f44d9d46ba5dde3862f` landed as `dc2b8532`; its handoff landed as `821bf252`, with main's cumulative notes preserved.
 - `cargo fmt --check -p amaterasu-authentication` passed; `cargo test -p amaterasu-authentication` passed 42/42, including the Windows case-insensitive file-state alias regression; strict Clippy passed.
 - The Unix case-sensitive regression still needs execution on a Unix runner. Broader migration, signed editor, and runtime qualification remain pending; no stable ID is closed.
+
+
+## Independent foundation slice: global:vibeshine_file_state alias resolution
+
+Reservation `outbox/luna-01/0043-vibeshine-file-state-alias-reservation.json` reserved only `modules/authentication/src/migration.rs` for `global:vibeshine_file_state`. The change accepts repeated configured spellings only when both existing paths resolve to the same canonical contained file. Missing aliases and paths to distinct files remain ambiguous. Primary `file_state` behavior and all schemas remain unchanged.
+
+The isolated child worktree was `D:/sources/worktrees/amaterasu-auth-vibeshine-state-alias`, branch `config-parity/auth-vibeshine-state-alias`, based on clean lane HEAD `4b3a5d47e9d0aa45e9882faf69205471adfb72a8`. Worker `/root/auth_vibeshine_state_alias_slice`, thread `01a0d6d9-84e3-7e63-8260-903b1ced5d5f`, session `01a0d516-858e-7c40-b459-5de0bbf3d0dd`, was verified as `gpt-6-luna/xhigh` before edits. It committed `b01f31cbfad5bbef09eef79d68dd4e636cf341ed`, changing only `modules/authentication/src/migration.rs`. The lead reviewed the exact diff and required commit trailers, then cherry-picked it into this lane as `0baec8351598972f6263b3487e32f13c32e268a2`.
+
+Regression coverage covers Windows case-variant spellings resolving as one candidate, distinct case-sensitive Unix files remaining ambiguous, a missing-versus-existing Unix alias remaining ambiguous, and differently spelled missing aliases remaining ambiguous on all platforms. `rustfmt --edition 2024 --check modules/authentication/src/migration.rs`, `git diff --check HEAD^ HEAD`, and `git show --check HEAD` passed in the child/lane review. No Cargo tests, builds, or Clippy were run in the lightweight worktrees; Windows and Unix execution is not claimed. The coordinator should run authentication formatting, tests, and strict Clippy on main, with Unix qualification for the case-sensitive and missing-versus-existing tests.
+
+All seven assigned IDs remain `pending`; this slice does not close `global:vibeshine_file_state`. Signed management editing and authorization, complete product-wide migration behavior, and Windows/Unix qualification remain. No shared coverage ledger was edited and main was not modified by Luna-01.
