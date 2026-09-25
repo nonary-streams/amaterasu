@@ -17,6 +17,7 @@ use amaterasu_media::{
 use std::{
     ffi::c_void,
     sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -35,6 +36,7 @@ use windows::{
 const POLICY_CONFIG_CLASS: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 const POLICY_CONFIG_INTERFACE: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
 const HRESULT_NOT_FOUND: HRESULT = HRESULT(0x80070490u32 as i32);
+const DEFAULT_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
 
@@ -647,6 +649,8 @@ pub struct Capture {
     capture: IAudioCaptureClient,
     client: IAudioClient,
     endpoint: String,
+    follow_console_default: bool,
+    next_console_default_check: Instant,
     format: Format,
     timeline: Timeline,
     recovery_config: RecoveryConfig,
@@ -690,6 +694,8 @@ impl Capture {
             select_policy_virtual_sink(endpoints, requested, virtual_sink, host_audio_enabled)
         });
         let uses_virtual_sink = virtual_sink.is_some() || automatic_virtual_sink.is_some();
+        let follow_console_default =
+            super::should_follow_console_default(requested, uses_virtual_sink);
         let effective_channels = channels.or_else(|| automatic_virtual_sink.map(|_| 2));
         let desired_layout = uses_virtual_sink
             .then(|| channel_layout(effective_channels.unwrap_or(2)))
@@ -712,7 +718,12 @@ impl Capture {
                 let wide: Vec<u16> = selected.id.encode_utf16().chain(Some(0)).collect();
                 enumerator.GetDevice(PCWSTR(wide.as_ptr()))
             } else if requested.is_empty() || requested == "default" {
-                enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)
+                let role = if follow_console_default {
+                    eConsole
+                } else {
+                    eMultimedia
+                };
+                enumerator.GetDefaultAudioEndpoint(eRender, role)
             } else {
                 let wide: Vec<u16> = requested.encode_utf16().chain(Some(0)).collect();
                 enumerator.GetDevice(PCWSTR(wide.as_ptr()))
@@ -728,6 +739,7 @@ impl Capture {
                 desired_layout,
                 preferred_valid_bits,
                 effective_capture_only,
+                follow_console_default,
             )
         }
     }
@@ -735,16 +747,19 @@ impl Capture {
     pub fn reopen(config: &RecoveryConfig) -> AudioResult<Self> {
         let apartment = Apartment::start()?;
         let enumerator = enumerator()?;
-        let wide: Vec<u16> = config.endpoint.encode_utf16().chain(Some(0)).collect();
         // SAFETY: the endpoint ID was returned by this backend and all COM
         // interfaces remain local to the worker's apartment thread.
         unsafe {
-            let device = enumerator
-                .GetDevice(PCWSTR(wide.as_ptr()))
-                .map_err(|_| "endpoint_not_found")?;
+            let device = if config.follow_console_default {
+                enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
+            } else {
+                let wide: Vec<u16> = config.endpoint.encode_utf16().chain(Some(0)).collect();
+                enumerator.GetDevice(PCWSTR(wide.as_ptr()))
+            }
+            .map_err(|_| "endpoint_not_found")?;
             validate_render_device(&device)?;
             let endpoint = identifier(&device)?;
-            if endpoint != config.endpoint {
+            if !config.follow_console_default && endpoint != config.endpoint {
                 return Err("audio_endpoint_changed");
             }
             let desired_layout = config.virtual_channels.map(channel_layout).transpose()?;
@@ -756,6 +771,7 @@ impl Capture {
                 desired_layout,
                 config.preferred_valid_bits,
                 config.capture_sink_without_routing,
+                config.follow_console_default,
             )
         }
     }
@@ -772,12 +788,16 @@ impl Capture {
         desired_layout: Option<ChannelLayout>,
         preferred_valid_bits: Option<u16>,
         capture_sink_without_routing: bool,
+        follow_console_default: bool,
     ) -> AudioResult<Self> {
         // SAFETY: the caller created this device and enumerator in the live
         // worker apartment; all COM operations remain on that thread.
         unsafe {
-            let route_lease =
-                RouteLease::acquire(enumerator, &endpoint, capture_sink_without_routing)?;
+            let route_lease = RouteLease::acquire(
+                enumerator,
+                &endpoint,
+                capture_sink_without_routing || follow_console_default,
+            )?;
             let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
                 (Some(layout), Some(valid_bits)) => {
                     Some(set_virtual_device_layout(&endpoint, layout, valid_bits)?)
@@ -834,6 +854,7 @@ impl Capture {
             client.Start().map_err(|_| "audio_start_failed")?;
             let recovery_config = RecoveryConfig {
                 endpoint: endpoint.clone(),
+                follow_console_default,
                 virtual_channels: desired_layout.map(|layout| layout.channels),
                 preferred_valid_bits,
                 capture_sink_without_routing,
@@ -842,6 +863,8 @@ impl Capture {
                 capture,
                 client,
                 endpoint,
+                follow_console_default,
+                next_console_default_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
                 format,
                 timeline: Timeline::new(),
                 recovery_config,
@@ -860,6 +883,12 @@ impl Capture {
     }
 
     pub fn read(&mut self) -> AudioResult<Option<Packet>> {
+        if self.follow_console_default && Instant::now() >= self.next_console_default_check {
+            self.next_console_default_check = Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL;
+            if !self.is_current_console_default() {
+                return Err("default_endpoint_changed");
+            }
+        }
         // SAFETY: GetBuffer/ReleaseBuffer are paired on the same worker thread;
         // copy_samples never borrows uninitialized padding or silent pointers.
         unsafe {
@@ -886,6 +915,19 @@ impl Capture {
             let packet = self.timeline.packet(frames, flags, bytes?, qpc)?;
             Ok(Some(packet))
         }
+    }
+
+    fn is_current_console_default(&self) -> bool {
+        let Ok(enumerator) = enumerator() else {
+            // A failed check triggers the worker's recoverable default reopen.
+            return false;
+        };
+        // SAFETY: this read-only query runs on the capture's live apartment
+        // thread; no COM interface leaves the worker.
+        let Ok(device) = (unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }) else {
+            return false;
+        };
+        identifier(&device).is_ok_and(|endpoint| endpoint == self.endpoint)
     }
 }
 

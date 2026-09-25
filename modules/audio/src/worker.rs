@@ -22,6 +22,7 @@ const RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 struct RecoveryPolicy {
     expected_endpoint: String,
     expected_format: Format,
+    follow_console_default: bool,
     retry_delay: Duration,
 }
 
@@ -143,6 +144,7 @@ impl Worker {
                 let endpoint = capture.endpoint().to_owned();
                 let format = capture.format();
                 let recovery_config = capture.recovery_config();
+                let follow_console_default = recovery_config.follow_console_default;
                 run_capture_loop(
                     Box::new(capture),
                     move || {
@@ -155,6 +157,7 @@ impl Worker {
                     RecoveryPolicy {
                         expected_endpoint: endpoint,
                         expected_format: format,
+                        follow_console_default,
                         retry_delay: RECOVERY_RETRY_DELAY,
                     },
                 );
@@ -264,17 +267,25 @@ fn run_capture_loop<F>(
                 }
             }
             Ok(None) => thread::park_timeout(POLL_INTERVAL),
-            Err("device_lost") => {
+            Err(error)
+                if error == "device_lost"
+                    || (error == "default_endpoint_changed"
+                        && recovery_policy.follow_console_default) =>
+            {
                 set_recovering(health, true);
                 continuity.begin_recovery();
                 drop(capture);
+                let mut retry_immediately = error == "default_endpoint_changed";
                 loop {
-                    if !wait_for_retry(stop, recovery_policy.retry_delay) {
+                    if !retry_immediately && !wait_for_retry(stop, recovery_policy.retry_delay) {
                         return;
                     }
+                    retry_immediately = false;
                     match reopen() {
                         Ok(reopened) => {
-                            if reopened.endpoint() != recovery_policy.expected_endpoint {
+                            if !recovery_policy.follow_console_default
+                                && reopened.endpoint() != recovery_policy.expected_endpoint
+                            {
                                 fail(health, "audio_endpoint_changed");
                                 return;
                             }
@@ -366,6 +377,11 @@ mod tests {
                 events: events.into_iter().collect(),
             }
         }
+
+        fn with_endpoint(mut self, endpoint: &str) -> Self {
+            self.endpoint = endpoint.into();
+            self
+        }
     }
 
     impl CaptureDevice for FakeCapture {
@@ -444,6 +460,7 @@ mod tests {
                     RecoveryPolicy {
                         expected_endpoint: "render.fixed".into(),
                         expected_format: format,
+                        follow_console_default: false,
                         retry_delay: Duration::ZERO,
                     },
                 );
@@ -492,6 +509,7 @@ mod tests {
                     RecoveryPolicy {
                         expected_endpoint: "render.fixed".into(),
                         expected_format: format,
+                        follow_console_default: false,
                         retry_delay: Duration::from_secs(30),
                     },
                 );
@@ -526,11 +544,93 @@ mod tests {
             RecoveryPolicy {
                 expected_endpoint: "render.fixed".into(),
                 expected_format: format,
+                follow_console_default: false,
                 retry_delay: Duration::ZERO,
             },
         );
         let health = health.lock().unwrap();
         assert_eq!(health.failure, Some("audio_format_changed"));
         assert!(!health.recovering);
+    }
+
+    #[test]
+    fn console_default_change_reopens_new_endpoint_without_breaking_packet_clock() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(
+            format,
+            [Ok(Some(packet(1_000, 0))), Err("default_endpoint_changed")],
+        );
+        let (sender, packets) = mpsc::sync_channel(4);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let runner = thread::spawn({
+            let health = health.clone();
+            let stop = stop.clone();
+            move || {
+                run_capture_loop(
+                    Box::new(initial),
+                    || {
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                                .with_endpoint("render.console-new"),
+                        ) as Box<dyn CaptureDevice>)
+                    },
+                    &sender,
+                    &health,
+                    &stop,
+                    RecoveryPolicy {
+                        expected_endpoint: "render.fixed".into(),
+                        expected_format: format,
+                        follow_console_default: true,
+                        retry_delay: Duration::from_secs(30),
+                    },
+                );
+            }
+        });
+
+        let first = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        let recovered = packets.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        runner.thread().unpark();
+        runner.join().unwrap();
+
+        assert_eq!((first.sequence, first.timestamp_us), (0, 1_000));
+        assert_eq!(recovered.sequence, 1);
+        assert!(recovered.timestamp_us > first.timestamp_us);
+        assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+        let health = health.lock().unwrap();
+        assert!(!health.recovering);
+        assert_eq!(health.failure, None);
+        assert_eq!(health.discontinuities, 1);
+    }
+
+    #[test]
+    fn pinned_endpoint_recovery_rejects_a_different_endpoint() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let (sender, _packets) = mpsc::sync_channel(1);
+        let health = Mutex::new(Health::default());
+        run_capture_loop(
+            Box::new(initial),
+            || {
+                Ok(
+                    Box::new(FakeCapture::new(format, []).with_endpoint("render.other"))
+                        as Box<dyn CaptureDevice>,
+                )
+            },
+            &sender,
+            &health,
+            &AtomicBool::new(false),
+            RecoveryPolicy {
+                expected_endpoint: "render.fixed".into(),
+                expected_format: format,
+                follow_console_default: false,
+                retry_delay: Duration::ZERO,
+            },
+        );
+        assert_eq!(
+            health.lock().unwrap().failure,
+            Some("audio_endpoint_changed")
+        );
     }
 }

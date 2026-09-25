@@ -45,8 +45,12 @@ multimedia endpoint. It uses stereo for this automatic virtual selection. If
 Steam speakers are unavailable, capture falls back to the requested ordinary
 endpoint and reports its actual ID; if that endpoint is unavailable, open fails.
 When host audio is enabled and an ordinary endpoint is available, regular
-selection is preserved. An explicit `virtual_sink` always takes precedence and
-remains strict: it does not fall back when missing. An empty explicit selector
+selection is preserved. With no virtual sink selected, an empty or `default`
+ordinary endpoint follows the Windows Console render default. The worker checks
+the Console endpoint identity every 100 ms and reopens capture after it changes,
+without changing any render default role. Explicit regular endpoint IDs remain
+pinned. An explicit `virtual_sink` always takes precedence and remains strict: it
+does not fall back when missing. An empty explicit selector
 matches the active endpoint whose adapter name is exactly
 `Steam Streaming Speakers`; nonempty text matches an active endpoint's
 ID, friendly name, device description, or adapter name, in that priority order.
@@ -86,12 +90,15 @@ final restoration attempt until a later routed open retries cleanup. Each stream
 includes its selected/requested endpoint, format,
 `state:"capturing"|"recovering"|"failed"`, `failure`, `discontinuities`, and
 `dropped_packets`. After WASAPI reports device loss, the worker reports
-`recovering` while it retries the originally selected endpoint every five
-seconds. Retry delays are cancelled by close or module shutdown. A reopened
-capture must keep the published PCM format; an incompatible format fails the
-stream with `audio_format_changed`. The first packet after recovery is marked
-discontinuous, and sequence/timestamp values continue across the new capture's
-timeline.
+`recovering` while it retries the selected endpoint every five seconds. A
+Console-default change starts an immediate reopen; failed reopen attempts retry
+every five seconds. Retry delays are cancelled by close or module shutdown. A
+reopened capture must keep the published PCM format; an incompatible format
+fails the stream with `audio_format_changed`. The first packet after recovery
+is marked discontinuous, and sequence/timestamp values continue across the new
+capture's timeline. `endpoint` remains the initial selected endpoint snapshot
+for the stream, so the stream-session shared lease keeps its existing identity
+even after a followed Console-default change.
 Close returns `{ok:true}`. Missing/foreign lookup or close returns
 `{ok:false,code:"stream_not_found"}`; absent status returns an empty list.
 Driver error strings and PCM samples are never placed in control replies.
@@ -163,12 +170,14 @@ Vibeshine `src/audio.h` and the Windows audio policy/capture behavior were used 
 behavioral references without copying or translating source. The pinned
 selected-endpoint capture-only case is represented by the per-open policy above.
 Opus encoding, configured speaker remapping, resampling, continuous silent audio,
-process-specific loopback, microphone capture, Linux/macOS backends, automatic
-endpoint switching, and full streaming audio parity remain unimplemented.
+process-specific loopback, microphone capture, Linux/macOS backends, and full
+streaming audio parity remain unimplemented.
 
 Host tests use fake endpoint/capture backends and real native callback bindings
 for selection, ownership, idempotency, cancellation rollback, silent packets,
-discontinuities, timestamps, queue overflow, sink retry, and close/drop. Pure
+discontinuities, timestamps, queue overflow, sink retry, and close/drop. Worker
+coverage checks Console-default reinitialization on a changed endpoint, packet
+clock continuity, and strict endpoint pinning when following is disabled. Pure
 route-policy tests cover same-target leases, conflicting targets, partial
 assignment rollback, and preserving roles changed elsewhere. They do not call
 the Windows role-switch COM interface or capture desktop audio. Windows and
@@ -184,7 +193,8 @@ cargo test -p amaterasu-audio explicit_endpoint_captures_without_changing_any_de
 That test has not been run on development hardware. Real Windows qualification
 of routed opens must exercise successful switching/restoration, each partial
 switch failure and rollback, role changes made by another application, device
-removal, and recovery after restoration failure. Waveform/channel correctness,
+removal, default-device changes while capturing, and recovery after restoration
+failure. Waveform/channel correctness,
 silence, sustained backpressure, discontinuities, and cancellation while drivers
 initialize also need hardware coverage. Automatic Steam fallback has pure
 endpoint-policy tests only; it requires an active Steam Streaming Speakers
