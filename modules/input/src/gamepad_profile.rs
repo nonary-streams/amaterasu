@@ -113,6 +113,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn recognized_profiles_round_trip_and_cover_implemented_profiles() {
+        for &profile_token in GamepadProfile::recognized_profiles() {
+            let profile = serde_json::from_value::<GamepadProfile>(json!(profile_token)).unwrap();
+
+            assert_eq!(profile.as_str(), profile_token);
+            assert_eq!(serde_json::to_value(profile).unwrap(), json!(profile_token));
+        }
+
+        for &implemented_token in GamepadProfile::implemented_profiles() {
+            assert!(
+                GamepadProfile::recognized_profiles().contains(&implemented_token),
+                "implemented profile {implemented_token:?} is not recognized"
+            );
+        }
+    }
+
+    #[test]
     fn profile_validation_uses_pinned_choices_for_this_platform() {
         assert_eq!(
             serde_json::from_value::<GamepadProfile>(json!("auto")).unwrap(),
