@@ -135,7 +135,8 @@ pub fn select_endpoint<'a>(endpoints: &'a [Endpoint], selector: &str) -> Option<
 }
 
 /// Selects the default Steam endpoint when product policy disables host audio
-/// or no ordinary sink is available. An explicit virtual selector always wins.
+/// or the ordinary Console endpoint is unavailable. Capture-only opens with
+/// host audio enabled keep the pinned Console endpoint even when it is absent.
 #[cfg(any(windows, test))]
 pub fn select_policy_virtual_sink<'a>(
     endpoints: &'a [Endpoint],
@@ -149,14 +150,12 @@ pub fn select_policy_virtual_sink<'a>(
         return None;
     }
 
-    // Capture-only opens retain their pre-existing Multimedia availability rule.
-    let default_sink_available = if capture_sink_without_routing {
-        endpoints.iter().any(|endpoint| endpoint.default_multimedia)
-    } else {
-        console_default_available
-    };
-    let ordinary_sink_missing = (requested_endpoint.is_empty() || requested_endpoint == "default")
-        && !default_sink_available;
+    let requested_default = requested_endpoint.is_empty() || requested_endpoint == "default";
+    if host_audio_enabled && capture_sink_without_routing && requested_default {
+        return None;
+    }
+
+    let ordinary_sink_missing = requested_default && !console_default_available;
     if host_audio_enabled && !ordinary_sink_missing {
         return None;
     }
@@ -277,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_policy_keeps_host_disabled_explicit_and_capture_only_behavior() {
+    fn audio_policy_keeps_host_disabled_and_explicit_selection_behavior() {
         let mut endpoints = [
             endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
             endpoint(
@@ -299,15 +298,37 @@ mod tests {
                 .is_none()
         );
 
-        // Capture-only keeps its existing Multimedia-based selection behavior.
-        assert_eq!(
-            select_policy_virtual_sink(&endpoints, "", None, true, true, true)
-                .unwrap()
-                .id,
-            "render.virtual"
+        assert!(
+            select_policy_virtual_sink(&endpoints, "render.default", None, true, false, true)
+                .is_none()
         );
+        assert!(
+            select_policy_virtual_sink(&endpoints, "", None, false, true, true)
+                .is_some_and(|selected| selected.id == "render.virtual")
+        );
+    }
+
+    #[test]
+    fn capture_only_default_uses_console_policy_when_multimedia_disagrees() {
+        let mut endpoints = [
+            endpoint("render.default", "Speakers", "speakers", "Realtek Audio"),
+            endpoint(
+                "render.virtual",
+                "Steam Streaming Speakers",
+                "virtual speakers",
+                DEFAULT_VIRTUAL_SINK_ADAPTER,
+            ),
+        ];
+
+        // Multimedia is active while the pinned Console default is missing.
         endpoints[0].default_multimedia = true;
         assert!(select_policy_virtual_sink(&endpoints, "", None, true, false, true).is_none());
+
+        // Console is active while Multimedia is missing; Steam is still not selected.
+        endpoints[0].default_multimedia = false;
+        assert!(
+            select_policy_virtual_sink(&endpoints, "default", None, true, true, true).is_none()
+        );
     }
 
     #[test]
@@ -333,6 +354,7 @@ mod tests {
         assert!(
             select_policy_virtual_sink(&endpoints, "", Some(""), false, false, false).is_none()
         );
+        assert!(select_policy_virtual_sink(&endpoints, "", Some(""), true, false, true).is_none());
     }
 
     #[test]
