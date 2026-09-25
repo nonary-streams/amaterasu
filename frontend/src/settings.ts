@@ -17,21 +17,49 @@ namespace Amaterasu {
   }
 
   export function parseHistorySettings(
-    enabled: boolean,
-    ttlDays: number,
-    sizeLimitMb: number,
+    enabled: unknown,
+    ttlDays: unknown,
+    sizeLimitMb: unknown,
   ): HistorySettingsReply["settings"] {
     if (
       typeof enabled !== "boolean" ||
+      typeof ttlDays !== "number" ||
       !Number.isSafeInteger(ttlDays) ||
       ttlDays < 0 ||
       ttlDays > maxHistoryLimit ||
+      typeof sizeLimitMb !== "number" ||
       !Number.isSafeInteger(sizeLimitMb) ||
       sizeLimitMb < 0 ||
       sizeLimitMb > maxHistoryLimit
     )
       throw new Error("History limits must be whole numbers from 0 to 2147483647.");
     return { enabled, ttl_days: ttlDays, db_size_limit_mb: sizeLimitMb };
+  }
+
+  export function parseHistorySettingsReply(value: unknown): HistorySettingsReply {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Session history settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true)
+      throw new Error("Session history settings reply must report success.");
+    if (reply.settings === null || typeof reply.settings !== "object" || Array.isArray(reply.settings))
+      throw new Error("Session history settings reply contains invalid settings.");
+    if (
+      typeof reply.revision !== "number" ||
+      !Number.isSafeInteger(reply.revision) ||
+      reply.revision < 0
+    )
+      throw new Error("Session history settings revision must be a nonnegative safe integer.");
+    if (typeof reply.effective_enabled !== "boolean")
+      throw new Error("Session history effective enabled state must be a boolean.");
+
+    const settings = reply.settings as Record<string, unknown>;
+    return {
+      ok: true,
+      settings: parseHistorySettings(settings.enabled, settings.ttl_days, settings.db_size_limit_mb),
+      revision: reply.revision,
+      effective_enabled: reply.effective_enabled,
+    };
   }
 
   export function parseAuthTokenLifetimes(
@@ -1548,8 +1576,8 @@ namespace Amaterasu {
     async function loadHistorySettings(): Promise<void> {
       historyArea.replaceChildren(el("p", "muted", "Loading session history settings…"));
       try {
-        const reply = await context.api.post<HistorySettingsReply>(
-          "history/settings_get",
+        const reply = parseHistorySettingsReply(
+          await context.api.post<unknown>("history/settings_get"),
         );
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
@@ -1611,16 +1639,15 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
-            const updated = await context.api.post<HistorySettingsReply>(
-              "history/settings_update",
-              {
+            const updated = parseHistorySettingsReply(
+              await context.api.post<unknown>("history/settings_update", {
                 settings: parseHistorySettings(
                   enabled.checked,
                   ttl.valueAsNumber,
                   size.valueAsNumber,
                 ),
                 expected_revision: reply.revision,
-              },
+              }),
             );
             context.notify(
               updated.effective_enabled === updated.settings.enabled

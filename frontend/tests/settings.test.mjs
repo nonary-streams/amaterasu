@@ -222,6 +222,50 @@ test("history settings preserve disabled pruning and enforce host integer bounds
   }
 });
 
+test("session history readback validates metadata and preserves configured and effective state", () => {
+  const parseReply = context.Amaterasu.parseHistorySettingsReply;
+  const deferredDisable = {
+    ok: true,
+    settings: { enabled: false, ttl_days: 0, db_size_limit_mb: 0 },
+    revision: 0,
+    effective_enabled: true,
+  };
+  assert.deepEqual(ordinary(parseReply(deferredDisable)), deferredDisable);
+
+  const disabled = {
+    ok: true,
+    settings: { enabled: false, ttl_days: 2147483647, db_size_limit_mb: 0 },
+    revision: 42,
+    effective_enabled: false,
+  };
+  assert.deepEqual(ordinary(parseReply(disabled)), disabled);
+
+  for (const invalid of [
+    null,
+    undefined,
+    [],
+    false,
+    { ...deferredDisable, ok: false },
+    { ...deferredDisable, ok: "true" },
+    { ...deferredDisable, settings: null },
+    { ...deferredDisable, settings: [] },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, enabled: "false" } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, ttl_days: -1 } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, ttl_days: 1.5 } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, ttl_days: 2147483648 } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, db_size_limit_mb: "0" } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, db_size_limit_mb: -1 } },
+    { ...deferredDisable, settings: { ...deferredDisable.settings, db_size_limit_mb: 2147483648 } },
+    { ...deferredDisable, revision: -1 },
+    { ...deferredDisable, revision: 1.5 },
+    { ...deferredDisable, revision: Number.MAX_SAFE_INTEGER + 1 },
+    { ...deferredDisable, revision: "0" },
+    { ...deferredDisable, effective_enabled: "true" },
+  ]) {
+    assert.throws(() => parseReply(invalid));
+  }
+});
+
 test("Playnite editor validates complete sparse settings and bounded filter lists", () => {
   const parseSettings = context.Amaterasu.parsePlayniteSettings;
   const values = {
