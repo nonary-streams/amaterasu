@@ -1912,7 +1912,7 @@ fn paired_frame_limiter_values_override_global_settings_and_keep_sparse_presence
             .launch(
                 10,
                 request(1),
-                peer_with_frame_limiter_overrides(1, Some(false), Some(0)),
+                peer_with_frame_limiter_overrides(1, Some(false), Some(0.0)),
                 now,
             )
             .is_none()
