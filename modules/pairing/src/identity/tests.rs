@@ -6,7 +6,7 @@ use crate::{
 use rsa::{Pkcs1v15Sign, Pss, RsaPublicKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use x509_cert::der::Encode;
 const HOST_CERT: &str = include_str!("../../tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../tests/fixtures/host-key.pem");
@@ -72,7 +72,7 @@ fn temporary_identity_directory() -> PathBuf {
     directory.canonicalize().unwrap()
 }
 fn write_identity_files(
-    directory: &PathBuf,
+    directory: &Path,
     label: &str,
     certificate: &str,
     key: &str,

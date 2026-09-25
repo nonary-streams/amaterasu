@@ -235,9 +235,15 @@ impl Snapshot {
     }
 }
 
+struct SnapshotCacheEntry {
+    pairing_revision: u64,
+    configuration_revision: u64,
+    snapshot: Option<Arc<Snapshot>>,
+}
+
 #[derive(Default)]
 pub struct Shared {
-    snapshot: RwLock<Option<((u64, u64), Option<Arc<Snapshot>>)>>,
+    snapshot: RwLock<Option<SnapshotCacheEntry>>,
     latest_time: AtomicU64,
 }
 impl Shared {
@@ -264,13 +270,17 @@ impl Shared {
             .snapshot
             .write()
             .map_err(|_| "identity_cache_unavailable")?;
-        if current
-            .as_ref()
-            .is_some_and(|(previous, _)| *previous == (pairing_revision, configuration_revision))
-        {
+        if current.as_ref().is_some_and(|previous| {
+            previous.pairing_revision == pairing_revision
+                && previous.configuration_revision == configuration_revision
+        }) {
             return Ok(());
         }
-        *current = Some(((pairing_revision, configuration_revision), snapshot));
+        *current = Some(SnapshotCacheEntry {
+            pairing_revision,
+            configuration_revision,
+            snapshot,
+        });
         Ok(())
     }
     pub fn now(&self) -> Result<u64, Status> {
@@ -286,7 +296,7 @@ impl Shared {
             .read()
             .map_err(|_| IDENTITY_UNAVAILABLE)?
             .as_ref()
-            .and_then(|(_, snapshot)| snapshot.clone())
+            .and_then(|entry| entry.snapshot.clone())
             .ok_or(IDENTITY_UNAVAILABLE)?;
         if !snapshot.host.valid(now) {
             return Err(IDENTITY_UNAVAILABLE);
@@ -300,7 +310,7 @@ impl Shared {
             && self.snapshot.read().is_ok_and(|current| {
                 current
                     .as_ref()
-                    .and_then(|(_, current)| current.as_ref())
+                    .and_then(|entry| entry.snapshot.as_ref())
                     .is_some_and(|current| Arc::ptr_eq(current, snapshot))
             })
     }
