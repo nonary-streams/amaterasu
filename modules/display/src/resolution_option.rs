@@ -103,10 +103,189 @@ impl fmt::Display for ManualResolutionParseError {
 
 impl std::error::Error for ManualResolutionParseError {}
 
+/// Why the configured resolution option could not select an additional resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolutionOptionError {
+    /// Automatic resolution selection had no validated client-requested resolution.
+    MissingClientResolution,
+    /// Manual resolution selection had no specified resolution.
+    MissingManualResolution,
+}
+
+impl fmt::Display for ResolutionOptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingClientResolution => {
+                write!(
+                    formatter,
+                    "automatic resolution requires a client resolution"
+                )
+            }
+            Self::MissingManualResolution => {
+                write!(formatter, "manual resolution must be specified")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolutionOptionError {}
+
+/// Selects the additional resolution for the configured global option.
+///
+/// The caller must handle higher-priority explicit launch-resolution and client
+/// `display_mode` overrides before calling this helper. This is pure option
+/// policy: it does not resolve app or client settings, persist configuration,
+/// serialize requests, or call a display provider.
+///
+/// When Moonlight Optimize game settings is disabled, no option selects an
+/// additional resolution. Automatic selection uses the already-validated
+/// client-requested resolution; manual selection uses the specified manual
+/// resolution, including zero dimensions if they were accepted by its parser.
+pub fn select_additional_resolution(
+    option: ResolutionOption,
+    manual_resolution: ManualResolution,
+    client_resolution: Option<Resolution>,
+    optimize_game_settings: bool,
+) -> Result<Option<Resolution>, ResolutionOptionError> {
+    if !optimize_game_settings {
+        return Ok(None);
+    }
+
+    match option {
+        ResolutionOption::Disabled => Ok(None),
+        ResolutionOption::Auto => client_resolution
+            .map(Some)
+            .ok_or(ResolutionOptionError::MissingClientResolution),
+        ResolutionOption::Manual => match manual_resolution {
+            ManualResolution::Unspecified => Err(ResolutionOptionError::MissingManualResolution),
+            ManualResolution::Specified(resolution) => Ok(Some(resolution)),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ManualResolution, ManualResolutionParseError, ResolutionOption};
+    use super::{
+        ManualResolution, ManualResolutionParseError, ResolutionOption, ResolutionOptionError,
+        select_additional_resolution,
+    };
     use crate::mode_remapping::Resolution;
+
+    #[test]
+    fn auto_selects_client_resolution_and_ignores_manual_resolution() {
+        let client_resolution = Resolution {
+            width: 2560,
+            height: 1440,
+        };
+        let manual_resolution = ManualResolution::Specified(Resolution {
+            width: 1280,
+            height: 720,
+        });
+
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Auto,
+                manual_resolution,
+                Some(client_resolution),
+                true,
+            ),
+            Ok(Some(client_resolution))
+        );
+    }
+
+    #[test]
+    fn disabled_selects_no_additional_resolution() {
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Disabled,
+                ManualResolution::Specified(Resolution {
+                    width: 1280,
+                    height: 720,
+                }),
+                Some(Resolution {
+                    width: 2560,
+                    height: 1440,
+                }),
+                true,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn manual_selects_the_specified_resolution() {
+        let manual_resolution = Resolution {
+            width: 1920,
+            height: 1080,
+        };
+
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Manual,
+                ManualResolution::Specified(manual_resolution),
+                Some(Resolution {
+                    width: 2560,
+                    height: 1440,
+                }),
+                true,
+            ),
+            Ok(Some(manual_resolution))
+        );
+    }
+
+    #[test]
+    fn auto_without_client_resolution_reports_typed_error() {
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Auto,
+                ManualResolution::Unspecified,
+                None,
+                true,
+            ),
+            Err(ResolutionOptionError::MissingClientResolution)
+        );
+    }
+
+    #[test]
+    fn manual_without_specified_resolution_reports_typed_error() {
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Manual,
+                ManualResolution::Unspecified,
+                None,
+                true,
+            ),
+            Err(ResolutionOptionError::MissingManualResolution)
+        );
+    }
+
+    #[test]
+    fn optimize_gate_bypasses_every_resolution_option() {
+        for option in [
+            ResolutionOption::Auto,
+            ResolutionOption::Disabled,
+            ResolutionOption::Manual,
+        ] {
+            assert_eq!(
+                select_additional_resolution(option, ManualResolution::Unspecified, None, false,),
+                Ok(None),
+                "unexpected result for {option:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_selection_preserves_zero_dimensions() {
+        let zero_resolution = ManualResolution::parse("0x0").unwrap();
+
+        assert_eq!(
+            select_additional_resolution(ResolutionOption::Manual, zero_resolution, None, true,),
+            Ok(Some(Resolution {
+                width: 0,
+                height: 0,
+            }))
+        );
+    }
 
     #[test]
     fn defaults_to_auto_and_serializes_default_token() {
