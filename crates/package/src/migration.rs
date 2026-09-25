@@ -972,10 +972,6 @@ fn collect_configured_state_files(
             let previous = configured.get(&key);
             let has_different_spelling =
                 previous.is_some_and(|previous| previous.relative.as_path() != relative);
-            if has_different_spelling && key != "vibeshine_file_state" {
-                return Err("predecessor configuration has conflicting state paths".into());
-            }
-
             let canonical_file = optional_contained_state_file(root, &canonical_root, relative)?;
             if has_different_spelling
                 && !previous

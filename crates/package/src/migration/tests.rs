@@ -784,6 +784,108 @@ fn snapshots_configured_primary_and_auxiliary_state_files_only_when_contained() 
 
 #[cfg(unix)]
 #[test]
+fn snapshots_repeated_primary_state_spellings_when_they_resolve_to_one_file() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let state = br#"{"root":{}}"#;
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = private/state.json\n",
+    );
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = state-alias.json\n",
+    );
+    write(&predecessor.join("private/state.json"), state);
+    symlink("private/state.json", predecessor.join("state-alias.json")).unwrap();
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    let canonical_state = predecessor
+        .join("private/state.json")
+        .canonicalize()
+        .unwrap();
+    for relative in ["private/state.json", "state-alias.json"] {
+        let relative = PathBuf::from(relative);
+        assert!(collected.files.contains(&relative));
+        assert!(collected.configured_state_files.contains(&relative));
+        assert_eq!(
+            collected.copy_sources.get(&relative),
+            Some(&canonical_state)
+        );
+    }
+
+    let destination = fixture.path().join("Amaterasu");
+    import_legacy_configuration_with_sensitive_sources(
+        &destination,
+        &[source(LegacyProduct::Sunshine, &predecessor)],
+        &[ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: false,
+        }],
+    )
+    .unwrap();
+
+    let imported_root = destination.join(LEGACY_IMPORT_DIRECTORY).join("sunshine");
+    assert_eq!(
+        fs::read(imported_root.join("private/state.json")).unwrap(),
+        state
+    );
+    assert_eq!(
+        fs::read(imported_root.join("state-alias.json")).unwrap(),
+        state
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn snapshots_repeated_primary_state_case_spellings_for_one_file_on_windows() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    let state_path = PathBuf::from("private/state.json");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = private/state.json\n",
+    );
+    write(
+        &predecessor.join("vibeshine.conf"),
+        b"file_state = PRIVATE/STATE.JSON\n",
+    );
+    write(&predecessor.join(&state_path), br#"{"root":{}}"#);
+
+    let collected = collect_configuration_files(&predecessor).unwrap().unwrap();
+    let canonical_state = predecessor.join(&state_path).canonicalize().unwrap();
+    assert!(collected.files.contains(&state_path));
+    assert!(collected.configured_state_files.contains(&state_path));
+    assert_eq!(
+        collected.copy_sources.get(&state_path),
+        Some(&canonical_state)
+    );
+}
+
+#[test]
+fn rejects_repeated_primary_state_spellings_for_distinct_or_missing_targets() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = private/first.json\nfile_state = private/second.json\n",
+    );
+    write(&predecessor.join("private/first.json"), b"first");
+    write(&predecessor.join("private/second.json"), b"second");
+    assert!(collect_configuration_files(&predecessor).is_err());
+
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"file_state = private/first.json\nfile_state = private/not-created.json\n",
+    );
+    assert!(collect_configuration_files(&predecessor).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn snapshots_repeated_vibeshine_state_spellings_when_they_resolve_to_one_file() {
     use std::os::unix::fs::symlink;
 
