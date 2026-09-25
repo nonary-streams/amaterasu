@@ -106,13 +106,15 @@ directory, and executable, but the record itself has no ticket, PID, or creation
 identity. Only one game can be associated with a ticket; duplicates of that
 GUID are idempotent and a second distinct game ID makes the session fail closed.
 The exact-executable watchdog checks the full reported image path at most once
-per second. It requires either a matching authenticated `gameStopped` or prior
-observation of that exact image, then requires three seconds with no process of
-that image before restoration. Access-denied and incomplete process scans do
-not count as exit evidence. Since the extension does not report a game PID or
+per second. It requires prior observation of that exact image, then requires
+three seconds with no process of that image before restoration. A matching
+`gameStopped` prompts the next scheduled exact-image verification scan, but
+does not replace prior process observation. Access-denied and incomplete scans
+do not count as exit evidence. Since the extension does not report a game PID or
 bind game status to a ticket, a same-path process from another launch delays
-return, and a process that starts and exits before the first scan without a
-stop status cannot safely be attributed or recovered. The pinned extension
+return. If a game starts and exits between scans, even a `gameStopped` record
+cannot establish that its process is gone; the ticket remains Playing until
+manual stop. The pinned extension
 normally omits `gameStopped` for games started after a generic launcher
 connection; exact-image process observation is the fallback. Its session-bound
 `playniteExiting` record suppresses auto-return for an intentional Playnite

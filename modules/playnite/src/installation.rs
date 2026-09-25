@@ -274,6 +274,11 @@ impl Installation {
         }
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn processes_with_fullscreen_image(&self) -> Option<Vec<ProcessImage>> {
+        self.processes_with_exact_image(&self.fullscreen_executable.to_string_lossy())
+    }
+
     fn expected_fullscreen_path(&self) -> &Path {
         &self.fullscreen_executable
     }
