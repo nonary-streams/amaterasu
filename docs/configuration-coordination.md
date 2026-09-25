@@ -6,7 +6,7 @@
 - Main checkout: `C:\Users\Chase\sources\amaterasu`
 - No integration branch/worktree is used. The coordinator cherry-picks accepted lane commits directly onto `main`.
 - External session logs and mailboxes: `D:\sources\worktrees\amaterasu-config-runs\f220bcaa-20260924-152010`
-- Status: all six lane CLI sessions are running; XHigh worker startup and work are tracked in the external run directory.
+- Status: see the current session snapshot at the end of this file. The last process check found four live lane leads; L03 had completed its parser candidate, while L04 had stopped at a cross-lane contract gate.
 
 ## Lane worktrees and accountable configuration IDs
 
@@ -343,6 +343,7 @@ Coordinator decisions and dependency acknowledgments are tracked here and in the
 | luna-04 Windows audio capture recovery | `0c9e1fb9`, `f23da668`, `ecf2a15c` | `666c4d7f`, `b62a6b41`, `c531b811` | Recovery and the Clippy correction are on main. Windows-target audio tests passed (42 passed, 1 ignored live-endpoint test), formatting passed, and strict Clippy passed. Windows hardware qualification remains pending. |
 | luna-04 direct virtual-sink capture-policy normalization | `1d8bb712`, `83ace035` | `3914de70`, `f5425f9a` | Direct audio API opens clear capture-only routing when a virtual-sink selector is present. Formatting passed, Windows-target tests passed (46 passed, 1 ignored live-endpoint test), and strict Clippy passed after the one-file XHigh correction. Both audio setting IDs remain pending for persistence, caller-scoped resolution, management, and device qualification. |
 | luna-02 pairing identity inline-comment handling | `a9c75702` | pending | Lane committed the parser correction and focused tests; coordinator package validation is pending. |
+| luna-03 manual-resolution parser | `afe11022` | `d66ac2a9` | Cherry-picked directly to main. `cargo fmt --check -p amaterasu-display`, `git diff --check`, 40 display tests, and strict Clippy passed. The parser slice does not add persistence, scoped resolution, UI readback, or runtime effects; `global:dd_manual_resolution` remains pending. |
 
 Cherry-pick each new lane candidate directly onto `main`, resolve clear conflicts in the main checkout, and record the resulting main commit here. Lightweight lane worktrees remain source-only; package tests and Clippy run from this coordinator checkout.
 
@@ -350,7 +351,9 @@ Cherry-pick each new lane candidate directly onto `main`, resolve clear conflict
 
 No host-global audio, virtual-display, input-device, port, or installed-service tests scheduled yet.
 
-## Active Luna Max CLI sessions
+## Initial Luna Max CLI launch snapshot (2026-09-24)
+
+These rows record the original launch state. See the current process snapshot below for live status.
 
 All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled, and three child slots defaulting to `gpt-6-luna` at `xhigh`. Outbox messages verify the model/worker configuration per lane; messages that are still pending are marked `launch-configured` until that lane reports its startup check. Runner PIDs identify the supervising PowerShell process; CLI session IDs are stable resume keys.
 
@@ -363,7 +366,7 @@ All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled
 | luna-05 | `01a0d516-8830-7960-af1e-079a13415f97` | 23228 | Steam and launch workers scoped; settings report pending |
 | luna-06 | `01a0d516-8960-7e02-ac81-3eee350f679a` | 43508 | two XHigh workers confirmed (diagnostics, session history) |
 
-## XHigh workers
+## Initial XHigh worker allocation (2026-09-24)
 
 | Lead | Worker | Worker session | Settings | Scope | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -373,3 +376,18 @@ All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled
 | luna-05 | `launchers_slice` | not yet reported | `gpt-6-luna` / `xhigh` requested | `modules/playnite/`, `modules/lutris/` | startup confirmation pending |
 | luna-06 | `diagnostics` | `01a0d51a-45be-7bd0-b4d8-08923ae89823` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/diagnostics/` | active |
 | luna-06 | `session_history` | `01a0d51a-69e9-7532-873f-55552f306fae` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/session-history/` | active |
+
+## Current session snapshot (2026-09-25)
+
+This reflects the latest process and worktree check. Lead session IDs remain the stable resume keys.
+
+| Lead | Lead process | Latest work evidence |
+| --- | --- | --- |
+| luna-01 | PID 45472, live | Its XHigh credentials worker (session `01a0d8e5-cd34-7620-a043-72b29cb01c8b`, PID 56812) has an uncommitted 161-line change in `modules/authentication/src/migration.rs`. |
+| luna-02 | PID 52592, live | Network lane has a 13-file draft across NVHTTP, RTSP, and stream-session. |
+| luna-03 | stopped | Manual-resolution parser landed on main as `d66ac2a9`; coordinator formatting, 40 tests, and strict Clippy passed. The ID remains pending. |
+| luna-04 | stopped | Native pen/touch worker candidate is reviewed but held pending L02/L05 contract acknowledgements and coordinator release. |
+| luna-05 | PID 50380, live | Its XHigh Catalog worker committed `2d87ceb6` for `dd_hdr_request_override`; lead review and validation are pending. |
+| luna-06 | PID 33088, live | Its XHigh locale worker (session `01a0d8e5-6cd6-7951-aa66-e3efc85e5cf6`, PID 56584) is live; no worktree diff was visible at the last check. |
+
+L03 and L04 can be resumed when new work or the outstanding gate is ready. The main checkout remains the direct landing point; do not push.
