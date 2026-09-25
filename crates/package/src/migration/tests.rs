@@ -306,6 +306,74 @@ fn approved_pairing_preserves_only_contained_configured_identity_files() {
 }
 
 #[test]
+fn approved_pairing_preserves_custom_identity_bytes_for_each_product() {
+    let products = [
+        (LegacyProduct::Apollo, "apollo.conf", "apollo"),
+        (LegacyProduct::Sunshine, "sunshine.conf", "sunshine"),
+        (LegacyProduct::Vibeshine, "vibeshine.conf", "vibeshine"),
+        (LegacyProduct::Vibepollo, "vibepollo.conf", "vibepollo"),
+    ];
+
+    for (product, configuration_file, import_directory) in products {
+        let fixture = TemporaryDirectory::new();
+        let predecessor = fixture.path().join("source");
+        let pkey_relative_path = PathBuf::from("credentials/custom-key.pem");
+        let cert_relative_path = PathBuf::from("credentials/custom-cert.pem");
+        let pkey_bytes: &[u8] = b"synthetic pkey test bytes\x00\xff";
+        let cert_bytes: &[u8] = b"synthetic cert test bytes\x01\xfe";
+
+        write(
+            &predecessor.join(configuration_file),
+            b"pkey = credentials/custom-key.pem\ncert = credentials/custom-cert.pem\n",
+        );
+        write(&predecessor.join(&pkey_relative_path), pkey_bytes);
+        write(&predecessor.join(&cert_relative_path), cert_bytes);
+
+        let legacy_source = source(product, &predecessor);
+        let validated_pairing = [ValidatedPairingSource { product }];
+        let plan = preflight_legacy_configuration_with_pairing(
+            std::slice::from_ref(&legacy_source),
+            &validated_pairing,
+        )
+        .unwrap();
+        assert!(
+            plan.critical_items.is_empty(),
+            "validated pairing should clear identity preflight for {import_directory}"
+        );
+
+        let data_root = fixture.path().join("Amaterasu");
+        let receipt = import_legacy_configuration_with_pairing(
+            &data_root,
+            &[legacy_source],
+            &validated_pairing,
+        )
+        .unwrap();
+
+        for (relative_path, expected_bytes, identity_kind) in [
+            (&pkey_relative_path, pkey_bytes, "pkey"),
+            (&cert_relative_path, cert_bytes, "cert"),
+        ] {
+            let imported_path = data_root
+                .join(LEGACY_IMPORT_DIRECTORY)
+                .join(import_directory)
+                .join(relative_path);
+            assert!(
+                receipt
+                    .imported_files
+                    .iter()
+                    .any(|imported| imported.path == imported_path),
+                "{identity_kind} was not imported under {import_directory}"
+            );
+            let imported_bytes = fs::read(imported_path).unwrap();
+            assert!(
+                imported_bytes.as_slice() == expected_bytes,
+                "custom {identity_kind} bytes changed for {import_directory}"
+            );
+        }
+    }
+}
+
+#[test]
 fn configured_credentials_file_is_authentication_input_not_pairing_credentials() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");
