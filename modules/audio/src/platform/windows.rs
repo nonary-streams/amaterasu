@@ -1164,8 +1164,13 @@ fn packet_flags(flags: u32) -> u32 {
 }
 
 fn capture_error(error: windows::core::Error) -> &'static str {
-    if error.code() == AUDCLNT_E_DEVICE_INVALIDATED || error.code() == AUDCLNT_E_SERVICE_NOT_RUNNING
-    {
+    if matches!(
+        error.code(),
+        AUDCLNT_E_DEVICE_INVALIDATED
+            | AUDCLNT_E_RESOURCES_INVALIDATED
+            | AUDCLNT_E_BUFFER_OPERATION_PENDING
+            | AUDCLNT_E_SERVICE_NOT_RUNNING
+    ) {
         "device_lost"
     } else {
         "audio_capture_failed"
@@ -1175,6 +1180,25 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_or_reset_capture_enters_device_recovery() {
+        for code in [
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            AUDCLNT_E_RESOURCES_INVALIDATED,
+            AUDCLNT_E_BUFFER_OPERATION_PENDING,
+            AUDCLNT_E_SERVICE_NOT_RUNNING,
+        ] {
+            assert_eq!(
+                capture_error(windows::core::Error::from_hresult(code)),
+                "device_lost"
+            );
+        }
+        assert_eq!(
+            capture_error(windows::core::Error::from_hresult(AUDCLNT_E_OUT_OF_ORDER)),
+            "audio_capture_failed"
+        );
+    }
 
     #[test]
     fn route_restore_shutdown_unparks_and_joins_waiting_worker() {
