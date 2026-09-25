@@ -184,7 +184,12 @@ If an active ViGEm target rejects a report, input detaches that target before
 creating a replacement and submitting the current state. A failed detach keeps
 the old target owned for later cleanup; a failed replacement remains retryable
 on module ticks. This recovers a stale target within the existing client
-connection. Reconnecting a lost ViGEmBus client connection is not implemented.
+connection. If target removal fails, input treats the shared client connection
+as unusable and disconnects it, removing all attached targets, then retries
+opening a new client once per second. Each active slot keeps its latest state
+and Back timer, then recreates its target and resends that state after the new
+connection succeeds. Lease release during reconnection cancels the retry.
+Real ViGEmBus removal and restoration still need hardware qualification.
 
 When `key_rightalt_to_key_win` is enabled, Moonlight VK_RMENU (`0xA5`) maps to
 VK_LWIN (`0x5B`) before native injection. This applies to normalized and raw

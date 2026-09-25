@@ -451,6 +451,15 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         }
     }
 
+    /// A shared native connection was lost. Each slot keeps its client state
+    /// and timers, but must resend its effective state to a replacement device.
+    pub(crate) fn invalidate_devices(&mut self, mut invalidate: impl FnMut(&mut Device)) {
+        for slot in self.devices.iter_mut().flatten() {
+            invalidate(&mut slot.device);
+            slot.dirty = true;
+        }
+    }
+
     pub(crate) fn stop(&mut self) -> InputResult<()> {
         let mut first_error = None;
         for slot_device in &mut self.devices {

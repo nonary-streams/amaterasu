@@ -3,7 +3,7 @@ use crate::gamepad::{
 };
 use crate::gamepad_profile::GamepadProfile;
 use crate::model::{Event, InputError, InputResult};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::{size_of, transmute_copy};
@@ -11,7 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -20,6 +20,9 @@ use windows_sys::Win32::System::LibraryLoader::{
 
 const VIGEM_CLIENT_DLL: &str = "ViGEmClient.dll";
 const VIGEM_ERROR_NONE: u32 = 0x2000_0000;
+const VIGEM_ERROR_BUS_NOT_FOUND: u32 = 0xE000_0001;
+const VIGEM_ERROR_BUS_INVALID_HANDLE: u32 = 0xE000_0013;
+const VIGEM_ERROR_WINAPI: u32 = 0xE000_0017;
 
 type VigemClient = *mut c_void;
 type VigemTarget = *mut c_void;
@@ -93,6 +96,7 @@ struct VigemConnection {
     client: NonNull<c_void>,
     functions: VigemFunctions,
     allocated_targets: RefCell<HashSet<NonNull<c_void>>>,
+    reconnect_required: Cell<bool>,
 }
 
 impl VigemConnection {
@@ -161,6 +165,7 @@ impl VigemConnection {
             client,
             functions,
             allocated_targets: RefCell::new(HashSet::new()),
+            reconnect_required: Cell::new(false),
         })
     }
 
@@ -177,6 +182,9 @@ impl VigemConnection {
         // SAFETY: both handles are live objects from this ViGEmClient instance.
         let status = unsafe { (self.functions.target_add)(self.client.as_ptr(), target.as_ptr()) };
         if !vigem_succeeded(status) {
+            if is_connection_failure(status) {
+                self.reconnect_required.set(true);
+            }
             // SAFETY: target_add failed, so this target was not attached to the
             // driver and can be freed with the matching SDK allocator.
             unsafe { (self.functions.target_free)(target.as_ptr()) };
@@ -208,6 +216,9 @@ impl VigemConnection {
         // SAFETY: the client and target are live objects from this ViGEm SDK.
         let status = unsafe { (self.functions.target_add)(self.client.as_ptr(), target.as_ptr()) };
         if !vigem_succeeded(status) {
+            if is_connection_failure(status) {
+                self.reconnect_required.set(true);
+            }
             // SAFETY: a failed target_add leaves this target detached and owned
             // by the caller, so the matching SDK deallocator can free it.
             unsafe { (self.functions.target_free)(target.as_ptr()) };
@@ -257,6 +268,7 @@ impl VigemConnection {
         let status =
             unsafe { (self.functions.target_remove)(self.client.as_ptr(), target.as_ptr()) };
         if !vigem_succeeded(status) {
+            self.reconnect_required.set(true);
             return Err(vigem_error("target_remove", status));
         }
         // ViGEmClient documents that successful removal detaches the target and
@@ -327,21 +339,24 @@ unsafe fn load_symbol<T: Copy>(module: HMODULE, name: &'static [u8]) -> InputRes
 impl Drop for VigemConnection {
     fn drop(&mut self) {
         // SAFETY: this connection owns a successfully connected client. Any
-        // target whose normal remove failed is still registered here; disconnect
-        // removes driver-side targets before their remaining SDK objects are freed.
+        // target whose normal remove failed is still registered here. The SDK
+        // guarantees disconnect destroys all connected targets; their allocated
+        // objects remain caller-owned and are freed after disconnect.
         unsafe {
             (self.functions.disconnect)(self.client.as_ptr());
             for target in self.allocated_targets.get_mut().drain() {
                 (self.functions.target_free)(target.as_ptr());
             }
             (self.functions.free)(self.client.as_ptr());
-            FreeLibrary(self.module);
+            if !self.module.is_null() {
+                FreeLibrary(self.module);
+            }
         }
     }
 }
 
 struct VigemGamepad {
-    connection: Rc<VigemConnection>,
+    connection: Option<Rc<VigemConnection>>,
     target: Option<NonNull<c_void>>,
     profile: GamepadProfile,
     ds4_back_as_touchpad_click: bool,
@@ -364,7 +379,7 @@ impl VigemGamepad {
             }
         };
         Ok(Self {
-            connection,
+            connection: Some(connection),
             target: Some(target),
             profile,
             ds4_back_as_touchpad_click,
@@ -379,17 +394,36 @@ impl VigemGamepad {
             )
         })
     }
+
+    fn connection(&self) -> InputResult<&VigemConnection> {
+        self.connection.as_deref().ok_or_else(|| {
+            InputError::new("controller_unavailable", "ViGEm client is reconnecting")
+        })
+    }
+
+    fn invalidate_connection(&mut self) {
+        // The old client's disconnect destroys every attached target. Its
+        // owned target objects are freed by VigemConnection::drop, so these
+        // pointers must never be used or freed from the next client generation.
+        self.target = None;
+        self.connection = None;
+    }
+
+    fn bind_connection(&mut self, connection: Rc<VigemConnection>) {
+        self.connection = Some(connection);
+    }
 }
 
 impl GamepadDevice for VigemGamepad {
     fn update(&mut self, state: ControllerSnapshot) -> InputResult<()> {
         match self.profile {
-            GamepadProfile::Ds4 => {
-                self.connection
-                    .update_ds4(self.target()?, state, self.ds4_back_as_touchpad_click)
-            }
+            GamepadProfile::Ds4 => self.connection()?.update_ds4(
+                self.target()?,
+                state,
+                self.ds4_back_as_touchpad_click,
+            ),
             GamepadProfile::Auto | GamepadProfile::X360 => {
-                self.connection.update_x360(self.target()?, state)
+                self.connection()?.update_x360(self.target()?, state)
             }
             _ => Err(InputError::new(
                 "controller_unavailable",
@@ -408,8 +442,10 @@ impl GamepadDevice for VigemGamepad {
         // lease cleanup can retry it; never allocate a replacement first.
         self.release()?;
         let replacement = match self.profile {
-            GamepadProfile::Ds4 => self.connection.create_ds4_target()?,
-            GamepadProfile::Auto | GamepadProfile::X360 => self.connection.create_x360_target()?,
+            GamepadProfile::Ds4 => self.connection()?.create_ds4_target()?,
+            GamepadProfile::Auto | GamepadProfile::X360 => {
+                self.connection()?.create_x360_target()?
+            }
             _ => {
                 return Err(InputError::new(
                     "controller_unavailable",
@@ -428,7 +464,7 @@ impl GamepadDevice for VigemGamepad {
             // no longer connected to applications.
             match self.profile {
                 GamepadProfile::Ds4 => {
-                    let _ = self.connection.update_ds4(
+                    let _ = self.connection()?.update_ds4(
                         target,
                         ControllerSnapshot::default(),
                         self.ds4_back_as_touchpad_click,
@@ -436,12 +472,12 @@ impl GamepadDevice for VigemGamepad {
                 }
                 GamepadProfile::Auto | GamepadProfile::X360 => {
                     let _ = self
-                        .connection
+                        .connection()?
                         .update_x360(target, ControllerSnapshot::default());
                 }
                 _ => {}
             }
-            self.connection.remove_target(target)?;
+            self.connection()?.remove_target(target)?;
             self.target = None;
         }
         Ok(())
@@ -466,6 +502,7 @@ pub(super) struct WindowsGamepads {
     effective_profile: Option<&'static str>,
     back_button_timeout_ms: i32,
     ds4_back_as_touchpad_click: bool,
+    reconnect_at: Option<Instant>,
 }
 
 impl WindowsGamepads {
@@ -479,6 +516,7 @@ impl WindowsGamepads {
             effective_profile: None,
             back_button_timeout_ms: -1,
             ds4_back_as_touchpad_click: true,
+            reconnect_at: None,
         }
     }
 
@@ -498,6 +536,7 @@ impl WindowsGamepads {
                     ));
                 }
                 self.effective_profile = None;
+                self.reconnect_at = None;
                 self.unavailable_reason = Some(format!(
                     "Windows gamepad profile '{}' is recognized but not implemented by this backend",
                     unsupported.as_str()
@@ -533,6 +572,8 @@ impl WindowsGamepads {
         }
         self.unavailable_reason = None;
         self.effective_profile = None;
+        self.reconnect_at = None;
+        self.target_profile = target_profile;
         match probe() {
             Ok(connection)
                 if target_profile == GamepadProfile::Ds4 && !connection.supports_ds4() =>
@@ -540,13 +581,16 @@ impl WindowsGamepads {
                 self.unavailable_reason = Some(
                     "ViGEmClient is missing the DS4 target allocation or report export".into(),
                 );
+                self.reconnect_at = Some(Instant::now() + Duration::from_secs(1));
             }
             Ok(connection) => {
-                self.target_profile = target_profile;
                 self.connection = Some(Rc::new(connection));
                 self.effective_profile = Some(target_profile.as_str());
             }
-            Err(error) => self.unavailable_reason = Some(error.message),
+            Err(error) => {
+                self.unavailable_reason = Some(error.message);
+                self.reconnect_at = Some(Instant::now() + Duration::from_secs(1));
+            }
         }
         Ok(())
     }
@@ -579,7 +623,9 @@ impl WindowsGamepads {
     }
 
     pub(super) fn disable(&mut self) -> InputResult<()> {
-        self.slots.stop()
+        let result = self.slots.stop();
+        self.invalidate_if_required(Instant::now());
+        result
     }
 
     pub(super) fn validate(&self, event: &Event) -> InputResult<()> {
@@ -629,28 +675,35 @@ impl WindowsGamepads {
             .clone();
         let target_profile = self.target_profile;
         let ds4_back_as_touchpad_click = self.ds4_back_as_touchpad_click;
-        self.slots
-            .apply(
-                *number,
-                *active_mask,
-                state,
-                self.back_button_timeout_ms,
-                Instant::now(),
-                |_slot| {
-                    VigemGamepad::create(
-                        connection.clone(),
-                        target_profile,
-                        ds4_back_as_touchpad_click,
-                    )
-                },
-            )
-            .map_err(|error| InputError::new("controller_unavailable", error.message))
+        let result = self.slots.apply(
+            *number,
+            *active_mask,
+            state,
+            self.back_button_timeout_ms,
+            Instant::now(),
+            |_slot| {
+                VigemGamepad::create(
+                    connection.clone(),
+                    target_profile,
+                    ds4_back_as_touchpad_click,
+                )
+            },
+        );
+        drop(connection);
+        self.invalidate_if_required(Instant::now());
+        result.map_err(|error| InputError::new("controller_unavailable", error.message))
     }
 
     pub(super) fn advance(&mut self, now: Instant) {
+        if self.connection.is_none() && self.reconnect_at.is_some_and(|due| now >= due) {
+            self.reconnect(now);
+        }
         // A timer write failure remains dirty in GamepadSlots and is retried
         // on later module ticks without tearing down keyboard/mouse injection.
-        let _ = self.slots.advance(now);
+        if self.connection.is_some() {
+            let _ = self.slots.advance(now);
+            self.invalidate_if_required(now);
+        }
     }
 
     pub(super) fn set_back_button_timeout(&mut self, timeout_ms: i32) {
@@ -666,12 +719,71 @@ impl WindowsGamepads {
     }
 
     pub(super) fn stop(&mut self) -> InputResult<()> {
-        self.slots.stop()?;
+        let result = self.slots.stop();
+        self.invalidate_if_required(Instant::now());
+        result?;
         self.connection = None;
         self.unavailable_reason = None;
         self.effective_profile = None;
+        self.reconnect_at = None;
         Ok(())
     }
+
+    fn invalidate_if_required(&mut self, now: Instant) {
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.reconnect_required.get())
+        {
+            self.slots
+                .invalidate_devices(VigemGamepad::invalidate_connection);
+            // This drops the last old-generation Rc. The SDK disconnects all
+            // its targets, then our connection owner frees their objects.
+            self.connection = None;
+            self.effective_profile = None;
+            self.unavailable_reason = Some("ViGEm client connection is reconnecting".into());
+            self.reconnect_at = Some(now + Duration::from_secs(1));
+        }
+    }
+
+    fn reconnect(&mut self, now: Instant) {
+        self.reconnect_with(now, VigemConnection::connect_default);
+    }
+
+    fn reconnect_with(
+        &mut self,
+        now: Instant,
+        probe: impl FnOnce() -> InputResult<VigemConnection>,
+    ) {
+        self.reconnect_at = Some(now + Duration::from_secs(1));
+        match probe() {
+            Ok(connection)
+                if self.target_profile == GamepadProfile::Ds4 && !connection.supports_ds4() =>
+            {
+                self.unavailable_reason = Some(
+                    "ViGEmClient is missing the DS4 target allocation or report export".into(),
+                );
+            }
+            Ok(connection) => {
+                let connection = Rc::new(connection);
+                self.slots.invalidate_devices(|device| {
+                    device.bind_connection(connection.clone());
+                });
+                self.connection = Some(connection);
+                self.effective_profile = Some(self.target_profile.as_str());
+                self.unavailable_reason = None;
+                self.reconnect_at = None;
+            }
+            Err(error) => self.unavailable_reason = Some(error.message),
+        }
+    }
+}
+
+fn is_connection_failure(status: VigemError) -> bool {
+    matches!(
+        status,
+        VIGEM_ERROR_BUS_NOT_FOUND | VIGEM_ERROR_BUS_INVALID_HANDLE | VIGEM_ERROR_WINAPI
+    )
 }
 
 fn xusb_report(state: ControllerSnapshot) -> XusbReport {
@@ -837,6 +949,210 @@ const fn vigem_succeeded(status: VigemError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeBusTrace {
+        attached: usize,
+        freed: usize,
+        disconnects: usize,
+        fail_next_update: bool,
+        fail_remove: bool,
+        updates: Vec<(u8, u16)>,
+    }
+
+    struct FakeClient {
+        generation: u8,
+        trace: Rc<RefCell<FakeBusTrace>>,
+    }
+
+    struct FakeTarget {
+        generation: u8,
+        trace: Option<Rc<RefCell<FakeBusTrace>>>,
+    }
+
+    unsafe extern "C" fn fake_alloc() -> VigemClient {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn fake_free(client: VigemClient) {
+        // SAFETY: fake_connection allocates this exact FakeClient with Box.
+        drop(unsafe { Box::from_raw(client.cast::<FakeClient>()) });
+    }
+
+    unsafe extern "C" fn fake_connect(_: VigemClient) -> VigemError {
+        VIGEM_ERROR_NONE
+    }
+
+    unsafe extern "C" fn fake_disconnect(client: VigemClient) {
+        // SAFETY: the test connection owns this live FakeClient until fake_free.
+        let client = unsafe { &*client.cast::<FakeClient>() };
+        let mut trace = client.trace.borrow_mut();
+        trace.attached = 0;
+        trace.disconnects += 1;
+    }
+
+    unsafe extern "C" fn fake_target_alloc() -> VigemTarget {
+        Box::into_raw(Box::new(FakeTarget {
+            generation: 0,
+            trace: None,
+        }))
+        .cast()
+    }
+
+    unsafe extern "C" fn fake_target_free(target: VigemTarget) {
+        // SAFETY: fake_target_alloc creates this target, freed exactly once by
+        // VigemConnection after removal or disconnect.
+        let target = unsafe { Box::from_raw(target.cast::<FakeTarget>()) };
+        if let Some(trace) = &target.trace {
+            trace.borrow_mut().freed += 1;
+        }
+    }
+
+    unsafe extern "C" fn fake_target_add(client: VigemClient, target: VigemTarget) -> VigemError {
+        // SAFETY: both pointers are live Box allocations for this test client.
+        let client = unsafe { &*client.cast::<FakeClient>() };
+        let target = unsafe { &mut *target.cast::<FakeTarget>() };
+        target.generation = client.generation;
+        target.trace = Some(client.trace.clone());
+        client.trace.borrow_mut().attached += 1;
+        VIGEM_ERROR_NONE
+    }
+
+    unsafe extern "C" fn fake_target_remove(client: VigemClient, _: VigemTarget) -> VigemError {
+        // SAFETY: the client remains owned by its VigemConnection.
+        let client = unsafe { &*client.cast::<FakeClient>() };
+        let mut trace = client.trace.borrow_mut();
+        if trace.fail_remove {
+            return 0xE000_0004;
+        }
+        trace.attached -= 1;
+        VIGEM_ERROR_NONE
+    }
+
+    unsafe extern "C" fn fake_x360_update(
+        client: VigemClient,
+        _: VigemTarget,
+        report: XusbReport,
+    ) -> VigemError {
+        // SAFETY: the client remains owned by its VigemConnection.
+        let client = unsafe { &*client.cast::<FakeClient>() };
+        let mut trace = client.trace.borrow_mut();
+        if std::mem::take(&mut trace.fail_next_update) {
+            return VIGEM_ERROR_WINAPI;
+        }
+        trace.updates.push((client.generation, report.buttons));
+        VIGEM_ERROR_NONE
+    }
+
+    fn fake_connection(generation: u8, trace: Rc<RefCell<FakeBusTrace>>) -> VigemConnection {
+        let client = Box::into_raw(Box::new(FakeClient { generation, trace })).cast();
+        VigemConnection {
+            // A null library handle is test-only; Drop skips FreeLibrary for it.
+            module: std::ptr::null_mut(),
+            client: NonNull::new(client).expect("boxed fake client"),
+            functions: VigemFunctions {
+                alloc: fake_alloc,
+                free: fake_free,
+                connect: fake_connect,
+                disconnect: fake_disconnect,
+                target_x360_alloc: fake_target_alloc,
+                target_free: fake_target_free,
+                target_add: fake_target_add,
+                target_remove: fake_target_remove,
+                target_x360_update: fake_x360_update,
+                target_ds4_alloc: None,
+                target_ds4_update: None,
+            },
+            allocated_targets: RefCell::new(HashSet::new()),
+            reconnect_required: Cell::new(false),
+        }
+    }
+
+    fn controller_event(number: u16, active_mask: u16, buttons: u32) -> Event {
+        Event::Controller {
+            number,
+            active_mask,
+            buttons,
+            left_trigger: 0,
+            right_trigger: 0,
+            left_x: 0,
+            left_y: 0,
+            right_x: 0,
+            right_y: 0,
+        }
+    }
+
+    #[test]
+    fn failed_update_and_remove_reconnect_both_active_slots_without_wrong_generation_free() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.set_back_button_timeout(200);
+        gamepads
+            .inject(&controller_event(0, 1, BACK_BUTTON_MASK))
+            .unwrap();
+        gamepads.inject(&controller_event(1, 3, 1 << 13)).unwrap();
+        assert_eq!(trace.borrow().attached, 2);
+
+        trace.borrow_mut().fail_next_update = true;
+        trace.borrow_mut().fail_remove = true;
+        assert!(gamepads.inject(&controller_event(1, 3, 1 << 14)).is_err());
+        assert!(!gamepads.supported());
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().disconnects, 1);
+        assert_eq!(trace.borrow().freed, 2);
+
+        trace.borrow_mut().fail_remove = false;
+        let now = Instant::now();
+        gamepads.reconnect_with(now, || Ok(fake_connection(2, trace.clone())));
+        gamepads.advance(now);
+        assert_eq!(trace.borrow().attached, 2);
+        assert!(trace.borrow().updates.contains(&(2, 0x0020)));
+        assert!(trace.borrow().updates.contains(&(2, 0x4000)));
+        gamepads.advance(now + Duration::from_millis(200));
+        assert!(
+            trace.borrow().updates.contains(&(2, 0x0400)),
+            "Back timer and Guide pulse must survive a connection change"
+        );
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 4);
+        assert_eq!(trace.borrow().disconnects, 2);
+    }
+
+    #[test]
+    fn stop_during_pending_reconnect_releases_all_old_targets_without_probe() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        trace.borrow_mut().fail_next_update = true;
+        trace.borrow_mut().fail_remove = true;
+        assert!(gamepads.inject(&controller_event(0, 1, 1 << 13)).is_err());
+        assert!(gamepads.reconnect_at.is_some());
+        gamepads.reconnect_with(Instant::now(), || {
+            Err(InputError::new(
+                "controller_unavailable",
+                "bus still absent",
+            ))
+        });
+        assert!(gamepads.reconnect_at.is_some());
+        gamepads.stop().unwrap();
+        assert!(gamepads.reconnect_at.is_none());
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 1);
+        gamepads.advance(Instant::now() + Duration::from_secs(2));
+        assert!(!gamepads.supported());
+        assert_eq!(trace.borrow().disconnects, 1);
+    }
 
     #[test]
     fn xusb_snapshot_maps_supported_buttons_axes_and_triggers() {
