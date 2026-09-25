@@ -287,8 +287,10 @@ pub enum Event {
         y: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pressure: Option<f32>,
+        /// Touchport-transformed desktop length normalized by 65535.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contact_area_major: Option<f32>,
+        /// Touchport-transformed desktop length normalized by 65535.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contact_area_minor: Option<f32>,
         /// None means rotation was not reported; known values are 0..359.

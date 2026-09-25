@@ -301,8 +301,9 @@ At most 128 keys/buttons and 16 pen/touch contacts may be held. Supported events
   coordinates (`u16`, 0–65535). Touch pointer IDs retain the packet ID; pen
   uses the stable `pointer_id` 1 in its separate device namespace because the
   source pen packet has no ID. Optional pressure is finite and normalized to
-  0–1. Touch and pen can carry paired normalized `contact_area_major` and
-  `contact_area_minor` values. Optional `rotation_degrees` preserves unknown as
+  0–1. Touch and pen can carry paired `contact_area_major` and
+  `contact_area_minor` values: each touchport-transformed desktop length is
+  divided by 65535. Optional `rotation_degrees` preserves unknown as
   `null` and accepts known values from 0 through 359. Pen can also carry
   `pen_tool` (`unknown`, `pen`, or `eraser`), a `pen_buttons` bit mask
   (`primary` 1, `secondary` 2, `tertiary` 4), and raw `tilt` from 0 through
@@ -419,11 +420,15 @@ keyboard/mouse cleanup remain unimplemented.
 
 The pen/touch event coordinates and contact dimensions arriving at this module
 are expected to have already been transformed from client coordinates into the
-captured desktop geometry by the protocol adapter. The Linux backend reports
-touch orientation through its signed ABS_MT orientation range; Windows derives
-touch contact bounds and pen tilt axes from the retained rotation and tilt when
-those values are known. Native pointer ranges and contact geometry still need
-qualification on supported operating-system versions and input stacks.
+captured desktop geometry by the protocol adapter. Contact lengths use the
+reference transform's polar-to-cartesian axis scaling, divided by the same 65535
+coordinate span used by `x` and `y`; native adapters restore that length scale
+without applying the touchport transform a second time. The Linux backend
+reports touch orientation through its signed ABS_MT orientation range; Windows
+derives touch contact bounds and pen tilt axes from the retained rotation and
+tilt when those values are known. Native pointer ranges and contact geometry
+still need qualification on supported operating-system versions and input
+stacks.
 
 ## Validation and reference
 
