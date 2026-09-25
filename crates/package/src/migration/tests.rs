@@ -70,6 +70,128 @@ fn detects_only_known_product_roots_with_supported_configuration() {
 }
 
 #[test]
+fn discovery_deduplicates_lexical_aliases_of_existing_roots() {
+    let fixture = TemporaryDirectory::new();
+    let profile_root = fixture.path().join("profiles");
+    fs::create_dir_all(profile_root.join("nested")).unwrap();
+    write(
+        &profile_root.join("Sunshine/sunshine.conf"),
+        b"port = 47990",
+    );
+
+    let found = discover_legacy_sources(&LegacySearchPaths {
+        profile_data_roots: vec![profile_root.clone(), profile_root.join("nested/..")],
+        installation_roots: vec![],
+    })
+    .unwrap();
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].root, profile_root.join("Sunshine"));
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_keeps_case_distinct_roots_on_case_sensitive_filesystems() {
+    let fixture = TemporaryDirectory::new();
+    let lowercase_profile = fixture.path().join("profiles");
+    let uppercase_profile = fixture.path().join("Profiles");
+    fs::create_dir_all(&lowercase_profile).unwrap();
+    match fs::create_dir(&uppercase_profile) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("failed to create case-distinct profile root: {error}"),
+    }
+    write(
+        &lowercase_profile.join("Sunshine/sunshine.conf"),
+        b"port = 47990",
+    );
+    write(
+        &uppercase_profile.join("Sunshine/sunshine.conf"),
+        b"port = 47991",
+    );
+
+    let found = discover_legacy_sources(&LegacySearchPaths {
+        profile_data_roots: vec![lowercase_profile.clone(), uppercase_profile.clone()],
+        installation_roots: vec![],
+    })
+    .unwrap();
+
+    assert_eq!(found.len(), 2);
+    assert!(
+        found
+            .iter()
+            .any(|source| source.root == lowercase_profile.join("Sunshine"))
+    );
+    assert!(
+        found
+            .iter()
+            .any(|source| source.root == uppercase_profile.join("Sunshine"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_keeps_distinct_non_unicode_roots() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = TemporaryDirectory::new();
+    let first_profile = fixture
+        .path()
+        .join(std::ffi::OsString::from_vec(b"profile-\xff".to_vec()));
+    let second_profile = fixture
+        .path()
+        .join(std::ffi::OsString::from_vec(b"profile-\xfe".to_vec()));
+    write(
+        &first_profile.join("Sunshine/sunshine.conf"),
+        b"port = 47990",
+    );
+    write(
+        &second_profile.join("Sunshine/sunshine.conf"),
+        b"port = 47991",
+    );
+
+    let found = discover_legacy_sources(&LegacySearchPaths {
+        profile_data_roots: vec![first_profile.clone(), second_profile.clone()],
+        installation_roots: vec![],
+    })
+    .unwrap();
+
+    assert_eq!(found.len(), 2);
+    assert!(
+        found
+            .iter()
+            .any(|source| source.root == first_profile.join("Sunshine"))
+    );
+    assert!(
+        found
+            .iter()
+            .any(|source| source.root == second_profile.join("Sunshine"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn discovery_deduplicates_windows_case_variants_of_existing_roots() {
+    let fixture = TemporaryDirectory::new();
+    let lowercase_profile = fixture.path().join("profiles");
+    write(
+        &lowercase_profile.join("Sunshine/sunshine.conf"),
+        b"port = 47990",
+    );
+    let uppercase_profile = fixture.path().join("PROFILES");
+    assert!(uppercase_profile.is_dir());
+
+    let found = discover_legacy_sources(&LegacySearchPaths {
+        profile_data_roots: vec![lowercase_profile.clone(), uppercase_profile],
+        installation_roots: vec![],
+    })
+    .unwrap();
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].root, lowercase_profile.join("Sunshine"));
+}
+
+#[test]
 fn preflight_refuses_sensitive_configuration_without_exposing_its_contents() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Sunshine");

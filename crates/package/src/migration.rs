@@ -198,10 +198,12 @@ pub fn discover_legacy_sources(
     }
 
     let mut discovered = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeSet::<(LegacyProduct, PathBuf)>::new();
     for source in candidates {
-        let canonical_key = source.root.to_string_lossy().to_lowercase();
-        if !seen.insert((source.product, canonical_key)) {
+        let Some(identity) = canonical_existing_source_root(&source.root)? else {
+            continue;
+        };
+        if !seen.insert((source.product, identity)) {
             continue;
         }
         if collect_configuration_files(&source.root)?.is_some() {
@@ -209,6 +211,27 @@ pub fn discover_legacy_sources(
         }
     }
     Ok(discovered)
+}
+
+fn canonical_existing_source_root(root: &Path) -> PackageResult<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+        return Err("predecessor configuration root is not a directory".into());
+    }
+
+    let canonical_root = root.canonicalize().map_err(io_error)?;
+    #[cfg(windows)]
+    {
+        Ok(Some(resolved_existing_absolute_path(&canonical_root)?))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Some(canonical_root))
+    }
 }
 
 /// Builds a non-secret, reviewable import plan from explicit predecessor roots.
@@ -1079,33 +1102,57 @@ fn resolved_existing_relative_path(root: &Path, relative: &Path) -> PackageResul
             let std::path::Component::Normal(requested) = component else {
                 return Err("predecessor configuration path is not relative".into());
             };
-            let mut insensitive_match = None;
-            let mut ambiguous_match = false;
-            for entry in fs::read_dir(&current).map_err(io_error)? {
-                let name = entry.map_err(io_error)?.file_name();
-                if name.as_os_str() == requested {
-                    insensitive_match = Some(name);
-                    ambiguous_match = false;
-                    break;
-                }
-                if windows_path_component_matches(requested, &name)? {
-                    if insensitive_match.is_some() {
-                        ambiguous_match = true;
-                    } else {
-                        insensitive_match = Some(name);
-                    }
-                }
-            }
-            if ambiguous_match {
-                return Err("predecessor configuration path casing is ambiguous".into());
-            }
-            let name =
-                insensitive_match.ok_or("predecessor configuration path cannot be resolved")?;
+            let name = existing_windows_path_component(&current, requested)?;
             current.push(&name);
             resolved.push(name);
         }
         Ok(resolved)
     }
+}
+
+#[cfg(windows)]
+fn resolved_existing_absolute_path(path: &Path) -> PackageResult<PathBuf> {
+    let mut components = path.components();
+    let Some(std::path::Component::Prefix(prefix)) = components.next() else {
+        return Err("predecessor configuration root is not an absolute path".into());
+    };
+    let Some(std::path::Component::RootDir) = components.next() else {
+        return Err("predecessor configuration root is not an absolute path".into());
+    };
+
+    let mut current = PathBuf::from(prefix.as_os_str());
+    current.push(std::path::MAIN_SEPARATOR.to_string());
+    let mut resolved = current.clone();
+    for component in components {
+        let std::path::Component::Normal(requested) = component else {
+            return Err("predecessor configuration root cannot be resolved".into());
+        };
+        let name = existing_windows_path_component(&current, requested)?;
+        current.push(&name);
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn existing_windows_path_component(
+    parent: &Path,
+    requested: &std::ffi::OsStr,
+) -> PackageResult<std::ffi::OsString> {
+    let mut insensitive_match = None;
+    for entry in fs::read_dir(parent).map_err(io_error)? {
+        let name = entry.map_err(io_error)?.file_name();
+        if name.as_os_str() == requested {
+            return Ok(name);
+        }
+        if windows_path_component_matches(requested, &name)? {
+            if insensitive_match.is_some() {
+                return Err("predecessor configuration path casing is ambiguous".into());
+            }
+            insensitive_match = Some(name);
+        }
+    }
+    insensitive_match.ok_or_else(|| "predecessor configuration path cannot be resolved".into())
 }
 
 #[cfg(windows)]
