@@ -19,22 +19,23 @@ Strict JSON controls:
 ```
 
 Enumeration returns `{ok:true,enabled,endpoints:[{id,name,description,adapter_name,default_multimedia}]}`
-for active render endpoints. Explicit endpoint IDs come from that list. Unless
-the virtual-sink policy selects Steam speakers, `default` and an empty ordinary
-endpoint resolve the current multimedia render endpoint once when opened. The
-selected endpoint remains fixed for the session. Enumeration is limited to 64
-endpoints and a 12,000-byte metadata reply. On Windows, opening an explicit
-endpoint with `capture_sink_without_routing` omitted or false temporarily
-assigns that endpoint as the Console, Multimedia, and Communications render
-default, unless it is already the Console default. Concurrent captures of the
-same endpoint share the assignment; a conflicting endpoint open fails. When the
-final capture closes,
-the provider restores only roles it assigned that still point to the selected
-endpoint, preserving role changes made elsewhere. If assignment fails, open
-fails and attempts to restore roles changed earlier in the same open. A failed
-restore blocks later routed opens, which retry cleanup first; there is no
-background retry. Opening `default`
-does not change default roles. The provider does not change volume or mute state.
+for active render endpoints. Explicit endpoint IDs come from that list. With no
+virtual sink selected, an empty or `default` ordinary endpoint initially selects
+the current Windows Console render default. Regular empty/default opens normally
+follow later Console default changes; capture-only opens pin the initially
+selected endpoint.
+Enumeration is limited to 64 endpoints and a 12,000-byte metadata reply. On
+Windows, opening an explicit endpoint with `capture_sink_without_routing` omitted
+or false temporarily assigns that endpoint as the Console, Multimedia, and
+Communications render default, unless it is already the Console default.
+Concurrent captures of the same endpoint share the assignment; a conflicting
+endpoint open fails. When the final capture closes, the provider restores only
+roles it assigned that still point to the selected endpoint, preserving role
+changes made elsewhere. If assignment fails, open fails and attempts to restore
+roles changed earlier in the same open. A failed restore blocks later routed
+opens, which retry cleanup first; there is no background retry. Opening
+`default` does not change default roles. The provider does not change volume or
+mute state.
 
 An open with `virtual_sink` selects a managed virtual render endpoint before the
 regular `endpoint`. `virtual_sink:null` or omission allows the audio policy to
@@ -46,11 +47,14 @@ Steam speakers are unavailable, capture falls back to the requested ordinary
 endpoint and reports its actual ID; if that endpoint is unavailable, open fails.
 When host audio is enabled and an ordinary endpoint is available, regular
 selection is preserved. With no virtual sink selected, an empty or `default`
-ordinary endpoint follows the Windows Console render default. The worker checks
-the Console endpoint identity every 100 ms and reopens capture after it changes,
-without changing any render default role. Explicit regular endpoint IDs remain
-pinned. An explicit `virtual_sink` always takes precedence and remains strict: it
-does not fall back when missing. An empty explicit selector
+ordinary endpoint resolves the current Windows Console render default. Unless
+`capture_sink_without_routing` is true, the worker checks the Console endpoint
+identity every 100 ms and reopens capture after it changes, without changing any
+render default role. Capture-only default opens keep the initially selected
+Console endpoint across default changes and device-loss retries. Explicit
+regular endpoint IDs remain pinned. An explicit `virtual_sink` always takes
+precedence and remains strict: it does not fall back when missing. An empty
+explicit selector
 matches the active endpoint whose adapter name is exactly
 `Steam Streaming Speakers`; nonempty text matches an active endpoint's
 ID, friendly name, device description, or adapter name, in that priority order.
@@ -70,8 +74,11 @@ capture closes. Capture-only routing is invalid for virtual selection; virtual
 opens use the normal shared default-role lease and cleanup.
 
 Set `capture_sink_without_routing:true` on an open to capture the selected
-endpoint without changing any render default role. The product resolver should
-set it only for Vibeshine's capture-only case: capture-only enabled, a configured
+endpoint without changing any render default role. On Windows, when the regular
+selector is empty or `default` and no virtual sink is selected, the provider
+resolves the current Console default once and pins that endpoint across later
+default changes and device-loss retries. The product resolver should set the
+flag only for Vibeshine's capture-only case: capture-only enabled, a configured
 sink present, no configured virtual sink, and the selected sink equal to that
 configured sink. The audio module receives this per-open policy snapshot; it does
 not derive eligibility from product settings.
@@ -91,13 +98,15 @@ includes its selected/requested endpoint, format,
 `state:"capturing"|"recovering"|"failed"`, `failure`, `discontinuities`, and
 `dropped_packets`. After WASAPI reports device loss, the worker reports
 `recovering` while it retries the selected endpoint every five seconds. A
-Console-default change starts an immediate reopen; failed reopen attempts retry
-every five seconds. Retry delays are cancelled by close or module shutdown. A
-reopened capture must keep the published PCM format; an incompatible format
-fails the stream with `audio_format_changed`. The first packet after recovery
-is marked discontinuous, and sequence/timestamp values continue across the new
-capture's timeline. In status, `endpoint` reports the active capture endpoint
-and updates after a followed Console-default change successfully reopens capture;
+Console-default change starts an immediate reopen only for a stream that follows
+that default; capture-only default opens stay pinned. Failed reopen attempts
+retry every five seconds. Retry delays are cancelled by close or module
+shutdown. A reopened capture must keep the published PCM format; an incompatible
+format fails the stream with `audio_format_changed`. The first packet after
+recovery is marked discontinuous, and sequence/timestamp values continue across
+the new capture's timeline. In status, `endpoint` reports the active capture
+endpoint and updates after a followed Console-default change successfully
+reopens capture;
 while recovery is in progress, it remains the last successfully opened capture
 endpoint. `requested_endpoint` remains the initial selector. Open/lookup keep
 `endpoint` as the initial selected endpoint snapshot, so the stream-session

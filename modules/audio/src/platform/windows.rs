@@ -701,8 +701,6 @@ impl Capture {
             select_policy_virtual_sink(endpoints, requested, virtual_sink, host_audio_enabled)
         });
         let uses_virtual_sink = virtual_sink.is_some() || automatic_virtual_sink.is_some();
-        let follow_console_default =
-            super::should_follow_console_default(requested, uses_virtual_sink);
         let effective_channels = channels.or_else(|| automatic_virtual_sink.map(|_| 2));
         let desired_layout = uses_virtual_sink
             .then(|| channel_layout(effective_channels.unwrap_or(2)))
@@ -712,6 +710,13 @@ impl Capture {
         }
         let effective_capture_only =
             capture_sink_without_routing && automatic_virtual_sink.is_none();
+        let resolve_console_default =
+            super::should_resolve_console_default(requested, uses_virtual_sink);
+        let follow_console_default = super::should_follow_console_default(
+            requested,
+            uses_virtual_sink,
+            effective_capture_only,
+        );
         let preferred_valid_bits = desired_layout.map(|_| default_render_valid_bits(&enumerator));
         // SAFETY: activation and capture interface references never leave this
         // apartment. The mix-format allocation stays live through Initialize.
@@ -725,7 +730,7 @@ impl Capture {
                 let wide: Vec<u16> = selected.id.encode_utf16().chain(Some(0)).collect();
                 enumerator.GetDevice(PCWSTR(wide.as_ptr()))
             } else if requested.is_empty() || requested == "default" {
-                let role = if follow_console_default {
+                let role = if resolve_console_default {
                     eConsole
                 } else {
                     eMultimedia
