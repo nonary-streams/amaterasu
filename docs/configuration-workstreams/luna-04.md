@@ -1,5 +1,12 @@
 # Luna-04: audio and input configuration parity
 
+## Coordinator validation: Windows gamepad lint and audio route retry landed
+
+- The input helper candidate `bca6a3b203ea0b87d2fcfe1d4942b7163a179929` landed directly on main as `2f1690f396fa80b1a6259f1f141f324f311ad7fd`. Coordinator gates passed: `cargo fmt --check -p amaterasu-input`, `cargo test -p amaterasu-input` (113/113), and strict Clippy.
+- The Windows route restoration retry candidate `6d5dec5bcd17eeb078be0ff0538af83c649b82e6` landed directly on main as `331f5968b5abe6ab3cabf4172336e80d2b0d26bc`. Coordinator gates passed: `cargo fmt --check -p amaterasu-audio`, `cargo test -p amaterasu-audio` (53/53; one controlled-audio hardware test ignored), and strict Clippy.
+- Windows COM behavior and controlled endpoint route restoration remain unqualified. Durable audio settings/default migration, scoped client/application resolution, management authority/UI, and end-to-end stream evidence also remain open. Keep all assigned audio IDs pending.
+- This status update does not alter either landed code slice. The lane head before this update was `62867867530328dd306ae8eeeca6197533d9fa20` on `config-parity/audio-input`; the coordinator owns direct-main cherry-picks.
+
 ## Coordinator validation: capture-only Console-default pinning landed
 
 - Lane candidate `d4125c364c5fa5c1ee98e1a4eb3bdc51c40dacbb` landed directly on main as `9625a2f6f3ed4ffca27abcdeb573769e02303164`. Coordinator acknowledgement `coordinator-capture-only-contract-ack-20260925` identifies main tip `ca36e432c64ff1956a0b917d79dd19a54e129688` and accepts the policy.
