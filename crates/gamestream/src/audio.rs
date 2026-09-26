@@ -5,7 +5,7 @@ use crate::video::linear_combination;
 
 const RTP_BYTES: usize = 12;
 const FEC_BYTES: usize = 12;
-const MAX_WIRE_PAYLOAD: usize = 1376; // Client receive buffer is 1400 bytes.
+const MAX_WIRE_PAYLOAD: usize = 1280; // Maximum AES-CBC padded Opus shard.
 const MAX_OPUS_BYTES: usize = 1275;
 const AUDIO_MATRIX: [[u8; 4]; 2] = [[0x77, 0x40, 0x38, 0x0e], [0xc7, 0xa7, 0x0d, 0x6c]];
 
@@ -59,7 +59,7 @@ pub struct AudioPacketizer {
 impl AudioPacketizer {
     pub fn new(config: AudioConfig) -> Result<Self, AudioError> {
         if config.sample_rate != 48000
-            || config.channels != 2
+            || !matches!(config.channels, 2 | 6 | 8)
             || !matches!(config.frames_per_packet, 240 | 480)
         {
             return Err(AudioError::UnsupportedFormat);

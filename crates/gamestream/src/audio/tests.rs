@@ -174,7 +174,11 @@ fn negotiated_formats_and_opus_frame_packing_are_validated() {
             ..config(4)
         },
         AudioConfig {
-            channels: 6,
+            channels: 4,
+            ..config(4)
+        },
+        AudioConfig {
+            channels: 7,
             ..config(4)
         },
         AudioConfig {
@@ -187,7 +191,7 @@ fn negotiated_formats_and_opus_frame_packing_are_validated() {
             Err(AudioError::UnsupportedFormat)
         ));
     }
-    for bytes in [0, 1377, usize::MAX] {
+    for bytes in [0, 1281, 1376, usize::MAX] {
         assert!(matches!(
             AudioPacketizer::new(config(bytes)),
             Err(AudioError::InvalidPayloadSize)
@@ -208,6 +212,74 @@ fn negotiated_formats_and_opus_frame_packing_are_validated() {
         &[0x87, 0x82, 250, 1][..],
     ] {
         assert!(opus::decoded_frames(malformed).is_err());
+    }
+}
+
+#[test]
+fn surround_channels_preserve_rtp_fec_and_discontinuity_with_bounded_wire_shards() {
+    for channels in [6, 8] {
+        for frames in [240, 480] {
+            let mut sender = AudioPacketizer::new(AudioConfig {
+                channels,
+                frames_per_packet: frames,
+                ..config(4)
+            })
+            .unwrap();
+            let opus = if frames == 240 {
+                [0x8c, 1, 2, 3]
+            } else {
+                [0x94, 1, 2, 3]
+            };
+            let mut datagrams = Vec::new();
+            for _ in 0..4 {
+                datagrams.extend(sender.packetize(&opus, frames).unwrap());
+            }
+            assert_eq!(datagrams.len(), 6);
+            assert!(
+                datagrams[..4]
+                    .iter()
+                    .all(|packet| packet.len() == 16 && packet[1] == 97)
+            );
+            assert!(
+                datagrams[4..]
+                    .iter()
+                    .all(|packet| packet.len() == 28 && packet[1] == 127)
+            );
+            assert_eq!(sender.next_sequence(), 4);
+            sender.packetize(&opus, frames).unwrap();
+            let reset = sender.reset_discontinuity();
+            assert_eq!(
+                (
+                    reset.discarded_shards,
+                    reset.skipped_packets,
+                    reset.next_sequence
+                ),
+                (1, 3, 8)
+            );
+        }
+        let mut oversized = AudioPacketizer::new(AudioConfig {
+            channels,
+            wire_payload_bytes: 1280,
+            ..config(4)
+        })
+        .unwrap();
+        assert_eq!(
+            oversized.packetize(&vec![0x94; 1276], 480),
+            Err(AudioError::InvalidPayloadSize)
+        );
+        assert_eq!(oversized.next_sequence(), 0);
+        let maximum_plain = vec![0x94; 1275];
+        let mut plain = AudioPacketizer::new(AudioConfig {
+            channels,
+            wire_payload_bytes: 1275,
+            ..config(4)
+        })
+        .unwrap();
+        assert_eq!(plain.packetize(&maximum_plain, 480).unwrap()[0].len(), 1287);
+        let sealed = oversized
+            .packetize_sealed(&maximum_plain, 480, |_, _| Ok(vec![0; 1280]))
+            .unwrap();
+        assert_eq!(sealed[0].len(), 1292);
     }
 }
 

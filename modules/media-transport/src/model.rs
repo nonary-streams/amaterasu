@@ -241,7 +241,7 @@ impl Open {
             }
         }
         if !matches!(self.audio.packet_ms, 5 | 10)
-            || self.audio.channels != 2
+            || !matches!(self.audio.channels, 2 | 6 | 8)
             || !self.valid_audio_wire_length()
         {
             return Err("invalid_audio_configuration");

@@ -142,6 +142,100 @@ fn real_udp_video_fec_and_audio_groups_flush_with_no_invented_eos_datagram() {
 }
 
 #[test]
+fn surround_audio_packetize_submit_and_drain_keep_channel_and_wire_bounds() {
+    for channels in [6_u16, 8] {
+        for packet_ms in [5, 10] {
+            for encrypted in [false, true] {
+                let (video, audio) = receivers();
+                let mut settings = request(&video, &audio, encrypted);
+                settings.audio.channels = channels;
+                settings.audio.packet_ms = packet_ms;
+                let mut stream = Stream::open("owner", &settings).unwrap();
+                let opus = if packet_ms == 5 {
+                    [0x8c, 1, 2, 3]
+                } else {
+                    [0x94, 1, 2, 3]
+                };
+                let packet = |sequence| EncodedAudioPacket {
+                    channels: u32::from(channels),
+                    frames: packet_ms * 48,
+                    timestamp_us: sequence * u64::from(packet_ms) * 1_000,
+                    ..audio_packet(&opus, sequence)
+                };
+                let wrong = EncodedAudioPacket {
+                    channels: 2,
+                    ..packet(0)
+                };
+                assert_eq!(unsafe { stream.submit_audio(&wrong) }, MEDIA_UNSUPPORTED);
+                assert_eq!(stream.audio_sequence, None);
+                assert_eq!(stream.delivery.queued(), 0);
+                for sequence in 0..4 {
+                    assert_eq!(unsafe { stream.submit_audio(&packet(sequence)) }, STATUS_OK);
+                }
+                assert_eq!(stream.delivery.queued(), 6);
+                assert_eq!(stream.drain(), STATUS_OK);
+                stream.delivery.tick();
+                for index in 0..6 {
+                    let datagram = receive(&audio);
+                    assert_eq!(datagram[1], if index < 4 { 97 } else { 127 });
+                    assert!(datagram.len() <= 1_304);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_surround_counts_and_oversized_opus_fail_without_queue_mutation() {
+    let (video, audio) = receivers();
+    for channels in [0, 1, 3, 4, 5, 7, 9] {
+        let mut settings = request(&video, &audio, false);
+        settings.audio.channels = channels;
+        assert!(matches!(
+            Stream::open("owner", &settings),
+            Err("invalid_audio_configuration")
+        ));
+    }
+    let mut settings = request(&video, &audio, false);
+    settings.audio.channels = 6;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let oversized = vec![0x94; 1_276];
+    let packet = EncodedAudioPacket {
+        channels: 6,
+        ..audio_packet(&oversized, 0)
+    };
+    assert_eq!(
+        unsafe { stream.submit_audio(&packet) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.audio_sequence, None);
+    assert_eq!(stream.delivery.queued(), 0);
+}
+
+#[test]
+fn maximum_surround_opus_payload_respects_plain_and_encrypted_wire_caps() {
+    for channels in [6_u16, 8] {
+        for encrypted in [false, true] {
+            let (video, audio) = receivers();
+            let mut settings = request(&video, &audio, encrypted);
+            settings.audio.channels = channels;
+            settings.audio.wire_payload_bytes = if encrypted { 1_280 } else { 1_275 };
+            let mut stream = Stream::open("owner", &settings).unwrap();
+            let opus = vec![0x94; 1_275];
+            let packet = EncodedAudioPacket {
+                channels: u32::from(channels),
+                ..audio_packet(&opus, 0)
+            };
+            assert_eq!(unsafe { stream.submit_audio(&packet) }, STATUS_OK);
+            assert_eq!(stream.delivery.queued(), 1);
+            assert_eq!(stream.drain(), STATUS_OK);
+            stream.delivery.tick();
+            assert_eq!(receive(&audio).len(), if encrypted { 1_292 } else { 1_287 });
+        }
+    }
+}
+
+#[test]
 fn real_udp_video_without_fec_emits_only_the_data_datagram() {
     let (video, audio) = receivers();
     let mut settings = request(&video, &audio, false);
