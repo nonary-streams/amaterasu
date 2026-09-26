@@ -20,6 +20,8 @@ pub enum Operation {
         configuration: Configuration,
         #[serde(default)]
         mode_policy: Option<ModePolicy>,
+        #[serde(default)]
+        mode_policies: Option<Vec<ModePolicy>>,
     },
     Restore {
         lease: String,
@@ -106,7 +108,6 @@ impl Configuration {
         policy: &ModePolicy,
         available_modes: Option<&[AvailableMode]>,
     ) -> Result<(), DisplayError> {
-        self.validate()?;
         let display = self
             .displays
             .iter_mut()
@@ -247,7 +248,7 @@ impl Configuration {
                 DisplayHdrOption::Disabled => None,
             };
         }
-        self.validate()
+        Ok(())
     }
     pub fn validate(&self) -> Result<(), DisplayError> {
         if self.displays.is_empty() || self.displays.len() > MAX_DISPLAYS {

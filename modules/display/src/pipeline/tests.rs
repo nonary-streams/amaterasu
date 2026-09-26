@@ -70,6 +70,29 @@ fn two_display_snapshot() -> Snapshot {
 fn configuration() -> Value {
     json!({"displays":[{"id":"monitor.one","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]})
 }
+fn two_display_configuration() -> Value {
+    json!({"displays":[
+        {"id":"monitor.one","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
+        {"id":"monitor.two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
+    ]})
+}
+fn policy(display_id: &str, resolution: &str, refresh: &str) -> Value {
+    json!({
+        "display_id": display_id,
+        "context": {
+            "resolution_is_automatic": true,
+            "refresh_rate_is_automatic": true,
+            "client_display_mode_override": false,
+            "optimize_game_settings": true
+        },
+        "remapping": {"mixed": [{
+            "requested_resolution": "1280x720",
+            "requested_fps": "60",
+            "final_resolution": resolution,
+            "final_refresh_rate": refresh
+        }]}
+    })
+}
 fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
     json!({
         "action":"apply",
@@ -93,12 +116,16 @@ struct FakePlatform {
     effects: Vec<&'static str>,
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
+    prepared_modes: Vec<(String, u32, u32, Rational)>,
+    applied_modes: Vec<(String, u32, u32, Rational)>,
     apply_failure: bool,
     late_mode_drift: bool,
     restore_failure: bool,
     topology_changed: bool,
     available_modes: Vec<crate::model::AvailableMode>,
+    second_available_modes: Vec<crate::model::AvailableMode>,
     mode_queries: usize,
+    queried_displays: Vec<String>,
     inactive: bool,
     inactive_activation_hdr: bool,
     hdr_supported: bool,
@@ -122,22 +149,44 @@ impl Platform for FakePlatform {
         display: &str,
     ) -> DisplayResult<Vec<crate::model::AvailableMode>> {
         self.mode_queries += 1;
-        if self.inactive || !display.eq_ignore_ascii_case("monitor.one") {
+        self.queried_displays.push(display.to_lowercase());
+        if self.inactive {
             return Err(DisplayError::new(
                 "unsupported_display",
                 "display is inactive",
             ));
         }
-        Ok(self.available_modes.clone())
+        if display.eq_ignore_ascii_case("monitor.one") {
+            Ok(self.available_modes.clone())
+        } else if display.eq_ignore_ascii_case("monitor.two") {
+            Ok(self.second_available_modes.clone())
+        } else {
+            Err(DisplayError::new(
+                "unsupported_display",
+                "display is inactive",
+            ))
+        }
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let display = &configuration.displays[0];
+        self.prepared_modes = configuration
+            .displays
+            .iter()
+            .map(|display| {
+                (
+                    display.id.clone(),
+                    display.width,
+                    display.height,
+                    display.refresh,
+                )
+            })
+            .collect();
         if display.hdr_enabled == Some(true) && (!self.hdr_supported || self.inactive) {
             return Err(DisplayError::new("unsupported_display", "HDR unavailable"));
         }
         self.prepared_hdr = Some(display.hdr_enabled);
         self.prepared_mode = Some((display.width, display.height, display.refresh));
-        let mut before = if self.reorder_readback {
+        let mut before = if self.reorder_readback || configuration.displays.len() == 2 {
             two_display_snapshot()
         } else {
             snapshot()
@@ -176,6 +225,18 @@ impl Platform for FakePlatform {
             self.hdr_state = self.inactive_activation_hdr;
         }
         self.applied_mode = Some((display.width, display.height, display.refresh));
+        self.applied_modes = configuration
+            .displays
+            .iter()
+            .map(|display| {
+                (
+                    display.id.clone(),
+                    display.width,
+                    display.height,
+                    display.refresh,
+                )
+            })
+            .collect();
         if let Some(enabled) = display
             .hdr_enabled
             .filter(|_| self.hdr_supported && was_active)
@@ -251,6 +312,18 @@ impl Platform for FakePlatform {
             before.paths[0].source.height,
             before.paths[0].refresh,
         ));
+        self.applied_modes = before
+            .paths
+            .iter()
+            .map(|path| {
+                (
+                    path.id.clone(),
+                    path.source.width,
+                    path.source.height,
+                    path.refresh,
+                )
+            })
+            .collect();
         self.inactive = before.paths[0].id != "monitor.one";
         Ok(())
     }
@@ -777,6 +850,174 @@ fn remapped_mode_reaches_prepare_and_durable_apply() {
     assert_eq!(pipeline.platform.prepared_mode, mode);
     assert_eq!(pipeline.platform.applied_mode, mode);
     assert!(state.journal.is_some());
+}
+
+#[test]
+fn two_mode_policies_reach_one_durable_apply_and_restore() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":two_display_configuration(),
+            "mode_policies":[
+                policy("monitor.one", "1920x1080", "120"),
+                policy("MONITOR.TWO", "1600x900", "75")
+            ]
+        }),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    let expected = vec![
+        (
+            "monitor.one".into(),
+            1920,
+            1080,
+            Rational {
+                numerator: 120,
+                denominator: 1,
+            },
+        ),
+        (
+            "monitor.two".into(),
+            1600,
+            900,
+            Rational {
+                numerator: 75,
+                denominator: 1,
+            },
+        ),
+    ];
+    assert_eq!(pipeline.platform.prepared_modes, expected);
+    assert_eq!(pipeline.platform.applied_modes, expected);
+    assert_eq!(
+        state.journal.as_ref().unwrap()["snapshot"]["paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"restore", "lease":result["lease"]
+        }),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert_eq!(pipeline.platform.applied_modes.len(), 2);
+    assert_eq!(pipeline.platform.applied_modes[0].1, 1920);
+    assert_eq!(pipeline.platform.applied_modes[1].1, 1920);
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn highest_refresh_queries_each_policy_target() {
+    let mode = |hz| crate::model::AvailableMode {
+        width: 1280,
+        height: 720,
+        refresh: Rational {
+            numerator: hz,
+            denominator: 1,
+        },
+        nominal_refresh_hz: hz,
+        bits_per_pixel: 32,
+        exact_current: false,
+    };
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            available_modes: vec![mode(120)],
+            second_available_modes: vec![mode(75)],
+            ..Default::default()
+        },
+        true,
+    );
+    let mut state = State::default();
+    let policy = |display_id| {
+        json!({
+            "display_id": display_id,
+            "remapping": {},
+            "context": {
+                "resolution_is_automatic": true,
+                "refresh_rate_is_automatic": true,
+                "client_display_mode_override": false,
+                "optimize_game_settings": false
+            },
+            "refresh_rate_option": "prefer_highest"
+        })
+    };
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action": "apply",
+            "configuration": two_display_configuration(),
+            "mode_policies": [policy("monitor.one"), policy("monitor.two")]
+        }),
+    );
+    assert_eq!(result["applied"], true, "{result}");
+    assert_eq!(
+        pipeline.platform.queried_displays,
+        ["monitor.one", "monitor.two"]
+    );
+    assert_eq!(pipeline.platform.prepared_modes[0].3.numerator, 120);
+    assert_eq!(pipeline.platform.prepared_modes[1].3.numerator, 75);
+}
+
+#[test]
+fn invalid_second_mode_policy_has_no_prepare_journal_or_native_mutation() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":two_display_configuration(),
+            "mode_policies":[
+                policy("monitor.one", "1920x1080", "120"),
+                {"display_id":"monitor.two", "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                }, "remapping":{"mixed":[{"final_resolution":"0x0"}]}}
+            ]
+        }),
+    );
+    assert_eq!(result["error"]["code"], "invalid_request");
+    assert!(pipeline.platform.prepared_modes.is_empty());
+    assert!(pipeline.platform.applied_modes.is_empty());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn conflicting_duplicate_and_unknown_policy_targets_fail_before_prepare() {
+    for policies in [
+        json!({"mode_policy":policy("monitor.one", "1920x1080", "120"),
+               "mode_policies":[]}),
+        json!({"mode_policies":[policy("monitor.one", "1920x1080", "120"),
+                                 policy("MONITOR.ONE", "1600x900", "75")]}),
+        json!({"mode_policies":[policy("monitor.one", "1920x1080", "120"),
+                                 policy("monitor.missing", "1600x900", "75")]}),
+    ] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+        let mut request = json!({"action":"apply", "configuration":two_display_configuration()});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(policies.as_object().unwrap().clone());
+        let result = state.run(&mut pipeline, "owner", request);
+        assert_eq!(result["error"]["code"], "invalid_request");
+        assert!(pipeline.platform.prepared_modes.is_empty());
+        assert_eq!(pipeline.platform.mode_queries, 0);
+        assert!(pipeline.platform.effects.is_empty());
+        assert!(state.journal.is_none());
+    }
 }
 
 #[test]

@@ -3,7 +3,7 @@ use crate::platform::Platform;
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 type Transport = ModuleResult<Response>;
@@ -274,6 +274,7 @@ impl<P: Platform> Pipeline<P> {
             Operation::Apply {
                 mut configuration,
                 mode_policy,
+                mode_policies,
             } => {
                 if journal.is_some() {
                     return complete(
@@ -285,7 +286,12 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
-                if let Some(policy) = mode_policy {
+                let policies =
+                    match collect_mode_policies(&configuration, mode_policy, mode_policies) {
+                        Ok(policies) => policies,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                for policy in policies {
                     let modes = if policy.refresh_rate_option
                         == Some(crate::refresh_rate_option::RefreshRateOption::PreferHighest)
                         && !policy.context.client_display_mode_override
@@ -439,6 +445,40 @@ impl<P: Platform> Pipeline<P> {
         let payload = json!({"action":"delete","key":JOURNAL_KEY,"expected_revision":revision});
         self.submit(context, payload, Stage::Clearing(reply), send)
     }
+}
+fn collect_mode_policies(
+    configuration: &Configuration,
+    mode_policy: Option<crate::model::ModePolicy>,
+    mode_policies: Option<Vec<crate::model::ModePolicy>>,
+) -> DisplayResult<Vec<crate::model::ModePolicy>> {
+    configuration.validate()?;
+    if mode_policy.is_some() && mode_policies.is_some() {
+        return Err(DisplayError::new(
+            "invalid_request",
+            "apply accepts either mode_policy or mode_policies, not both",
+        ));
+    }
+    let policies = mode_policies.unwrap_or_else(|| mode_policy.into_iter().collect());
+    let mut targets = BTreeSet::new();
+    for policy in &policies {
+        if !targets.insert(policy.display_id.to_lowercase()) {
+            return Err(DisplayError::new(
+                "invalid_request",
+                "mode policies must target distinct displays",
+            ));
+        }
+        if !configuration
+            .displays
+            .iter()
+            .any(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+        {
+            return Err(DisplayError::new(
+                "invalid_request",
+                "mode policy display is not in the configuration",
+            ));
+        }
+    }
+    Ok(policies)
 }
 fn read_journal(payload: Value) -> DisplayResult<Option<Journal>> {
     match payload["found"].as_bool() {

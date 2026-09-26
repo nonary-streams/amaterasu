@@ -40,7 +40,7 @@ pinned meanings are:
   display supports it.
 - `disabled` performs no additional HDR configuration.
 
-For `apply`, `mode_policy.hdr_option` selects HDR for its `display_id`.
+For `apply`, a policy's `hdr_option` selects HDR for its `display_id`.
 `auto` requires `effective_client_hdr_request` (a boolean already resolved by
 the caller) and sets that display's requested `hdr_enabled` state. `disabled`
 clears the HDR request. A display in the concrete configuration may instead
@@ -101,6 +101,7 @@ Moonlight gate.
 {"action":"enumerate","display":"<id returned by enumeration>","offset":0,"limit":32}
 {"action":"apply","configuration":{"displays":[{"id":"<id returned by enumeration>","width":1920,"height":1080,"refresh":{"numerator":60000,"denominator":1001},"x":0,"y":0,"rotation":"identity"}]}}
 {"action":"apply","configuration":{"displays":[{"id":"<id returned by enumeration>","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]},"mode_policy":{"display_id":"<same id>","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false},"hdr_option":"auto","effective_client_hdr_request":true}}
+{"action":"apply","configuration":{"displays":[{"id":"<first id>","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},{"id":"<second id>","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}]},"mode_policies":[{"display_id":"<first id>","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},{"display_id":"<second id>","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}]}
 {"action":"restore","lease":"display-0000000000000001"}
 {"action":"recover","lease":"display-0000000000000001"}
 ```
@@ -132,6 +133,13 @@ Apply specifies the **entire desired active display set**. Omitted displays are
 disabled. Each display must use an independent source, rectangles must not
 overlap, and one display must begin at `(0,0)`. Rotation is `identity`, `rotate90`,
 `rotate180`, or `rotate270`; dimensions describe the resulting desktop source.
+The optional `mode_policy` retains the single-display wire format. Use optional
+`mode_policies` to resolve several display policies in one configuration. Supplying
+both fields is an `invalid_request`, even when the list is empty. Policy targets
+must be distinct ignoring case and present in `configuration.displays`. Every
+policy resolves its own display, including per-target `prefer_highest` mode lookup;
+the final complete configuration is validated before one journaled prepare/apply
+transaction. An empty list applies the concrete configuration as given.
 Dimensions, positions, rational refresh rates and duplicate identities are
 validated before persistence. Windows must validate the supplied configuration
 without silently changing requested settings. Success returns `applied:true`
