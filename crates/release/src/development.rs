@@ -4,8 +4,8 @@ use amaterasu_package::{
     ActivationState, BootstrapConfig, ComponentManifest, PackageResult, ReleaseManifest,
     ReleaseSignature, RootLock, VerificationPolicy, create_machine_private_directory,
     create_private_directory, current_target, decode_hex, encode_hex, package_directory,
-    random_identifier, read_bounded, read_json, sha256, stage_package, unix_timestamp,
-    verify_package, write_json_atomically,
+    protect_machine_private_file, random_identifier, read_bounded, read_json, sha256,
+    stage_package, unix_timestamp, verify_package, write_json_atomically,
 };
 use amaterasu_storage::write_atomically;
 use ed25519_dalek::{Signer, SigningKey};
@@ -26,8 +26,158 @@ const PROVISION_JOURNAL: &str = ".installer-provision.json";
 const POLICY_TRANSITION_JOURNAL: &str = ".installer-policy-transition.json";
 const POLICY_TRANSITION_BACKUPS: &str = "installer-policy-backups";
 const MAX_TRANSITION_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const TLS_BIND_ENV: &str = "AMATERASU_MANAGEMENT_TLS_BIND";
+const TLS_CERT_ENV: &str = "AMATERASU_MANAGEMENT_TLS_CERTIFICATE_PATH";
+const TLS_KEY_ENV: &str = "AMATERASU_MANAGEMENT_TLS_PRIVATE_KEY_PATH";
+const WORKER_STATE_ROOT_TOKEN: &str = "__AMATERASU_WORKER_STATE_ROOT__";
+
+struct InstallerTls {
+    bind: std::net::SocketAddr,
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+}
+
+impl InstallerTls {
+    fn from_environment() -> PackageResult<Option<Self>> {
+        let values = [TLS_BIND_ENV, TLS_CERT_ENV, TLS_KEY_ENV].map(std::env::var_os);
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let [Some(bind), Some(certificate), Some(private_key)] = values else {
+            return Err(
+                "management TLS bind, certificate and private key must be supplied together".into(),
+            );
+        };
+        let bind: std::net::SocketAddr = bind
+            .to_str()
+            .ok_or("management TLS bind is invalid")?
+            .parse()
+            .map_err(|_| "management TLS bind is invalid")?;
+        if !bind.ip().is_loopback() || bind.port() == 0 {
+            return Err("management TLS bind must be an explicit loopback port".into());
+        }
+        let certificate = PathBuf::from(certificate);
+        let private_key = PathBuf::from(private_key);
+        if !certificate.is_absolute() || !private_key.is_absolute() || certificate == private_key {
+            return Err("management TLS requires distinct absolute source paths".into());
+        }
+        for path in [&certificate, &private_key] {
+            let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                return Err("management TLS source must be a regular file".into());
+            }
+        }
+        let certificate = read_bounded(&certificate, 64 * 1024)?;
+        let private_key = read_bounded(&private_key, 16 * 1024)?;
+        if certificate.is_empty() || private_key.is_empty() {
+            return Err("management TLS source cannot be empty".into());
+        }
+        Ok(Some(Self {
+            bind,
+            certificate,
+            private_key,
+        }))
+    }
+
+    fn paths(&self, root: &Path) -> (PathBuf, PathBuf) {
+        let directory = root.join("management-tls");
+        (
+            directory.join(format!("management-cert-{}.pem", sha256(&self.certificate))),
+            directory.join(format!("management-key-{}.pem", sha256(&self.private_key))),
+        )
+    }
+
+    fn apply_settings(&self, bootstrap: &mut BootstrapConfig, root: &Path) -> PackageResult<()> {
+        let (certificate, private_key) = self.paths(root);
+        let certificate = format!(
+            "{WORKER_STATE_ROOT_TOKEN}/management-tls/{}",
+            certificate
+                .file_name()
+                .ok_or("TLS filename missing")?
+                .to_string_lossy()
+        );
+        let private_key = format!(
+            "{WORKER_STATE_ROOT_TOKEN}/management-tls/{}",
+            private_key
+                .file_name()
+                .ok_or("TLS filename missing")?
+                .to_string_lossy()
+        );
+        let management = bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.management")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("installer bootstrap lacks management policy")?;
+        if management.get("bind").and_then(serde_json::Value::as_str)
+            == Some(self.bind.to_string().as_str())
+        {
+            return Err("management TLS bind conflicts with HTTP bind".into());
+        }
+        management.insert("tls_bind".into(), serde_json::json!(self.bind));
+        management.insert(
+            "tls_certificate_path".into(),
+            serde_json::json!(certificate),
+        );
+        management.insert(
+            "tls_private_key_path".into(),
+            serde_json::json!(private_key),
+        );
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        root: &Path,
+        machine: bool,
+        mut record: impl FnMut(&Path, &[u8]) -> PackageResult<()>,
+    ) -> PackageResult<()> {
+        let directory = root.join("management-tls");
+        create_machine_private_directory(&directory)?;
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || is_reparse_or_symlink(&metadata) {
+            return Err("management TLS destination is not a real directory".into());
+        }
+        let (certificate, private_key) = self.paths(root);
+        for (path, bytes) in [
+            (&certificate, &self.certificate),
+            (&private_key, &self.private_key),
+        ] {
+            if path.exists() {
+                if read_bounded(path, bytes.len() as u64)? != *bytes {
+                    return Err("management TLS destination changed".into());
+                }
+            } else {
+                record(
+                    path.strip_prefix(root).map_err(|error| error.to_string())?,
+                    bytes,
+                )?;
+                write_atomically(path, bytes).map_err(|error| error.to_string())?;
+            }
+            if machine {
+                protect_machine_private_file(path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
+}
 
 pub fn initialize(root: &Path) -> PackageResult<()> {
+    let tls = InstallerTls::from_environment()?;
     if root.join("bootstrap.json").exists() || root.join("development-key.json").exists() {
         return Err(
             "development root is already initialized; refusing to replace its trust identity"
@@ -54,6 +204,20 @@ pub fn initialize(root: &Path) -> PackageResult<()> {
         "enabled": false,
         "web": {"directory": web_directory.canonicalize().map_err(|error| error.to_string())?, "trusted_keys": bootstrap.trusted_keys}
     }));
+    if let Some(tls) = &tls {
+        let state_root = root.join("data/state");
+        create_private_directory(&state_root)?;
+        tls.write(&state_root, false, |_, _| Ok(()))?;
+        let management = bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.management")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("development bootstrap lacks management settings")?;
+        management.insert("enabled".into(), serde_json::json!(true));
+        management.insert("bind".into(), serde_json::json!("127.0.0.1:0"));
+        tls.apply_settings(&mut bootstrap, &state_root)?;
+    }
 
     write_json_atomically(&root.join("development-key.json"), &encode_hex(&secret))?;
     write_json_atomically(&root.join("bootstrap.json"), &bootstrap)?;
@@ -155,6 +319,7 @@ fn installer_signing_key() -> PackageResult<SigningKey> {
 /// The MSI runs this after its files are present, so the signed package itself
 /// is never rebuilt or re-signed on the installed machine.
 pub fn provision_installer_root(template: &Path, package: &Path, root: &Path) -> PackageResult<()> {
+    let tls = InstallerTls::from_environment()?;
     if root
         .join("bootstrap.json")
         .try_exists()
@@ -163,7 +328,7 @@ pub fn provision_installer_root(template: &Path, package: &Path, root: &Path) ->
         return Err("installer runtime root already exists; refusing to replace it".into());
     }
     create_machine_private_directory(root)?;
-    let result = provision_installer_root_inner(template, package, root);
+    let result = provision_installer_root_inner(template, package, root, tls.as_ref());
     if result.is_err() {
         let _ = unprovision_if_created(root);
     }
@@ -248,12 +413,22 @@ fn install_existing_installer_root(
     root: &Path,
     inject_failure_after_switch: bool,
 ) -> PackageResult<()> {
+    let tls = InstallerTls::from_environment()?;
     let bootstrap_path = root.join("bootstrap.json");
     let selection_path = root.join("selection.json");
     let bootstrap_bytes = read_bounded(&bootstrap_path, MAX_TRANSITION_FILE_BYTES)?;
     let current: BootstrapConfig =
         serde_json::from_slice(&bootstrap_bytes).map_err(|error| error.to_string())?;
-    let candidate = materialize_installer_bootstrap(template, root)?;
+    let current_has_tls = validate_existing_tls_settings(&current)?;
+    if current.development && current_has_tls && tls.is_none() {
+        return Err(
+            "development TLS material must be supplied again for production transition".into(),
+        );
+    }
+    let mut candidate = materialize_installer_bootstrap(template, root)?;
+    if let Some(tls) = &tls {
+        tls.apply_settings(&mut candidate, root)?;
+    }
     require_installer_signer_continuity(&current, &candidate)?;
 
     let selection_bytes = read_bounded(&selection_path, MAX_TRANSITION_FILE_BYTES)?;
@@ -285,13 +460,16 @@ fn install_existing_installer_root(
             production_authorization_upgrade(&current, &candidate);
         let (upgraded_host, host_result) =
             production_host_configuration_upgrade(&current, &candidate);
-        let has_upgrade = upgraded_auth.is_some() || upgraded_host.is_some();
+        let has_upgrade = upgraded_auth.is_some() || upgraded_host.is_some() || tls.is_some();
         let mut upgraded = upgraded_auth.unwrap_or_else(|| current.clone());
         if let Some(grants) = upgraded_host {
             upgraded
                 .policy
                 .principals
                 .insert("amaterasu.host-configuration".into(), grants);
+        }
+        if let Some(tls) = &tls {
+            tls.apply_settings(&mut upgraded, root)?;
         }
         let upgraded = has_upgrade.then_some(upgraded);
         if let Some(upgraded) = upgraded {
@@ -305,6 +483,7 @@ fn install_existing_installer_root(
                 &bootstrap_bytes,
                 &selection_bytes,
                 inject_failure_after_switch,
+                tls.as_ref(),
             )?;
         } else if next_package.digest != active
             && selection.pending.as_deref() != Some(next_package.digest.as_str())
@@ -319,6 +498,7 @@ fn install_existing_installer_root(
                 &bootstrap_bytes,
                 &selection_bytes,
                 inject_failure_after_switch,
+                None,
             )?;
         } else if selection.pending.as_deref() == Some(next_package.digest.as_str()) {
             verify_package(
@@ -342,7 +522,25 @@ fn install_existing_installer_root(
         &bootstrap_bytes,
         &selection_bytes,
         inject_failure_after_switch,
+        tls.as_ref(),
     )
+}
+
+fn validate_existing_tls_settings(bootstrap: &BootstrapConfig) -> PackageResult<bool> {
+    let Some(management) = bootstrap
+        .policy
+        .settings
+        .get("amaterasu.management")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(false);
+    };
+    let fields = ["tls_bind", "tls_certificate_path", "tls_private_key_path"];
+    let present = fields.map(|field| management.get(field).is_some_and(|value| !value.is_null()));
+    if present.iter().any(|value| *value) && !present.iter().all(|value| *value) {
+        return Err("installed management TLS settings are incomplete".into());
+    }
+    Ok(present[0])
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -496,10 +694,16 @@ fn transition_installer_policy(
     bootstrap_bytes: &[u8],
     selection_bytes: &[u8],
     inject_failure_after_switch: bool,
+    tls: Option<&InstallerTls>,
 ) -> PackageResult<()> {
     let bootstrap_path = root.join("bootstrap.json");
     let transition = PolicyTransition::begin(root, bootstrap_bytes, selection_bytes)?;
     let result = (|| {
+        if let Some(tls) = tls {
+            tls.write(root, true, |path, bytes| {
+                transition.record_tls_file(path, bytes)
+            })?;
+        }
         if next_digest != active {
             transition.record_new_set(next_digest)?;
             let _ = stage_package(package, root, current, false)?;
@@ -600,6 +804,8 @@ struct PolicyTransitionJournal {
     backups: Vec<TransitionBackup>,
     replacements: Vec<TransitionReplacement>,
     created_set: Option<String>,
+    #[serde(default)]
+    created_tls: Vec<JournalFile>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -653,6 +859,7 @@ impl PolicyTransition {
             backups,
             replacements: Vec::new(),
             created_set: None,
+            created_tls: Vec::new(),
         };
         validate_policy_transition(&journal)?;
         write_json_atomically(&journal_path, &journal)?;
@@ -675,6 +882,15 @@ impl PolicyTransition {
         if journal.created_set.replace(digest.into()).is_some() {
             return Err("installer policy transition already records a package set".into());
         }
+        self.write(&journal)
+    }
+
+    fn record_tls_file(&self, path: &Path, bytes: &[u8]) -> PackageResult<()> {
+        let mut journal = self.read()?;
+        journal.created_tls.push(JournalFile {
+            path: path.to_path_buf(),
+            sha256: sha256(bytes),
+        });
         self.write(&journal)
     }
 
@@ -734,10 +950,22 @@ fn rollback_policy_transition_locked(root: &Path) -> PackageResult<()> {
         }
         write_atomically(&root.join(&backup.path), &bytes).map_err(|error| error.to_string())?;
     }
+    for file in &journal.created_tls {
+        if root.join(&file.path).exists()
+            && sha256(&read_bounded(&root.join(&file.path), 64 * 1024)?) != file.sha256
+        {
+            return Err("management TLS file changed after transition; refusing rollback".into());
+        }
+    }
     if let Some(digest) = &journal.created_set {
         let directory = package_directory(root, digest)?;
         if directory.try_exists().map_err(|error| error.to_string())? {
             fs::remove_dir_all(&directory).map_err(|error| error.to_string())?;
+        }
+    }
+    for file in journal.created_tls.iter().rev() {
+        if root.join(&file.path).exists() {
+            fs::remove_file(root.join(&file.path)).map_err(|error| error.to_string())?;
         }
     }
     let backup = root.join(&journal.backup_directory);
@@ -793,6 +1021,10 @@ fn validate_policy_transition(journal: &PolicyTransitionJournal) -> PackageResul
             .created_set
             .as_deref()
             .is_some_and(|digest| !valid_digest(digest))
+        || journal
+            .created_tls
+            .iter()
+            .any(|file| !valid_tls_seed_file(&file.path) || !valid_digest(&file.sha256))
     {
         return Err("installer policy transition journal is invalid".into());
     }
@@ -807,17 +1039,46 @@ fn validate_policy_transition(journal: &PolicyTransitionJournal) -> PackageResul
     Ok(())
 }
 
+fn valid_tls_seed_file(path: &Path) -> bool {
+    normal_relative(path)
+        && path.components().count() == 2
+        && path.starts_with("management-tls")
+        && path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            let hash = name
+                .strip_prefix("management-cert-")
+                .or_else(|| name.strip_prefix("management-key-"));
+            hash.and_then(|name| name.strip_suffix(".pem"))
+                .is_some_and(valid_digest)
+        })
+}
+
 fn provision_installer_root_inner(
     template: &Path,
     package: &Path,
     root: &Path,
+    tls: Option<&InstallerTls>,
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
-    let bootstrap = materialize_installer_bootstrap(template, root)?;
+    let mut bootstrap = materialize_installer_bootstrap(template, root)?;
+    if let Some(tls) = tls {
+        tls.apply_settings(&mut bootstrap, root)?;
+    }
     let mut journal = ProvisionJournal::default();
     write_journal(root, &mut journal)?;
     create_journaled_directory(root, Path::new("data"), &mut journal)?;
     create_journaled_directory(root, Path::new("data/state"), &mut journal)?;
+    if let Some(tls) = tls {
+        create_journaled_directory(root, Path::new("management-tls"), &mut journal)?;
+        write_journal(root, &mut journal)?;
+        tls.write(root, true, |path, bytes| {
+            journal.files.push(JournalFile {
+                path: path.to_path_buf(),
+                sha256: sha256(bytes),
+            });
+            write_journal(root, &mut journal)
+        })?;
+    }
     write_journal(root, &mut journal)?;
     write_json_atomically(&root.join("bootstrap.json"), &bootstrap)?;
     record_journal_file(root, Path::new("bootstrap.json"), &mut journal)?;
@@ -919,7 +1180,7 @@ fn record_journal_file(
     Ok(())
 }
 fn validate_journal(journal: &ProvisionJournal) -> PackageResult<()> {
-    if journal.schema != 1 || journal.directories.len() > 4 || journal.files.len() > 64 {
+    if journal.schema != 1 || journal.directories.len() > 5 || journal.files.len() > 66 {
         return Err("installer provision journal is invalid".into());
     }
     if journal
@@ -943,6 +1204,7 @@ fn normal_relative(path: &Path) -> bool {
 fn valid_directory(path: &Path) -> bool {
     path == Path::new("data")
         || path == Path::new("data/state")
+        || path == Path::new("management-tls")
         || path == Path::new("sets")
         || (path.components().count() == 2
             && path
@@ -958,15 +1220,16 @@ fn valid_file(path: &Path) -> bool {
     matches!(
         path.to_string_lossy().as_ref(),
         "bootstrap.json" | "selection.json"
-    ) || (path.components().count() == 3
-        && path
-            .components()
-            .next()
-            .is_some_and(|part| part.as_os_str() == "sets")
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| !name.is_empty() && name.len() <= 256))
+    ) || valid_tls_seed_file(path)
+        || (path.components().count() == 3
+            && path
+                .components()
+                .next()
+                .is_some_and(|part| part.as_os_str() == "sets")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.is_empty() && name.len() <= 256))
 }
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
@@ -1096,6 +1359,153 @@ mod provision_tests {
             .call
             .remove("amaterasu.diagnostics/1");
         write_json_atomically(&template_path, &template).unwrap();
+    }
+
+    #[test]
+    fn supplied_tls_survives_reinstall_and_rotation_rolls_back_with_policy() {
+        let root = fixture("tls-provision-rotation");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[31; 32]));
+        let certificate = root.join("supplied-cert.pem");
+        let private_key = root.join("supplied-key.pem");
+        fs::write(
+            &certificate,
+            include_bytes!("../../../modules/management/tests/fixtures/browser-cert.pem"),
+        )
+        .unwrap();
+        fs::write(
+            &private_key,
+            include_bytes!("../../../modules/management/tests/fixtures/browser-key.pem"),
+        )
+        .unwrap();
+        let original = InstallerTls {
+            bind: "127.0.0.1:47989".parse().unwrap(),
+            certificate: fs::read(&certificate).unwrap(),
+            private_key: fs::read(&private_key).unwrap(),
+        };
+        let runtime = root.join("runtime");
+        create_machine_private_directory(&runtime).unwrap();
+        provision_installer_root_inner(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+            Some(&original),
+        )
+        .unwrap();
+        let (cert_path, key_path) = original.paths(&runtime);
+        assert_eq!(fs::read(&cert_path).unwrap(), original.certificate);
+        assert_eq!(fs::read(&key_path).unwrap(), original.private_key);
+        let before: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        let settings = &before.policy.settings["amaterasu.management"];
+        assert_eq!(settings["tls_bind"], "127.0.0.1:47989");
+        assert!(
+            settings["tls_certificate_path"]
+                .as_str()
+                .unwrap()
+                .starts_with(WORKER_STATE_ROOT_TOKEN)
+        );
+        assert!(
+            settings["tls_private_key_path"]
+                .as_str()
+                .unwrap()
+                .starts_with(WORKER_STATE_ROOT_TOKEN)
+        );
+        finalize_installer_provision(&runtime).unwrap();
+
+        // A later installer run with no TLS input retains locally installed settings.
+        install_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            read_json::<BootstrapConfig>(&runtime.join("bootstrap.json"))
+                .unwrap()
+                .policy
+                .settings["amaterasu.management"],
+            *settings
+        );
+        let mut rotated = InstallerTls {
+            bind: original.bind,
+            certificate: original.certificate.clone(),
+            private_key: original.private_key.clone(),
+        };
+        rotated.private_key.extend_from_slice(b"\n");
+        let (rotated_cert, rotated_key) = rotated.paths(&runtime);
+        let mut replacement = before.clone();
+        rotated.apply_settings(&mut replacement, &runtime).unwrap();
+        let bootstrap_bytes = fs::read(runtime.join("bootstrap.json")).unwrap();
+        let selection_bytes = fs::read(runtime.join("selection.json")).unwrap();
+        let active = read_json::<ActivationState>(&runtime.join("selection.json"))
+            .unwrap()
+            .active
+            .unwrap();
+        {
+            let _lock = RootLock::acquire(&runtime).unwrap();
+            assert!(
+                transition_installer_policy(
+                    &runtime,
+                    &seed.join("package"),
+                    &before,
+                    Some(&replacement),
+                    &active,
+                    &active,
+                    &bootstrap_bytes,
+                    &selection_bytes,
+                    true,
+                    Some(&rotated)
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_bytes
+        );
+        assert!(!rotated_key.exists());
+        assert!(rotated_cert.exists());
+        {
+            let _lock = RootLock::acquire(&runtime).unwrap();
+            transition_installer_policy(
+                &runtime,
+                &seed.join("package"),
+                &before,
+                Some(&replacement),
+                &active,
+                &active,
+                &bootstrap_bytes,
+                &selection_bytes,
+                false,
+                Some(&rotated),
+            )
+            .unwrap();
+        }
+        assert_eq!(fs::read(&rotated_key).unwrap(), rotated.private_key);
+        let rotated_settings = replacement.policy.settings["amaterasu.management"].clone();
+        assert_eq!(
+            read_json::<BootstrapConfig>(&runtime.join("bootstrap.json"))
+                .unwrap()
+                .policy
+                .settings["amaterasu.management"],
+            rotated_settings
+        );
+        finalize_installer_provision(&runtime).unwrap();
+        install_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            read_json::<BootstrapConfig>(&runtime.join("bootstrap.json"))
+                .unwrap()
+                .policy
+                .settings["amaterasu.management"],
+            rotated_settings
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
