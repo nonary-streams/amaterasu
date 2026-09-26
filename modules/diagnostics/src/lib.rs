@@ -640,6 +640,106 @@ mod hydration_tests {
     }
 
     #[test]
+    fn signed_logging_revision_recovers_after_disk_path_returns() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-signed-recovery-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut journal = Journal::unready();
+        let mut reader = HostLoggingConfigurationReader::default();
+        let now = Instant::now();
+        let apply = || {
+            json!({
+                "action":"apply_host_logging",
+                "configuration":configuration(&root, 7, "capture.log")
+            })
+        };
+        let request = |journal: &mut Journal, reader: &mut HostLoggingConfigurationReader| {
+            handle_request(
+                journal,
+                reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(),
+                now,
+                Some(&root),
+            )
+        };
+        let record = |message| json!({"action":"record","level":"error","target":"capture","message":message});
+        let status = |journal: &mut Journal| journal.handle("capture", json!({"action":"status"}));
+
+        assert_eq!(
+            request(&mut journal, &mut reader),
+            json!({"ok":true,"applied_revision":7})
+        );
+        journal.close_sink_for_test();
+        let log_directory = root.join("logs");
+        let saved_logs = root.join("saved_logs");
+        std::fs::rename(&log_directory, &saved_logs).unwrap();
+        std::fs::write(&log_directory, b"block session reopening").unwrap();
+
+        assert_eq!(
+            journal.handle("capture", record("during outage"))["sequence"],
+            1
+        );
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"write"})
+        );
+        assert_eq!(status(&mut journal)["logging_configuration_revision"], 7);
+        assert_eq!(
+            request(&mut journal, &mut reader),
+            json!({"ok":false,"code":"logging_unavailable"})
+        );
+        let retry = Instant::now() + std::time::Duration::from_secs(5);
+        journal.recover_logging_if_due(retry);
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"open"})
+        );
+        assert_eq!(
+            request(&mut journal, &mut reader),
+            json!({"ok":false,"code":"logging_unavailable"})
+        );
+
+        std::fs::remove_file(&log_directory).unwrap();
+        std::fs::rename(&saved_logs, &log_directory).unwrap();
+        journal.recover_logging_if_due(retry + std::time::Duration::from_secs(5));
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"healthy","failure":null})
+        );
+        assert_eq!(status(&mut journal)["logging_configuration_revision"], 7);
+        let files_after_recovery = std::fs::read_dir(&log_directory).unwrap().count();
+        assert_eq!(
+            request(&mut journal, &mut reader),
+            json!({"ok":true,"applied_revision":7})
+        );
+        assert_eq!(
+            std::fs::read_dir(&log_directory).unwrap().count(),
+            files_after_recovery
+        );
+        assert_eq!(
+            journal.handle("capture", record("after recovery"))["sequence"],
+            2
+        );
+        let contents = std::fs::read_dir(&log_directory)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(contents.matches("after recovery").count(), 1);
+        assert!(!contents.contains("during outage"));
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn valid_provider_configuration_enables_readiness_after_path_validation() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
