@@ -211,6 +211,9 @@ pub struct Client {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfigOverrides {
+    /// Physical presentation mode; the streamed viewport and cadence are separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,6 +286,13 @@ pub struct ClientConfigOverrides {
 
 impl ClientConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .display_mode
+            .as_deref()
+            .is_some_and(|mode| parse_client_display_mode(mode).is_none())
+        {
+            return Err("invalid_config_overrides");
+        }
         if self
             .fec_percentage
             .is_some_and(|percentage| percentage == 0)
@@ -394,7 +404,8 @@ impl ClientConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fec_percentage.is_none()
+        self.display_mode.is_none()
+            && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
@@ -454,6 +465,52 @@ impl ClientConfigOverrides {
                 || self.rtss_frame_limit_type.is_some()
         }
     }
+}
+
+/// The final component is Hz with up to three decimals. Historical integral
+/// values above 1000 are already millihertz, as in paired client exports.
+fn parse_client_display_mode(mode: &str) -> Option<(u32, u32, u32)> {
+    let mut components = mode.split('x');
+    let parse_unsigned = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u32>().ok())
+            .flatten()
+    };
+    let width = parse_unsigned(components.next()?)?;
+    let height = parse_unsigned(components.next()?)?;
+    let refresh = components.next()?;
+    if components.next().is_some()
+        || width == 0
+        || height == 0
+        || width > i32::MAX as u32
+        || height > i32::MAX as u32
+    {
+        return None;
+    }
+    let millihertz = if let Some((whole, fraction)) = refresh.split_once('.') {
+        if fraction.is_empty()
+            || fraction.len() > 3
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let whole = parse_unsigned(whole)?;
+        let scale = 10_u32.pow(3 - fraction.len() as u32);
+        let fractional_millihertz = parse_unsigned(fraction)?.checked_mul(scale)?;
+        whole
+            .checked_mul(1000)?
+            .checked_add(fractional_millihertz)?
+    } else {
+        let raw = parse_unsigned(refresh)?;
+        if raw > 1000 {
+            raw
+        } else {
+            raw.checked_mul(1000)?
+        }
+    };
+    (10_000..=1_000_000)
+        .contains(&millihertz)
+        .then_some((width, height, millihertz))
 }
 
 fn valid_display_mode_remapping(value: &serde_json::Value) -> bool {
@@ -1430,5 +1487,56 @@ mod tests {
         let spaced_resolution: ClientConfigOverrides =
             serde_json::from_value(json!({"dd_manual_resolution":" 1920×1080 "})).unwrap();
         spaced_resolution.validate().unwrap();
+    }
+
+    #[test]
+    fn paired_client_display_mode_keeps_exact_physical_refresh() {
+        let inherited: ClientConfigOverrides =
+            serde_json::from_value(json!({"display_mode":null})).unwrap();
+        inherited.validate().unwrap();
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        for (mode, expected_millihertz) in [
+            ("1920x1080x59.94", 59_940),
+            ("1920x1080x59.004", 59_004),
+            ("1920x1080x60", 60_000),
+            ("1920x1080x60000", 60_000),
+        ] {
+            let selected: ClientConfigOverrides =
+                serde_json::from_value(json!({"display_mode":mode})).unwrap();
+            selected.validate().unwrap();
+            assert!(!selected.is_empty());
+            assert_eq!(
+                parse_client_display_mode(mode).unwrap().2,
+                expected_millihertz
+            );
+            assert_eq!(
+                serde_json::to_value(selected).unwrap(),
+                json!({"display_mode":mode})
+            );
+        }
+        for mode in [
+            "",
+            "0x1080x60",
+            "1920x0x60",
+            "1920x1080x0",
+            "1920x1080x9.999",
+            "1920x1080x1000.001",
+            "1920x1080x59.1234",
+            "1920x1080x59.",
+            "1920x1080x.5",
+            "1920x1080x+60",
+            "1920x1080x60x1",
+            "1920×1080×60",
+        ] {
+            let selected: ClientConfigOverrides =
+                serde_json::from_value(json!({"display_mode":mode})).unwrap();
+            assert_eq!(
+                selected.validate(),
+                Err("invalid_config_overrides"),
+                "{mode}"
+            );
+        }
     }
 }
