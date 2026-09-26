@@ -303,20 +303,30 @@ namespace Amaterasu {
     path: string,
   ): Promise<HostConfiguration> {
     const logging = parseHostLoggingSettings(level, path);
-    await api.post("host-configuration/update", {
+    const updated = parseHostConfigurationReply(await api.post<unknown>("host-configuration/update", {
       ...current.values,
       ...logging,
       expected_revision: current.revision,
-    });
+    }));
+    if (!confirmsHostLoggingUpdate(updated, current, logging))
+      throw new Error("Host logging update could not be confirmed. Refresh and check the current values.");
     const saved = parseHostConfigurationReply(await api.post<unknown>("host-configuration/get"));
-    if (saved.revision !== current.revision + 1 ||
-        saved.values.log_path !== logging.log_path ||
-        saved.values.min_log_level !== logging.min_log_level ||
-        ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert"].some(
-          (key) => saved.values[key as keyof typeof saved.values] !== current.values[key as keyof typeof current.values],
-        ))
+    if (!confirmsHostLoggingUpdate(saved, current, logging))
       throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
     return saved;
+  }
+
+  function confirmsHostLoggingUpdate(
+    reply: HostConfiguration,
+    current: HostConfiguration,
+    logging: { min_log_level: HostLogLevel; log_path: string },
+  ): boolean {
+    return reply.revision === current.revision + 1 &&
+      reply.values.log_path === logging.log_path &&
+      reply.values.min_log_level === logging.min_log_level &&
+      ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert"].every(
+        (key) => reply.values[key as keyof typeof reply.values] === current.values[key as keyof typeof current.values],
+      );
   }
 
   type DiagnosticsSinkStatus = DiagnosticsLoggingStatus & {
@@ -348,6 +358,28 @@ namespace Amaterasu {
   ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsSinkStatus | null }> {
     const settings = parseHostConfigurationReply(await api.post<unknown>("host-configuration/get"));
     return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+  }
+
+  export class HostLoggingLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<{
+      settings: HostConfiguration;
+      diagnostics: DiagnosticsSinkStatus | null;
+    } | null> {
+      const generation = ++this.generation;
+      try {
+        const state = await readHostLoggingState(api);
+        return generation === this.generation ? state : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
   }
 
   async function readDiagnosticsLoggingStatus(api: Pick<Api, "post">): Promise<DiagnosticsSinkStatus | null> {
@@ -1018,6 +1050,7 @@ namespace Amaterasu {
     const authArea = el("div");
     const authLoads = new AuthTokenSettingsLoadGate();
     const hostLoggingArea = el("div");
+    const hostLoggingLoads = new HostLoggingLoadGate();
     const hostArea = el("div");
     const steamArea = el("div");
     const lutrisArea = el("div");
@@ -1129,7 +1162,9 @@ namespace Amaterasu {
     async function loadHostLogging(): Promise<void> {
       hostLoggingArea.replaceChildren(el("p", "muted", "Loading host logging policy…"));
       try {
-        const { settings, diagnostics: diagnosticsStatus } = await readHostLoggingState(context.api);
+        const state = await hostLoggingLoads.read(context.api);
+        if (state === null) return;
+        const { settings, diagnostics: diagnosticsStatus } = state;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const level = el("select");
@@ -1169,6 +1204,7 @@ namespace Amaterasu {
           event.preventDefault();
           if (!form.reportValidity()) return;
           void runAction(save, status, async () => {
+            hostLoggingLoads.invalidate();
             try {
               const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
               context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));

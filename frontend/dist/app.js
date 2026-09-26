@@ -2323,20 +2323,25 @@ var Amaterasu;
     Amaterasu.parseHostConfigurationReply = parseHostConfigurationReply;
     async function saveHostLoggingSettings(api, current, level, path) {
         const logging = parseHostLoggingSettings(level, path);
-        await api.post("host-configuration/update", {
+        const updated = parseHostConfigurationReply(await api.post("host-configuration/update", {
             ...current.values,
             ...logging,
             expected_revision: current.revision,
-        });
+        }));
+        if (!confirmsHostLoggingUpdate(updated, current, logging))
+            throw new Error("Host logging update could not be confirmed. Refresh and check the current values.");
         const saved = parseHostConfigurationReply(await api.post("host-configuration/get"));
-        if (saved.revision !== current.revision + 1 ||
-            saved.values.log_path !== logging.log_path ||
-            saved.values.min_log_level !== logging.min_log_level ||
-            ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert"].some((key) => saved.values[key] !== current.values[key]))
+        if (!confirmsHostLoggingUpdate(saved, current, logging))
             throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
         return saved;
     }
     Amaterasu.saveHostLoggingSettings = saveHostLoggingSettings;
+    function confirmsHostLoggingUpdate(reply, current, logging) {
+        return reply.revision === current.revision + 1 &&
+            reply.values.log_path === logging.log_path &&
+            reply.values.min_log_level === logging.min_log_level &&
+            ["file_state", "vibeshine_file_state", "credentials_file", "pkey", "cert"].every((key) => reply.values[key] === current.values[key]);
+    }
     function parseDiagnosticsLoggingStatus(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Diagnostics status is invalid.");
@@ -2362,6 +2367,25 @@ var Amaterasu;
         return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
     }
     Amaterasu.readHostLoggingState = readHostLoggingState;
+    class HostLoggingLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        async read(api) {
+            const generation = ++this.generation;
+            try {
+                const state = await readHostLoggingState(api);
+                return generation === this.generation ? state : null;
+            }
+            catch (error) {
+                if (generation !== this.generation)
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.HostLoggingLoadGate = HostLoggingLoadGate;
     async function readDiagnosticsLoggingStatus(api) {
         try {
             return parseDiagnosticsLoggingStatus(await api.post("diagnostics/status"));
@@ -2949,6 +2973,7 @@ var Amaterasu;
         const authArea = Amaterasu.el("div");
         const authLoads = new AuthTokenSettingsLoadGate();
         const hostLoggingArea = Amaterasu.el("div");
+        const hostLoggingLoads = new HostLoggingLoadGate();
         const hostArea = Amaterasu.el("div");
         const steamArea = Amaterasu.el("div");
         const lutrisArea = Amaterasu.el("div");
@@ -3022,7 +3047,10 @@ var Amaterasu;
         async function loadHostLogging() {
             hostLoggingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host logging policy…"));
             try {
-                const { settings, diagnostics: diagnosticsStatus } = await readHostLoggingState(context.api);
+                const state = await hostLoggingLoads.read(context.api);
+                if (state === null)
+                    return;
+                const { settings, diagnostics: diagnosticsStatus } = state;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3055,6 +3083,7 @@ var Amaterasu;
                     if (!form.reportValidity())
                         return;
                     void Amaterasu.runAction(save, status, async () => {
+                        hostLoggingLoads.invalidate();
                         try {
                             const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
                             context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));

@@ -216,7 +216,7 @@ test("host logging editor preserves other paths under CAS and confirms signed re
         values: { ...original.values, log_path: body.log_path, min_log_level: body.min_log_level },
         effective: { log_path: "C:/state/logs/diagnostics.log", min_log_level: "warning" },
       };
-      return { ok: true };
+      return ordinary(stored);
     },
   };
   const current = context.Amaterasu.parseHostConfigurationReply(await api.post("host-configuration/get"));
@@ -250,9 +250,13 @@ test("host logging editor rejects invalid values, stale revisions and changed un
     { ...hostConfiguration(7), values: { ...hostConfiguration().values, log_path: "other.log" } },
     { ...hostConfiguration(7), values: { ...hostConfiguration().values, cert: "changed.pem", log_path: "new.log" } },
   ]) {
+    const updated = {
+      ...hostConfiguration(7),
+      values: { ...hostConfiguration().values, log_path: "new.log" },
+    };
     const api = {
       async post(route) {
-        return route === "host-configuration/get" ? changed : { ok: true };
+        return route === "host-configuration/get" ? changed : updated;
       },
     };
     await assert.rejects(
@@ -260,6 +264,49 @@ test("host logging editor rejects invalid values, stale revisions and changed un
       /could not be confirmed/,
     );
   }
+  const confirmed = {
+    ...hostConfiguration(7),
+    values: { ...hostConfiguration().values, log_path: "new.log" },
+  };
+  for (const rejected of [
+    { ok: false, error: { code: "revision_conflict" } },
+    hostConfiguration(6),
+    { ...confirmed, revision: 8 },
+    { ...confirmed, values: { ...confirmed.values, cert: "other/key.pem" } },
+    { ...confirmed, values: { ...confirmed.values, log_path: "different.log" } },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveHostLoggingSettings({ async post(route) {
+      routes.push(route);
+      return rejected;
+    } }, hostConfiguration(), "product_default", "new.log"));
+    assert.deepEqual(routes, ["host-configuration/update"]);
+  }
+});
+
+test("host logging editor discards delayed loads and failures after refresh or save", async () => {
+  const gate = new context.Amaterasu.HostLoggingLoadGate();
+  const pending = [];
+  const api = { post(route) {
+    if (route === "diagnostics/status")
+      return Promise.resolve({ ok: true, ready: true, logging_configuration_revision: 8 });
+    assert.equal(route, "host-configuration/get");
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  } };
+  const old = gate.read(api);
+  const latest = gate.read(api);
+  pending[1].resolve(hostConfiguration(8));
+  assert.equal((await latest).settings.revision, 8);
+  pending[0].resolve(hostConfiguration(7));
+  assert.equal(await old, null);
+
+  const duringSave = gate.read(api);
+  gate.invalidate();
+  pending[2].reject(new Error("old load failed"));
+  assert.equal(await duringSave, null);
+  const reloaded = gate.read(api);
+  pending[3].resolve(hostConfiguration(9));
+  assert.equal((await reloaded).settings.revision, 9);
 });
 
 test("diagnostics status distinguishes saved, pending, unavailable and newer logging revisions", () => {
@@ -289,7 +336,7 @@ test("host logging save confirms signed readback and reports disk sink failure a
       assert.equal(body.expected_revision, stored.revision);
       stored = hostConfiguration(stored.revision + 1);
       stored.values = { ...stored.values, min_log_level: body.min_log_level, log_path: body.log_path };
-      return { ok: true };
+      return stored;
     }
     if (route === "host-configuration/get") return stored;
     return { ok: true, ready: true, logging_configuration_revision: stored.revision, logging_sink: sink };
