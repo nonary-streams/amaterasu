@@ -10,6 +10,7 @@ const STATE_KEY: &str = "global/amaterasu.host-configuration";
 const MAX_DOCUMENT_BYTES: usize = 12_000;
 const MAX_RESPONSE_BYTES: usize = 16_384;
 const MAX_REQUEST_MS: u64 = 30_000;
+const DIAGNOSTICS_SERVICE: &str = "amaterasu.diagnostics/1";
 
 type TransportResult = ModuleResult<Response>;
 
@@ -17,6 +18,15 @@ struct Incoming {
     request_id: u64,
     operation: Operation,
     deadline: Instant,
+}
+
+struct UpdateToSave {
+    request_id: u64,
+    deadline: Instant,
+    state_revision: u64,
+    document: Document,
+    previous: Document,
+    response: Value,
 }
 
 struct Pending {
@@ -32,6 +42,16 @@ enum Stage {
     Saving {
         expected_state_revision: u64,
         response: Value,
+        previous: Document,
+    },
+    Applying {
+        response: Value,
+        previous: Document,
+        saved_state_revision: u64,
+    },
+    RollingBack {
+        saved_revision: u64,
+        expected_state_revision: u64,
     },
 }
 
@@ -167,11 +187,22 @@ impl Pipeline {
             let _ = send(Command::ReleaseResult {
                 request: pending.state_request_id,
             });
-            return complete(
-                send,
-                pending.request_id,
-                error("deadline_exceeded", "host configuration request expired"),
-            );
+            let response = match pending.stage {
+                Stage::Saving { response, .. } => {
+                    save_unconfirmed(response["revision"].as_u64().unwrap_or_default())
+                }
+                Stage::Applying { response, .. } => {
+                    application_unconfirmed(response["revision"].as_u64().unwrap_or_default())
+                }
+                Stage::RollingBack { saved_revision, .. } => rollback_unconfirmed(
+                    saved_revision,
+                    "compensating write timed out; inspect current configuration before retrying",
+                ),
+                Stage::Loading(_) => {
+                    error("deadline_exceeded", "host configuration request expired")
+                }
+            };
+            return complete(send, pending.request_id, response);
         }
         if matches!(&pending.phase, PendingPhase::Releasing(_)) {
             let outcome = match std::mem::replace(&mut pending.phase, PendingPhase::Waiting) {
@@ -181,9 +212,16 @@ impl Pipeline {
             return self.release_and_consume(pending, outcome, send);
         }
 
-        match send(Command::TakeResult {
+        let result = match send(Command::TakeResult {
             request: pending.state_request_id,
-        })? {
+        }) {
+            Ok(result) => result,
+            Err(_) => {
+                self.pending = Some(pending);
+                return Ok(());
+            }
+        };
+        match result {
             Response::Pending => {
                 self.pending = Some(pending);
                 Ok(())
@@ -191,18 +229,15 @@ impl Pipeline {
             Response::Result { payload } => {
                 self.release_and_consume(pending, ChildOutcome::Payload(payload), send)
             }
-            Response::Error { code, message }
-                if code == "not_found" || code == "permission_denied" =>
-            {
-                self.finish_child_failure(pending.request_id, code, message, send)
-            }
             Response::Error { code, message } => {
                 self.release_and_consume(pending, ChildOutcome::Failure { code, message }, send)
             }
-            response => self.finish_child_failure(
-                pending.request_id,
-                "invalid_state_response".into(),
-                format!("unexpected state response: {response:?}"),
+            response => self.release_and_consume(
+                pending,
+                ChildOutcome::Failure {
+                    code: "invalid_child_response".into(),
+                    message: format!("unexpected child response: {response:?}"),
+                },
                 send,
             ),
         }
@@ -248,25 +283,98 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         match outcome {
-            ChildOutcome::Failure { code, message } => {
-                self.finish_child_failure(pending.request_id, code, message, send)
-            }
+            ChildOutcome::Failure { code, message } => match pending.stage {
+                Stage::Applying {
+                    previous,
+                    saved_state_revision,
+                    response,
+                } if code == "permission_denied" => self.rollback(
+                    pending.request_id,
+                    saved_state_revision,
+                    previous,
+                    response["revision"].as_u64().unwrap_or_default(),
+                    send,
+                ),
+                Stage::Applying { response, .. } => complete(
+                    send,
+                    pending.request_id,
+                    application_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
+                ),
+                Stage::RollingBack { saved_revision, .. } => complete(
+                    send,
+                    pending.request_id,
+                    rollback_failed(
+                        saved_revision,
+                        format!("state service failure ({code}): {message}"),
+                    ),
+                ),
+                _ => self.finish_child_failure(pending.request_id, code, message, send),
+            },
             ChildOutcome::Payload(payload) => {
                 if payload.get("ok").and_then(Value::as_bool) != Some(true) {
                     let message = payload
                         .pointer("/error/message")
                         .and_then(Value::as_str)
                         .unwrap_or("state returned an unsuccessful response");
-                    return complete(send, pending.request_id, unavailable(message));
+                    return match pending.stage {
+                        Stage::Applying {
+                            previous,
+                            saved_state_revision,
+                            response,
+                        } => self.rollback(
+                            pending.request_id,
+                            saved_state_revision,
+                            previous,
+                            response["revision"].as_u64().unwrap_or_default(),
+                            send,
+                        ),
+                        Stage::RollingBack { saved_revision, .. } => complete(
+                            send,
+                            pending.request_id,
+                            rollback_failed(saved_revision, message),
+                        ),
+                        _ => complete(send, pending.request_id, unavailable(message)),
+                    };
+                }
+                if let Stage::Applying {
+                    response,
+                    previous,
+                    saved_state_revision,
+                } = pending.stage
+                {
+                    let saved_revision = response["revision"].as_u64().unwrap_or_default();
+                    if payload.get("applied_revision").and_then(Value::as_u64)
+                        == Some(saved_revision)
+                    {
+                        let mut response = response;
+                        response["logging"] = json!({
+                            "saved_revision":saved_revision,
+                            "applied_revision":saved_revision,
+                            "status":"applied"
+                        });
+                        return complete(send, pending.request_id, response);
+                    }
+                    let _ = (previous, saved_state_revision);
+                    return complete(
+                        send,
+                        pending.request_id,
+                        application_unconfirmed(saved_revision),
+                    );
                 }
                 let state_revision = match payload.get("revision").and_then(Value::as_u64) {
                     Some(revision) => revision,
                     None => {
-                        return complete(
-                            send,
-                            pending.request_id,
-                            unavailable("state response omitted its revision"),
-                        );
+                        let response = match pending.stage {
+                            Stage::RollingBack { saved_revision, .. } => rollback_unconfirmed(
+                                saved_revision,
+                                "compensating write response omitted its revision",
+                            ),
+                            Stage::Saving { response, .. } => {
+                                save_unconfirmed(response["revision"].as_u64().unwrap_or_default())
+                            }
+                            _ => unavailable("state response omitted its revision"),
+                        };
+                        return complete(send, pending.request_id, response);
                     }
                 };
                 match pending.stage {
@@ -287,6 +395,7 @@ impl Pipeline {
                     Stage::Saving {
                         expected_state_revision,
                         response,
+                        previous,
                     } => {
                         let Some(written_revision) =
                             state_revision.checked_sub(expected_state_revision)
@@ -294,18 +403,50 @@ impl Pipeline {
                             return complete(
                                 send,
                                 pending.request_id,
-                                unavailable("state revision moved backwards after update"),
+                                save_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
                             );
                         };
                         if written_revision != 1 {
                             return complete(
                                 send,
                                 pending.request_id,
-                                unavailable("state did not confirm the expected durable update"),
+                                save_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
                             );
                         }
-                        complete(send, pending.request_id, response)
+                        self.apply_logging(
+                            pending.request_id,
+                            pending.deadline,
+                            written_revision + expected_state_revision,
+                            previous,
+                            response,
+                            send,
+                        )
                     }
+                    Stage::RollingBack {
+                        saved_revision,
+                        expected_state_revision,
+                    } => {
+                        if state_revision != expected_state_revision.saturating_add(1) {
+                            return complete(
+                                send,
+                                pending.request_id,
+                                rollback_unconfirmed(
+                                    saved_revision,
+                                    "state did not confirm the compensating write",
+                                ),
+                            );
+                        }
+                        complete(
+                            send,
+                            pending.request_id,
+                            json!({
+                                "ok":false,
+                                "error":{"code":"logging_apply_failed","message":"logging policy could not be applied; previous configuration was restored"},
+                                "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"rolled_back"}
+                            }),
+                        )
+                    }
+                    Stage::Applying { .. } => unreachable!(),
                 }
             }
         }
@@ -368,6 +509,16 @@ impl Pipeline {
                         );
                     }
                 };
+                if revision.checked_add(1).is_none() {
+                    return complete(
+                        send,
+                        request_id,
+                        error(
+                            "revision_exhausted",
+                            "configuration revision cannot support rollback",
+                        ),
+                    );
+                }
                 let Some(settings) = update_settings else {
                     unreachable!("update contains settings")
                 };
@@ -389,44 +540,164 @@ impl Pipeline {
                     Ok(response) => response,
                     Err(response) => return complete(send, request_id, response),
                 };
-                self.save(request_id, deadline, state_revision, next, response, send)
+                let apply_request = json!({"action":"apply_host_logging","configuration":response});
+                let success_response = json!({
+                    "logging":{"saved_revision":revision,"applied_revision":revision,"status":"applied"},
+                    "configuration":response
+                });
+                if !value_fits(&apply_request) || !value_fits(&success_response) {
+                    return complete(
+                        send,
+                        request_id,
+                        error(
+                            "resource_exhausted",
+                            "logging update exceeds the runtime payload limit",
+                        ),
+                    );
+                }
+                self.save(
+                    UpdateToSave {
+                        request_id,
+                        deadline,
+                        state_revision,
+                        document: next,
+                        previous: document,
+                        response,
+                    },
+                    send,
+                )
             }
         }
     }
 
     fn save(
         &mut self,
-        request_id: u64,
-        deadline: Instant,
-        state_revision: u64,
-        document: Document,
-        response: Value,
+        update: UpdateToSave,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        let Some(state_request_id) = submit_state(
+        let state_request = submit_state(
             send,
-            request_id,
-            deadline,
+            update.request_id,
+            update.deadline,
             "save",
             json!({
                 "action":"set","key":STATE_KEY,
-                "expected_revision":state_revision,"value":document
+                "expected_revision":update.state_revision,"value":update.document
             }),
-        )?
-        else {
+        );
+        let Some(state_request_id) = state_request.ok().flatten() else {
+            return complete(
+                send,
+                update.request_id,
+                save_unconfirmed(update.document.revision),
+            );
+        };
+        self.pending = Some(Pending {
+            request_id: update.request_id,
+            deadline: update.deadline,
+            state_request_id,
+            stage: Stage::Saving {
+                expected_state_revision: update.state_revision,
+                response: update.response,
+                previous: update.previous,
+            },
+            phase: PendingPhase::Waiting,
+        });
+        Ok(())
+    }
+
+    fn apply_logging(
+        &mut self,
+        request_id: u64,
+        deadline: Instant,
+        saved_state_revision: u64,
+        previous: Document,
+        response: Value,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let saved_revision = response["revision"].as_u64().unwrap_or_default();
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        if remaining_ms == 0 {
+            return complete(send, request_id, application_unconfirmed(saved_revision));
+        }
+        let result = send(Command::Request {
+            service: DIAGNOSTICS_SERVICE.into(),
+            payload: json!({"action":"apply_host_logging","configuration":response}),
+            timeout_ms: remaining_ms.min(MAX_REQUEST_MS),
+            operation_id: format!("host-configuration.{request_id}.apply-logging"),
+            parent: Some(request_id),
+        });
+        let child_id = match result {
+            Ok(Response::Accepted { id }) => id,
+            Ok(Response::Error { code, .. }) if code == "permission_denied" => {
+                return self.rollback(
+                    request_id,
+                    saved_state_revision,
+                    previous,
+                    saved_revision,
+                    send,
+                );
+            }
+            _ => return complete(send, request_id, application_unconfirmed(saved_revision)),
+        };
+        self.pending = Some(Pending {
+            request_id,
+            deadline,
+            state_request_id: child_id,
+            stage: Stage::Applying {
+                response,
+                previous,
+                saved_state_revision,
+            },
+            phase: PendingPhase::Waiting,
+        });
+        Ok(())
+    }
+
+    fn rollback(
+        &mut self,
+        request_id: u64,
+        expected_state_revision: u64,
+        mut previous: Document,
+        saved_revision: u64,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        previous.revision = saved_revision
+            .checked_add(1)
+            .ok_or("configuration revision exhausted during rollback")?;
+        let deadline = Instant::now() + Duration::from_millis(MAX_REQUEST_MS);
+        let child_id = send(Command::Request {
+            service: crate::STATE_SERVICE.into(),
+            payload: json!({
+                "action":"set","key":STATE_KEY,
+                "expected_revision":expected_state_revision,"value":previous
+            }),
+            timeout_ms: MAX_REQUEST_MS,
+            operation_id: format!("host-configuration.{request_id}.rollback-logging"),
+            parent: None,
+        });
+        let Some(child_id) = (match child_id {
+            Ok(Response::Accepted { id }) => Some(id),
+            _ => None,
+        }) else {
             return complete(
                 send,
                 request_id,
-                unavailable("state service did not accept the configuration write"),
+                rollback_unconfirmed(
+                    saved_revision,
+                    "state service did not confirm the compensating write",
+                ),
             );
         };
         self.pending = Some(Pending {
             request_id,
             deadline,
-            state_request_id,
-            stage: Stage::Saving {
-                expected_state_revision: state_revision,
-                response,
+            state_request_id: child_id,
+            stage: Stage::RollingBack {
+                saved_revision,
+                expected_state_revision,
             },
             phase: PendingPhase::Waiting,
         });
@@ -455,6 +726,17 @@ fn submit_state(
     stage: &str,
     payload: Value,
 ) -> ModuleResult<Option<u64>> {
+    submit_child(send, parent, deadline, stage, crate::STATE_SERVICE, payload)
+}
+
+fn submit_child(
+    send: &mut impl FnMut(Command) -> TransportResult,
+    parent: u64,
+    deadline: Instant,
+    stage: &str,
+    service: &str,
+    payload: Value,
+) -> ModuleResult<Option<u64>> {
     let remaining_ms = deadline
         .saturating_duration_since(Instant::now())
         .as_millis() as u64;
@@ -462,7 +744,7 @@ fn submit_state(
         return Ok(None);
     }
     match send(Command::Request {
-        service: crate::STATE_SERVICE.into(),
+        service: service.into(),
         payload,
         timeout_ms: remaining_ms.min(MAX_REQUEST_MS),
         operation_id: format!("host-configuration.{parent}.{stage}"),
@@ -471,6 +753,38 @@ fn submit_state(
         Response::Accepted { id } => Ok(Some(id)),
         _ => Ok(None),
     }
+}
+
+fn rollback_failed(saved_revision: u64, message: impl Into<String>) -> Value {
+    json!({
+        "ok":false,
+        "error":{"code":"logging_rollback_failed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
+        "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"saved_not_applied"}
+    })
+}
+
+fn rollback_unconfirmed(saved_revision: u64, message: impl Into<String>) -> Value {
+    json!({
+        "ok":false,
+        "error":{"code":"logging_rollback_unconfirmed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
+        "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"rollback_unconfirmed"}
+    })
+}
+
+fn save_unconfirmed(attempted_revision: u64) -> Value {
+    json!({
+        "ok":false,
+        "error":{"code":"save_unconfirmed","message":"configuration write outcome is unknown; GET configuration before retrying"},
+        "logging":{"attempted_revision":attempted_revision,"saved_revision":null,"applied_revision":null,"status":"save_unconfirmed"}
+    })
+}
+
+fn application_unconfirmed(saved_revision: u64) -> Value {
+    json!({
+        "ok":false,
+        "error":{"code":"logging_application_unconfirmed","message":"configuration was saved but logging application is unconfirmed; GET configuration and diagnostics status before retrying"},
+        "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"saved_application_unconfirmed"}
+    })
 }
 
 fn complete(
@@ -543,6 +857,10 @@ fn revision_conflict(current_revision: u64) -> Value {
 
 fn document_fits(document: &Document) -> bool {
     serde_json::to_vec(document).is_ok_and(|bytes| bytes.len() <= MAX_DOCUMENT_BYTES)
+}
+
+fn value_fits(value: &Value) -> bool {
+    serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_RESPONSE_BYTES)
 }
 
 #[cfg(test)]
