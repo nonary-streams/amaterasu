@@ -131,9 +131,19 @@ fn frame_read_rechecks_published_geometry_before_delivering_pixels() {
     let moved = sample_geometry(0);
     for (current, expected_status, expected_bytes, closes) in [
         (Ok(Some(moved)), MEDIA_CLOSED, Vec::new(), true),
+        (Ok(None), MEDIA_CLOSED, Vec::new(), true),
         (Ok(Some(initial)), STATUS_OK, sample_frame().bytes, false),
         (
             Err(CaptureError::new("access_lost", "provider lost output")),
+            MEDIA_CLOSED,
+            Vec::new(),
+            true,
+        ),
+        (
+            Err(CaptureError::new(
+                "geometry_unavailable",
+                "topology unavailable",
+            )),
             MEDIA_CLOSED,
             Vec::new(),
             true,
@@ -569,6 +579,48 @@ fn native_geometry_is_owner_scoped_and_change_closes_the_stream() {
     assert_eq!(owner.geometry(id), (STATUS_OK, Some(initial)));
     assert_eq!(owner.geometry(id), (MEDIA_CLOSED, None));
     assert_eq!(owner.geometry(id), (MEDIA_CLOSED, None));
+}
+
+#[test]
+fn advertised_geometry_becoming_unavailable_closes_only_its_owner_stream() {
+    let initial = sample_geometry(-1920);
+    for unavailable in [
+        Ok(None),
+        Err(CaptureError::new(
+            "geometry_unavailable",
+            "topology unavailable",
+        )),
+    ] {
+        let (controller, drops) =
+            setup_with_geometry(true, VecDeque::from([Ok(Some(initial)), unavailable]));
+        let id = open(&mut controller.lock().unwrap(), "owner");
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(
+            controller.geometry("foreign", id).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.geometry("owner", id).unwrap_err().code,
+            "access_lost"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.geometry("owner", id).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(
+            controller.read("owner", id, 0).err().unwrap().code,
+            "not_found"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            controller.handle("owner", Operation::Status, &mut || Ok(()))["streams"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
