@@ -353,8 +353,12 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
     let image = root
         .join("appcache/librarycache")
         .join("42_library_600x900_2x.jpg");
-    let image_bytes = b"\xff\xd8\xffsteam portrait";
-    std::fs::write(&image, image_bytes).unwrap();
+    let mut image_bytes = vec![0; 24];
+    image_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    image_bytes[12..16].copy_from_slice(b"IHDR");
+    image_bytes[16..20].copy_from_slice(&600_u32.to_be_bytes());
+    image_bytes[20..24].copy_from_slice(&900_u32.to_be_bytes());
+    std::fs::write(&image, &image_bytes).unwrap();
     let root = root.canonicalize().unwrap();
     let artwork = artwork::discover(42, &root, &[]);
     let revision = artwork.revision.clone().unwrap();
@@ -389,10 +393,10 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["app_id"], 42);
     assert_eq!(payload["revision"], revision);
-    assert_eq!(payload["mime_type"], "image/jpeg");
+    assert_eq!(payload["mime_type"], "image/png");
     assert_eq!(payload["total_bytes"], image_bytes.len() as u64);
     assert_eq!(payload["next_offset"], Value::Null);
-    assert_eq!(payload["data"], "/9j/c3RlYW0gcG9ydHJhaXQ=");
+    assert!(payload["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
     assert!(payload.get("path").is_none());
     assert_eq!(
         provider.read_artwork(11, 42, "1", 0, 1_000).unwrap_err(),

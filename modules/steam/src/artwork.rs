@@ -672,7 +672,7 @@ fn validate_remote_artwork(bytes: &[u8]) -> bool {
             width >= 600
                 && height >= 900
                 && u64::from(width) * 3 == u64::from(height) * 2
-                && u64::from(width) * u64::from(height) * 4 <= MAX_DECODED_ARTWORK_BYTES
+                && decoded_size_is_bounded(width, height)
         })
 }
 
@@ -1055,7 +1055,10 @@ fn inspect_candidate(
         return None;
     }
     image_mime(&canonical_path)?;
-    let (width, height) = image_dimensions(&canonical_path).unwrap_or_default();
+    let (width, height) = image_dimensions(&canonical_path)?;
+    if !decoded_size_is_bounded(width, height) {
+        return None;
+    }
     // A mislabeled wide library image is a header even when its filename says
     // 600x900. It must not displace a real portrait in another Steam root.
     let role_priority = if role_priority == 3 && width > height {
@@ -1092,7 +1095,8 @@ fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
     file.take(MAX_DIMENSION_HEADER_BYTES as u64)
         .read_to_end(&mut header)
         .ok()?;
-    if header.starts_with(b"\x89PNG\r\n\x1a\n") && header.len() >= 24 {
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") && header.len() >= 24 && &header[12..16] == b"IHDR"
+    {
         let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
         let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
         return (width > 0 && height > 0).then_some((width, height));
@@ -1101,6 +1105,13 @@ fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
         return jpeg_dimensions_from_prefix(&header);
     }
     webp_dimensions(&header)
+}
+
+fn decoded_size_is_bounded(width: u32, height: u32) -> bool {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= MAX_DECODED_ARTWORK_BYTES)
 }
 
 fn webp_dimensions(header: &[u8]) -> Option<(u32, u32)> {
@@ -1321,15 +1332,15 @@ mod tests {
         fs::create_dir_all(&cache).unwrap();
         let portrait = cache.join("42_library_600x900_2x.jpg");
         let header = cache.join("42_header.jpg");
-        fs::write(&portrait, b"\x89PNG\r\n\x1a\nportrait").unwrap();
-        fs::write(&header, b"\xff\xd8\xffheader").unwrap();
+        fs::write(&portrait, synthetic_png(300, 450)).unwrap();
+        fs::write(&header, synthetic_jpeg(800, 450, 64)).unwrap();
 
         let first = discover(42, &root.0, &[]);
         assert_eq!(first.source_path.as_deref(), portrait.to_str());
         assert!(first.revision.is_some());
         assert!(first.needs_remote_upgrade);
 
-        fs::write(&portrait, b"\x89PNG\r\n\x1a\nupdated portrait bytes").unwrap();
+        fs::write(&portrait, synthetic_png(301, 451)).unwrap();
         let second = discover(42, &root.0, &[]);
         assert_eq!(second.source_path.as_deref(), portrait.to_str());
         assert_ne!(second.revision, first.revision);
@@ -1488,6 +1499,42 @@ mod tests {
         assert_eq!(image_dimensions(&png_path), Some((1200, 1800)));
     }
 
+    #[test]
+    fn oversized_or_malformed_local_headers_yield_to_a_valid_portrait() {
+        let primary = TemporaryRoot::new();
+        let fallback = TemporaryRoot::new();
+        let primary_cache = primary.0.join("appcache/librarycache");
+        let fallback_cache = fallback.0.join("appcache/librarycache");
+        fs::create_dir_all(&primary_cache).unwrap();
+        fs::create_dir_all(&fallback_cache).unwrap();
+        fs::write(
+            primary_cache.join("42_library_600x900_2x.png"),
+            synthetic_png(u32::MAX, u32::MAX),
+        )
+        .unwrap();
+        fs::write(
+            primary_cache.join("42_library_600x900_2x.jpg"),
+            synthetic_jpeg(6000, 9000, 64),
+        )
+        .unwrap();
+        let mut webp = vec![0; 30];
+        webp[..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[24..27].copy_from_slice(&[0xff, 0xff, 0]);
+        webp[27..30].copy_from_slice(&[0xff, 0xff, 0]);
+        fs::write(primary_cache.join("42_library_600x900_2x.webp"), webp).unwrap();
+        let mut malformed_png = synthetic_png(1200, 1800);
+        malformed_png[12..16].copy_from_slice(b"JUNK");
+        fs::write(primary_cache.join("42_library_600x900.png"), malformed_png).unwrap();
+        let portrait = fallback_cache.join("42_library_600x900.png");
+        fs::write(&portrait, synthetic_png(600, 900)).unwrap();
+
+        let artwork = discover(42, &primary.0, std::slice::from_ref(&fallback.0));
+        assert_eq!(artwork.source_path.as_deref(), portrait.to_str());
+        assert!(!artwork.needs_remote_upgrade);
+    }
+
     fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = vec![0; 24];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -1502,7 +1549,7 @@ mod tests {
         let root = TemporaryRoot::new();
         let grid = root.0.join("userdata/100/config/grid");
         fs::create_dir_all(&grid).unwrap();
-        fs::write(grid.join("42p.png"), b"\x89PNG\r\n\x1a\ncustom portrait").unwrap();
+        fs::write(grid.join("42p.png"), synthetic_png(600, 900)).unwrap();
 
         let artwork = discover(42, &root.0, &[]);
         assert_eq!(
@@ -1537,8 +1584,7 @@ mod tests {
         let cache = root.0.join("appcache/librarycache");
         fs::create_dir_all(&cache).unwrap();
         let image = cache.join("42_library_600x900_2x.jpg");
-        let mut bytes = vec![0xff, 0xd8, 0xff];
-        bytes.resize(ARTWORK_CHUNK_BYTES + 3, 7);
+        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 3);
         fs::write(&image, &bytes).unwrap();
         let discovered = discover(42, &root.0, &[]);
         let source_path = discovered.source_path.unwrap();

@@ -317,7 +317,12 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     let artwork_directory = library.join("appcache/librarycache");
     fs::create_dir_all(&artwork_directory).unwrap();
     let artwork_path = artwork_directory.join("42_library_600x900_2x.jpg");
-    fs::write(&artwork_path, b"\x89PNG\r\n\x1a\nfirst artwork").unwrap();
+    let mut portrait = vec![0; 24];
+    portrait[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    portrait[12..16].copy_from_slice(b"IHDR");
+    portrait[16..20].copy_from_slice(&600_u32.to_be_bytes());
+    portrait[20..24].copy_from_slice(&900_u32.to_be_bytes());
+    fs::write(&artwork_path, &portrait).unwrap();
 
     let mut scan = Scan::new(std::slice::from_ref(&library));
     finish(&mut scan);
@@ -332,7 +337,8 @@ fn discovery_tracks_local_artwork_changes_without_exposing_host_paths() {
     assert!(listed.get("artwork_source_path").is_none());
     assert!(listed.get("artwork_candidate_signature").is_none());
 
-    fs::write(&artwork_path, b"\x89PNG\r\n\x1a\nchanged artwork data").unwrap();
+    portrait[16..20].copy_from_slice(&601_u32.to_be_bytes());
+    fs::write(&artwork_path, portrait).unwrap();
     let mut refreshed = Scan::new(&[library]);
     finish(&mut refreshed);
     assert_ne!(
