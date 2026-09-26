@@ -406,6 +406,15 @@ fn import_legacy_configuration_after_preflight(
     sources: &[LegacyConfigSource],
     plan: ImportPlan,
 ) -> PackageResult<MigrationReceipt> {
+    import_legacy_configuration_with_persistence(data_root, sources, plan, persist_import_metadata)
+}
+
+fn import_legacy_configuration_with_persistence(
+    data_root: &Path,
+    sources: &[LegacyConfigSource],
+    plan: ImportPlan,
+    persist: impl FnOnce(&MigrationReceipt) -> PackageResult<()>,
+) -> PackageResult<MigrationReceipt> {
     create_private_directory(data_root)?;
 
     let transaction = random_identifier()?;
@@ -427,8 +436,7 @@ fn import_legacy_configuration_after_preflight(
             imported_files: created,
             plan: plan.clone(),
         };
-        let _ = rollback_legacy_configuration(&receipt);
-        return Err(error);
+        return Err(rollback_failed_import(&receipt, error));
     }
 
     let receipt = MigrationReceipt {
@@ -436,12 +444,34 @@ fn import_legacy_configuration_after_preflight(
         imported_files: created,
         plan,
     };
+    if let Err(error) = persist(&receipt) {
+        return Err(rollback_failed_import(&receipt, error));
+    }
+    Ok(receipt)
+}
+
+fn persist_import_metadata(receipt: &MigrationReceipt) -> PackageResult<()> {
     write_json_atomically(
         &receipt.backup_directory.join("import-plan.json"),
         &receipt.plan,
     )?;
-    write_json_atomically(&receipt.backup_directory.join("receipt.json"), &receipt)?;
-    Ok(receipt)
+    write_json_atomically(&receipt.backup_directory.join("receipt.json"), receipt)
+}
+
+fn rollback_failed_import(receipt: &MigrationReceipt, error: String) -> String {
+    let mut failure = error;
+    for name in ["receipt.json", "import-plan.json"] {
+        let path = receipt.backup_directory.join(name);
+        if let Err(remove_error) = fs::remove_file(&path)
+            && remove_error.kind() != io::ErrorKind::NotFound
+        {
+            failure.push_str(&format!("; import metadata cleanup failed: {remove_error}"));
+        }
+    }
+    if let Err(rollback_error) = rollback_legacy_configuration(receipt) {
+        failure.push_str(&format!("; import rollback failed: {rollback_error}"));
+    }
+    failure
 }
 
 pub fn import_legacy_configuration_with_sensitive_sources(
@@ -1391,19 +1421,40 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 fn copy_regular_file(source: &Path, destination: &Path) -> PackageResult<()> {
+    copy_regular_file_with(source, destination, |input, output| {
+        io::copy(input, output)?;
+        output.sync_all()
+    })
+}
+
+fn copy_regular_file_with(
+    source: &Path,
+    destination: &Path,
+    transfer: impl FnOnce(&mut File, &mut File) -> io::Result<()>,
+) -> PackageResult<()> {
     validate_regular_file(source)?;
     let parent = destination
         .parent()
         .ok_or("migration destination has no parent")?;
     create_private_directory(parent)?;
+    let mut input = File::open(source).map_err(io_error)?;
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(destination)
         .map_err(io_error)?;
-    let mut input = File::open(source).map_err(io_error)?;
-    io::copy(&mut input, &mut output).map_err(io_error)?;
-    output.sync_all().map_err(io_error)
+    let result = transfer(&mut input, &mut output);
+    drop(output);
+    if let Err(error) = result {
+        return match fs::remove_file(destination) {
+            Ok(()) => Err(io_error(error)),
+            Err(cleanup_error) => Err(format!(
+                "{}; partial import cleanup failed: {cleanup_error}",
+                io_error(error)
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn digest_regular_file(path: &Path) -> PackageResult<String> {

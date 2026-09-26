@@ -1,5 +1,6 @@
 use super::*;
 use std::fs;
+use std::io::Write;
 
 struct TemporaryDirectory(PathBuf);
 
@@ -1572,6 +1573,69 @@ fn rollback_removes_only_files_created_by_its_transaction() {
             .join("source/vibepollo/0/vibepollo.conf")
             .exists()
     );
+}
+
+#[test]
+fn failed_receipt_write_removes_new_imports_and_preserves_existing_files() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(&predecessor.join("sunshine.conf"), b"fps = 60\n");
+    write(&predecessor.join("apps.json"), b"[]");
+    let source = source(LegacyProduct::Sunshine, &predecessor);
+    let data_root = fixture.path().join("Amaterasu");
+    let import_root = data_root.join(LEGACY_IMPORT_DIRECTORY).join("sunshine");
+    write(&import_root.join("sunshine.conf"), b"fps = 60\n");
+
+    let plan = analyze_legacy_configuration(std::slice::from_ref(&source)).unwrap();
+    let error =
+        import_legacy_configuration_with_persistence(&data_root, &[source], plan, |receipt| {
+            write_json_atomically(
+                &receipt.backup_directory.join("import-plan.json"),
+                &receipt.plan,
+            )?;
+            write_json_atomically(&receipt.backup_directory.join("receipt.json"), receipt)?;
+            Err("simulated receipt write failure".into())
+        })
+        .unwrap_err();
+
+    assert_eq!(error, "simulated receipt write failure");
+    assert_eq!(
+        fs::read(import_root.join("sunshine.conf")).unwrap(),
+        b"fps = 60\n"
+    );
+    assert!(!import_root.join("apps.json").exists());
+    assert_eq!(fs::read(predecessor.join("apps.json")).unwrap(), b"[]");
+    let backup_directory = fs::read_dir(data_root.join(MIGRATION_BACKUP_DIRECTORY))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        fs::read(backup_directory.join("source/sunshine/0/apps.json")).unwrap(),
+        b"[]"
+    );
+    assert!(!backup_directory.join("receipt.json").exists());
+    assert!(!backup_directory.join("import-plan.json").exists());
+}
+
+#[test]
+fn failed_copy_removes_partial_destination_so_import_can_retry() {
+    let fixture = TemporaryDirectory::new();
+    let source = fixture.path().join("source/apps.json");
+    let destination = fixture.path().join("import/apps.json");
+    write(&source, b"[]");
+
+    let error = copy_regular_file_with(&source, &destination, |_, output| {
+        output.write_all(b"partial")?;
+        Err(io::Error::other("simulated copy failure"))
+    })
+    .unwrap_err();
+
+    assert!(error.contains("filesystem operation failed"));
+    assert!(!destination.exists());
+    copy_regular_file(&source, &destination).unwrap();
+    assert_eq!(fs::read(destination).unwrap(), b"[]");
 }
 
 #[test]
