@@ -632,6 +632,91 @@ fn native_geometry_is_owner_scoped_and_change_closes_the_stream() {
 }
 
 #[test]
+fn advertised_geometry_failure_closes_stream_and_discards_cached_pixels() {
+    let initial = CaptureGeometry::new(
+        DesktopRect::new(-1920, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(-1920, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap();
+    for unavailable in [
+        Ok(None),
+        Err(CaptureError::new(
+            "geometry_unavailable",
+            "topology unavailable",
+        )),
+        Err(CaptureError::new("backend_error", "geometry probe failed")),
+    ] {
+        let acquired = frame(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let pixels = Arc::downgrade(&acquired.bytes);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let geometries = Arc::new(Mutex::new(VecDeque::from([
+            Ok(Some(initial)),
+            Ok(Some(initial)),
+        ])));
+        let mut controller = Controller::new(
+            FakeBackend {
+                events: Arc::new(Mutex::new(VecDeque::from([Ok(Some(acquired))]))),
+                geometries: geometries.clone(),
+                touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+                drops: drops.clone(),
+            },
+            true,
+        );
+        let id = open_constant_rate(&mut controller, "owner");
+        drop(controller.read("owner", id, 0).unwrap());
+        assert!(pixels.upgrade().is_some());
+        let mut pending_geometry = geometries.lock().unwrap();
+        pending_geometry.clear();
+        pending_geometry.push_back(unavailable);
+        drop(pending_geometry);
+
+        assert_eq!(
+            controller.geometry("foreign", id).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            controller.geometry("owner", id).unwrap_err().code,
+            "access_lost"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(pixels.upgrade().is_none());
+        assert_eq!(
+            controller.geometry("owner", id).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(
+            controller.read("owner", id, 0).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn geometry_failure_without_advertised_mapping_keeps_stream_open() {
+    let (controller, drops) = setup_with_geometry(
+        true,
+        VecDeque::from([
+            Ok(None),
+            Err(CaptureError::new(
+                "geometry_unavailable",
+                "topology unavailable",
+            )),
+        ]),
+    );
+    let mut controller = controller.lock().unwrap();
+    let id = open(&mut controller, "owner");
+    assert_eq!(
+        controller.geometry("owner", id).unwrap_err().code,
+        "geometry_unavailable"
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    controller.close("owner", id).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn frame_delivery_rechecks_same_size_output_location() {
     let initial = CaptureGeometry::new(
         DesktopRect::new(-1920, 0, 1920, 1080).unwrap(),

@@ -359,19 +359,20 @@ impl<B: Backend> Controller<B> {
         if current.is_err() {
             stream.last_frame = None;
         }
-        let changed = current
-            .as_ref()
-            .is_ok_and(|current| *current != stream.geometry);
-        if changed
-            || current
-                .as_ref()
-                .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
-        {
+        let geometry_lost = match &current {
+            Ok(geometry) => *geometry != stream.geometry,
+            Err(error) => {
+                stream.geometry.is_some()
+                    || error.code == "access_lost"
+                    || error.code == "device_lost"
+            }
+        };
+        if geometry_lost {
             stream.last_frame = None;
             self.streams.remove(&id);
             return Err(CaptureError::new(
                 "access_lost",
-                "capture desktop geometry changed; enumerate and reopen",
+                "capture desktop geometry changed or became unavailable; enumerate and reopen",
             ));
         }
         current
