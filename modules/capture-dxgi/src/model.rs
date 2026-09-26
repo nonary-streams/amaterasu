@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 pub const MAX_STREAMS: usize = 4;
 pub const MAX_WAIT_MS: u32 = 16;
+pub const MAX_ENUMERATE_LIMIT: usize = 256;
 
 #[derive(Debug)]
 pub struct CaptureError {
@@ -75,7 +76,10 @@ pub fn verify_output_mode(
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
-    Enumerate,
+    Enumerate {
+        offset: Option<usize>,
+        limit: Option<usize>,
+    },
     Open {
         output: String,
         operation_id: Option<String>,

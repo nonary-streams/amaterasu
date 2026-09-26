@@ -13,7 +13,11 @@ Native modules are trusted code; these grants are not a native-code sandbox.
   the caller's `streams` (`stream` ID and `output` identity).
 - `{"action":"enumerate"}` returns `outputs`: `id`, `adapter`, `device_name`,
   `attached`, `left`, `top`, `width`, `height`, and the DXGI numeric `rotation`.
-  Enumeration is read-only and available when capture is disabled.
+  Enumeration is read-only and available when capture is disabled. Outputs are
+  ordered by ID. Optional `offset` (default 0) and `limit` (1..=256, default
+  256) page results. A `next_offset` field is returned when more outputs remain;
+  each page fits the 12 KB control reply limit. Re-enumerate from zero if
+  topology changes between pages and an offset becomes invalid.
 - `{"action":"open","output":"<enumerated id>"}` returns
   `{"ok":true,"stream":123,"output":"..."}` plus `desktop_geometry` when
   Windows can prove the selected monitor's physical rectangle and the complete

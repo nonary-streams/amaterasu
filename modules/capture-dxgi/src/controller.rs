@@ -1,5 +1,8 @@
 use crate::backend::{Backend, CaptureSession, TouchSurface};
-use crate::model::{CaptureError, CaptureResult, Frame, MAX_STREAMS, MAX_WAIT_MS, Operation};
+use crate::model::{
+    CaptureError, CaptureResult, Frame, MAX_ENUMERATE_LIMIT, MAX_STREAMS, MAX_WAIT_MS, Operation,
+    Output,
+};
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -48,7 +51,10 @@ impl<B: Backend> Controller<B> {
         self.opened_stream = None;
         let result = match operation {
             Operation::Status => Ok(self.status(caller)),
-            Operation::Enumerate => self.backend.enumerate().and_then(enumeration_reply),
+            Operation::Enumerate { offset, limit } => self
+                .backend
+                .enumerate()
+                .and_then(|outputs| enumeration_reply(outputs, offset, limit)),
             Operation::Open {
                 output,
                 operation_id,
@@ -296,16 +302,54 @@ fn validate_operation_id(operation_id: &str) -> CaptureResult<()> {
     Ok(())
 }
 
-fn enumeration_reply(outputs: Vec<crate::model::Output>) -> CaptureResult<Value> {
-    let reply = json!({"ok":true,"outputs":outputs});
-    let encoded = serde_json::to_vec(&reply)
-        .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
-    if encoded.len() > 12_000 {
+fn enumeration_reply(
+    mut outputs: Vec<Output>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> CaptureResult<Value> {
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(MAX_ENUMERATE_LIMIT);
+    if limit == 0 || limit > MAX_ENUMERATE_LIMIT {
         return Err(CaptureError::new(
-            "resource_exhausted",
-            "output metadata exceeds the control reply limit",
+            "invalid_request",
+            "enumeration limit must be within 1..=256",
         ));
     }
+    outputs.sort_by(|left, right| left.id.cmp(&right.id));
+    if offset > outputs.len() || (offset == outputs.len() && offset != 0) {
+        return Err(CaptureError::new(
+            "invalid_request",
+            "enumeration offset is outside the current output list",
+        ));
+    }
+
+    let total_outputs = outputs.len();
+    let mut page = Vec::new();
+    for output in outputs.into_iter().skip(offset).take(limit) {
+        page.push(output);
+        let next_offset = offset + page.len();
+        // Reserve the worst-case cursor overhead so adding it cannot overflow
+        // the control reply after the page has been selected.
+        let encoded =
+            serde_json::to_vec(&json!({"ok":true,"outputs":page,"next_offset":next_offset}))
+                .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
+        if encoded.len() > 12_000 {
+            page.pop();
+            if page.is_empty() {
+                return Err(CaptureError::new(
+                    "resource_exhausted",
+                    "one output exceeds the control reply limit",
+                ));
+            }
+            break;
+        }
+    }
+    let next_offset = offset + page.len();
+    let reply = if next_offset < total_outputs {
+        json!({"ok":true,"outputs":page,"next_offset":next_offset})
+    } else {
+        json!({"ok":true,"outputs":page})
+    };
     Ok(reply)
 }
 

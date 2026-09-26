@@ -3,11 +3,13 @@ use crate::backend::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureResult, Frame, Output};
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::*;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct FakeBackend {
+    outputs: Vec<Output>,
     events: Arc<Mutex<VecDeque<CaptureResult<Option<Frame>>>>>,
     geometries: Arc<Mutex<VecDeque<CaptureResult<Option<CaptureGeometry>>>>>,
     touch_surfaces: Arc<Mutex<VecDeque<CaptureResult<Option<TouchSurface>>>>>,
@@ -27,7 +29,7 @@ impl Backend for FakeBackend {
     }
 
     fn enumerate(&self) -> CaptureResult<Vec<Output>> {
-        Ok(Vec::new())
+        Ok(self.outputs.clone())
     }
 
     fn open(&self, _: &str) -> CaptureResult<Box<dyn CaptureSession>> {
@@ -95,6 +97,7 @@ fn setup_with_frames_and_geometry(
 ) -> (Arc<Mutex<Controller<FakeBackend>>>, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     let backend = FakeBackend {
+        outputs: Vec::new(),
         events: Arc::new(Mutex::new(events)),
         geometries: Arc::new(Mutex::new(geometries)),
         touch_surfaces: Arc::new(Mutex::new(touch_surfaces)),
@@ -104,6 +107,175 @@ fn setup_with_frames_and_geometry(
         Arc::new(Mutex::new(Controller::new(backend, enabled))),
         drops,
     )
+}
+
+fn sample_output(index: usize) -> Output {
+    Output {
+        id: format!("output-{index:03}"),
+        adapter: "fake-adapter".into(),
+        adapter_vendor_id: 0,
+        adapter_device_id: 0,
+        adapter_description: "fake".into(),
+        device_name: format!("display-{index}"),
+        attached: true,
+        left: index as i32 * 10,
+        top: 0,
+        width: 1920,
+        height: 1080,
+        rotation: 1,
+    }
+}
+
+#[test]
+fn enumeration_pages_all_outputs_without_changing_an_open_stream() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let backend = FakeBackend {
+        outputs: (0..90).rev().map(sample_output).collect(),
+        events: Arc::new(Mutex::new(VecDeque::new())),
+        geometries: Arc::new(Mutex::new(VecDeque::new())),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+        drops: drops.clone(),
+    };
+    let mut controller = Controller::new(backend, true);
+    let opened = controller.handle(
+        "owner",
+        Operation::Open {
+            output: "output-000".into(),
+            operation_id: None,
+        },
+        &mut || Ok(()),
+    );
+    let stream = opened["stream"].as_u64().unwrap();
+    let mut offset = None;
+    let mut ids = Vec::new();
+    loop {
+        let reply = controller.handle(
+            "owner",
+            Operation::Enumerate {
+                offset,
+                limit: Some(13),
+            },
+            &mut || Ok(()),
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= 12_000);
+        ids.extend(
+            reply["outputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|output| output["id"].as_str().unwrap().to_owned()),
+        );
+        offset = reply["next_offset"].as_u64().map(|value| value as usize);
+        if offset.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        ids,
+        (0..90)
+            .map(|index| format!("output-{index:03}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(controller.read("owner", stream, 0).unwrap().is_none());
+    assert_eq!(
+        controller.handle("owner", Operation::Status, &mut || Ok(()))["streams"][0]["output"],
+        "output-000"
+    );
+    controller.close("owner", stream).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn enumeration_bounds_and_oversized_metadata_fail_closed() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            outputs: vec![sample_output(0), sample_output(1)],
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        true,
+    );
+    let enumerate = |controller: &mut Controller<FakeBackend>, offset, limit| {
+        controller.handle("owner", Operation::Enumerate { offset, limit }, &mut || {
+            Ok(())
+        })
+    };
+    assert_eq!(
+        enumerate(&mut controller, None, None)["outputs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for (offset, limit) in [
+        (Some(2), None),
+        (Some(usize::MAX), None),
+        (None, Some(0)),
+        (None, Some(257)),
+    ] {
+        assert_eq!(
+            enumerate(&mut controller, offset, limit)["error"]["code"],
+            "invalid_request"
+        );
+    }
+    let mut oversized = sample_output(0);
+    oversized.device_name = "x".repeat(12_000);
+    let mut controller = Controller::new(
+        FakeBackend {
+            outputs: vec![oversized],
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        true,
+    );
+    assert_eq!(
+        enumerate(&mut controller, None, None)["error"]["code"],
+        "resource_exhausted"
+    );
+}
+
+#[test]
+fn default_enumeration_paginates_when_metadata_fills_reply() {
+    let mut outputs: Vec<_> = (0..24).map(sample_output).collect();
+    for output in &mut outputs {
+        output.device_name = "display".repeat(80);
+    }
+    let mut controller = Controller::new(
+        FakeBackend {
+            outputs,
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        false,
+    );
+    let mut offset = None;
+    let mut count = 0;
+    let mut pages = 0;
+    loop {
+        let request = match offset {
+            Some(offset) => json!({"action":"enumerate","offset":offset}),
+            None => json!({"action":"enumerate"}),
+        };
+        let operation = serde_json::from_value(request).unwrap();
+        let reply = controller.handle("owner", operation, &mut || Ok(()));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= 12_000);
+        count += reply["outputs"].as_array().unwrap().len();
+        pages += 1;
+        offset = reply["next_offset"].as_u64().map(|value| value as usize);
+        if offset.is_none() {
+            break;
+        }
+    }
+    assert_eq!(count, 24);
+    assert!(pages > 1);
 }
 
 fn sample_geometry(left: i32) -> CaptureGeometry {
@@ -701,6 +873,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
     let drops = Arc::new(AtomicUsize::new(0));
     let controller = Arc::new(Mutex::new(Controller::new(
         FakeBackend {
+            outputs: Vec::new(),
             events,
             geometries: Arc::new(Mutex::new(VecDeque::new())),
             touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
@@ -940,6 +1113,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
     let drops = Arc::new(AtomicUsize::new(0));
     let controller = Arc::new(Mutex::new(Controller::new(
         FakeBackend {
+            outputs: Vec::new(),
             events,
             geometries: Arc::new(Mutex::new(VecDeque::new())),
             touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
