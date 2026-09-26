@@ -7,6 +7,114 @@ use super::*;
 use harness::*;
 
 #[test]
+fn active_audio_failure_recovers_same_encoder_stream_before_more_media() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    let encoder = host.pipeline.records[&id].resources[&Resource::AudioEncoder];
+    host.plane.borrow_mut().failure = Some("audio_encoder_failed");
+    host.tick();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert!(host.pipeline.records[&id].audio_recovery_needed);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert!(!host.pipeline.records[&id].audio_recovery_needed);
+    assert_eq!(host.plane.borrow().failure, None);
+    let recover: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.payload["action"] == "recover")
+        .collect();
+    assert_eq!(recover.len(), 1);
+    assert_eq!(recover[0].service, Resource::AudioEncoder.service());
+    assert_eq!(recover[0].payload["stream"], encoder);
+}
+
+#[test]
+fn rejected_audio_recovery_enters_owned_cleanup_without_replacing_stream() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.fail_audio_recover = true;
+    host.plane.borrow_mut().failure = Some("audio_encoder_failed");
+    host.idle();
+    assert!(matches!(
+        host.pipeline.records[&id].state,
+        State::Failed | State::CleanupFailed
+    ));
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("dependency_rejected")
+    );
+    assert_eq!(host.plane.borrow().dropped, 1);
+}
+
+#[test]
+fn mismatched_audio_recovery_stream_enters_confirmed_cleanup() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.malformed_audio_recover = true;
+    host.plane.borrow_mut().failure = Some("audio_encoder_failed");
+    host.idle();
+    assert!(matches!(
+        host.pipeline.records[&id].state,
+        State::Failed | State::CleanupFailed
+    ));
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("invalid_audio_recovery_response")
+    );
+    assert!(!host.pipeline.records[&id].audio_recovery_needed);
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn lost_recovery_admission_retries_one_operation_and_stop_still_owns_cleanup() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.fault = Some((Resource::AudioEncoder.service(), Fault::Admission));
+    host.plane.borrow_mut().failure = Some("audio_encoder_failed");
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.payload["action"] == "recover")
+            .count(),
+        1
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn encoder_failure_while_draining_recovers_before_transport_cleanup() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    {
+        let record = host.pipeline.records.get_mut(&id).unwrap();
+        record.state = State::Stopping;
+        record.outcome = State::Stopped;
+        record.plane.as_mut().unwrap().stop();
+    }
+    host.pipeline.job = Some(Job::new(id, None, Step::WaitDrain, host.now + 5000));
+    host.plane.borrow_mut().failure = Some("audio_encoder_failed");
+    host.tick();
+    assert!(host.pipeline.job.as_ref().unwrap().step == Step::RecoverAudio);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Stopped);
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
 fn fixed_media_response_without_readiness_fields_remains_compatible() {
     let mut host = Harness::new();
     let prepared = host.response(1, prepare());

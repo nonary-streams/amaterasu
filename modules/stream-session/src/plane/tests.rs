@@ -13,6 +13,7 @@ struct Fake {
     audio_busy: bool,
     pcm_busy: bool,
     control_failed: bool,
+    encoder_failed: bool,
     video_failure_after_submit: bool,
     videos_sent: Vec<(u32, Vec<u8>)>,
     audio_sent: Vec<Vec<u8>>,
@@ -43,7 +44,13 @@ impl Backend for Fake {
     }
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>> {
         self.audio_reads += 1;
-        Ok(self.audios.pop_front())
+        if let Some(packet) = self.audios.pop_front() {
+            Ok(Some(packet))
+        } else if self.encoder_failed {
+            Err("audio_encoder_failed")
+        } else {
+            Ok(None)
+        }
     }
     fn submit_video(&mut self, packet: &EncodedPacket) -> PlaneResult<bool> {
         if self.video_busy {
@@ -216,6 +223,35 @@ fn audio_payload_bytes_are_counted_after_admission_but_audio_eos_is_not() {
     assert_eq!(progress.accepted_video_access_units, 0);
     assert_eq!(progress.accepted_media_payload_bytes, 3);
     assert_eq!(progress.observed_video_sequence_gaps, 0);
+}
+
+#[test]
+fn encoder_recovery_preserves_admitted_packets_and_waiting_pcm() {
+    let mut backend = Fake {
+        encoder_failed: true,
+        ..Fake::default()
+    };
+    backend.audios.extend([audio(false), audio(false)]);
+    backend.pcms.push_back(pcm());
+    let mut pump = Pump::new(backend);
+
+    let failure = pump.tick(true).unwrap_err();
+    assert_eq!(failure.code, "audio_encoder_failed");
+    assert_eq!(failure.progress.accepted_media_payload_bytes, 6);
+    assert_eq!(pump.backend.audio_sent.len(), 2);
+    assert_eq!(pump.backend.pcm_reads, 0);
+    assert!(pump.tick(true).is_ok());
+    assert_eq!(pump.backend.audio_reads, 3);
+    assert_eq!(pump.backend.pcm_reads, 0);
+
+    pump.backend.encoder_failed = false;
+    pump.audio_recovery_needed = false;
+    pump.tick(true).unwrap();
+    assert_eq!(
+        pump.backend.audio_sent,
+        [vec![0xf4, 1, 2], vec![0xf4, 1, 2]]
+    );
+    assert_eq!(pump.backend.pcm_sent, 1);
 }
 
 #[test]

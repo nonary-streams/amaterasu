@@ -53,6 +53,7 @@ impl Pipeline {
                     }
                     record.uncertain = Some(pending);
                     record.plane = None;
+                    record.audio_recovery_needed = false;
                     record.cleanup_error = Some("request_cancellation_unconfirmed");
                     record.state = State::CleanupFailed;
                     self.reply(record, job, send);
@@ -151,12 +152,17 @@ impl Pipeline {
         } else {
             job.request
         };
-        job.pending = Some(rpc::Pending::new(
+        let pending = rpc::Pending::new(
             &service,
             payload,
             format!("ss-{:x}-{}", record.id, self.sequence),
             parent,
-        ));
+        );
+        job.pending = Some(if job.step == Step::RecoverAudio {
+            pending.retry_uncertain_admission()
+        } else {
+            pending
+        });
         true
     }
 
@@ -352,6 +358,23 @@ impl Pipeline {
             Step::ForceIdr => {
                 record.force_idr = false;
                 Ok(false)
+            }
+            Step::RecoverAudio => {
+                if payload["stream"] != record.resources[&Resource::AudioEncoder]
+                    || payload["packet_bytes"] != record.packet_bytes as u64
+                {
+                    return Err("invalid_audio_recovery_response");
+                }
+                record.audio_recovery_needed = false;
+                if let Some(plane) = record.plane.as_mut() {
+                    plane.recover_audio();
+                }
+                if record.state == State::Stopping {
+                    job.step = Step::WaitDrain;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
             _ => Err("invalid_workflow"),
         })();

@@ -72,6 +72,10 @@ impl Plane {
     pub fn is_drained(&self) -> bool {
         self.pump.transport_draining
     }
+
+    pub fn recover_audio(&mut self) {
+        self.pump.audio_recovery_needed = false;
+    }
 }
 
 trait Backend {
@@ -98,6 +102,7 @@ struct Pump<B> {
     audio_ended: bool,
     transport_draining: bool,
     failure: Option<&'static str>,
+    audio_recovery_needed: bool,
     last_accepted_video_sequence: Option<u64>,
 }
 
@@ -120,6 +125,7 @@ impl<B: Backend> Pump<B> {
             audio_ended: false,
             transport_draining: false,
             failure: None,
+            audio_recovery_needed: false,
             last_accepted_video_sequence: None,
         }
     }
@@ -133,7 +139,11 @@ impl<B: Backend> Pump<B> {
         }
         let result = self.advance(media_active);
         if let Err(failure) = &result {
-            self.failure = Some(failure.code);
+            if failure.code == "audio_encoder_failed" {
+                self.audio_recovery_needed = true;
+            } else {
+                self.failure = Some(failure.code);
+            }
         }
         result
     }
@@ -160,7 +170,9 @@ impl<B: Backend> Pump<B> {
         if let Err(code) = self.pump_video(&mut progress) {
             return Err(TickFailure { code, progress });
         }
-        if let Err(code) = self.pump_audio(&mut progress) {
+        if !self.audio_recovery_needed
+            && let Err(code) = self.pump_audio(&mut progress)
+        {
             return Err(TickFailure { code, progress });
         }
         if self.video_ended && self.audio_ended && !self.transport_draining {

@@ -46,6 +46,8 @@ pub struct Broker {
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub fail_close: Option<String>,
+    pub fail_audio_recover: bool,
+    pub malformed_audio_recover: bool,
     pub authenticated: bool,
     pub video_close_polls: u8,
     pub video_remaining: u8,
@@ -406,6 +408,12 @@ impl Broker {
             }
             return json!({"ok":true,"stream":id,"state":"closing"});
         }
+        if action == "recover" && service == "amaterasu.audio-encode/1" {
+            if self.fail_audio_recover {
+                return error("codec_unavailable");
+            }
+            return json!({"ok":true,"stream":if self.malformed_audio_recover {id + 1} else {id},"packet_bytes":160});
+        }
         if service == "amaterasu.session/1" {
             let allocation = self.allocations.get_mut(&key).unwrap();
             match action {
@@ -686,6 +694,9 @@ pub struct PlaneState {
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
+    fn recover_audio(&mut self) {
+        self.0.borrow_mut().failure = None;
+    }
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         let mut state = self.0.borrow_mut();
         state.ticks += 1;

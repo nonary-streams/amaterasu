@@ -5,6 +5,7 @@ use amaterasu_module_sdk::{Command, Response};
 struct Provider {
     duplicate: bool,
     invalid_status: bool,
+    audio_failed: bool,
 }
 
 struct Host {
@@ -140,8 +141,13 @@ unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) 
 unsafe extern "C" fn pcm(_: *mut c_void, _: u64, _: AudioSink) -> Status {
     MEDIA_PENDING
 }
-unsafe extern "C" fn audio(_: *mut c_void, _: u64, _: AudioPacketSink) -> Status {
-    MEDIA_PENDING
+unsafe extern "C" fn audio(context: *mut c_void, _: u64, _: AudioPacketSink) -> Status {
+    // SAFETY: the test keeps the boxed provider live for the binding lifetime.
+    if unsafe { &*context.cast::<Provider>() }.audio_failed {
+        MEDIA_BACKEND_ERROR
+    } else {
+        MEDIA_PENDING
+    }
 }
 unsafe extern "C" fn control(_: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
     MEDIA_PENDING
@@ -237,4 +243,20 @@ fn repeated_callbacks_and_output_with_pending_status_are_protocol_errors() {
     host.provider.invalid_status = true;
     assert_eq!(backend.video().err(), Some("native_delivery_failed"));
     drop(backend);
+}
+
+#[test]
+fn encoder_backend_status_is_distinct_from_other_native_failures() {
+    let mut host = Host::new();
+    host.provider.audio_failed = true;
+    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    assert_eq!(backend.audio().err(), Some("audio_encoder_failed"));
+    assert_eq!(
+        encoder_accepted(MEDIA_BACKEND_ERROR),
+        Err("audio_encoder_failed")
+    );
+    assert_eq!(
+        accepted(MEDIA_BACKEND_ERROR),
+        Err("native_operation_failed")
+    );
 }

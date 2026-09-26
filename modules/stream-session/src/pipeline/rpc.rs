@@ -16,6 +16,7 @@ pub(super) struct Pending {
     settling: bool,
     first_sent_at: Option<u64>,
     admission_rejected: bool,
+    retry_uncertain_admission: bool,
 }
 
 pub(super) enum Progress {
@@ -41,7 +42,15 @@ impl Pending {
             settling: false,
             first_sent_at: None,
             admission_rejected: false,
+            retry_uncertain_admission: false,
         }
+    }
+
+    /// Broker operation IDs make replay of this command safe after a lost
+    /// admission. The caller must use this only for an idempotent provider action.
+    pub fn retry_uncertain_admission(mut self) -> Self {
+        self.retry_uncertain_admission = true;
+        self
     }
 
     pub fn cancel(&mut self) {
@@ -152,7 +161,9 @@ impl Pending {
                     Progress::Failed
                 }
                 _ => {
-                    self.settling = true;
+                    if !self.retry_uncertain_admission {
+                        self.settling = true;
+                    }
                     self.attempts += 1;
                     Progress::Waiting
                 }

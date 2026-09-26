@@ -27,6 +27,7 @@ trait Drive {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
+    fn recover_audio(&mut self);
 }
 
 impl Drive for Plane {
@@ -38,6 +39,9 @@ impl Drive for Plane {
     }
     fn is_drained(&self) -> bool {
         Plane::is_drained(self)
+    }
+    fn recover_audio(&mut self) {
+        Plane::recover_audio(self)
     }
 }
 
@@ -134,6 +138,12 @@ impl Pipeline {
         factory: &mut Factory<'_>,
     ) -> ModuleResult<()> {
         self.pump(now);
+        if let Some(job) = self.job.as_mut()
+            && job.step == Step::WaitDrain
+            && self.records[&job.session].audio_recovery_needed
+        {
+            job.step = Step::RecoverAudio;
+        }
         self.progress_history(now, send);
         if let Some(mut job) = self.job.take() {
             let mut record = self
@@ -150,7 +160,7 @@ impl Pipeline {
         if let Some(record) = self
             .records
             .values()
-            .find(|record| record.state == State::Stopping)
+            .find(|record| record.state == State::Stopping && !record.audio_recovery_needed)
         {
             let mut job = Job::new(record.id, None, Step::Open(Resource::Session), now + 15000);
             job.cleanup = true;
@@ -230,10 +240,12 @@ impl Pipeline {
 
     fn schedule_control(&mut self, now: u64) -> bool {
         let eligible = |record: &&Record| {
-            (record.state == State::Active
-                && (record.force_idr
-                    || (record.input_lease.is_some()
-                        && (now >= record.input_renew_at || !record.input_events.is_empty()))))
+            (matches!(record.state, State::Active | State::Stopping)
+                && record.audio_recovery_needed)
+                || (record.state == State::Active
+                    && (record.force_idr
+                        || (record.input_lease.is_some()
+                            && (now >= record.input_renew_at || !record.input_events.is_empty()))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
         };
         let next = self
@@ -256,6 +268,8 @@ impl Pipeline {
                 },
                 record.prepared_until,
             )
+        } else if record.audio_recovery_needed {
+            (Step::RecoverAudio, now.saturating_add(5000))
         } else if record.input_lease.is_some() && now >= record.input_renew_at {
             (
                 Step::RenewInput,
@@ -359,6 +373,10 @@ impl Pipeline {
                         failure.progress.accepted_media_payload_bytes,
                         failure.progress.observed_video_sequence_gaps,
                     );
+                    if failure.code == "audio_encoder_failed" && record.config.stream_audio {
+                        record.audio_recovery_needed = true;
+                        continue;
+                    }
                     record.error = Some(failure.code);
                     record.outcome = State::Failed;
                     record.history.stopping(failure.code);

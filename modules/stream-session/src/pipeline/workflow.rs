@@ -30,6 +30,7 @@ pub(super) enum Step {
     StopSession,
     FinishSession,
     ForceIdr,
+    RecoverAudio,
 }
 
 pub(super) struct Job {
@@ -73,6 +74,7 @@ impl Job {
         record.history.stopping(code);
         record.state = State::Stopping;
         record.plane = None;
+        record.audio_recovery_needed = false;
         if let Some(pending) = self.pending.as_mut() {
             pending.cancel();
             self.settling_allocation = true;
@@ -207,6 +209,10 @@ impl Job {
             Step::DrainVideo => (
                 Resource::Video.service(),
                 json!({"action":"drain","stream":record.resources[&Resource::Video]}),
+            ),
+            Step::RecoverAudio => (
+                Resource::AudioEncoder.service(),
+                json!({"action":"recover","stream":record.resources[&Resource::AudioEncoder]}),
             ),
             Step::CloseCapture => (
                 Resource::AudioCapture.service(),

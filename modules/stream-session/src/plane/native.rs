@@ -128,7 +128,11 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        if status == MEDIA_BACKEND_ERROR {
+            Err("audio_encoder_failed")
+        } else {
+            output.finish(status)
+        }
     }
 
     fn submit_video(&mut self, packet: &EncodedPacket) -> PlaneResult<bool> {
@@ -146,7 +150,7 @@ impl Backend for NativeBackend {
         let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
         let api =
             unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe { (api.submit)(encoder.context(), stream, frame) })
+        encoder_accepted(unsafe { (api.submit)(encoder.context(), stream, frame) })
     }
 
     fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool> {
@@ -164,7 +168,7 @@ impl Backend for NativeBackend {
         let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
         let api =
             unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe { (api.drain)(encoder.context(), stream) })
+        encoder_accepted(unsafe { (api.drain)(encoder.context(), stream) })
     }
 
     fn drain_transport(&mut self) -> PlaneResult<bool> {
@@ -181,6 +185,14 @@ fn accepted(status: Status) -> PlaneResult<bool> {
         MEDIA_BUSY | MEDIA_PENDING => Ok(false),
         MEDIA_CLOSED => Err("native_stream_closed"),
         _ => Err("native_operation_failed"),
+    }
+}
+
+fn encoder_accepted(status: Status) -> PlaneResult<bool> {
+    if status == MEDIA_BACKEND_ERROR {
+        Err("audio_encoder_failed")
+    } else {
+        accepted(status)
     }
 }
 
