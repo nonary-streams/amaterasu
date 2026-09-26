@@ -1,5 +1,6 @@
 use crate::PackageResult;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 
 pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -20,6 +21,21 @@ pub fn decode_hex<const N: usize>(value: &str) -> PackageResult<[u8; N]> {
 
 pub fn sha256(bytes: &[u8]) -> String {
     encode_hex(&Sha256::digest(bytes))
+}
+
+pub fn sha256_reader(mut reader: impl Read) -> PackageResult<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let size = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if size == 0 {
+            break;
+        }
+        digest.update(&buffer[..size]);
+    }
+    Ok(encode_hex(&digest.finalize()))
 }
 
 pub fn random_identifier() -> PackageResult<String> {

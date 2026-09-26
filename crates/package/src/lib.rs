@@ -16,7 +16,7 @@ mod verification;
 pub mod web;
 
 pub use dependencies::ordered_components;
-pub use digest::{decode_hex, encode_hex, random_identifier, sha256};
+pub use digest::{decode_hex, encode_hex, random_identifier, sha256, sha256_reader};
 pub use manifest::*;
 pub use staging::{package_directory, stage_package};
 pub use storage::{

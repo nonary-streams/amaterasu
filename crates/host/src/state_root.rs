@@ -856,6 +856,70 @@ mod tests {
         let pairing = read_seed_namespace(&user.join(&pairing_relative)).unwrap();
         assert_eq!(pairing.values["pairing/v1"]["identity"], "new");
         assert!(user.join(".migration-seed-applied").exists());
+
+        // A later validated import refreshes the service snapshot. The same
+        // user receives its missing values on the next worker start, while
+        // the local credential remains authoritative.
+        fs::write(
+            machine.join(&relative),
+            br#"{"format_version":1,"revision":2,"values":{"authentication/v1":{"credential":"imported"},"authentication/new/v1":{"credential":"later"}}}"#,
+        )
+        .unwrap();
+        stage_seed_snapshot(&machine, &container, &sid).unwrap();
+        super::apply_pending_seed(&staged, &user).unwrap();
+        let result = read_seed_namespace(&user.join(&relative)).unwrap();
+        assert_eq!(result.values["authentication/v1"]["credential"], "current");
+        assert_eq!(
+            result.values["authentication/new/v1"]["credential"],
+            "later"
+        );
+        let revision = result.revision;
+        super::apply_pending_seed(&staged, &user).unwrap();
+        assert_eq!(
+            read_seed_namespace(&user.join(&relative)).unwrap().revision,
+            revision
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_completion_marker_replays_once_and_upgrades() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-legacy-marker-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let seed = root.join("seed");
+        let user = root.join("user");
+        let namespace = "616d617465726173752e61757468656e7469636174696f6e";
+        fs::create_dir_all(seed.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        fs::write(user.join(".migration-seed-applied"), b"S-1-5-18").unwrap();
+        fs::write(
+            seed.join("namespaces").join(namespace).join("state.json"),
+            br#"{"format_version":1,"revision":1,"values":{"authentication/v1":{"credential":"imported"}}}"#,
+        )
+        .unwrap();
+
+        super::apply_pending_seed(&seed, &user).unwrap();
+        let path = user.join("namespaces").join(namespace).join("state.json");
+        assert_eq!(
+            read_seed_namespace(&path).unwrap().values["authentication/v1"]["credential"],
+            "imported"
+        );
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(user.join(".migration-seed-applied")).unwrap())
+                .unwrap();
+        assert_eq!(marker["version"], 1);
+        fs::remove_file(path).unwrap();
+        super::apply_pending_seed(&seed, &user).unwrap();
+        assert!(
+            !user
+                .join("namespaces")
+                .join(namespace)
+                .join("state.json")
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
