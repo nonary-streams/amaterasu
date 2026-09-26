@@ -158,6 +158,28 @@ try {
         Assert-Equal (($old.Queue.Take())[0] | ConvertFrom-Json).nonce ('a' * 32) 'old queued frame was restamped'
         Assert-Equal (($new.Queue.Take())[0] | ConvertFrom-Json).nonce ('b' * 32) 'new queued frame used stale nonce'
         Assert-Equal ($newFrame[-1] | ConvertFrom-Json).nonce ('b' * 32) 'new end nonce'
+        $new.Api = $api
+        $new.Dispatcher = $api.MainView.UIDispatcher
+        $new.Stream = [System.IO.MemoryStream]::new()
+        & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $requestId
+        $queuedBeforeChange = $new.Queue.Take()
+        Assert-Equal $queuedBeforeChange.CapturedAt $updatedPayload.CapturedAt 'queued snapshot lost capture generation'
+        Assert-Equal $queuedBeforeChange.RequestId $requestId 'queued snapshot lost request correlation'
+        $staleWriter = [System.IO.StringWriter]::new()
+        $new.Signals['dirty'] = $updatedPayload.CapturedAt.AddTicks(1)
+        Assert-True (-not (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $queuedBeforeChange $staleWriter)) 'stale queued snapshot was sent'
+        Assert-Equal $staleWriter.ToString() '' 'stale queued snapshot emitted a partial bracket'
+        & $extension { param($connection,$id) Queue-Snapshot $connection $id } $new $queuedBeforeChange.RequestId
+        $recoveredFrame = $new.Queue.Take()
+        Assert-True ($recoveredFrame.CapturedAt -gt $queuedBeforeChange.CapturedAt) 'stale requested snapshot was not recaptured'
+        Assert-Equal $recoveredFrame.RequestId $requestId 'recaptured snapshot lost request correlation'
+        $new.Signals.Clear()
+        $freshWriter = [System.IO.StringWriter]::new()
+        Assert-True (& $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $new $queuedBeforeChange $freshWriter) 'fresh snapshot was dropped'
+        Assert-Equal @($freshWriter.ToString().Trim().Split("`n")).Count 5 'complete queued snapshot was not written'
+        Assert-Equal (($freshWriter.ToString().Trim().Split("`n")[-1]) | ConvertFrom-Json).nonce ('b' * 32) 'queued completion nonce changed'
+        Assert-Equal (($freshWriter.ToString().Trim().Split("`n")[-1]) | ConvertFrom-Json).requestId $requestId 'queued completion request ID changed'
+        $staleWriter.Dispose(); $freshWriter.Dispose()
         Assert-Throws {
             & $extension { param($connection) New-SnapshotFrame $connection } (New-MockConnection ('d' * 32) ([System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new())) | Out-Null
         } 'frame built without a complete cached payload'

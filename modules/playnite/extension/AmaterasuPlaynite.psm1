@@ -166,21 +166,46 @@ function Capture-SnapshotPayload($Api) {
     return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow }
 }
 
-function New-SnapshotFrame($Connection, [string]$RequestId = '') {
-    $payload = $null
-    if (-not $Connection.Cache.TryGetValue('payload', [ref]$payload)) { throw 'no complete UI-thread snapshot exists' }
+function New-SnapshotFrame($Connection, [string]$RequestId = '', $Payload = $null) {
+    if (-not $Payload -and -not $Connection.Cache.TryGetValue('payload', [ref]$Payload)) { throw 'no complete UI-thread snapshot exists' }
     $dirtyAt = [DateTime]::MinValue
     [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
-    if ($payload.CapturedAt -lt $dirtyAt) { throw 'Playnite library changed after cached snapshot' }
+    if ($Payload.CapturedAt -lt $dirtyAt) { throw 'Playnite library changed after cached snapshot' }
     $marker = @{ type='snapshotStart'; nonce=[string]$Connection.Nonce }
     if ($RequestId) { $marker.requestId = $RequestId }
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add((Convert-FrameLine $marker))
-    foreach ($line in [string[]]$payload.Lines) { $lines.Add($line) }
-    $end = @{ type='snapshotComplete'; nonce=[string]$Connection.Nonce; games=[int]$payload.Games }
+    foreach ($line in [string[]]$Payload.Lines) { $lines.Add($line) }
+    $end = @{ type='snapshotComplete'; nonce=[string]$Connection.Nonce; games=[int]$Payload.Games }
     if ($RequestId) { $end.requestId = $RequestId }
     $lines.Add((Convert-FrameLine $end))
     return $lines.ToArray()
+}
+
+function Add-SnapshotFrame($Connection, [string[]]$Lines, [DateTime]$CapturedAt, [string]$RequestId = '') {
+    # Keep the capture generation with the bracket until the writer finishes.
+    # A queued frame can become stale while a library event is being handled.
+    if ($Lines.Count -gt 512) { return $false }
+    $bytes = 0
+    foreach ($line in $Lines) {
+        $bytes += [System.Text.Encoding]::UTF8.GetByteCount($line) + 1
+        if ($bytes -gt 8388608) { return $false }
+    }
+    return $Connection.Queue.TryAdd(@{ Lines=$Lines; CapturedAt=$CapturedAt; RequestId=$RequestId })
+}
+
+function Write-QueuedFrame($Connection, $Frame, $Writer) {
+    $snapshot = $Frame -is [System.Collections.IDictionary]
+    $lines = if ($snapshot) { [string[]]$Frame.Lines } else { [string[]]$Frame }
+    foreach ($line in $lines) {
+        if ($snapshot) {
+            $dirtyAt = [DateTime]::MinValue
+            [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
+            if ($dirtyAt -gt $Frame.CapturedAt) { return $false }
+        }
+        $Writer.WriteLine($line)
+    }
+    return $true
 }
 
 function Queue-Snapshot($Connection, [string]$RequestId = '') {
@@ -195,8 +220,10 @@ function Queue-Snapshot($Connection, [string]$RequestId = '') {
             if (-not $fresh -or $fresh.CapturedAt -lt $dirtyAt) { throw 'library changed during UI capture' }
             $Connection.Cache['payload'] = $fresh
         }
-        $frame = @(New-SnapshotFrame $Connection $RequestId)
-        if (-not (Add-Frame $Connection $frame)) { throw 'snapshot outbox full' }
+        $payload = $null
+        if (-not $Connection.Cache.TryGetValue('payload', [ref]$payload)) { throw 'no complete UI-thread snapshot exists' }
+        $frame = [string[]]@(New-SnapshotFrame $Connection $RequestId $payload)
+        if (-not (Add-SnapshotFrame $Connection $frame $payload.CapturedAt $RequestId)) { throw 'snapshot outbox full' }
     } catch { $Connection.Stream.Dispose() }
 }
 
@@ -348,7 +375,9 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
             if (Write-FullscreenShutdown $connection $writer) { break }
             $frame = $null
             if ($connection.Queue.TryTake([ref]$frame, 100)) {
-                foreach ($line in [string[]]$frame) { $writer.WriteLine($line) }
+                if (-not (Write-QueuedFrame $connection $frame $writer) -and $frame.RequestId) {
+                    Queue-Snapshot $connection $frame.RequestId
+                }
             }
         }
     } finally {
@@ -435,10 +464,10 @@ function OnApplicationStarted() {
 function OnGameStarted($evnArgs) { Send-Status 'gameStarted' $evnArgs.Game }
 function OnGameStopped($evnArgs) { Send-Status 'gameStopped' $evnArgs.Game }
 function OnLibraryUpdated() {
+    $script:Signals['dirty'] = [DateTime]::UtcNow
     try {
         $payload = Capture-SnapshotPayload $PlayniteApi
         $script:SnapshotCache['payload'] = $payload
-        $script:Signals['dirty'] = $payload.CapturedAt
     } catch {
         $discard = $null
         [void]$script:SnapshotCache.TryRemove('payload', [ref]$discard)
