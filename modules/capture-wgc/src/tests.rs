@@ -894,6 +894,7 @@ fn closed_capture_drops_constant_rate_cache_and_requires_a_new_stream() {
         FakeBackend {
             events: events.clone(),
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: drops.clone(),
         },
         true,
