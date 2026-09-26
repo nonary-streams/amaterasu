@@ -27,5 +27,14 @@ foreach ($slot in 1..6) {
     $age = if ($events) { [math]::Round(([DateTime]::UtcNow - $events.LastWriteTimeUtc).TotalMinutes, 1) } else { 'unknown' }
     Write-Output "Slot ${slot} ($($start.role)): $status; event age=${age}m; $($start.branch)"
     & git -C $start.worktree log -1 --format='%h %cr %s'
-    & git -C $start.worktree log main..HEAD --format='  unlanded: %h %s'
+    $candidatePatches = & git -C $start.worktree cherry -v main HEAD
+    if ($LASTEXITCODE -ne 0) { throw "Cannot compare slot $slot patches with main." }
+    $pending = @($candidatePatches | Where-Object { $_.StartsWith('+ ') })
+    if ($pending.Count -eq 0) {
+        Write-Output '  pending patches: none'
+    } else {
+        foreach ($candidate in $pending) {
+            Write-Output "  pending patch: $($candidate.Substring(2))"
+        }
+    }
 }
