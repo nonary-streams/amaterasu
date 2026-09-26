@@ -369,6 +369,42 @@ fn touch_port() -> Value {
 }
 
 #[test]
+fn large_logical_touchport_caps_contact_area_without_changing_coordinates() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.desktop_geometry = Some(desktop_geometry());
+    let mut port = touch_port();
+    port["logical_width"] = json!(1_000_000);
+    port["logical_height"] = json!(1_000_000);
+    host.broker.touch_port = Some(port);
+    host.broker.input_pen_touch_supported = Some(json!(true));
+    host.broker.input_native_pen_touch = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(touch_packet(0x55000002, 1, 17));
+    host.idle();
+
+    let event = &host.broker.input_events[0];
+    let rect = serde_json::from_value::<amaterasu_media::CaptureGeometry>(desktop_geometry())
+        .unwrap()
+        .normalized_output()
+        .unwrap();
+    assert_eq!(
+        event["x"],
+        json!(((f32::from(rect.left) + f32::from(rect.right)) / 2.0).round() as u16)
+    );
+    assert_eq!(
+        event["y"],
+        json!(((f32::from(rect.top) + f32::from(rect.bottom)) / 2.0).round() as u16)
+    );
+    assert_eq!(event["contact_area_major"], 1.0);
+    assert_eq!(event["contact_area_minor"], 1.0);
+}
+
+#[test]
 fn inset_touchport_reaches_both_capture_edges_and_bad_metadata_fails_closed() {
     let mut host = Harness::new();
     enable_input(&mut host);

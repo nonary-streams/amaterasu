@@ -413,7 +413,7 @@ fn pen_touch_payload(
     let scale = |radius: f32, radians: f32| -> f32 {
         let horizontal = radius * radians.cos() * port.logical_width / 65535.0;
         let vertical = radius * radians.sin() * port.logical_height / 65535.0;
-        horizontal.hypot(vertical)
+        horizontal.hypot(vertical).clamp(0.0, 1.0)
     };
     let mut value = json!({
         "kind":"pen_touch", "pointer_id":packet.pointer_id,
