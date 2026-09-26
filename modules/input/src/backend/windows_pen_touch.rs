@@ -2,7 +2,7 @@ use crate::model::{
     Event, InputError, InputResult, PEN_POINTER_ID, PenTool, PenTouchDevice, PenTouchPhase,
     pen_tilt_axes,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{GetLastError, RECT};
@@ -175,8 +175,36 @@ impl WindowsPenTouch {
             *self.device_state_slot_mut(*device) = Some(PointerDeviceState {
                 handle,
                 contacts: BTreeMap::new(),
+                recovery_required: false,
+                uncertain_contacts: BTreeSet::new(),
             });
         }
+        let terminal_pointer =
+            matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel).then_some(*pointer_id);
+        let recovered = self.recover_device(*device, virtual_desktop, terminal_pointer)?;
+        if recovered && terminal_pointer.is_some() {
+            // Destroying the old generation released this contact. A terminal
+            // event must not recreate it merely to send Up or Cancel.
+            if let Some(state) = self.device_state_mut(*device).as_mut() {
+                state.contacts.remove(pointer_id);
+                state.uncertain_contacts.remove(pointer_id);
+            }
+            self.update_keepalive_deadline(Instant::now());
+            return Ok(());
+        }
+        if terminal_pointer.is_some()
+            && self
+                .device_state(*device)
+                .is_some_and(|state| state.uncertain_contacts.contains(pointer_id))
+        {
+            if let Some(state) = self.device_state_mut(*device).as_mut() {
+                state.contacts.remove(pointer_id);
+                state.uncertain_contacts.remove(pointer_id);
+            }
+            self.update_keepalive_deadline(Instant::now());
+            return Ok(());
+        }
+        self.prepare_active_contact(*device, *pointer_id, virtual_desktop)?;
         let contact = PointerContact {
             x: *x,
             y: *y,
@@ -209,7 +237,7 @@ impl WindowsPenTouch {
             state.contacts.insert(*pointer_id, contact);
             let frame = build_pointer_frame(
                 *device,
-                &state.contacts,
+                &state.native_contacts(),
                 Some((*pointer_id, *phase)),
                 virtual_desktop,
             )?;
@@ -227,6 +255,16 @@ impl WindowsPenTouch {
             {
                 state.contacts.insert(*pointer_id, previous_contact);
             }
+            if let Some(state) = self.device_state_mut(*device).as_mut() {
+                state.recovery_required = true;
+                if matches!(
+                    phase,
+                    PenTouchPhase::Down | PenTouchPhase::Up | PenTouchPhase::Cancel
+                ) {
+                    state.uncertain_contacts.insert(*pointer_id);
+                }
+            }
+            self.quarantine_device(*device);
             self.update_keepalive_deadline(Instant::now());
             return Err(error);
         }
@@ -235,6 +273,7 @@ impl WindowsPenTouch {
             && let Some(state) = self.device_state_mut(*device).as_mut()
         {
             state.contacts.remove(pointer_id);
+            state.uncertain_contacts.remove(pointer_id);
         }
         self.update_keepalive_deadline(Instant::now());
         Ok(())
@@ -254,6 +293,14 @@ impl WindowsPenTouch {
 
     pub(super) fn stop(&mut self) -> InputResult<()> {
         for device in [PenTouchDevice::Pen, PenTouchDevice::Touch] {
+            if self
+                .device_state(device)
+                .is_some_and(|state| state.recovery_required)
+            {
+                // The generation is uncertain; destroying its owned handle
+                // releases every contact without sending another poisoned frame.
+                continue;
+            }
             let pointer_ids = self
                 .device_state(device)
                 .map(|state| state.contacts.keys().copied().collect::<Vec<_>>())
@@ -267,7 +314,9 @@ impl WindowsPenTouch {
         }
 
         for device in [PenTouchDevice::Pen, PenTouchDevice::Touch] {
-            if let Some(state) = self.device_state_slot_mut(device).take() {
+            if let Some(state) = self.device_state_slot_mut(device).take()
+                && !state.handle.is_null()
+            {
                 self.api.destroy_device(state.handle);
             }
         }
@@ -277,6 +326,16 @@ impl WindowsPenTouch {
     }
 
     fn cancel_pointer(&mut self, device: PenTouchDevice, pointer_id: u32) -> InputResult<()> {
+        if self
+            .device_state(device)
+            .is_some_and(|state| state.uncertain_contacts.contains(&pointer_id))
+        {
+            if let Some(state) = self.device_state_mut(device).as_mut() {
+                state.contacts.remove(&pointer_id);
+                state.uncertain_contacts.remove(&pointer_id);
+            }
+            return Ok(());
+        }
         let contact = self
             .device_state(device)
             .and_then(|state| state.contacts.get(&pointer_id))
@@ -287,7 +346,7 @@ impl WindowsPenTouch {
             let state = self
                 .device_state(device)
                 .expect("active pointer has an owned device");
-            let mut contacts = state.contacts.clone();
+            let mut contacts = state.native_contacts();
             contacts.insert(pointer_id, contact);
             (
                 state.handle,
@@ -310,22 +369,33 @@ impl WindowsPenTouch {
         let virtual_desktop = self.api.virtual_desktop()?;
         let mut first_error = None;
         for device in [PenTouchDevice::Pen, PenTouchDevice::Touch] {
+            if let Err(error) = self.recover_device(device, virtual_desktop, None) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
             let Some(state) = self.device_state(device) else {
                 continue;
             };
-            if state.contacts.is_empty() {
+            let contacts = state.native_contacts();
+            if contacts.is_empty() {
                 continue;
             }
-            let frame = build_pointer_frame(device, &state.contacts, None, virtual_desktop)
+            let frame = build_pointer_frame(device, &contacts, None, virtual_desktop)
                 .map(|records| (state.handle, records));
             let result = match frame {
                 Ok((handle, records)) => self.api.inject(handle, &records),
                 Err(error) => Err(error),
             };
-            if let Err(error) = result
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = result {
+                if let Some(state) = self.device_state_mut(device).as_mut() {
+                    state.recovery_required = true;
+                }
+                self.quarantine_device(device);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -336,6 +406,103 @@ impl WindowsPenTouch {
             PenTouchDevice::Pen => self.pen.as_ref(),
             PenTouchDevice::Touch => self.touch.as_ref(),
         }
+    }
+
+    fn recover_device(
+        &mut self,
+        device: PenTouchDevice,
+        virtual_desktop: VirtualDesktop,
+        terminal_pointer: Option<u32>,
+    ) -> InputResult<bool> {
+        let Some(mut state) = self.device_state_slot_mut(device).take() else {
+            return Ok(false);
+        };
+        if !state.recovery_required {
+            *self.device_state_slot_mut(device) = Some(state);
+            return Ok(false);
+        }
+
+        if !state.handle.is_null() {
+            self.api.destroy_device(state.handle);
+            state.handle = std::ptr::null_mut();
+        }
+        let result = (|| {
+            let mut restored = BTreeMap::new();
+            for (&pointer_id, &contact) in &state.contacts {
+                if state.uncertain_contacts.contains(&pointer_id)
+                    || terminal_pointer == Some(pointer_id)
+                {
+                    continue;
+                }
+                if state.handle.is_null() {
+                    state.handle = self.api.create_device(device)?;
+                }
+                restored.insert(pointer_id, contact);
+                let records = build_pointer_frame(
+                    device,
+                    &restored,
+                    Some((pointer_id, PenTouchPhase::Down)),
+                    virtual_desktop,
+                )?;
+                self.api.inject(state.handle, &records)?;
+            }
+            state.recovery_required = false;
+            Ok(true)
+        })();
+        if result.is_err() && !state.handle.is_null() {
+            self.api.destroy_device(state.handle);
+            state.handle = std::ptr::null_mut();
+        }
+        *self.device_state_slot_mut(device) = Some(state);
+        result
+    }
+
+    fn quarantine_device(&mut self, device: PenTouchDevice) {
+        if let Some(mut state) = self.device_state_slot_mut(device).take() {
+            if !state.handle.is_null() {
+                self.api.destroy_device(state.handle);
+                state.handle = std::ptr::null_mut();
+            }
+            *self.device_state_slot_mut(device) = Some(state);
+        }
+    }
+
+    fn prepare_active_contact(
+        &mut self,
+        device: PenTouchDevice,
+        pointer_id: u32,
+        virtual_desktop: VirtualDesktop,
+    ) -> InputResult<()> {
+        let Some(mut state) = self.device_state_slot_mut(device).take() else {
+            return Ok(());
+        };
+        let result = (|| {
+            if state.handle.is_null() {
+                state.handle = self.api.create_device(device)?;
+            }
+            if state.uncertain_contacts.contains(&pointer_id) {
+                let mut contacts = state.native_contacts();
+                if let Some(contact) = state.contacts.get(&pointer_id) {
+                    contacts.insert(pointer_id, *contact);
+                    let records = build_pointer_frame(
+                        device,
+                        &contacts,
+                        Some((pointer_id, PenTouchPhase::Down)),
+                        virtual_desktop,
+                    )?;
+                    if let Err(error) = self.api.inject(state.handle, &records) {
+                        state.recovery_required = true;
+                        self.api.destroy_device(state.handle);
+                        state.handle = std::ptr::null_mut();
+                        return Err(error);
+                    }
+                    state.uncertain_contacts.remove(&pointer_id);
+                }
+            }
+            Ok(())
+        })();
+        *self.device_state_slot_mut(device) = Some(state);
+        result
     }
 
     fn device_state_slot_mut(&mut self, device: PenTouchDevice) -> &mut Option<PointerDeviceState> {
@@ -353,7 +520,12 @@ impl WindowsPenTouch {
         [self.pen.as_ref(), self.touch.as_ref()]
             .into_iter()
             .flatten()
-            .any(|state| !state.contacts.is_empty())
+            .any(|state| {
+                state
+                    .contacts
+                    .keys()
+                    .any(|pointer_id| !state.uncertain_contacts.contains(pointer_id))
+            })
     }
 
     fn update_keepalive_deadline(&mut self, now: Instant) {
@@ -372,6 +544,18 @@ impl Drop for WindowsPenTouch {
 struct PointerDeviceState {
     handle: SyntheticPointerHandle,
     contacts: BTreeMap<u32, PointerContact>,
+    recovery_required: bool,
+    uncertain_contacts: BTreeSet<u32>,
+}
+
+impl PointerDeviceState {
+    fn native_contacts(&self) -> BTreeMap<u32, PointerContact> {
+        self.contacts
+            .iter()
+            .filter(|(pointer_id, _)| !self.uncertain_contacts.contains(pointer_id))
+            .map(|(&pointer_id, &contact)| (pointer_id, contact))
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +999,7 @@ fn unsupported_api_error() -> InputError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     #[derive(Default)]
@@ -825,6 +1010,8 @@ mod tests {
         frames: Vec<(PenTouchDevice, Vec<POINTER_TYPE_INFO>)>,
         destroyed: Vec<usize>,
         fail_next_injection: bool,
+        lose_handle_on_next_failure: bool,
+        lost_handles: BTreeSet<usize>,
         fail_next_device_creation: bool,
     }
 
@@ -867,11 +1054,20 @@ mod tests {
             pointers: &[POINTER_TYPE_INFO],
         ) -> InputResult<()> {
             let mut state = self.state.borrow_mut();
+            let handle_id = handle as usize;
+            if state.lost_handles.contains(&handle_id) {
+                return Err(InputError::new(
+                    "injection_failed",
+                    "synthetic handle is lost",
+                ));
+            }
             if state.fail_next_injection {
                 state.fail_next_injection = false;
+                if std::mem::take(&mut state.lose_handle_on_next_failure) {
+                    state.lost_handles.insert(handle_id);
+                }
                 return Err(InputError::new("injection_failed", "simulated device loss"));
             }
-            let handle_id = handle as usize;
             let device = state
                 .created
                 .iter()
@@ -1615,27 +1811,261 @@ mod tests {
             .unwrap();
 
         let state = state.borrow();
-        assert_eq!(state.frames.len(), 3);
-        let first_cancel = &state.frames[1].1;
-        assert_eq!(first_cancel.len(), 2);
-        assert_eq!(touch_info(&first_cancel[0]).pointerInfo.pointerId, 10);
+        assert_eq!(state.frames.len(), 2);
+        assert_eq!(state.destroyed, vec![1, 2]);
+        assert_eq!(state.created.len(), 2);
         assert_eq!(
-            touch_info(&first_cancel[0]).pointerInfo.pointerFlags,
-            POINTER_FLAG_UP | POINTER_FLAG_CANCELED
+            touch_info(&state.frames[1].1[0]).pointerInfo.pointerFlags,
+            POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN
         );
-        assert_eq!(touch_info(&first_cancel[1]).pointerInfo.pointerId, 20);
-        assert_eq!(
-            touch_info(&first_cancel[1]).pointerInfo.pointerFlags & POINTER_FLAG_CANCELED,
-            0
-        );
-        let final_cancel = &state.frames[2].1;
-        assert_eq!(final_cancel.len(), 1);
-        assert_eq!(touch_info(&final_cancel[0]).pointerInfo.pointerId, 20);
-        assert_eq!(
-            touch_info(&final_cancel[0]).pointerInfo.pointerFlags,
-            POINTER_FLAG_UP | POINTER_FLAG_CANCELED
-        );
+        assert!(state.frames.iter().all(|(_, frame)| {
+            frame
+                .iter()
+                .all(|pointer| touch_info(pointer).pointerInfo.pointerId != 10)
+        }));
         assert!(backend.touch.as_ref().unwrap().contacts.is_empty());
+    }
+
+    #[test]
+    fn lost_touch_generation_does_not_replay_uncertain_down_before_other_cancel() {
+        let (mut backend, state) = backend();
+        backend
+            .inject(&event(
+                20,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                30,
+                40,
+            ))
+            .unwrap();
+        backend
+            .inject(&event(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                50,
+                60,
+            ))
+            .unwrap();
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        assert_eq!(
+            backend
+                .inject(&event(
+                    10,
+                    PenTouchDevice::Touch,
+                    PenTouchPhase::Down,
+                    10,
+                    20
+                ))
+                .unwrap_err()
+                .code,
+            "injection_failed"
+        );
+        assert!(backend.touch.as_ref().unwrap().recovery_required);
+        assert!(
+            backend
+                .touch
+                .as_ref()
+                .unwrap()
+                .uncertain_contacts
+                .contains(&10)
+        );
+        backend
+            .inject(&event(
+                20,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                30,
+                40,
+            ))
+            .unwrap();
+        assert!(backend.touch.as_ref().unwrap().contacts.contains_key(&10));
+        assert!(!backend.touch.as_ref().unwrap().contacts.contains_key(&20));
+        assert!(
+            backend
+                .pen
+                .as_ref()
+                .unwrap()
+                .contacts
+                .contains_key(&PEN_POINTER_ID)
+        );
+        assert_eq!(state.borrow().destroyed, vec![1]);
+        {
+            let fake = state.borrow();
+            assert_eq!(fake.frames.len(), 2);
+            assert!(
+                fake.frames
+                    .iter()
+                    .filter(|(device, _)| *device == PenTouchDevice::Touch)
+                    .all(|(_, frame)| {
+                        frame
+                            .iter()
+                            .all(|pointer| touch_info(pointer).pointerInfo.pointerId != 10)
+                    })
+            );
+        }
+        backend
+            .inject(&event(
+                10,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Cancel,
+                10,
+                20,
+            ))
+            .unwrap();
+        backend.stop().unwrap();
+        assert_eq!(state.borrow().destroyed, vec![1, 2]);
+        backend.start().unwrap();
+        backend
+            .inject(&event(
+                30,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                70,
+                80,
+            ))
+            .unwrap();
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn healthy_touch_move_replays_without_uncertain_pointer_on_new_handle() {
+        let (mut backend, state) = backend();
+        backend
+            .inject(&event(
+                20,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                30,
+                40,
+            ))
+            .unwrap();
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        assert!(
+            backend
+                .inject(&event(
+                    10,
+                    PenTouchDevice::Touch,
+                    PenTouchPhase::Down,
+                    10,
+                    20
+                ))
+                .is_err()
+        );
+        backend
+            .inject(&event(
+                20,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Move,
+                31,
+                41,
+            ))
+            .unwrap();
+        assert!(backend.touch.as_ref().unwrap().contacts.contains_key(&10));
+        assert_eq!(state.borrow().destroyed, vec![1]);
+        let fake = state.borrow();
+        assert_eq!(fake.frames.len(), 3);
+        for (_, frame) in &fake.frames[1..] {
+            assert_eq!(frame.len(), 1);
+            assert_eq!(touch_info(&frame[0]).pointerInfo.pointerId, 20);
+        }
+        drop(fake);
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn lost_touch_handle_recovers_move_up_and_cancel_retries() {
+        for phase in [
+            PenTouchPhase::Move,
+            PenTouchPhase::Up,
+            PenTouchPhase::Cancel,
+        ] {
+            let (mut backend, state) = backend();
+            let down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+            backend.inject(&down).unwrap();
+            let transition = event(7, PenTouchDevice::Touch, phase, 11, 21);
+            {
+                let mut fake = state.borrow_mut();
+                fake.fail_next_injection = true;
+                fake.lose_handle_on_next_failure = true;
+            }
+            assert_eq!(
+                backend.inject(&transition).unwrap_err().code,
+                "injection_failed"
+            );
+            assert_eq!(backend.touch.as_ref().unwrap().contacts[&7].x, 10);
+            backend.inject(&transition).unwrap();
+            assert_eq!(state.borrow().destroyed, vec![1]);
+            assert!(!backend.touch.as_ref().unwrap().recovery_required);
+            match phase {
+                PenTouchPhase::Move => {
+                    assert_eq!(backend.touch.as_ref().unwrap().contacts[&7].x, 11);
+                    backend
+                        .inject(&event(
+                            7,
+                            PenTouchDevice::Touch,
+                            PenTouchPhase::Cancel,
+                            11,
+                            21,
+                        ))
+                        .unwrap();
+                }
+                PenTouchPhase::Up | PenTouchPhase::Cancel => {
+                    assert!(backend.touch.as_ref().unwrap().contacts.is_empty());
+                }
+                PenTouchPhase::Down => unreachable!(),
+            }
+            backend.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_replacement_keeps_uncertain_down_for_later_recovery_or_stop() {
+        let (mut backend, state) = backend();
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        let down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        assert_eq!(backend.inject(&down).unwrap_err().code, "injection_failed");
+        state.borrow_mut().fail_next_device_creation = true;
+        let moved = event(7, PenTouchDevice::Touch, PenTouchPhase::Move, 11, 21);
+        assert_eq!(
+            backend.inject(&moved).unwrap_err().code,
+            "device_creation_failed"
+        );
+        assert!(backend.touch.as_ref().unwrap().handle.is_null());
+        assert!(
+            backend
+                .touch
+                .as_ref()
+                .unwrap()
+                .uncertain_contacts
+                .contains(&7)
+        );
+        assert!(backend.touch.as_ref().unwrap().contacts.contains_key(&7));
+        backend.inject(&moved).unwrap();
+        assert_eq!(backend.touch.as_ref().unwrap().contacts[&7].x, 11);
+        backend.stop().unwrap();
+        assert_eq!(state.borrow().destroyed, vec![1, 2]);
+
+        let (mut backend, state) = self::backend();
+        state.borrow_mut().fail_next_injection = true;
+        assert!(backend.inject(&down).is_err());
+        state.borrow_mut().fail_next_device_creation = true;
+        assert!(backend.inject(&moved).is_err());
+        backend.stop().unwrap();
+        assert!(backend.touch.is_none());
+        assert_eq!(state.borrow().destroyed, vec![1]);
     }
 
     #[test]
@@ -1692,7 +2122,11 @@ mod tests {
             .unwrap();
 
         let deadline = backend.next_keepalive.unwrap();
-        state.borrow_mut().fail_next_injection = true;
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
         assert_eq!(
             backend.advance(deadline).unwrap_err().code,
             "injection_failed"
@@ -1711,9 +2145,67 @@ mod tests {
 
         backend.advance(backend.next_keepalive.unwrap()).unwrap();
         let state = state.borrow();
-        assert_eq!(state.frames.len(), 5);
+        assert_eq!(state.frames.len(), 6);
         assert_eq!(state.frames[3].0, PenTouchDevice::Pen);
-        assert_eq!(state.frames[4].0, PenTouchDevice::Touch);
+        assert_eq!(state.frames[4].0, PenTouchDevice::Pen);
+        assert_eq!(state.frames[5].0, PenTouchDevice::Touch);
+        assert_eq!(state.destroyed, vec![1]);
+    }
+
+    #[test]
+    fn failed_touch_keepalive_rebuilds_confirmed_contacts_without_blocking_pen() {
+        let (mut backend, state) = backend();
+        backend
+            .inject(&event(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                10,
+                20,
+            ))
+            .unwrap();
+        backend
+            .inject(&event(
+                8,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                30,
+                40,
+            ))
+            .unwrap();
+        let deadline = backend.next_keepalive.unwrap();
+        {
+            let mut fake = state.borrow_mut();
+            fake.fail_next_injection = true;
+            fake.lose_handle_on_next_failure = true;
+        }
+        assert_eq!(
+            backend.advance(deadline).unwrap_err().code,
+            "injection_failed"
+        );
+        assert!(backend.touch.as_ref().unwrap().recovery_required);
+        backend
+            .inject(&event(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                50,
+                60,
+            ))
+            .unwrap();
+        backend.advance(backend.next_keepalive.unwrap()).unwrap();
+        assert_eq!(state.borrow().destroyed, vec![1]);
+        assert_eq!(backend.touch.as_ref().unwrap().contacts.len(), 2);
+        assert!(!backend.touch.as_ref().unwrap().recovery_required);
+        assert!(
+            backend
+                .pen
+                .as_ref()
+                .unwrap()
+                .contacts
+                .contains_key(&PEN_POINTER_ID)
+        );
+        backend.stop().unwrap();
     }
 
     #[test]
