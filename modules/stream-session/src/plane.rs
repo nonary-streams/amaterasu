@@ -18,6 +18,7 @@ pub struct Handles {
     pub media_transport: u64,
     pub control_transport: u64,
     pub stream_audio: bool,
+    pub audio_channels: u32,
 }
 
 #[derive(Debug)]
@@ -54,6 +55,7 @@ impl Plane {
             pump: Pump::with_audio(
                 native::NativeBackend::new(runtime, handles)?,
                 handles.stream_audio,
+                handles.audio_channels,
             ),
         })
     }
@@ -93,6 +95,7 @@ trait Backend {
 struct Pump<B> {
     backend: B,
     stream_audio: bool,
+    audio_channels: u32,
     video: VideoAssembly,
     pending_pcm: Option<PcmPacket>,
     pending_audio: Option<AudioPacket>,
@@ -109,13 +112,14 @@ struct Pump<B> {
 impl<B: Backend> Pump<B> {
     #[cfg(test)]
     fn new(backend: B) -> Self {
-        Self::with_audio(backend, true)
+        Self::with_audio(backend, true, 2)
     }
 
-    fn with_audio(backend: B, stream_audio: bool) -> Self {
+    fn with_audio(backend: B, stream_audio: bool, audio_channels: u32) -> Self {
         Self {
             backend,
             stream_audio,
+            audio_channels,
             video: VideoAssembly::default(),
             pending_pcm: None,
             pending_audio: None,
@@ -253,7 +257,7 @@ impl<B: Backend> Pump<B> {
                     codec: CODEC_OPUS,
                     flags: AUDIO_PACKET_END_OF_STREAM,
                     sample_rate: 48_000,
-                    channels: 2,
+                    channels: self.audio_channels,
                     frames: 0,
                     data: std::ptr::null(),
                     len: 0,
@@ -272,6 +276,9 @@ impl<B: Backend> Pump<B> {
         for _ in 0..READ_BUDGET {
             if let Some(packet) = &self.pending_audio {
                 let header = packet.header();
+                if header.channels != self.audio_channels {
+                    return Err("unsupported_audio_channels");
+                }
                 if !self.backend.submit_audio(&header)? {
                     return Ok(());
                 }
@@ -289,6 +296,9 @@ impl<B: Backend> Pump<B> {
         }
         if let Some(packet) = &self.pending_audio {
             let header = packet.header();
+            if header.channels != self.audio_channels {
+                return Err("unsupported_audio_channels");
+            }
             if !self.backend.submit_audio(&header)? {
                 return Ok(());
             }
@@ -303,6 +313,9 @@ impl<B: Backend> Pump<B> {
             self.pending_pcm = self.backend.pcm()?;
         }
         if let Some(packet) = &self.pending_pcm {
+            if packet.header().channels != self.audio_channels {
+                return Err("unsupported_audio_channels");
+            }
             if !self.backend.submit_pcm(&packet.header())? {
                 return Ok(());
             }

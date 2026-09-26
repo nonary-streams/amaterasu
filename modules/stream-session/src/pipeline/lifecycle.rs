@@ -526,10 +526,31 @@ impl Pipeline {
                     .filter(|bytes| (1..=1275).contains(bytes))
                     .ok_or("unsupported_audio_packet")? as usize;
                 if payload["constant_bitrate"] != true
-                    || payload["channels"] != 2
+                    || payload["channels"] != record.config.audio.channels
                     || payload["sample_rate"] != 48000
                 {
                     return Err("unsupported_audio_format");
+                }
+                if let Some((streams, coupled, mapping, wave_mapping)) =
+                    record.config.audio.channel_mapping()
+                {
+                    if payload["mapping_family"] != 1
+                        || payload["streams"] != streams
+                        || payload["coupled_streams"] != coupled
+                        || payload["channel_mapping"] != json!(mapping)
+                        || payload["wave_channel_mapping"] != json!(wave_mapping)
+                        || payload["packet_ms"] != record.config.audio.packet_ms
+                        || payload["bitrate"] != record.config.audio.bitrate
+                    {
+                        return Err("unsupported_audio_format");
+                    }
+                    record.audio_encoder_layout = Some(json!({
+                        "mapping_family": 1,
+                        "streams": streams,
+                        "coupled_streams": coupled,
+                        "channel_mapping": mapping,
+                        "wave_channel_mapping": wave_mapping,
+                    }));
                 }
                 record.packet_bytes = bytes;
                 record.wire_audio_bytes = if record.config.encrypt_audio {
@@ -537,6 +558,9 @@ impl Pipeline {
                 } else {
                     bytes
                 };
+                if record.wire_audio_bytes > 1280 {
+                    return Err("unsupported_audio_packet");
+                }
                 job.step = Step::Open(Resource::Media);
             }
             Resource::Media => {
@@ -570,9 +594,9 @@ impl Pipeline {
             Resource::AudioCapture => {
                 let format = &payload["format"];
                 if format["sample_rate"] != 48000
-                    || format["channels"] != 2
+                    || format["channels"] != record.config.audio.channels
                     || !matches!(format["format"].as_str(), Some("f32" | "i16"))
-                    || format["channel_mask"] != 3
+                    || format["channel_mask"] != record.config.audio.channel_mask
                 {
                     return Err("unsupported_audio_format");
                 }

@@ -87,12 +87,30 @@ impl VideoWire {
 pub struct AudioWire {
     pub packet_ms: u32,
     pub bitrate: u32,
+    #[serde(skip_serializing_if = "is_stereo_layout")]
+    pub layout: String,
+    #[serde(skip_serializing_if = "is_stereo_channels")]
+    pub channels: u32,
+    #[serde(skip_serializing_if = "is_stereo_mask")]
+    pub channel_mask: u32,
+}
+fn is_stereo_channels(channels: &u32) -> bool {
+    *channels == 2
+}
+fn is_stereo_mask(mask: &u32) -> bool {
+    *mask == 3
+}
+fn is_stereo_layout(layout: &String) -> bool {
+    layout == "stereo"
 }
 impl Default for AudioWire {
     fn default() -> Self {
         Self {
             packet_ms: 10,
             bitrate: 128000,
+            layout: "stereo".into(),
+            channels: 2,
+            channel_mask: 3,
         }
     }
 }
@@ -246,7 +264,15 @@ impl DisplayRequest {
             identities.push(display.id.as_str());
         }
         let raw_policies: Vec<&Value> = match (&self.mode_policy, &self.mode_policies) {
-            (Some(policy), None) if identities.len() == 1 => vec![policy],
+            (Some(policy), None)
+                if identities.len() == 1
+                    || matches!(
+                        policy["configuration_option"].as_str(),
+                        Some("ensure_active" | "ensure_primary" | "ensure_only_display")
+                    ) =>
+            {
+                vec![policy]
+            }
             (None, Some(policies)) if policies.len() == identities.len() => {
                 policies.iter().collect()
             }
@@ -262,6 +288,7 @@ impl DisplayRequest {
                 || targets
                     .iter()
                     .any(|id| id.eq_ignore_ascii_case(&policy.display_id))
+                || self.mode_policies.is_some() && raw_policy.get("configuration_option").is_some()
                 || policy
                     .configuration_option
                     .as_deref()
@@ -562,8 +589,23 @@ fn valid_ping_payload(value: &str) -> bool {
 }
 
 impl AudioWire {
+    pub fn channel_mapping(&self) -> Option<(u32, u32, &'static [u8], &'static [u8])> {
+        match self.channels {
+            6 => Some((4, 2, &[0, 4, 1, 2, 3, 5], &[0, 1, 4, 5, 2, 3])),
+            8 => Some((5, 3, &[0, 6, 1, 2, 3, 4, 5, 7], &[0, 1, 6, 7, 4, 5, 2, 3])),
+            _ => None,
+        }
+    }
     fn validate(&self) -> Result<(), &'static str> {
-        if !matches!(self.packet_ms, 5 | 10) || !(6000..=512000).contains(&self.bitrate) {
+        let bitrate_range = match (self.channels, self.packet_ms, self.channel_mask) {
+            (2, 5 | 10, 3) if self.layout == "stereo" => 6000..=512000,
+            (6, 5 | 10, 0x3f) if self.layout == "5.1" => 256000..=1536000,
+            (8, 5, 0x63f) if self.layout == "7.1" => 512000..=2048000,
+            (8, 10, 0x63f) if self.layout == "7.1" => 450000..=2048000,
+            _ => return Err("invalid_audio_configuration"),
+        };
+        let packet_bytes = (u64::from(self.bitrate) * u64::from(self.packet_ms)).div_ceil(8000);
+        if !bitrate_range.contains(&self.bitrate) || !(1..=1275).contains(&packet_bytes) {
             return Err("invalid_audio_configuration");
         }
         Ok(())
@@ -680,6 +722,11 @@ pub struct StartConfig {
     pub host_audio_enabled: bool,
 }
 impl StartConfig {
+    pub fn matches_prepared_audio(&self, prepared: &PrepareConfig) -> bool {
+        !prepared.stream_audio
+            || prepared.audio.channels == 2 && self.channels.is_none()
+            || self.channels == Some(prepared.audio.channels)
+    }
     pub fn matches_prepared_encryption(&self, prepared: &PrepareConfig) -> bool {
         self.encrypt_video
             .is_none_or(|encrypt_video| encrypt_video == prepared.encrypt_video)
@@ -739,12 +786,7 @@ impl StartConfig {
                     && !selector.chars().any(char::is_control)
                     && matches!(channels, 2 | 6 | 8)
                     && self.audio_endpoint.is_empty()
-                    && !self.capture_sink_without_routing =>
-            {
-                if stream_audio && channels != 2 {
-                    return Err("unsupported_audio_channels");
-                }
-            }
+                    && !self.capture_sink_without_routing => {}
             (Some(_), _) => return Err("invalid_virtual_sink_channels"),
         }
         Ok(())
@@ -926,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_sink_start_requires_a_valid_selector_channel_pair_and_stereo_transport() {
+    fn virtual_sink_start_requires_a_valid_selector_channel_pair() {
         let mut value = start_json();
         value["audio_endpoint"] = json!("");
         value["virtual_sink"] = json!("Steam Streaming Speakers");
@@ -944,7 +986,7 @@ mod tests {
         for channels in [6, 8] {
             value["channels"] = json!(channels);
             let surround: StartConfig = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(surround.validate(true), Err("unsupported_audio_channels"));
+            assert!(surround.validate(true).is_ok());
         }
 
         value["channels"] = json!(2);
@@ -1242,7 +1284,11 @@ mod tests {
         for packet_ms in [5, 10] {
             for bitrate in [6000, 256000, 512000] {
                 let mut config = prepare();
-                config.audio = AudioWire { packet_ms, bitrate };
+                config.audio = AudioWire {
+                    packet_ms,
+                    bitrate,
+                    ..AudioWire::default()
+                };
                 assert!(config.validate(false).is_ok());
             }
         }

@@ -159,6 +159,10 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
+        if !configuration.matches_prepared_audio(&record.config) {
+            rpc::complete(send, request, error("audio_configuration_mismatch"));
+            return;
+        }
         if !configuration.matches_prepared_encryption(&record.config) {
             rpc::complete(send, request, error("encryption_configuration_mismatch"));
             return;

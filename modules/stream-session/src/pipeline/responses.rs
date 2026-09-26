@@ -88,7 +88,7 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
         || payload["video"] != json!(config.video.effective())
         || batch_size_fallback != config.video.batch_size_fallback()
         || payload["audio"]["packet_ms"] != config.audio.packet_ms
-        || payload["audio"]["channels"] != 2
+        || payload["audio"]["channels"] != config.audio.channels
         || payload["audio"]["wire_payload_bytes"] != record.wire_audio_bytes
         || payload["video_encrypted"] != config.encrypt_video
         || payload["audio_encrypted"] != (config.stream_audio && config.encrypt_audio)

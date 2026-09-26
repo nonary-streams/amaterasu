@@ -92,7 +92,7 @@ impl Backend for NativeBackend {
     }
 
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>> {
-        let mut output = Delivery::default();
+        let mut output: Delivery<PcmPacket> = Delivery::default();
         // SAFETY: callback copies initialized PCM before the provider borrow ends.
         let capture = self.capture.as_ref().ok_or("audio_disabled")?;
         let stream = self.handles.audio_capture.ok_or("audio_disabled")?;
@@ -108,11 +108,18 @@ impl Backend for NativeBackend {
                 },
             )
         };
-        output.finish(status)
+        let packet = output.finish(status)?;
+        if packet
+            .as_ref()
+            .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
+        {
+            return Err("unsupported_audio_channels");
+        }
+        Ok(packet)
     }
 
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>> {
-        let mut output = Delivery::default();
+        let mut output: Delivery<AudioPacket> = Delivery::default();
         // SAFETY: stack output and binding outlive the synchronous encoder call.
         let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
         let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
@@ -131,7 +138,14 @@ impl Backend for NativeBackend {
         if status == MEDIA_BACKEND_ERROR {
             Err("audio_encoder_failed")
         } else {
-            output.finish(status)
+            let packet = output.finish(status)?;
+            if packet
+                .as_ref()
+                .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
+            {
+                return Err("unsupported_audio_channels");
+            }
+            Ok(packet)
         }
     }
 

@@ -136,6 +136,52 @@ fn pcm() -> PcmPacket {
 }
 
 #[test]
+fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
+    for channels in [6, 8] {
+        let pcm_bytes = vec![0; 480 * channels as usize * 4];
+        let frame = AudioFrame {
+            sample_rate: 48_000,
+            channels,
+            format: PCM_F32,
+            frames: 480,
+            flags: 0,
+            data: pcm_bytes.as_ptr(),
+            len: pcm_bytes.len(),
+            timestamp_us: 0,
+            sequence: 0,
+        };
+        let encoded_bytes = [0xf4, 1, 2];
+        let encoded = EncodedAudioPacket {
+            codec: CODEC_OPUS,
+            flags: 0,
+            sample_rate: 48_000,
+            channels,
+            frames: 480,
+            data: encoded_bytes.as_ptr(),
+            len: encoded_bytes.len(),
+            timestamp_us: 0,
+            sequence: 0,
+        };
+        let mut backend = Fake::default();
+        // SAFETY: both input allocations remain initialized throughout copying.
+        backend
+            .pcms
+            .push_back(unsafe { PcmPacket::copy(&frame).unwrap() });
+        backend
+            .audios
+            .push_back(unsafe { AudioPacket::copy(&encoded).unwrap() });
+        let mut pump = Pump::with_audio(backend, true, channels);
+        assert_eq!(pump.tick(true).unwrap().accepted_media_payload_bytes, 3);
+        assert_eq!(pump.backend.audio_sent, [encoded_bytes]);
+        assert_eq!(pump.backend.pcm_sent, 1);
+        pump.stopping = true;
+        pump.tick(true).unwrap();
+        assert_eq!(pump.backend.encoder_drains, 1);
+        assert_eq!(pump.backend.transport_drains, 0);
+    }
+}
+
+#[test]
 fn fragments_form_one_access_unit_without_waiting_for_a_later_frame() {
     let mut backend = Fake::default();
     backend.videos.extend([
@@ -309,7 +355,7 @@ fn disabled_audio_retries_only_eos_without_polling_capture_or_encoder() {
     backend.videos.push_back(video(&[], FLAG_END_OF_STREAM, 0));
     backend.audios.push_back(audio(false));
     backend.pcms.push_back(pcm());
-    let mut pump = Pump::with_audio(backend, false);
+    let mut pump = Pump::with_audio(backend, false, 2);
 
     pump.tick(true).unwrap();
     assert!(pump.video_ended);

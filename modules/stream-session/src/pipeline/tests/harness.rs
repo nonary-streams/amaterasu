@@ -725,7 +725,25 @@ impl Broker {
                 let bitrate = allocation.request["bitrate"].as_u64().unwrap();
                 let packet_ms = allocation.request["packet_ms"].as_u64().unwrap();
                 let packet_bytes = bitrate * packet_ms / 8_000;
-                json!({"ok":true,"stream":id,"sample_rate":48000,"channels":2,"packet_bytes":packet_bytes,"constant_bitrate":true})
+                let channels = allocation.request["channels"].as_u64().unwrap();
+                let mut reply = json!({"ok":true,"stream":id,"sample_rate":48000,"channels":channels,
+                    "packet_ms":packet_ms,"bitrate":bitrate,"packet_bytes":packet_bytes,"constant_bitrate":true});
+                if let Some((streams, coupled, mapping, wave_mapping)) = (crate::model::AudioWire {
+                    channels: channels as u32,
+                    packet_ms: packet_ms as u32,
+                    bitrate: bitrate as u32,
+                    channel_mask: if channels == 6 { 0x3f } else { 0x63f },
+                    layout: if channels == 6 { "5.1" } else { "7.1" }.into(),
+                })
+                .channel_mapping()
+                {
+                    reply["mapping_family"] = json!(1);
+                    reply["streams"] = json!(streams);
+                    reply["coupled_streams"] = json!(coupled);
+                    reply["channel_mapping"] = json!(mapping);
+                    reply["wave_channel_mapping"] = json!(wave_mapping);
+                }
+                reply
             }
             "amaterasu.media-transport/1" => {
                 let request = &allocation.request;
@@ -766,7 +784,13 @@ impl Broker {
                 reply
             }
             "amaterasu.audio/1" => {
-                json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint","format":{"sample_rate":self.format_rate,"channels":2,"channel_mask":3,"format":"f32"}})
+                let channels = allocation.request["channels"].as_u64().unwrap_or(2);
+                let mask = match channels {
+                    6 => 0x3f,
+                    8 => 0x63f,
+                    _ => 3,
+                };
+                json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint","format":{"sample_rate":self.format_rate,"channels":channels,"channel_mask":mask,"format":"f32"}})
             }
             _ => panic!("unexpected component"),
         }

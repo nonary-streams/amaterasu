@@ -121,6 +121,7 @@ pub(super) struct Record {
     pub input_events_sent: u64,
     pub input_batches: u64,
     pub packet_bytes: usize,
+    pub audio_encoder_layout: Option<Value>,
     pub wire_audio_bytes: usize,
     pub control_local: Option<String>,
     pub video_local: Option<String>,
@@ -184,6 +185,7 @@ impl Record {
             input_events_sent: 0,
             input_batches: 0,
             packet_bytes: 0,
+            audio_encoder_layout: None,
             wire_audio_bytes: 0,
             control_local: None,
             video_local: None,
@@ -248,6 +250,7 @@ impl Record {
             media_transport: get(Resource::Media)?,
             control_transport: get(Resource::Control)?,
             stream_audio: self.config.stream_audio,
+            audio_channels: self.config.audio.channels,
         })
     }
 
@@ -272,6 +275,7 @@ impl Record {
             "display_state": self.display_state,
             "display_applied": self.display_lease.is_some() && self.display_state == "applied",
             "packet_bytes": self.packet_bytes,
+            "audio_encoder_layout": self.audio_encoder_layout,
             "wire_audio_bytes": self.wire_audio_bytes,
             "control_local": self.control_local,
             "video_local": self.video_local,
@@ -301,7 +305,7 @@ impl Record {
         let config = &self.config;
         let mut payload = match resource {
             Resource::Session => return json!({"action":"create","key":self.operation(resource)}),
-            Resource::AudioEncoder => json!({"action":"open","channels":2,
+            Resource::AudioEncoder => json!({"action":"open","channels":config.audio.channels,
                 "packet_ms":config.audio.packet_ms,"bitrate":config.audio.bitrate}),
             Resource::Media => {
                 let audio_encrypted = config.stream_audio && config.encrypt_audio;
@@ -311,7 +315,7 @@ impl Record {
                     "video_bind":config.video_bind,"audio_bind":config.audio_bind,"video":config.video,
                     "ping_timeout_ms":config.ping_timeout_ms,
                     "stream_audio":config.stream_audio,
-                    "audio":{"packet_ms":config.audio.packet_ms,"channels":2,"wire_payload_bytes":self.wire_audio_bytes},
+                    "audio":{"packet_ms":config.audio.packet_ms,"channels":config.audio.channels,"wire_payload_bytes":self.wire_audio_bytes},
                     "encryption":if config.encrypt_video || audio_encrypted {
                         json!({"key_hex":config.key_hex,"key_id":config.key_id,"video":config.encrypt_video,
                             "audio":audio_encrypted,"permit_legacy_audio_iv_wrap":permit_legacy_audio_iv_wrap})

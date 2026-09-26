@@ -88,7 +88,7 @@ impl PcmPacket {
     pub(super) unsafe fn copy(frame: &AudioFrame) -> PlaneResult<Self> {
         let bytes = unsafe { frame.bytes() }.map_err(|_| "invalid_pcm_frame")?;
         if frame.sample_rate != 48_000
-            || frame.channels != 2
+            || !matches!(frame.channels, 2 | 6 | 8)
             || !matches!(frame.format, PCM_F32 | PCM_I16)
         {
             return Err("unsupported_pcm_format");
@@ -119,7 +119,7 @@ impl AudioPacket {
     /// Provider packet allocation remains live and immutable during this copy.
     pub(super) unsafe fn copy(packet: &EncodedAudioPacket) -> PlaneResult<Self> {
         let bytes = unsafe { packet.bytes() }.map_err(|_| "invalid_audio_packet")?;
-        if packet.channels != 2 {
+        if !matches!(packet.channels, 2 | 6 | 8) {
             return Err("unsupported_audio_channels");
         }
         let mut metadata = *packet;

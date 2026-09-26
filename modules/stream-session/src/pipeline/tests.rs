@@ -67,6 +67,117 @@ fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
 }
 
 #[test]
+fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
+    for (channels, mask, packet_ms, bitrate, bytes, wire) in [
+        (6, 0x3f, 5, 1_536_000, 960, 976),
+        (6, 0x3f, 10, 800_000, 1000, 1008),
+        (8, 0x63f, 5, 512_000, 320, 336),
+        (8, 0x63f, 10, 450_000, 562, 576),
+    ] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["audio"] = json!({"channels":channels,"channel_mask":mask,
+            "layout":if channels == 6 { "5.1" } else { "7.1" },
+            "packet_ms":packet_ms,"bitrate":bitrate});
+        let prepared = host.response(1, request.clone());
+        let id = prepared["session"]
+            .as_u64()
+            .expect("prepared surround stream");
+        assert_eq!(prepared["audio"], request["audio"]);
+        assert_eq!(prepared["packet_bytes"], bytes);
+        assert_eq!(prepared["wire_audio_bytes"], wire);
+        assert_eq!(prepared["audio_encoder_layout"]["mapping_family"], 1);
+        let encoder = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::AudioEncoder.service() && call.payload["action"] == "open"
+            })
+            .unwrap();
+        assert_eq!(encoder.payload["channels"], channels);
+        assert_eq!(encoder.payload["bitrate"], bitrate);
+        let media = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Media.service() && call.payload["action"] == "open"
+            })
+            .unwrap();
+        assert_eq!(
+            media.payload["audio"],
+            json!({"channels":channels,
+            "packet_ms":packet_ms,"wire_payload_bytes":wire})
+        );
+        let mut start_request = start(id);
+        start_request["configuration"]["audio_endpoint"] = json!("");
+        start_request["configuration"]["virtual_sink"] = json!("Steam Streaming Speakers");
+        start_request["configuration"]["channels"] = json!(channels);
+        assert_eq!(host.response(2, start_request)["state"], "active");
+        let capture = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+            })
+            .unwrap();
+        assert_eq!(capture.payload["channels"], channels);
+        assert_eq!(
+            host.response(3, json!({"action":"stop","session":id}))["state"],
+            "stopped"
+        );
+        assert_eq!(host.broker.leases(), 0);
+    }
+}
+
+#[test]
+fn surround_invalid_layout_and_packet_size_fail_before_resources() {
+    for (channels, mask, packet_ms, bitrate) in [
+        (6, 3, 5, 256_000),
+        (8, 0x63f, 5, 450_000),
+        (8, 0x63f, 5, 2_048_000),
+        (6, 0x3f, 10, 1_536_000),
+    ] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["audio"] = json!({"channels":channels,"channel_mask":mask,
+            "layout":if channels == 6 { "5.1" } else { "7.1" },
+            "packet_ms":packet_ms,"bitrate":bitrate});
+        assert_eq!(
+            host.response(1, request)["code"],
+            "invalid_audio_configuration"
+        );
+        assert!(host.broker.calls.is_empty());
+    }
+}
+
+#[test]
+fn surround_start_rejects_capture_layout_mismatch_before_capture() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["audio"] = json!({"channels":6,"channel_mask":0x3f,"layout":"5.1",
+        "packet_ms":5,"bitrate":256000});
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    let mut start_request = start(id);
+    start_request["configuration"]["audio_endpoint"] = json!("");
+    start_request["configuration"]["virtual_sink"] = json!("Steam Streaming Speakers");
+    start_request["configuration"]["channels"] = json!(8);
+    assert_eq!(
+        host.response(2, start_request)["code"],
+        "audio_configuration_mismatch"
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioCapture.service())
+    );
+}
+
+#[test]
 fn active_audio_failure_recovers_same_encoder_stream_before_more_media() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

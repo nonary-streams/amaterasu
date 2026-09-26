@@ -176,6 +176,7 @@ fn handles() -> Handles {
         media_transport: 40,
         control_transport: 50,
         stream_audio: true,
+        audio_channels: 2,
     }
 }
 
@@ -187,6 +188,7 @@ fn disabled_audio_handles() -> Handles {
         media_transport: 40,
         control_transport: 50,
         stream_audio: false,
+        audio_channels: 2,
     }
 }
 
