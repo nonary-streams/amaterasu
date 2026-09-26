@@ -79,6 +79,11 @@ pub struct Broker {
     pub history_ends: Vec<Value>,
     pub history_samples: Vec<Value>,
     pub history_events: Vec<Value>,
+    pub limiter_unavailable: bool,
+    pub limiter_admission_unavailable: bool,
+    pub limiter_restore_failures: usize,
+    pub limiter_lease: Option<String>,
+    pub limiter_session: Option<String>,
 }
 
 impl Broker {
@@ -156,6 +161,12 @@ impl Broker {
                 ..
             } => {
                 if service == "amaterasu.session-history/1" && !self.history_available {
+                    return Ok(Response::Error {
+                        code: "service_unavailable".into(),
+                        message: String::new(),
+                    });
+                }
+                if service == "amaterasu.frame-limiter/1" && self.limiter_admission_unavailable {
                     return Ok(Response::Error {
                         code: "service_unavailable".into(),
                         message: String::new(),
@@ -305,6 +316,9 @@ impl Broker {
         if service == "amaterasu.input/1" {
             return self.input(action, &call.payload);
         }
+        if service == "amaterasu.frame-limiter/1" {
+            return self.frame_limiter(action, &call.payload);
+        }
         if matches!(action, "open" | "create") {
             if self.fail_open.as_deref() == Some(service) {
                 return error("backend_failed");
@@ -445,6 +459,47 @@ impl Broker {
             return json!({"ok":true,"streams":[metadata]});
         }
         json!({"ok":true,"stream":id})
+    }
+
+    fn frame_limiter(&mut self, action: &str, payload: &Value) -> Value {
+        match action {
+            "apply" => {
+                if self.limiter_unavailable {
+                    return json!({"ok":true,"state":"runtime_unavailable","applied":false});
+                }
+                let session = payload["session_id"].as_str().unwrap();
+                if self.limiter_session.as_deref() == Some(session) {
+                    return json!({"ok":true,"state":"already_applied","applied":true,
+                        "lease":self.limiter_lease});
+                }
+                let lease = format!("limiter-{session}");
+                self.limiter_session = Some(session.into());
+                self.limiter_lease = Some(lease.clone());
+                json!({"ok":true,"state":"applied","applied":true,"lease":lease})
+            }
+            "status" => {
+                let leases = if self.limiter_session.as_deref() == payload["session_id"].as_str() {
+                    vec![
+                        json!({"session_id":self.limiter_session,"lease":self.limiter_lease,
+                        "state":"applied","applied":true}),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                json!({"ok":true,"state":if leases.is_empty() {"not_found"} else {"applied"},"applied":false,"leases":leases})
+            }
+            "restore" => {
+                if self.limiter_restore_failures > 0 {
+                    self.limiter_restore_failures -= 1;
+                    return json!({"ok":true,"state":"restore_failed","applied":true});
+                }
+                assert_eq!(payload["lease"], json!(self.limiter_lease));
+                self.limiter_lease = None;
+                self.limiter_session = None;
+                json!({"ok":true,"state":"restored","applied":false})
+            }
+            _ => panic!("unexpected frame limiter action"),
+        }
     }
 
     fn input(&mut self, action: &str, payload: &Value) -> Value {

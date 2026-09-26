@@ -2,6 +2,7 @@ mod armed;
 mod harness;
 mod history;
 mod input;
+mod limiter;
 use super::*;
 use harness::*;
 

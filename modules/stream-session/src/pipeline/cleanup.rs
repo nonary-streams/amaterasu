@@ -12,6 +12,24 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::FindLimiter => {
+                super::limiter::accept_status(record, &payload);
+                if record.limiter_lease.is_none() {
+                    if super::limiter::status_confirms_no_lease(&payload) {
+                        record.limiter_attempted = false;
+                    }
+                    job.limiter_tried = true;
+                }
+            }
+            Step::RestoreLimiter => {
+                if super::limiter::accept_restore(record, &payload) {
+                    record.limiter_attempted = false;
+                    job.limiter_tried = true;
+                } else {
+                    record.cleanup_error = Some("frame_limiter_restore_failed");
+                    job.limiter_tried = true;
+                }
+            }
             Step::FindInput => {
                 if input_missing(&payload) || input_released(record, &payload) {
                     clear_input(record);
@@ -120,6 +138,16 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("component_cleanup_failed");
         match job.step {
+            Step::FindLimiter => {
+                record.cleanup_error = Some("frame_limiter_status_unavailable");
+                job.limiter_tried = true;
+                true
+            }
+            Step::RestoreLimiter => {
+                record.cleanup_error = Some("frame_limiter_restore_failed");
+                job.limiter_tried = true;
+                true
+            }
             Step::ReleaseInput => {
                 record.input_lookup_required = true;
                 job.input_tried = false;
@@ -154,6 +182,8 @@ impl Pipeline {
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
+            && record.limiter_lease.is_none()
+            && !record.limiter_attempted
         {
             record.cleanup_error = None;
             record.outcome

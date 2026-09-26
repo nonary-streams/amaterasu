@@ -42,6 +42,15 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if job.step == Step::ApplyLimiter {
+                        let settled = pending.shutdown(send);
+                        if !settled {
+                            record.uncertain = Some(pending);
+                        }
+                        record.limiter_state = "apply_uncertain".into();
+                        job.fail(record, "frame_limiter_apply_uncertain", now);
+                        return true;
+                    }
                     record.uncertain = Some(pending);
                     record.plane = None;
                     record.cleanup_error = Some("request_cancellation_unconfirmed");
@@ -67,11 +76,27 @@ impl Pipeline {
                                 | Step::FinishSession
                                 | Step::FindInput
                                 | Step::ReleaseInput
+                                | Step::FindLimiter
+                                | Step::RestoreLimiter
                         ) {
                             self.cleanup_rejected(record, job, send)
                         } else {
                             true
                         };
+                    }
+                    if matches!(job.step, Step::ApplyLimiter | Step::FindLimiter) {
+                        record.limiter_state = "runtime_unavailable".into();
+                        if job.step == Step::ApplyLimiter && pending.admission_rejected() {
+                            record.limiter_attempted = false;
+                            job.step = Step::AcquireOutput;
+                            return true;
+                        }
+                        job.step = if job.step == Step::ApplyLimiter {
+                            Step::FindLimiter
+                        } else {
+                            Step::AcquireOutput
+                        };
+                        return true;
                     }
                     job.fail(record, "dependency_unavailable", now);
                 }
@@ -96,6 +121,9 @@ impl Pipeline {
         }
         if let Step::Open(resource) = job.step {
             record.attempted.insert(resource);
+        }
+        if job.step == Step::ApplyLimiter {
+            record.limiter_attempted = true;
         }
         if job.step == Step::AcquireInput {
             record.input_attempted = true;
@@ -143,6 +171,28 @@ impl Pipeline {
     ) -> bool {
         if job.cleanup {
             return self.consume_cleanup(record, job, payload, now, send);
+        }
+        if job.step == Step::ApplyLimiter {
+            super::limiter::accept_apply(record, &payload);
+            if record.limiter_lease.is_none()
+                && matches!(
+                    record.limiter_state.as_str(),
+                    "not_needed" | "runtime_unavailable" | "lease_conflict" | "policy_only"
+                )
+            {
+                record.limiter_attempted = false;
+            }
+            job.step = Step::AcquireOutput;
+            return true;
+        }
+        if job.step == Step::FindLimiter {
+            super::limiter::accept_status(record, &payload);
+            if record.limiter_lease.is_none() && super::limiter::status_confirms_no_lease(&payload)
+            {
+                record.limiter_attempted = false;
+            }
+            job.step = Step::AcquireOutput;
+            return true;
         }
         if payload["ok"] != true {
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
@@ -204,7 +254,13 @@ impl Pipeline {
                         record.state = State::Starting;
                         job.deadline = now.saturating_add(15000);
                     }
-                    job.step = Step::AcquireOutput;
+                    job.step = if record.config.frame_limiter_settings.is_some()
+                        && !record.limiter_attempted
+                    {
+                        Step::ApplyLimiter
+                    } else {
+                        Step::AcquireOutput
+                    };
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {

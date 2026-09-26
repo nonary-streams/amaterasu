@@ -101,6 +101,9 @@ pub(super) struct Record {
     pub input_attempted: bool,
     pub input_lookup_required: bool,
     pub input_lease: Option<String>,
+    pub limiter_attempted: bool,
+    pub limiter_lease: Option<String>,
+    pub limiter_state: String,
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
     pub input_renew_at: u64,
@@ -153,6 +156,9 @@ impl Record {
             input_attempted: false,
             input_lookup_required: false,
             input_lease: None,
+            limiter_attempted: false,
+            limiter_lease: None,
+            limiter_state: "not_requested".into(),
             input_request_started_at: 0,
             input_expires_at: 0,
             input_renew_at: 0,
@@ -174,6 +180,10 @@ impl Record {
 
     pub fn input_operation(&self) -> String {
         format!("ss-{:x}-input", self.id)
+    }
+
+    pub fn limiter_session(&self) -> String {
+        format!("stream-{:016x}", self.id)
     }
 
     pub fn lease(&self, audio: bool) -> String {
@@ -228,6 +238,8 @@ impl Record {
             "stream_audio": self.config.stream_audio,
             "frame_limiter_settings": self.config.frame_limiter_settings,
             "frame_limiter_executable_path": self.config.frame_limiter_executable_path,
+            "frame_limiter_state": self.limiter_state,
+            "frame_limiter_applied": self.limiter_lease.is_some() && self.limiter_state == "applied",
             "packet_bytes": self.packet_bytes,
             "wire_audio_bytes": self.wire_audio_bytes,
             "control_local": self.control_local,

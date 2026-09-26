@@ -15,6 +15,7 @@ pub(super) struct Pending {
     attempts: u8,
     settling: bool,
     first_sent_at: Option<u64>,
+    admission_rejected: bool,
 }
 
 pub(super) enum Progress {
@@ -39,6 +40,7 @@ impl Pending {
             attempts: 0,
             settling: false,
             first_sent_at: None,
+            admission_rejected: false,
         }
     }
 
@@ -96,6 +98,10 @@ impl Pending {
         self.first_sent_at.is_some()
     }
 
+    pub fn admission_rejected(&self) -> bool {
+        self.admission_rejected
+    }
+
     /// Releases a result already retrieved by `poll`. Result ownership belongs
     /// to the caller once `Progress::Result` is returned.
     pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
@@ -138,7 +144,10 @@ impl Pending {
                     self.attempts = 0;
                     Progress::Waiting
                 }
-                Ok(Response::Error { .. }) => Progress::Failed,
+                Ok(Response::Error { .. }) => {
+                    self.admission_rejected = true;
+                    Progress::Failed
+                }
                 _ => {
                     self.settling = true;
                     self.attempts += 1;

@@ -3,6 +3,7 @@ mod cleanup;
 mod history;
 mod input;
 mod lifecycle;
+mod limiter;
 mod record;
 mod responses;
 mod rpc;
@@ -76,12 +77,34 @@ impl Pipeline {
 
     fn shutdown_with(&mut self, send: &mut Send<'_>) -> bool {
         let mut settled = true;
+        if let Some(job) = self.job.as_mut()
+            && job.step == Step::ApplyLimiter
+            && let Some(mut pending) = job.pending.take()
+            && let Some(record) = self.records.get_mut(&job.session)
+        {
+            let mut resolved = false;
+            for turn in 0..8 {
+                match pending.poll(send, turn) {
+                    rpc::Progress::Result(response) => {
+                        limiter::accept_apply(record, &response);
+                        resolved = pending.release_result(send);
+                        break;
+                    }
+                    rpc::Progress::Waiting => {}
+                    rpc::Progress::Failed | rpc::Progress::Unresolved => break,
+                }
+            }
+            if !resolved {
+                settled &= pending.shutdown(send);
+            }
+        }
         for record in self.records.values_mut() {
             record.plane = None;
             settled &= record.history.shutdown(send);
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
+            settled &= limiter::shutdown(record, send);
         }
         if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
             settled &= pending.shutdown(send);

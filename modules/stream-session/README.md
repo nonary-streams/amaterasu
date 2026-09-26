@@ -37,6 +37,14 @@ cleanup has only begun: the coordinator waits for lookup to confirm absence.
 Unconfirmed cleanup remains visible as `cleanup_failed` and retains lease
 ownership; a later stop can retry it.
 
+When prepare includes a frozen frame-limiter snapshot and authoritative game
+executable path, start applies that policy before opening video. A verified
+lease stays with the stream session and is restored after media closes, including
+failed startup and bounded module shutdown. Provider unavailability does not
+prevent streaming; `frame_limiter_applied` is true only for a verified effect.
+Playnite launches currently lack an authoritative game executable path, so they
+cannot safely apply a per-game limiter profile through this path.
+
 Orderly stop must run before module replacement. Unload releases native bindings
 and attempts to settle pending broker requests; it cannot drive asynchronous
 provider cleanup after ticking ends. Provider unload/process shutdown remains the

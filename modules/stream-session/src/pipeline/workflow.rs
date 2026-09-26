@@ -9,6 +9,9 @@ pub(super) enum Step {
     Open(Resource),
     Authenticate,
     MediaReady,
+    ApplyLimiter,
+    FindLimiter,
+    RestoreLimiter,
     AcquireOutput,
     AcquireAudio,
     Activate,
@@ -40,6 +43,7 @@ pub(super) struct Job {
     pub deadline: u64,
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
+    pub limiter_tried: bool,
 }
 
 impl Job {
@@ -55,6 +59,7 @@ impl Job {
             deadline,
             tried: Default::default(),
             input_tried: false,
+            limiter_tried: false,
         }
     }
 
@@ -104,6 +109,15 @@ impl Job {
             }
             self.tried.insert(resource);
         }
+        if !self.limiter_tried {
+            if record.limiter_attempted && record.limiter_lease.is_none() {
+                return Some(Step::FindLimiter);
+            }
+            if record.limiter_lease.is_some() {
+                return Some(Step::RestoreLimiter);
+            }
+            self.limiter_tried = true;
+        }
         if record.resources.contains_key(&Resource::Session) {
             if record
                 .attempted
@@ -131,6 +145,18 @@ impl Job {
             Step::MediaReady => (
                 Resource::Media.service(),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),
+            ),
+            Step::ApplyLimiter => (
+                "amaterasu.frame-limiter/1".into(),
+                super::limiter::apply(record),
+            ),
+            Step::FindLimiter => (
+                "amaterasu.frame-limiter/1".into(),
+                json!({"action":"status","version":1,"session_id":record.limiter_session()}),
+            ),
+            Step::RestoreLimiter => (
+                "amaterasu.frame-limiter/1".into(),
+                json!({"action":"restore","version":1,"lease":record.limiter_lease}),
             ),
             Step::AcquireOutput | Step::AcquireAudio => (
                 Resource::Session.service(),
