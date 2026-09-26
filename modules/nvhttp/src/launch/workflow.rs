@@ -1013,6 +1013,15 @@ fn rtsp_response<'a>(
         .is_some_and(|expected| expected != ticket)
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
+        || payload.get("frame_limiter_settings")
+            != Some(
+                record
+                    .executable_path
+                    .as_ref()
+                    .and(record.frame_limiter_snapshot.as_ref())
+                    .unwrap_or(&Value::Null),
+            )
+        || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
     {
         return Err("invalid_rtsp_response");
     }

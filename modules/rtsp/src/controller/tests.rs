@@ -114,6 +114,28 @@ fn record(state: State) -> Record {
 }
 
 #[test]
+fn ticket_readback_keeps_the_admitted_frame_limiter_snapshot() {
+    let mut record = record(State::Preparing);
+    let snapshot = serde_json::json!({"version":1,"settings":{"frame_limiter_provider":"rtss"}});
+    record.config.frame_limiter_settings = Some(snapshot.clone());
+    record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
+    for state in [
+        State::Preparing,
+        State::Ready,
+        State::Playing,
+        State::Closing,
+    ] {
+        record.state = state;
+        let response = record.response();
+        assert_eq!(response["frame_limiter_settings"], snapshot);
+        assert_eq!(
+            response["frame_limiter_executable_path"],
+            "C:\\Games\\Example.exe"
+        );
+    }
+}
+
+#[test]
 fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let config = open();

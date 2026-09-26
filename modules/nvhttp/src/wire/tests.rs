@@ -133,6 +133,8 @@ impl Broker {
                         "ticket": 1,
                         "rtsp_url": "rtspenc://127.0.0.1:48010",
                         "state": "ready",
+                        "frame_limiter_settings": payload["frame_limiter_settings"],
+                        "frame_limiter_executable_path": payload["frame_limiter_executable_path"],
                         "failure": null,
                         "cleanup_error": null
                     }),

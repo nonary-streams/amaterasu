@@ -900,6 +900,9 @@ struct Broker {
     application_snapshot: Option<Value>,
     application_executable_path: Option<String>,
     application_catalog_revision: u64,
+    rtsp_snapshot: Option<Value>,
+    rtsp_executable_path: Option<String>,
+    wrong_rtsp_snapshot: bool,
 }
 
 impl Default for Broker {
@@ -937,6 +940,9 @@ impl Default for Broker {
             application_snapshot: None,
             application_executable_path: None,
             application_catalog_revision: 1,
+            rtsp_snapshot: None,
+            rtsp_executable_path: None,
+            wrong_rtsp_snapshot: false,
         }
     }
 }
@@ -994,6 +1000,12 @@ impl Broker {
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.rtsp/1" && action == "open" {
+            self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
+            self.rtsp_executable_path = payload["frame_limiter_executable_path"]
+                .as_str()
+                .map(str::to_owned);
+        }
         if service == "amaterasu.rtsp/1"
             && self
                 .unavailable_output
@@ -1138,6 +1150,8 @@ impl Broker {
         } else {
             "ready"
         };
+        let wrong_rtsp_snapshot = self.wrong_rtsp_snapshot;
+        self.wrong_rtsp_snapshot = false;
         json!({
             "ok": true,
             "ticket": 71,
@@ -1146,6 +1160,12 @@ impl Broker {
             "rtsp_url": "rtspenc://127.0.0.1:48010/launch-47",
             "session": 11,
             "stream_state": "prepared",
+            "frame_limiter_settings": if wrong_rtsp_snapshot {
+                json!({"wrong":"snapshot"})
+            } else {
+                self.rtsp_snapshot.clone().unwrap_or(Value::Null)
+            },
+            "frame_limiter_executable_path": self.rtsp_executable_path,
             "failure": null,
             "cleanup_error": if state == "cleanup_failed" {
                 Value::String("fixture_failure".into())
@@ -2466,6 +2486,22 @@ fn changed_catalog_revision_after_preflight_stops_application_before_rtsp() {
 }
 
 #[test]
+fn rtsp_snapshot_readback_mismatch_never_completes_launch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_executable_path: Some("C:\\Games\\Example.exe".into()),
+        wrong_rtsp_snapshot: true,
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    assert_eq!(controller.current_game(&peer(1)), 0);
+}
+
+#[test]
 fn expired_preflight_settles_without_scheduling_application_cleanup() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
@@ -2560,6 +2596,7 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker {
         lose_rtsp_open_once: true,
+        application_executable_path: Some("C:\\Games\\Example.exe".into()),
         ..Broker::default()
     };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
@@ -2584,6 +2621,10 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
         .collect();
     assert_eq!(rtsp_requests.len(), 3);
     assert_eq!(rtsp_requests[0].1, rtsp_requests[1].1);
+    assert_eq!(
+        rtsp_requests[0].1["frame_limiter_settings"],
+        broker.rtsp_snapshot.clone().expect("frozen RTSP snapshot")
+    );
     assert_eq!(rtsp_requests[0].2, rtsp_requests[1].2);
     assert_eq!(rtsp_requests[2].1["action"], "lookup");
     let cancel = broker

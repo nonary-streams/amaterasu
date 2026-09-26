@@ -68,6 +68,8 @@ impl Record {
     pub fn response(&self) -> Value {
         json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
+            "frame_limiter_settings":self.config.frame_limiter_settings,
+            "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
             "failure":self.failure,"cleanup_error":self.cleanup_error})
     }
 
