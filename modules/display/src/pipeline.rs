@@ -493,6 +493,7 @@ impl<P: Platform> Pipeline<P> {
                         topology_option,
                         Some(
                             DisplayConfigurationOption::EnsureActive
+                                | DisplayConfigurationOption::EnsurePrimary
                                 | DisplayConfigurationOption::EnsureOnlyDisplay
                         )
                     ) && let Some(policy) = mode_policy.as_ref()
@@ -914,18 +915,44 @@ fn compose_configuration(
             configuration.displays.push(selected);
             configuration
         }
+        Some(DisplayConfigurationOption::EnsurePrimary) => {
+            let mut configuration = active;
+            let anchor = configuration
+                .displays
+                .iter()
+                .min_by_key(|display| display.x)
+                .ok_or_else(|| DisplayError::new("unsupported_topology", "no active desktop"))?;
+            let width = i32::try_from(selected.width).map_err(|_| {
+                DisplayError::new(
+                    "invalid_request",
+                    "selected width overflows desktop coordinates",
+                )
+            })?;
+            let shift = width.checked_sub(anchor.x).ok_or_else(|| {
+                DisplayError::new("invalid_request", "primary translation overflows desktop")
+            })?;
+            let vertical_shift = anchor.y.checked_neg().ok_or_else(|| {
+                DisplayError::new("invalid_request", "primary translation overflows desktop")
+            })?;
+            for display in &mut configuration.displays {
+                display.x = display.x.checked_add(shift).ok_or_else(|| {
+                    DisplayError::new("invalid_request", "primary translation overflows desktop")
+                })?;
+                display.y = display.y.checked_add(vertical_shift).ok_or_else(|| {
+                    DisplayError::new("invalid_request", "primary translation overflows desktop")
+                })?;
+            }
+            selected.x = 0;
+            selected.y = 0;
+            configuration.displays.push(selected);
+            configuration
+        }
         Some(DisplayConfigurationOption::EnsureOnlyDisplay) => {
             selected.x = 0;
             selected.y = 0;
             Configuration {
                 displays: vec![selected],
             }
-        }
-        Some(DisplayConfigurationOption::EnsurePrimary) => {
-            return Err(DisplayError::new(
-                "unsupported_topology",
-                "inactive display route cannot be bound across the journal boundary",
-            ));
         }
         _ => {
             return Err(DisplayError::new(

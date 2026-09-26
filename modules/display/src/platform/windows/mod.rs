@@ -759,6 +759,143 @@ mod tests {
     }
 
     #[test]
+    fn inactive_primary_builder_translates_two_saved_sources_without_changing_modes() {
+        let mut left = readback_path("monitor.one", -1920, Some(false));
+        let mut primary = readback_path("monitor.two", 0, Some(false));
+        left.source.y = 800;
+        left.source.pixel_format = 7;
+        left.scaling = 3;
+        left.signal.pixel_rate = 123_456_789;
+        left.path_flags = 5;
+        primary.source.pixel_format = 6;
+        primary.scaling = 4;
+        primary.signal.pixel_rate = 234_567_890;
+        primary.path_flags = 9;
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![left.clone(), primary.clone()],
+        };
+        let mut configuration = before.configuration().unwrap();
+        configuration.displays[0].x = 1280;
+        configuration.displays[1].x = 3200;
+        configuration.displays[0].y = 0;
+        configuration.displays[1].y = -800;
+        let mut selected = requested().displays.remove(0);
+        selected.id = "monitor.three".into();
+        selected.width = 1280;
+        selected.hdr_enabled = None;
+        configuration.displays.push(selected);
+        let route = RouteBinding {
+            id: "monitor.three".into(),
+            source_name: "DISPLAY3".into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 52,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 53,
+            },
+            output_technology: 0,
+        };
+        let mut path = DISPLAYCONFIG_PATH_INFO::default();
+        path.sourceInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.sourceInfo.id = 52;
+        path.targetInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.targetInfo.id = 53;
+        path.targetInfo.targetAvailable = 1;
+        let buffers = apply::append_bound_inactive(
+            synthetic_bound(&before),
+            &configuration,
+            &before,
+            "monitor.three",
+            &route,
+            path,
+        )
+        .unwrap();
+        assert_eq!(buffers.paths.len(), 3);
+        assert_eq!(buffers.modes.len(), 5);
+        assert_eq!(buffers.paths[0].targetInfo.id, 53);
+        assert_eq!(
+            (
+                buffers.paths[1].targetInfo.id,
+                buffers.paths[2].targetInfo.id
+            ),
+            (left.target_address.id, primary.target_address.id)
+        );
+        for (index, (saved, translated_x, translated_y)) in
+            [(left.clone(), 1280, 0), (primary.clone(), 3200, -800)]
+                .into_iter()
+                .enumerate()
+        {
+            let old_path = &buffers.paths[index + 1];
+            // SAFETY: the builder checked and compacted both mode indexes.
+            let source_index = unsafe { old_path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            let target_index = unsafe { old_path.targetInfo.Anonymous.modeInfoIdx } as usize;
+            let source = unsafe { buffers.modes[source_index].Anonymous.sourceMode };
+            let target = unsafe { buffers.modes[target_index].Anonymous.targetMode };
+            assert_eq!(source.position.x, translated_x);
+            assert_eq!(source.position.y, translated_y);
+            assert_eq!(source.pixelFormat, saved.source.pixel_format);
+            assert_eq!(
+                (source.width, source.height),
+                (saved.source.width, saved.source.height)
+            );
+            assert_eq!(
+                target.targetVideoSignalInfo.pixelRate,
+                saved.signal.pixel_rate
+            );
+            assert_eq!(old_path.targetInfo.scaling, saved.scaling);
+            assert_eq!(old_path.flags, saved.path_flags);
+        }
+        let mut readback = before.clone();
+        readback.paths[0].source.x = 1280;
+        readback.paths[0].source.y = 0;
+        readback.paths[1].source.x = 3200;
+        readback.paths[1].source.y = -800;
+        readback
+            .paths
+            .push(readback_path("monitor.three", 0, Some(false)));
+        assert!(apply::verifies_untouched(
+            &configuration,
+            &before,
+            &readback,
+            "monitor.three"
+        ));
+        readback.paths[1].source.y += 1;
+        assert!(!apply::verifies_untouched(
+            &configuration,
+            &before,
+            &readback,
+            "monitor.three"
+        ));
+        let mut wrong = configuration.clone();
+        wrong.displays[1].x += 1;
+        assert_eq!(
+            apply::append_bound_inactive(
+                synthetic_bound(&before),
+                &wrong,
+                &before,
+                "monitor.three",
+                &route,
+                path
+            )
+            .err()
+            .unwrap()
+            .code,
+            "unsupported_topology"
+        );
+    }
+
+    #[test]
     fn inactive_only_rejects_unknown_saved_hdr_before_journal() {
         let mut before = Snapshot {
             format_version: 1,

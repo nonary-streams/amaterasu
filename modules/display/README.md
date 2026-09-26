@@ -139,14 +139,20 @@ On a multi-monitor desktop they rebuild only that target's requested mode and
 translate untouched source positions for a primary change, while retaining the
 saved source/target modes, timing, scaling, pixel format, and route flags of
 other targets. Full native readback verifies those untouched paths after HDR.
-`ensure_active` can also activate an inactive physical target when QDC reports
+`ensure_active` and `ensure_primary` can also activate an inactive physical
+target when QDC reports
 exactly one available free source route for one physical target. The provider
 persists that monitor/source/target binding with the journal and rechecks it
-after journal acknowledgement and just before native Apply. It preserves all
-previously active paths and places the new target to their right. HDR=true is
+after journal acknowledgement and just before native Apply. `ensure_active`
+preserves all previously active paths and places the new target to their right.
+`ensure_primary` places the selected target at (0,0), then translates the old
+desktop with one checked x/y offset so its leftmost path touches the selected
+target. The new primary takes first CCD path priority; old paths retain their
+relative priority and full native modes. Native readback must prove the entire
+requested layout or restore the saved baseline. Windows hardware may reject or
+rearrange layouts that fail its desktop connectivity rules. HDR=true is
 rejected without a saved baseline; false or unspecified HDR must read back as
-off after activation, or the provider rolls back. An inactive target remains
-unsupported for `ensure_primary`.
+off after activation, or the provider rolls back.
 The selected path uses the existing CCD Apply contract, including its requested
 32bpp mode and preferred scaling.
 

@@ -377,7 +377,7 @@ pub(super) fn only_from_bound_inactive(
 }
 
 pub(super) fn append_bound_inactive(
-    bound: ConfigurationBuffers,
+    mut bound: ConfigurationBuffers,
     configuration: &Configuration,
     before: &Snapshot,
     selected: &str,
@@ -395,28 +395,7 @@ pub(super) fn append_bound_inactive(
             "inactive selected route does not match complete desired topology",
         ));
     }
-    for saved in &before.paths {
-        let wanted = configuration
-            .displays
-            .iter()
-            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
-            .ok_or_else(|| {
-                DisplayError::new("unsupported_topology", "active display was omitted")
-            })?;
-        if saved.source.width != wanted.width
-            || saved.source.height != wanted.height
-            || saved.source.x != wanted.x
-            || saved.source.y != wanted.y
-            || !saved.refresh.equivalent(wanted.refresh)
-            || saved.rotation != rotation(wanted.rotation)
-        {
-            return Err(DisplayError::new(
-                "unsupported_topology",
-                "inactive activation must preserve every active path",
-            ));
-        }
-    }
-    let wanted = configuration
+    let selected_wanted = configuration
         .displays
         .iter()
         .find(|display| display.id.eq_ignore_ascii_case(selected))
@@ -426,7 +405,84 @@ pub(super) fn append_bound_inactive(
                 "inactive target is missing from request",
             )
         })?;
-    append_selected_inactive(bound, wanted, route, path)
+    let (translation_x, translation_y) = if selected_wanted.x == 0 && selected_wanted.y == 0 {
+        let anchor = before
+            .paths
+            .iter()
+            .min_by_key(|saved| saved.source.x)
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_topology", "saved desktop has no active paths")
+            })?;
+        let horizontal = i32::try_from(selected_wanted.width)
+            .ok()
+            .and_then(|width| width.checked_sub(anchor.source.x))
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "unsupported_topology",
+                    "primary translation overflows desktop",
+                )
+            })?;
+        let vertical = anchor.source.y.checked_neg().ok_or_else(|| {
+            DisplayError::new(
+                "unsupported_topology",
+                "primary translation overflows desktop",
+            )
+        })?;
+        (horizontal, vertical)
+    } else {
+        (0, 0)
+    };
+    for (index, saved) in before.paths.iter().enumerate() {
+        let wanted = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_topology", "active display was omitted")
+            })?;
+        if saved.source.width != wanted.width
+            || saved.source.height != wanted.height
+            || saved.source.x.checked_add(translation_x) != Some(wanted.x)
+            || saved.source.y.checked_add(translation_y) != Some(wanted.y)
+            || !saved.refresh.equivalent(wanted.refresh)
+            || saved.rotation != rotation(wanted.rotation)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "inactive activation must preserve each active path with one translation",
+            ));
+        }
+        let path = &bound.paths[index];
+        // SAFETY: restoration() constructed this active path's SOURCE index in
+        // the owned mode array; bounds and type are checked below before use.
+        let mode_index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let mode = bound.modes.get_mut(mode_index).ok_or_else(|| {
+            DisplayError::new("unsupported_topology", "saved source mode index is invalid")
+        })?;
+        if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+            || address(mode.adapterId, mode.id)
+                != address(path.sourceInfo.adapterId, path.sourceInfo.id)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "saved source mode no longer matches its route",
+            ));
+        }
+        let mut source = saved.source.clone();
+        source.x = wanted.x;
+        source.y = wanted.y;
+        mode.Anonymous = DISPLAYCONFIG_MODE_INFO_0 {
+            sourceMode: native_source(&source),
+        };
+    }
+    let mut result = append_selected_inactive(bound, selected_wanted, route, path)?;
+    if selected_wanted.x == 0 && selected_wanted.y == 0 {
+        // CCD path order is priority order. Give the new primary first
+        // priority while retaining the relative order of saved active paths.
+        let primary = result.paths.pop().expect("selected path was appended");
+        result.paths.insert(0, primary);
+    }
+    Ok(result)
 }
 
 fn append_selected_inactive(

@@ -1318,9 +1318,10 @@ fn pending_inactive_route_restart_recovers_only_saved_active_baseline() {
 }
 
 #[test]
-fn ensure_primary_rejects_inactive_target_with_monitor_left_of_primary() {
+fn ensure_primary_places_inactive_target_left_of_translated_desktop_and_restores() {
     let mut baseline = two_display_snapshot();
     baseline.paths[0].source.x = -1920;
+    baseline.paths[0].source.y = 800;
     baseline.paths[1].source.x = 0;
     let mut state = State::default();
     let mut pipeline = Pipeline::new(
@@ -1339,9 +1340,161 @@ fn ensure_primary_rejects_inactive_target_with_monitor_left_of_primary() {
         "owner",
         mutating_option_request("ensure_primary", "monitor.new", selected, &revision),
     );
-    assert_eq!(applied["error"]["code"], "unsupported_topology");
+    assert_eq!(applied["applied"], true, "{applied}");
+    let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    assert_eq!(prepared.displays.len(), 3);
+    assert_eq!(
+        (
+            prepared.displays[0].x,
+            prepared.displays[1].x,
+            prepared.displays[2].x
+        ),
+        (1280, 3200, 0)
+    );
+    assert_eq!(
+        (
+            prepared.displays[0].y,
+            prepared.displays[1].y,
+            prepared.displays[2].y
+        ),
+        (0, -800, 0)
+    );
+    assert_eq!(
+        state.journal.as_ref().unwrap()["pending_route"]["id"],
+        "monitor.new"
+    );
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        [
+            "prepare:monitor.new:PreserveActive",
+            "apply:monitor.new:PreserveActive"
+        ]
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.applied_modes.len(), 2);
+}
+
+#[test]
+fn ensure_primary_inactive_overflow_and_route_drift_have_no_native_effect() {
+    let mut baseline = two_display_snapshot();
+    baseline.paths[0].source.x = -65_536;
+    baseline.paths[1].source.x = 0;
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut selected = configuration();
+    selected["displays"][0]["id"] = json!("monitor.new");
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_primary",
+            "monitor.new",
+            selected.clone(),
+            &json!(baseline.revision().unwrap()),
+        ),
+    );
+    assert_eq!(reply["error"]["code"], "invalid_request");
     assert!(state.journal.is_none());
     assert!(pipeline.platform.effects.is_empty());
+
+    let mut baseline = two_display_snapshot();
+    baseline.paths[0].source.x = -1920;
+    baseline.paths[1].source.x = 0;
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            inactive_route_changed: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_primary",
+            "monitor.new",
+            selected,
+            &json!(baseline.revision().unwrap()),
+        ),
+    );
+    assert_eq!(reply["error"]["code"], "topology_changed");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn ensure_primary_inactive_partial_apply_and_restart_restore_old_desktop() {
+    let mut baseline = two_display_snapshot();
+    baseline.paths[0].source.x = -1920;
+    baseline.paths[0].source.y = 800;
+    baseline.paths[1].source.x = 0;
+    let mut selected = configuration();
+    selected["displays"][0]["id"] = json!("monitor.new");
+    let request = mutating_option_request(
+        "ensure_primary",
+        "monitor.new",
+        selected,
+        &json!(baseline.revision().unwrap()),
+    );
+    let mut state = State::default();
+    let mut failing = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            apply_failure: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let failed = state.run(&mut failing, "owner", request.clone());
+    assert_eq!(failed["error"]["code"], "platform_error");
+    assert_eq!(failing.platform.effects, ["apply", "restore"]);
+    assert_eq!(failing.platform.applied_modes.len(), 2);
+    assert!(state.journal.is_none());
+
+    let mut applying = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut applying, "owner", request);
+    assert_eq!(applied["applied"], true);
+    let mut restarted = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline),
+            hdr_supported: true,
+            inactive_route_changed: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let restored = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(restarted.platform.effects, ["restore"]);
+    assert_eq!(restarted.platform.applied_modes.len(), 2);
+    assert!(state.journal.is_none());
 }
 
 #[test]
