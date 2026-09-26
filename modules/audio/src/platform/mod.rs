@@ -12,6 +12,7 @@ pub struct RecoveryConfig {
     pub virtual_channels: Option<u32>,
     pub preferred_valid_bits: Option<u16>,
     pub capture_sink_without_routing: bool,
+    pub explicit_route: bool,
 }
 
 pub(super) fn should_resolve_console_default(requested: &str, uses_virtual_sink: bool) -> bool {

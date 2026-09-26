@@ -171,6 +171,7 @@ impl RouteLease {
         endpoint: &str,
         capture_sink_without_routing: bool,
         virtual_sink: bool,
+        explicit_route: bool,
     ) -> AudioResult<Self> {
         if capture_sink_without_routing || endpoint == "default" {
             return Ok(Self::unchanged(endpoint));
@@ -180,12 +181,21 @@ impl RouteLease {
         let mut policy = mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(restore_pending(enumerator, &mut policy), Ok(true)) {
-            drop(policy);
-            schedule_route_restore_retry_if_pending();
-            return Err("audio_route_restore_failed");
-        }
-        let original = default_endpoints(enumerator)?;
+        let original = if matches!(restore_pending(enumerator, &mut policy), Ok(true)) {
+            default_endpoints(enumerator)?
+        } else {
+            let current = default_endpoints(enumerator).ok();
+            if !explicit_route
+                || !current.as_ref().is_some_and(|current| {
+                    policy.abandon_absent_restore_for_new_route(endpoint, current)
+                })
+            {
+                drop(policy);
+                schedule_route_restore_retry_if_pending();
+                return Err("audio_route_restore_failed");
+            }
+            current.expect("successful handoff requires a route snapshot")
+        };
         match policy.acquire_with_tracking(endpoint, &original, virtual_sink)? {
             AcquirePlan::Unchanged => Ok(Self::unchanged(endpoint)),
             AcquirePlan::Tracked | AcquirePlan::Shared => Ok(Self {
@@ -829,6 +839,7 @@ struct OpenSelectedOptions {
     preferred_valid_bits: Option<u16>,
     capture_sink_without_routing: bool,
     follow_console_default: bool,
+    explicit_route: bool,
 }
 
 pub struct Capture {
@@ -900,6 +911,11 @@ impl Capture {
         }
         let effective_capture_only =
             capture_sink_without_routing && automatic_virtual_sink.is_none();
+        let explicit_route = explicit_route_requested(
+            requested,
+            virtual_sink.is_some(),
+            automatic_virtual_sink.is_some(),
+        );
         let resolve_console_default =
             super::should_resolve_console_default(requested, uses_virtual_sink);
         let follow_console_default = super::should_follow_console_default(
@@ -943,6 +959,7 @@ impl Capture {
                     preferred_valid_bits,
                     capture_sink_without_routing: effective_capture_only,
                     follow_console_default,
+                    explicit_route,
                 },
             )
         }
@@ -977,6 +994,7 @@ impl Capture {
                     preferred_valid_bits: config.preferred_valid_bits,
                     capture_sink_without_routing: config.capture_sink_without_routing,
                     follow_console_default: config.follow_console_default,
+                    explicit_route: config.explicit_route,
                 },
             )
         }
@@ -998,6 +1016,7 @@ impl Capture {
             preferred_valid_bits,
             capture_sink_without_routing,
             follow_console_default,
+            explicit_route,
         } = options;
         let route_virtual_sink = desired_layout.is_some();
         // SAFETY: the caller created this device and enumerator in the live
@@ -1008,6 +1027,7 @@ impl Capture {
                 &endpoint,
                 capture_sink_without_routing || follow_console_default,
                 route_virtual_sink,
+                explicit_route,
             )?;
             let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
                 (Some(layout), Some(valid_bits)) => {
@@ -1069,6 +1089,7 @@ impl Capture {
                 virtual_channels: desired_layout.map(|layout| layout.channels),
                 preferred_valid_bits,
                 capture_sink_without_routing,
+                explicit_route,
             };
             Ok(Self {
                 capture,
@@ -1171,6 +1192,14 @@ impl Drop for Capture {
     }
 }
 
+fn explicit_route_requested(
+    requested: &str,
+    selected_virtual_sink: bool,
+    automatic_virtual_sink: bool,
+) -> bool {
+    selected_virtual_sink || (!automatic_virtual_sink && !matches!(requested, "" | "default"))
+}
+
 trait CaptureBufferRelease {
     fn release_buffer(&self, frames: u32) -> AudioResult<()>;
 }
@@ -1241,6 +1270,15 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_virtual_selection_does_not_abandon_an_older_route() {
+        assert!(!explicit_route_requested("default", false, true));
+        assert!(!explicit_route_requested("render.explicit", false, true));
+        assert!(!explicit_route_requested("default", false, false));
+        assert!(explicit_route_requested("render.explicit", false, false));
+        assert!(explicit_route_requested("default", true, false));
+    }
 
     #[test]
     fn console_default_poll_reopens_only_for_a_confirmed_change() {
