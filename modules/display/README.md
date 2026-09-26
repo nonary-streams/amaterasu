@@ -143,6 +143,9 @@ When the selected target shares an active clone source, its resolved resolution
 and source position apply to the whole clone group. The provider preserves each
 peer's target refresh and timing, places the selected target first in CCD path
 priority for `ensure_primary`, and journals the exact prior clone topology.
+Windows CCD readback must return that target first in path priority order after
+Apply and after HDR changes. Clone restoration also verifies the saved clone
+priority before releasing the recovery lease.
 
 `ensure_active` and `ensure_primary` can also activate an inactive physical
 target when QDC reports
@@ -288,9 +291,9 @@ output technology, and queryable HDR state. Transient adapter LUIDs are
 rebound after restart rather than compared as persistent identities. A driver
 that normalizes these saved flags can leave the recovery lease armed until its
 behavior is qualified; this has not been tested on physical display hardware.
-Readback matches paths by monitor identity independent of array order; it does
-not assert native path priority order. Read-only source/target status flags may
-drift and are not restore invariants.
+Readback matches paths by monitor identity independent of array order, except
+for selected primary priority and restoration of existing clone path priority.
+Read-only source/target status flags may drift and are not restore invariants.
 
 This implementation uses the classic CCD compatibility view and journals the
 queryable HDR on/off state of active paths. Active HDR can be restored; enforced

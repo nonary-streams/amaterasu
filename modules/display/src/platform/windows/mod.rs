@@ -267,12 +267,12 @@ impl Platform for WindowsPlatform {
         settle(
             |current| reject_foreign_restore_state(snapshot, &previous, &rebound_targets, current),
             |current| {
-                if snapshot.equivalent(current) {
+                if snapshot.equivalent(current) && saved_clone_priorities_match(snapshot, current) {
                     Ok(())
                 } else {
                     Err(DisplayError::new(
                         "verification_failed",
-                        "restored CCD mode/topology does not exactly match the saved snapshot",
+                        "restored CCD mode/topology or clone priority differs from the saved snapshot",
                     ))
                 }
             },
@@ -396,6 +396,9 @@ fn apply_configuration(
         |current| reject_foreign_apply_state(configuration, before, route, current),
         |current| {
             verify_applied_configuration(configuration, Ok(current.clone()))?;
+            if let Some((selected, TopologyShape::PrimaryActive)) = selected {
+                verify_primary_path_priority(selected, current)?;
+            }
             if let Some(route) = route {
                 verify_activated_route(route, current)?;
             }
@@ -441,6 +444,9 @@ fn apply_configuration(
         |current| {
             verify_applied_configuration(configuration, Ok(current.clone()))?;
             verify_requested_hdr(configuration, current)?;
+            if let Some((selected, TopologyShape::PrimaryActive)) = selected {
+                verify_primary_path_priority(selected, current)?;
+            }
             if let Some(route) = route {
                 verify_activated_route(route, current)?;
             }
@@ -541,7 +547,47 @@ fn verify_restoration_routes(saved: &Snapshot, current: &Snapshot) -> DisplayRes
         )
         .after_mutation());
     }
+    if !saved_clone_priorities_match(saved, current) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "restored clone path priority differs from the saved snapshot",
+        )
+        .after_mutation());
+    }
     Ok(())
+}
+
+fn saved_clone_priorities_match(saved: &Snapshot, current: &Snapshot) -> bool {
+    let has_clone = saved.paths.iter().enumerate().any(|(index, path)| {
+        saved
+            .paths
+            .iter()
+            .skip(index + 1)
+            .any(|peer| peer.source_address == path.source_address)
+    });
+    !has_clone
+        || (saved.paths.len() == current.paths.len()
+            && saved
+                .paths
+                .iter()
+                .zip(&current.paths)
+                .all(|(saved, observed)| saved.id.eq_ignore_ascii_case(&observed.id)))
+}
+
+fn verify_primary_path_priority(selected: &str, current: &Snapshot) -> DisplayResult<()> {
+    if current
+        .paths
+        .first()
+        .is_some_and(|path| path.id.eq_ignore_ascii_case(selected))
+    {
+        Ok(())
+    } else {
+        Err(DisplayError::new(
+            "verification_failed",
+            "Windows did not give the selected primary target first CCD path priority",
+        )
+        .after_mutation())
+    }
 }
 
 fn check_inactive_only_recovery(
@@ -969,6 +1015,111 @@ mod tests {
             bound.paths[2].sourceInfo.id,
             before.paths[2].source_address.id
         );
+    }
+
+    #[test]
+    fn primary_clone_readback_retries_normalized_priority_and_fails_closed() {
+        let first = readback_path("monitor.one", 0, Some(false));
+        let mut second = readback_path("monitor.two", 0, Some(false));
+        second.source_name = first.source_name.clone();
+        second.source_address = first.source_address.clone();
+        second.target_address.id = 99;
+        let normalized = Snapshot {
+            format_version: 1,
+            paths: vec![first, second],
+        };
+        let mut wanted = normalized.clone();
+        wanted.paths.swap(0, 1);
+        let configuration = wanted.configuration().unwrap();
+        assert!(apply::verifies(&configuration, &normalized));
+        assert_eq!(
+            verify_primary_path_priority("monitor.two", &normalized)
+                .unwrap_err()
+                .code,
+            "verification_failed"
+        );
+        let mut reads = 0;
+        let converged = settled_readback(
+            || {
+                reads += 1;
+                Ok(if reads == 1 {
+                    normalized.clone()
+                } else {
+                    wanted.clone()
+                })
+            },
+            |_| Ok(()),
+            |current| {
+                verify_applied_configuration(&configuration, Ok(current.clone()))?;
+                verify_primary_path_priority("monitor.two", current)
+            },
+            || {},
+        );
+        assert!(converged.is_ok());
+        assert_eq!(reads, 2);
+        let mut reads = 0;
+        let denied = settled_readback(
+            || {
+                reads += 1;
+                Ok(normalized.clone())
+            },
+            |_| Ok(()),
+            |current| verify_primary_path_priority("monitor.two", current),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(reads, CCD_SETTLE_ATTEMPTS);
+        assert_eq!(denied.code, "verification_failed");
+        assert!(denied.may_have_changed);
+    }
+
+    #[test]
+    fn clone_restore_requires_saved_path_priority_before_lease_cleanup() {
+        let first = readback_path("monitor.one", 0, Some(false));
+        let mut second = readback_path("monitor.two", 0, Some(false));
+        second.source_name = first.source_name.clone();
+        second.source_address = first.source_address.clone();
+        second.target_address.id = 99;
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![first, second],
+        };
+        let mut reordered = saved.clone();
+        reordered.paths.swap(0, 1);
+        assert!(saved.equivalent(&reordered));
+        assert_eq!(
+            verify_restoration_routes(&saved, &reordered)
+                .unwrap_err()
+                .code,
+            "verification_failed"
+        );
+        let mut reads = 0;
+        let recovered = settled_readback(
+            || {
+                reads += 1;
+                Ok(if reads == 1 {
+                    reordered.clone()
+                } else {
+                    saved.clone()
+                })
+            },
+            |_| Ok(()),
+            |current| verify_restoration_routes(&saved, current),
+            || {},
+        );
+        assert!(recovered.is_ok());
+        assert_eq!(reads, 2);
+        let mut saved_with_peer = saved;
+        saved_with_peer
+            .paths
+            .push(readback_path("monitor.three", 1920, Some(false)));
+        let mut reordered_peer = saved_with_peer.clone();
+        reordered_peer.paths.swap(1, 2);
+        assert!(saved_with_peer.equivalent(&reordered_peer));
+        assert!(!saved_clone_priorities_match(
+            &saved_with_peer,
+            &reordered_peer
+        ));
     }
 
     #[test]

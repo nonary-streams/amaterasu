@@ -224,6 +224,53 @@ fn ensure_primary_on_active_clone_translates_shared_source_and_recovers_exact_ba
 }
 
 #[test]
+fn active_clone_primary_failed_restore_retains_owner_recovery_lease() {
+    let baseline = cloned_snapshot();
+    let mut selected = configuration();
+    selected["displays"][0]["id"] = json!("monitor.two");
+    let request = mutating_option_request(
+        "ensure_primary",
+        "monitor.two",
+        selected,
+        &json!(baseline.revision().unwrap()),
+    );
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline),
+            hdr_supported: true,
+            restore_failure: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", request);
+    assert_eq!(applied["applied"], true, "{applied}");
+    let failed = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(failed["recovery_required"], true);
+    assert!(state.journal.is_some());
+    let foreign = state.run(
+        &mut pipeline,
+        "foreign",
+        json!({"action":"recover","lease":applied["lease"]}),
+    );
+    assert_eq!(foreign["error"]["code"], "permission_denied");
+    pipeline.platform.restore_failure = false;
+    let recovered = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":applied["lease"]}),
+    );
+    assert_eq!(recovered["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["apply", "restore", "restore"]);
+    assert!(state.journal.is_none());
+}
+
+#[test]
 fn conflicting_clone_mode_policies_fail_before_journal_or_native_effect() {
     let baseline = cloned_snapshot();
     let mut state = State::default();
