@@ -90,7 +90,9 @@ its integrated team branch after changes interact or conflict.
 
 Use Commitlog with actual session attribution. Commit coherent validated increments
 as they finish. Preserve historical attribution; new work names its actual team
-and model when appropriate. Do not manufacture status-only commits for throughput.
+and model when appropriate. Do not carry obsolete Luna orchestration footers
+from earlier task notes into new commits. Do not manufacture status-only commits
+for throughput.
 
 One independent review within the team is sufficient for ordinary changes. The
 coordinator can review worker-authored code; a worker reviews coordinator-authored

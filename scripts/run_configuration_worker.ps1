@@ -126,7 +126,9 @@ Implement across all assigned feature paths; no startup approval round trip.
 If an additional unreserved file is essential, report it to the coordinator;
 continue independent work. Never edit another checkout or main.
 Commit coherent validated increments using commitlog with actual session
-attribution. Do not wait for other workers to commit. Do not push.
+attribution. Do not copy obsolete Luna model or orchestration footers from
+historical task notes into new commits; use only currently applicable roles.
+Do not wait for other workers to commit. Do not push.
 Return commit SHAs, changed paths, exact checks/results, and remaining platform
 gates. A saved preference without its runtime behavior is not full parity.
 Report a concrete blocker after 15 minutes without implementation progress;
