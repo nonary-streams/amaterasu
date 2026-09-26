@@ -3,7 +3,10 @@
 `amaterasu.lutris/1` imports installed Lutris games into the shared catalog on
 Linux. The provider reads the current process user's `pga.db` from
 `$XDG_DATA_HOME/lutris/pga.db`, falling back to
-`$HOME/.local/share/lutris/pga.db`. It opens SQLite read-only and selects only
+`$HOME/.local/share/lutris/pga.db`. When there is no complete native database
+and client pair, it can use the current user's
+`$HOME/.var/app/net.lutris.Lutris/data/lutris/pga.db` with a verified per-user
+Flatpak installation. It opens SQLite read-only and selects only
 installed rows with a nonempty game configuration path. It does not inspect
 other users' home directories. A machine service running as root cannot infer
 the active desktop user's identity, so it refuses discovery until a trusted
@@ -23,6 +26,21 @@ and leave the catalog unchanged. Entries launch the canonical client with
 preserves Lutris runner-specific launch behavior. A later scan re-resolves the
 client; a client removed after import cannot be revalidated by this provider at
 launch time until the shared Launch admission contract supports that check.
+
+For the Flatpak path, the provider accepts only a database confined to the
+current user's canonical Lutris Flatpak data directory and a root-owned,
+protected `/usr/bin/flatpak` or `/usr/local/bin/flatpak` launcher. A bounded
+`flatpak info --user --show-ref net.lutris.Lutris` probe must return exactly
+one stable app reference. The Catalog launch is the verified launcher with
+`run --user --branch=stable --arch=<host architecture> net.lutris.Lutris
+lutris:rungameid/<id>` as fixed argv, without a shell. Failed or timed-out
+probes leave the Catalog unchanged. Status reports
+local database and executable hints; the discovery probe authorizes an import.
+Native database plus native client take precedence. A native executable with
+only Flatpak data uses the verified Flatpak pair. Machine services do not
+infer another user's installation. Flatpak-only launch is an Amaterasu addition
+to the pinned Vibeshine behavior, which discovers Flatpak data but requires a
+native Lutris client for direct launch.
 
 Version 1 product settings are owned by Lutris and stored through
 `amaterasu.configuration/1` with revision compare-and-swap. Only the management
@@ -121,7 +139,7 @@ Catalog acceptance requires the canonical decimal Lutris source ID artwork
 authorization contract. Client image delivery still needs the consuming integration.
 
 Other remaining gaps are trusted per-session discovery and launch for machine
-services, cross-user import, Flatpak-only clients, and launch admission for a
+services, cross-user import, and launch admission for a
 retained row after its client disappears or Lutris is disabled.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.

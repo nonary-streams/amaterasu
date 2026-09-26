@@ -667,6 +667,17 @@ fn prepare_snapshot(
         .to_str()
         .filter(|path| Path::new(path).is_absolute())
         .ok_or_else(|| "lutris_executable_path_is_not_utf8_absolute".to_owned())?;
+    let launch_arguments = |id: i64| match snapshot.launch_kind {
+        crate::discovery::LaunchKind::Native => vec![format!("lutris:rungameid/{id}")],
+        crate::discovery::LaunchKind::FlatpakUser => vec![
+            "run".to_owned(),
+            "--user".to_owned(),
+            "--branch=stable".to_owned(),
+            format!("--arch={}", std::env::consts::ARCH),
+            "net.lutris.Lutris".to_owned(),
+            format!("lutris:rungameid/{id}"),
+        ],
+    };
     let mut entries = Vec::new();
     let mut selection_remove_source_ids = Vec::new();
     for game in &snapshot.games {
@@ -702,7 +713,7 @@ fn prepare_snapshot(
             "launch":{
                 "kind":"executable",
                 "program":executable,
-                "arguments":[format!("lutris:rungameid/{}", game.id)],
+                "arguments":launch_arguments(game.id),
                 "working_directory":null,
                 "auto_detach":true,
                 "wait_all":false,
@@ -713,7 +724,7 @@ fn prepare_snapshot(
                 "provider":"lutris","game_id":game.id,"revision":revision
             });
         }
-        validate_catalog_entry(&entry, executable)
+        validate_catalog_entry(&entry, executable, &launch_arguments(game.id))
             .map_err(|error| format!("Lutris entry {} is not catalog-safe: {error}", game.id))?;
         entries.push(json!({
             "source_id":source_id,
@@ -748,7 +759,11 @@ fn runner_description(runner: &str) -> String {
     }
 }
 
-fn validate_catalog_entry(entry: &Value, executable: &str) -> Result<(), &'static str> {
+fn validate_catalog_entry(
+    entry: &Value,
+    executable: &str,
+    expected_arguments: &[String],
+) -> Result<(), &'static str> {
     let name = entry
         .get("name")
         .and_then(Value::as_str)
@@ -780,7 +795,11 @@ fn validate_catalog_entry(entry: &Value, executable: &str) -> Result<(), &'stati
         || !Path::new(launch_path).is_absolute()
         || launch_path != executable
         || !printable_text(launch_path, 2048)
-        || arguments.len() != 1
+        || arguments.len() != expected_arguments.len()
+        || arguments
+            .iter()
+            .zip(expected_arguments)
+            .any(|(actual, expected)| actual.as_str() != Some(expected))
         || arguments.iter().any(|argument| {
             argument
                 .as_str()
@@ -949,6 +968,7 @@ mod tests {
         Snapshot {
             database_path: PathBuf::from("/home/user/.local/share/lutris/pga.db"),
             lutris_executable: test_lutris_path(),
+            launch_kind: crate::discovery::LaunchKind::Native,
             games,
             artwork_revisions: Default::default(),
             artwork_scan_incomplete: false,
@@ -1081,6 +1101,52 @@ mod tests {
         );
         assert_eq!(entries[0]["entry"]["launch"]["auto_detach"], true);
         assert_eq!(entries[0]["entry"]["launch"]["wait_all"], false);
+    }
+
+    #[test]
+    fn flatpak_only_snapshot_projects_fixed_user_scoped_argv_without_touching_other_rows() {
+        let mut source = snapshot(vec![
+            game(7, "Example", "wine", "", ""),
+            game(42, "Steam Copy", "steam", "steam", "9001"),
+        ]);
+        source.database_path =
+            PathBuf::from("/home/user/.var/app/net.lutris.Lutris/data/lutris/pga.db");
+        source.lutris_executable = if cfg!(target_os = "windows") {
+            std::env::temp_dir().join("flatpak.exe")
+        } else {
+            PathBuf::from("/usr/bin/flatpak")
+        };
+        source.launch_kind = crate::discovery::LaunchKind::FlatpakUser;
+        let entries =
+            prepare_entries(&source, &ProductSettings::default(), &BTreeSet::new()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["source_id"], "7");
+        assert_eq!(
+            entries[0]["entry"]["launch"]["program"],
+            source.lutris_executable.to_str().unwrap()
+        );
+        assert_eq!(
+            entries[0]["entry"]["launch"]["arguments"],
+            json!([
+                "run",
+                "--user",
+                "--branch=stable",
+                format!("--arch={}", std::env::consts::ARCH),
+                "net.lutris.Lutris",
+                "lutris:rungameid/7"
+            ])
+        );
+        assert_eq!(entries[0]["entry"]["launch"]["auto_detach"], true);
+        assert_eq!(entries[0]["entry"]["launch"]["wait_all"], false);
+        let excluded = ProductSettings {
+            exclude_games: vec![crate::settings::Exclusion::Id("7".into())],
+            ..ProductSettings::default()
+        };
+        assert!(
+            prepare_entries(&source, &excluded, &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

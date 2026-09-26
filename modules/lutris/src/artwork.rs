@@ -370,6 +370,7 @@ mod tests {
         let source = Snapshot {
             database_path: data.join("pga.db"),
             lutris_executable: PathBuf::from("/usr/bin/lutris"),
+            launch_kind: crate::discovery::LaunchKind::Native,
             games: vec![game(1, "first"), game(2, "second")],
             artwork_revisions: BTreeMap::new(),
             artwork_scan_incomplete: false,

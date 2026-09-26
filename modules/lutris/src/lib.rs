@@ -26,6 +26,7 @@ const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceSignature {
     executable: std::path::PathBuf,
+    launch_kind: discovery::LaunchKind,
     games: Vec<discovery::Game>,
     artwork_revisions: std::collections::BTreeMap<i64, String>,
     artwork_scan_incomplete: bool,
@@ -35,6 +36,7 @@ impl From<&Snapshot> for SourceSignature {
     fn from(snapshot: &Snapshot) -> Self {
         Self {
             executable: snapshot.lutris_executable.clone(),
+            launch_kind: snapshot.launch_kind,
             games: snapshot.games.clone(),
             artwork_revisions: snapshot.artwork_revisions.clone(),
             artwork_scan_incomplete: snapshot.artwork_scan_incomplete,
@@ -674,6 +676,7 @@ mod tests {
             } else {
                 PathBuf::from("/usr/bin/lutris")
             },
+            launch_kind: discovery::LaunchKind::Native,
             games: vec![
                 game(7, "steam", "steam", "9001"),
                 game(8, "steam", "steam", "9002"),
@@ -965,6 +968,15 @@ mod tests {
         assert_ne!(SourceSignature::from(&changed), signature);
         changed.games[0].config_path = "/games/example.yml".into();
         changed.artwork_revisions.insert(10, "a".repeat(64));
+        assert!(should_reconcile(
+            &SourceSignature::from(&changed),
+            Some(&signature),
+            Some(now),
+            false,
+            now,
+        ));
+        changed.artwork_revisions.clear();
+        changed.launch_kind = discovery::LaunchKind::FlatpakUser;
         assert!(should_reconcile(
             &SourceSignature::from(&changed),
             Some(&signature),
