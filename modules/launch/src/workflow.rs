@@ -7,9 +7,12 @@ pub const CATALOG: &str = "amaterasu.catalog/1";
 pub const SESSION: &str = "amaterasu.session/1";
 pub const APPLICATION: &str = "amaterasu.application/1";
 pub const PLAYNITE: &str = "amaterasu.playnite/1";
+pub const LUTRIS: &str = "amaterasu.lutris/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Catalog,
+    LutrisStatus,
+    LutrisPreSpawn,
     CreateSession,
     Acquire,
     Spawn,
@@ -115,6 +118,7 @@ impl Workflow {
                 };
                 (CATALOG, json!({"action":action,"id":record.app_id}))
             }
+            Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
             Step::CreateSession => (SESSION, json!({"action":"create","key":record.session_key})),
             Step::Acquire => (
                 SESSION,

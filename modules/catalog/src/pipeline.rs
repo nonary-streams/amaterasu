@@ -49,6 +49,7 @@ struct Pending {
 }
 enum Stage {
     Loading(Operation),
+    LaunchMarkerPage(LaunchMarkerScan),
     Legacy(Operation),
     Migrating(Operation),
     Paging(Scan),
@@ -68,6 +69,16 @@ enum Stage {
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
     ProviderOverrideEntry(Box<ProviderOverrideEntry>),
+}
+struct LaunchMarkerScan {
+    reply: Value,
+    state_revision: u64,
+    entry_id: String,
+    fingerprint: String,
+    after: String,
+    scanned: usize,
+    source_id: Option<String>,
+    matched: bool,
 }
 
 struct ProviderOverrideEntry {
@@ -275,7 +286,7 @@ impl Pipeline {
                 Ok((
                     format!("principal/{initiator}"),
                     None,
-                    Operation::Get { id },
+                    Operation::ResolveLaunch { id },
                 ))
             }
             operation @ Operation::ResolveExportedLaunch { .. } => {
@@ -403,6 +414,7 @@ impl Pipeline {
     ) -> ModuleResult<()> {
         let key = match &operation {
             Operation::Get { id }
+            | Operation::ResolveLaunch { id }
             | Operation::ResolveExportedLaunch { id }
             | Operation::Update { id, .. }
             | Operation::Delete { id, .. } => Some(id),
@@ -2197,6 +2209,9 @@ impl Pipeline {
                     .retain(|_, session| session.key != context.key);
                 complete(send, context.request_id, reply)
             }
+            Stage::LaunchMarkerPage(scan) => {
+                self.consume_launch_marker_page(context, scan, state_revision, payload, send)
+            }
             Stage::ProviderSaving(mut save) => {
                 save.session.collection_revision = state_revision;
                 if save.finish && !save.remaining_cleanup.is_empty() {
@@ -2447,6 +2462,7 @@ impl Pipeline {
                     Err(failure) => return complete(send, context.request_id, failure),
                 };
                 if let Operation::Get { id }
+                | Operation::ResolveLaunch { id }
                 | Operation::ResolveExportedLaunch { id }
                 | Operation::Update { id, .. }
                 | Operation::Delete { id, .. } = &operation
@@ -2594,6 +2610,34 @@ impl Pipeline {
                     ScanProjection::List,
                 )
             }
+            operation @ (Operation::ResolveLaunch { .. }
+            | Operation::ResolveExportedLaunch { .. }) => {
+                let reply = match apply(operation, Some(document)) {
+                    Ok(Change::Read(reply)) => reply,
+                    Ok(Change::Write { .. }) => {
+                        return Err("launch resolution unexpectedly attempted a mutation".into());
+                    }
+                    Err(failure) => return complete(send, context.request_id, failure),
+                };
+                let Some(entry_id) = reply["id"].as_str() else {
+                    return complete(send, context.request_id, malformed());
+                };
+                let entry: Entry = match serde_json::from_value::<Entry>(reply["entry"].clone()) {
+                    Ok(entry) if entry.validate().is_ok() => entry,
+                    _ => return complete(send, context.request_id, malformed()),
+                };
+                let scan = LaunchMarkerScan {
+                    state_revision,
+                    entry_id: entry_id.to_owned(),
+                    fingerprint: provider_entry_fingerprint(LUTRIS_IMPORTER, &entry),
+                    after: format!("{}{}:", ENTRY_PREFIX, LUTRIS_IMPORTER),
+                    scanned: 0,
+                    source_id: None,
+                    matched: false,
+                    reply,
+                };
+                return self.scan_launch_markers(context, scan, send);
+            }
             operation => {
                 return match apply(operation, Some(document)) {
                     Ok(Change::Read(reply)) => complete_selected(send, context, reply),
@@ -2647,6 +2691,92 @@ impl Pipeline {
         };
         self.page(context, scan, send)
     }
+    fn scan_launch_markers(
+        &mut self,
+        context: Context,
+        scan: LaunchMarkerScan,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let request = json!({
+            "action":"collection_page", "collection":context.key,
+            "revision":scan.state_revision, "after":scan.after, "limit":128,
+        });
+        self.submit(context, request, Stage::LaunchMarkerPage(scan), send)
+    }
+
+    fn consume_launch_marker_page(
+        &mut self,
+        context: Context,
+        mut scan: LaunchMarkerScan,
+        state_revision: u64,
+        payload: Value,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if state_revision != scan.state_revision || payload["revision"] != scan.state_revision {
+            return complete(send, context.request_id, malformed());
+        }
+        let Some(rows) = payload["entries"].as_array() else {
+            return complete(send, context.request_id, malformed());
+        };
+        let prefix = format!("{ENTRY_PREFIX}{LUTRIS_IMPORTER}:");
+        let mut past_prefix = false;
+        for row in rows {
+            let Some(key) = row["key"].as_str() else {
+                return complete(send, context.request_id, malformed());
+            };
+            if key <= scan.after.as_str() {
+                return complete(send, context.request_id, malformed());
+            }
+            scan.after = key.to_owned();
+            scan.scanned += 1;
+            if !key.starts_with(&prefix) {
+                past_prefix = true;
+                break;
+            }
+            let source_id = &key[prefix.len()..];
+            let marker: Marker = match serde_json::from_value(row["value"].clone()) {
+                Ok(marker) if validate_marker(&marker, LUTRIS_IMPORTER, source_id) => marker,
+                _ => return complete(send, context.request_id, malformed()),
+            };
+            if marker.entry_id == scan.entry_id {
+                if scan.matched {
+                    return complete(send, context.request_id, malformed());
+                }
+                scan.matched = true;
+                let numeric_id = source_id
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0 && id.to_string() == source_id);
+                let Some(_) = numeric_id else {
+                    return complete(send, context.request_id, malformed());
+                };
+                if !marker.detached && marker.fingerprint == scan.fingerprint {
+                    scan.source_id = Some(source_id.to_owned());
+                }
+            }
+        }
+        let more = match payload.get("next") {
+            Some(Value::Null) => false,
+            Some(Value::String(_)) if past_prefix => false,
+            Some(Value::String(next)) if next == &scan.after && !rows.is_empty() => true,
+            _ => return complete(send, context.request_id, malformed()),
+        };
+        if more && rows.is_empty() {
+            return complete(send, context.request_id, malformed());
+        }
+        if !past_prefix && more {
+            if scan.scanned >= MAX_ENTRIES {
+                return complete(send, context.request_id, malformed());
+            }
+            return self.scan_launch_markers(context, scan, send);
+        }
+        if let Some(source_id) = scan.source_id {
+            scan.reply["provider_provenance"] =
+                json!({"provider":LUTRIS_IMPORTER,"source_id":source_id});
+        }
+        complete_selected(send, context, scan.reply)
+    }
+
     fn page(
         &mut self,
         context: Context,

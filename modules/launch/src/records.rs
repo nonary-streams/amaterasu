@@ -36,6 +36,8 @@ pub struct Record {
     #[serde(skip)]
     pub catalog_selection: CatalogSelection,
     #[serde(skip)]
+    pub lutris_source_id: Option<i64>,
+    #[serde(skip)]
     pub catalog_initiator: String,
     #[serde(skip)]
     pub session_key: String,
@@ -210,6 +212,7 @@ impl Records {
                 owner: caller.into(),
                 catalog_principal,
                 catalog_selection,
+                lutris_source_id: None,
                 catalog_initiator: initiator.into(),
                 session_key: key.clone(),
                 process_operation: key.clone(),

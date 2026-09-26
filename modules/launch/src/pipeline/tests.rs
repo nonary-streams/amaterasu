@@ -47,6 +47,10 @@ struct Harness {
     fail_terminate: bool,
     commands: Vec<(String, Value, Option<u64>)>,
     catalog_exit: bool,
+    catalog_provenance: Option<Value>,
+    lutris_status: Option<Value>,
+    lutris_status_sequence: std::collections::VecDeque<Value>,
+    lutris_transport_unavailable: bool,
     drop_spawn_result: bool,
     reject_activation_completion: bool,
     queue_spawn: bool,
@@ -108,6 +112,10 @@ impl Harness {
             fail_terminate: false,
             commands: Vec::new(),
             catalog_exit: false,
+            catalog_provenance: None,
+            lutris_status: None,
+            lutris_status_sequence: std::collections::VecDeque::new(),
+            lutris_transport_unavailable: false,
             drop_spawn_result: false,
             reject_activation_completion: false,
             queue_spawn: false,
@@ -538,6 +546,10 @@ impl Harness {
                 let action = payload["action"].as_str().unwrap().to_owned();
                 self.commands
                     .push((service.clone(), payload.clone(), parent));
+                if service == crate::workflow::LUTRIS && self.lutris_transport_unavailable {
+                    self.reply = Some(Response::error("service_unavailable", "Lutris unavailable"));
+                    return Ok(Response::Accepted { id: 50 });
+                }
                 if action == "launch" && self.queue_spawn {
                     self.queued_spawn = Some(payload);
                     self.drop_spawn_result = true;
@@ -652,11 +664,18 @@ impl Harness {
                         if action == "resolve_exported_launch" {
                             reply["catalog_owner"] = json!("management");
                         }
+                        if let Some(provenance) = &self.catalog_provenance {
+                            reply["provider_provenance"] = provenance.clone();
+                        }
                         reply
                     }
                     crate::workflow::SESSION => self.session(&payload),
                     crate::workflow::APPLICATION => self.application(&payload),
                     crate::workflow::PLAYNITE => self.playnite(&payload),
+                    crate::workflow::LUTRIS => self.lutris_status_sequence.pop_front()
+                        .or_else(|| self.lutris_status.clone()).unwrap_or_else(|| {
+                            json!({"ok":true,"settings_ready":true,"enabled":true,"available":true})
+                        }),
                     _ => panic!("unexpected dependency"),
                 };
                 if (action == "launch" && self.cancel_after_spawn)
@@ -772,6 +791,128 @@ fn launch(operation: &str) -> Value {
 }
 fn launch_export(operation: &str) -> Value {
     json!({"action":"launch_export","operation_id":operation,"app_id":"app-0000000000000001"})
+}
+
+#[test]
+fn retained_lutris_launch_requires_live_enabled_available_status_before_session() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"42"}));
+    harness.lutris_status =
+        Some(json!({"ok":true,"settings_ready":true,"enabled":false,"available":true}));
+    let disabled = harness.request(&mut pipeline, "alice", launch("lutris-disabled"));
+    assert_eq!(
+        disabled["launch"]["failure"], "lutris_unavailable",
+        "{disabled}"
+    );
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+
+    harness.lutris_status = None;
+    let enabled = harness.request(&mut pipeline, "alice", launch("lutris-enabled"));
+    assert_eq!(enabled["ok"], true, "{enabled}");
+    assert_eq!(harness.sessions.len(), 1);
+    assert_eq!(harness.processes.len(), 1);
+    assert!(harness.commands.iter().any(|(service, request, _)| {
+        service == crate::workflow::LUTRIS && request["action"] == "status"
+    }));
+}
+
+#[test]
+fn exported_lutris_preflight_rechecks_status_at_launch_admission() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"42"}));
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"preflight_export","operation_id":"lutris-export","app_id":"app-0000000000000001"}),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    assert!(
+        harness
+            .commands
+            .iter()
+            .all(|(service, _, _)| service != crate::workflow::LUTRIS)
+    );
+    harness.lutris_status =
+        Some(json!({"ok":true,"settings_ready":true,"enabled":false,"available":true}));
+    let mut launch = launch_export("lutris-export");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    let denied = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
+    assert_eq!(
+        denied["launch"]["failure"], "lutris_unavailable",
+        "{denied}"
+    );
+    assert!(harness.sessions.is_empty());
+}
+
+#[test]
+fn lutris_admission_fails_closed_on_unavailable_or_malformed_status_and_provenance() {
+    for status in [
+        json!({"ok":false}),
+        json!({"ok":true,"settings_ready":true,"enabled":true,"available":false}),
+        json!({"ok":true,"settings_ready":true,"enabled":true}),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"42"}));
+        harness.lutris_status = Some(status);
+        let rejected = harness.request(&mut pipeline(), "alice", launch("status-reject"));
+        assert_eq!(
+            rejected["launch"]["failure"], "lutris_unavailable",
+            "{rejected}"
+        );
+        assert!(harness.sessions.is_empty());
+    }
+    let mut harness = Harness::new();
+    harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"042"}));
+    let rejected = harness.request(&mut pipeline(), "alice", launch("bad-provenance"));
+    assert_eq!(
+        rejected["launch"]["failure"], "invalid_catalog_response",
+        "{rejected}"
+    );
+    assert!(harness.sessions.is_empty());
+
+    let mut harness = Harness::new();
+    harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"42"}));
+    harness.lutris_transport_unavailable = true;
+    let unavailable = harness.request(&mut pipeline(), "alice", launch("unavailable-provider"));
+    assert_eq!(unavailable["launch"]["state"], "failed", "{unavailable}");
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+}
+
+#[test]
+fn lutris_disable_after_session_acquisition_prevents_process_spawn_and_cleans_up() {
+    let mut harness = Harness::new();
+    harness.catalog_provenance = Some(json!({"provider":"amaterasu.lutris","source_id":"42"}));
+    harness
+        .lutris_status_sequence
+        .push_back(json!({"ok":true,"settings_ready":true,"enabled":true,"available":true}));
+    harness
+        .lutris_status_sequence
+        .push_back(json!({"ok":true,"settings_ready":true,"enabled":false,"available":true}));
+    let rejected = harness.request(&mut pipeline(), "alice", launch("disable-before-spawn"));
+    assert_eq!(
+        rejected["launch"]["failure"], "lutris_unavailable",
+        "{rejected}"
+    );
+    assert!(harness.processes.is_empty());
+    assert_eq!(harness.sessions.len(), 1);
+    assert_eq!(harness.sessions[0].state, "stopped");
+    assert_eq!(harness.sessions[0].lease, None);
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, _, _)| service == crate::workflow::LUTRIS)
+            .count(),
+        2,
+    );
+    assert!(harness.commands.iter().all(|(service, request, _)| {
+        service != crate::workflow::APPLICATION || request["action"] != "launch"
+    }));
 }
 
 #[test]

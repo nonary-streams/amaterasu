@@ -599,7 +599,11 @@ impl Pipeline {
                         record.client_frame_limiter_overrides = client_frame_limiter_overrides;
                         record.launch_started = true;
                         let mut workflow = Workflow::launch(id, request, remaining_ms);
-                        workflow.step = Step::CreateSession;
+                        workflow.step = if record.lutris_source_id.is_some() {
+                            Step::LutrisStatus
+                        } else {
+                            Step::CreateSession
+                        };
                         self.job = Some(workflow);
                         Ok(())
                     }
@@ -937,6 +941,9 @@ impl Pipeline {
             return self.consume_cleanup(job, payload, send);
         }
         if payload["ok"] != true {
+            if matches!(job.step, Step::LutrisStatus | Step::LutrisPreSpawn) {
+                return self.dependency_failed(job, "lutris_unavailable", send);
+            }
             if job.step == Step::StartPlaynite && responses::provider_start_not_started(&payload) {
                 let record = self
                     .records
@@ -994,6 +1001,27 @@ impl Pipeline {
                     }
                     Err(code) => return self.dependency_failed(job, code, send),
                 }
+                record.lutris_source_id = match payload.get("provider_provenance") {
+                    None => None,
+                    Some(provenance) => {
+                        let valid_object = provenance.as_object().is_some_and(|fields| {
+                            fields.len() == 2 && provenance["provider"] == "amaterasu.lutris"
+                        });
+                        let source_id = provenance["source_id"].as_str().and_then(|source| {
+                            source
+                                .parse::<i64>()
+                                .ok()
+                                .filter(|id| *id > 0 && id.to_string() == source)
+                        });
+                        if !valid_object
+                            || source_id.is_none()
+                            || !matches!(record.target, Some(LaunchTarget::Executable(_)))
+                        {
+                            return self.dependency_failed(job, "invalid_catalog_response", send);
+                        }
+                        source_id
+                    }
+                };
                 let config_overrides = match payload["entry"].get("config_overrides") {
                     Some(value) => match serde_json::from_value::<
                         crate::protocol::ApplicationConfigOverrides,
@@ -1023,7 +1051,29 @@ impl Pipeline {
                     let response = record.preflight_response();
                     return complete(send, job.request.expect("preflight request"), response);
                 }
+                job.step = if record.lutris_source_id.is_some() {
+                    Step::LutrisStatus
+                } else {
+                    Step::CreateSession
+                };
+            }
+            Step::LutrisStatus => {
+                if payload["settings_ready"] != true
+                    || payload["enabled"] != true
+                    || payload["available"] != true
+                {
+                    return self.dependency_failed(job, "lutris_unavailable", send);
+                }
                 job.step = Step::CreateSession;
+            }
+            Step::LutrisPreSpawn => {
+                if payload["settings_ready"] != true
+                    || payload["enabled"] != true
+                    || payload["available"] != true
+                {
+                    return self.dependency_failed(job, "lutris_unavailable", send);
+                }
+                job.step = Step::Spawn;
             }
             Step::CreateSession => {
                 let session = match responses::session(&payload, record) {
@@ -1045,6 +1095,9 @@ impl Pipeline {
                     return self.dependency_failed(job, "invalid_session_response", send);
                 }
                 job.step = match record.target.as_ref() {
+                    Some(LaunchTarget::Executable(_)) if record.lutris_source_id.is_some() => {
+                        Step::LutrisPreSpawn
+                    }
                     Some(LaunchTarget::Executable(_)) => Step::Spawn,
                     Some(LaunchTarget::Playnite { preparation, .. })
                     | Some(LaunchTarget::PlayniteFullscreen { preparation, .. })

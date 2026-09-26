@@ -282,6 +282,119 @@ fn lutris_importer() -> Pipeline {
     )
 }
 
+#[test]
+fn launch_provenance_comes_only_from_attached_canonical_lutris_marker() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["amaterasu.launch".into()]),
+        BTreeMap::from([("amaterasu.nvhttp".into(), "amaterasu.management".into())]),
+        BTreeMap::new(),
+        BTreeMap::from([("amaterasu.lutris".into(), "amaterasu.management".into())]),
+    );
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("lutris-launch", 1),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(begin["ok"], true, "{begin}");
+    let batch = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "lutris-launch",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![("42", entry("Lutris title"))],
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let finish = backend.run_for(
+        &mut pipeline,
+        snapshot_finish(
+            "lutris-launch",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            batch["revision"].as_u64().unwrap(),
+            1,
+            true,
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    let marker_key = "~provider.entry:amaterasu.lutris:42";
+    let id = backend.entries[marker_key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let resolve = |backend: &mut Backend, pipeline: &mut Pipeline, action: &str| {
+        let initiator = if action == "resolve_launch" {
+            "amaterasu.management"
+        } else {
+            "amaterasu.nvhttp"
+        };
+        backend.run_for(
+            pipeline,
+            json!({"action":action,"id":id}),
+            "amaterasu.launch",
+            initiator,
+            "amaterasu.management",
+        )
+    };
+    for action in ["resolve_launch", "resolve_exported_launch"] {
+        let reply = resolve(&mut backend, &mut pipeline, action);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(
+            reply["provider_provenance"],
+            json!({"provider":"amaterasu.lutris","source_id":"42"})
+        );
+    }
+    backend.entries.get_mut(&id).unwrap()["name"] = json!("User edited Lutris title");
+    backend.entries.get_mut(&id).unwrap()["tags"] = json!(["lutris"]);
+    let detached = resolve(&mut backend, &mut pipeline, "resolve_launch");
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert!(detached.get("provider_provenance").is_none());
+
+    let mut forged = entry("Forged Lutris title");
+    forged["tags"] = json!(["lutris"]);
+    let manual_revision = backend.metadata["revision"].clone();
+    let manual = backend.run_for(
+        &mut pipeline,
+        json!({"action":"create","expected_revision":manual_revision,"entry":forged}),
+        "amaterasu.management",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual["ok"], true, "{manual}");
+    let manual_resolved = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_launch","id":manual["id"]}),
+        "amaterasu.launch",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(manual_resolved["ok"], true, "{manual_resolved}");
+    assert!(manual_resolved.get("provider_provenance").is_none());
+
+    let mut noncanonical = backend.entries.remove(marker_key).unwrap();
+    noncanonical["source_id"] = json!("042");
+    backend
+        .entries
+        .insert("~provider.entry:amaterasu.lutris:042".into(), noncanonical);
+    let malformed = resolve(&mut backend, &mut pipeline, "resolve_launch");
+    assert_eq!(
+        malformed["error"]["code"], "invalid_state_response",
+        "{malformed}"
+    );
+}
+
 fn playnite_entry(name: &str) -> Value {
     json!({
         "name":name,
@@ -1699,7 +1812,7 @@ fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority()
         .unwrap();
     assert_eq!(key, "principal/original.client");
     assert_eq!(catalog_owner, None);
-    assert!(matches!(operation, Operation::Get { .. }));
+    assert!(matches!(operation, Operation::ResolveLaunch { .. }));
     let (key, _, _) = pipeline
         .select_catalog(
             "launch",
