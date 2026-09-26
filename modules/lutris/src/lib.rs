@@ -163,7 +163,6 @@ impl SnapshotWorker {
 struct CapturedScan {
     snapshot: Snapshot,
     settings: ProductSettings,
-    manual: bool,
     source_revision: u64,
     settings_epoch: u64,
 }
@@ -279,11 +278,12 @@ impl LutrisModule {
         self.last_reconciled_source = None;
         self.last_reconciled_at = None;
         let settings = self.configuration.settings();
-        self.next_auto_sync = if settings.enabled && settings.auto_sync {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        schedule_settings_scan(
+            settings,
+            &mut self.manual_refresh_pending,
+            &mut self.next_auto_sync,
+            Instant::now(),
+        );
     }
 
     fn poll_snapshot(&mut self) {
@@ -292,7 +292,7 @@ impl LutrisModule {
             return;
         };
         if settings_epoch != self.settings_epoch || !self.configuration.settings().enabled {
-            self.reschedule_stale_scan(manual, settings_epoch);
+            self.reschedule_stale_scan(settings_epoch);
             return;
         }
         match result {
@@ -332,7 +332,6 @@ impl LutrisModule {
                 let scan = CapturedScan {
                     snapshot,
                     settings,
-                    manual,
                     source_revision,
                     settings_epoch,
                 };
@@ -372,7 +371,7 @@ impl LutrisModule {
                     self.pending_source = None;
                     self.schedule_next_auto_sync(false);
                 } else {
-                    self.reschedule_stale_scan(pending.scan.manual, pending.scan.settings_epoch);
+                    self.reschedule_stale_scan(pending.scan.settings_epoch);
                 }
             }
             SteamProgress::Complete(steam_ids) => {
@@ -384,7 +383,6 @@ impl LutrisModule {
 
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
         let settings_changed = scan.settings_epoch != self.settings_epoch;
-        let manual = scan.manual;
         let captured_epoch = scan.settings_epoch;
         match scan.start_catalog(
             &mut self.catalog,
@@ -396,7 +394,7 @@ impl LutrisModule {
                 self.pending_source = Some((signature, settings_epoch));
                 self.last_error = None;
             }
-            Ok(None) => self.reschedule_stale_scan(manual, captured_epoch),
+            Ok(None) => self.reschedule_stale_scan(captured_epoch),
             Err(error) => {
                 self.last_error = Some(error);
                 self.last_reconciled_source = None;
@@ -428,10 +426,9 @@ impl LutrisModule {
         );
     }
 
-    fn reschedule_stale_scan(&mut self, manual: bool, captured_epoch: u64) {
+    fn reschedule_stale_scan(&mut self, captured_epoch: u64) {
         reschedule_stale_scan(
             self.configuration.settings(),
-            manual,
             captured_epoch != self.settings_epoch,
             &mut self.manual_refresh_pending,
             &mut self.next_auto_sync,
@@ -644,15 +641,24 @@ fn next_auto_sync_after_scan(
     })
 }
 
+fn schedule_settings_scan(
+    settings: &ProductSettings,
+    scan_pending: &mut bool,
+    next_auto_sync: &mut Option<Instant>,
+    now: Instant,
+) {
+    *scan_pending = settings.enabled;
+    *next_auto_sync = (settings.enabled && settings.auto_sync).then_some(now);
+}
+
 fn reschedule_stale_scan(
     settings: &ProductSettings,
-    manual: bool,
     settings_changed: bool,
     manual_refresh_pending: &mut bool,
     next_auto_sync: &mut Option<Instant>,
     now: Instant,
 ) {
-    if settings.enabled && manual {
+    if settings.enabled {
         *manual_refresh_pending = true;
     }
     *next_auto_sync = next_auto_sync_after_scan(settings, settings_changed, now);
@@ -894,7 +900,7 @@ mod tests {
             receiver: Some(receiver),
             _thread: None,
             settings: Some(settings),
-            manual: true,
+            manual: false,
             settings_epoch: 3,
         }
     }
@@ -998,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_manual_scan_requeues_a_fresh_scan_when_auto_sync_is_off() {
+    fn stale_automatic_scan_and_reenable_each_trigger_manual_only_discovery() {
         let settings = ProductSettings {
             enabled: true,
             auto_sync: false,
@@ -1009,7 +1015,6 @@ mod tests {
         let mut next_auto_sync = None;
         reschedule_stale_scan(
             &settings,
-            true,
             true,
             &mut manual_pending,
             &mut next_auto_sync,
@@ -1027,13 +1032,17 @@ mod tests {
         reschedule_stale_scan(
             &disabled,
             true,
-            true,
             &mut manual_pending,
             &mut next_auto_sync,
             now,
         );
         assert!(!manual_pending);
         assert!(!scan_is_due(&disabled, manual_pending, next_auto_sync, now));
+
+        schedule_settings_scan(&settings, &mut manual_pending, &mut next_auto_sync, now);
+        assert!(manual_pending);
+        assert_eq!(next_auto_sync, None);
+        assert!(scan_is_due(&settings, manual_pending, next_auto_sync, now));
     }
 
     #[test]
@@ -1142,7 +1151,6 @@ mod tests {
             scan: CapturedScan {
                 snapshot: source.clone(),
                 settings,
-                manual: true,
                 source_revision: 1,
                 settings_epoch: 7,
             },
@@ -1176,7 +1184,6 @@ mod tests {
                 include_steam: true,
                 ..ProductSettings::default()
             },
-            manual: true,
             source_revision: 2,
             settings_epoch: 7,
         };
@@ -1275,7 +1282,7 @@ mod tests {
     fn stale_pre_disable_scan_cannot_publish_after_reenable() {
         let scan_start_settings = ProductSettings {
             enabled: true,
-            auto_sync: false,
+            auto_sync: true,
             autosync_remove_uninstalled: false,
             include_steam: true,
             exclude_games: Vec::new(),
@@ -1299,14 +1306,36 @@ mod tests {
         );
         assert!(worker.busy());
 
+        let current_settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            include_steam: true,
+            autosync_remove_uninstalled: false,
+            exclude_games: vec![Exclusion::Id("10".into())],
+        };
+        let now = Instant::now();
+        let mut scan_pending = false;
+        let mut next_auto_sync = None;
+        schedule_settings_scan(
+            &current_settings,
+            &mut scan_pending,
+            &mut next_auto_sync,
+            now,
+        );
+        assert!(scan_is_due(
+            &current_settings,
+            scan_pending,
+            next_auto_sync,
+            now
+        ));
+
         let (captured_settings, manual, settings_epoch, result) = worker.take_result().unwrap();
         assert!(!worker.busy());
-        assert!(manual);
+        assert!(!manual);
         assert_eq!(settings_epoch, 3);
         let scan = CapturedScan {
             snapshot: result.unwrap(),
             settings: captured_settings,
-            manual,
             source_revision: 1,
             settings_epoch,
         };
@@ -1323,17 +1352,23 @@ mod tests {
         );
         assert!(!catalog.busy());
         assert_eq!(catalog.status()["last_import_count"], 0);
+        reschedule_stale_scan(
+            &current_settings,
+            true,
+            &mut scan_pending,
+            &mut next_auto_sync,
+            now,
+        );
+        assert!(scan_is_due(
+            &current_settings,
+            scan_pending,
+            next_auto_sync,
+            now
+        ));
 
         let fresh = CapturedScan {
             snapshot: snapshot(),
-            settings: ProductSettings {
-                enabled: true,
-                auto_sync: false,
-                include_steam: true,
-                autosync_remove_uninstalled: false,
-                exclude_games: vec![Exclusion::Id("10".into())],
-            },
-            manual: true,
+            settings: current_settings,
             source_revision: 2,
             settings_epoch: 5,
         };

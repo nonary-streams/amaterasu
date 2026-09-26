@@ -92,22 +92,24 @@ complete scan. Catalog revision changes during inventory restart the inventory
 before cleanup is submitted.
 
 Each enabled scan captures its complete settings at scan start. Disabling Lutris
-while discovery, Steam deduplication, or catalog reconciliation is in flight does
-not cancel that scan: it completes one snapshot using the captured settings.
-Disabled settings prevent later scans from starting, and disabling alone does not
-remove already imported catalog rows. Stale removal remains governed by the
-captured `autosync_remove_uninstalled` value.
+discards discovery and Steam deduplication results that have not entered catalog
+reconciliation. A catalog transaction already started finishes using its captured
+settings. Disabled settings prevent later scans from starting, and disabling
+alone does not remove already imported catalog rows. Stale removal for an
+already started transaction follows its captured `autosync_remove_uninstalled` value.
 
 Automatic discovery checks the installed rows every 30 seconds after the
 previous scan and catalog work finish. A catalog snapshot is submitted when the
 source rows, local image digest, or resolved Lutris executable change, after a settings change, or
 at least every five minutes to retry catalog state changes outside Lutris.
-Manual refresh always submits a snapshot. A failed scan or reconciliation is
+Enabling Lutris starts one discovery even when automatic sync is off. Manual
+refresh always submits a snapshot. A failed scan or reconciliation is
 retried on the next automatic discovery; only a validated catalog finish records
-the source as reconciled. If settings change during an in-flight scan, that scan
-finishes with its captured values and the new settings trigger another scan.
-If that old discovery or Steam deduplication fails after disable and re-enable,
-the current enabled settings still trigger an immediate automatic scan.
+the source as reconciled. If settings change during discovery or Steam
+deduplication, that result is discarded before catalog publication and the new
+enabled settings trigger another scan. If old discovery or Steam deduplication
+fails after disable and re-enable, the current enabled settings still trigger a
+fresh scan.
 The provider status keeps `refresh_pending` true through catalog completion and
 reports a catalog failure in `last_error`; a successful later reconciliation
 clears it.
