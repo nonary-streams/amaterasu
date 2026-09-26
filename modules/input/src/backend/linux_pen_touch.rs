@@ -155,7 +155,21 @@ impl ContactTracker {
             }
         };
 
-        let frame = pen_frame(event, frame_metadata)?;
+        // A failed Down can leave a reserved pen without a native report.
+        // The first successful Move must send a complete initial report.
+        let recovering_down = phase == PenTouchPhase::Move
+            && !self
+                .pen
+                .as_ref()
+                .expect("active pen has a contact")
+                .contact
+                .down_written;
+        let frame_event = if recovering_down {
+            with_phase(event, PenTouchPhase::Down)
+        } else {
+            event.clone()
+        };
+        let frame = pen_frame(&frame_event, frame_metadata)?;
         emit(Target::Pen, &frame)?;
         match phase {
             PenTouchPhase::Down => {
@@ -165,7 +179,15 @@ impl ContactTracker {
                     .contact
                     .down_written = true;
             }
-            PenTouchPhase::Move => {}
+            PenTouchPhase::Move => {
+                if recovering_down {
+                    self.pen
+                        .as_mut()
+                        .expect("successful recovery retains its pen")
+                        .contact
+                        .down_written = true;
+                }
+            }
             PenTouchPhase::Up | PenTouchPhase::Cancel => self.pen = None,
         }
         Ok(())
@@ -224,12 +246,27 @@ impl ContactTracker {
             }
         }
 
-        let slot = self
+        let touch = self
             .touches
             .get(&pointer_id)
-            .map(|touch| touch.slot)
             .ok_or_else(pointer_not_active)?;
-        let frame = touch_frame(event, slot, self.touches.len())?;
+        let slot = touch.slot;
+        let down_written = touch.contact.down_written;
+        // A failed Down may have reserved a slot without creating a uinput
+        // device. The first successful Move must establish its tracking ID.
+        let recovering_down = phase == PenTouchPhase::Move && !down_written;
+        let frame_event = if recovering_down {
+            with_phase(event, PenTouchPhase::Down)
+        } else {
+            event.clone()
+        };
+        let written_contacts = self
+            .touches
+            .values()
+            .filter(|touch| touch.contact.down_written)
+            .count();
+        let active_contacts = written_contacts + usize::from(!down_written);
+        let frame = touch_frame(&frame_event, slot, active_contacts)?;
         emit(Target::Touch, &frame)?;
         match phase {
             PenTouchPhase::Down => {
@@ -239,7 +276,15 @@ impl ContactTracker {
                     .contact
                     .down_written = true;
             }
-            PenTouchPhase::Move => {}
+            PenTouchPhase::Move => {
+                if recovering_down {
+                    self.touches
+                        .get_mut(&pointer_id)
+                        .expect("successful recovery retains its contact")
+                        .contact
+                        .down_written = true;
+                }
+            }
             PenTouchPhase::Up | PenTouchPhase::Cancel => {
                 self.touches.remove(&pointer_id);
             }
@@ -304,7 +349,13 @@ impl ContactTracker {
                 continue;
             };
             let cancel_event = with_phase(&touch.contact.last_event, PenTouchPhase::Cancel);
-            let frame = touch_frame(&cancel_event, touch.slot, self.touches.len())?;
+            let written_contacts = self
+                .touches
+                .values()
+                .filter(|contact| contact.contact.down_written)
+                .count();
+            let active_contacts = written_contacts + usize::from(!touch.contact.down_written);
+            let frame = touch_frame(&cancel_event, touch.slot, active_contacts)?;
             match emit(Target::Touch, &frame) {
                 Ok(()) => {
                     self.touches.remove(&pointer_id);
@@ -959,6 +1010,84 @@ mod tests {
             tracker.touches.get(&2).map(|touch| touch.slot.slot),
             Some(1)
         );
+    }
+
+    #[test]
+    fn move_after_failed_pen_down_emits_a_complete_initial_report() {
+        let mut tracker = ContactTracker::default();
+        let mut writer = FakeWriter {
+            fail_next: true,
+            ..FakeWriter::default()
+        };
+        let mut down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            10,
+            20,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut down {
+            *pressure = None;
+        }
+        assert!(emit(&mut tracker, &mut writer, &down).is_err());
+        let mut moved = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Move,
+            11,
+            21,
+        );
+        if let Event::PenTouch { pressure, .. } = &mut moved {
+            *pressure = None;
+        }
+        emit(&mut tracker, &mut writer, &moved).unwrap();
+        let recovered = &writer.frames[1].1;
+        assert_eq!(event_at(recovered, EV_ABS, ABS_X), Some(11));
+        assert_eq!(event_at(recovered, EV_ABS, ABS_PRESSURE), Some(0));
+        assert_eq!(event_at(recovered, EV_KEY, BTN_TOUCH), Some(1));
+        assert_eq!(event_at(recovered, EV_KEY, BTN_TOOL_PEN), Some(1));
+        assert!(tracker.pen.as_ref().unwrap().contact.down_written);
+    }
+
+    #[test]
+    fn move_after_failed_down_starts_touch_and_reserved_contacts_do_not_hold_tip() {
+        let mut tracker = ContactTracker::default();
+        let mut writer = FakeWriter {
+            fail_next: true,
+            ..FakeWriter::default()
+        };
+        let first_down = event(7, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        let second_down = event(8, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        assert!(emit(&mut tracker, &mut writer, &first_down).is_err());
+        writer.fail_next = true;
+        assert!(emit(&mut tracker, &mut writer, &second_down).is_err());
+
+        let first_move = event(7, PenTouchDevice::Touch, PenTouchPhase::Move, 11, 21);
+        writer.fail_next = true;
+        assert!(emit(&mut tracker, &mut writer, &first_move).is_err());
+        assert!(!tracker.touches.get(&7).unwrap().contact.down_written);
+        emit(&mut tracker, &mut writer, &first_move).unwrap();
+        let recovered = &writer.frames[3].1;
+        assert_eq!(event_at(recovered, EV_ABS, ABS_MT_TRACKING_ID), Some(0));
+        assert_eq!(event_at(recovered, EV_ABS, ABS_MT_POSITION_X), Some(11));
+        assert_eq!(event_at(recovered, EV_KEY, BTN_TOUCH), Some(1));
+        assert!(tracker.touches.get(&7).unwrap().contact.down_written);
+
+        emit(
+            &mut tracker,
+            &mut writer,
+            &event(7, PenTouchDevice::Touch, PenTouchPhase::Up, 11, 21),
+        )
+        .unwrap();
+        assert_eq!(event_at(&writer.frames[4].1, EV_KEY, BTN_TOUCH), Some(0));
+
+        let second_move = event(8, PenTouchDevice::Touch, PenTouchPhase::Move, 31, 41);
+        emit(&mut tracker, &mut writer, &second_move).unwrap();
+        assert_eq!(
+            event_at(&writer.frames[5].1, EV_ABS, ABS_MT_TRACKING_ID),
+            Some(1)
+        );
+        assert_eq!(event_at(&writer.frames[5].1, EV_KEY, BTN_TOUCH), Some(1));
     }
 
     #[test]
