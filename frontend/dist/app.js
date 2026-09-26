@@ -2282,6 +2282,67 @@ var Amaterasu;
         }
     }
     Amaterasu.AuthTokenSettingsLoadGate = AuthTokenSettingsLoadGate;
+    function parseRegisteredConfigurationReply(value) {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Registered settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            reply.fields === null || typeof reply.fields !== "object" || Array.isArray(reply.fields) ||
+            reply.values === null || typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error("Registered settings reply is invalid.");
+        return reply;
+    }
+    Amaterasu.parseRegisteredConfigurationReply = parseRegisteredConfigurationReply;
+    function sameConfigurationValue(left, right) {
+        if (left === right)
+            return true;
+        if (Array.isArray(left) && Array.isArray(right))
+            return left.length === right.length && left.every((value, index) => sameConfigurationValue(value, right[index]));
+        if (!left || !right || typeof left !== "object" || typeof right !== "object" ||
+            Array.isArray(left) || Array.isArray(right))
+            return false;
+        const leftObject = left;
+        const rightObject = right;
+        const keys = Object.keys(leftObject);
+        return keys.length === Object.keys(rightObject).length &&
+            keys.every((key) => Object.hasOwn(rightObject, key) && sameConfigurationValue(leftObject[key], rightObject[key]));
+    }
+    async function saveRegisteredConfiguration(api, current, values) {
+        const expectedValues = { ...current.values, ...values };
+        const confirms = (reply) => reply.revision === current.revision + 1 &&
+            sameConfigurationValue(reply.fields, current.fields) &&
+            sameConfigurationValue(reply.values, expectedValues);
+        const updated = parseRegisteredConfigurationReply(await api.post("configuration/update", {
+            values,
+            expected_revision: current.revision,
+        }));
+        if (!confirms(updated))
+            throw new Error("Registered settings update could not be confirmed. Refresh and check the current values.");
+        const saved = parseRegisteredConfigurationReply(await api.post("configuration/get"));
+        if (!confirms(saved))
+            throw new Error("Registered settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveRegisteredConfiguration = saveRegisteredConfiguration;
+    class RegisteredConfigurationLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        async read(api) {
+            const generation = ++this.generation;
+            try {
+                const settings = parseRegisteredConfigurationReply(await api.post("configuration/get"));
+                return generation === this.generation ? settings : null;
+            }
+            catch (error) {
+                if (generation !== this.generation)
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.RegisteredConfigurationLoadGate = RegisteredConfigurationLoadGate;
     const hostLogLevels = [
         "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
     ];
@@ -2970,6 +3031,7 @@ var Amaterasu;
     Amaterasu.steamStatusDescription = steamStatusDescription;
     function renderSettings(context) {
         const area = Amaterasu.el("div");
+        const registeredLoads = new RegisteredConfigurationLoadGate();
         const authArea = Amaterasu.el("div");
         const authLoads = new AuthTokenSettingsLoadGate();
         const hostLoggingArea = Amaterasu.el("div");
@@ -3969,7 +4031,9 @@ var Amaterasu;
         async function load() {
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading settings…"));
             try {
-                const document = await context.api.post("configuration/get");
+                const document = await registeredLoads.read(context.api);
+                if (document === null)
+                    return;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -4028,7 +4092,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${document.revision}`)));
+                form.append(Amaterasu.el("p", "muted", "Saving confirms stored values. Runtime use of registered settings is not verified on this page."), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${document.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -4038,12 +4102,20 @@ var Amaterasu;
                             if (definition)
                                 values[name] = Amaterasu.fieldValue(definition, control);
                         }
-                        await context.api.post("configuration/update", {
-                            values,
-                            expected_revision: document.revision,
-                        });
-                        context.notify("Settings saved.");
-                        await load();
+                        registeredLoads.invalidate();
+                        try {
+                            await saveRegisteredConfiguration(context.api, document, values);
+                            context.notify("Registered settings saved and read back. Runtime application is not verified here.");
+                            await load();
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                                await load();
+                                context.notify("Registered settings changed elsewhere. Review the latest values and save again.");
+                                return;
+                            }
+                            throw error;
+                        }
                     });
                 });
                 area.replaceChildren(Object.keys(document.fields).length

@@ -100,6 +100,7 @@ namespace Amaterasu {
     | { type: "list"; default: unknown[]; item: Field; min_items?: number; max_items?: number }
     | { type: "object"; default: Record<string, unknown>; fields: Record<string, Field> };
   export interface Configuration {
+    ok: true;
     revision: number;
     fields: Record<string, Field>;
     values: Record<string, unknown>;

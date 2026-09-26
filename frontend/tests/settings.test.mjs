@@ -176,6 +176,106 @@ test("authentication editor discards old loads and failures after refresh or sav
   assert.equal((await reloaded).revision, 9);
 });
 
+function registeredSettings(revision = 4) {
+  return {
+    ok: true,
+    revision,
+    fields: {
+      notify_pre_releases: { type: "boolean", default: false },
+      update_check_interval: { type: "integer", default: 1440, minimum: 1 },
+      unrelated: { type: "object", default: { state: "old" }, fields: {} },
+    },
+    values: {
+      notify_pre_releases: false,
+      update_check_interval: 1440,
+      unrelated: { state: "kept", options: [1, 2] },
+    },
+  };
+}
+
+test("registered settings editor confirms signed update and durable readback without changing other fields", async () => {
+  const original = registeredSettings();
+  let stored = original;
+  const routes = [];
+  const api = { async post(route, payload = {}) {
+    routes.push(route);
+    if (route === "configuration/get") return ordinary(stored);
+    assert.equal(route, "configuration/update");
+    assert.deepEqual(ordinary(payload), {
+      expected_revision: 4, values: { notify_pre_releases: true },
+    });
+    stored = {
+      ...original,
+      revision: 5,
+      values: {
+        unrelated: { options: [1, 2], state: "kept" },
+        update_check_interval: 1440,
+        notify_pre_releases: true,
+      },
+    };
+    return ordinary(stored);
+  } };
+  const saved = await context.Amaterasu.saveRegisteredConfiguration(api, original, {
+    notify_pre_releases: true,
+  });
+  assert.deepEqual(ordinary(saved), stored);
+  assert.deepEqual(routes, ["configuration/update", "configuration/get"]);
+});
+
+test("registered settings editor rejects a denied or mismatched update and concurrent readback", async () => {
+  const original = registeredSettings();
+  const expected = { ...original, revision: 5,
+    values: { ...original.values, notify_pre_releases: true } };
+  for (const rejected of [
+    { ok: false, error: { code: "revision_conflict" } },
+    { ...expected, revision: 6 },
+    { ...expected, fields: { ...expected.fields, update_check_interval: { type: "integer", default: 20 } } },
+    { ...expected, values: { ...expected.values, update_check_interval: 20 } },
+    { ...expected, values: { notify_pre_releases: true } },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveRegisteredConfiguration({ async post(route) {
+      routes.push(route);
+      return rejected;
+    } }, original, { notify_pre_releases: true }));
+    assert.deepEqual(routes, ["configuration/update"]);
+  }
+  for (const stale of [
+    original,
+    { ...expected, revision: 6 },
+    { ...expected, values: { ...expected.values, unrelated: { state: "changed" } } },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveRegisteredConfiguration({ async post(route) {
+      routes.push(route);
+      return route === "configuration/update" ? expected : stale;
+    } }, original, { notify_pre_releases: true }), /could not be confirmed/);
+    assert.deepEqual(routes, ["configuration/update", "configuration/get"]);
+  }
+});
+
+test("registered settings editor ignores older loads and failures after refresh or save", async () => {
+  const gate = new context.Amaterasu.RegisteredConfigurationLoadGate();
+  const pending = [];
+  const api = { post(route) {
+    assert.equal(route, "configuration/get");
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  } };
+  const old = gate.read(api);
+  const latest = gate.read(api);
+  pending[1].resolve(registeredSettings(8));
+  assert.equal((await latest).revision, 8);
+  pending[0].resolve(registeredSettings(7));
+  assert.equal(await old, null);
+  const duringSave = gate.read(api);
+  gate.invalidate();
+  pending[2].reject(new Error("old request failed"));
+  assert.equal(await duringSave, null);
+  const reloaded = gate.read(api);
+  pending[3].resolve(registeredSettings(9));
+  assert.equal((await reloaded).revision, 9);
+});
+
 function hostConfiguration(revision = 6) {
   return {
     ok: true,

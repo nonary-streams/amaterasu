@@ -251,6 +251,71 @@ namespace Amaterasu {
     }
   }
 
+  export function parseRegisteredConfigurationReply(value: unknown): Configuration {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Registered settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
+        reply.fields === null || typeof reply.fields !== "object" || Array.isArray(reply.fields) ||
+        reply.values === null || typeof reply.values !== "object" || Array.isArray(reply.values))
+      throw new Error("Registered settings reply is invalid.");
+    return reply as unknown as Configuration;
+  }
+
+  function sameConfigurationValue(left: unknown, right: unknown): boolean {
+    if (left === right) return true;
+    if (Array.isArray(left) && Array.isArray(right))
+      return left.length === right.length && left.every((value, index) => sameConfigurationValue(value, right[index]));
+    if (!left || !right || typeof left !== "object" || typeof right !== "object" ||
+        Array.isArray(left) || Array.isArray(right)) return false;
+    const leftObject = left as Record<string, unknown>;
+    const rightObject = right as Record<string, unknown>;
+    const keys = Object.keys(leftObject);
+    return keys.length === Object.keys(rightObject).length &&
+      keys.every((key) => Object.hasOwn(rightObject, key) && sameConfigurationValue(leftObject[key], rightObject[key]));
+  }
+
+  export async function saveRegisteredConfiguration(
+    api: Pick<Api, "post">,
+    current: Configuration,
+    values: Payload,
+  ): Promise<Configuration> {
+    const expectedValues = { ...current.values, ...values };
+    const confirms = (reply: Configuration): boolean =>
+      reply.revision === current.revision + 1 &&
+      sameConfigurationValue(reply.fields, current.fields) &&
+      sameConfigurationValue(reply.values, expectedValues);
+    const updated = parseRegisteredConfigurationReply(await api.post<unknown>("configuration/update", {
+      values,
+      expected_revision: current.revision,
+    }));
+    if (!confirms(updated))
+      throw new Error("Registered settings update could not be confirmed. Refresh and check the current values.");
+    const saved = parseRegisteredConfigurationReply(await api.post<unknown>("configuration/get"));
+    if (!confirms(saved))
+      throw new Error("Registered settings could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
+  export class RegisteredConfigurationLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<Configuration | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = parseRegisteredConfigurationReply(await api.post<unknown>("configuration/get"));
+        return generation === this.generation ? settings : null;
+      } catch (error) {
+        if (generation !== this.generation) return null;
+        throw error;
+      }
+    }
+  }
+
   const hostLogLevels: HostLogLevel[] = [
     "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
   ];
@@ -1047,6 +1112,7 @@ namespace Amaterasu {
 
   export function renderSettings(context: PageContext): void {
     const area = el("div");
+    const registeredLoads = new RegisteredConfigurationLoadGate();
     const authArea = el("div");
     const authLoads = new AuthTokenSettingsLoadGate();
     const hostLoggingArea = el("div");
@@ -2644,8 +2710,8 @@ namespace Amaterasu {
     async function load(): Promise<void> {
       area.replaceChildren(el("p", "muted", "Loading settings…"));
       try {
-        const document =
-          await context.api.post<Configuration>("configuration/get");
+        const document = await registeredLoads.read(context.api);
+        if (document === null) return;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const inputs = new Map<
@@ -2711,6 +2777,7 @@ namespace Amaterasu {
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
         form.append(
+          el("p", "muted", "Saving confirms stored values. Runtime use of registered settings is not verified on this page."),
           status,
           el("div", "actions", save, badge(`Revision ${document.revision}`)),
         );
@@ -2722,12 +2789,19 @@ namespace Amaterasu {
               const definition = document.fields[name];
               if (definition) values[name] = fieldValue(definition, control);
             }
-            await context.api.post("configuration/update", {
-              values,
-              expected_revision: document.revision,
-            });
-            context.notify("Settings saved.");
-            await load();
+            registeredLoads.invalidate();
+            try {
+              await saveRegisteredConfiguration(context.api, document, values);
+              context.notify("Registered settings saved and read back. Runtime application is not verified here.");
+              await load();
+            } catch (error) {
+              if (error instanceof ApiError && error.code === "revision_conflict") {
+                await load();
+                context.notify("Registered settings changed elsewhere. Review the latest values and save again.");
+                return;
+              }
+              throw error;
+            }
           });
         });
         area.replaceChildren(
