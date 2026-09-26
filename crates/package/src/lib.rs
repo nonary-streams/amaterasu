@@ -9,6 +9,7 @@ pub mod handoff;
 pub mod importer;
 mod manifest;
 pub mod migration;
+pub mod playnite_extension;
 mod staging;
 mod storage;
 mod verification;
