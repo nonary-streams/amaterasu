@@ -72,6 +72,13 @@ pub enum Operation {
         certificate_id: String,
         catalog_revision: u64,
     },
+    VerifyFrameLimiterSnapshot {
+        application_operation_id: String,
+        app_id: String,
+        catalog_revision: u64,
+        frame_limiter_settings: BTreeMap<String, Value>,
+        frame_limiter_executable_path: String,
+    },
     Lookup {
         operation_id: String,
     },
@@ -120,6 +127,13 @@ impl Operation {
                 validate_legacy_preparation(legacy_global_preparation)?;
             }
             Self::Lookup { operation_id } if !valid_operation_id(operation_id) => {
+                return Err("invalid_request");
+            }
+            Self::VerifyFrameLimiterSnapshot {
+                application_operation_id,
+                app_id,
+                ..
+            } if !valid_operation_id(application_operation_id) || !valid_app_id(app_id) => {
                 return Err("invalid_request");
             }
             Self::PrepareDisplayAdmission {

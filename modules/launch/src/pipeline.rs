@@ -748,6 +748,46 @@ impl Pipeline {
                 }
                 complete(send, request, response)
             }
+            Operation::VerifyFrameLimiterSnapshot {
+                application_operation_id,
+                app_id,
+                catalog_revision,
+                frame_limiter_settings,
+                frame_limiter_executable_path,
+            } => {
+                let verified = caller == "amaterasu.rtsp"
+                    && self.records.values.values().any(|record| {
+                        record.owner == "amaterasu.nvhttp"
+                            && record.catalog_selection == CatalogSelection::Exported
+                            && record.preflight_ready
+                            && record.preflight_token.is_some()
+                            && record.launch_started
+                            && record.state == State::Active
+                            && record.operation_id == application_operation_id
+                            && record.app_id == app_id
+                            && record.catalog_revision == Some(catalog_revision)
+                            && record.frame_limiter_settings.as_ref()
+                                == Some(&frame_limiter_settings)
+                            && record.executable_path.as_deref()
+                                == Some(frame_limiter_executable_path.as_str())
+                    });
+                if !verified {
+                    return complete(send, request, error("frame_limiter_snapshot_denied"));
+                }
+                complete(
+                    send,
+                    request,
+                    serde_json::json!({
+                        "ok":true,
+                        "verified":true,
+                        "application_operation_id":application_operation_id,
+                        "app_id":app_id,
+                        "catalog_revision":catalog_revision,
+                        "frame_limiter_settings":frame_limiter_settings,
+                        "frame_limiter_executable_path":frame_limiter_executable_path,
+                    }),
+                )
+            }
             Operation::Lookup { operation_id } => {
                 let response = self
                     .records

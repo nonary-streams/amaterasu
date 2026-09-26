@@ -1212,6 +1212,98 @@ fn preflight_keeps_target_and_sparse_limiter_policy_together_after_catalog_edit(
 }
 
 #[test]
+fn rtsp_verifies_only_the_active_preflight_frame_limiter_snapshot() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let operation_id = "verified-frame-limiter";
+    let app_id = "app-0000000000000001";
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"preflight_export","operation_id":operation_id,"app_id":app_id}),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    let mut launch = launch_export(operation_id);
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    let mut verify = json!({
+        "action":"verify_frame_limiter_snapshot",
+        "application_operation_id":operation_id,
+        "app_id":app_id,
+        "catalog_revision":preflight["catalog_revision"],
+        "frame_limiter_settings":launch["frame_limiter_settings"],
+        "frame_limiter_executable_path":preflight["executable_path"],
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
+        "frame_limiter_snapshot_denied"
+    );
+
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(
+        harness.request(&mut pipeline, "other-service", verify.clone())["code"],
+        "frame_limiter_snapshot_denied"
+    );
+    let verified = harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone());
+    assert_eq!(
+        verified,
+        json!({
+            "ok":true,
+            "verified":true,
+            "application_operation_id":operation_id,
+            "app_id":app_id,
+            "catalog_revision":preflight["catalog_revision"],
+            "frame_limiter_settings":started["launch"]["frame_limiter_settings"],
+            "frame_limiter_executable_path":preflight["executable_path"],
+        })
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone()),
+        verified
+    );
+
+    for (field, value) in [
+        ("application_operation_id", json!("other-operation")),
+        ("app_id", json!("app-0000000000000002")),
+        ("catalog_revision", json!(2)),
+        ("frame_limiter_executable_path", json!("other-executable")),
+    ] {
+        let mut changed = verify.clone();
+        changed[field] = value;
+        assert_eq!(
+            harness.request(&mut pipeline, "amaterasu.rtsp", changed)["code"],
+            "frame_limiter_snapshot_denied",
+            "{field}"
+        );
+    }
+    verify["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
+        "frame_limiter_snapshot_denied"
+    );
+    verify["frame_limiter_settings"] = started["launch"]["frame_limiter_settings"].clone();
+    assert_eq!(
+        harness
+            .commands
+            .iter()
+            .filter(|(service, _, _)| service == crate::workflow::CATALOG)
+            .count(),
+        1
+    );
+    let stopped = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_ne!(stopped["launch"]["state"], "active", "{stopped}");
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify)["code"],
+        "frame_limiter_snapshot_denied"
+    );
+}
+
+#[test]
 fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     let mut harness = Harness::new();
     let display = json!({
