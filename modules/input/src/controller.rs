@@ -141,6 +141,7 @@ pub struct Controller<B: Backend> {
     native_pen_touch: bool,
     controller_enabled: bool,
     controller_cleanup_pending: bool,
+    startup_cleanup_pending: bool,
     repeating_key: Option<RepeatingKey>,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
@@ -169,6 +170,7 @@ impl<B: Backend> Controller<B> {
             native_pen_touch: true,
             controller_enabled: true,
             controller_cleanup_pending: false,
+            startup_cleanup_pending: false,
             repeating_key: None,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
@@ -255,6 +257,9 @@ impl<B: Backend> Controller<B> {
         }
         if self.controller_cleanup_pending && now >= self.retry_at {
             let _ = self.retry_controller_cleanup(now);
+        }
+        if self.startup_cleanup_pending && now >= self.retry_at {
+            let _ = self.retry_startup_cleanup(now);
         }
         let lease_cleanup_required = self
             .lease
@@ -472,6 +477,20 @@ impl<B: Backend> Controller<B> {
         }
     }
 
+    fn retry_startup_cleanup(&mut self, now: Instant) -> InputResult<()> {
+        match self.backend.stop() {
+            Ok(()) => {
+                self.startup_cleanup_pending = false;
+                self.retry_at = now;
+                Ok(())
+            }
+            Err(error) => {
+                self.retry_at = now + Duration::from_millis(100);
+                Err(InputError::new("release_failed", error.message))
+            }
+        }
+    }
+
     fn reset_scroll_remainders(&mut self) {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
@@ -525,7 +544,8 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn cleanup_required(&self) -> bool {
-        self.controller_cleanup_pending
+        self.startup_cleanup_pending
+            || self.controller_cleanup_pending
             || self
                 .lease
                 .as_ref()
@@ -643,10 +663,10 @@ impl<B: Backend> Controller<B> {
                 "no native input backend for this platform",
             ));
         }
-        if self.controller_cleanup_pending {
+        if self.controller_cleanup_pending || self.startup_cleanup_pending {
             return Err(InputError::new(
                 "cleanup_required",
-                "virtual controller cleanup must complete before acquiring a lease",
+                "native input cleanup must complete before acquiring a lease",
             ));
         }
         if self.lease.is_some() {
@@ -691,6 +711,8 @@ impl<B: Backend> Controller<B> {
         self.backend
             .set_key_rightalt_to_key_win(key_rightalt_to_key_win);
         if let Err(error) = self.backend.start() {
+            self.startup_cleanup_pending = true;
+            let _ = self.retry_startup_cleanup(now);
             self.backend
                 .set_back_button_timeout(self.back_button_timeout_ms);
             self.backend.set_gamepad_profile(self.gamepad_profile);
@@ -1372,7 +1394,7 @@ impl<B: Backend> Controller<B> {
                 "gamepad_unavailable_reason":lease.gamepad_unavailable_reason,
             })
         });
-        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
+        json!({"ok":true,"enabled":self.enabled,"keyboard":self.device_policy.keyboard,"mouse":self.device_policy.mouse,"controller_enabled":self.controller_enabled,"controller_cleanup_required":self.controller_cleanup_pending,"startup_cleanup_required":self.startup_cleanup_pending,"high_resolution_scrolling":self.high_resolution_scrolling,"always_send_scancodes":self.always_send_scancodes,"key_rightalt_to_key_win":self.key_rightalt_to_key_win,"key_repeat_delay":self.key_repeat_delay_ms,"key_repeat_frequency":self.key_repeat_frequency_hz,"back_button_timeout":self.back_button_timeout_ms,"gamepad":self.gamepad_profile.as_str(),"ds4_back_as_touchpad_click":self.ds4_back_as_touchpad_click,"native_pen_touch":self.native_pen_touch,"pen_touch_supported":self.backend.pen_touch_supported(),"supported_profiles":self.backend.supported_gamepad_profiles(),"recognized_profiles":GamepadProfile::recognized_profiles(),"effective_gamepad_profile":effective_gamepad_profile,"gamepad_unavailable_reason":gamepad_unavailable_reason,"backend":self.backend.name(),"native_supported":self.backend.supported(),"key_encoding":self.backend.key_encoding(),"absolute_pointer":self.backend.absolute_pointer(),"controller_input":self.backend.controller_input_supported(),"lease":lease})
     }
     fn failure(&self, error: InputError) -> Value {
         let mut value = error.payload();

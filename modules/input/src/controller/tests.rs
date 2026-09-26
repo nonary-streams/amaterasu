@@ -15,6 +15,8 @@ struct FakeBackend {
     fail_next: bool,
     fail_release: bool,
     fail_stop: bool,
+    fail_start_once: bool,
+    native_resource_owned: bool,
     fail_controller_input: bool,
     reject_absolute: bool,
     supports_pen_touch: bool,
@@ -70,6 +72,19 @@ impl Backend for FakeBackend {
     }
     fn start(&mut self) -> InputResult<()> {
         self.starts += 1;
+        if self.native_resource_owned {
+            return Err(InputError::new(
+                "backend_busy",
+                "native resource still owned",
+            ));
+        }
+        self.native_resource_owned = true;
+        if std::mem::take(&mut self.fail_start_once) {
+            return Err(InputError::new(
+                "injection_failed",
+                "partial native startup",
+            ));
+        }
         Ok(())
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
@@ -157,6 +172,7 @@ impl Backend for FakeBackend {
                 "virtual device still active",
             ))
         } else {
+            self.native_resource_owned = false;
             Ok(())
         }
     }
@@ -205,29 +221,101 @@ fn moonlight_key(code: u8, state: KeyState, repeat_modifiers: u8, temporary: boo
     }
 }
 fn acquire(controller: &mut Controller<FakeBackend>, now: Instant) -> String {
-    let response = controller.handle(
-        "owner",
-        Operation::Acquire {
-            operation_id: None,
-            ttl_ms: Some(1000),
-            back_button_timeout: None,
-            controller: None,
-            gamepad: None,
-            ds4_back_as_touchpad_click: None,
-            native_pen_touch: None,
-            keyboard: None,
-            mouse: None,
-            high_resolution_scrolling: None,
-            always_send_scancodes: None,
-            key_rightalt_to_key_win: None,
-            key_repeat_delay: None,
-            key_repeat_frequency: None,
-        },
-        now,
-        &mut || Ok(()),
-    );
+    let response = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
     assert_eq!(response["ok"], true);
     response["lease"].as_str().unwrap().into()
+}
+
+fn acquire_operation() -> Operation {
+    Operation::Acquire {
+        operation_id: None,
+        ttl_ms: Some(1000),
+        back_button_timeout: None,
+        controller: None,
+        gamepad: None,
+        ds4_back_as_touchpad_click: None,
+        native_pen_touch: None,
+        keyboard: None,
+        mouse: None,
+        high_resolution_scrolling: None,
+        always_send_scancodes: None,
+        key_rightalt_to_key_win: None,
+        key_repeat_delay: None,
+        key_repeat_frequency: None,
+    }
+}
+
+#[test]
+fn failed_startup_releases_partial_device_before_next_acquire() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_start_once: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let first = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(first["error"]["code"], "injection_failed");
+    assert_eq!(controller.backend.stops, 1);
+    assert!(!controller.backend.native_resource_owned);
+    assert!(!controller.cleanup_required());
+
+    let lease = acquire(&mut controller, now);
+    assert!(controller.backend.native_resource_owned);
+    assert_eq!(
+        batch(&mut controller, &lease, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+    let released = controller.handle("owner", Operation::Release { lease }, now, &mut || Ok(()));
+    assert_eq!(released["released"], true);
+    assert!(!controller.backend.native_resource_owned);
+}
+
+#[test]
+fn failed_startup_cleanup_blocks_acquire_until_retry_succeeds() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_start_once: true,
+            fail_stop: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let first = controller.handle("owner", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(first["error"]["code"], "injection_failed");
+    assert!(controller.backend.native_resource_owned);
+    assert_eq!(
+        controller.handle("owner", Operation::Status, now, &mut || Ok(()))["startup_cleanup_required"],
+        true
+    );
+    assert_eq!(
+        controller.handle("owner", acquire_operation(), now, &mut || Ok(()))["error"]["code"],
+        "cleanup_required"
+    );
+    controller.expire(now + Duration::from_millis(99));
+    assert_eq!(controller.backend.stops, 1);
+
+    controller.backend.fail_stop = false;
+    controller.expire(now + Duration::from_millis(100));
+    assert_eq!(controller.backend.stops, 2);
+    assert!(!controller.cleanup_required());
+    let lease = acquire(&mut controller, now + Duration::from_millis(101));
+    assert_eq!(
+        batch(&mut controller, &lease, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease },
+            now + Duration::from_millis(101),
+            &mut || Ok(())
+        )["released"],
+        true
+    );
+    assert!(!controller.backend.native_resource_owned);
 }
 
 #[test]
