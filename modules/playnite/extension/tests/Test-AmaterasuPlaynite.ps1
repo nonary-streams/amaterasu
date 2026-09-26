@@ -72,6 +72,61 @@ Assert-True ($manifest -match '(?m)^Version:\s*\d+\.\d+\.\d+\s*$') 'packaging ve
 
 $extension = Import-Module -Name $ModulePath -PassThru -Force
 try {
+    $eventSignals = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    $timer = [System.Timers.Timer]::new(20)
+    $timer.AutoReset = $false
+    $eventSubscription = & $extension {
+        param($source,$signals)
+        Register-LibraryChangeEvent $source 'Elapsed' $signals
+    } $timer $eventSignals
+    Assert-True ($eventSubscription.SubscriptionId -gt 0) 'event registration did not return a removable subscriber'
+    try {
+        $timer.Start()
+        $deadline = [DateTime]::UtcNow.AddSeconds(2)
+        while (-not $eventSignals.ContainsKey('generation') -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+        Assert-True ([long]$eventSignals['generation'] -gt 0) 'installed module event action did not mark the shared library generation'
+    } finally {
+        $timer.Stop()
+        Unregister-Event -SubscriptionId $eventSubscription.SubscriptionId -ErrorAction SilentlyContinue
+        $timer.Dispose()
+    }
+
+    if (-not ('BlockedPlayniteWriteStream' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class BlockedPlayniteWriteStream : Stream {
+    readonly TaskCompletionSource<object> pending = new TaskCompletionSource<object>();
+    public bool WasDisposed { get; private set; }
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => !WasDisposed;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken token) => pending.Task;
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken token = default) => new ValueTask(pending.Task);
+    protected override void Dispose(bool disposing) { WasDisposed = true; pending.TrySetCanceled(); base.Dispose(disposing); }
+}
+'@
+    }
+    $blockedStream = [BlockedPlayniteWriteStream]::new()
+    $blockedWriter = [System.IO.StreamWriter]::new($blockedStream, [System.Text.UTF8Encoding]::new($false), 1024, $true)
+    $blockedWriter.AutoFlush = $true
+    $blockedConnection = New-MockConnection ('3' * 32) ([System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new())
+    $blockedConnection.Stream = $blockedStream
+    $blockedFrame = @{ Lines=[string[]]@('{"type":"snapshotComplete"}'); CapturedAt=[DateTime]::UtcNow; Generation=0L; RequestId='' }
+    try {
+        Assert-Throws { & $extension { param($connection,$frame,$writer) Write-QueuedFrame $connection $frame $writer } $blockedConnection $blockedFrame $blockedWriter } 'blocked completion write did not time out'
+        Assert-True $blockedStream.WasDisposed 'timed out completion left its pipe open'
+    } finally { $blockedWriter.Dispose(); $blockedStream.Dispose(); $blockedConnection.Queue.Dispose() }
+
     Assert-Throws {
         & $extension { param($api) Capture-SnapshotPayload $api } (New-MockApi $false) | Out-Null
     } 'capture was accepted outside the UI dispatcher'

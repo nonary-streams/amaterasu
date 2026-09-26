@@ -85,9 +85,15 @@ then places an immutable snapshot batch in a bounded queue owned by one pipe
 connection. Each bracket contains the fresh nonce from that connection's
 authenticated hello, and requested brackets also echo a request ID. A queued
 batch from an old connection cannot acquire a new nonce. Missing, mismatched,
-partial, or stale brackets cannot update the catalog. The 30-second poll remains
-as recovery if a collection event is missed. Launch and stop results are bound
-to the current connection nonce and command request ID.
+or partial brackets cannot update the catalog. A library change whose dirty
+generation is observed before completion cancels the bracket and recaptures a
+requested snapshot with its original request ID. The final completion write
+and dirty generation update share a lock; a blocked completion write closes
+the pipe after one second. Playnite collection events are asynchronous, so a
+mutation reported only after completion may briefly leave an older complete
+snapshot visible until the debounced update or 30-second recovery poll. Native
+installed Playnite testing must qualify that event ordering. Launch and stop
+results are bound to the current connection nonce and command request ID.
 
 Playnite's installed extension directory is `%AppData%\Playnite\Extensions`;
 portable installs use `Extensions` below the Playnite installation. To test a

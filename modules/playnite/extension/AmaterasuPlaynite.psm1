@@ -25,6 +25,21 @@ function Mark-LibraryDirty($Signals) {
     } finally { [System.Threading.Monitor]::Exit($Signals) }
 }
 
+function Register-LibraryChangeEvent($Source, [string]$EventName, $Signals) {
+    # PowerShell runs event actions in a dynamic module. Keep the mutation
+    # self-contained because private functions in this module are not visible.
+    $sourceId = 'Amaterasu.Playnite.Library.' + [Guid]::NewGuid().ToString('N')
+    [void](Register-ObjectEvent -InputObject $Source -EventName $EventName -SourceIdentifier $sourceId -MessageData $Signals -Action {
+        $signals = $Event.MessageData
+        [System.Threading.Monitor]::Enter($signals)
+        try {
+            $signals['generation'] = [long]$signals['generation'] + 1L
+            $signals['dirty'] = [DateTime]::UtcNow
+        } finally { [System.Threading.Monitor]::Exit($signals) }
+    })
+    return Get-EventSubscriber -SourceIdentifier $sourceId
+}
+
 if (-not ('AmaterasuPlaynitePeer' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -495,7 +510,7 @@ function OnApplicationStarted() {
     [void]$worker.AddScript('param($modulePath,$api,$dispatcher,$connections,$stop,$signals,$cache,$slots) Import-Module -Name $modulePath -Force; Start-PipeServer $api $dispatcher $connections $stop $signals $cache $slots').AddArgument($script:ModulePath).AddArgument($PlayniteApi).AddArgument($dispatcher).AddArgument($script:Connections).AddArgument($script:Stop).AddArgument($script:Signals).AddArgument($script:SnapshotCache).AddArgument($script:ConnectionSlots)
     $script:Background = @{ Runspace=$runspace; Worker=$worker; Handle=$worker.BeginInvoke() }
     foreach ($eventName in @('ItemCollectionChanged','ItemUpdated')) {
-        try { $script:Subscriptions += Register-ObjectEvent -InputObject $PlayniteApi.Database.Games -EventName $eventName -MessageData $script:Signals -Action { Mark-LibraryDirty $Event.MessageData } } catch {}
+        try { $script:Subscriptions += Register-LibraryChangeEvent $PlayniteApi.Database.Games $eventName $script:Signals } catch {}
     }
 }
 
