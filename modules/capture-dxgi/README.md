@@ -16,8 +16,9 @@ Native modules are trusted code; these grants are not a native-code sandbox.
   Enumeration is read-only and available when capture is disabled. Outputs are
   ordered by ID. Optional `offset` (default 0) and `limit` (1..=256, default
   256) page results. A `next_offset` field is returned when more outputs remain;
-  each page fits the 12 KB control reply limit. Re-enumerate from zero if
-  topology changes between pages and an offset becomes invalid.
+  each page fits the 12 KB control reply limit. Every reply includes an opaque
+  `enumeration_id` for the complete sorted output list. Consumers should reject
+  pages with a different ID and re-enumerate from zero after a topology change.
 - `{"action":"open","output":"<enumerated id>"}` returns
   `{"ok":true,"stream":123,"output":"..."}` plus `desktop_geometry` when
   Windows can prove the selected monitor's physical rectangle and the complete

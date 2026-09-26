@@ -126,6 +126,79 @@ fn sample_output(index: usize) -> Output {
     }
 }
 
+fn enumerate_fake_outputs(outputs: Vec<Output>, offset: Option<usize>) -> serde_json::Value {
+    let mut controller = Controller::new(
+        FakeBackend {
+            outputs,
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        false,
+    );
+    controller.handle(
+        "owner",
+        Operation::Enumerate {
+            offset,
+            limit: Some(1),
+        },
+        &mut || Ok(()),
+    )
+}
+
+#[test]
+fn enumeration_token_identifies_the_complete_sorted_topology() {
+    let outputs = vec![sample_output(0), sample_output(1), sample_output(2)];
+    let first = enumerate_fake_outputs(outputs.clone(), None);
+    let second = enumerate_fake_outputs(outputs.clone(), Some(1));
+    let token = first["enumeration_id"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(second["enumeration_id"], token);
+    assert_eq!(first["next_offset"], 1);
+    assert_eq!(second["next_offset"], 2);
+
+    let mut reordered = outputs.clone();
+    reordered.reverse();
+    assert_eq!(
+        enumerate_fake_outputs(reordered, None)["enumeration_id"],
+        token
+    );
+
+    let removed = enumerate_fake_outputs(outputs[1..].to_vec(), None);
+    assert_ne!(removed["enumeration_id"], token);
+
+    let mut added = outputs.clone();
+    added.push(sample_output(3));
+    assert_ne!(enumerate_fake_outputs(added, None)["enumeration_id"], token);
+
+    let mut detached = outputs.clone();
+    detached[2].attached = false;
+    assert_ne!(
+        enumerate_fake_outputs(detached, None)["enumeration_id"],
+        token
+    );
+
+    let mut renamed = outputs.clone();
+    renamed[2].device_name = "another display".into();
+    assert_ne!(
+        enumerate_fake_outputs(renamed, None)["enumeration_id"],
+        token
+    );
+
+    let mut moved = outputs;
+    moved[2].left += 100;
+    assert_ne!(enumerate_fake_outputs(moved, None)["enumeration_id"], token);
+
+    let mut duplicate = sample_output(1);
+    duplicate.device_name = "different monitor".into();
+    assert_eq!(
+        enumerate_fake_outputs(vec![sample_output(1), duplicate], None)["error"]["code"],
+        "backend_error"
+    );
+}
+
 #[test]
 fn enumeration_pages_all_outputs_without_changing_an_open_stream() {
     let drops = Arc::new(AtomicUsize::new(0));

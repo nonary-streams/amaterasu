@@ -5,6 +5,7 @@ use crate::model::{
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 struct Stream {
@@ -316,6 +317,15 @@ fn enumeration_reply(
         ));
     }
     outputs.sort_by(|left, right| left.id.cmp(&right.id));
+    if outputs.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(CaptureError::new(
+            "backend_error",
+            "capture backend returned duplicate output identities",
+        ));
+    }
+    let full_list = serde_json::to_vec(&outputs)
+        .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
+    let enumeration_id = format!("{:x}", Sha256::digest(&full_list));
     if offset > outputs.len() || (offset == outputs.len() && offset != 0) {
         return Err(CaptureError::new(
             "invalid_request",
@@ -331,7 +341,7 @@ fn enumeration_reply(
         // Reserve the worst-case cursor overhead so adding it cannot overflow
         // the control reply after the page has been selected.
         let encoded =
-            serde_json::to_vec(&json!({"ok":true,"outputs":page,"next_offset":next_offset}))
+            serde_json::to_vec(&json!({"ok":true,"outputs":page,"next_offset":next_offset,"enumeration_id":enumeration_id}))
                 .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
         if encoded.len() > 12_000 {
             page.pop();
@@ -346,9 +356,9 @@ fn enumeration_reply(
     }
     let next_offset = offset + page.len();
     let reply = if next_offset < total_outputs {
-        json!({"ok":true,"outputs":page,"next_offset":next_offset})
+        json!({"ok":true,"outputs":page,"next_offset":next_offset,"enumeration_id":enumeration_id})
     } else {
-        json!({"ok":true,"outputs":page})
+        json!({"ok":true,"outputs":page,"enumeration_id":enumeration_id})
     };
     Ok(reply)
 }
