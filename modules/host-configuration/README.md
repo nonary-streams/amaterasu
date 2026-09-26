@@ -110,12 +110,15 @@ If a caller times out while the state service is persisting an update, the write
 may still have committed; read the current revision before retrying.
 
 `update` is a full replacement. `expected_revision` compares to the document
-revision. Before writing, the provider requires a ready `status` response from
-diagnostics under its signed call grant. Missing grants or unavailable diagnostics
-leave the document unchanged. The provider then increments its revision once and
-writes with the state namespace's revision as `expected_revision` in the state CAS.
-After that durable write,
-the provider sends the GET-shaped configuration to diagnostics as
+revision. Before writing, the provider checks diagnostics `status` under its
+signed call grant. It normally requires `ready:true`. For the exact default
+document at state revision zero, it accepts the initial `ready:false` status
+only when diagnostics reports no applied revision and a disabled sink without
+failure. That permits the first write that diagnostics needs to become ready.
+Missing grants, malformed status, and later unready diagnostics leave the
+document unchanged. The provider then increments its revision once and writes
+with the state namespace's revision as `expected_revision` in the state CAS.
+After that durable write, the provider sends the GET-shaped configuration as
 `apply_host_logging`. Success requires diagnostics to confirm the same applied
 revision, after opening the requested logging sink:
 
@@ -135,11 +138,13 @@ revision, after opening the requested logging sink:
  "logging":{"saved_revision":1,"applied_revision":1,"status":"applied"}}
 ```
 
-An explicit diagnostics rejection leaves its prior logger active. The provider
-then restores the previous settings through another state CAS, using the next
-document revision to keep revisions monotonic. A confirmed compensation reports
-`logging_apply_failed` with `logging.status: "rolled_back"`. If the
-compensating write is explicitly rejected, it reports `logging_rollback_failed`
+An explicit diagnostics rejection triggers a state CAS restoring the previous
+settings at the next document revision. The provider then directly applies that
+restored document to diagnostics. Only matching applied-revision confirmation
+reports `logging_apply_failed` with `logging.status: "rolled_back"`. A failed
+or ambiguous restored-logging apply reports `logging_rollback_application_unconfirmed`
+with the saved and restored revisions; callers must inspect diagnostics status.
+If the compensating write is explicitly rejected, it reports `logging_rollback_failed`
 with `logging.status: "rollback_failed"`. An ambiguous compensation reports
 `logging_rollback_unconfirmed`. When a write or diagnostics apply
 has an ambiguous transport or timeout outcome, the provider does not claim

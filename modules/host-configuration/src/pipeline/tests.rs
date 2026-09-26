@@ -346,7 +346,7 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
     ));
     let mut completed = None;
 
-    for tick_number in 1..=6 {
+    for tick_number in 1..=7 {
         pipeline
             .tick(|command| match (tick_number, command) {
                 (1, Command::Poll {}) => Ok(incoming.take().unwrap()),
@@ -431,7 +431,30 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
                     payload: json!({"ok":true,"revision":14}),
                 }),
                 (6, Command::ReleaseResult { request: 26 }) => Ok(Response::Ok),
-                (6, Command::Complete { payload, .. }) => {
+                (
+                    6,
+                    Command::Request {
+                        service,
+                        payload,
+                        parent,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(parent, Some(7));
+                    assert_eq!(payload["action"], "apply_host_logging");
+                    assert_eq!(payload["configuration"]["revision"], 7);
+                    assert_eq!(
+                        payload["configuration"]["values"]["log_path"],
+                        "amaterasu.log"
+                    );
+                    Ok(Response::Accepted { id: 27 })
+                }
+                (7, Command::TakeResult { request: 27 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"applied_revision":7}),
+                }),
+                (7, Command::ReleaseResult { request: 27 }) => Ok(Response::Ok),
+                (7, Command::Complete { payload, .. }) => {
                     completed = Some(payload);
                     Ok(Response::Ok)
                 }
@@ -444,7 +467,74 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
     let response = completed.unwrap();
     assert_eq!(response["error"]["code"], "logging_apply_failed");
     assert_eq!(response["logging"]["saved_revision"], 6);
+    assert_eq!(response["logging"]["applied_revision"], 7);
     assert_eq!(response["logging"]["status"], "rolled_back");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restored_state_without_confirmed_diagnostics_reapply_reports_divergence() {
+    let root = test_root();
+    let restored = Document::from_settings(7, crate::settings::Settings::default());
+    let restored_configuration = build_read_response(&restored, &root).unwrap();
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    pipeline.pending = Some(Pending {
+        request_id: 7,
+        deadline: Instant::now() + Duration::from_secs(30),
+        state_request_id: 26,
+        stage: Stage::RollingBack {
+            saved_revision: 6,
+            expected_state_revision: 13,
+            original_deadline: Instant::now() + Duration::from_secs(30),
+            restored_configuration: Some(restored_configuration),
+        },
+        phase: PendingPhase::Waiting,
+    });
+    let mut completed = None;
+
+    for tick_number in 1..=2 {
+        pipeline
+            .tick(|command| match (tick_number, command) {
+                (1, Command::TakeResult { request: 26 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"revision":14}),
+                }),
+                (1, Command::ReleaseResult { request: 26 }) => Ok(Response::Ok),
+                (
+                    1,
+                    Command::Request {
+                        service, payload, ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload["action"], "apply_host_logging");
+                    assert_eq!(payload["configuration"]["revision"], 7);
+                    Ok(Response::Accepted { id: 27 })
+                }
+                (2, Command::TakeResult { request: 27 }) => Ok(Response::Result {
+                    payload: json!({"ok":false,"code":"logging_unavailable"}),
+                }),
+                (2, Command::ReleaseResult { request: 27 }) => Ok(Response::Ok),
+                (2, Command::Complete { payload, .. }) => {
+                    completed = Some(payload);
+                    Ok(Response::Ok)
+                }
+                (_, Command::Poll {}) => Ok(Response::Pending),
+                (_, command) => panic!("unexpected compensation command: {command:?}"),
+            })
+            .unwrap();
+    }
+
+    let response = completed.unwrap();
+    assert_eq!(
+        response["error"]["code"],
+        "logging_rollback_application_unconfirmed"
+    );
+    assert_eq!(response["logging"]["restored_revision"], 7);
+    assert_eq!(response["logging"]["applied_revision"], Value::Null);
+    assert_eq!(
+        response["logging"]["status"],
+        "rollback_application_unconfirmed"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -529,6 +619,8 @@ fn accepted_state_errors_preserve_uncertain_save_and_rollback_outcomes() {
     let rollback = || Stage::RollingBack {
         saved_revision: 6,
         expected_state_revision: 13,
+        original_deadline: Instant::now() + Duration::from_secs(30),
+        restored_configuration: None,
     };
     let transport_failure = || ChildOutcome::Failure {
         code: "deadline_exceeded".into(),
@@ -624,6 +716,7 @@ struct LifecycleTransport {
     next_child_id: u64,
     completed: Option<Value>,
     applied_revision: Option<u64>,
+    diagnostics_status: Value,
     events: Vec<&'static str>,
 }
 
@@ -636,6 +729,7 @@ impl LifecycleTransport {
             next_child_id: 20,
             completed: None,
             applied_revision: None,
+            diagnostics_status: json!({"ok":true,"ready":true,"logging_configuration_revision":null,"logging_sink":{"state":"healthy","failure":null}}),
             events: Vec::new(),
         }
     }
@@ -693,7 +787,7 @@ impl LifecycleTransport {
                     match payload["action"].as_str().unwrap() {
                         "status" => {
                             self.events.push("preflight");
-                            json!({"ok":true,"ready":true,"applied_revision":self.applied_revision})
+                            self.diagnostics_status.clone()
                         }
                         "apply_host_logging" => {
                             self.events.push("apply");
@@ -707,6 +801,11 @@ impl LifecycleTransport {
                                 json!(saved.min_log_level)
                             );
                             self.applied_revision = Some(saved.revision);
+                            self.diagnostics_status = json!({
+                                "ok":true,"ready":true,
+                                "logging_configuration_revision":saved.revision,
+                                "logging_sink":{"state":"healthy","failure":null}
+                            });
                             json!({"ok":true,"applied_revision":saved.revision})
                         }
                         action => panic!("unexpected diagnostics action: {action}"),
@@ -751,6 +850,10 @@ fn durable_update_applies_logging_then_provider_reload_reads_saved_settings() {
     let root = test_root();
     let state_file = root.join("host-configuration-test-state.json");
     let mut transport = LifecycleTransport::new(state_file.clone());
+    transport.diagnostics_status = json!({
+        "ok":true,"ready":false,"logging_configuration_revision":null,
+        "logging_sink":{"state":"disabled","failure":null}
+    });
     transport.incoming = Some(request(
         "amaterasu.management",
         json!({
@@ -765,6 +868,11 @@ fn durable_update_applies_logging_then_provider_reload_reads_saved_settings() {
     assert_eq!(updated["revision"], 1);
     assert_eq!(updated["logging"]["applied_revision"], 1);
     assert_eq!(transport.applied_revision, Some(1));
+    assert_eq!(transport.diagnostics_status["ready"], true);
+    assert_eq!(
+        transport.diagnostics_status["logging_configuration_revision"],
+        1
+    );
     assert_eq!(transport.events, ["read", "preflight", "save", "apply"]);
 
     // A new provider instance must read the durable document, not cached settings.
@@ -781,4 +889,67 @@ fn durable_update_applies_logging_then_provider_reload_reads_saved_settings() {
     );
     assert_eq!(restarted_transport.events, ["read"]);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unready_diagnostics_preflight_only_allows_exact_initial_bootstrap_status() {
+    let initial_status = json!({
+        "ok":true,"ready":false,"logging_configuration_revision":null,
+        "logging_sink":{"state":"disabled","failure":null}
+    });
+    let cases = [
+        (1, false, initial_status.clone()),
+        (0, true, initial_status.clone()),
+        (
+            0,
+            false,
+            json!({"ok":true,"ready":false,"logging_sink":{"state":"disabled","failure":null}}),
+        ),
+        (
+            0,
+            false,
+            json!({"ok":true,"ready":false,"logging_configuration_revision":null}),
+        ),
+        (
+            0,
+            false,
+            json!({"ok":true,"ready":false,"logging_configuration_revision":null,"logging_sink":{"state":"failed","failure":"open"}}),
+        ),
+    ];
+
+    for (revision, nondefault_document, status) in cases {
+        let root = test_root();
+        let state_file = root.join("host-configuration-test-state.json");
+        if revision != 0 || nondefault_document {
+            let mut settings = crate::settings::Settings::default();
+            if nondefault_document {
+                settings.log_path = "old.log".into();
+            }
+            std::fs::write(
+                &state_file,
+                serde_json::to_vec(&json!({
+                    "revision":revision,
+                    "value":Document::from_settings(revision, settings)
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut transport = LifecycleTransport::new(state_file);
+        transport.diagnostics_status = status;
+        transport.incoming = Some(request(
+            "amaterasu.management",
+            json!({
+                "action":"update","expected_revision":revision,
+                "file_state":"state.json","vibeshine_file_state":"legacy.json",
+                "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+                "log_path":"logs/live.log","min_log_level":"warning"
+            }),
+        ));
+        let response = transport.complete(&mut Pipeline::new(Ok(root.clone())));
+        assert_eq!(response["error"]["code"], "configuration_unavailable");
+        assert_eq!(transport.stored().0, revision);
+        assert_eq!(transport.events, ["read", "preflight"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

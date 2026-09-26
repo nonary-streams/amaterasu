@@ -27,6 +27,7 @@ struct UpdateToSave {
     document: Document,
     previous: Document,
     response: Value,
+    allow_unready_bootstrap: bool,
 }
 
 struct Pending {
@@ -53,6 +54,13 @@ enum Stage {
     RollingBack {
         saved_revision: u64,
         expected_state_revision: u64,
+        original_deadline: Instant,
+        restored_configuration: Option<Value>,
+    },
+    Compensating {
+        saved_revision: u64,
+        restored_revision: u64,
+        parented: bool,
     },
 }
 
@@ -199,6 +207,15 @@ impl Pipeline {
                     saved_revision,
                     "compensating write timed out; inspect current configuration before retrying",
                 ),
+                Stage::Compensating {
+                    saved_revision,
+                    restored_revision,
+                    ..
+                } => rollback_application_unconfirmed(
+                    saved_revision,
+                    restored_revision,
+                    "restored logging apply timed out",
+                ),
                 Stage::Loading(_) => {
                     error("deadline_exceeded", "host configuration request expired")
                 }
@@ -294,6 +311,7 @@ impl Pipeline {
                     response,
                 } if code == "permission_denied" => self.rollback(
                     pending.request_id,
+                    pending.deadline,
                     saved_state_revision,
                     previous,
                     response["revision"].as_u64().unwrap_or_default(),
@@ -315,6 +333,19 @@ impl Pipeline {
                     rollback_unconfirmed(
                         saved_revision,
                         format!("state service failure ({code}): {message}"),
+                    ),
+                ),
+                Stage::Compensating {
+                    saved_revision,
+                    restored_revision,
+                    ..
+                } => complete(
+                    send,
+                    pending.request_id,
+                    rollback_application_unconfirmed(
+                        saved_revision,
+                        restored_revision,
+                        format!("restored logging apply failed ({code}): {message}"),
                     ),
                 ),
                 Stage::Preflighting(_) => complete(
@@ -339,6 +370,7 @@ impl Pipeline {
                             response,
                         } => self.rollback(
                             pending.request_id,
+                            pending.deadline,
                             saved_state_revision,
                             previous,
                             response["revision"].as_u64().unwrap_or_default(),
@@ -354,6 +386,19 @@ impl Pipeline {
                             };
                             complete(send, pending.request_id, response)
                         }
+                        Stage::Compensating {
+                            saved_revision,
+                            restored_revision,
+                            ..
+                        } => complete(
+                            send,
+                            pending.request_id,
+                            rollback_application_unconfirmed(
+                                saved_revision,
+                                restored_revision,
+                                message,
+                            ),
+                        ),
                         Stage::Saving { response, .. } => complete(
                             send,
                             pending.request_id,
@@ -368,7 +413,20 @@ impl Pipeline {
                     };
                 }
                 if let Stage::Preflighting(update) = pending.stage {
-                    if payload.get("ready").and_then(Value::as_bool) != Some(true) {
+                    let ready = payload.get("ready").and_then(Value::as_bool) == Some(true);
+                    let initial_unready = update.allow_unready_bootstrap
+                        && payload.get("ready").and_then(Value::as_bool) == Some(false)
+                        && payload
+                            .get("logging_configuration_revision")
+                            .is_some_and(Value::is_null)
+                        && payload
+                            .pointer("/logging_sink/state")
+                            .and_then(Value::as_str)
+                            == Some("disabled")
+                        && payload
+                            .pointer("/logging_sink/failure")
+                            .is_some_and(Value::is_null);
+                    if !ready && !initial_unready {
                         return complete(
                             send,
                             pending.request_id,
@@ -400,6 +458,36 @@ impl Pipeline {
                         send,
                         pending.request_id,
                         application_unconfirmed(saved_revision),
+                    );
+                }
+                if let Stage::Compensating {
+                    saved_revision,
+                    restored_revision,
+                    parented,
+                } = pending.stage
+                {
+                    if payload.get("applied_revision").and_then(Value::as_u64)
+                        == Some(restored_revision)
+                        && parented
+                    {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            json!({
+                                "ok":false,
+                                "error":{"code":"logging_apply_failed","message":"logging policy could not be applied; previous configuration and logging policy were restored"},
+                                "logging":{"saved_revision":saved_revision,"restored_revision":restored_revision,"applied_revision":restored_revision,"status":"rolled_back"}
+                            }),
+                        );
+                    }
+                    return complete(
+                        send,
+                        pending.request_id,
+                        rollback_application_unconfirmed(
+                            saved_revision,
+                            restored_revision,
+                            "restored logging application was not confirmed within the management request",
+                        ),
                     );
                 }
                 let state_revision = match payload.get("revision").and_then(Value::as_u64) {
@@ -466,6 +554,8 @@ impl Pipeline {
                     Stage::RollingBack {
                         saved_revision,
                         expected_state_revision,
+                        original_deadline,
+                        restored_configuration,
                     } => {
                         if state_revision != expected_state_revision.saturating_add(1) {
                             return complete(
@@ -477,18 +567,17 @@ impl Pipeline {
                                 ),
                             );
                         }
-                        complete(
-                            send,
+                        self.compensate_logging(
                             pending.request_id,
-                            json!({
-                                "ok":false,
-                                "error":{"code":"logging_apply_failed","message":"logging policy could not be applied; previous configuration was restored"},
-                                "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"rolled_back"}
-                            }),
+                            original_deadline,
+                            saved_revision,
+                            restored_configuration,
+                            send,
                         )
                     }
                     Stage::Applying { .. } => unreachable!(),
                     Stage::Preflighting(_) => unreachable!(),
+                    Stage::Compensating { .. } => unreachable!(),
                 }
             }
         }
@@ -597,6 +686,8 @@ impl Pipeline {
                         ),
                     );
                 }
+                let allow_unready_bootstrap =
+                    state_revision == 0 && document == Document::default();
                 self.preflight(
                     UpdateToSave {
                         request_id,
@@ -605,6 +696,7 @@ impl Pipeline {
                         document: next,
                         previous: document,
                         response,
+                        allow_unready_bootstrap,
                     },
                     send,
                 )
@@ -708,6 +800,7 @@ impl Pipeline {
             Ok(Response::Error { code, .. }) if code == "permission_denied" => {
                 return self.rollback(
                     request_id,
+                    deadline,
                     saved_state_revision,
                     previous,
                     saved_revision,
@@ -733,6 +826,7 @@ impl Pipeline {
     fn rollback(
         &mut self,
         request_id: u64,
+        original_deadline: Instant,
         expected_state_revision: u64,
         mut previous: Document,
         saved_revision: u64,
@@ -741,6 +835,11 @@ impl Pipeline {
         previous.revision = saved_revision
             .checked_add(1)
             .ok_or("configuration revision exhausted during rollback")?;
+        let restored_configuration = self
+            .trusted_root
+            .as_ref()
+            .ok()
+            .and_then(|root| build_read_response(&previous, root).ok());
         let deadline = Instant::now() + Duration::from_millis(MAX_REQUEST_MS);
         let child_id = send(Command::Request {
             service: crate::STATE_SERVICE.into(),
@@ -772,6 +871,73 @@ impl Pipeline {
             stage: Stage::RollingBack {
                 saved_revision,
                 expected_state_revision,
+                original_deadline,
+                restored_configuration,
+            },
+            phase: PendingPhase::Waiting,
+        });
+        Ok(())
+    }
+
+    fn compensate_logging(
+        &mut self,
+        request_id: u64,
+        original_deadline: Instant,
+        saved_revision: u64,
+        restored_configuration: Option<Value>,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let restored_revision = saved_revision + 1;
+        let Some(restored_configuration) = restored_configuration else {
+            return complete(
+                send,
+                request_id,
+                rollback_application_unconfirmed(
+                    saved_revision,
+                    restored_revision,
+                    "restored configuration cannot be returned safely",
+                ),
+            );
+        };
+        let remaining_ms = original_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        let parented = remaining_ms > 0;
+        let deadline = if parented {
+            original_deadline
+        } else {
+            Instant::now() + Duration::from_millis(MAX_REQUEST_MS)
+        };
+        let result = send(Command::Request {
+            service: DIAGNOSTICS_SERVICE.into(),
+            payload: json!({"action":"apply_host_logging","configuration":restored_configuration}),
+            timeout_ms: if parented {
+                remaining_ms.min(MAX_REQUEST_MS)
+            } else {
+                MAX_REQUEST_MS
+            },
+            operation_id: format!("host-configuration.{request_id}.restore-logging"),
+            parent: parented.then_some(request_id),
+        });
+        let Ok(Response::Accepted { id }) = result else {
+            return complete(
+                send,
+                request_id,
+                rollback_application_unconfirmed(
+                    saved_revision,
+                    restored_revision,
+                    "diagnostics did not accept restored logging apply",
+                ),
+            );
+        };
+        self.pending = Some(Pending {
+            request_id,
+            deadline,
+            state_request_id: id,
+            stage: Stage::Compensating {
+                saved_revision,
+                restored_revision,
+                parented,
             },
             phase: PendingPhase::Waiting,
         });
@@ -842,6 +1008,18 @@ fn rollback_unconfirmed(saved_revision: u64, message: impl Into<String>) -> Valu
         "ok":false,
         "error":{"code":"logging_rollback_unconfirmed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
         "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"rollback_unconfirmed"}
+    })
+}
+
+fn rollback_application_unconfirmed(
+    saved_revision: u64,
+    restored_revision: u64,
+    message: impl Into<String>,
+) -> Value {
+    json!({
+        "ok":false,
+        "error":{"code":"logging_rollback_application_unconfirmed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
+        "logging":{"saved_revision":saved_revision,"restored_revision":restored_revision,"applied_revision":null,"status":"rollback_application_unconfirmed"}
     })
 }
 
