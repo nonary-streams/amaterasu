@@ -39,6 +39,11 @@ pub trait Backend {
     fn advance(&mut self, _now: Instant) -> InputResult<()> {
         Ok(())
     }
+    /// Keeps unrelated pointer devices alive while virtual controller removal
+    /// is pending; the regular tick may otherwise replay controller state.
+    fn advance_pen_touch(&mut self, _now: Instant) -> InputResult<()> {
+        Ok(())
+    }
     fn set_back_button_timeout(&mut self, _timeout_ms: i32) {}
     fn set_gamepad_profile(&mut self, _profile: GamepadProfile) {}
     fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) {}

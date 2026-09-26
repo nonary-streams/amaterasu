@@ -265,13 +265,16 @@ impl<B: Backend> Controller<B> {
             .lease
             .as_ref()
             .is_some_and(|lease| lease.cleanup_required);
-        if self.lease.is_some()
-            && !lease_cleanup_required
-            && !self.controller_cleanup_pending
-            && self.backend.advance(now).is_err()
-        {
-            let _ = self.finish_lease(now, "failed");
-            return;
+        if self.lease.is_some() && !lease_cleanup_required {
+            let advance_result = if self.controller_cleanup_pending {
+                self.backend.advance_pen_touch(now)
+            } else {
+                self.backend.advance(now)
+            };
+            if advance_result.is_err() {
+                let _ = self.finish_lease(now, "failed");
+                return;
+            }
         }
         if self.lease.is_some() && !lease_cleanup_required && self.repeat_if_due(now).is_err() {
             let _ = self.finish_lease(now, "failed");

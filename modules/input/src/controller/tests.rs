@@ -35,6 +35,8 @@ struct FakeBackend {
     fail_controller_disable: bool,
     controller_disable_calls: usize,
     active_controller_slots: BTreeSet<u16>,
+    full_advances: usize,
+    pen_touch_advances: usize,
 }
 impl Backend for FakeBackend {
     fn name(&self) -> &'static str {
@@ -156,6 +158,14 @@ impl Backend for FakeBackend {
     }
     fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
         self.ds4_back_as_touchpad_click = enabled;
+    }
+    fn advance(&mut self, _now: Instant) -> InputResult<()> {
+        self.full_advances += 1;
+        Ok(())
+    }
+    fn advance_pen_touch(&mut self, _now: Instant) -> InputResult<()> {
+        self.pen_touch_advances += 1;
+        Ok(())
     }
     fn disable_controller_input(&mut self) -> InputResult<()> {
         self.controller_disable_calls += 1;
@@ -1558,6 +1568,75 @@ fn failed_controller_slot_removal_retries_without_blocking_keyboard_or_mouse() {
     assert_eq!(
         controller.backend.active_controller_slots,
         BTreeSet::from([0])
+    );
+}
+
+#[test]
+fn pen_touch_refresh_continues_while_controller_removal_retries() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            supports_pen_touch: true,
+            fail_controller_disable: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let lease = acquire(&mut controller, now);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &lease,
+            vec![
+                controller_event(),
+                pen_touch(7, PenTouchDevice::Touch, PenTouchPhase::Down, 100, 200),
+            ],
+        )["ok"],
+        true
+    );
+    assert!(controller.set_controller_enabled(false, now).is_err());
+    let full_advances = controller.backend.full_advances;
+
+    controller.expire(now + Duration::from_millis(50));
+    assert_eq!(controller.backend.full_advances, full_advances);
+    assert!(controller.backend.pen_touch_advances > 0);
+    assert_eq!(controller.pen_touch_contacts.len(), 1);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &lease,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Move,
+                101,
+                201
+            )],
+        )["ok"],
+        true
+    );
+
+    controller.expire(now + Duration::from_millis(100));
+    assert!(!controller.cleanup_required());
+    assert!(controller.backend.full_advances > full_advances);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &lease,
+            vec![pen_touch(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Up,
+                101,
+                201
+            )],
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        controller.handle("owner", Operation::Release { lease }, now, &mut || Ok(()))["released"],
+        true
     );
 }
 

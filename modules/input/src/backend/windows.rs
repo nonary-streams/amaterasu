@@ -225,6 +225,10 @@ impl Backend for WindowsBackend {
         self.pen_touch.advance(now)
     }
 
+    fn advance_pen_touch(&mut self, now: std::time::Instant) -> InputResult<()> {
+        self.pen_touch.advance(now)
+    }
+
     fn set_back_button_timeout(&mut self, timeout_ms: i32) {
         self.gamepads.set_back_button_timeout(timeout_ms);
     }
