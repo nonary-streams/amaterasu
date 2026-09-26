@@ -593,6 +593,8 @@ struct FakePlatform {
     available_modes: Vec<crate::model::AvailableMode>,
     second_available_modes: Vec<crate::model::AvailableMode>,
     mode_queries: usize,
+    drift_after_mode_query: bool,
+    lose_mode_after_first_query: bool,
     queried_displays: Vec<String>,
     inactive: bool,
     inactive_activation_hdr: bool,
@@ -679,6 +681,9 @@ impl Platform for FakePlatform {
         } else {
             snapshot()
         };
+        if self.inactive {
+            current.paths[0].id = "monitor.other".into();
+        }
         if self.topology_changed {
             current.paths[0].source.width += 1;
         }
@@ -693,6 +698,11 @@ impl Platform for FakePlatform {
     ) -> DisplayResult<Vec<crate::model::AvailableMode>> {
         self.mode_queries += 1;
         self.queried_displays.push(display.to_lowercase());
+        if self.drift_after_mode_query && self.mode_queries == 1 {
+            let mut changed = self.current_snapshot.clone().unwrap_or_else(snapshot);
+            changed.paths[0].target_address.id += 1;
+            self.current_snapshot = Some(changed);
+        }
         if self.inactive {
             return Err(DisplayError::new(
                 "unsupported_display",
@@ -700,7 +710,11 @@ impl Platform for FakePlatform {
             ));
         }
         if display.eq_ignore_ascii_case("monitor.one") {
-            Ok(self.available_modes.clone())
+            if self.lose_mode_after_first_query && self.mode_queries > 1 {
+                Ok(Vec::new())
+            } else {
+                Ok(self.available_modes.clone())
+            }
         } else if display.eq_ignore_ascii_case("monitor.two") {
             Ok(self.second_available_modes.clone())
         } else {
@@ -2195,7 +2209,7 @@ fn policy_retry_uses_original_request_after_mode_and_hdr_apply() {
     assert_eq!(pipeline.platform.applied_mode.unwrap().2.numerator, 120);
     assert!(pipeline.platform.hdr_state);
     assert_eq!(pipeline.platform.hdr_mutations, 1);
-    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(pipeline.platform.mode_queries, 2);
     assert_eq!(
         pipeline
             .platform
@@ -2212,7 +2226,7 @@ fn policy_retry_uses_original_request_after_mode_and_hdr_apply() {
     assert_eq!(retry["state"], "recovery_required");
     assert_eq!(retry["applied"], false);
     assert_eq!(retry["lease"], lease);
-    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(pipeline.platform.mode_queries, 2);
     assert_eq!(pipeline.platform.hdr_mutations, 1);
     assert_eq!(pipeline.platform.effects, ["apply"]);
 
@@ -2721,7 +2735,13 @@ fn remapped_mode_reaches_prepare_and_durable_apply() {
 #[test]
 fn two_mode_policies_reach_one_durable_apply_and_restore() {
     let mut state = State::default();
-    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(two_display_snapshot()),
+            ..Default::default()
+        },
+        true,
+    );
     let result = state.run(
         &mut pipeline,
         "owner",
@@ -2796,6 +2816,7 @@ fn highest_refresh_queries_each_policy_target() {
         FakePlatform {
             available_modes: vec![mode(120)],
             second_available_modes: vec![mode(75)],
+            current_snapshot: Some(two_display_snapshot()),
             ..Default::default()
         },
         true,
@@ -2826,7 +2847,7 @@ fn highest_refresh_queries_each_policy_target() {
     assert_eq!(result["applied"], true, "{result}");
     assert_eq!(
         pipeline.platform.queried_displays,
-        ["monitor.one", "monitor.two"]
+        ["monitor.one", "monitor.two", "monitor.one", "monitor.two"]
     );
     assert_eq!(pipeline.platform.prepared_modes[0].3.numerator, 120);
     assert_eq!(pipeline.platform.prepared_modes[1].3.numerator, 75);
@@ -3074,7 +3095,7 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
             denominator: 1001,
         },
     ));
-    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(pipeline.platform.mode_queries, 2);
     assert_eq!(pipeline.platform.prepared_mode, selected);
     assert_eq!(pipeline.platform.applied_mode, selected);
     assert!(state.journal.is_some());
@@ -3086,6 +3107,76 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
     assert_eq!(restored["restored"], true);
     assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
     assert!(state.journal.is_none());
+}
+
+#[test]
+fn mode_selection_rejects_physical_route_drift_before_prepare_or_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            available_modes: vec![mode(120)],
+            drift_after_mode_query: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let result = state.run(&mut pipeline, "owner", highest_refresh_request());
+    assert_eq!(result["error"]["code"], "topology_changed");
+    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert!(pipeline.platform.prepared_configuration.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn mode_selection_rejects_disappeared_capability_before_prepare_or_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            available_modes: vec![mode(120)],
+            lose_mode_after_first_query: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let result = state.run(&mut pipeline, "owner", highest_refresh_request());
+    assert_eq!(result["error"]["code"], "topology_changed");
+    assert_eq!(pipeline.platform.mode_queries, 2);
+    assert!(pipeline.platform.prepared_configuration.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+fn highest_refresh_request() -> Value {
+    json!({
+        "action": "apply",
+        "configuration": configuration(),
+        "mode_policy": {
+            "display_id": "monitor.one",
+            "context": {
+                "resolution_is_automatic": false,
+                "refresh_rate_is_automatic": false,
+                "client_display_mode_override": false,
+                "optimize_game_settings": true
+            },
+            "remapping": {},
+            "refresh_rate_option": "prefer_highest"
+        }
+    })
+}
+
+fn mode(refresh_hz: u32) -> crate::model::AvailableMode {
+    crate::model::AvailableMode {
+        width: 1280,
+        height: 720,
+        refresh: Rational {
+            numerator: refresh_hz,
+            denominator: 1,
+        },
+        nominal_refresh_hz: refresh_hz,
+        bits_per_pixel: 32,
+        exact_current: false,
+    }
 }
 
 #[test]

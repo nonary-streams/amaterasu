@@ -1,6 +1,7 @@
 use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
-    Configuration, DisplayError, DisplayResult, Journal, Operation, RouteBinding, Snapshot,
+    Configuration, DisplayError, DisplayResult, Journal, Operation, Rational, RouteBinding,
+    Snapshot,
 };
 use crate::platform::{Platform, TopologyShape};
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
@@ -22,6 +23,8 @@ struct Incoming {
 }
 struct PrepareIntent {
     expected_topology_revision: Option<String>,
+    selection_revision: Option<String>,
+    preferred_modes: Vec<(String, u32, u32, Rational)>,
     operation_id: Option<String>,
     request_identity: Value,
     topology_change: bool,
@@ -573,6 +576,18 @@ impl<P: Platform> Pipeline<P> {
                         Ok(policies) => policies,
                         Err(error) => return complete(send, context.request, error.payload()),
                     };
+                if !policies.is_empty() && clone_baseline.is_none() {
+                    clone_baseline = match self.platform.snapshot() {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                }
+                let selection_revision = clone_baseline.as_ref().map(physical_revision).transpose();
+                let selection_revision = match selection_revision {
+                    Ok(revision) => revision,
+                    Err(error) => return complete(send, context.request, error.payload()),
+                };
+                let mut preferred_modes = Vec::new();
                 let singular_nonclone = policies.len() == 1
                     && !configuration
                         .displays
@@ -606,6 +621,19 @@ impl<P: Platform> Pipeline<P> {
                     };
                     if let Err(error) = resolution {
                         return complete(send, context.request, error.payload());
+                    }
+                    if modes.is_some() {
+                        let selected = configuration
+                            .displays
+                            .iter()
+                            .find(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+                            .expect("policy display validated");
+                        preferred_modes.push((
+                            policy.display_id.clone(),
+                            selected.width,
+                            selected.height,
+                            selected.refresh,
+                        ));
                     }
                     if clone_baseline.is_none() {
                         clone_baseline = match self.platform.snapshot() {
@@ -738,6 +766,8 @@ impl<P: Platform> Pipeline<P> {
                     configuration,
                     PrepareIntent {
                         expected_topology_revision,
+                        selection_revision,
+                        preferred_modes,
                         operation_id,
                         request_identity,
                         topology_change: topology_change
@@ -798,6 +828,8 @@ impl<P: Platform> Pipeline<P> {
     ) -> ModuleResult<()> {
         let PrepareIntent {
             expected_topology_revision,
+            selection_revision,
+            preferred_modes,
             operation_id,
             request_identity,
             topology_change,
@@ -806,6 +838,43 @@ impl<P: Platform> Pipeline<P> {
         } = intent;
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
+        }
+        if let Some(selected_revision) = &selection_revision {
+            let current_revision = self
+                .platform
+                .snapshot()
+                .and_then(|snapshot| physical_revision(&snapshot));
+            if current_revision.as_ref().ok() != Some(selected_revision) {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "topology_changed",
+                        "active display topology changed after mode selection",
+                    ),
+                );
+            }
+        }
+        for (display, width, height, refresh) in &preferred_modes {
+            let modes = match self.platform.available_modes(display) {
+                Ok(modes) => modes,
+                Err(error) => return complete(send, context.request, error.payload()),
+            };
+            if !modes.iter().any(|mode| {
+                mode.width == *width
+                    && mode.height == *height
+                    && mode.bits_per_pixel == 32
+                    && mode.refresh == *refresh
+            }) {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "topology_changed",
+                        "selected display mode is no longer available",
+                    ),
+                );
+            }
         }
         let prepared = match native_target.as_ref() {
             Some((selected, shape)) => self.platform.prepare_preserving(
@@ -820,6 +889,22 @@ impl<P: Platform> Pipeline<P> {
             Ok(snapshot) => snapshot,
             Err(error) => return complete(send, context.request, error.payload()),
         };
+        if let Some(selected_revision) = &selection_revision {
+            let prepared_revision = match physical_revision(&snapshot) {
+                Ok(revision) => revision,
+                Err(error) => return complete(send, context.request, error.payload()),
+            };
+            if &prepared_revision != selected_revision {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "topology_changed",
+                        "physical display topology changed during mode preparation",
+                    ),
+                );
+            }
+        }
         if let Some(expected) = &expected_topology_revision {
             if snapshot.revision().as_ref().ok() != Some(expected) {
                 return complete(
@@ -999,6 +1084,15 @@ fn read_only_apply<P: Platform>(
     }
     Ok(json!({"ok":true,"applied":false,"verified":true,"configuration_option":"verify_only"}))
 }
+fn physical_revision(snapshot: &Snapshot) -> DisplayResult<String> {
+    let mut physical = snapshot.clone();
+    for path in &mut physical.paths {
+        // HDR capability may be unavailable while CCD routes and modes stay the same.
+        path.hdr_enabled = None;
+    }
+    physical.revision()
+}
+
 fn synchronize_clone_group(configuration: &mut Configuration, snapshot: &Snapshot, selected: &str) {
     let Some(source) = snapshot
         .paths
