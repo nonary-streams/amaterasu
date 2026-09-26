@@ -1,4 +1,5 @@
 use super::Backend;
+use super::owned_devices::release_input_pair;
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
@@ -651,20 +652,23 @@ impl Backend for LinuxBackend {
     }
     fn stop(&mut self) -> InputResult<()> {
         let pen_touch_result = self.pen_touch.stop();
-        self.gamepads.stop()?;
-        if let Some(probe) = self.gamepad_probe.as_mut() {
-            probe.destroy()?;
-            self.gamepad_probe = None;
-        }
-        self.pointer = None;
-        self.keyboard = None;
+        let gamepad_result = self.gamepads.stop();
+        // Keep each descriptor after a failed UI_DEV_DESTROY so a later lease
+        // cleanup can retry the same device without reopening /dev/uinput.
+        let probe_result =
+            release_owned_device(&mut self.gamepad_probe, |_| Ok(()), Device::destroy);
+        let input_result =
+            release_input_pair(&mut self.keyboard, &mut self.pointer, Device::destroy);
         self.held_virtual_keycodes.clear();
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
-        pen_touch_result
+        for result in [pen_touch_result, gamepad_result, probe_result, input_result] {
+            result?;
+        }
+        Ok(())
     }
 
     fn set_key_rightalt_to_key_win(&mut self, enabled: bool) {

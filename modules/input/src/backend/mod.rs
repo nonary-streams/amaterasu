@@ -60,6 +60,8 @@ mod windows;
 pub use windows::WindowsBackend as NativeBackend;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+mod owned_devices;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as NativeBackend;
 #[cfg(not(any(windows, target_os = "linux")))]
