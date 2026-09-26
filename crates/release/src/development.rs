@@ -238,10 +238,9 @@ pub fn install_installer_root(template: &Path, package: &Path, root: &Path) -> P
     }
 }
 
-/// Transitions only installer-owned development roots whose trust identity is
-/// byte-for-byte continuous with the authenticated production template.  A
-/// locally initialized development root or any key rotation must be handled by
-/// an explicit future migration, never by an MSI self-upgrade.
+/// Transitions installer-owned development roots and exact generated production
+/// authorization policies under the same signer. Locally customized policy and
+/// key rotation require an explicit migration rather than an MSI self-upgrade.
 fn install_existing_installer_root(
     template: &Path,
     package: &Path,
@@ -278,34 +277,157 @@ fn install_existing_installer_root(
     }
     verify_installer_web_bundle(template, &candidate)?;
 
-    // Established production roots retain their policy and trust identity.
-    // Staging an already-active immutable set is a no-op, which keeps a repair
-    // install from manufacturing a new pending activation.
+    // A generated production authorization policy may gain a scope under the
+    // same signer. Everything else in an established root stays local.
     if !current.development {
-        if next_package.digest != active {
+        let (upgraded, authorization_result) =
+            production_authorization_upgrade(&current, &candidate);
+        if let Some(upgraded) = upgraded {
+            transition_installer_policy(
+                root,
+                package,
+                &current,
+                &upgraded,
+                &next_package.digest,
+                active,
+                &bootstrap_bytes,
+                &selection_bytes,
+                inject_failure_after_switch,
+            )?;
+        } else if next_package.digest != active {
             let _ = stage_package(package, root, &current, false)?;
         }
+        eprintln!("installer authorization policy: {authorization_result}");
         return Ok(());
     }
 
-    let transition = PolicyTransition::begin(root, &bootstrap_bytes, &selection_bytes)?;
+    transition_installer_policy(
+        root,
+        package,
+        &current,
+        &candidate,
+        &next_package.digest,
+        active,
+        &bootstrap_bytes,
+        &selection_bytes,
+        inject_failure_after_switch,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProductionAuthorizationResult {
+    Upgraded,
+    ScopeListedInCustomPolicy,
+    PreservedWithoutLutrisScope,
+}
+
+impl std::fmt::Display for ProductionAuthorizationResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Upgraded => write!(
+                formatter,
+                "generated policy upgraded; lutris.read available"
+            ),
+            Self::ScopeListedInCustomPolicy => {
+                write!(formatter, "custom policy preserved; lutris.read is listed")
+            }
+            Self::PreservedWithoutLutrisScope => write!(
+                formatter,
+                "custom policy preserved; lutris.read remains unavailable"
+            ),
+        }
+    }
+}
+
+fn production_authorization_upgrade(
+    current: &BootstrapConfig,
+    candidate: &BootstrapConfig,
+) -> (Option<BootstrapConfig>, ProductionAuthorizationResult) {
+    let name = "amaterasu.authentication";
+    let Some(generated) = installer_policy(WEB_DIRECTORY_TOKEN, current.trusted_keys.clone())
+        .settings
+        .remove(name)
+    else {
+        return (
+            None,
+            ProductionAuthorizationResult::PreservedWithoutLutrisScope,
+        );
+    };
+    // Immutable generated installer setting from before lutris.read was added.
+    // Keep this literal independent of future installer_policy changes.
+    let previous = serde_json::json!({
+        "administrator_principals": ["amaterasu.management"],
+        "authorization_policy_generation": 2,
+        "session_token_ttl_seconds": 7200,
+        "remember_me_refresh_token_ttl_seconds": 604800,
+        "allowed_scopes": [
+            "catalog.read", "catalog.write", "configuration.read", "configuration.write",
+            "session.read", "session.write", "application.read", "application.launch",
+            "application.terminate", "steam.read", "steam.refresh", "diagnostics.read",
+            "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
+        ],
+    });
+    let mut expected_current = previous.clone();
+    expected_current["authorization_policy_generation"] = serde_json::json!(3);
+    expected_current["allowed_scopes"]
+        .as_array_mut()
+        .expect("historical installer scopes are an array")
+        .insert(11, serde_json::json!("lutris.read"));
+    let installed = current.policy.settings.get(name);
+    let offered = candidate.policy.settings.get(name);
+    if installed == Some(&previous) && generated == expected_current && offered == Some(&generated)
+    {
+        let mut upgraded = current.clone();
+        upgraded.policy.settings.insert(name.into(), generated);
+        return (Some(upgraded), ProductionAuthorizationResult::Upgraded);
+    }
+    let has_scope = installed
+        .and_then(|settings| settings.get("allowed_scopes"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|scopes| scopes.iter().any(|scope| scope == "lutris.read"));
+    (
+        None,
+        if has_scope {
+            ProductionAuthorizationResult::ScopeListedInCustomPolicy
+        } else {
+            ProductionAuthorizationResult::PreservedWithoutLutrisScope
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_installer_policy(
+    root: &Path,
+    package: &Path,
+    current: &BootstrapConfig,
+    replacement: &BootstrapConfig,
+    next_digest: &str,
+    active: &str,
+    bootstrap_bytes: &[u8],
+    selection_bytes: &[u8],
+    inject_failure_after_switch: bool,
+) -> PackageResult<()> {
+    let bootstrap_path = root.join("bootstrap.json");
+    let transition = PolicyTransition::begin(root, bootstrap_bytes, selection_bytes)?;
     let result = (|| {
-        if next_package.digest != active {
-            transition.record_new_set(&next_package.digest)?;
-            let _ = stage_package(package, root, &current, false)?;
+        if next_digest != active {
+            transition.record_new_set(next_digest)?;
+            let _ = stage_package(package, root, current, false)?;
             transition.record_replacement(root, Path::new("selection.json"))?;
         }
-        write_json_atomically(&bootstrap_path, &candidate)?;
+        write_json_atomically(&bootstrap_path, replacement)?;
         transition.record_replacement(root, Path::new("bootstrap.json"))?;
         if inject_failure_after_switch {
             return Err("injected installer policy switch failure".into());
         }
         Ok(())
     })();
-    if result.is_err() {
-        let _ = rollback_policy_transition_locked(root);
+    if let Err(error) = result {
+        rollback_policy_transition_locked(root)
+            .map_err(|rollback| format!("{error}; policy rollback failed: {rollback}"))?;
+        return Err(error);
     }
-    result
+    Ok(())
 }
 
 fn require_installer_signer_continuity(
@@ -825,6 +947,232 @@ mod provision_tests {
         selection.pending = None;
         write_json_atomically(&runtime.join("selection.json"), &selection).unwrap();
         runtime
+    }
+
+    fn legacy_production_runtime(root: &Path, seed: &Path) -> PathBuf {
+        let runtime = root.join("production-runtime");
+        provision_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        finalize_installer_provision(&runtime).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        let auth = bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap();
+        auth["authorization_policy_generation"] = serde_json::json!(2);
+        auth["allowed_scopes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|scope| scope != "lutris.read");
+        write_json_atomically(&runtime.join("bootstrap.json"), &bootstrap).unwrap();
+        runtime
+    }
+
+    #[test]
+    fn signed_production_upgrade_adds_lutris_scope_and_preserves_local_policy() {
+        let root = fixture("production-auth-upgrade");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let signing_key = SigningKey::from_bytes(&[21; 32]);
+        let seed = prepare_seed(&root, &artifacts, &signing_key);
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut before: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        before.policy.settings.insert(
+            "amaterasu.input".into(),
+            serde_json::json!({"allow_injection": true}),
+        );
+        write_json_atomically(&runtime.join("bootstrap.json"), &before).unwrap();
+        let previous_selection = fs::read(runtime.join("selection.json")).unwrap();
+
+        let update_root = root.join("update");
+        let update_artifacts = update_root.join("artifacts");
+        write_artifacts(&update_artifacts);
+        fs::write(
+            update_artifacts.join(library_filename("amaterasu_runtime")),
+            b"updated-runtime-artifact",
+        )
+        .unwrap();
+        let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        install_installer_root(
+            &update.join("bootstrap-template.json"),
+            &update.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        let after: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        let mut expected = before.clone();
+        expected.policy.settings.insert(
+            "amaterasu.authentication".into(),
+            installer_policy(WEB_DIRECTORY_TOKEN, before.trusted_keys.clone()).settings
+                ["amaterasu.authentication"]
+                .clone(),
+        );
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            after.policy.settings["amaterasu.authentication"]["authorization_policy_generation"],
+            3
+        );
+        assert!(
+            after.policy.settings["amaterasu.authentication"]["allowed_scopes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("lutris.read"))
+        );
+        assert_ne!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            previous_selection
+        );
+        assert!(runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        finalize_installer_provision(&runtime).unwrap();
+
+        let bootstrap_bytes = fs::read(runtime.join("bootstrap.json")).unwrap();
+        let selection_bytes = fs::read(runtime.join("selection.json")).unwrap();
+        install_installer_root(
+            &update.join("bootstrap-template.json"),
+            &update.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_bytes
+        );
+        assert_eq!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            selection_bytes
+        );
+        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_production_authorization_is_preserved_with_missing_scope_result() {
+        let root = fixture("production-custom-auth");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let signing_key = SigningKey::from_bytes(&[22; 32]);
+        let seed = prepare_seed(&root, &artifacts, &signing_key);
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut before: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        before
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap()["session_token_ttl_seconds"] = serde_json::json!(3600);
+        write_json_atomically(&runtime.join("bootstrap.json"), &before).unwrap();
+        let candidate =
+            materialize_installer_bootstrap(&seed.join("bootstrap-template.json"), &runtime)
+                .unwrap();
+        let (upgrade, result) = production_authorization_upgrade(&before, &candidate);
+        assert!(upgrade.is_none());
+        assert_eq!(
+            result,
+            ProductionAuthorizationResult::PreservedWithoutLutrisScope
+        );
+        assert!(
+            result
+                .to_string()
+                .contains("lutris.read remains unavailable")
+        );
+        let bootstrap_bytes = fs::read(runtime.join("bootstrap.json")).unwrap();
+        install_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_bytes
+        );
+        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_production_scope_upgrade_restores_bootstrap_and_selection_bytes() {
+        let root = fixture("production-auth-rollback");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let signing_key = SigningKey::from_bytes(&[23; 32]);
+        let seed = prepare_seed(&root, &artifacts, &signing_key);
+        let runtime = legacy_production_runtime(&root, &seed);
+        let bootstrap_before = fs::read(runtime.join("bootstrap.json")).unwrap();
+        let selection_before = fs::read(runtime.join("selection.json")).unwrap();
+
+        let update_root = root.join("update");
+        let update_artifacts = update_root.join("artifacts");
+        write_artifacts(&update_artifacts);
+        fs::write(
+            update_artifacts.join(library_filename("amaterasu_runtime")),
+            b"updated-runtime-artifact",
+        )
+        .unwrap();
+        let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        {
+            let _lock = RootLock::acquire(&runtime).unwrap();
+            assert!(
+                install_existing_installer_root(
+                    &update.join("bootstrap-template.json"),
+                    &update.join("package"),
+                    &runtime,
+                    true,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_before
+        );
+        assert_eq!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            selection_before
+        );
+        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        assert_eq!(fs::read_dir(runtime.join("sets")).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_policy_only_upgrade_restores_exact_bootstrap_and_selection() {
+        let root = fixture("production-auth-policy-only-rollback");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[24; 32]));
+        let runtime = legacy_production_runtime(&root, &seed);
+        let bootstrap_before = fs::read(runtime.join("bootstrap.json")).unwrap();
+        let selection_before = fs::read(runtime.join("selection.json")).unwrap();
+        {
+            let _lock = RootLock::acquire(&runtime).unwrap();
+            assert!(
+                install_existing_installer_root(
+                    &seed.join("bootstrap-template.json"),
+                    &seed.join("package"),
+                    &runtime,
+                    true,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_before
+        );
+        assert_eq!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            selection_before
+        );
+        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
