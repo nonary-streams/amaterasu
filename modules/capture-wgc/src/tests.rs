@@ -166,6 +166,26 @@ fn enumeration_pages_are_bounded_ordered_and_do_not_disturb_capture() {
 }
 
 #[test]
+fn no_argument_enumeration_pages_more_than_the_default_limit() {
+    let outputs = (0..257).rev().map(|id| test_output(id, "")).collect();
+    let mut controller = Controller::new(paged_backend(outputs), true);
+    let first = controller.handle(
+        "owner",
+        Operation::Enumerate {
+            offset: None,
+            limit: None,
+        },
+        &mut || Ok(()),
+    );
+    let page = first["outputs"].as_array().unwrap();
+    assert!(!page.is_empty());
+    assert!(page.len() <= 256);
+    assert_eq!(first["next_offset"], page.len());
+    assert!(serde_json::to_vec(&first).unwrap().len() <= 12_000);
+    assert_eq!(page[0]["id"], "output-000");
+}
+
+#[test]
 fn enumeration_validates_cursor_and_preserves_small_legacy_reply() {
     let mut controller = Controller::new(paged_backend(vec![test_output(1, "short")]), true);
     let legacy = controller.handle(

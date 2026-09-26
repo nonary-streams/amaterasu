@@ -457,7 +457,7 @@ fn enumeration_reply(
         ));
     }
 
-    if !requested_page {
+    if !requested_page && outputs.len() <= MAX_PAGE_OUTPUTS {
         let reply = json!({"ok":true,"outputs":outputs});
         if serialized_size(&reply)? <= MAX_REPLY_BYTES {
             return Ok(reply);
