@@ -884,6 +884,25 @@ fn explicit_environment_and_working_directory_reach_child() {
 }
 
 #[test]
+fn omitted_working_directory_uses_main_executable_directory() {
+    let directory = test_directory("default-main-cwd");
+    let source_executable = std::env::current_exe().unwrap();
+    let executable = directory.join(source_executable.file_name().unwrap());
+    std::fs::copy(source_executable, &executable).unwrap();
+
+    let mut manager = ProcessManager::default();
+    let mut request = launch("default-main-cwd", "cwd");
+    request["executable"] = json!(executable);
+    request["environment"]["AMATERASU_TEST_CWD"] = json!(directory);
+    let started = manager.handle("alice", request);
+    assert_eq!(started["process"]["state"], "running", "{started}");
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(wait_for_exit(&mut manager, id)["process"]["success"], true);
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn shutdown_terminates_and_reaps_every_direct_child() {
     let mut manager = ProcessManager::default();
     manager.handle("alice", launch("one", "sleep"));

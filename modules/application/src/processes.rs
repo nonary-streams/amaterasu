@@ -8,6 +8,7 @@ use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -132,9 +133,12 @@ impl ProcessRecord {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(cwd) = &self.spec.cwd {
-            command.current_dir(cwd);
-        }
+        let working_directory = self.spec.cwd.as_deref().map(Path::new).unwrap_or_else(|| {
+            Path::new(&self.spec.executable)
+                .parent()
+                .expect("validated absolute executable path has a parent")
+        });
+        command.current_dir(working_directory);
         if self.is_steam_metadata_launch() {
             self.steam_tracker = self
                 .spec

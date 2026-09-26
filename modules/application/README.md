@@ -99,7 +99,8 @@ without `undo` is simply removed from the owed stack during cleanup. Raw command
 also use the step's `elevated` flag for both `do` and `undo`.
 
 Use an absolute native executable path appropriate to the host. `args` and
-`environment` default to empty; `cwd` defaults to the host working directory.
+`environment` default to empty; `cwd` defaults to the main executable's
+directory.
 The environment is cleared before applying the supplied map; host secrets and
 PATH are not inherited. Supply any platform/application-required variables
 explicitly. Stdin, stdout, and stderr are null handles. Main executables and
@@ -236,8 +237,6 @@ application launch and working-directory requirements. Source was not copied.
 Detached launchers are a bounded argv-only subset: output handling and
 per-command environment overrides remain parity gaps. Desktop pseudo-apps, URI
 launch, and launcher-specific behavior also remain unimplemented.
-In particular, this module's omitted cwd inherits the host cwd rather than using
-the executable directory.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural
 exit reaping, cwd/environment delivery, owner isolation, retries/conflicts,
