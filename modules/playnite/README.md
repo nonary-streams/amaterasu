@@ -83,7 +83,9 @@ Sunshine-role connection and single outbox require connector multiplexing
 before its unsolicited snapshots can safely replace polling.
 
 The typed GUID launch route uses the bounded extension connection and ticket
-protocol. Fullscreen entry is a separate Windows-only launch action, authorized
+protocol. Snapshot, launch, and stop requests use the extension's typed
+`command` envelope; a successful pipe write alone does not confirm execution.
+Fullscreen entry is a separate Windows-only launch action, authorized
 only to `amaterasu.launch`; management can read or update the persisted
 `fullscreen_entry_enabled` setting. It defaults to false, is preserved by older
 settings updates that omit it. The setting controls the generated catalog row;

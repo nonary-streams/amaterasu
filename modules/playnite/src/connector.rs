@@ -273,7 +273,7 @@ fn connect_role(
 #[cfg(windows)]
 pub fn request_snapshot(expected_processes: &[ProcessImage]) -> Result<Snapshot, String> {
     let (data_pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
-    data_pipe.write_all(b"{\"command\":\"snapshot\"}\n")?;
+    data_pipe.write_all(&extension_command_line("snapshot", None)?)?;
 
     let mut assembler = SnapshotAssembler::default();
     let mut line = Vec::new();
@@ -323,8 +323,6 @@ pub fn watch_game(
     recovery: bool,
     focus_policy: FocusPolicy,
 ) {
-    use serde_json::json;
-
     let fail = |state| {
         let _ = events.send(state);
     };
@@ -376,18 +374,13 @@ pub fn watch_game(
                 }
             };
         }
-        if send_command(&expected_processes, &json!({"command":"stop","id":game_id})).is_err() {
+        if send_command(&expected_processes, "stop", game_id).is_err() {
             fail(super::launch::State::CleanupFailed);
             return;
         }
         stop_deadline = Some(Instant::now() + Duration::from_secs(request.timeout_seconds));
         let _ = events.send(super::launch::State::Stopping);
-    } else if send_command(
-        &expected_processes,
-        &json!({"command":"launch","id":game_id}),
-    )
-    .is_err()
-    {
+    } else if send_command(&expected_processes, "launch", game_id).is_err() {
         fail(state_after_start_failure(true));
         return;
     }
@@ -415,9 +408,7 @@ pub fn watch_game(
                             }
                         };
                 }
-                if send_command(&expected_processes, &json!({"command":"stop","id":game_id}))
-                    .is_err()
-                {
+                if send_command(&expected_processes, "stop", game_id).is_err() {
                     fail(super::launch::State::CleanupFailed);
                     return;
                 }
@@ -634,13 +625,23 @@ fn watch_fullscreen_windows(
 #[cfg(windows)]
 fn send_command(
     expected_processes: &[ProcessImage],
-    command: &serde_json::Value,
+    command: &str,
+    game_id: &str,
 ) -> Result<(), String> {
     let (pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
-    let mut line =
-        serde_json::to_vec(command).map_err(|_| "Playnite command serialization failed")?;
+    pipe.write_all(&extension_command_line(command, Some(game_id))?)
+}
+
+#[cfg(any(windows, test))]
+fn extension_command_line(command: &str, game_id: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut message = serde_json::json!({"type":"command","command":command});
+    if let Some(game_id) = game_id {
+        message["id"] = game_id.into();
+    }
+    let mut line = serde_json::to_vec(&message)
+        .map_err(|_| "Playnite command serialization failed".to_owned())?;
     line.push(b'\n');
-    pipe.write_all(&line)
+    Ok(line)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -776,9 +777,30 @@ mod tests {
     #[cfg(windows)]
     use super::decode_pipe_name;
     use super::{FullscreenStatusKind, parse_fullscreen_status};
-    use super::{apply_game_status, parse_game_status, state_after_start_failure};
+    use super::{
+        apply_game_status, extension_command_line, parse_game_status, state_after_start_failure,
+    };
     use crate::focus::FocusTarget;
     use crate::launch::State;
+
+    #[test]
+    fn sunshine_commands_use_the_extension_dispatch_envelope() {
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        assert_eq!(
+            extension_command_line("snapshot", None).unwrap(),
+            b"{\"command\":\"snapshot\",\"type\":\"command\"}\n"
+        );
+        assert_eq!(
+            extension_command_line("launch", Some(game_id)).unwrap(),
+            format!("{{\"command\":\"launch\",\"id\":\"{game_id}\",\"type\":\"command\"}}\n")
+                .into_bytes()
+        );
+        assert_eq!(
+            extension_command_line("stop", Some(game_id)).unwrap(),
+            format!("{{\"command\":\"stop\",\"id\":\"{game_id}\",\"type\":\"command\"}}\n")
+                .into_bytes()
+        );
+    }
 
     #[cfg(windows)]
     #[test]
