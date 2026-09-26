@@ -553,6 +553,17 @@ impl Open {
             (None, None, None) => {}
             _ => return Err("frame_limiter_unattested"),
         }
+        if self.frame_limiter_settings.is_some()
+            && self.display_request.is_some()
+            && self
+                .display_policy_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot["catalog_revision"].as_u64() != self.catalog_revision
+                })
+        {
+            return Err("frame_limiter_unattested");
+        }
         match (
             &self.display_request,
             &self.display_admission_token,
@@ -1662,6 +1673,33 @@ mod tests {
         assert_eq!(
             prepare["frame_limiter_executable_path"],
             value["frame_limiter_executable_path"]
+        );
+
+        let mut combined = value.clone();
+        combined["display_request"] = json!({
+            "expected_topology_revision":"aa".repeat(16),
+            "configuration":{"displays":[
+                {"id":"one","width":1920,"height":1080,
+                 "refresh":{"numerator":60,"denominator":1},"x":0,"y":0}
+            ]},
+            "mode_policy":{"display_id":"one","remapping":{},"context":{
+                "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
+                "client_display_mode_override":false,"optimize_game_settings":false
+            }}
+        });
+        combined["display_admission_token"] = json!("ab".repeat(32));
+        combined["display_policy_snapshot"] = json!({
+            "global_revision":1,"global_overrides":{},"catalog_revision":1,
+            "certificate_id":"cd".repeat(32),"application_overrides":{},
+            "client_overrides":{},"effective_overrides":{}
+        });
+        let consistent: Open = serde_json::from_value(combined.clone()).unwrap();
+        consistent.validate(false).unwrap();
+        combined["display_policy_snapshot"]["catalog_revision"] = json!(2);
+        let inconsistent: Open = serde_json::from_value(combined).unwrap();
+        assert_eq!(
+            inconsistent.validate(false),
+            Err("frame_limiter_unattested")
         );
 
         let mut unbound = value.clone();
