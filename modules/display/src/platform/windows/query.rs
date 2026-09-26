@@ -234,15 +234,20 @@ fn verify_advanced_color_route(
 const HDR_SETTLE_ATTEMPTS: usize = 6;
 const HDR_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Clone)]
 struct AdvancedColorReadback {
     target: Address,
     output_technology: i32,
+    source: Address,
+    source_name: String,
     enabled: Option<bool>,
 }
 
 fn settle_advanced_color(
     saved_target: &Address,
     saved_output_technology: i32,
+    write_source: &Address,
+    write_source_name: &str,
     enabled: bool,
     mut read: impl FnMut() -> DisplayResult<AdvancedColorReadback>,
     mut wait: impl FnMut(),
@@ -256,6 +261,13 @@ fn settle_advanced_color(
             current.output_technology,
         )
         .map_err(DisplayError::after_mutation)?;
+        if current.source != *write_source || current.source_name != write_source_name {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "HDR target switched source route after the native write",
+            )
+            .after_mutation());
+        }
         match current.enabled {
             Some(current) if current == enabled => return Ok(()),
             Some(_) => {}
@@ -293,6 +305,8 @@ fn read_advanced_color(saved: &DisplayPath) -> DisplayResult<AdvancedColorReadba
     Ok(AdvancedColorReadback {
         target,
         output_technology: current.targetInfo.outputTechnology,
+        source: address(current.sourceInfo.adapterId, current.sourceInfo.id),
+        source_name: names(current)?.source,
         enabled: advanced_color_enabled(current)?,
     })
 }
@@ -307,6 +321,8 @@ pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<(
         address(path.targetInfo.adapterId, path.targetInfo.id),
         path.targetInfo.outputTechnology,
     )?;
+    let write_source = address(path.sourceInfo.adapterId, path.sourceInfo.id);
+    let write_source_name = names(path)?.source;
     match advanced_color_enabled(path)? {
         Some(current) if current == enabled => return Ok(()),
         Some(_) => {}
@@ -338,6 +354,8 @@ pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<(
     settle_advanced_color(
         &saved.target_address,
         saved.output_technology,
+        &write_source,
+        &write_source_name,
         enabled,
         || read_advanced_color(saved),
         || std::thread::sleep(HDR_SETTLE_INTERVAL),
@@ -565,7 +583,17 @@ mod tests {
         AdvancedColorReadback {
             target: target.clone(),
             output_technology: 4,
+            source: write_source(),
+            source_name: "DISPLAY1".into(),
             enabled,
+        }
+    }
+
+    fn write_source() -> Address {
+        Address {
+            adapter_low: 1,
+            adapter_high: 2,
+            id: 8,
         }
     }
 
@@ -577,6 +605,8 @@ mod tests {
         settle_advanced_color(
             &target,
             4,
+            &write_source(),
+            "DISPLAY1",
             true,
             || {
                 reads += 1;
@@ -595,6 +625,8 @@ mod tests {
         let error = settle_advanced_color(
             &target,
             4,
+            &write_source(),
+            "DISPLAY1",
             true,
             || {
                 reads += 1;
@@ -617,6 +649,8 @@ mod tests {
         let error = settle_advanced_color(
             &target,
             4,
+            &write_source(),
+            "DISPLAY1",
             true,
             || {
                 reads += 1;
@@ -631,11 +665,43 @@ mod tests {
     }
 
     #[test]
+    fn advanced_color_readback_rejects_changed_source_before_accepting_hdr() {
+        let target = saved_target();
+        for change_name in [false, true] {
+            let mut wrong = readback(&target, Some(true));
+            if change_name {
+                wrong.source_name = "DISPLAY2".into();
+            } else {
+                wrong.source.id += 1;
+            }
+            let mut reads = 0;
+            let error = settle_advanced_color(
+                &target,
+                4,
+                &write_source(),
+                "DISPLAY1",
+                true,
+                || {
+                    reads += 1;
+                    Ok(wrong.clone())
+                },
+                || panic!("source switch must fail before retry"),
+            )
+            .unwrap_err();
+            assert_eq!(reads, 1);
+            assert_eq!(error.code, "topology_changed");
+            assert!(error.may_have_changed);
+        }
+    }
+
+    #[test]
     fn advanced_color_readback_rejects_lost_support_and_query_failure() {
         let target = saved_target();
         let unsupported = settle_advanced_color(
             &target,
             4,
+            &write_source(),
+            "DISPLAY1",
             false,
             || Ok(readback(&target, None)),
             || panic!("lost HDR support must not be retried"),
@@ -647,6 +713,8 @@ mod tests {
         let query_error = settle_advanced_color(
             &target,
             4,
+            &write_source(),
+            "DISPLAY1",
             true,
             || Err(DisplayError::new("topology_changed", "ambiguous HDR route")),
             || panic!("native query failure must not be retried"),
