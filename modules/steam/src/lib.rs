@@ -573,6 +573,9 @@ impl ManagedModule for SteamModule {
             runtime,
             provider: {
                 let mut provider = Provider::new(settings.roots);
+                provider
+                    .remote_artwork
+                    .set_cache_root(settings.steam_artwork_cache_root);
                 provider.set_enabled(configuration.settings().enabled);
                 provider
             },

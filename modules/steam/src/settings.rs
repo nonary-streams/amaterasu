@@ -200,6 +200,8 @@ impl ProductSettings {
 pub struct StartupSettings {
     #[serde(default)]
     pub roots: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    pub steam_artwork_cache_root: Option<std::path::PathBuf>,
 }
 
 impl StartupSettings {
@@ -212,6 +214,13 @@ impl StartupSettings {
         {
             return Err("Steam roots must be at most 32 bounded absolute paths");
         }
+        if self
+            .steam_artwork_cache_root
+            .as_ref()
+            .is_some_and(|root| !root.is_absolute() || root.as_os_str().len() > 4096)
+        {
+            return Err("Steam artwork cache root must be a bounded absolute path");
+        }
         Ok(())
     }
 }
@@ -219,6 +228,17 @@ impl StartupSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_artwork_cache_root_requires_a_bounded_absolute_path() {
+        let mut settings = StartupSettings {
+            roots: Vec::new(),
+            steam_artwork_cache_root: Some(std::env::temp_dir()),
+        };
+        assert!(settings.validate().is_ok());
+        settings.steam_artwork_cache_root = Some("relative/cache".into());
+        assert!(settings.validate().is_err());
+    }
 
     #[test]
     fn defaults_disabled_and_generates_a_versioned_product_update() {

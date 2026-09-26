@@ -167,8 +167,12 @@ local reference. If a later remote read fails after cache eviction, the provider
 returns to the local revision and asks the reader to retry. An expired client
 read does not change the catalog reference. Missing local art still uses the
 fixed CDN reference and the UI's existing icon fallback on fetch failure.
-Amaterasu has no Steam-authorized product cache root or host service for
-persistent artwork, so remote images are not persisted or converted to PNG.
+An existing `steam_artwork_cache_root` in trusted startup settings enables a
+four-image disk cache across module restarts. Cache entries are bounded and
+validated before serving, and corrupt entries fall back to the CDN. The host
+must overwrite any package-supplied value with its own dedicated cache root;
+until that host injection exists, remote images remain memory cached only.
+Remote images are not converted to PNG.
 Manual mode needs another `force_sync` to reconcile a later promotion; ordinary
 `refresh` remains discovery-only.
 The sync fingerprint also includes an internal, bounded signature over every

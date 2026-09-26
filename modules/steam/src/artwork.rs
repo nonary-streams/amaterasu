@@ -1,7 +1,7 @@
 //! Bounded local Steam artwork discovery for catalog synchronization.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -73,6 +73,7 @@ struct CachedRemoteArtwork {
 pub struct RemoteArtworkCache {
     images: VecDeque<CachedRemoteArtwork>,
     failed_until: BTreeMap<u32, Instant>,
+    disk_root: Option<PathBuf>,
 }
 
 pub struct RemoteArtworkRequest {
@@ -102,6 +103,7 @@ pub struct RemoteArtworkWorker {
     completions: Option<mpsc::Receiver<RemoteArtworkCompletion>>,
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    cache_root: Option<PathBuf>,
 }
 
 /// Stable opaque revision for the fixed Steam CDN portrait URL. Including the
@@ -123,6 +125,15 @@ fn remote_portrait_url(app_id: u32) -> Option<String> {
 }
 
 impl RemoteArtworkCache {
+    fn with_disk_root(root: Option<PathBuf>) -> Self {
+        Self {
+            disk_root: root
+                .and_then(|root| root.canonicalize().ok())
+                .filter(|root| root.is_dir()),
+            ..Self::default()
+        }
+    }
+
     fn read_chunk_with(
         &mut self,
         app_id: u32,
@@ -157,6 +168,11 @@ impl RemoteArtworkCache {
             return result;
         }
 
+        if let Some(bytes) = self.read_disk(app_id, &revision) {
+            self.failed_until.remove(&app_id);
+            return self.remember_image(app_id, revision, bytes, offset);
+        }
+
         if self
             .failed_until
             .get(&app_id)
@@ -177,17 +193,148 @@ impl RemoteArtworkCache {
                 return Err(error);
             }
         };
+        self.write_disk(app_id, &revision, &bytes);
+        self.failed_until.remove(&app_id);
+        self.remember_image(app_id, revision, bytes, offset)
+    }
+
+    fn remember_image(
+        &mut self,
+        app_id: u32,
+        revision: String,
+        bytes: Vec<u8>,
+        offset: u64,
+    ) -> Result<ArtworkChunk, &'static str> {
         if self.images.len() == MAX_REMOTE_CACHE_IMAGES {
             self.images.pop_front();
         }
-        self.failed_until.remove(&app_id);
         self.images.push_back(CachedRemoteArtwork {
             app_id,
-            revision: revision.clone(),
+            revision,
             bytes,
         });
         let image = self.images.back().expect("new cache item exists");
         chunk_from_bytes(&image.bytes, &image.revision, offset)
+    }
+
+    fn disk_path(&self, app_id: u32, revision: &str) -> Option<PathBuf> {
+        if app_id == 0
+            || revision.is_empty()
+            || revision.len() > 20
+            || !revision.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(
+            self.disk_root
+                .as_ref()?
+                .join(format!("{app_id}-{revision}.jpg")),
+        )
+    }
+
+    fn read_disk(&self, app_id: u32, revision: &str) -> Option<Vec<u8>> {
+        let path = self.disk_path(app_id, revision)?;
+        if path.canonicalize().ok()? != path {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_ARTWORK_BYTES
+        {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(path)
+            .ok()?
+            .take(MAX_ARTWORK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() as u64 == metadata.len() && validate_remote_artwork(&bytes)).then_some(bytes)
+    }
+
+    fn write_disk(&self, app_id: u32, revision: &str, bytes: &[u8]) {
+        let Some(path) = self.disk_path(app_id, revision) else {
+            return;
+        };
+        if !validate_remote_artwork(bytes) || bytes.len() as u64 > MAX_ARTWORK_BYTES {
+            return;
+        }
+        // A host-owned cache directory is required. Never create a directory at
+        // an untrusted path or follow a preexisting cache entry's symlink.
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || path.canonicalize().ok().as_deref() != Some(path.as_path())
+                || fs::remove_file(&path).is_err())
+        {
+            return;
+        }
+        if !self.make_disk_room() {
+            return;
+        }
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let Ok(mut file) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        else {
+            return;
+        };
+        let written = file.write_all(bytes).and_then(|_| file.sync_all()).is_ok();
+        drop(file);
+        if written && fs::symlink_metadata(&path).is_err() {
+            let _ = fs::rename(&temporary, &path);
+        }
+        let _ = fs::remove_file(temporary);
+    }
+
+    fn make_disk_room(&self) -> bool {
+        let Some(root) = &self.disk_root else {
+            return false;
+        };
+        let Ok(entries) = fs::read_dir(root) else {
+            return false;
+        };
+        let mut images = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= 256 {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".jpg") else {
+                continue;
+            };
+            let Some((app_id, revision)) = stem.split_once('-') else {
+                continue;
+            };
+            if app_id.parse::<u32>().ok().filter(|id| *id != 0).is_none()
+                || revision.is_empty()
+                || revision.len() > 20
+                || !revision.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                return false;
+            };
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                images.push((metadata.modified().unwrap_or(UNIX_EPOCH), entry.path()));
+            }
+        }
+        images.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        while images.len() >= MAX_REMOTE_CACHE_IMAGES {
+            if fs::remove_file(images.remove(0).1).is_err() {
+                return false;
+            }
+        }
+        true
     }
 
     fn remember_failure(&mut self, app_id: u32, now: Instant) {
@@ -202,6 +349,10 @@ impl RemoteArtworkCache {
 }
 
 impl RemoteArtworkWorker {
+    pub fn set_cache_root(&mut self, root: Option<PathBuf>) {
+        self.cache_root = root;
+    }
+
     pub fn enqueue(&mut self, request: RemoteArtworkRequest) -> Result<(), &'static str> {
         self.start_if_needed()?;
         let Some(sender) = &self.requests else {
@@ -237,10 +388,11 @@ impl RemoteArtworkWorker {
         let (completion_sender, completion_receiver) =
             mpsc::sync_channel(REMOTE_FETCH_QUEUE_CAPACITY + 1);
         let stopped = Arc::clone(&self.stopped);
+        let cache_root = self.cache_root.clone();
         let worker_thread = thread::Builder::new()
             .name("steam-artwork-fetch".into())
             .spawn(move || {
-                let mut cache = RemoteArtworkCache::default();
+                let mut cache = RemoteArtworkCache::with_disk_root(cache_root);
                 while let Ok(request) = request_receiver.recv() {
                     if stopped.load(Ordering::Acquire) {
                         break;
@@ -1224,6 +1376,59 @@ mod tests {
         assert_eq!(last.next_offset, None);
         assert_eq!(last.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
         assert_eq!(last.revision, revision);
+    }
+
+    #[test]
+    fn remote_artwork_survives_cache_restart_and_rejects_corrupt_disk_bytes() {
+        let root = TemporaryRoot::new();
+        let revision = remote_revision(42, 123).unwrap();
+        let bytes = synthetic_jpeg(600, 900, ARTWORK_CHUNK_BYTES + 19);
+        let now = Instant::now();
+        let mut first = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        first
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .unwrap();
+        let path = root.0.join(format!("42-{revision}.jpg"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut restarted = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        let from_disk = restarted
+            .read_chunk_with(42, 123, &revision, ARTWORK_CHUNK_BYTES as u64, now, |_| {
+                panic!("valid persistent portrait must not fetch")
+            })
+            .unwrap();
+        assert_eq!(from_disk.data, base64_encode(&bytes[ARTWORK_CHUNK_BYTES..]));
+
+        fs::write(&path, b"corrupt").unwrap();
+        let mut recovered = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        recovered
+            .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(recovered.images.len(), 1);
+    }
+
+    #[test]
+    fn disk_cache_evicts_old_portraits_and_requires_an_existing_root() {
+        let root = TemporaryRoot::new();
+        let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        for app_id in 1..=6 {
+            let revision = remote_revision(app_id, 123).unwrap();
+            cache
+                .read_chunk_with(app_id, 123, &revision, 0, Instant::now(), |_| {
+                    Ok(synthetic_jpeg(600, 900, 64))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(&root.0).unwrap().count(),
+            MAX_REMOTE_CACHE_IMAGES
+        );
+        assert!(
+            RemoteArtworkCache::with_disk_root(Some(root.0.join("missing")))
+                .disk_root
+                .is_none()
+        );
     }
 
     #[test]
