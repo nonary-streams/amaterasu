@@ -226,6 +226,182 @@ fn saved_recording_toggle_waits_for_stream_drain_but_retention_survives_restart(
 }
 
 #[test]
+fn restart_during_pending_recording_toggles_adopts_saved_policy_without_phantom_sessions() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-history-pending-restart-{}-{}",
+        std::process::id(),
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let database = directory.join("history.db");
+    let call = |store: &mut HistoryStore, caller: &str, payload: serde_json::Value, now| {
+        let operation: Operation = serde_json::from_value(payload).unwrap();
+        assert!(is_authorized(caller, &operation));
+        execute(store, operation, now).unwrap()
+    };
+    let assert_policy = |store: &mut HistoryStore, saved, effective, active, sessions| {
+        // This getter supplies the settings RPC readback; status exposes both
+        // the saved policy and the decision currently used at admission.
+        assert_eq!(store.settings().0.enabled, saved);
+        assert_eq!(store.settings().1, effective);
+        let status = call(
+            store,
+            MANAGEMENT_CALLER,
+            json!({"action":"history_status"}),
+            0,
+        );
+        assert_eq!(status["status"]["enabled"], saved);
+        assert_eq!(status["status"]["effective_enabled"], effective);
+        assert_eq!(status["status"]["active_streams"], active);
+        assert_eq!(status["status"]["sessions"], sessions);
+    };
+    let policy = |enabled| HistorySettings {
+        enabled,
+        ttl_days: 0,
+        db_size_limit_mb: 0,
+    };
+
+    let mut store = HistoryStore::open(&database, 100).unwrap();
+    store.apply_configuration(policy(true), 100).unwrap();
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_begin",
+                "metadata":{"session_id":"recorded","protocol":"sunshine-modern"},
+            }),
+            100
+        )["recorded"],
+        true
+    );
+    store.apply_configuration(policy(false), 101).unwrap();
+    assert_policy(&mut store, false, true, 1, 1);
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"record_event",
+                "event":{"session_id":"recorded","recorded_at_unix":102,"event_type":"still_recording"},
+            }),
+            102
+        )["recorded"],
+        true
+    );
+    drop(store);
+
+    let mut store = HistoryStore::open(&database, 110).unwrap();
+    store.apply_configuration(policy(false), 111).unwrap();
+    assert_policy(&mut store, false, false, 0, 1);
+    let detail = call(
+        &mut store,
+        MANAGEMENT_CALLER,
+        json!({
+            "action":"session_detail","session_id":"recorded"
+        }),
+        111,
+    );
+    assert_eq!(detail["detail"]["session"]["ended_at_unix"], 110);
+    assert_eq!(
+        detail["detail"]["events"][0]["event_type"],
+        "stream_started"
+    );
+    assert_eq!(
+        detail["detail"]["events"][1]["event_type"],
+        "still_recording"
+    );
+    assert_eq!(
+        detail["detail"]["events"][2]["event_type"],
+        "stream_interrupted"
+    );
+    assert_eq!(detail["detail"]["event_count"], 3);
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_end","session_id":"recorded"
+            }),
+            112
+        )["recorded"],
+        false
+    );
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_begin",
+                "metadata":{"session_id":"unrecorded","protocol":"sunshine-modern"},
+            }),
+            112
+        )["recorded"],
+        false
+    );
+    store.apply_configuration(policy(true), 113).unwrap();
+    assert_policy(&mut store, true, false, 1, 1);
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_begin",
+                "metadata":{"session_id":"also_unrecorded","protocol":"sunshine-modern"},
+            }),
+            114
+        )["recorded"],
+        false
+    );
+    assert_policy(&mut store, true, false, 2, 1);
+    drop(store);
+
+    let mut store = HistoryStore::open(&database, 120).unwrap();
+    store.apply_configuration(policy(true), 121).unwrap();
+    assert_policy(&mut store, true, true, 0, 1);
+    let detail = call(
+        &mut store,
+        MANAGEMENT_CALLER,
+        json!({
+            "action":"session_detail","session_id":"recorded"
+        }),
+        121,
+    );
+    assert_eq!(detail["detail"]["event_count"], 3);
+    for session_id in ["unrecorded", "also_unrecorded"] {
+        assert!(matches!(
+            store.session_detail(session_id),
+            Err(HistoryError::NotFound)
+        ));
+    }
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_begin",
+                "metadata":{"session_id":"fresh","protocol":"sunshine-modern"},
+            }),
+            122
+        )["recorded"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut store,
+            STREAM_SESSION_CALLER,
+            json!({
+                "action":"session_end","session_id":"fresh"
+            }),
+            123
+        )["recorded"],
+        true
+    );
+    assert_policy(&mut store, true, true, 0, 2);
+    drop(store);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn producer_updates_remain_ordered_and_readable_after_restart() {
     let directory = std::env::temp_dir().join(format!(
         "amaterasu-history-rpc-{}-{}",
