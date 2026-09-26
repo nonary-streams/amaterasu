@@ -339,7 +339,13 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
         let state = self.effective_state(now);
         if let Err(error) = self.device.update(state) {
             self.device.recover_after_update_failure(error)?;
-            self.device.update(state)?;
+            if let Err(replay_error) = self.device.update(state) {
+                // The replay target may now contain a partially applied report
+                // too. Retire it before a later tick can resend this state.
+                self.device
+                    .recover_after_update_failure(replay_error.clone())?;
+                return Err(replay_error);
+            }
         }
         self.dirty = false;
         if self.guide_pulse_pending {
@@ -1502,6 +1508,107 @@ mod tests {
         );
         slots.stop().unwrap();
         assert_eq!(trace.borrow().last(), Some(&"release"));
+        assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn failed_replay_retires_its_target_before_a_later_write() {
+        struct ReplayedDevice {
+            number: u8,
+            trace: Rc<RefCell<Vec<(u8, &'static str)>>>,
+            failures_left: u8,
+            detach_count: u8,
+            replacement_pending: bool,
+            uncertain: bool,
+        }
+
+        impl ReplayedDevice {
+            fn replace(&mut self) -> InputResult<()> {
+                if self.uncertain {
+                    self.trace.borrow_mut().push((self.number, "detach"));
+                    self.detach_count += 1;
+                    if self.number == 0 && self.detach_count == 2 {
+                        return Err(InputError::new("release_failed", "detach failed"));
+                    }
+                    self.uncertain = false;
+                }
+                self.trace.borrow_mut().push((self.number, "allocate"));
+                self.replacement_pending = false;
+                Ok(())
+            }
+        }
+
+        impl GamepadDevice for ReplayedDevice {
+            fn update(&mut self, _: ControllerSnapshot) -> InputResult<()> {
+                if self.replacement_pending {
+                    self.replace()?;
+                }
+                assert!(!self.uncertain, "must detach before another native report");
+                self.trace.borrow_mut().push((self.number, "write"));
+                if self.failures_left > 0 {
+                    self.failures_left -= 1;
+                    self.uncertain = true;
+                    return Err(InputError::new("injection_failed", "partial report"));
+                }
+                Ok(())
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                self.replacement_pending = true;
+                self.replace()
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                if self.uncertain {
+                    self.trace.borrow_mut().push((self.number, "detach"));
+                    self.uncertain = false;
+                }
+                self.trace.borrow_mut().push((self.number, "release"));
+                Ok(())
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut slots = GamepadSlots::new();
+        let now = Instant::now();
+        let mut create = |number| {
+            Ok(ReplayedDevice {
+                number,
+                trace: trace.clone(),
+                failures_left: if number == 0 { 2 } else { 0 },
+                detach_count: 0,
+                replacement_pending: false,
+                uncertain: false,
+            })
+        };
+        assert_eq!(
+            slots
+                .apply(0, 1, ControllerSnapshot::default(), -1, now, &mut create)
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        slots
+            .apply(1, 3, ControllerSnapshot::default(), -1, now, &mut create)
+            .unwrap();
+        assert_eq!(
+            &*trace.borrow(),
+            &[
+                (0, "write"),
+                (0, "detach"),
+                (0, "allocate"),
+                (0, "write"),
+                (0, "detach"),
+                (1, "write"),
+            ]
+        );
+
+        slots.advance(now).unwrap();
+        assert_eq!(
+            &trace.borrow()[6..],
+            &[(0, "detach"), (0, "allocate"), (0, "write")]
+        );
+        slots.stop().unwrap();
         assert!(slots.is_empty());
     }
 
