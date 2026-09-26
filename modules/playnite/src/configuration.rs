@@ -13,6 +13,7 @@ pub struct ProductConfiguration {
     revision: u64,
     ready: bool,
     pending: Option<Pending>,
+    deferred_response: Option<(u64, Value, bool)>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,7 @@ impl ProductConfiguration {
                     operation_id: "playnite.product-settings.load".into(),
                 },
             }),
+            deferred_response: None,
         }
     }
 
@@ -81,7 +83,42 @@ impl ProductConfiguration {
         self.ready
     }
     pub fn busy(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.deferred_response.is_some()
+    }
+
+    pub fn require_epoch_for_deferred_response(&mut self) {
+        if let Some((_, _, required)) = self.deferred_response.as_mut() {
+            *required = true;
+        }
+    }
+
+    pub fn release_deferred_response(
+        &mut self,
+        runtime: &RuntimeClient,
+        epoch_ready: bool,
+    ) -> ModuleResult<()> {
+        self.release_deferred_response_with(epoch_ready, |request, payload| {
+            complete(runtime, request, payload)
+        })
+    }
+
+    fn release_deferred_response_with(
+        &mut self,
+        epoch_ready: bool,
+        mut send: impl FnMut(u64, Value) -> ModuleResult<()>,
+    ) -> ModuleResult<()> {
+        let Some((request, payload, required)) = self.deferred_response.take() else {
+            return Ok(());
+        };
+        if required && !epoch_ready {
+            self.deferred_response = Some((request, payload, required));
+            return Ok(());
+        }
+        if let Err(error) = send(request, payload.clone()) {
+            self.deferred_response = Some((request, payload, required));
+            return Err(error);
+        }
+        Ok(())
     }
     pub fn management_response(&self) -> Value {
         self.settings.management_response(self.revision)
@@ -96,7 +133,7 @@ impl ProductConfiguration {
         if !self.ready {
             return Err(json!({"ok":false,"code":"settings_loading"}));
         }
-        if self.pending.is_some() {
+        if self.busy() {
             return Err(json!({"ok":false,"code":"settings_busy"}));
         }
         if expected_revision != self.revision {
@@ -219,7 +256,7 @@ impl ProductConfiguration {
 
     fn consume(
         &mut self,
-        runtime: &RuntimeClient,
+        _runtime: &RuntimeClient,
         operation: Operation,
         response: Response,
         settings_epoch: &mut u64,
@@ -252,7 +289,8 @@ impl ProductConfiguration {
                             if expected_revision.checked_add(1) == Some(revision) && actual == settings =>
                         {
                             self.apply(actual, revision, settings_epoch);
-                            complete(runtime, request, self.management_response())
+                            self.deferred_response = Some((request, self.management_response(), false));
+                            Ok(())
                         }
                         _ => self.schedule_reconciliation(request, UpdateResolution::Unknown("configuration returned a malformed or different committed document".into())),
                     }
@@ -299,7 +337,8 @@ impl ProductConfiguration {
                         }
                     }
                 };
-                complete(runtime, request, response)
+                self.deferred_response = Some((request, response, false));
+                Ok(())
             }
         }
     }
@@ -377,5 +416,35 @@ fn complete(runtime: &RuntimeClient, request: u64, payload: Value) -> ModuleResu
         Response::Ok => Ok(()),
         Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
         response => Err(format!("Playnite settings response failed: {response:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disable_response_waits_for_durable_epoch_acknowledgment() {
+        let mut configuration = ProductConfiguration::new();
+        configuration.pending = None;
+        configuration.deferred_response = Some((71, json!({"ok":true,"revision":2}), false));
+        configuration.require_epoch_for_deferred_response();
+        let mut completions = Vec::new();
+        configuration
+            .release_deferred_response_with(false, |request, payload| {
+                completions.push((request, payload));
+                Ok(())
+            })
+            .unwrap();
+        assert!(configuration.busy());
+        assert!(completions.is_empty());
+        configuration
+            .release_deferred_response_with(true, |request, payload| {
+                completions.push((request, payload));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(completions, [(71, json!({"ok":true,"revision":2}))]);
+        assert!(!configuration.busy());
     }
 }

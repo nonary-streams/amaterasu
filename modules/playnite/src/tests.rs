@@ -1,4 +1,176 @@
 use super::*;
+use amaterasu_module_sdk::abi::{
+    AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
+};
+use std::ffi::c_void;
+
+#[derive(Default)]
+struct EpochLaunchHost {
+    inventory_calls: usize,
+    epoch: u64,
+    probe_ready: bool,
+    completed: Vec<Value>,
+    commands: Vec<Command>,
+}
+
+unsafe extern "C" fn invoke_epoch_launch_host(
+    context: *mut c_void,
+    input: BorrowedBytes,
+    reply: ReplySink,
+) -> Status {
+    // SAFETY: the boxed fake host outlives each synchronous ABI invocation.
+    let Ok(input) = (unsafe { input.read() }) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Ok(command) = serde_json::from_slice::<Command>(input) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    // SAFETY: context points to the boxed fake host retained by the test.
+    let host = unsafe { &mut *(context as *mut EpochLaunchHost) };
+    let response = match &command {
+        Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
+        Command::Poll {} => Response::Pending,
+        Command::Complete { payload, .. } => {
+            host.completed.push(payload.clone());
+            Response::Ok
+        }
+        Command::Request { payload, .. } if payload["action"] == "product_get" => {
+            Response::Result {
+                payload: json!({
+                    "ok":true,"found":true,"version":1,"revision":1,
+                    "values":{"enabled":true,"auto_sync":false}
+                }),
+            }
+        }
+        Command::Request { payload, .. } if payload["action"] == "provider_snapshot_revoke" => {
+            host.epoch += 1;
+            Response::Result {
+                payload: json!({"ok":true,"provider_epoch":host.epoch,"revision":1}),
+            }
+        }
+        Command::Request { payload, .. } if payload["action"] == "provider_snapshot_inventory" => {
+            host.inventory_calls += 1;
+            if host.inventory_calls == 1 {
+                Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":0}),
+                }
+            } else {
+                Response::Accepted { id: 77 }
+            }
+        }
+        Command::TakeResult { request: 77 } => {
+            if host.probe_ready {
+                Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":1}),
+                }
+            } else {
+                Response::Pending
+            }
+        }
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    host.commands.push(command);
+    let encoded = serde_json::to_vec(&response).unwrap();
+    // SAFETY: encoded remains live until the receiver copies the reply.
+    unsafe { reply.send(&encoded) };
+    STATUS_OK
+}
+
+#[test]
+fn launch_request_waits_for_authenticated_inventory_result_and_release() {
+    let mut host = Box::new(EpochLaunchHost::default());
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut *host as *mut EpochLaunchHost).cast(),
+        invoke: invoke_epoch_launch_host,
+    };
+    // SAFETY: host is boxed and remains live through all RuntimeClient calls.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    let mut module = PlayniteModule::start(runtime).unwrap();
+    let process = process(4242, r"C:\Playnite\Playnite.DesktopApp.exe");
+    module.discovery_override = Some(discovery::Discovery {
+        running: true,
+        processes: vec![process.clone()],
+        executable_paths: vec![process.path.clone()],
+    });
+    module.tick().unwrap();
+    module.tick().unwrap();
+    assert!(module.catalog.epoch_ready());
+    let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+    module.eligible_launch_ids.insert(game_id.into());
+    module.catalog_processes = Some(vec![process]);
+    module
+        .handle_request(
+            91,
+            LAUNCH_CALLER,
+            json!({"action":"launch_start","operation_id":"epoch-launch","game_id":game_id}),
+        )
+        .unwrap();
+    assert!(host.completed.is_empty());
+    module.tick().unwrap();
+    assert!(host.commands.iter().any(|command| matches!(command, Command::Request { payload, .. } if payload["action"] == "provider_snapshot_inventory")));
+    assert!(host.completed.is_empty());
+    host.probe_ready = true;
+    module.tick().unwrap();
+    assert!(
+        host.commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 77 }))
+    );
+    assert_eq!(host.completed.len(), 1);
+    assert_eq!(host.completed[0]["ok"], true);
+
+    host.probe_ready = false;
+    module
+        .handle_request(
+            92,
+            LAUNCH_CALLER,
+            json!({"action":"launch_start","operation_id":"changed-process","game_id":game_id}),
+        )
+        .unwrap();
+    module.tick().unwrap();
+    assert_eq!(host.completed.len(), 1);
+    module.discovery_override = Some(discovery::Discovery {
+        running: true,
+        processes: vec![discovery::ProcessImage {
+            process_id: 4243,
+            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            creation_time: 4243,
+        }],
+        executable_paths: vec![r"C:\Playnite\Playnite.DesktopApp.exe".into()],
+    });
+    module.tick().unwrap();
+    assert_eq!(host.completed.len(), 2);
+    assert_eq!(host.completed[1]["ok"], false);
+    assert_eq!(host.completed[1]["launch_state"], "not_started");
+}
+
+#[test]
+fn concurrent_launch_admissions_keep_distinct_operations_and_coalesce_duplicates() {
+    let now = Instant::now();
+    let pending = |request, operation_id: &str, game_id: &str| PendingLaunch {
+        requests: vec![request],
+        action: Action::LaunchStart {
+            operation_id: operation_id.into(),
+            game_id: game_id.into(),
+        },
+        operation_id: operation_id.into(),
+        processes: Vec::new(),
+        settings_epoch: 1,
+        deadline: now + Duration::from_secs(4),
+    };
+    let mut admissions = VecDeque::new();
+    queue_pending_launch(&mut admissions, pending(1, "first", "game-a")).unwrap();
+    queue_pending_launch(&mut admissions, pending(2, "second", "game-b")).unwrap();
+    queue_pending_launch(&mut admissions, pending(3, "first", "game-a")).unwrap();
+    assert_eq!(admissions.len(), 2);
+    assert_eq!(admissions[0].requests, [1, 3]);
+    assert_eq!(admissions[1].requests, [2]);
+    assert_eq!(
+        queue_pending_launch(&mut admissions, pending(4, "first", "different")),
+        Err("operation_conflict")
+    );
+}
 use serde_json::json;
 
 fn process(process_id: u32, path: &str) -> discovery::ProcessImage {

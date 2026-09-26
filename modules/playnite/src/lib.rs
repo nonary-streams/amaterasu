@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::ProductSettings;
 use snapshot::Snapshot;
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +27,7 @@ const MANAGEMENT_CALLER: &str = "amaterasu.management";
 const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     Status {},
@@ -254,6 +255,43 @@ struct PlayniteModule {
     fullscreen_launches: fullscreen::FullscreenSessions,
     fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync,
     next_discovery: Instant,
+    pending_launches: VecDeque<PendingLaunch>,
+    last_epoch_ready: bool,
+    #[cfg(test)]
+    discovery_override: Option<discovery::Discovery>,
+}
+
+struct PendingLaunch {
+    requests: Vec<u64>,
+    action: Action,
+    operation_id: String,
+    processes: Vec<discovery::ProcessImage>,
+    settings_epoch: u64,
+    deadline: Instant,
+}
+
+fn queue_pending_launch(
+    pending_launches: &mut VecDeque<PendingLaunch>,
+    mut incoming: PendingLaunch,
+) -> Result<(), &'static str> {
+    if let Some(existing) = pending_launches
+        .iter_mut()
+        .find(|pending| pending.operation_id == incoming.operation_id)
+    {
+        if existing.action != incoming.action {
+            return Err("operation_conflict");
+        }
+        if existing.requests.len() >= 16 {
+            return Err("launch_capacity");
+        }
+        existing.requests.append(&mut incoming.requests);
+        return Ok(());
+    }
+    if pending_launches.len() >= 16 {
+        return Err("launch_capacity");
+    }
+    pending_launches.push_back(incoming);
+    Ok(())
 }
 
 impl ManagedModule for PlayniteModule {
@@ -282,6 +320,10 @@ impl ManagedModule for PlayniteModule {
             fullscreen_launches: fullscreen::FullscreenSessions::default(),
             fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync::default(),
             next_discovery: Instant::now(),
+            pending_launches: VecDeque::new(),
+            last_epoch_ready: false,
+            #[cfg(test)]
+            discovery_override: None,
         })
     }
 
@@ -299,9 +341,25 @@ impl ManagedModule for PlayniteModule {
         self.catalog
             .advance(&self.runtime, self.settings_epoch)
             .map_err(|error| format!("Playnite catalog import failed: {error}"))?;
+        let epoch_ready = self.catalog.epoch_ready();
+        if !epoch_ready {
+            self.eligible_launch_ids.clear();
+            self.catalog_processes = None;
+        } else if !self.last_epoch_ready
+            && self.configuration.ready()
+            && self.configuration.settings().enabled
+            && self.configuration.settings().auto_sync
+        {
+            self.next_auto_sync = Some(Instant::now());
+        }
+        self.last_epoch_ready = epoch_ready;
+        self.configuration
+            .release_deferred_response(&self.runtime, self.catalog.epoch_ready())?;
+        self.resume_pending_launch()?;
         self.poll_unsolicited_snapshot();
         self.fullscreen_entry_sync.advance(&self.runtime)?;
         if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids()
+            && self.catalog.epoch_ready()
             && can_publish_eligibility(self.catalog_processes.as_deref(), &self.last_discovery)
         {
             self.eligible_launch_ids = launchable_game_ids;
@@ -326,6 +384,14 @@ impl Drop for PlayniteModule {
 }
 
 impl PlayniteModule {
+    fn discover_processes(&self) -> discovery::Discovery {
+        #[cfg(test)]
+        if let Some(discovery) = &self.discovery_override {
+            return discovery.clone();
+        }
+        discovery::discover()
+    }
+
     fn observe_sunshine_connection(&mut self) {
         let enabled = self.configuration.ready() && self.configuration.settings().enabled;
         let desired = (
@@ -343,15 +409,19 @@ impl PlayniteModule {
             return;
         }
         self.observed_settings_epoch = self.settings_epoch;
-        let settings = self.configuration.settings();
+        let settings = self.configuration.settings().clone();
         let same_catalog_policy = apply_settings_transition(
             self.observed_settings.as_ref(),
-            settings,
+            &settings,
             &mut self.eligible_launch_ids,
             &mut self.catalog_processes,
             &mut self.next_auto_sync,
             Instant::now(),
         );
+        if !same_catalog_policy {
+            self.catalog.revoke_epoch();
+            self.configuration.require_epoch_for_deferred_response();
+        }
         // A snapshot from this Playnite instance remains usable when only
         // focus or Fullscreen entry behavior changed while it was in flight.
         self.snapshot_worker
@@ -368,12 +438,13 @@ impl PlayniteModule {
 
     fn refresh_discovery(&mut self) {
         let previous_processes = self.last_discovery.processes.clone();
+        let discovered = self.discover_processes();
         refresh_discovery_at(
             &mut self.last_discovery,
             &mut self.next_discovery,
             Instant::now(),
             false,
-            discovery::discover,
+            || discovered,
         );
         if update_discovery_state(
             &previous_processes,
@@ -386,6 +457,7 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.catalog.cancel_after_process_change();
+            self.catalog.revoke_epoch();
             self.pending_unsolicited_snapshot = None;
         }
     }
@@ -394,12 +466,13 @@ impl PlayniteModule {
         // Launch and stop need current PIDs after a Playnite restart. Recovery
         // also checks paths against the launch's trusted install root.
         let previous_processes = self.last_discovery.processes.clone();
+        let discovered = self.discover_processes();
         refresh_discovery_at(
             &mut self.last_discovery,
             &mut self.next_discovery,
             Instant::now(),
             true,
-            discovery::discover,
+            || discovered,
         );
         if update_discovery_state(
             &previous_processes,
@@ -412,6 +485,7 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.catalog.cancel_after_process_change();
+            self.catalog.revoke_epoch();
             self.pending_unsolicited_snapshot = None;
         }
         self.observe_sunshine_connection();
@@ -423,6 +497,7 @@ impl PlayniteModule {
         };
         if !self.configuration.ready()
             || !self.configuration.settings().enabled
+            || !self.catalog.epoch_ready()
             || self.snapshot_worker.settings_epoch != self.settings_epoch
         {
             self.last_error = Some("discarded a Playnite snapshot after settings changed".into());
@@ -480,6 +555,9 @@ impl PlayniteModule {
         if self.catalog.busy() || self.snapshot_worker.busy() {
             return;
         }
+        if !self.catalog.epoch_ready() {
+            return;
+        }
         let event = self.pending_unsolicited_snapshot.take().unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -507,6 +585,7 @@ impl PlayniteModule {
         let settings = self.configuration.settings();
         if !settings.enabled
             || !settings.auto_sync
+            || !self.catalog.epoch_ready()
             || self.snapshot_worker.busy()
             || self.catalog.busy()
             || !self.sunshine_observation.confirmed_for(&(
@@ -546,6 +625,74 @@ impl PlayniteModule {
         if action.is_fullscreen_launch() && !launch_caller_is_authorized(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
         }
+        if let Some(operation_id) = match &action {
+            Action::LaunchStart { operation_id, .. } | Action::FullscreenStart { operation_id } => {
+                Some(operation_id.clone())
+            }
+            _ => None,
+        } {
+            if !self.configuration.ready() {
+                return self.complete(id, launch::not_started_error("settings_loading"));
+            }
+            if !self.configuration.settings().enabled {
+                return self.complete(id, launch::not_started_error("playnite_disabled"));
+            }
+            self.refresh_discovery_now();
+            if !self.pending_launches.is_empty() || !self.catalog.verify_launch_epoch(&operation_id)
+            {
+                let incoming = PendingLaunch {
+                    requests: vec![id],
+                    action,
+                    operation_id,
+                    processes: self.last_discovery.processes.clone(),
+                    settings_epoch: self.settings_epoch,
+                    deadline: Instant::now() + Duration::from_secs(4),
+                };
+                return match queue_pending_launch(&mut self.pending_launches, incoming) {
+                    Ok(()) => Ok(()),
+                    Err(code) => self.complete(id, launch::not_started_error(code)),
+                };
+            }
+        }
+        self.handle_action(id, action)
+    }
+
+    fn resume_pending_launch(&mut self) -> ModuleResult<()> {
+        let Some(pending) = self.pending_launches.pop_front() else {
+            return Ok(());
+        };
+        if Instant::now() >= pending.deadline {
+            self.catalog
+                .cancel_launch_probe(Some(&pending.operation_id));
+            for request in pending.requests {
+                self.complete(request, launch::not_started_error("catalog_unavailable"))?;
+            }
+            return Ok(());
+        }
+        self.refresh_discovery_now();
+        if !self.configuration.ready()
+            || !self.configuration.settings().enabled
+            || pending.settings_epoch != self.settings_epoch
+            || pending.processes != self.last_discovery.processes
+        {
+            self.catalog
+                .cancel_launch_probe(Some(&pending.operation_id));
+            for request in pending.requests {
+                self.complete(request, launch::not_started_error("playnite_changed"))?;
+            }
+            return Ok(());
+        }
+        if !self.catalog.verify_launch_epoch(&pending.operation_id) {
+            self.pending_launches.push_front(pending);
+            return Ok(());
+        }
+        for request in pending.requests {
+            self.handle_action(request, pending.action.clone())?;
+        }
+        Ok(())
+    }
+
+    fn handle_action(&mut self, id: u64, action: Action) -> ModuleResult<()> {
         if action.is_settings() && self.configuration.busy() {
             let code = if self.configuration.ready() {
                 "settings_busy"
@@ -566,7 +713,6 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, launch::not_started_error("playnite_disabled"));
                 }
-                self.refresh_discovery_now();
                 if !self.last_discovery.running {
                     return self.complete(id, launch::not_started_error("playnite_not_running"));
                 }
@@ -627,7 +773,6 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, launch::not_started_error("playnite_disabled"));
                 }
-                self.refresh_discovery_now();
                 let installation = installation::Installation::discover_associated();
                 let response = self.fullscreen_launches.start(
                     &operation_id,
@@ -742,7 +887,8 @@ impl PlayniteModule {
                 if !self.configuration.settings().enabled {
                     return self.complete(id, json!({"ok":false,"code":"playnite_disabled"}));
                 }
-                if self.snapshot_worker.busy() || self.catalog.busy() {
+                if self.snapshot_worker.busy() || self.catalog.busy() || !self.catalog.epoch_ready()
+                {
                     return self.complete(id, json!({"ok":false,"code":"refresh_busy"}));
                 }
                 self.refresh_discovery_now();
@@ -766,6 +912,7 @@ impl PlayniteModule {
             "ok":true,
             "settings_ready":self.configuration.ready(),
             "enabled":self.configuration.settings().enabled,
+            "catalog_epoch_ready":self.catalog.epoch_ready(),
             "auto_sync":self.configuration.settings().auto_sync,
             "fullscreen_entry_enabled":self.configuration.settings().fullscreen_entry_enabled,
             "fullscreen_supported":cfg!(windows),

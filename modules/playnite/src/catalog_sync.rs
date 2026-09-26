@@ -8,8 +8,9 @@ use crate::snapshot::{
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -35,10 +36,191 @@ enum Call {
     Waiting { request: u64 },
 }
 
+enum BarrierCall {
+    Submit,
+    Waiting { request: u64, deadline: Instant },
+}
+
+struct EpochBarrier {
+    epoch: Option<u64>,
+    revocations: VecDeque<String>,
+    read_operation_id: String,
+    call: BarrierCall,
+    stale_request: Option<u64>,
+}
+
+struct LaunchProbe {
+    operation_id: String,
+    request_id: String,
+    provider_epoch: u64,
+    request: Option<u64>,
+    deadline: Instant,
+    verified: bool,
+}
+
+impl Default for EpochBarrier {
+    fn default() -> Self {
+        Self {
+            epoch: None,
+            revocations: VecDeque::new(),
+            read_operation_id: format!("playnite.catalog.epoch-read.{}", new_sync_id(0)),
+            call: BarrierCall::Submit,
+            stale_request: None,
+        }
+    }
+}
+
+impl EpochBarrier {
+    fn ready(&self) -> bool {
+        self.epoch.is_some() && self.revocations.is_empty()
+    }
+
+    fn revoke(&mut self) {
+        // No snapshot or launch is admitted until the current revocation is
+        // acknowledged, so further transitions can share its durable fence.
+        if self.revocations.is_empty() {
+            self.revocations.push_back(new_sync_id(0));
+        }
+    }
+
+    fn invalidate(&mut self) {
+        if let BarrierCall::Waiting { request, .. } = self.call {
+            self.stale_request = Some(request);
+        }
+        self.epoch = None;
+        self.call = BarrierCall::Submit;
+        self.read_operation_id = format!("playnite.catalog.epoch-read.{}", new_sync_id(0));
+        if self.revocations.is_empty() {
+            self.revoke();
+        }
+    }
+
+    fn revoke_conflicted(&mut self) {
+        self.revocations.pop_front();
+        self.epoch = None;
+        self.call = BarrierCall::Submit;
+        self.read_operation_id = format!("playnite.catalog.epoch-read.{}", new_sync_id(0));
+        self.revoke();
+    }
+
+    fn advance_with(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(Command) -> Result<Response, String>,
+    ) -> Result<(), String> {
+        if let Some(request) = self.stale_request {
+            if settle_stale_child_with(request, &mut send) {
+                self.stale_request = None;
+            }
+            return Ok(());
+        }
+        if self.ready() {
+            return Ok(());
+        }
+        let payload = if let Some(epoch) = self.epoch {
+            json!({
+                "action":"provider_snapshot_revoke",
+                "expected_provider_epoch":epoch,
+                "revocation_id":self.revocations.front().expect("pending revocation has an ID")
+            })
+        } else {
+            json!({"action":"provider_snapshot_inventory","after":null,"limit":1})
+        };
+        let operation_id = self
+            .revocations
+            .front()
+            .filter(|_| self.epoch.is_some())
+            .map_or_else(
+                || self.read_operation_id.clone(),
+                |id| format!("playnite.catalog.revoke.{id}"),
+            );
+        let response = match self.call {
+            BarrierCall::Submit => send(Command::Request {
+                service: CATALOG_SERVICE.into(),
+                payload,
+                timeout_ms: REQUEST_TIMEOUT_MS,
+                operation_id,
+                parent: None,
+            }),
+            BarrierCall::Waiting { request, deadline } if now < deadline => {
+                let result = send(Command::TakeResult { request });
+                match result {
+                    Ok(Response::Pending) | Err(_) => return Ok(()),
+                    Ok(response) => {
+                        if !settled(send(Command::ReleaseResult { request })) {
+                            return Ok(());
+                        }
+                        self.call = BarrierCall::Submit;
+                        Ok(response)
+                    }
+                }
+            }
+            BarrierCall::Waiting { request, .. } => {
+                if settled(send(Command::Cancel { request }))
+                    && settled(send(Command::ReleaseResult { request }))
+                {
+                    // The Catalog revoke may have committed before its reply was lost.
+                    // Reuse the same revocation ID and expected epoch on replay.
+                    self.call = BarrierCall::Submit;
+                }
+                return Ok(());
+            }
+        };
+        match response {
+            Ok(Response::Accepted { id }) => {
+                self.call = BarrierCall::Waiting {
+                    request: id,
+                    deadline: now + Duration::from_millis(REQUEST_TIMEOUT_MS + 5_000),
+                };
+            }
+            Ok(Response::Result { payload }) => {
+                if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+                    if self.epoch.is_some()
+                        && payload.pointer("/error/code").and_then(Value::as_str)
+                            == Some("provider_epoch_conflict")
+                    {
+                        self.revoke_conflicted();
+                    }
+                    return Err("Catalog rejected Playnite epoch transition".into());
+                }
+                let epoch = payload
+                    .get("provider_epoch")
+                    .and_then(Value::as_u64)
+                    .ok_or("Catalog omitted Playnite provider_epoch")?;
+                if let Some(previous) = self.epoch {
+                    if epoch <= previous {
+                        return Err("Catalog revocation did not advance Playnite epoch".into());
+                    }
+                    self.revocations.pop_front();
+                }
+                self.epoch = Some(epoch);
+                self.call = BarrierCall::Submit;
+            }
+            Ok(Response::Error { code, message }) => {
+                if self.epoch.is_some() && code == "provider_epoch_conflict" {
+                    self.revoke_conflicted();
+                }
+                return Err(format!("{code}: {message}"));
+            }
+            Ok(response) => {
+                return Err(format!("unexpected Playnite epoch response: {response:?}"));
+            }
+            Err(_) => {}
+        }
+        Ok(())
+    }
+}
+
+fn settled(response: Result<Response, String>) -> bool {
+    matches!(response, Ok(Response::Ok))
+        || matches!(response, Ok(Response::Error { code, .. }) if code == "not_found")
+}
+
 struct Transaction {
     sync_id: String,
     source_revision: u64,
     settings_epoch: u64,
+    provider_epoch: u64,
     canceled_for_process_change: bool,
     launchable_game_ids: std::collections::BTreeSet<String>,
     entries: Vec<Vec<Value>>,
@@ -101,6 +283,7 @@ impl Transaction {
                 "action":"provider_snapshot_begin",
                 "sync_id":self.sync_id,
                 "source_revision":self.source_revision,
+                "provider_epoch":self.provider_epoch,
                 "expected_collection_revision":self.collection_revision
             }),
             Stage::Batch => json!({
@@ -108,6 +291,7 @@ impl Transaction {
                 "sync_id":self.sync_id,
                 "generation":self.generation.expect("begin is committed first"),
                 "source_revision":self.source_revision,
+                "provider_epoch":self.provider_epoch,
                 "sequence":self.sequence,
                 "expected_revision":self.revision.expect("begin provides revision"),
                 "entries":self.entries_for_batch(),
@@ -120,6 +304,7 @@ impl Transaction {
                 "sync_id":self.sync_id,
                 "generation":self.generation.expect("begin is committed first"),
                 "source_revision":self.source_revision,
+                "provider_epoch":self.provider_epoch,
                 "expected_revision":self.revision.expect("begin provides revision"),
                 "next_sequence":self.sequence,
                 "complete":true,
@@ -564,6 +749,8 @@ fn should_expire(
 
 #[derive(Default)]
 pub struct CatalogSync {
+    epoch_barrier: EpochBarrier,
+    launch_probe: Option<LaunchProbe>,
     transaction: Option<Transaction>,
     completed_launchable_game_ids: Option<std::collections::BTreeSet<String>>,
     source_revision: u64,
@@ -572,6 +759,149 @@ pub struct CatalogSync {
 }
 
 impl CatalogSync {
+    pub fn epoch_ready(&self) -> bool {
+        self.epoch_barrier.ready()
+    }
+
+    pub fn revoke_epoch(&mut self) {
+        self.completed_launchable_game_ids = None;
+        self.cancel_after_process_change();
+        self.cancel_launch_probe(None);
+        self.epoch_barrier.revoke();
+    }
+
+    pub fn cancel_launch_probe(&mut self, operation_id: Option<&str>) {
+        let Some(probe) = self.launch_probe.as_mut() else {
+            return;
+        };
+        if operation_id.is_some_and(|operation_id| probe.operation_id != operation_id) {
+            return;
+        }
+        if probe.request.is_some() {
+            probe.operation_id.clear();
+            probe.verified = false;
+        } else {
+            self.launch_probe = None;
+        }
+    }
+
+    /// A launch is admitted only after a fresh authenticated Catalog inventory
+    /// reply for this operation, including settlement of an accepted child.
+    pub fn verify_launch_epoch(&mut self, operation_id: &str) -> bool {
+        if !self.epoch_ready() {
+            return false;
+        }
+        if let Some(probe) = self.launch_probe.as_ref() {
+            if probe.operation_id == operation_id
+                && probe.verified
+                && Some(probe.provider_epoch) == self.epoch_barrier.epoch
+            {
+                self.launch_probe = None;
+                return true;
+            }
+            if probe.request.is_some() || !probe.verified {
+                return false;
+            }
+        }
+        self.launch_probe = Some(LaunchProbe {
+            operation_id: operation_id.to_owned(),
+            request_id: format!("playnite.catalog.launch-check.{}", new_sync_id(0)),
+            provider_epoch: self.epoch_barrier.epoch.expect("ready epoch"),
+            request: None,
+            deadline: Instant::now(),
+            verified: false,
+        });
+        false
+    }
+
+    fn advance_launch_probe_with(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(Command) -> Result<Response, String>,
+    ) {
+        let Some(mut probe) = self.launch_probe.take() else {
+            return;
+        };
+        if probe.operation_id.is_empty() {
+            if let Some(request) = probe.request
+                && !settle_stale_child_with(request, &mut send)
+            {
+                self.launch_probe = Some(probe);
+            }
+            return;
+        }
+        if Some(probe.provider_epoch) != self.epoch_barrier.epoch {
+            if let Some(request) = probe.request
+                && !settle_stale_child_with(request, &mut send)
+            {
+                self.launch_probe = Some(probe);
+            }
+            return;
+        }
+        if probe.verified {
+            self.launch_probe = Some(probe);
+            return;
+        }
+        if let Some(request) = probe.request {
+            if now >= probe.deadline {
+                if settled(send(Command::Cancel { request }))
+                    && settled(send(Command::ReleaseResult { request }))
+                {
+                    probe.request = None;
+                    probe.request_id = format!("playnite.catalog.launch-check.{}", new_sync_id(0));
+                }
+                self.launch_probe = Some(probe);
+                return;
+            }
+            match send(Command::TakeResult { request }) {
+                Ok(Response::Pending) | Err(_) => {
+                    self.launch_probe = Some(probe);
+                    return;
+                }
+                Ok(response) => {
+                    if !settled(send(Command::ReleaseResult { request })) {
+                        self.launch_probe = Some(probe);
+                        return;
+                    }
+                    probe.request = None;
+                    if let Response::Result { payload } = response {
+                        probe.verified = payload.get("ok").and_then(Value::as_bool) == Some(true)
+                            && payload.get("provider_epoch").and_then(Value::as_u64)
+                                == Some(probe.provider_epoch);
+                    }
+                }
+            }
+        } else {
+            match send(Command::Request {
+                service: CATALOG_SERVICE.into(),
+                payload: json!({"action":"provider_snapshot_inventory","after":null,"limit":1}),
+                timeout_ms: REQUEST_TIMEOUT_MS,
+                operation_id: probe.request_id.clone(),
+                parent: None,
+            }) {
+                Ok(Response::Accepted { id }) => {
+                    probe.request = Some(id);
+                    probe.deadline = now + Duration::from_millis(REQUEST_TIMEOUT_MS + 5_000);
+                }
+                Ok(Response::Result { payload }) => {
+                    probe.verified = payload.get("ok").and_then(Value::as_bool) == Some(true)
+                        && payload.get("provider_epoch").and_then(Value::as_u64)
+                            == Some(probe.provider_epoch);
+                }
+                _ => {}
+            }
+        }
+        if probe.verified && Some(probe.provider_epoch) != self.epoch_barrier.epoch {
+            probe.verified = false;
+        }
+        if !probe.verified && probe.request.is_none() {
+            self.epoch_barrier.invalidate();
+            self.launch_probe = None;
+            return;
+        }
+        self.launch_probe = Some(probe);
+    }
+
     pub fn start(
         &mut self,
         snapshot: &Snapshot,
@@ -644,6 +974,7 @@ impl CatalogSync {
             sync_id: new_sync_id(self.source_revision),
             source_revision: self.source_revision,
             settings_epoch,
+            provider_epoch: self.epoch_barrier.epoch.unwrap_or(0),
             canceled_for_process_change: false,
             launchable_game_ids,
             entries,
@@ -732,23 +1063,32 @@ impl CatalogSync {
         runtime: &RuntimeClient,
         current_settings_epoch: u64,
     ) -> Result<(), String> {
+        if let Err(error) = self
+            .epoch_barrier
+            .advance_with(Instant::now(), |command| runtime.send(command))
+        {
+            self.last_error = Some(format!("Playnite catalog epoch unavailable: {error}"));
+        }
+        if !self.epoch_ready() {
+            return Ok(());
+        }
+        self.advance_launch_probe_with(Instant::now(), |command| runtime.send(command));
+        if !self.epoch_ready() {
+            return Ok(());
+        }
         let Some(mut transaction) = self.transaction.take() else {
             return Ok(());
         };
         if transaction.settings_epoch != current_settings_epoch
             || transaction.canceled_for_process_change
+            || Some(transaction.provider_epoch) != self.epoch_barrier.epoch
         {
             let canceled_for_process_change = transaction.canceled_for_process_change;
-            if let Call::Waiting { request } = transaction.call {
-                // An old provider call may sit in the broker until its full
-                // timeout. Cancel prevents queued delivery and releases its
-                // broker record so a current snapshot can be reconciled.
-                // A call already delivered to Catalog can still mutate there;
-                // the next sync must inventory and reconcile that state.
-                if !settle_canceled_request(runtime, request) {
-                    transaction.call = Call::Waiting { request };
-                    self.transaction = Some(transaction);
-                }
+            if let Call::Waiting { request } = transaction.call
+                && !settle_stale_child_with(request, |command| runtime.send(command))
+            {
+                transaction.call = Call::Waiting { request };
+                self.transaction = Some(transaction);
             }
             self.last_error = Some(
                 if canceled_for_process_change {
@@ -787,15 +1127,22 @@ impl CatalogSync {
                     Err(error) => {
                         transaction.call = Call::Submit { operation_id };
                         self.transaction = Some(transaction);
-                        let _ = error;
+                        self.epoch_barrier.invalidate();
+                        self.last_error = Some(format!("Playnite catalog unavailable: {error}"));
                     }
                 }
             }
             Call::Waiting { request } => {
                 match runtime.send_ephemeral(Command::TakeResult { request }) {
-                    Ok(Response::Pending) | Err(_) => {
+                    Ok(Response::Pending) => {
                         transaction.call = Call::Waiting { request };
                         self.transaction = Some(transaction);
+                    }
+                    Err(error) => {
+                        transaction.call = Call::Waiting { request };
+                        self.transaction = Some(transaction);
+                        self.epoch_barrier.invalidate();
+                        self.last_error = Some(format!("Playnite catalog unavailable: {error}"));
                     }
                     Ok(Response::Result { payload }) => self.finish_call(transaction, payload),
                     Ok(Response::Error { code, message }) => {
@@ -814,18 +1161,31 @@ impl CatalogSync {
     fn finish_call(&mut self, mut transaction: Transaction, payload: Value) {
         match transaction.consume(payload) {
             Ok(true) => {
-                if transaction.publish_launchable_game_ids {
+                if transaction.publish_launchable_game_ids
+                    && self.epoch_ready()
+                    && Some(transaction.provider_epoch) == self.epoch_barrier.epoch
+                {
                     self.completed_launchable_game_ids =
                         Some(transaction.launchable_game_ids.clone());
                 }
                 self.last_error = None;
             }
             Ok(false) => self.transaction = Some(transaction),
-            Err(error) => self.last_error = Some(error),
+            Err(error) => {
+                if error.starts_with("provider_epoch_conflict:") {
+                    self.epoch_barrier.invalidate();
+                }
+                self.last_error = Some(error);
+            }
         }
     }
 
     fn call_failed(&mut self, mut transaction: Transaction, error: String) {
+        if error.starts_with("provider_epoch_conflict:") {
+            self.epoch_barrier.invalidate();
+            self.last_error = Some(error);
+            return;
+        }
         if transaction.conflicts < MAX_CONFLICT_RESTARTS {
             transaction.conflicts += 1;
             transaction.restart();
@@ -836,18 +1196,17 @@ impl CatalogSync {
     }
 }
 
-fn settle_canceled_request(runtime: &RuntimeClient, request: u64) -> bool {
-    for command in [
-        Command::Cancel { request },
-        Command::ReleaseResult { request },
-    ] {
-        match runtime.send_ephemeral(command) {
-            Ok(Response::Ok) => {}
-            Ok(Response::Error { code, .. }) if code == "not_found" => {}
-            _ => return false,
-        }
+fn settle_stale_child_with(
+    request: u64,
+    mut send: impl FnMut(Command) -> Result<Response, String>,
+) -> bool {
+    if settled(send(Command::Cancel { request })) {
+        return settled(send(Command::ReleaseResult { request }));
     }
-    true
+    match send(Command::TakeResult { request }) {
+        Ok(Response::Pending) | Err(_) => false,
+        Ok(_) => settled(send(Command::ReleaseResult { request })),
+    }
 }
 
 fn prepare_entries(games: &[Game]) -> Result<(Vec<Vec<Value>>, u64), String> {
@@ -946,6 +1305,344 @@ mod tests {
         AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
     };
     use std::ffi::c_void;
+
+    #[test]
+    fn lost_revocation_reply_reuses_transition_id_and_unblocks_current_epoch() {
+        let mut barrier = EpochBarrier::default();
+        barrier.revoke();
+        let now = Instant::now();
+        barrier
+            .advance_with(now, |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected inventory")
+                };
+                assert_eq!(payload["action"], "provider_snapshot_inventory");
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":7}),
+                })
+            })
+            .unwrap();
+        let mut original_id = String::new();
+        barrier
+            .advance_with(now, |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected revoke")
+                };
+                assert_eq!(payload["expected_provider_epoch"], 7);
+                original_id = payload["revocation_id"].as_str().unwrap().to_owned();
+                Ok(Response::Accepted { id: 44 })
+            })
+            .unwrap();
+        assert!(!barrier.ready());
+        barrier
+            .advance_with(now + Duration::from_secs(36), |command| {
+                assert!(matches!(
+                    command,
+                    Command::Cancel { request: 44 } | Command::ReleaseResult { request: 44 }
+                ));
+                Ok(Response::Ok)
+            })
+            .unwrap();
+        barrier
+            .advance_with(now + Duration::from_secs(37), |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected retry")
+                };
+                assert_eq!(payload["revocation_id"], original_id);
+                assert_eq!(payload["expected_provider_epoch"], 7);
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":8,"revision":9}),
+                })
+            })
+            .unwrap();
+        assert!(barrier.ready());
+        assert_eq!(barrier.epoch, Some(8));
+    }
+
+    #[test]
+    fn repeated_process_changes_during_outage_share_one_pending_revocation() {
+        let mut barrier = EpochBarrier {
+            epoch: Some(6),
+            ..Default::default()
+        };
+        barrier.revoke();
+        let first_id = barrier.revocations.front().unwrap().clone();
+        for _ in 0..100 {
+            barrier.revoke();
+            barrier
+                .advance_with(Instant::now(), |_| Err("catalog offline".into()))
+                .unwrap();
+        }
+        assert_eq!(barrier.revocations.len(), 1);
+        assert_eq!(barrier.revocations.front(), Some(&first_id));
+        barrier
+            .advance_with(Instant::now(), |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected revoke")
+                };
+                assert_eq!(payload["revocation_id"], first_id);
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":7}),
+                })
+            })
+            .unwrap();
+        assert!(barrier.ready());
+        barrier.revoke();
+        assert_ne!(barrier.revocations.front(), Some(&first_id));
+    }
+
+    #[test]
+    fn revoke_conflict_rereads_epoch_with_new_transition_id() {
+        let mut barrier = EpochBarrier {
+            epoch: Some(3),
+            ..Default::default()
+        };
+        barrier.revoke();
+        let stale_id = barrier.revocations.front().unwrap().clone();
+        assert!(
+            barrier
+                .advance_with(Instant::now(), |command| {
+                    let Command::Request { payload, .. } = command else {
+                        panic!("expected revoke")
+                    };
+                    assert_eq!(payload["revocation_id"], stale_id);
+                    Ok(Response::Result {
+                        payload: json!({"ok":false,"error":{"code":"provider_epoch_conflict"}}),
+                    })
+                })
+                .is_err()
+        );
+        assert_eq!(barrier.epoch, None);
+        assert_ne!(barrier.revocations.front(), Some(&stale_id));
+        barrier
+            .advance_with(Instant::now(), |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected inventory")
+                };
+                assert_eq!(payload["action"], "provider_snapshot_inventory");
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":4}),
+                })
+            })
+            .unwrap();
+        barrier
+            .advance_with(Instant::now(), |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected revoke")
+                };
+                assert_eq!(payload["expected_provider_epoch"], 4);
+                assert_ne!(payload["revocation_id"], stale_id);
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":5}),
+                })
+            })
+            .unwrap();
+        assert!(barrier.ready());
+    }
+
+    #[test]
+    fn launch_probe_requires_result_and_release_then_recovers_after_outage() {
+        let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(3);
+        assert!(!sync.verify_launch_epoch("first"));
+        let now = Instant::now();
+        sync.advance_launch_probe_with(now, |command| {
+            assert!(matches!(command, Command::Request { .. }));
+            Ok(Response::Accepted { id: 61 })
+        });
+        assert!(!sync.verify_launch_epoch("first"));
+        let mut commands = Vec::new();
+        sync.advance_launch_probe_with(now, |command| {
+            commands.push(command);
+            Ok(if commands.len() == 1 {
+                Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":3}),
+                }
+            } else {
+                Response::Ok
+            })
+        });
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::TakeResult { request: 61 },
+                Command::ReleaseResult { request: 61 }
+            ]
+        ));
+        assert!(sync.verify_launch_epoch("first"));
+
+        assert!(!sync.verify_launch_epoch("outage"));
+        sync.advance_launch_probe_with(now, |_| Err("catalog offline".into()));
+        assert!(!sync.epoch_ready());
+        assert!(!sync.verify_launch_epoch("outage"));
+        sync.epoch_barrier
+            .advance_with(now, |_| {
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":3}),
+                })
+            })
+            .unwrap();
+        sync.epoch_barrier
+            .advance_with(now, |_| {
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":4}),
+                })
+            })
+            .unwrap();
+        assert!(sync.epoch_ready());
+        assert!(!sync.verify_launch_epoch("recovered"));
+        sync.advance_launch_probe_with(now, |_| {
+            Ok(Response::Result {
+                payload: json!({"ok":true,"provider_epoch":4}),
+            })
+        });
+        assert!(sync.verify_launch_epoch("recovered"));
+    }
+
+    #[test]
+    fn expired_launch_probe_settles_old_child_before_new_operation() {
+        let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(5);
+        assert!(!sync.verify_launch_epoch("old"));
+        sync.advance_launch_probe_with(Instant::now(), |_| Ok(Response::Accepted { id: 62 }));
+        sync.cancel_launch_probe(Some("old"));
+        assert!(!sync.verify_launch_epoch("new"));
+        sync.advance_launch_probe_with(Instant::now(), |command| {
+            assert!(matches!(
+                command,
+                Command::Cancel { request: 62 } | Command::ReleaseResult { request: 62 }
+            ));
+            Ok(Response::Ok)
+        });
+        assert!(sync.launch_probe.is_none());
+        assert!(!sync.verify_launch_epoch("new"));
+        sync.advance_launch_probe_with(Instant::now(), |_| {
+            Ok(Response::Result {
+                payload: json!({"ok":true,"provider_epoch":5}),
+            })
+        });
+        assert!(sync.verify_launch_epoch("new"));
+    }
+
+    #[test]
+    fn canceled_finish_child_remains_owned_until_broker_settles() {
+        for attempt in 0..8 {
+            let mut calls = Vec::new();
+            assert!(!settle_stale_child_with(63, |command| {
+                calls.push(command);
+                if attempt % 2 == 0 && calls.len() == 1 {
+                    Err("cancel unavailable".into())
+                } else if attempt % 2 == 1 && calls.len() == 2 {
+                    Err("release unavailable".into())
+                } else if attempt % 2 == 1 {
+                    Ok(Response::Ok)
+                } else {
+                    Ok(Response::Pending)
+                }
+            }));
+        }
+        let mut calls = Vec::new();
+        assert!(settle_stale_child_with(63, |command| {
+            calls.push(command);
+            Ok(Response::Ok)
+        }));
+        assert!(matches!(
+            calls.as_slice(),
+            [
+                Command::Cancel { request: 63 },
+                Command::ReleaseResult { request: 63 }
+            ]
+        ));
+    }
+
+    #[test]
+    fn old_finish_is_not_resubmitted_after_epoch_revocation() {
+        let snapshot = Snapshot {
+            games: vec![],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(7);
+        sync.start(&snapshot, &ProductSettings::default(), 1, 0)
+            .unwrap();
+        let transaction = sync.transaction.as_mut().unwrap();
+        transaction.stage = Stage::Finish;
+        transaction.generation = Some(1);
+        transaction.revision = Some(1);
+        transaction.call = Call::Waiting { request: 51 };
+        assert_eq!(transaction.payload()["provider_epoch"], 7);
+        sync.cancel_after_process_change();
+        sync.revoke_epoch();
+        sync.epoch_barrier
+            .advance_with(Instant::now(), |command| {
+                let Command::Request { payload, .. } = command else {
+                    panic!("expected revoke")
+                };
+                assert_eq!(payload["action"], "provider_snapshot_revoke");
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":8,"revision":2}),
+                })
+            })
+            .unwrap();
+        assert!(sync.epoch_ready());
+        assert!(
+            sync.transaction
+                .as_ref()
+                .unwrap()
+                .canceled_for_process_change
+        );
+        assert!(sync.take_completed_launchable_game_ids().is_none());
+        let mut current = CatalogSync::default();
+        current.epoch_barrier.epoch = Some(8);
+        current
+            .start(&snapshot, &ProductSettings::default(), 2, 0)
+            .unwrap();
+        assert_eq!(
+            current.transaction.as_ref().unwrap().payload()["action"],
+            "provider_snapshot_inventory"
+        );
+        current.transaction.as_mut().unwrap().stage = Stage::Begin;
+        assert_eq!(
+            current.transaction.as_ref().unwrap().payload()["provider_epoch"],
+            8
+        );
+    }
+
+    #[test]
+    fn catalog_epoch_conflict_reloads_durable_epoch_before_new_snapshot() {
+        let snapshot = Snapshot {
+            games: vec![],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(2);
+        sync.start(&snapshot, &ProductSettings::default(), 1, 0)
+            .unwrap();
+        let transaction = sync.transaction.take().unwrap();
+        sync.finish_call(transaction, json!({"ok":false,"error":{"code":"provider_epoch_conflict","message":"stale provider"}}));
+        assert!(!sync.epoch_ready());
+        assert!(!sync.busy());
+        sync.epoch_barrier
+            .advance_with(Instant::now(), |_| {
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":4}),
+                })
+            })
+            .unwrap();
+        sync.epoch_barrier
+            .advance_with(Instant::now(), |_| {
+                Ok(Response::Result {
+                    payload: json!({"ok":true,"provider_epoch":5}),
+                })
+            })
+            .unwrap();
+        assert!(sync.epoch_ready());
+        sync.start(&snapshot, &ProductSettings::default(), 2, 0)
+            .unwrap();
+        assert_eq!(sync.transaction.as_ref().unwrap().provider_epoch, 5);
+    }
 
     #[derive(Default)]
     struct FakeCatalogHost {
@@ -1166,6 +1863,7 @@ mod tests {
             ..ProductSettings::default()
         };
         let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(0);
         sync.start(&snapshot, &settings, 7, 0).unwrap();
         sync.retain_for_settings_epoch(8, true);
 
@@ -1417,6 +2115,7 @@ mod tests {
             ..ProductSettings::default()
         };
         let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(0);
         sync.start(&snapshot, &settings, 1, 0).unwrap();
         let mut transaction = sync.transaction.take().unwrap();
         assert!(transaction.publish_launchable_game_ids);
@@ -1782,6 +2481,7 @@ mod tests {
     fn launch_eligibility_is_published_only_after_complete_catalog_finish() {
         let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
         let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(8);
         sync.start(
             &Snapshot {
                 games: vec![game(game_id, "Game", r"C:\Games\game.exe")],
@@ -1799,9 +2499,15 @@ mod tests {
         assert!(sync.take_completed_launchable_game_ids().is_none());
 
         let mut transaction = sync.transaction.take().unwrap();
-        transaction.stage = Stage::Finish;
+        assert_eq!(transaction.provider_epoch, 8);
+        transaction.stage = Stage::Begin;
+        assert_eq!(transaction.payload()["provider_epoch"], 8);
+        transaction.stage = Stage::Batch;
         transaction.generation = Some(1);
         transaction.revision = Some(2);
+        assert_eq!(transaction.payload()["provider_epoch"], 8);
+        transaction.stage = Stage::Finish;
+        assert_eq!(transaction.payload()["provider_epoch"], 8);
         sync.finish_call(
             transaction,
             json!({
