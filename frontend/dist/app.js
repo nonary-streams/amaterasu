@@ -841,7 +841,7 @@ var Amaterasu;
             this.resetMemory(true, true);
             const pending = this.withSessionLock(async () => {
                 if (this.readPendingCookieLogout() !== marker)
-                    return;
+                    throw new ApiError("Sign-out could not be confirmed because another browser session changed while it was waiting. Review the current session before retrying.", "logout_unconfirmed", 503);
                 await this.completeCookieLogout(marker);
             });
             this.logoutInFlight = pending;

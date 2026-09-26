@@ -1401,10 +1401,49 @@ test("peer sign-out during a locked login cancels that login without a later rev
   active = true;
   finishLogin(Response.json(browserReply(future(3600))));
   await assert.rejects(replacing, /cancelled by a pending sign-out/);
-  await logout;
+  await assert.rejects(logout, { code: "logout_unconfirmed" });
   assert.equal(active, false);
   assert.equal(logouts, 3); // Initial cleanup, replacement cleanup, pending cleanup.
   assert.equal(second.api.subject, "");
+});
+
+test("queued logout reports unconfirmed when peer replaces its marker and session", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const locks = lockManager();
+  let logouts = 0;
+  let peerSessionActive = false;
+  const { api } = apiHarness((url) => {
+    if (url.endsWith("/browser/logout")) {
+      logouts += 1;
+      return Response.json({ ok: true });
+    }
+    return Response.json(browserReply(future(3600)));
+  }, { origin, storage, locks });
+  await api.login("admin", "password", true);
+
+  let release;
+  let acquired;
+  const lockAcquired = new Promise((resolve) => acquired = resolve);
+  const blocker = locks.request(
+    `amaterasu.session.refresh:${origin}`,
+    { mode: "exclusive" },
+    () => new Promise((resolve) => {
+      release = resolve;
+      acquired();
+    }),
+  );
+  await lockAcquired;
+  const logout = api.logout();
+  storage.removeItem(`amaterasu.session.cookie-pending-logout.${encodeURIComponent(origin)}`);
+  peerSessionActive = true;
+  release();
+  await blocker;
+
+  await assert.rejects(logout, { code: "logout_unconfirmed" });
+  assert.equal(logouts, 1); // Initial pre-login cleanup only.
+  assert.equal(peerSessionActive, true);
+  assert.equal(api.subject, "");
 });
 
 test("queued stale HTTPS login cannot overwrite a newer cookie session", async () => {
