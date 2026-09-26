@@ -13,12 +13,13 @@ pub const fn ioctl(function: u32, access: u32) -> u32 {
 }
 pub const VERSION: u32 = ioctl(0x900, 0);
 pub const CREATE_OWNED: u32 = ioctl(0x90c, 3);
+pub const RECLAIM: u32 = ioctl(0x90d, 3);
 pub const REMOVE: u32 = ioctl(0x902, 3);
 pub const FEED: u32 = ioctl(0x903, 3);
 pub const QUERY_LEASE: u32 = ioctl(0x905, 1);
 pub const QUERY_STATE: u32 = ioctl(0x908, 1);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Binding {
     pub adapter_low: u32,
     pub adapter_high: i32,
@@ -70,6 +71,28 @@ pub fn created(bytes: &[u8], lease: u64, display: u64) -> Result<Binding, &'stat
     })
 }
 
+pub fn reclaim_request(display: u64, lease: u64, capability: &[u8; 32]) -> Vec<u8> {
+    let mut bytes = packet(72);
+    put_u64(&mut bytes, 16, display);
+    put_u64(&mut bytes, 24, lease);
+    put_u32(&mut bytes, 32, LEASE_TIMEOUT_MS);
+    bytes[40..72].copy_from_slice(capability);
+    bytes
+}
+
+pub fn reclaimed(bytes: &[u8], lease: u64, display: u64) -> Result<(), &'static str> {
+    check(bytes, 48)?;
+    if read_u64(bytes, 16) != lease
+        || read_u64(bytes, 24) != display
+        || read_u32(bytes, 36) != LEASE_TIMEOUT_MS
+        || read_u32(bytes, 40) != 1
+        || read_u32(bytes, 44) != 0
+    {
+        return Err("invalid_driver_response");
+    }
+    Ok(())
+}
+
 pub fn lease_request(lease: u64) -> Vec<u8> {
     let mut bytes = packet(32);
     put_u64(&mut bytes, 16, lease);
@@ -102,12 +125,51 @@ pub fn present(bytes: &[u8], lease: u64, display: u64) -> Result<bool, &'static 
     if count > 16 || read_u32(bytes, 16) > 16 || read_u32(bytes, 20) > 16 {
         return Err("invalid_driver_response");
     }
-    Ok((0..count).any(|index| {
+    let matches: Vec<_> = (0..count)
+        .filter(|index| {
+            let offset = 32 + 104 * index;
+            read_u32(bytes, offset) == 2 && read_u64(bytes, offset + 16) == display
+        })
+        .collect();
+    if matches.len() > 1 {
+        return Err("invalid_driver_response");
+    }
+    Ok(matches
+        .first()
+        .is_some_and(|index| read_u64(bytes, 32 + 104 * index + 8) == lease))
+}
+
+pub fn matches_specification(
+    bytes: &[u8],
+    lease: u64,
+    display: u64,
+    spec: &Specification,
+) -> Result<bool, &'static str> {
+    check(bytes, STATE_BYTES)?;
+    let count = read_u32(bytes, 24) as usize;
+    if count > 16 || read_u32(bytes, 16) > 16 || read_u32(bytes, 20) > 16 {
+        return Err("invalid_driver_response");
+    }
+    for index in 0..count {
         let offset = 32 + 104 * index;
-        read_u32(bytes, offset) == 2
+        if read_u32(bytes, offset) == 2
             && read_u64(bytes, offset + 8) == lease
             && read_u64(bytes, offset + 16) == display
-    }))
+        {
+            let name = &bytes[offset + 72..offset + 104];
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or("invalid_driver_response")?;
+            return Ok(read_u32(bytes, offset + 52) == spec.width
+                && read_u32(bytes, offset + 56) == spec.height
+                && read_u32(bytes, offset + 60) == 600
+                && read_u32(bytes, offset + 64) == 340
+                && read_u32(bytes, offset + 68) == spec.refresh_millihz
+                && &name[..end] == spec.name.as_bytes());
+        }
+    }
+    Ok(false)
 }
 
 fn check(bytes: &[u8], length: usize) -> Result<(), &'static str> {
@@ -156,6 +218,13 @@ mod tests {
         assert_eq!(&encoded[56..64], b"Example\0");
         assert_eq!(&encoded[96..], &[0x7c; 32]);
         assert_eq!(CREATE_OWNED, 0x22e430);
+        assert_eq!(RECLAIM, 0x22e434);
+        let reclaim = reclaim_request(42, 0x6000000000000002, &[0x7c; 32]);
+        assert_eq!(reclaim.len(), 72);
+        assert_eq!(read_u64(&reclaim, 16), 42);
+        assert_eq!(read_u64(&reclaim, 24), 0x6000000000000002);
+        assert_eq!(read_u32(&reclaim, 32), LEASE_TIMEOUT_MS);
+        assert_eq!(&reclaim[40..], &[0x7c; 32]);
         assert_eq!(remove_request(9, 42).len(), 32);
         assert_eq!(read_u64(&remove_request(9, 42), 24), 42);
     }
@@ -181,6 +250,44 @@ mod tests {
         assert!(created(&reply, 7, 9).is_err());
         reply[0] ^= 1;
         assert!(created(&reply, 7, 8).is_err());
+        let mut reclaimed_reply = packet(48);
+        put_u64(&mut reclaimed_reply, 16, 10);
+        put_u64(&mut reclaimed_reply, 24, 11);
+        put_u32(&mut reclaimed_reply, 36, LEASE_TIMEOUT_MS);
+        put_u32(&mut reclaimed_reply, 40, 1);
+        reclaimed(&reclaimed_reply, 10, 11).unwrap();
+        put_u32(&mut reclaimed_reply, 40, 2);
+        assert!(reclaimed(&reclaimed_reply, 10, 11).is_err());
+    }
+
+    #[test]
+    fn state_requires_unique_exact_specification() {
+        let spec = Specification {
+            identity: "00000000-0000-0000-0000-000000000001".into(),
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60000,
+            name: "Example".into(),
+        };
+        let mut state = packet(STATE_BYTES);
+        put_u32(&mut state, 24, 1);
+        put_u32(&mut state, 32, 2);
+        put_u64(&mut state, 40, 7);
+        put_u64(&mut state, 48, 8);
+        put_u32(&mut state, 84, spec.width);
+        put_u32(&mut state, 88, spec.height);
+        put_u32(&mut state, 92, 600);
+        put_u32(&mut state, 96, 340);
+        put_u32(&mut state, 100, spec.refresh_millihz);
+        state[104..111].copy_from_slice(b"Example");
+        assert!(present(&state, 7, 8).unwrap());
+        assert!(matches_specification(&state, 7, 8, &spec).unwrap());
+        state[104] = b'X';
+        assert!(!matches_specification(&state, 7, 8, &spec).unwrap());
+        put_u32(&mut state, 24, 2);
+        put_u32(&mut state, 136, 2);
+        put_u64(&mut state, 152, 8);
+        assert!(present(&state, 7, 8).is_err());
     }
 }
 

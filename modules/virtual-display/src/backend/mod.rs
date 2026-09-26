@@ -14,6 +14,7 @@ pub struct Ready {
 }
 pub struct Observation {
     pub exists: bool,
+    pub specification_matches: bool,
     pub pending_departure: bool,
     pub ready: Option<Ready>,
 }
@@ -32,8 +33,15 @@ pub trait Driver {
         lease: u64,
         display: u64,
         binding: Option<Binding>,
+        specification: &Specification,
     ) -> Result<Observation, &'static str>;
     fn feed(&mut self, lease: u64) -> Result<(), &'static str>;
+    fn reclaim(
+        &mut self,
+        display: u64,
+        lease: u64,
+        capability: &[u8; 32],
+    ) -> Result<(), &'static str>;
     fn remove(&mut self, lease: u64, display: u64) -> Result<(), &'static str>;
 }
 
@@ -67,10 +75,19 @@ impl Driver for NativeDriver {
     ) -> Result<Binding, &'static str> {
         Err("unsupported_platform")
     }
-    fn inspect(&mut self, _: u64, _: u64, _: Option<Binding>) -> Result<Observation, &'static str> {
+    fn inspect(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: Option<Binding>,
+        _: &Specification,
+    ) -> Result<Observation, &'static str> {
         Err("unsupported_platform")
     }
     fn feed(&mut self, _: u64) -> Result<(), &'static str> {
+        Err("unsupported_platform")
+    }
+    fn reclaim(&mut self, _: u64, _: u64, _: &[u8; 32]) -> Result<(), &'static str> {
         Err("unsupported_platform")
     }
     fn remove(&mut self, _: u64, _: u64) -> Result<(), &'static str> {

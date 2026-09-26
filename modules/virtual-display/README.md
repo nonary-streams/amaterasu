@@ -27,7 +27,10 @@ select Sunshine. Non-Windows create returns `unsupported_platform` when the modu
 is enabled and the Sunshine driver is selected.
 
 The provider needs only its service registration grant; clients need its call
-grant. There are no state, filesystem, or subprocess service dependencies.
+grant. On Windows, an enabled provider stores a private lease journal beneath
+`LOCALAPPDATA/Amaterasu/virtual-display` (falling back to `APPDATA`). It fails
+startup when this location is unavailable, linked, corrupt, or inaccessible.
+There are no state-service or subprocess dependencies.
 `serde`/`serde_json` implement the bounded SDK JSON boundary, `sha2` derives stable
 caller-specific IDs, `getrandom` supplies lease capabilities, and `windows-sys`
 provides documented Win32 bindings. Native code remains trusted, not sandboxed.
@@ -63,7 +66,11 @@ driver HDR luminance. At most eight records exist across callers.
 
 Create returns `{"ok":true,"monitor":{...}}` when ownership is recorded, including
 when a failed driver acknowledgement starts cleanup. Inspect `state` and `error`:
-`creating`, `ready`, `removing`, or `cleanup_failed`. A `ready` value contains the
+`creating`, `ready`, `recovered`, `reclaim_pending`, `removing`, or `cleanup_failed`.
+`recovered` is a capability-verified lease whose original CCD binding may be
+unavailable after a lost create reply; it remains fed but does not advertise
+capture readiness. `reclaim_pending` blocks feed and removal until exact driver
+state resolves an interrupted reclaim. A `ready` value contains the
 validated Windows monitor `device_path` and whether CCD reports the path active.
 Readiness means the exact returned adapter/target has a published monitor identity;
 it does not mean capture, encoding, streaming, or topology activation is ready.
@@ -79,7 +86,12 @@ caller, identity, and specification returns the existing record without replayin
 the native effect. Changing its specification returns `identity_conflict` until
 removed. A SHA-256 derivation of caller and UUID yields the stable requested driver
 ID; a fresh random lease/capability is used for each new lifecycle. Neither secret
-is exposed. Missing remove is idempotent. A remove of another caller's UUID never
+is exposed. The journal durably records owner, specification, capability, and
+lease before native creation. Restart reclaims a live matching monitor through
+the driver's capability-checked fencing operation, which rotates to a fresh
+lease. The prospective lease is journaled before that operation; a lost reply
+is resolved by inspecting both exact IDs. A stale capability or mismatched
+driver specification never authorizes feed or removal. Missing remove is idempotent. A remove of another caller's UUID never
 removes that caller's monitor. Status is a bounded snapshot, not persistent history;
 it reports the module gate and both canonical setting names, marks activation as
 unsupported through `activation_supported`, `activation_state`, and
@@ -89,9 +101,8 @@ driver is not selected.
 ## Protocol provenance and safety
 
 Behavior and ABI were inspected at Vibeshine commit
-`aa292c4cb097f22beab19d6ebf0307367f9bf449`, whose pinned
-`third-party/libvirtualdisplay` commit is
-`a72ba1c50392bb8f4c0549022739732903fe44ba`, particularly
+`457237db`, whose pinned `third-party/libvirtualdisplay` commit is
+`3083d210b55fba4b886e5c634e6abee0942201d4`, particularly
 `src/driver/include/virtual_display/driver/control_protocol.h`. This adapter is an
 original implementation; it does not copy or translate the reference implementation.
 
@@ -104,6 +115,7 @@ control codes with these function numbers and byte layouts:
 | --- | --- | --- |
 | Version | 0x900 | 0 / 24 |
 | Owned temporary create | 0x90c | 128 / 56 |
+| Capability-checked reclaim | 0x90d | 72 / 48 |
 | Exact lease/display remove | 0x902 | 32 / 0 |
 | Lease feed | 0x903 | 32 / 0 |
 | Lease query | 0x905 | 32 / 48 |
@@ -126,7 +138,8 @@ A ten-second lease is fed once per second while healthy. One monitor is maintain
 per tick, with 200 ms polling. Ambiguous creation is never replayed: it enters exact
 lease/display cleanup. Cleanup makes at most three native removal attempts per
 window; an explicit Remove by the owning caller can retry a failed window. The
-manager keeps its record until state and pending-departure queries confirm removal.
+manager keeps its record and journal entry until state and pending-departure
+queries confirm removal. Unresolved restart records block duplicate creation.
 Failed cleanup stops lease feeding. Drop makes one best-effort exact removal per owned record;
 there is no remove-all command. A newly admitted create whose completion is cancelled or cannot be delivered enters
 exact cleanup and stops feeding; failed completion of an idempotent retry leaves
@@ -138,9 +151,11 @@ actual OS departure.
 
 Real Windows hardware/driver qualification remains required; tests use a fake backend
 and byte fixtures, and cross-compilation does not prove driver interoperability.
-Durable lease capability storage/reclaim and restart recovery are unimplemented.
-The driver ID remains stable on a later create, but this is not durable ownership:
-a crash can require waiting for the previous lease to expire. Driver identity
+The driver does not return the CCD adapter/target binding on reclaim. A lease
+recovered from a lost create reply therefore remains in `recovered` state and
+cannot report a ready device path until a future API provides that binding.
+If the driver is unavailable or the lease has expired, recovery waits for
+confirmed exact departure; it does not issue a duplicate create. Driver identity
 retention/cleanup policy, persistent monitor manifests, adapter selection, HDR/ICC,
 DPI controls, and the incompatible SudoVDA protocol are not supported. There is no
 automatic session/launch coordination or Linux DRM virtual display backend yet.

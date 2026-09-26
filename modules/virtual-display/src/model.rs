@@ -128,7 +128,7 @@ pub enum Operation {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Specification {
     pub identity: String,
     pub width: u32,

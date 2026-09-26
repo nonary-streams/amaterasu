@@ -1,5 +1,6 @@
 //! Caller-owned temporary monitors for the Sunshine Windows virtual display driver.
 mod backend;
+mod journal;
 mod manager;
 mod model;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -8,6 +9,7 @@ mod scale;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeDriver;
+use journal::Journal;
 use manager::Manager;
 use model::{Operation, Settings, failure};
 
@@ -28,10 +30,12 @@ impl ManagedModule for VirtualDisplayModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self {
-            runtime,
-            manager: Manager::new(settings, NativeDriver::new()),
-        })
+        let manager = if settings.enabled && cfg!(windows) {
+            Manager::with_journal(settings, NativeDriver::new(), Journal::open_default()?)?
+        } else {
+            Manager::new(settings, NativeDriver::new())
+        };
+        Ok(Self { runtime, manager })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {

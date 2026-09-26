@@ -72,6 +72,19 @@ impl Driver for NativeDriver {
         self.exchange(protocol::FEED, &protocol::lease_request(lease), 0)
             .map(|_| ())
     }
+    fn reclaim(
+        &mut self,
+        display: u64,
+        lease: u64,
+        capability: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        let reply = self.exchange(
+            protocol::RECLAIM,
+            &protocol::reclaim_request(display, lease, capability),
+            48,
+        )?;
+        protocol::reclaimed(&reply, lease, display)
+    }
     fn remove(&mut self, lease: u64, display: u64) -> Result<(), &'static str> {
         self.exchange(
             protocol::REMOVE,
@@ -85,9 +98,12 @@ impl Driver for NativeDriver {
         lease: u64,
         display: u64,
         binding: Option<Binding>,
+        specification: &Specification,
     ) -> Result<Observation, &'static str> {
         let state = self.exchange(protocol::QUERY_STATE, &[], protocol::STATE_BYTES)?;
         let exists = protocol::present(&state, lease, display)?;
+        let specification_matches =
+            !exists || protocol::matches_specification(&state, lease, display, specification)?;
         let lease_state =
             self.exchange(protocol::QUERY_LEASE, &protocol::lease_request(lease), 48)?;
         let pending_departure = protocol::pending_departure(&lease_state, lease)?;
@@ -101,6 +117,7 @@ impl Driver for NativeDriver {
         };
         Ok(Observation {
             exists,
+            specification_matches,
             pending_departure,
             ready,
         })

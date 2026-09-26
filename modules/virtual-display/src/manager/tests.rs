@@ -2,6 +2,7 @@ use super::*;
 use crate::backend::Observation;
 use crate::scale::SUPPORTED_SCALE_VALUES;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 const ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -43,10 +44,17 @@ impl Driver for Fake {
             target: 2,
         })
     }
-    fn inspect(&mut self, _: u64, _: u64, _: Option<Binding>) -> Result<Observation, &'static str> {
+    fn inspect(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: Option<Binding>,
+        _: &Specification,
+    ) -> Result<Observation, &'static str> {
         let calls = self.0.borrow();
         Ok(Observation {
             exists: calls.exists,
+            specification_matches: true,
             pending_departure: calls.pending,
             ready: calls.ready.then(|| Ready {
                 device_path: "owned-device".into(),
@@ -57,6 +65,9 @@ impl Driver for Fake {
     fn feed(&mut self, lease: u64) -> Result<(), &'static str> {
         self.0.borrow_mut().feeds.push(lease);
         Ok(())
+    }
+    fn reclaim(&mut self, _: u64, _: u64, _: &[u8; 32]) -> Result<(), &'static str> {
+        Err("reclaim_unavailable")
     }
     fn remove(&mut self, lease: u64, display: u64) -> Result<(), &'static str> {
         let mut calls = self.0.borrow_mut();
@@ -106,6 +117,299 @@ fn tick(manager: &mut Manager<Fake>) {
         monitor.next_poll = Instant::now();
     }
     manager.tick();
+}
+
+#[derive(Default)]
+struct RecoveryCalls {
+    lease: Option<u64>,
+    display: u64,
+    capability: [u8; 32],
+    creates: usize,
+    reclaims: usize,
+    removes: usize,
+    mismatch: bool,
+    lost_reclaim_reply: bool,
+}
+
+struct RecoveryFake(Rc<RefCell<RecoveryCalls>>);
+
+impl Driver for RecoveryFake {
+    fn supported(&self) -> bool {
+        true
+    }
+    fn create(
+        &mut self,
+        _: &Specification,
+        _: u64,
+        _: u64,
+        _: &[u8; 32],
+    ) -> Result<Binding, &'static str> {
+        self.0.borrow_mut().creates += 1;
+        Err("unexpected_create")
+    }
+    fn inspect(
+        &mut self,
+        lease: u64,
+        display: u64,
+        _: Option<Binding>,
+        _: &Specification,
+    ) -> Result<Observation, &'static str> {
+        let calls = self.0.borrow();
+        let exists = calls.lease == Some(lease) && calls.display == display;
+        Ok(Observation {
+            exists,
+            specification_matches: !exists || !calls.mismatch,
+            pending_departure: false,
+            ready: None,
+        })
+    }
+    fn feed(&mut self, _: u64) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn reclaim(
+        &mut self,
+        display: u64,
+        lease: u64,
+        capability: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        let mut calls = self.0.borrow_mut();
+        calls.reclaims += 1;
+        if calls.lease.is_none() || calls.display != display || &calls.capability != capability {
+            return Err("lease_not_found");
+        }
+        calls.lease = Some(lease);
+        if calls.lost_reclaim_reply {
+            Err("driver_io_timeout")
+        } else {
+            Ok(())
+        }
+    }
+    fn remove(&mut self, lease: u64, display: u64) -> Result<(), &'static str> {
+        let mut calls = self.0.borrow_mut();
+        calls.removes += 1;
+        if calls.lease == Some(lease) && calls.display == display {
+            calls.lease = None;
+        }
+        Ok(())
+    }
+}
+
+fn recovery_journal() -> (Journal, PathBuf) {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-vd-recovery-{:016x}",
+        u64::from_le_bytes(nonce)
+    ));
+    let journal = Journal::open(&root.join("leases.jsonl")).unwrap();
+    (journal, root)
+}
+
+fn recovery_record(prospective_lease: Option<u64>) -> Record {
+    let specification = match create() {
+        Operation::Create {
+            identity,
+            width,
+            height,
+            refresh_millihz,
+            name,
+            ..
+        } => Specification {
+            identity,
+            width,
+            height,
+            refresh_millihz,
+            name,
+        },
+        _ => unreachable!(),
+    };
+    Record {
+        owner: "alice".into(),
+        display_id: display_id("alice", ID),
+        specification,
+        lease: 0x6000_0000_0000_0001,
+        prospective_lease,
+        capability: [7; 32],
+        binding: None,
+    }
+}
+
+#[test]
+fn restart_reclaims_prepared_owned_create_without_replaying_create() {
+    let (mut journal, root) = recovery_journal();
+    let record = recovery_record(None);
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(record.lease),
+        display: record.display_id,
+        capability: record.capability,
+        ..Default::default()
+    }));
+    let mut manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        RecoveryFake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(calls.borrow().reclaims, 1);
+    assert_ne!(
+        manager.monitors.values().next().unwrap().lease,
+        record.lease
+    );
+    assert_eq!(
+        manager.handle("alice", create())["monitor"]["state"],
+        "recovered"
+    );
+    assert!(
+        manager.handle("bob", Operation::Status { identity: None })["monitors"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        manager.handle(
+            "bob",
+            Operation::Remove {
+                identity: ID.into()
+            }
+        )["removed"],
+        true
+    );
+    assert_eq!(calls.borrow().creates, 0);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lost_reclaim_reply_adopts_only_the_recorded_new_lease() {
+    let (mut journal, root) = recovery_journal();
+    let new_lease = 0x6000_0000_0000_0002;
+    let record = recovery_record(Some(new_lease));
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(new_lease),
+        display: record.display_id,
+        capability: record.capability,
+        ..Default::default()
+    }));
+    let manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        RecoveryFake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(manager.monitors.values().next().unwrap().lease, new_lease);
+    assert_eq!(calls.borrow().reclaims, 0);
+    assert_eq!(
+        manager
+            .journal
+            .as_ref()
+            .unwrap()
+            .records()
+            .next()
+            .unwrap()
+            .prospective_lease,
+        None
+    );
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ambiguous_reclaim_reply_remains_prepared_until_exact_readback() {
+    let (mut journal, root) = recovery_journal();
+    let new_lease = 0x6000_0000_0000_0002;
+    let record = recovery_record(Some(new_lease));
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(record.lease),
+        display: record.display_id,
+        capability: record.capability,
+        lost_reclaim_reply: true,
+        ..Default::default()
+    }));
+    let mut manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        RecoveryFake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    assert_eq!(
+        manager.monitors.values().next().unwrap().state,
+        "reclaim_pending"
+    );
+    assert_eq!(calls.borrow().lease, Some(new_lease));
+    assert_eq!(
+        manager
+            .journal
+            .as_ref()
+            .unwrap()
+            .records()
+            .next()
+            .unwrap()
+            .prospective_lease,
+        Some(new_lease)
+    );
+    manager.monitors.values_mut().next().unwrap().next_poll = Instant::now();
+    manager.tick();
+    assert_eq!(manager.monitors.values().next().unwrap().state, "recovered");
+    assert_eq!(manager.monitors.values().next().unwrap().lease, new_lease);
+    assert_eq!(calls.borrow().reclaims, 1);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stale_capability_and_specification_mismatch_fail_closed() {
+    for mismatch in [false, true] {
+        let (mut journal, root) = recovery_journal();
+        let record = recovery_record(None);
+        journal.upsert(record.clone()).unwrap();
+        let calls = Rc::new(RefCell::new(RecoveryCalls {
+            lease: Some(record.lease),
+            display: record.display_id,
+            capability: [9; 32],
+            mismatch,
+            ..Default::default()
+        }));
+        let mut manager = Manager::with_journal(
+            Settings {
+                enabled: true,
+                ..Settings::default()
+            },
+            RecoveryFake(calls.clone()),
+            journal,
+        )
+        .unwrap();
+        assert_eq!(calls.borrow().creates, 0);
+        assert_eq!(calls.borrow().removes, 0);
+        if !mismatch {
+            assert_eq!(
+                manager.handle(
+                    "alice",
+                    Operation::Remove {
+                        identity: ID.into()
+                    }
+                )["code"],
+                "recovery_pending"
+            );
+        }
+        assert_eq!(calls.borrow().removes, 0);
+        assert_eq!(manager.handle("alice", create())["ok"], false);
+        assert!(manager.journal.as_ref().unwrap().records().next().is_some());
+        drop(manager);
+        assert_eq!(calls.borrow().removes, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn create_payload() -> serde_json::Value {

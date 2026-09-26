@@ -1,4 +1,5 @@
 use crate::backend::{Driver, Ready};
+use crate::journal::{Journal, Record};
 use crate::model::{Operation, Settings, Specification, display_id, failure, valid_identity};
 use crate::protocol::Binding;
 use crate::scale::ScaleSetting;
@@ -15,6 +16,8 @@ struct Monitor {
     specification: Specification,
     display_id: u64,
     lease: u64,
+    prospective_lease: Option<u64>,
+    capability: [u8; 32],
     binding: Option<Binding>,
     ready: Option<Ready>,
     state: &'static str,
@@ -26,6 +29,17 @@ struct Monitor {
 }
 
 impl Monitor {
+    fn record(&self, owner: &str) -> Record {
+        Record {
+            owner: owner.into(),
+            specification: self.specification.clone(),
+            display_id: self.display_id,
+            lease: self.lease,
+            prospective_lease: self.prospective_lease,
+            capability: self.capability,
+            binding: self.binding,
+        }
+    }
     fn response(&self) -> Value {
         json!({"ok":true,"monitor":{"specification":self.specification,"display_id":format!("{:016x}",self.display_id),
             "state":self.state,"ready":self.ready,"error":self.error}})
@@ -48,6 +62,7 @@ pub struct Manager<D: Driver> {
     settings: Settings,
     driver: D,
     monitors: BTreeMap<(String, String), Monitor>,
+    journal: Option<Journal>,
     cursor: usize,
 }
 
@@ -57,8 +72,163 @@ impl<D: Driver> Manager<D> {
             settings,
             driver,
             monitors: BTreeMap::new(),
+            journal: None,
             cursor: 0,
         }
+    }
+
+    pub fn with_journal(settings: Settings, driver: D, journal: Journal) -> Result<Self, String> {
+        let mut manager = Self::new(settings, driver);
+        let records: Vec<_> = journal.records().cloned().collect();
+        manager.journal = Some(journal);
+        for record in records {
+            manager.recover(record)?;
+        }
+        Ok(manager)
+    }
+
+    fn recover(&mut self, record: Record) -> Result<(), String> {
+        let now = Instant::now();
+        let key = (record.owner.clone(), record.specification.identity.clone());
+        let mut monitor = Monitor {
+            specification: record.specification,
+            display_id: record.display_id,
+            lease: record.lease,
+            prospective_lease: record.prospective_lease,
+            capability: record.capability,
+            binding: record.binding,
+            ready: None,
+            state: "recovered",
+            error: None,
+            readiness_started: now,
+            next_poll: now,
+            next_feed: now,
+            remove_attempts: 0,
+        };
+        monitor.state = "reclaim_pending";
+        self.monitors.insert(key, monitor);
+        self.reconcile_recovery()
+    }
+
+    fn reconcile_recovery(&mut self) -> Result<(), String> {
+        let keys: Vec<_> = self
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| monitor.state == "reclaim_pending")
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let monitor = self.monitors.get_mut(&key).expect("recovery key");
+            if Instant::now() < monitor.next_poll {
+                continue;
+            }
+            monitor.next_poll = Instant::now() + POLL_INTERVAL;
+            let old = self.driver.inspect(
+                monitor.lease,
+                monitor.display_id,
+                monitor.binding,
+                &monitor.specification,
+            );
+            let next = monitor.prospective_lease.map(|lease| {
+                self.driver.inspect(
+                    lease,
+                    monitor.display_id,
+                    monitor.binding,
+                    &monitor.specification,
+                )
+            });
+            let (Ok(old), next) = (old, next) else {
+                continue;
+            };
+            let next = match next {
+                Some(Ok(next)) => Some(next),
+                Some(Err(_)) => continue,
+                None => None,
+            };
+            if (old.exists && !old.specification_matches)
+                || next
+                    .as_ref()
+                    .is_some_and(|next| next.exists && !next.specification_matches)
+            {
+                monitor.state = "ownership_conflict";
+                monitor.error = Some("identity_conflict");
+                continue;
+            }
+            if next
+                .as_ref()
+                .is_some_and(|next| next.exists && !next.pending_departure)
+                && !old.exists
+            {
+                let mut record = monitor.record(&key.0);
+                record.lease = record.prospective_lease.take().expect("prospective lease");
+                self.journal
+                    .as_mut()
+                    .expect("journal")
+                    .upsert(record.clone())?;
+                monitor.lease = record.lease;
+                monitor.prospective_lease = None;
+                monitor.state = "recovered";
+                continue;
+            }
+            if !old.exists
+                && !old.pending_departure
+                && next
+                    .as_ref()
+                    .is_none_or(|next| !next.exists && !next.pending_departure)
+            {
+                self.journal
+                    .as_mut()
+                    .expect("journal")
+                    .delete(&key.0, &key.1)?;
+                self.monitors.remove(&key);
+                continue;
+            }
+            if !old.exists
+                || old.pending_departure
+                || next
+                    .as_ref()
+                    .is_some_and(|next| next.exists || next.pending_departure)
+            {
+                continue;
+            }
+            if monitor.prospective_lease.is_none() {
+                let new_lease = random_lease().ok_or("entropy_unavailable")?;
+                monitor.prospective_lease = Some(new_lease);
+                self.journal
+                    .as_mut()
+                    .expect("journal")
+                    .upsert(monitor.record(&key.0))?;
+            }
+            let new_lease = monitor.prospective_lease.expect("prepared lease");
+            if self
+                .driver
+                .reclaim(monitor.display_id, new_lease, &monitor.capability)
+                .is_ok()
+            {
+                let Ok(observation) = self.driver.inspect(
+                    new_lease,
+                    monitor.display_id,
+                    monitor.binding,
+                    &monitor.specification,
+                ) else {
+                    continue;
+                };
+                if !observation.exists
+                    || !observation.specification_matches
+                    || observation.pending_departure
+                {
+                    continue;
+                }
+                let mut record = monitor.record(&key.0);
+                record.lease = new_lease;
+                record.prospective_lease = None;
+                self.journal.as_mut().expect("journal").upsert(record)?;
+                monitor.lease = new_lease;
+                monitor.prospective_lease = None;
+                monitor.state = "recovered";
+            }
+        }
+        Ok(())
     }
 
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
@@ -178,6 +348,13 @@ impl<D: Driver> Manager<D> {
         }
         let key = (caller.to_owned(), specification.identity.clone());
         if let Some(existing) = self.monitors.get(&key) {
+            if matches!(existing.state, "ownership_conflict" | "reclaim_pending") {
+                return failure(if existing.state == "ownership_conflict" {
+                    "ownership_conflict"
+                } else {
+                    "recovery_pending"
+                });
+            }
             return if existing.specification == specification {
                 existing.response()
             } else {
@@ -200,6 +377,13 @@ impl<D: Driver> Manager<D> {
             return failure("entropy_unavailable");
         }
         let lease = u64::from_le_bytes(secrets[..8].try_into().unwrap()) | 0x6000000000000000;
+        if self
+            .monitors
+            .values()
+            .any(|monitor| monitor.lease == lease || monitor.prospective_lease == Some(lease))
+        {
+            return failure("lease_collision");
+        }
         let capability: [u8; 32] = secrets[8..].try_into().unwrap();
         let now = Instant::now();
         // Record exact ownership before issuing create: a failed acknowledgement may
@@ -208,6 +392,8 @@ impl<D: Driver> Manager<D> {
             specification,
             display_id,
             lease,
+            prospective_lease: None,
+            capability,
             binding: None,
             ready: None,
             state: "creating",
@@ -217,11 +403,23 @@ impl<D: Driver> Manager<D> {
             next_feed: now + FEED_INTERVAL,
             remove_attempts: 0,
         };
+        if let Some(journal) = &mut self.journal
+            && journal.upsert(monitor.record(&key.0)).is_err()
+        {
+            return failure("journal_unavailable");
+        }
         match self
             .driver
             .create(&monitor.specification, lease, display_id, &capability)
         {
-            Ok(binding) => monitor.binding = Some(binding),
+            Ok(binding) => {
+                monitor.binding = Some(binding);
+                if let Some(journal) = &mut self.journal
+                    && journal.upsert(monitor.record(&key.0)).is_err()
+                {
+                    monitor.begin_cleanup(Some("journal_unavailable"));
+                }
+            }
             Err(code) => monitor.begin_cleanup(Some(code)),
         }
         let reply = monitor.response();
@@ -236,6 +434,13 @@ impl<D: Driver> Manager<D> {
         let Some(monitor) = self.monitors.get_mut(&(caller.into(), identity.into())) else {
             return json!({"ok":true,"removed":true,"identity":identity});
         };
+        if matches!(monitor.state, "ownership_conflict" | "reclaim_pending") {
+            return failure(if monitor.state == "ownership_conflict" {
+                "ownership_conflict"
+            } else {
+                "recovery_pending"
+            });
+        }
         if monitor.state == "cleanup_failed" {
             // Only an explicit request by the owning caller opens another
             // bounded removal window for this exact lease and display.
@@ -246,6 +451,9 @@ impl<D: Driver> Manager<D> {
     }
 
     pub fn tick(&mut self) {
+        if self.reconcile_recovery().is_err() {
+            return;
+        }
         if self.monitors.is_empty() {
             return;
         }
@@ -265,6 +473,9 @@ impl<D: Driver> Manager<D> {
         if now < monitor.next_poll {
             return;
         }
+        if matches!(monitor.state, "reclaim_pending" | "ownership_conflict") {
+            return;
+        }
         monitor.next_poll = now + POLL_INTERVAL;
         let removed = if matches!(monitor.state, "removing" | "cleanup_failed") {
             cleanup(&mut self.driver, monitor)
@@ -273,7 +484,16 @@ impl<D: Driver> Manager<D> {
             false
         };
         if removed {
-            self.monitors.remove(&key);
+            if self
+                .journal
+                .as_mut()
+                .is_none_or(|journal| journal.delete(&key.0, &key.1).is_ok())
+            {
+                self.monitors.remove(&key);
+            } else if let Some(monitor) = self.monitors.get_mut(&key) {
+                monitor.state = "cleanup_failed";
+                monitor.error = Some("journal_unavailable");
+            }
         }
     }
 }
@@ -283,13 +503,27 @@ impl<D: Driver> Drop for Manager<D> {
         // Best effort exact owned removals only. If process teardown interrupts this,
         // stopped lease feeding bounds orphan lifetime in the driver (ten seconds).
         for monitor in self.monitors.values() {
-            let _ = self.driver.remove(monitor.lease, monitor.display_id);
+            if monitor.prospective_lease.is_none()
+                && !matches!(monitor.state, "ownership_conflict" | "reclaim_pending")
+            {
+                let _ = self.driver.remove(monitor.lease, monitor.display_id);
+            }
         }
     }
 }
 
 fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
-    match driver.inspect(monitor.lease, monitor.display_id, monitor.binding) {
+    match driver.inspect(
+        monitor.lease,
+        monitor.display_id,
+        monitor.binding,
+        &monitor.specification,
+    ) {
+        Ok(observation) if observation.exists && !observation.specification_matches => {
+            monitor.ready = None;
+            monitor.state = "ownership_conflict";
+            monitor.error = Some("identity_conflict");
+        }
         Ok(observation) if observation.pending_departure => {
             monitor.begin_cleanup(Some("lease_departing"));
         }
@@ -299,7 +533,9 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
         }
         Ok(observation) if !observation.exists => monitor.begin_cleanup(Some("monitor_departed")),
         Ok(_) => {
-            if monitor.ready.take().is_some() {
+            if monitor.binding.is_none() {
+                monitor.state = "recovered";
+            } else if monitor.ready.take().is_some() {
                 // CCD can withdraw a published target while the driver lease still
                 // exists. Stop advertising the stale path and allow it to settle.
                 monitor.state = "creating";
@@ -310,7 +546,7 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
         }
         Err(code) => monitor.begin_cleanup(Some(code)),
     }
-    if monitor.state == "removing" {
+    if matches!(monitor.state, "removing" | "ownership_conflict") {
         return;
     }
     if now >= monitor.next_feed {
@@ -323,13 +559,36 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
 }
 
 fn cleanup(driver: &mut impl Driver, monitor: &mut Monitor) -> bool {
+    match driver.inspect(
+        monitor.lease,
+        monitor.display_id,
+        monitor.binding,
+        &monitor.specification,
+    ) {
+        Ok(observation) if observation.exists && !observation.specification_matches => {
+            monitor.state = "ownership_conflict";
+            monitor.error = Some("identity_conflict");
+            return false;
+        }
+        Err(code) => {
+            monitor.state = "cleanup_failed";
+            monitor.error = Some(code);
+            return false;
+        }
+        _ => {}
+    }
     if monitor.remove_attempts < 3 {
         monitor.remove_attempts += 1;
         if let Err(code) = driver.remove(monitor.lease, monitor.display_id) {
             monitor.error = Some(code);
         }
     }
-    match driver.inspect(monitor.lease, monitor.display_id, monitor.binding) {
+    match driver.inspect(
+        monitor.lease,
+        monitor.display_id,
+        monitor.binding,
+        &monitor.specification,
+    ) {
         Ok(observation) if !observation.exists && !observation.pending_departure => true,
         Ok(_) => {
             if monitor.remove_attempts >= 3 {
@@ -343,6 +602,12 @@ fn cleanup(driver: &mut impl Driver, monitor: &mut Monitor) -> bool {
             false
         }
     }
+}
+
+fn random_lease() -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes) | 0x6000000000000000)
 }
 
 #[cfg(test)]
