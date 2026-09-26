@@ -60,6 +60,10 @@ pub struct Record {
     pub client_frame_limiter_settings: FrameLimiterSettings,
     pub application_frame_limiter_settings: FrameLimiterSettings,
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
+    /// Sparse application display fields frozen at preflight for launch readback.
+    pub application_display_overrides: Option<Value>,
+    /// Authorized complete display request, absent until admission supplies all facts.
+    pub display_request: Option<Value>,
     pub application_preflight_token: Option<String>,
     pub application_catalog_revision: Option<u64>,
     pub frame_limiter_snapshot: Option<Value>,
@@ -176,6 +180,8 @@ impl Record {
             client_frame_limiter_settings,
             application_frame_limiter_settings: FrameLimiterSettings::default(),
             application_preflight_overrides: None,
+            application_display_overrides: None,
+            display_request: None,
             application_preflight_token: None,
             application_catalog_revision: None,
             frame_limiter_snapshot: None,

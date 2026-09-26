@@ -903,6 +903,7 @@ struct Broker {
     rtsp_snapshot: Option<Value>,
     rtsp_executable_path: Option<String>,
     wrong_rtsp_snapshot: bool,
+    wrong_application_display_overrides: bool,
 }
 
 impl Default for Broker {
@@ -943,6 +944,7 @@ impl Default for Broker {
             rtsp_snapshot: None,
             rtsp_executable_path: None,
             wrong_rtsp_snapshot: false,
+            wrong_application_display_overrides: false,
         }
     }
 }
@@ -1137,6 +1139,11 @@ impl Broker {
                 }
                 launch["config_overrides"] = config_overrides;
             }
+            launch["application_display_overrides"] =
+                super::workflow::application_display_overrides(launch.get("config_overrides"));
+            if self.wrong_application_display_overrides {
+                launch["application_display_overrides"] = json!({});
+            }
             return json!({"ok":true,"launch":launch});
         }
         let state = if action == "close" && self.fail_rtsp_cleanup {
@@ -1166,6 +1173,7 @@ impl Broker {
                 self.rtsp_snapshot.clone().unwrap_or(Value::Null)
             },
             "frame_limiter_executable_path": self.rtsp_executable_path,
+            "display_request": Value::Null,
             "failure": null,
             "cleanup_error": if state == "cleanup_failed" {
                 Value::String("fixture_failure".into())
@@ -2482,6 +2490,51 @@ fn changed_catalog_revision_after_preflight_stops_application_before_rtsp() {
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_ne!(reply.status, 200);
     assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn sparse_application_display_fields_are_frozen_before_launch_and_checked_on_readback() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({
+            "dd_refresh_rate_option":"prefer_highest",
+            "dd_hdr_request_override":"force_off"
+        })),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.application_catalog_revision, Some(1));
+    assert_eq!(
+        record.application_display_overrides,
+        Some(json!({
+            "dd_refresh_rate_option":"prefer_highest",
+            "dd_hdr_request_override":"force_off"
+        }))
+    );
+    assert!(
+        opened_rtsp_payload(&broker)
+            .get("display_request")
+            .is_none()
+    );
+}
+
+#[test]
+fn forged_display_readback_stops_before_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_input_overrides: Some(json!({"dd_refresh_rate_option":"manual"})),
+        wrong_application_display_overrides: true,
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
     assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
 }
 

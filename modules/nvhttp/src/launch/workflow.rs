@@ -236,6 +236,7 @@ impl Controller {
                         "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
                         "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
                         "frame_limiter_executable_path": record.executable_path,
+                        "display_request": record.display_request,
                         "capture": capture,
                         "profile": profile,
                     }),
@@ -276,6 +277,12 @@ impl Controller {
                 "wan_mode": policy.wan_mode,
             });
         }
+        if matches!(phase, Phase::OpenRtsp) && record.display_request.is_none() {
+            payload
+                .as_object_mut()
+                .expect("RTSP open payload")
+                .remove("display_request");
+        }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)
     }
@@ -299,6 +306,9 @@ impl Controller {
                     record.application_frame_limiter_settings =
                         application_overrides.frame_limiter_settings();
                     record.application_preflight_overrides = Some(application_overrides);
+                    record.application_display_overrides = Some(application_display_overrides(
+                        payload.get("config_overrides"),
+                    ));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     record.stage = Stage::LaunchApplication;
                 }
@@ -322,6 +332,13 @@ impl Controller {
                                     != record.application_catalog_revision
                                 {
                                     fail_record(record, "application_revision_mismatch", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
+                                if payload["launch"].get("application_display_overrides")
+                                    != record.application_display_overrides.as_ref()
+                                {
+                                    fail_record(record, "application_display_policy_mismatch", now);
                                     self.finish_or_retain(job.record, now, replies);
                                     return;
                                 }
@@ -819,6 +836,14 @@ pub(super) struct ApplicationConfigOverrides {
     max_bitrate: Option<i32>,
     minimum_fps_target: Option<f64>,
     video_max_batch_size_kb: Option<u8>,
+    dd_mode_remapping: Option<Value>,
+    dd_resolution_option: Option<String>,
+    dd_manual_resolution: Option<String>,
+    dd_refresh_rate_option: Option<String>,
+    dd_manual_refresh_rate: Option<String>,
+    dd_hdr_option: Option<String>,
+    dd_configuration_option: Option<String>,
+    dd_hdr_request_override: Option<String>,
     stream_audio: Option<bool>,
     audio_sink: Option<String>,
     virtual_sink: Option<String>,
@@ -867,6 +892,29 @@ pub(super) fn application_config_overrides(
     parse_application_config_overrides(launch.get("config_overrides"))
 }
 
+const APPLICATION_DISPLAY_KEYS: &[&str] = &[
+    "dd_mode_remapping",
+    "dd_resolution_option",
+    "dd_manual_resolution",
+    "dd_refresh_rate_option",
+    "dd_manual_refresh_rate",
+    "dd_hdr_option",
+    "dd_configuration_option",
+    "dd_hdr_request_override",
+];
+
+pub(super) fn application_display_overrides(config_overrides: Option<&Value>) -> Value {
+    let mut display = serde_json::Map::new();
+    for key in APPLICATION_DISPLAY_KEYS {
+        if let Some(value) = config_overrides.and_then(|overrides| overrides.get(*key))
+            && !value.is_null()
+        {
+            display.insert((*key).to_owned(), value.clone());
+        }
+    }
+    Value::Object(display)
+}
+
 fn application_preflight_response(
     record: &Record,
     payload: &Value,
@@ -913,6 +961,41 @@ fn parse_application_config_overrides(
         }
     };
     if config_overrides.fec_percentage == Some(0)
+        || config_overrides
+            .dd_mode_remapping
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        || config_overrides
+            .dd_resolution_option
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "disabled" | "manual"))
+        || config_overrides
+            .dd_refresh_rate_option
+            .as_deref()
+            .is_some_and(|value| {
+                !matches!(value, "auto" | "disabled" | "manual" | "prefer_highest")
+            })
+        || config_overrides
+            .dd_hdr_option
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "disabled"))
+        || config_overrides
+            .dd_configuration_option
+            .as_deref()
+            .is_some_and(|value| {
+                !matches!(
+                    value,
+                    "disabled"
+                        | "verify_only"
+                        | "ensure_active"
+                        | "ensure_primary"
+                        | "ensure_only_display"
+                )
+            })
+        || config_overrides
+            .dd_hdr_request_override
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "force_on" | "force_off"))
         || config_overrides
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
@@ -1022,6 +1105,8 @@ fn rtsp_response<'a>(
                     .unwrap_or(&Value::Null),
             )
         || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
+        || payload.get("display_request")
+            != Some(record.display_request.as_ref().unwrap_or(&Value::Null))
     {
         return Err("invalid_rtsp_response");
     }

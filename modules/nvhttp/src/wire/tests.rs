@@ -115,6 +115,7 @@ impl Broker {
                             "cleanup_error": null,
                             "frame_limiter_settings":payload["frame_limiter_settings"],
                             "catalog_revision": 0,
+                            "application_display_overrides": {},
                             "config_overrides": {
                                 "fec_percentage": 37,
                                 "stream_audio": true,
@@ -135,6 +136,7 @@ impl Broker {
                         "state": "ready",
                         "frame_limiter_settings": payload["frame_limiter_settings"],
                         "frame_limiter_executable_path": payload["frame_limiter_executable_path"],
+                        "display_request": payload["display_request"],
                         "failure": null,
                         "cleanup_error": null
                     }),

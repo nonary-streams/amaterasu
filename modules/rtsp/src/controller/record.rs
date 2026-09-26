@@ -70,6 +70,7 @@ impl Record {
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "frame_limiter_executable_path":self.config.frame_limiter_executable_path,
+            "display_request":self.config.display_request,
             "failure":self.failure,"cleanup_error":self.cleanup_error})
     }
 
