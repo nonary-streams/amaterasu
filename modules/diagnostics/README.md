@@ -165,7 +165,10 @@ accepts the host provider's stable `info` or prerelease `debug` result. Windows
 reparse points, including junctions, are rejected at the state root and in
 existing relative log path components.
 An identical revision and policy is idempotent without reopening the sink;
-older or conflicting revisions and failed sink preparation leave the previous
+the acknowledgement requires healthy disk delivery (or an intentionally
+disabled sink). A failed sink returns `logging_unavailable` until a later
+qualifying record recovers it, while status continues to show the failure.
+Older or conflicting revisions and failed sink preparation leave the previous
 logger and revision in place. The asynchronous reader also refuses to replace
 this policy with an older GET result that was in flight before the apply.
 

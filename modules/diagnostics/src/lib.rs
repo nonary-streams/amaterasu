@@ -195,7 +195,11 @@ fn apply_host_logging(
         }
         if revision == applied {
             return if journal.persisted_settings_match(&settings) {
-                json!({"ok":true,"applied_revision":revision})
+                if journal.logging_delivery_available() {
+                    json!({"ok":true,"applied_revision":revision})
+                } else {
+                    json!({"ok":false,"code":"logging_unavailable"})
+                }
             } else {
                 json!({"ok":false,"code":"revision_conflict"})
             };
@@ -544,6 +548,63 @@ mod hydration_tests {
         let status = journal.handle("capture", json!({"action":"status"}));
         assert_eq!(status["logging_configuration_revision"], 2);
         assert_eq!(status["logging_sink"]["state"], "healthy");
+
+        journal.close_sink_for_test();
+        assert_eq!(
+            journal.handle(
+                "capture",
+                json!({
+                    "action":"record","level":"error","target":"capture","message":"write fails"
+                })
+            )["sequence"],
+            1
+        );
+        let failed = journal.handle("capture", json!({"action":"status"}));
+        assert_eq!(
+            failed["logging_sink"],
+            json!({"state":"failed","failure":"write"})
+        );
+        assert_eq!(failed["logging_configuration_revision"], 2);
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"logging_unavailable"})
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"})),
+            failed
+        );
+        assert_eq!(
+            std::fs::read_dir(&log_directory).unwrap().count(),
+            files_before_duplicate
+        );
+
+        assert_eq!(
+            journal.handle(
+                "capture",
+                json!({
+                    "action":"record","level":"error","target":"capture","message":"write recovers"
+                })
+            )["sequence"],
+            2
+        );
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":true,"applied_revision":2})
+        );
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }

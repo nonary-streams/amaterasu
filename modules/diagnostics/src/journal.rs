@@ -102,6 +102,15 @@ impl Journal {
         self.persisted_logging_settings.as_ref() == Some(settings)
     }
 
+    pub(crate) fn logging_delivery_available(&self) -> bool {
+        self.logger.delivery_available()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_sink_for_test(&mut self) {
+        self.logger.close_sink_for_test();
+    }
+
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {
         let result = serde_json::from_value(payload)
             .map_err(|_| "invalid_request")

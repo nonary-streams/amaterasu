@@ -182,6 +182,10 @@ impl SessionLogger {
         json!({"state":state,"failure":failure})
     }
 
+    pub(crate) fn delivery_available(&self) -> bool {
+        self.settings.is_none() || (self.failure.is_none() && self.session.is_some())
+    }
+
     pub(crate) fn write_record(&mut self, caller: &str, record: &Record) {
         if record.level.numeric() < self.minimum_level {
             return;
