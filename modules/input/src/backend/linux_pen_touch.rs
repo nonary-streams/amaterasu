@@ -85,6 +85,12 @@ impl ContactTracker {
             };
         };
         match phase {
+            PenTouchPhase::Down if pointer_id_of(&pen.contact.initial_down) != Some(pointer_id) => {
+                Err(InputError::new(
+                    "contact_capacity",
+                    "Linux pen uinput supports one active pen pointer",
+                ))
+            }
             PenTouchPhase::Down if pen.contact.initial_down != *event => {
                 Err(duplicate_down_mismatch())
             }
@@ -1357,6 +1363,26 @@ mod tests {
             pen_touch.tracker.pen.as_ref().unwrap().contact.initial_down,
             down
         );
+
+        let other_pointer_down = event(2, PenTouchDevice::Pen, PenTouchPhase::Down, 70, 80);
+        assert_eq!(
+            pen_touch
+                .tracker
+                .validate_pen_lifecycle(2, PenTouchPhase::Down, &other_pointer_down)
+                .unwrap_err()
+                .code,
+            "contact_capacity"
+        );
+        assert_eq!(
+            pen_touch
+                .inject("\0", &other_pointer_down)
+                .unwrap_err()
+                .code,
+            "invalid_event",
+            "the public pen identity rule rejects this before native recovery"
+        );
+        assert!(pen_touch.pen_device.is_some());
+        assert!(pen_touch.pen_write_failed);
 
         let malformed_pen = event(2, PenTouchDevice::Pen, PenTouchPhase::Move, 10, 20);
         assert!(pen_touch.inject("\0", &malformed_pen).is_err());
