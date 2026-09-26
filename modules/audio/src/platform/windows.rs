@@ -236,20 +236,42 @@ impl RouteLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = default_endpoints(enumerator)?;
-        let assignments = policy.refresh_assignments(&self.endpoint, &current)?;
-        if assignments.is_empty() {
-            return Ok(());
-        }
-        let endpoint_policy = PolicyConfig::new()?;
-        for assignment in assignments {
-            if role_endpoint(enumerator, assignment.role)?.as_deref() != Some(&self.endpoint) {
-                policy.attempt_assignment(&self.endpoint, assignment.role, || {
-                    endpoint_policy.set_default(&self.endpoint, assignment.role)
-                })?;
-            }
-        }
-        Ok(())
+        let mut endpoint_policy = None;
+        refresh_virtual_route(
+            &mut policy,
+            &self.endpoint,
+            &current,
+            |role| role_endpoint(enumerator, role),
+            |role| {
+                if endpoint_policy.is_none() {
+                    endpoint_policy = Some(PolicyConfig::new()?);
+                }
+                endpoint_policy
+                    .as_ref()
+                    .expect("policy was created before assignment")
+                    .set_default(&self.endpoint, role)
+            },
+        )
     }
+}
+
+fn refresh_virtual_route(
+    policy: &mut RoutePolicy,
+    endpoint: &str,
+    current: &DefaultEndpoints,
+    mut read_role: impl FnMut(DefaultRole) -> AudioResult<Option<String>>,
+    mut assign_role: impl FnMut(DefaultRole) -> AudioResult<()>,
+) -> AudioResult<()> {
+    for assignment in policy.refresh_assignments(endpoint, current)? {
+        if read_role(assignment.role)?.as_deref() == Some(endpoint) {
+            continue;
+        }
+        policy.attempt_assignment(endpoint, assignment.role, || assign_role(assignment.role))?;
+        if read_role(assignment.role)?.as_deref() != Some(endpoint) {
+            return Err("audio_route_change_failed");
+        }
+    }
+    Ok(())
 }
 
 fn assign_route(
@@ -1459,6 +1481,80 @@ fn buffer_error_requires_recovery(first_error: &mut Option<Instant>, now: Instan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn virtual_route_refresh_retries_ambiguous_and_ineffective_assignments() {
+        let endpoint = "render.virtual";
+        let original = [
+            Some("render.console".to_owned()),
+            Some("render.multimedia".to_owned()),
+            None,
+        ];
+        let mut policy = RoutePolicy::new();
+        let AcquirePlan::Assign(assignments) = policy
+            .acquire_with_tracking(endpoint, &original, true)
+            .unwrap()
+        else {
+            panic!("virtual sink must acquire the available default roles");
+        };
+        let current = RefCell::new(original.clone());
+        for assignment in assignments {
+            policy.record_assignment(endpoint, assignment.role).unwrap();
+            current.borrow_mut()[assignment.role.index()] = Some(endpoint.to_owned());
+        }
+
+        current.borrow_mut()[DefaultRole::Console.index()] = Some("render.user".to_owned());
+        let attempts = Cell::new(0);
+        let refresh = |policy: &mut RoutePolicy| {
+            let snapshot = current.borrow().clone();
+            refresh_virtual_route(
+                policy,
+                endpoint,
+                &snapshot,
+                |role| Ok(current.borrow()[role.index()].clone()),
+                |role| {
+                    let attempt = attempts.get() + 1;
+                    attempts.set(attempt);
+                    if attempt == 1 {
+                        return Err("audio_route_change_failed");
+                    }
+                    if attempt == 3 {
+                        current.borrow_mut()[role.index()] = Some(endpoint.to_owned());
+                    }
+                    Ok(())
+                },
+            )
+        };
+        assert_eq!(refresh(&mut policy), Err("audio_route_change_failed"));
+        assert_eq!(refresh(&mut policy), Err("audio_route_change_failed"));
+        assert_eq!(current.borrow()[0].as_deref(), Some("render.user"));
+        refresh(&mut policy).unwrap();
+        assert_eq!(current.borrow()[0].as_deref(), Some(endpoint));
+        assert_eq!(current.borrow()[2], None);
+        assert_eq!(attempts.get(), 3);
+
+        let ReleasePlan::Restore(restore) = policy.release(endpoint, &current.borrow()).unwrap()
+        else {
+            panic!("final lease must restore assigned roles");
+        };
+        assert_eq!(restore.len(), 2);
+        policy.complete_restore(false);
+        assert_eq!(
+            policy.endpoint_with_pending_restore(),
+            Some(endpoint),
+            "failed release remains available for retry"
+        );
+        let pending = policy
+            .pending_restore_assignments(&current.borrow())
+            .unwrap();
+        for assignment in pending {
+            current.borrow_mut()[assignment.role.index()] = Some(assignment.endpoint);
+        }
+        policy.complete_restore(policy.pending_restore_complete(&current.borrow()));
+        assert_eq!(*current.borrow(), original);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
 
     #[test]
     fn inactive_endpoint_requires_recovery_but_query_failures_are_retried() {
