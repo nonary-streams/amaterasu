@@ -318,10 +318,14 @@ impl Configuration {
                     && i64::from(right.x) < i64::from(left.x) + i64::from(left.width)
                     && i64::from(left.y) < i64::from(right.y) + i64::from(right.height)
                     && i64::from(right.y) < i64::from(left.y) + i64::from(left.height)
+                    && (left.x != right.x
+                        || left.y != right.y
+                        || left.width != right.width
+                        || left.height != right.height)
                 {
                     return Err(DisplayError::new(
                         "unsupported_topology",
-                        "requested extended display rectangles must not overlap; clone requests are not supported",
+                        "requested display rectangles must be disjoint or exactly cloned",
                     ));
                 }
             }
@@ -406,10 +410,16 @@ impl Snapshot {
             ));
         }
         let mut ids = BTreeSet::new();
+        let mut targets = BTreeSet::new();
         for path in &self.paths {
             if path.id.is_empty()
                 || path.id.len() > 1024
                 || !ids.insert(path.id.to_lowercase())
+                || !targets.insert((
+                    path.target_address.adapter_low,
+                    path.target_address.adapter_high,
+                    path.target_address.id,
+                ))
                 || path.source_name.is_empty()
                 || path.source_name.len() > 128
                 || path.source.width == 0
@@ -426,6 +436,29 @@ impl Snapshot {
                     "invalid_snapshot",
                     "invalid display snapshot path",
                 ));
+            }
+        }
+        for (index, left) in self.paths.iter().enumerate() {
+            for right in self.paths.iter().skip(index + 1) {
+                if left.source_address == right.source_address
+                    && (left.source_name != right.source_name || left.source != right.source)
+                {
+                    return Err(DisplayError::new(
+                        "invalid_snapshot",
+                        "clone paths disagree about their shared source",
+                    ));
+                }
+                if left.source_address != right.source_address
+                    && left.source.x == right.source.x
+                    && left.source.y == right.source.y
+                    && left.source.width == right.source.width
+                    && left.source.height == right.source.height
+                {
+                    return Err(DisplayError::new(
+                        "unsupported_topology",
+                        "overlapping paths do not share one CCD source",
+                    ));
+                }
             }
         }
         Ok(())
@@ -485,6 +518,16 @@ impl Snapshot {
                 other.paths.iter().any(|right| {
                     left.id == right.id
                         && left.source_name == right.source_name
+                        && self.paths.iter().all(|peer| {
+                            other
+                                .paths
+                                .iter()
+                                .find(|candidate| candidate.id == peer.id)
+                                .is_some_and(|candidate| {
+                                    (left.source_address == peer.source_address)
+                                        == (right.source_address == candidate.source_address)
+                                })
+                        })
                         && left.source == right.source
                         && left.signal == right.signal
                         && left.rotation == right.rotation

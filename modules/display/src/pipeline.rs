@@ -436,6 +436,7 @@ impl<P: Platform> Pipeline<P> {
                 );
                 let mut native_target = None;
                 let mut pending_route = None;
+                let mut clone_baseline = None;
                 if topology_change {
                     let Some(expected) = expected_topology_revision.as_deref() else {
                         return complete(
@@ -451,6 +452,7 @@ impl<P: Platform> Pipeline<P> {
                         Ok(snapshot) => snapshot,
                         Err(error) => return complete(send, context.request, error.payload()),
                     };
+                    clone_baseline = Some(snapshot.clone());
                     if snapshot.revision().as_ref().ok().map(String::as_str) != Some(expected) {
                         return complete(
                             send,
@@ -546,12 +548,25 @@ impl<P: Platform> Pipeline<P> {
                         Err(error) => return complete(send, context.request, error.payload()),
                     };
                 }
-                let singular_policy = mode_policies.is_none();
                 let policies =
                     match collect_mode_policies(&configuration, mode_policy, mode_policies) {
                         Ok(policies) => policies,
                         Err(error) => return complete(send, context.request, error.payload()),
                     };
+                let singular_nonclone = policies.len() == 1
+                    && !configuration
+                        .displays
+                        .iter()
+                        .enumerate()
+                        .any(|(index, left)| {
+                            configuration.displays.iter().skip(index + 1).any(|right| {
+                                left.x == right.x
+                                    && left.y == right.y
+                                    && left.width == right.width
+                                    && left.height == right.height
+                            })
+                        });
+                let mut resolved_clone_modes = std::collections::BTreeMap::new();
                 for policy in policies {
                     let modes = if policy.refresh_rate_option
                         == Some(crate::refresh_rate_option::RefreshRateOption::PreferHighest)
@@ -564,13 +579,122 @@ impl<P: Platform> Pipeline<P> {
                     } else {
                         None
                     };
-                    let resolution = if singular_policy {
+                    let resolution = if singular_nonclone {
                         configuration.resolve_mode_policy(&policy, modes.as_deref())
                     } else {
                         configuration.resolve_mode_policy_in_batch(&policy, modes.as_deref())
                     };
                     if let Err(error) = resolution {
                         return complete(send, context.request, error.payload());
+                    }
+                    if clone_baseline.is_none() {
+                        clone_baseline = match self.platform.snapshot() {
+                            Ok(snapshot) => Some(snapshot),
+                            Err(error) => return complete(send, context.request, error.payload()),
+                        };
+                    }
+                    if let Some(snapshot) = &clone_baseline {
+                        if let Some(path) = snapshot
+                            .paths
+                            .iter()
+                            .find(|path| path.id.eq_ignore_ascii_case(&policy.display_id))
+                        {
+                            let source = (
+                                path.source_address.adapter_low,
+                                path.source_address.adapter_high,
+                                path.source_address.id,
+                            );
+                            let wanted = configuration
+                                .displays
+                                .iter()
+                                .find(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+                                .expect("policy display validated");
+                            let mode = (wanted.width, wanted.height, wanted.x, wanted.y);
+                            if resolved_clone_modes
+                                .insert(source, mode)
+                                .is_some_and(|earlier| earlier != mode)
+                            {
+                                return complete(
+                                    send,
+                                    context.request,
+                                    failure(
+                                        "unsupported_topology",
+                                        "clone targets requested conflicting source modes",
+                                    ),
+                                );
+                            }
+                        }
+                        synchronize_clone_group(&mut configuration, snapshot, &policy.display_id);
+                    }
+                }
+                if let Err(error) = configuration.validate() {
+                    return complete(send, context.request, error.payload());
+                }
+                if !topology_change
+                    && expected_topology_revision.is_none()
+                    && configuration
+                        .displays
+                        .iter()
+                        .enumerate()
+                        .any(|(index, left)| {
+                            configuration.displays.iter().skip(index + 1).any(|right| {
+                                left.x == right.x
+                                    && left.y == right.y
+                                    && left.width == right.width
+                                    && left.height == right.height
+                            })
+                        })
+                {
+                    let baseline = match self.platform.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                    if configuration.displays.iter().any(|display| {
+                        !baseline
+                            .paths
+                            .iter()
+                            .any(|path| path.id.eq_ignore_ascii_case(&display.id))
+                    }) {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "invalid_request",
+                                "inactive clone activation requires expected_topology_revision",
+                            ),
+                        );
+                    }
+                }
+                if !topology_change && expected_topology_revision.is_some() {
+                    let baseline = match self.platform.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                    if let Some(expected) = &expected_topology_revision
+                        && baseline.revision().as_ref().ok() != Some(expected)
+                    {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "topology_changed",
+                                "active display topology changed before clone binding",
+                            ),
+                        );
+                    }
+                    match clone_activation(&configuration, &baseline) {
+                        Ok(Some((selected, source))) => {
+                            pending_route =
+                                match self.platform.bind_clone(&selected, &source, &baseline) {
+                                    Ok(route) => Some(route),
+                                    Err(error) => {
+                                        return complete(send, context.request, error.payload());
+                                    }
+                                };
+                            native_target = Some((selected, TopologyShape::CloneActive));
+                        }
+                        Ok(None) => {}
+                        Err(error) => return complete(send, context.request, error.payload()),
                     }
                 }
                 if pending_route.as_ref().is_some_and(|route| {
@@ -595,7 +719,10 @@ impl<P: Platform> Pipeline<P> {
                     PrepareIntent {
                         expected_topology_revision,
                         operation_id,
-                        topology_change,
+                        topology_change: topology_change
+                            || native_target
+                                .as_ref()
+                                .is_some_and(|(_, shape)| *shape == TopologyShape::CloneActive),
                         native_target,
                         pending_route,
                     },
@@ -848,6 +975,38 @@ fn read_only_apply<P: Platform>(
     }
     Ok(json!({"ok":true,"applied":false,"verified":true,"configuration_option":"verify_only"}))
 }
+fn synchronize_clone_group(configuration: &mut Configuration, snapshot: &Snapshot, selected: &str) {
+    let Some(source) = snapshot
+        .paths
+        .iter()
+        .find(|path| path.id.eq_ignore_ascii_case(selected))
+        .map(|path| &path.source_address)
+    else {
+        return;
+    };
+    let Some(wanted) = configuration
+        .displays
+        .iter()
+        .find(|display| display.id.eq_ignore_ascii_case(selected))
+    else {
+        return;
+    };
+    let (x, y, width, height) = (wanted.x, wanted.y, wanted.width, wanted.height);
+    for peer in &snapshot.paths {
+        if peer.source_address == *source
+            && let Some(display) = configuration
+                .displays
+                .iter_mut()
+                .find(|display| display.id.eq_ignore_ascii_case(&peer.id))
+        {
+            display.x = x;
+            display.y = y;
+            display.width = width;
+            display.height = height;
+        }
+    }
+}
+
 fn compose_configuration(
     requested: &Configuration,
     snapshot: &Snapshot,
@@ -883,6 +1042,26 @@ fn compose_configuration(
             selected.x = origin_x;
             selected.y = origin_y;
             configuration.displays[index] = selected;
+            let selected_width = configuration.displays[index].width;
+            let selected_height = configuration.displays[index].height;
+            let selected_source = &snapshot
+                .paths
+                .iter()
+                .find(|path| path.id.eq_ignore_ascii_case(&policy.display_id))
+                .expect("selected active path")
+                .source_address;
+            for peer in &snapshot.paths {
+                if peer.source_address == *selected_source {
+                    let peer_index = configuration
+                        .displays
+                        .iter()
+                        .position(|display| display.id.eq_ignore_ascii_case(&peer.id))
+                        .expect("active path in configuration");
+                    let display = &mut configuration.displays[peer_index];
+                    display.width = selected_width;
+                    display.height = selected_height;
+                }
+            }
             if policy.configuration_option == Some(DisplayConfigurationOption::EnsurePrimary) {
                 for display in &mut configuration.displays {
                     display.x = display.x.checked_sub(origin_x).ok_or_else(|| {
@@ -986,6 +1165,72 @@ fn validate_active_ids(configuration: &Configuration, snapshot: &Snapshot) -> Di
         ));
     }
     Ok(())
+}
+fn clone_activation(
+    configuration: &Configuration,
+    snapshot: &Snapshot,
+) -> DisplayResult<Option<(String, crate::model::Address)>> {
+    let active = snapshot.configuration()?;
+    let added: Vec<_> = configuration
+        .displays
+        .iter()
+        .filter(|display| {
+            !snapshot
+                .paths
+                .iter()
+                .any(|path| path.id.eq_ignore_ascii_case(&display.id))
+        })
+        .collect();
+    if added.is_empty() {
+        return Ok(None);
+    }
+    if added.len() != 1 || configuration.displays.len() != active.displays.len() + 1 {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "revisioned apply requires active identities plus exactly one new clone target",
+        ));
+    }
+    for saved in &active.displays {
+        let Some(wanted) = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
+        else {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "clone activation omitted an active target",
+            ));
+        };
+        if serde_json::to_value(wanted).ok() != serde_json::to_value(saved).ok() {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "clone activation must preserve active target settings",
+            ));
+        }
+    }
+    let added = added[0];
+    if added.hdr_enabled == Some(true) {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "inactive clone has no recoverable HDR baseline",
+        ));
+    }
+    let source = snapshot
+        .paths
+        .iter()
+        .find(|path| {
+            path.source.x == added.x
+                && path.source.y == added.y
+                && path.source.width == added.width
+                && path.source.height == added.height
+        })
+        .ok_or_else(|| {
+            DisplayError::new(
+                "unsupported_topology",
+                "new clone target must match an active source rectangle",
+            )
+        })?;
+    Ok(Some((added.id.clone(), source.source_address.clone())))
 }
 fn collect_mode_policies(
     configuration: &Configuration,

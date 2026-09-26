@@ -1,4 +1,4 @@
-use crate::model::{AvailableMode, Configuration, DisplayResult, RouteBinding, Snapshot};
+use crate::model::{Address, AvailableMode, Configuration, DisplayResult, RouteBinding, Snapshot};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6,6 +6,7 @@ pub enum TopologyShape {
     PreserveActive,
     TranslateActive,
     OnlySelected,
+    CloneActive,
 }
 
 pub trait Platform {
@@ -21,6 +22,12 @@ pub trait Platform {
     fn snapshot(&mut self) -> DisplayResult<Snapshot>;
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding>;
+    fn bind_clone(
+        &mut self,
+        display: &str,
+        source: &Address,
+        before: &Snapshot,
+    ) -> DisplayResult<RouteBinding>;
     fn prepare_preserving(
         &mut self,
         configuration: &Configuration,
@@ -77,6 +84,9 @@ impl Platform for NativePlatform {
         unsupported()
     }
     fn bind_inactive(&mut self, _: &str, _: &Snapshot) -> DisplayResult<RouteBinding> {
+        unsupported()
+    }
+    fn bind_clone(&mut self, _: &str, _: &Address, _: &Snapshot) -> DisplayResult<RouteBinding> {
         unsupported()
     }
     fn prepare_preserving(

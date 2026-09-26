@@ -1,7 +1,8 @@
 use super::conversion::{address, native_rational, native_signal, native_source};
 use super::query::{ConfigurationBuffers, check, names, query};
 use crate::model::{
-    Configuration, DisplayError, DisplayResult, Rotation, RouteBinding, Snapshot, SourceMode,
+    Address, Configuration, DisplayError, DisplayResult, Rotation, RouteBinding, Snapshot,
+    SourceMode,
 };
 use std::collections::BTreeMap;
 use windows_sys::Win32::Devices::Display::*;
@@ -14,8 +15,66 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
     let available = query(QDC_ALL_PATHS)?;
     let mut paths = Vec::new();
     let mut modes = Vec::new();
-    let mut sources = Vec::new();
+    let mut sources = BTreeMap::new();
+    let mut clone_sources = BTreeMap::new();
+    let mut common_clone_sources = BTreeMap::new();
+    let mut selected_targets = std::collections::BTreeSet::new();
     for display in &configuration.displays {
+        let rectangle = (display.x, display.y, display.width, display.height);
+        let group: Vec<_> = configuration
+            .displays
+            .iter()
+            .filter(|member| (member.x, member.y, member.width, member.height) == rectangle)
+            .collect();
+        if group.len() < 2 || common_clone_sources.contains_key(&rectangle) {
+            continue;
+        }
+        let mut first_routes: Vec<_> = available
+            .paths
+            .iter()
+            .filter(|path| {
+                path.targetInfo.targetAvailable != 0
+                    && names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(&display.id))
+            })
+            .collect();
+        first_routes.sort_by_key(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0);
+        let common = first_routes
+            .into_iter()
+            .map(|path| {
+                (
+                    path.sourceInfo.adapterId.LowPart,
+                    path.sourceInfo.adapterId.HighPart,
+                    path.sourceInfo.id,
+                )
+            })
+            .find(|source| {
+                group.iter().all(|member| {
+                    available.paths.iter().any(|path| {
+                        path.targetInfo.targetAvailable != 0
+                            && (
+                                path.sourceInfo.adapterId.LowPart,
+                                path.sourceInfo.adapterId.HighPart,
+                                path.sourceInfo.id,
+                            ) == *source
+                            && names(path)
+                                .is_ok_and(|device| device.id.eq_ignore_ascii_case(&member.id))
+                    })
+                })
+            });
+        let source = common.ok_or_else(|| {
+            DisplayError::new(
+                "unsupported_topology",
+                "clone targets have no common available CCD source route",
+            )
+        })?;
+        common_clone_sources.insert(rectangle, source);
+    }
+    for display in &configuration.displays {
+        let rectangle = (display.x, display.y, display.width, display.height);
+        let required_source = common_clone_sources
+            .get(&rectangle)
+            .or_else(|| clone_sources.get(&rectangle))
+            .copied();
         let mut candidates = Vec::new();
         for candidate in &available.paths {
             if candidate.targetInfo.targetAvailable == 0 {
@@ -39,11 +98,31 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
         candidates.sort_by_key(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0);
         let mut path = candidates
             .into_iter()
-            .find(|path| !sources.contains(&address(path.sourceInfo.adapterId, path.sourceInfo.id)))
+            .find(|path| {
+                let target = address(path.targetInfo.adapterId, path.targetInfo.id);
+                let source_key = (
+                    path.sourceInfo.adapterId.LowPart,
+                    path.sourceInfo.adapterId.HighPart,
+                    path.sourceInfo.id,
+                );
+                !selected_targets.contains(&(target.adapter_low, target.adapter_high, target.id))
+                    && required_source.is_none_or(|required| required == source_key)
+                    && sources
+                        .get(&source_key)
+                        .is_none_or(|(_, previous): &(u32, SourceMode)| {
+                            previous.width == display.width
+                                && previous.height == display.height
+                                && previous.x == display.x
+                                && previous.y == display.y
+                        })
+                    && (!sources.contains_key(&source_key)
+                        || path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+                        || required_source == Some(source_key))
+            })
             .ok_or_else(|| {
                 DisplayError::new(
                     "unsupported_topology",
-                    "display is missing or has no independent source route",
+                    "display is missing or has no route for its requested clone group",
                 )
             })?;
         if matches!(
@@ -57,27 +136,48 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
                 "indirect and wireless display mutation is unsupported",
             ));
         }
-        sources.push(address(path.sourceInfo.adapterId, path.sourceInfo.id));
-        path.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
-        modes.push(DISPLAYCONFIG_MODE_INFO {
-            infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-            id: path.sourceInfo.id,
-            adapterId: path.sourceInfo.adapterId,
-            Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
-                sourceMode: native_source(&SourceMode {
-                    width: display.width,
-                    height: display.height,
-                    pixel_format: DISPLAYCONFIG_PIXELFORMAT_32BPP,
-                    x: display.x,
-                    y: display.y,
-                }),
-            },
-        });
+        let source_key = (
+            path.sourceInfo.adapterId.LowPart,
+            path.sourceInfo.adapterId.HighPart,
+            path.sourceInfo.id,
+        );
+        clone_sources.insert(rectangle, source_key);
+        let source = SourceMode {
+            width: display.width,
+            height: display.height,
+            pixel_format: DISPLAYCONFIG_PIXELFORMAT_32BPP,
+            x: display.x,
+            y: display.y,
+        };
+        let source_index = if let Some((index, previous)) = sources.get(&source_key) {
+            if previous != &source {
+                return Err(DisplayError::new(
+                    "unsupported_topology",
+                    "clone targets require one shared source mode",
+                ));
+            }
+            *index
+        } else {
+            let index = modes.len() as u32;
+            sources.insert(source_key, (index, source.clone()));
+            modes.push(DISPLAYCONFIG_MODE_INFO {
+                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+                id: path.sourceInfo.id,
+                adapterId: path.sourceInfo.adapterId,
+                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                    sourceMode: native_source(&source),
+                },
+            });
+            index
+        };
+        path.sourceInfo.Anonymous.modeInfoIdx = source_index;
         path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
         path.targetInfo.refreshRate = native_rational(display.refresh);
         path.targetInfo.rotation = rotation(display.rotation);
         path.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
         path.flags = DISPLAYCONFIG_PATH_ACTIVE;
+        let target = address(path.targetInfo.adapterId, path.targetInfo.id);
+        selected_targets.insert((target.adapter_low, target.adapter_high, target.id));
         paths.push(path);
     }
     Ok(ConfigurationBuffers { paths, modes })
@@ -187,6 +287,9 @@ pub fn preserving(
     shape: super::super::TopologyShape,
 ) -> DisplayResult<ConfigurationBuffers> {
     match (route, shape) {
+        (Some(route), super::super::TopologyShape::CloneActive) => {
+            clone_bound(restoration(before)?, configuration, before, selected, route)
+        }
         (Some(route), super::super::TopologyShape::OnlySelected) => {
             only_bound_inactive(configuration, before, selected, route)
         }
@@ -217,7 +320,190 @@ pub fn preserving(
             "unsupported_topology",
             "inactive primary topology requires a bound route",
         )),
+        (None, super::super::TopologyShape::CloneActive) => Err(DisplayError::new(
+            "unsupported_topology",
+            "clone activation requires a bound target route",
+        )),
     }
+}
+
+pub fn bind_clone(
+    display: &str,
+    source: &Address,
+    before: &Snapshot,
+) -> DisplayResult<RouteBinding> {
+    before.configuration()?;
+    if !before
+        .paths
+        .iter()
+        .any(|path| path.source_address == *source)
+        || before
+            .paths
+            .iter()
+            .any(|path| path.id.eq_ignore_ascii_case(display))
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "clone source must be active and target inactive",
+        ));
+    }
+    let (path, device) = select_clone_route(display, source, "unsupported_topology")?;
+    Ok(RouteBinding {
+        id: device.id,
+        source_name: device.source,
+        source_address: address(path.sourceInfo.adapterId, path.sourceInfo.id),
+        target_address: address(path.targetInfo.adapterId, path.targetInfo.id),
+        output_technology: path.targetInfo.outputTechnology,
+    })
+}
+
+fn select_clone_route(
+    display: &str,
+    source: &Address,
+    code: &'static str,
+) -> DisplayResult<(DISPLAYCONFIG_PATH_INFO, super::query::DeviceNames)> {
+    let available = query(QDC_ALL_PATHS)?;
+    let mut found: Option<(DISPLAYCONFIG_PATH_INFO, super::query::DeviceNames)> = None;
+    for path in &available.paths {
+        if path.targetInfo.targetAvailable == 0
+            || address(path.sourceInfo.adapterId, path.sourceInfo.id) != *source
+        {
+            continue;
+        }
+        let device = names(path)?;
+        if !device.id.eq_ignore_ascii_case(display) {
+            continue;
+        }
+        if matches!(
+            path.targetInfo.outputTechnology,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
+                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
+                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
+        ) {
+            return Err(DisplayError::new(
+                code,
+                "indirect clone route is unsupported",
+            ));
+        }
+        if let Some((previous, _)) = found.as_ref() {
+            if address(previous.targetInfo.adapterId, previous.targetInfo.id)
+                != address(path.targetInfo.adapterId, path.targetInfo.id)
+            {
+                return Err(DisplayError::new(code, "clone target route is ambiguous"));
+            }
+        } else {
+            found = Some((*path, device));
+        }
+    }
+    found.ok_or_else(|| DisplayError::new(code, "clone target has no route to the active source"))
+}
+
+pub fn bound_clone_path(route: &RouteBinding) -> DisplayResult<()> {
+    let (path, device) = select_clone_route(&route.id, &route.source_address, "topology_changed")?;
+    if device.source != route.source_name
+        || address(path.targetInfo.adapterId, path.targetInfo.id) != route.target_address
+        || path.targetInfo.outputTechnology != route.output_technology
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "bound clone route changed",
+        ));
+    }
+    Ok(())
+}
+
+fn clone_bound(
+    mut bound: ConfigurationBuffers,
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+    route: &RouteBinding,
+) -> DisplayResult<ConfigurationBuffers> {
+    let (mut path, device) =
+        select_clone_route(selected, &route.source_address, "topology_changed")?;
+    if device.source != route.source_name
+        || address(path.targetInfo.adapterId, path.targetInfo.id) != route.target_address
+        || path.targetInfo.outputTechnology != route.output_technology
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "bound clone route changed",
+        ));
+    }
+    let wanted = configuration
+        .displays
+        .iter()
+        .find(|display| display.id.eq_ignore_ascii_case(selected))
+        .ok_or_else(|| {
+            DisplayError::new(
+                "unsupported_display",
+                "clone target missing from configuration",
+            )
+        })?;
+    if wanted.hdr_enabled == Some(true)
+        || bound.paths.len() != before.paths.len()
+        || configuration.displays.len() != before.paths.len() + 1
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "invalid clone activation request",
+        ));
+    }
+    for saved in &before.paths {
+        let active = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "unsupported_topology",
+                    "clone activation omitted an active target",
+                )
+            })?;
+        if saved.source.width != active.width
+            || saved.source.height != active.height
+            || saved.source.x != active.x
+            || saved.source.y != active.y
+            || !saved.refresh.equivalent(active.refresh)
+            || saved.rotation != rotation(active.rotation)
+            || saved.hdr_enabled != active.hdr_enabled
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "clone activation changed an active target",
+            ));
+        }
+    }
+    if !before.paths.iter().any(|saved| {
+        saved.source_address == route.source_address
+            && saved.source.width == wanted.width
+            && saved.source.height == wanted.height
+            && saved.source.x == wanted.x
+            && saved.source.y == wanted.y
+    }) {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "clone target differs from bound active source",
+        ));
+    }
+    let source_path = bound
+        .paths
+        .iter()
+        .find(|existing| {
+            address(existing.sourceInfo.adapterId, existing.sourceInfo.id) == route.source_address
+        })
+        .ok_or_else(|| DisplayError::new("topology_changed", "bound clone source disappeared"))?;
+    // SAFETY: restoration constructed this active SOURCE index and the owned
+    // mode vector remains alive through SetDisplayConfig.
+    path.sourceInfo.Anonymous.modeInfoIdx = unsafe { source_path.sourceInfo.Anonymous.modeInfoIdx };
+    path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    path.targetInfo.refreshRate = native_rational(wanted.refresh);
+    path.targetInfo.rotation = rotation(wanted.rotation);
+    path.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
+    path.flags = DISPLAYCONFIG_PATH_ACTIVE;
+    bound.paths.push(path);
+    compact_modes(&mut bound)?;
+    Ok(bound)
 }
 
 pub fn bind_inactive(display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
@@ -579,6 +865,13 @@ pub(super) fn preserve_bound(
             "preserved request must contain every active path",
         ));
     }
+    let selected_source = before
+        .paths
+        .iter()
+        .find(|path| path.id.eq_ignore_ascii_case(selected))
+        .ok_or_else(|| DisplayError::new("unsupported_display", "selected monitor is not active"))?
+        .source_address
+        .clone();
     let mut selected_found = false;
     for (path, saved) in bound.paths.iter_mut().zip(&before.paths) {
         let wanted = configuration
@@ -612,15 +905,23 @@ pub(super) fn preserve_bound(
             path.targetInfo.rotation = rotation(wanted.rotation);
             path.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
             path.flags = DISPLAYCONFIG_PATH_ACTIVE;
-        } else if saved.source.width != wanted.width
-            || saved.source.height != wanted.height
-            || !saved.refresh.equivalent(wanted.refresh)
-            || saved.rotation != rotation(wanted.rotation)
-        {
-            return Err(DisplayError::new(
-                "unsupported_topology",
-                "untouched monitor mode changed in preserving request",
-            ));
+        } else {
+            let cloned_source = saved.source_address == selected_source;
+            if !cloned_source
+                && (saved.source.width != wanted.width || saved.source.height != wanted.height)
+                || !saved.refresh.equivalent(wanted.refresh)
+                || saved.rotation != rotation(wanted.rotation)
+            {
+                return Err(DisplayError::new(
+                    "unsupported_topology",
+                    "untouched monitor mode changed in preserving request",
+                ));
+            }
+            if cloned_source {
+                source.width = wanted.width;
+                source.height = wanted.height;
+                source.pixel_format = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+            }
         }
         mode.Anonymous = DISPLAYCONFIG_MODE_INFO_0 {
             sourceMode: native_source(&source),
@@ -702,6 +1003,11 @@ pub fn verifies_untouched(
     selected: &str,
 ) -> bool {
     let mut expected = before.clone();
+    let selected_source = before
+        .paths
+        .iter()
+        .find(|path| path.id.eq_ignore_ascii_case(selected))
+        .map(|path| &path.source_address);
     expected
         .paths
         .retain(|path| !path.id.eq_ignore_ascii_case(selected));
@@ -718,6 +1024,11 @@ pub fn verifies_untouched(
         };
         path.source.x = wanted.x;
         path.source.y = wanted.y;
+        if selected_source == Some(&path.source_address) {
+            path.source.width = wanted.width;
+            path.source.height = wanted.height;
+            path.source.pixel_format = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+        }
     }
     let mut observed = current.clone();
     observed
@@ -768,6 +1079,33 @@ pub fn verifies(configuration: &Configuration, current: &Snapshot) -> bool {
                     && actual.refresh.equivalent(wanted.refresh)
             })
         })
+        && configuration
+            .displays
+            .iter()
+            .enumerate()
+            .all(|(index, left)| {
+                configuration.displays.iter().skip(index + 1).all(|right| {
+                    let Some(actual_left) = current
+                        .paths
+                        .iter()
+                        .find(|path| path.id.eq_ignore_ascii_case(&left.id))
+                    else {
+                        return false;
+                    };
+                    let Some(actual_right) = current
+                        .paths
+                        .iter()
+                        .find(|path| path.id.eq_ignore_ascii_case(&right.id))
+                    else {
+                        return false;
+                    };
+                    let wanted_clone = left.x == right.x
+                        && left.y == right.y
+                        && left.width == right.width
+                        && left.height == right.height;
+                    wanted_clone == (actual_left.source_address == actual_right.source_address)
+                })
+            })
 }
 fn rotation(value: Rotation) -> DISPLAYCONFIG_ROTATION {
     match value {

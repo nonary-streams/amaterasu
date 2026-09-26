@@ -5,7 +5,7 @@ mod query;
 use super::Platform;
 use super::TopologyShape;
 use crate::model::{
-    AvailableMode, Configuration, DisplayError, DisplayResult, RouteBinding, Snapshot,
+    Address, AvailableMode, Configuration, DisplayError, DisplayResult, RouteBinding, Snapshot,
 };
 use serde_json::{Value, json};
 #[derive(Default)]
@@ -61,6 +61,14 @@ impl Platform for WindowsPlatform {
     }
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
         apply::bind_inactive(display, before)
+    }
+    fn bind_clone(
+        &mut self,
+        display: &str,
+        source: &Address,
+        before: &Snapshot,
+    ) -> DisplayResult<RouteBinding> {
+        apply::bind_clone(display, source, before)
     }
     fn prepare_preserving(
         &mut self,
@@ -207,7 +215,11 @@ fn apply_configuration(
         ));
     }
     if let Some(route) = route {
-        apply::bound_inactive_path(route, before)?;
+        if selected.is_some_and(|(_, shape)| shape == TopologyShape::CloneActive) {
+            apply::bound_clone_path(route)?;
+        } else {
+            apply::bound_inactive_path(route, before)?;
+        }
     }
     apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
     let initial_state = verify_applied_configuration(configuration, query::snapshot())?;
@@ -347,6 +359,7 @@ mod tests {
     fn synthetic_bound(snapshot: &Snapshot) -> query::ConfigurationBuffers {
         let mut paths = Vec::new();
         let mut modes = Vec::new();
+        let mut source_indexes = std::collections::BTreeMap::new();
         for saved in &snapshot.paths {
             let mut path = DISPLAYCONFIG_PATH_INFO::default();
             path.sourceInfo.adapterId = LUID {
@@ -359,15 +372,27 @@ mod tests {
                 HighPart: saved.target_address.adapter_high,
             };
             path.targetInfo.id = saved.target_address.id;
-            path.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
-            modes.push(DISPLAYCONFIG_MODE_INFO {
-                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-                id: path.sourceInfo.id,
-                adapterId: path.sourceInfo.adapterId,
-                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
-                    sourceMode: native_source(&saved.source),
-                },
-            });
+            let source_key = (
+                saved.source_address.adapter_low,
+                saved.source_address.adapter_high,
+                saved.source_address.id,
+            );
+            let source_index = if let Some(index) = source_indexes.get(&source_key) {
+                *index
+            } else {
+                let index = modes.len() as u32;
+                source_indexes.insert(source_key, index);
+                modes.push(DISPLAYCONFIG_MODE_INFO {
+                    infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+                    id: path.sourceInfo.id,
+                    adapterId: path.sourceInfo.adapterId,
+                    Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                        sourceMode: native_source(&saved.source),
+                    },
+                });
+                index
+            };
+            path.sourceInfo.Anonymous.modeInfoIdx = source_index;
             path.targetInfo.Anonymous.modeInfoIdx = modes.len() as u32;
             modes.push(DISPLAYCONFIG_MODE_INFO {
                 infoType: DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
@@ -542,6 +567,78 @@ mod tests {
             &after,
             "monitor.two"
         ));
+    }
+
+    #[test]
+    fn preserving_clone_changes_one_shared_source_and_keeps_peer_target_state() {
+        for selected in ["monitor.one", "monitor.two"] {
+            let first = readback_path("monitor.one", 0, Some(false));
+            let mut second = readback_path("monitor.two", 0, Some(true));
+            second.source_name = first.source_name.clone();
+            second.source_address = first.source_address.clone();
+            second.target_address.id = 2;
+            let before = Snapshot {
+                format_version: 1,
+                paths: vec![first, second],
+            };
+            let mut configuration = before.configuration().unwrap();
+            for display in &mut configuration.displays {
+                display.width = 1280;
+                display.height = 720;
+            }
+            configuration
+                .displays
+                .iter_mut()
+                .find(|display| display.id == selected)
+                .unwrap()
+                .refresh
+                .numerator = 75;
+            let bound =
+                apply::preserve_bound(synthetic_bound(&before), &configuration, &before, selected)
+                    .unwrap();
+            assert_eq!(
+                unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx },
+                unsafe { bound.paths[1].sourceInfo.Anonymous.modeInfoIdx }
+            );
+            let index = unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx } as usize;
+            let source = unsafe { bound.modes[index].Anonymous.sourceMode };
+            assert_eq!((source.width, source.height), (1280, 720));
+            assert_eq!(bound.modes.len(), 2);
+            let mut after = before.clone();
+            for path in &mut after.paths {
+                path.source.width = 1280;
+                path.source.height = 720;
+            }
+            after
+                .paths
+                .iter_mut()
+                .find(|path| path.id == selected)
+                .unwrap()
+                .refresh
+                .numerator = 75;
+            assert!(apply::verifies(&configuration, &after));
+            assert!(apply::verifies_untouched(
+                &configuration,
+                &before,
+                &after,
+                selected
+            ));
+            let mut false_clone = after.clone();
+            false_clone.paths[1].source_address.id += 1;
+            assert!(!apply::verifies(&configuration, &false_clone));
+            let peer = after
+                .paths
+                .iter_mut()
+                .find(|path| path.id != selected)
+                .unwrap();
+            peer.scaling += 1;
+            assert!(!apply::verifies_untouched(
+                &configuration,
+                &before,
+                &after,
+                selected
+            ));
+        }
     }
 
     #[test]

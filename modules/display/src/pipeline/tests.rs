@@ -67,6 +67,186 @@ fn two_display_snapshot() -> Snapshot {
     before.paths.push(second);
     before
 }
+fn cloned_snapshot() -> Snapshot {
+    let mut before = two_display_snapshot();
+    before.paths[1].source_name = before.paths[0].source_name.clone();
+    before.paths[1].source_address = before.paths[0].source_address.clone();
+    before.paths[1].source = before.paths[0].source.clone();
+    before
+}
+
+#[test]
+fn clone_configuration_preserves_target_state_and_rejects_false_clone() {
+    let mut baseline = cloned_snapshot();
+    baseline.paths[1].refresh = Rational {
+        numerator: 75,
+        denominator: 1,
+    };
+    baseline.paths[1].hdr_enabled = Some(true);
+    let configuration = baseline.configuration().unwrap();
+    assert_eq!(configuration.displays[0].x, configuration.displays[1].x);
+    assert_eq!(configuration.displays[1].refresh.numerator, 75);
+    assert_eq!(configuration.displays[1].hdr_enabled, Some(true));
+    let mut rebound = baseline.clone();
+    for path in &mut rebound.paths {
+        path.source_address.adapter_low = 99;
+        path.target_address.adapter_low = 99;
+    }
+    assert!(baseline.equivalent(&rebound));
+    rebound.paths[1].source_address.id += 1;
+    assert!(!baseline.equivalent(&rebound));
+    assert_eq!(rebound.validate().unwrap_err().code, "unsupported_topology");
+}
+
+#[test]
+fn selected_clone_mode_policy_updates_shared_source_and_restores_for_either_target() {
+    for selected in ["monitor.one", "monitor.two"] {
+        let baseline = cloned_snapshot();
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                current_snapshot: Some(baseline.clone()),
+                hdr_supported: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let mut requested = configuration();
+        requested["displays"][0]["id"] = selected.into();
+        let mut request = mutating_option_request(
+            "ensure_active",
+            selected,
+            requested,
+            &json!(baseline.revision().unwrap()),
+        );
+        request["mode_policy"]["remapping"] =
+            policy(selected, "1600x900", "75")["remapping"].clone();
+        request["mode_policy"]["context"]["optimize_game_settings"] = true.into();
+        let result = state.run(&mut pipeline, "owner", request);
+        assert_eq!(result["applied"], true, "{selected}: {result}");
+        assert_eq!(pipeline.platform.prepared_modes.len(), 2);
+        assert!(
+            pipeline
+                .platform
+                .prepared_modes
+                .iter()
+                .all(|(_, width, height, _)| *width == 1600 && *height == 900)
+        );
+        let restored = state.run(
+            &mut pipeline,
+            "owner",
+            json!({"action":"restore","lease":result["lease"]}),
+        );
+        assert_eq!(restored["restored"], true);
+        assert!(state.journal.is_none());
+    }
+}
+
+#[test]
+fn conflicting_clone_mode_policies_fail_before_journal_or_native_effect() {
+    let baseline = cloned_snapshot();
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let policies: Vec<_> = [("monitor.one", "1280x720"), ("monitor.two", "1600x900")]
+        .into_iter()
+        .map(|(display_id, resolution)| {
+            json!({
+                "display_id":display_id,
+                "remapping":{},
+                "context":{"resolution_is_automatic":false,"refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,"optimize_game_settings":true},
+                "resolution_option":"manual","manual_resolution":resolution
+            })
+        })
+        .collect();
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply","configuration":baseline.configuration().unwrap(),
+            "mode_policies":policies,
+            "expected_topology_revision":baseline.revision().unwrap()
+        }),
+    );
+    assert_eq!(reply["error"]["code"], "unsupported_topology");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(pipeline.platform.prepared_configuration.is_none());
+}
+
+#[test]
+fn inactive_clone_cas_binds_route_and_retry_restores_from_persisted_baseline() {
+    let baseline = snapshot();
+    let mut configuration = baseline.configuration().unwrap();
+    let mut clone = configuration.displays[0].clone();
+    clone.id = "monitor.two".into();
+    clone.hdr_enabled = None;
+    configuration.displays.push(clone);
+    let revision = baseline.revision().unwrap();
+    let request = json!({"action":"apply","configuration":configuration,
+        "expected_topology_revision":revision,"operation_id":"clone-session"});
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        [
+            "prepare:monitor.two:CloneActive",
+            "apply:monitor.two:CloneActive"
+        ]
+    );
+    assert_eq!(
+        state.journal.as_ref().unwrap()["pending_route"]["id"],
+        "monitor.two"
+    );
+    let retry = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(retry["applied"], false);
+    assert_eq!(retry["lease"], applied["lease"]);
+    let denied = state.run(
+        &mut pipeline,
+        "foreign",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+    let stale = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":"stale"}),
+    );
+    assert_eq!(stale["error"]["code"], "permission_denied");
+    let mut restarted = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(cloned_snapshot()),
+            ..Default::default()
+        },
+        true,
+    );
+    let recovery = state.run(&mut restarted, "owner", request);
+    assert_eq!(recovery["state"], "recovery_required");
+    assert_eq!(restarted.platform.effects.len(), 0);
+    let restored = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(state.journal.is_none());
+    assert_eq!(restarted.platform.effects, ["restore"]);
+}
 fn configuration() -> Value {
     json!({"displays":[{"id":"monitor.one","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]})
 }
@@ -213,6 +393,37 @@ impl Platform for FakePlatform {
             target_address: Address {
                 adapter_low: 1,
                 adapter_high: 0,
+                id: 43,
+            },
+            output_technology: 5,
+        })
+    }
+    fn bind_clone(
+        &mut self,
+        display: &str,
+        source: &Address,
+        before: &Snapshot,
+    ) -> DisplayResult<RouteBinding> {
+        if self.inactive_route_ambiguous {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "ambiguous clone route",
+            ));
+        }
+        let source_name = before
+            .paths
+            .iter()
+            .find(|path| path.source_address == *source)
+            .ok_or_else(|| DisplayError::new("unsupported_topology", "missing clone source"))?
+            .source_name
+            .clone();
+        Ok(RouteBinding {
+            id: display.into(),
+            source_name,
+            source_address: source.clone(),
+            target_address: Address {
+                adapter_low: source.adapter_low,
+                adapter_high: source.adapter_high,
                 id: 43,
             },
             output_technology: 5,
@@ -1140,9 +1351,11 @@ fn ensure_only_rejects_unknown_hdr_on_a_display_it_would_deactivate() {
 }
 
 #[test]
-fn ensure_only_inactive_rejects_cloned_baseline_without_effect() {
+fn ensure_only_inactive_restores_cloned_baseline() {
     let mut baseline = two_display_snapshot();
     baseline.paths[0].id = "monitor.other".into();
+    baseline.paths[1].source_address = baseline.paths[0].source_address.clone();
+    baseline.paths[1].source_name = baseline.paths[0].source_name.clone();
     baseline.paths[1].source.x = 0;
     let mut state = State::default();
     let mut pipeline = Pipeline::new(
@@ -1164,9 +1377,15 @@ fn ensure_only_inactive_rejects_cloned_baseline_without_effect() {
             &json!(baseline.revision().unwrap()),
         ),
     );
-    assert_eq!(reply["error"]["code"], "unsupported_topology");
+    assert_eq!(reply["applied"], true);
+    assert!(state.journal.is_some());
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":reply["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
     assert!(state.journal.is_none());
-    assert!(pipeline.platform.effects.is_empty());
 }
 
 #[test]
@@ -2705,6 +2924,7 @@ fn startup_policy_and_request_validation_prevent_effects() {
     let mut overlap = configuration();
     let mut second = overlap["displays"][0].clone();
     second["id"] = "monitor.two".into();
+    second["x"] = 100.into();
     overlap["displays"].as_array_mut().unwrap().push(second);
     assert!(
         serde_json::from_value::<Configuration>(overlap)
