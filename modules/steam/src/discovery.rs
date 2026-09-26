@@ -35,6 +35,10 @@ pub struct Game {
     pub artwork_is_remote: bool,
     #[serde(skip)]
     pub artwork_candidate_signature: String,
+    #[serde(skip)]
+    pub artwork_local_revision: Option<String>,
+    #[serde(skip)]
+    pub artwork_needs_remote_upgrade: bool,
 }
 
 #[derive(Default)]
@@ -554,6 +558,7 @@ fn read_game(
     let last_updated = unsigned_field(app, "lastupdated", false)?;
     let artwork = artwork::discover(expected_id, library, artwork_roots);
     let artwork_is_remote = artwork.revision.is_none();
+    let artwork_local_revision = artwork.revision.clone();
     let artwork_revision = artwork
         .revision
         .or_else(|| artwork::remote_revision(expected_id, last_updated));
@@ -579,6 +584,8 @@ fn read_game(
         artwork_source_path: artwork.source_path,
         artwork_is_remote,
         artwork_candidate_signature: artwork.candidate_signature,
+        artwork_local_revision,
+        artwork_needs_remote_upgrade: artwork.needs_remote_upgrade,
     };
     if serde_json::to_vec(&game)
         .map_err(|error| error.to_string())?

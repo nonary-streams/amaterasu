@@ -519,6 +519,8 @@ fn escaped_metadata_pages_fit_runtime_budget_without_losing_entries() {
                 artwork_revision: None,
                 artwork_source_path: None,
                 artwork_is_remote: false,
+                artwork_local_revision: None,
+                artwork_needs_remote_upgrade: false,
                 artwork_candidate_signature: String::new(),
             },
         );

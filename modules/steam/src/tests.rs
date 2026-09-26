@@ -11,6 +11,297 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
+fn upgrade_game(app_id: u32, needs_upgrade: bool) -> Game {
+    Game {
+        stable_id: format!("steam:{app_id}"),
+        app_id,
+        name: "Art test".into(),
+        install_directory: "C:/steam/steamapps/common/test".into(),
+        library_directory: "C:/steam".into(),
+        state_flags: 4,
+        installed: true,
+        last_updated: 123,
+        app_type: Some("game".into()),
+        last_played: None,
+        artwork_revision: Some("local-42".into()),
+        artwork_source_path: Some("C:/steam/appcache/42.png".into()),
+        artwork_is_remote: false,
+        artwork_local_revision: Some("local-42".into()),
+        artwork_needs_remote_upgrade: needs_upgrade,
+        artwork_candidate_signature: "candidate-1".into(),
+    }
+}
+
+fn remote_test_jpeg() -> Vec<u8> {
+    let mut bytes = vec![
+        0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 3, 132, 2, 88, 3, 1, 17, 0, 2, 17, 0, 3, 17, 0,
+    ];
+    bytes.extend_from_slice(&[0xff, 0xd9]);
+    bytes
+}
+
+fn drain_artwork_until(provider: &mut Provider, deadline: Instant) -> Vec<(u64, Value)> {
+    while Instant::now() < deadline {
+        let result = provider.drain_remote_artwork();
+        if provider.upgrade_pending.is_none() {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("fake artwork worker did not finish");
+}
+
+#[test]
+fn low_resolution_art_promotes_only_after_successful_current_remote_fetch() {
+    let mut provider = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    provider.games.insert(42, upgrade_game(42, true));
+    let bytes = remote_test_jpeg();
+    provider
+        .remote_artwork
+        .start_with_fetcher(move |app_id| {
+            assert_eq!(app_id, 42);
+            Ok(bytes.clone())
+        })
+        .unwrap();
+    provider.upgrade_queue.push_back(42);
+    provider.enqueue_next_upgrade();
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+    assert!(drain_artwork_until(&mut provider, Instant::now() + Duration::from_secs(2)).is_empty());
+    let remote = artwork::remote_revision(42, 123).unwrap();
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some(remote.as_str())
+    );
+    assert!(provider.games[&42].artwork_is_remote);
+    assert_eq!(provider.revision, 1);
+    assert!(provider.read_artwork(9, 42, "local-42", 0, 1000).is_err());
+    assert!(
+        provider
+            .read_artwork(10, 42, &remote, 0, 1000)
+            .unwrap()
+            .is_none()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let responses = loop {
+        let responses = provider.drain_remote_artwork();
+        if !responses.is_empty() {
+            break responses;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake artwork read did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, 10);
+    assert_eq!(responses[0].1["revision"], remote);
+}
+
+#[test]
+fn high_resolution_local_art_stays_local_and_failed_upgrade_keeps_fallback() {
+    let mut high = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    high.games.insert(42, upgrade_game(42, false));
+    high.upgrade_queue.push_back(42);
+    high.enqueue_next_upgrade();
+    assert!(high.upgrade_pending.is_none());
+    assert_eq!(
+        high.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+    let mut uninstalled = upgrade_game(43, true);
+    uninstalled.installed = false;
+    high.games.insert(43, uninstalled);
+    high.upgrade_queue.push_back(43);
+    high.enqueue_next_upgrade();
+    assert!(high.upgrade_pending.is_none());
+
+    let mut low = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    low.games.insert(42, upgrade_game(42, true));
+    low.remote_artwork
+        .start_with_fetcher(|_| Err("artwork_unavailable"))
+        .unwrap();
+    low.upgrade_queue.push_back(42);
+    low.enqueue_next_upgrade();
+    assert!(drain_artwork_until(&mut low, Instant::now() + Duration::from_secs(2)).is_empty());
+    assert_eq!(low.games[&42].artwork_revision.as_deref(), Some("local-42"));
+    assert!(!low.games[&42].artwork_is_remote);
+}
+
+#[test]
+fn stale_upgrade_after_local_change_or_disable_cannot_replace_newer_reference() {
+    let (release, proceed) = std::sync::mpsc::channel::<()>();
+    let mut provider = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    provider.games.insert(42, upgrade_game(42, true));
+    provider
+        .remote_artwork
+        .start_with_fetcher(move |_| {
+            proceed.recv().unwrap();
+            Ok(remote_test_jpeg())
+        })
+        .unwrap();
+    provider.upgrade_queue.push_back(42);
+    provider.enqueue_next_upgrade();
+    provider
+        .games
+        .get_mut(&42)
+        .unwrap()
+        .artwork_candidate_signature = "candidate-2".into();
+    release.send(()).unwrap();
+    drain_artwork_until(&mut provider, Instant::now() + Duration::from_secs(2));
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+
+    provider.upgrade_queue.push_back(42);
+    provider.enqueue_next_upgrade();
+    provider.set_enabled(false);
+    provider.set_enabled(true);
+    provider.games.insert(42, upgrade_game(42, true));
+    provider.snapshot_complete = true;
+    provider.drain_remote_artwork();
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+}
+
+#[test]
+fn new_scan_retires_in_flight_upgrade_before_its_old_completion() {
+    let (started_sender, started_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let mut provider = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    provider.games.insert(42, upgrade_game(42, true));
+    provider
+        .remote_artwork
+        .start_with_fetcher(move |_| {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(remote_test_jpeg())
+        })
+        .unwrap();
+    provider.upgrade_queue.push_back(42);
+    provider.enqueue_next_upgrade();
+    started_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(provider.start_scan());
+    assert!(provider.scan_in_progress());
+    release_sender.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while provider.artwork_completion_count == 0 {
+        provider.drain_remote_artwork();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+    assert_eq!(provider.revision, 0);
+}
+
+#[test]
+fn expired_client_read_does_not_demote_a_promoted_remote_reference() {
+    let mut provider = Provider {
+        enabled: true,
+        ..Provider::default()
+    };
+    let mut game = upgrade_game(42, true);
+    let remote = artwork::remote_revision(42, game.last_updated).unwrap();
+    game.artwork_revision = Some(remote.clone());
+    game.artwork_is_remote = true;
+    provider.games.insert(42, game);
+    provider
+        .remote_artwork
+        .start_with_fetcher(|_| panic!("expired read must never fetch"))
+        .unwrap();
+    assert!(
+        provider
+            .read_artwork(7, 42, &remote, 0, 0)
+            .unwrap()
+            .is_none()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let responses = loop {
+        let responses = provider.drain_remote_artwork();
+        if !responses.is_empty() {
+            break responses;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(responses[0].1["code"], "request_ended");
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some(remote.as_str())
+    );
+    assert!(provider.games[&42].artwork_is_remote);
+}
+
+#[test]
+fn failed_remote_read_restores_local_artwork_with_a_new_revision() {
+    let mut provider = Provider {
+        enabled: true,
+        ..Provider::default()
+    };
+    let mut game = upgrade_game(42, true);
+    let remote = artwork::remote_revision(42, game.last_updated).unwrap();
+    game.artwork_revision = Some(remote.clone());
+    game.artwork_is_remote = true;
+    provider.games.insert(42, game);
+    provider
+        .remote_artwork
+        .start_with_fetcher(|_| Err("artwork_unavailable"))
+        .unwrap();
+    assert!(
+        provider
+            .read_artwork(7, 42, &remote, 0, 1000)
+            .unwrap()
+            .is_none()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let responses = loop {
+        let responses = provider.drain_remote_artwork();
+        if !responses.is_empty() {
+            break responses;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(responses[0].1["code"], "artwork_changed");
+    assert_eq!(
+        provider.games[&42].artwork_revision.as_deref(),
+        Some("local-42")
+    );
+    assert!(!provider.games[&42].artwork_is_remote);
+    assert_eq!(provider.revision, 1);
+}
+
 #[test]
 fn product_settings_actions_require_the_management_principal() {
     assert!(is_management_caller("amaterasu.management"));
@@ -84,6 +375,8 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
             artwork_revision: artwork.revision,
             artwork_source_path: artwork.source_path,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );
@@ -185,6 +478,8 @@ fn disabled_steam_rejects_refresh_and_drops_the_prior_discovery_snapshot() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );
@@ -482,6 +777,8 @@ fn set_complete_test_snapshot(provider: &mut Provider, revision: u64, name: &str
             artwork_revision: Some("123".into()),
             artwork_source_path: Some("/Steam/art/42.jpg".into()),
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     )]
@@ -956,6 +1253,8 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );
@@ -976,6 +1275,8 @@ fn automatic_sync_imports_only_included_installed_games_with_a_complete_snapshot
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );
@@ -1163,6 +1464,8 @@ fn catalog_cleanup_waits_for_appinfo_when_tool_filtering_is_active() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );
@@ -1214,6 +1517,8 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
             artwork_revision: None,
             artwork_source_path: None,
             artwork_is_remote: false,
+            artwork_local_revision: None,
+            artwork_needs_remote_upgrade: false,
             artwork_candidate_signature: String::new(),
         },
     );

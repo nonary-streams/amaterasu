@@ -13,7 +13,7 @@ use discovery::{Game, Scan};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::{Exclusion, ProductSettings, StartupSettings};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,22 @@ struct Provider {
     history_complete: bool,
     owned_history_complete: bool,
     remote_artwork: artwork::RemoteArtworkWorker,
+    upgrade_queue: VecDeque<u32>,
+    upgrade_pending: Option<PendingArtworkUpgrade>,
+    upgrade_serial: u64,
+    artwork_generation: u64,
+    #[cfg(test)]
+    artwork_completion_count: usize,
+}
+
+#[derive(Clone)]
+struct PendingArtworkUpgrade {
+    serial: u64,
+    generation: u64,
+    app_id: u32,
+    last_updated: u64,
+    local_revision: Option<String>,
+    candidate_signature: String,
 }
 
 impl Provider {
@@ -96,9 +112,12 @@ impl Provider {
             return;
         }
         self.enabled = enabled;
+        self.artwork_generation = self.artwork_generation.saturating_add(1);
         if !enabled {
             self.scan = None;
             self.games.clear();
+            self.upgrade_queue.clear();
+            self.upgrade_pending = None;
             self.warnings.clear();
             self.warning_count = 0;
             self.appinfo_complete = false;
@@ -120,6 +139,9 @@ impl Provider {
         if self.automatic_roots {
             self.roots = defaults();
         }
+        self.artwork_generation = self.artwork_generation.saturating_add(1);
+        self.upgrade_pending = None;
+        self.upgrade_queue.clear();
         self.scan = Some(Scan::new(&self.roots));
         true
     }
@@ -145,14 +167,97 @@ impl Provider {
             // provider is running. Resolve it with each discovery snapshot so
             // reconciliation never keeps a stale launch program.
             self.steam_executable = discovery::find_steam_executable(&self.roots);
-            self.games = scan.games;
+            self.artwork_generation = self.artwork_generation.saturating_add(1);
+            self.upgrade_pending = None;
+            let mut games = scan.games;
+            for (app_id, game) in &mut games {
+                if let Some(previous) = self.games.get(app_id)
+                    && previous.artwork_is_remote
+                    && previous.artwork_needs_remote_upgrade
+                    && game.artwork_needs_remote_upgrade
+                    && previous.last_updated == game.last_updated
+                    && previous.artwork_local_revision == game.artwork_local_revision
+                    && previous.artwork_candidate_signature == game.artwork_candidate_signature
+                {
+                    game.artwork_is_remote = true;
+                    game.artwork_revision = previous.artwork_revision.clone();
+                }
+            }
+            self.games = games;
             self.warnings = scan.warnings;
             self.warning_count = scan.warning_count;
             self.snapshot_complete = scan.warning_count == 0;
+            self.upgrade_queue = if self.snapshot_complete {
+                self.games
+                    .iter()
+                    .filter_map(|(app_id, game)| {
+                        (game.installed
+                            && game.artwork_needs_remote_upgrade
+                            && !game.artwork_is_remote)
+                            .then_some(*app_id)
+                    })
+                    .collect()
+            } else {
+                VecDeque::new()
+            };
             self.appinfo_complete = scan.appinfo_complete;
             self.history_complete = scan.history_complete;
             self.owned_history_complete = scan.owned_history_complete;
             self.revision = self.revision.saturating_add(1);
+        }
+        self.enqueue_next_upgrade();
+    }
+
+    fn enqueue_next_upgrade(&mut self) {
+        if self.upgrade_pending.is_some()
+            || !self.enabled
+            || !self.snapshot_complete
+            || self.upgrade_serial == u64::MAX
+        {
+            return;
+        }
+        while let Some(app_id) = self.upgrade_queue.front().copied() {
+            let Some(game) = self.games.get(&app_id) else {
+                self.upgrade_queue.pop_front();
+                continue;
+            };
+            if !game.installed || !game.artwork_needs_remote_upgrade || game.artwork_is_remote {
+                self.upgrade_queue.pop_front();
+                continue;
+            }
+            let Some(revision) = artwork::remote_revision(app_id, game.last_updated) else {
+                self.upgrade_queue.pop_front();
+                continue;
+            };
+            let request = artwork::RemoteArtworkRequest {
+                prefetch: true,
+                generation: self.artwork_generation,
+                request_id: self.upgrade_serial.saturating_add(1),
+                app_id,
+                last_updated: game.last_updated,
+                revision,
+                offset: 0,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            match self.remote_artwork.enqueue(request) {
+                Ok(()) => {
+                    self.upgrade_serial = self.upgrade_serial.saturating_add(1);
+                    self.upgrade_pending = Some(PendingArtworkUpgrade {
+                        serial: self.upgrade_serial,
+                        generation: self.artwork_generation,
+                        app_id,
+                        last_updated: game.last_updated,
+                        local_revision: game.artwork_local_revision.clone(),
+                        candidate_signature: game.artwork_candidate_signature.clone(),
+                    });
+                    self.upgrade_queue.pop_front();
+                    return;
+                }
+                Err("artwork_busy") => return,
+                Err(_) => {
+                    self.upgrade_queue.pop_front();
+                }
+            }
         }
     }
 
@@ -245,6 +350,8 @@ impl Provider {
                 .checked_add(Duration::from_millis(remaining_ms))
                 .ok_or("invalid_request")?;
             self.remote_artwork.enqueue(artwork::RemoteArtworkRequest {
+                prefetch: false,
+                generation: self.artwork_generation,
                 request_id,
                 app_id,
                 last_updated,
@@ -265,27 +372,77 @@ impl Provider {
     }
 
     fn drain_remote_artwork(&mut self) -> Vec<(u64, Value)> {
-        self.remote_artwork
-            .drain()
-            .into_iter()
-            .map(|completion| {
-                let still_current = self.games.get(&completion.app_id).is_some_and(|game| {
-                    game.artwork_is_remote
-                        && game.artwork_revision.as_deref() == Some(&completion.revision)
+        let mut responses = Vec::new();
+        for completion in self.remote_artwork.drain() {
+            #[cfg(test)]
+            {
+                self.artwork_completion_count += 1;
+            }
+            if completion.prefetch {
+                let pending = self
+                    .upgrade_pending
+                    .as_ref()
+                    .filter(|pending| {
+                        pending.serial == completion.request_id
+                            && pending.app_id == completion.app_id
+                            && pending.generation == self.artwork_generation
+                            && pending.generation == completion.generation
+                    })
+                    .cloned();
+                if pending.is_some() {
+                    self.upgrade_pending = None;
+                }
+                if completion.result.is_ok()
+                    && pending.is_some()
+                    && let Some(game) = self.games.get_mut(&completion.app_id)
+                    && pending.as_ref().is_some_and(|pending| {
+                        pending.last_updated == game.last_updated
+                            && pending.local_revision == game.artwork_local_revision
+                            && pending.candidate_signature == game.artwork_candidate_signature
+                    })
+                    && game.artwork_needs_remote_upgrade
+                    && !game.artwork_is_remote
+                    && artwork::remote_revision(game.app_id, game.last_updated).as_deref()
+                        == Some(completion.revision.as_str())
+                    && self.revision < u64::MAX
+                {
+                    game.artwork_is_remote = true;
+                    game.artwork_revision = Some(completion.revision);
+                    self.revision += 1;
+                }
+                continue;
+            }
+            let still_current = self.games.get(&completion.app_id).is_some_and(|game| {
+                completion.generation == self.artwork_generation
+                    && game.artwork_is_remote
+                    && game.artwork_revision.as_deref() == Some(&completion.revision)
+            });
+            let source_failed =
+                completion.result.as_ref().err().is_some_and(|code| {
+                    matches!(*code, "artwork_unavailable" | "unsupported_artwork")
                 });
-                let payload = if !still_current {
-                    json!({"ok":false,"code":"artwork_changed"})
-                } else {
-                    match completion.result {
-                        Ok(chunk) => {
-                            artwork_chunk_payload(completion.app_id, completion.offset, chunk)
-                        }
-                        Err(code) => json!({"ok":false,"code":code}),
-                    }
-                };
-                (completion.request_id, payload)
-            })
-            .collect()
+            let mut payload = if !still_current {
+                json!({"ok":false,"code":"artwork_changed"})
+            } else {
+                match completion.result {
+                    Ok(chunk) => artwork_chunk_payload(completion.app_id, completion.offset, chunk),
+                    Err(code) => json!({"ok":false,"code":code}),
+                }
+            };
+            if still_current
+                && source_failed
+                && let Some(game) = self.games.get_mut(&completion.app_id)
+                && let Some(local_revision) = &game.artwork_local_revision
+                && self.revision < u64::MAX
+            {
+                game.artwork_revision = Some(local_revision.clone());
+                game.artwork_is_remote = false;
+                self.revision += 1;
+                payload = json!({"ok":false,"code":"artwork_changed"});
+            }
+            responses.push((completion.request_id, payload));
+        }
+        responses
     }
 
     fn status(&self) -> Value {

@@ -27,6 +27,7 @@ pub struct ArtworkMetadata {
     pub source_path: Option<String>,
     pub revision: Option<String>,
     pub candidate_signature: String,
+    pub needs_remote_upgrade: bool,
 }
 
 struct LocalArtworkCandidate {
@@ -75,6 +76,8 @@ pub struct RemoteArtworkCache {
 }
 
 pub struct RemoteArtworkRequest {
+    pub prefetch: bool,
+    pub generation: u64,
     pub request_id: u64,
     pub app_id: u32,
     pub last_updated: u64,
@@ -84,6 +87,8 @@ pub struct RemoteArtworkRequest {
 }
 
 pub struct RemoteArtworkCompletion {
+    pub prefetch: bool,
+    pub generation: u64,
     pub request_id: u64,
     pub app_id: u32,
     pub revision: String,
@@ -219,7 +224,7 @@ impl RemoteArtworkWorker {
         self.start_with_fetcher(fetch_remote)
     }
 
-    fn start_with_fetcher(
+    pub(crate) fn start_with_fetcher(
         &mut self,
         fetcher: impl Fn(u32) -> Result<Vec<u8>, &'static str> + Send + 'static,
     ) -> Result<(), &'static str> {
@@ -259,6 +264,8 @@ impl RemoteArtworkWorker {
                     };
                     if completion_sender
                         .send(RemoteArtworkCompletion {
+                            prefetch: request.prefetch,
+                            generation: request.generation,
                             request_id: request.request_id,
                             app_id: request.app_id,
                             revision: request.revision,
@@ -472,6 +479,10 @@ pub fn discover(app_id: u32, library: &Path, configured_roots: &[PathBuf]) -> Ar
     match best_candidate {
         Some(candidate) => ArtworkMetadata {
             candidate_signature,
+            needs_remote_upgrade: candidate.role_priority != 3
+                || candidate.width < 600
+                || candidate.height < 900
+                || u64::from(candidate.width) * 3 != u64::from(candidate.height) * 2,
             ..candidate.metadata
         },
         None => ArtworkMetadata {
@@ -707,6 +718,7 @@ fn inspect_candidate(
             source_path: canonical_path.to_str().map(str::to_owned),
             revision: Some(revision),
             candidate_signature: String::new(),
+            needs_remote_upgrade: false,
         },
         canonical_path,
         byte_length: metadata.len(),
@@ -959,6 +971,7 @@ mod tests {
         let first = discover(42, &root.0, &[]);
         assert_eq!(first.source_path.as_deref(), portrait.to_str());
         assert!(first.revision.is_some());
+        assert!(first.needs_remote_upgrade);
 
         fs::write(&portrait, b"\x89PNG\r\n\x1a\nupdated portrait bytes").unwrap();
         let second = discover(42, &root.0, &[]);
@@ -1043,6 +1056,7 @@ mod tests {
             artwork.source_path.as_deref(),
             high_resolution_portrait.to_str()
         );
+        assert!(!artwork.needs_remote_upgrade);
     }
 
     #[test]
@@ -1339,6 +1353,8 @@ mod tests {
         let started = Instant::now();
         worker
             .enqueue(RemoteArtworkRequest {
+                prefetch: false,
+                generation: 0,
                 request_id: 7,
                 app_id: 42,
                 last_updated: 123,
@@ -1381,6 +1397,8 @@ mod tests {
         let request = |request_id| {
             let app_id = 41 + u32::try_from(request_id).unwrap();
             RemoteArtworkRequest {
+                prefetch: false,
+                generation: 0,
                 request_id,
                 app_id,
                 last_updated: 123,
@@ -1421,6 +1439,8 @@ mod tests {
             .unwrap();
         worker
             .enqueue(RemoteArtworkRequest {
+                prefetch: false,
+                generation: 0,
                 request_id: 9,
                 app_id: 42,
                 last_updated: 123,

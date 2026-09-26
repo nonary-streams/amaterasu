@@ -159,12 +159,18 @@ same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
 an eight-second timeout, accepts only JPEG portraits up to 16 MiB, keeps up to
 four images in memory, and cools down failed app IDs for ten minutes. The
 authenticated chunk route and frontend assembly use the same 16 MiB image
-limit. Failed remote fetches leave the UI to use its existing icon fallback.
-Vibeshine retains persistent converted covers through transient remote failures
-and replaces low-resolution local art when a full portrait is available; those
-behaviors remain pending. Amaterasu has no Steam-authorized product cache root
-or host service for persistent artwork, so remote images are not persisted or
-converted to PNG and a low-resolution local portrait is not replaced remotely.
+limit. A selected local image below 600 by 900 pixels or outside a 2:3 portrait
+ratio stays available while a complete discovery schedules a bounded CDN fetch
+for installed games. A validated full portrait promotes the opaque artwork
+reference; automatic sync then reconciles the catalog. Failed fetches keep the
+local reference. If a later remote read fails after cache eviction, the provider
+returns to the local revision and asks the reader to retry. An expired client
+read does not change the catalog reference. Missing local art still uses the
+fixed CDN reference and the UI's existing icon fallback on fetch failure.
+Amaterasu has no Steam-authorized product cache root or host service for
+persistent artwork, so remote images are not persisted or converted to PNG.
+Manual mode needs another `force_sync` to reconcile a later promotion; ordinary
+`refresh` remains discovery-only.
 The sync fingerprint also includes an internal, bounded signature over every
 valid local artwork candidate found during discovery, including its canonical
 path, byte length, and modification timestamp, plus role and dimensions used for
