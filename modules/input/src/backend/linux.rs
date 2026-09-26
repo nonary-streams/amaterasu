@@ -694,11 +694,18 @@ impl Backend for LinuxBackend {
             release_owned_device(&mut self.gamepad_probe, false, |_| Ok(()), Device::destroy);
         let input_result =
             release_input_pair(&mut self.keyboard, &mut self.pointer, Device::destroy);
-        self.held_virtual_keycodes.clear();
-        self.keyboard_recovery_required = false;
-        self.pointer_recovery_required = false;
-        self.vertical_scroll_remainder = 0;
-        self.horizontal_scroll_remainder = 0;
+        // A failed destroy leaves the descriptor owned by this lease. Keep its
+        // recovery and event state until that exact descriptor is destroyed;
+        // another stop can then retry without losing the failed-write marker.
+        if self.keyboard.is_none() {
+            self.held_virtual_keycodes.clear();
+            self.keyboard_recovery_required = false;
+        }
+        if self.pointer.is_none() {
+            self.pointer_recovery_required = false;
+            self.vertical_scroll_remainder = 0;
+            self.horizontal_scroll_remainder = 0;
+        }
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;

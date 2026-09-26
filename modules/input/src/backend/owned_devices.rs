@@ -339,4 +339,100 @@ mod tests {
         assert_eq!((keyboard, pointer), (Some(3), Some(4)));
         assert_eq!(attempts, [1, 2, 2]);
     }
+
+    #[test]
+    fn failed_keyboard_write_recovers_without_touching_pointer_lease() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct FakeDevice {
+            id: u8,
+            updates: usize,
+        }
+
+        let mut keyboard = None;
+        let mut pointer = None;
+        let created = std::cell::RefCell::new(Vec::new());
+        acquire_input_pair(&mut keyboard, &mut pointer, |is_keyboard| {
+            let id = if is_keyboard { 1 } else { 2 };
+            created.borrow_mut().push(id);
+            Ok(FakeDevice { id, updates: 0 })
+        })
+        .unwrap();
+
+        let mut keyboard_recovery_required = false;
+        keyboard.as_mut().unwrap().updates += 1;
+        let write_result: InputResult<()> = Err(InputError::new(
+            "injection_failed",
+            "partial keyboard frame",
+        ));
+        if write_result.is_err() {
+            keyboard_recovery_required = true;
+        }
+        assert_eq!(keyboard.as_ref().unwrap().updates, 1);
+        pointer.as_mut().unwrap().updates += 1;
+        assert_eq!(pointer.as_ref().unwrap().updates, 1);
+
+        let mut destroy_attempts = Vec::new();
+        let mut fail_keyboard_destroy = true;
+        let mut fail_replacement_destroy = true;
+        let mut destroy = |device: &mut FakeDevice| {
+            destroy_attempts.push(device.id);
+            if device.id == 1 && std::mem::take(&mut fail_keyboard_destroy) {
+                Err(InputError::new("release_failed", "keyboard destroy failed"))
+            } else if device.id == 3 && std::mem::take(&mut fail_replacement_destroy) {
+                Err(InputError::new(
+                    "release_failed",
+                    "replacement destroy failed",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let mut recreate = || {
+            created.borrow_mut().push(3);
+            Ok(FakeDevice { id: 3, updates: 0 })
+        };
+        assert_eq!(
+            recover_input_device(
+                &mut keyboard,
+                &mut keyboard_recovery_required,
+                &mut destroy,
+                &mut recreate,
+            )
+            .unwrap_err()
+            .code,
+            "release_failed"
+        );
+        assert_eq!(keyboard.as_ref().unwrap().id, 1);
+        assert!(keyboard_recovery_required);
+        assert_eq!(pointer.as_ref().unwrap().id, 2);
+        assert_eq!(*created.borrow(), [1, 2]);
+
+        recover_input_device(
+            &mut keyboard,
+            &mut keyboard_recovery_required,
+            &mut destroy,
+            &mut recreate,
+        )
+        .unwrap();
+        assert_eq!(keyboard.as_ref().unwrap().id, 3);
+        assert!(!keyboard_recovery_required);
+        assert_eq!(pointer.as_ref().unwrap().id, 2);
+        keyboard.as_mut().unwrap().updates += 1;
+        assert_eq!(keyboard.as_ref().unwrap().updates, 1);
+        assert_eq!(pointer.as_ref().unwrap().updates, 1);
+
+        assert_eq!(
+            release_input_pair(&mut keyboard, &mut pointer, &mut destroy)
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        assert_eq!(keyboard.as_ref().unwrap().id, 3);
+        assert!(pointer.is_none());
+        assert_eq!(*created.borrow(), [1, 2, 3]);
+        release_input_pair(&mut keyboard, &mut pointer, &mut destroy).unwrap();
+        release_input_pair(&mut keyboard, &mut pointer, &mut destroy).unwrap();
+        assert_eq!(destroy_attempts, [1, 1, 3, 2, 3]);
+        assert!(keyboard.is_none() && pointer.is_none());
+    }
 }
