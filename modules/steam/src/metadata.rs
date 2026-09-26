@@ -99,7 +99,7 @@ impl Scanner {
             return false;
         }
         if let Some(Task::LocalConfig(path)) = self.tasks.pop_front() {
-            match read_localconfig(&path) {
+            match read_localconfig(&path, games) {
                 Ok(last_played) => {
                     for (app_id, timestamp) in last_played {
                         if let Some(game) = games.get_mut(&app_id) {
@@ -244,7 +244,10 @@ fn regular_metadata(path: &Path, metadata: Metadata) -> Result<(), String> {
     Ok(())
 }
 
-fn read_localconfig(path: &Path) -> Result<BTreeMap<u32, u64>, String> {
+fn read_localconfig(
+    path: &Path,
+    games: &BTreeMap<u32, Game>,
+) -> Result<BTreeMap<u32, u64>, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
@@ -278,6 +281,11 @@ fn read_localconfig(path: &Path) -> Result<BTreeMap<u32, u64>, String> {
             continue;
         };
         if app_id == 0 || app_id.to_string() != *raw_app_id {
+            continue;
+        }
+        // Other apps can have malformed local history without affecting this
+        // scan's installed games. Steam's localconfig is shared by all apps.
+        if !games.get(&app_id).is_some_and(|game| game.installed) {
             continue;
         }
         let Value::Object(fields) = app else {
@@ -722,6 +730,47 @@ mod tests {
         assert!(scan.appinfo_complete);
         assert!(!scan.history_complete);
         assert_eq!(scan.games[&42].last_played, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn unrelated_corrupt_history_does_not_block_installed_game_reconciliation() {
+        let fixture = Fixture::new();
+        fixture.installed_manifest(42);
+        fixture.appinfo(&[(42, "game")]);
+        let localconfig = fixture
+            .steam_root()
+            .join("userdata/100/config/localconfig.vdf");
+        fs::create_dir_all(localconfig.parent().unwrap()).unwrap();
+        fs::write(
+            &localconfig,
+            "UserLocalConfigStore { Software { Valve { Steam { apps { 42 { LastPlayed 1800000000 } 99 { LastPlayed broken } } } } } }",
+        )
+        .unwrap();
+
+        let scan = scan_to_completion(fixture.steam_root());
+        assert!(scan.history_complete);
+        assert!(scan.appinfo_complete);
+        assert_eq!(scan.games[&42].last_played, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn corrupt_installed_game_history_still_blocks_catalog_cleanup() {
+        let fixture = Fixture::new();
+        fixture.installed_manifest(42);
+        fixture.appinfo(&[(42, "game")]);
+        let localconfig = fixture
+            .steam_root()
+            .join("userdata/100/config/localconfig.vdf");
+        fs::create_dir_all(localconfig.parent().unwrap()).unwrap();
+        fs::write(
+            localconfig,
+            "UserLocalConfigStore { Software { Valve { Steam { apps { 42 { LastPlayed broken } } } } } }",
+        )
+        .unwrap();
+
+        let scan = scan_to_completion(fixture.steam_root());
+        assert!(!scan.history_complete);
+        assert!(scan.appinfo_complete);
     }
 
     #[test]

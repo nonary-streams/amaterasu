@@ -86,6 +86,8 @@ App types are read from the configured Steam install's binary
 accounts. These files are parsed locally and need no Steam Web API key. If the
 active selection policy needs app types or recent history and those sources are
 missing, malformed, oversized, or incomplete, the catalog is left unchanged.
+Malformed history for an unrelated or uninstalled app does not make the source
+incomplete; only installed apps in the current snapshot affect selection.
 Configure the Steam installation root (or its `steamapps` directory) as well
 as library roots so those sidecars can be found. Discovery and list remain
 available when metadata is incomplete. Status includes
