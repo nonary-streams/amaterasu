@@ -283,10 +283,16 @@ fn refresh_virtual_route(
     mut assign_role: impl FnMut(DefaultRole) -> AudioResult<()>,
 ) -> AudioResult<()> {
     for assignment in policy.refresh_assignments(endpoint, current)? {
-        if read_role(assignment.role)?.as_deref() == Some(endpoint) {
+        let observed = read_role(assignment.role)?;
+        if observed.as_deref() == Some(endpoint) {
             continue;
         }
-        policy.attempt_assignment(endpoint, assignment.role, || assign_role(assignment.role))?;
+        policy.attempt_refresh_assignment(
+            endpoint,
+            assignment.role,
+            observed.as_deref(),
+            || assign_role(assignment.role),
+        )?;
         if read_role(assignment.role)?.as_deref() != Some(endpoint) {
             return Err("audio_route_change_failed");
         }

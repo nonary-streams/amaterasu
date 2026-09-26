@@ -56,6 +56,7 @@ pub enum ReleasePlan {
 struct ActiveLease {
     endpoint: String,
     original: DefaultEndpoints,
+    initially_selected_roles: [bool; 3],
     assigned_roles: [bool; 3],
     references: usize,
 }
@@ -108,6 +109,9 @@ impl RoutePolicy {
                 self.active = Some(ActiveLease {
                     endpoint: endpoint.to_owned(),
                     original: current.clone(),
+                    initially_selected_roles: std::array::from_fn(|index| {
+                        current[index].as_deref() == Some(endpoint)
+                    }),
                     assigned_roles: [false; 3],
                     references: 1,
                 });
@@ -135,6 +139,9 @@ impl RoutePolicy {
         self.active = Some(ActiveLease {
             endpoint: endpoint.to_owned(),
             original: current.clone(),
+            initially_selected_roles: std::array::from_fn(|index| {
+                current[index].as_deref() == Some(endpoint)
+            }),
             assigned_roles: [false; 3],
             references: 1,
         });
@@ -164,6 +171,31 @@ impl RoutePolicy {
         assign: impl FnOnce() -> Result<(), &'static str>,
     ) -> Result<(), &'static str> {
         self.record_assignment(endpoint, role)?;
+        assign()
+    }
+
+    /// Reassert an active virtual sink after reading the current role. If
+    /// that sink was the original default, preserve the newer live choice for
+    /// final release. Record the attempt before the platform call because a
+    /// failed call can still have changed the default.
+    pub fn attempt_refresh_assignment(
+        &mut self,
+        endpoint: &str,
+        role: DefaultRole,
+        current: Option<&str>,
+        assign: impl FnOnce() -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let active = self.active.as_mut().ok_or("audio_route_unavailable")?;
+        if active.endpoint != endpoint || active.references == 0 {
+            return Err("audio_route_unavailable");
+        }
+        let index = role.index();
+        if active.initially_selected_roles[index]
+            && let Some(chosen) = current.filter(|current| *current != endpoint)
+        {
+            active.original[index] = Some(chosen.to_owned());
+        }
+        active.assigned_roles[index] = true;
         assign()
     }
 
@@ -613,7 +645,12 @@ mod tests {
             }])
         );
         policy
-            .record_assignment("render.virtual", DefaultRole::Console)
+            .attempt_refresh_assignment(
+                "render.virtual",
+                DefaultRole::Console,
+                Some("render.user"),
+                || Ok(()),
+            )
             .unwrap();
         let reasserted = endpoints("render.virtual", "render.user-multimedia", "render.comms");
         assert_eq!(
@@ -622,8 +659,93 @@ mod tests {
         );
         assert_eq!(
             policy.release("render.virtual", &reasserted),
-            Ok(ReleasePlan::Restore(Vec::new()))
+            Ok(ReleasePlan::Restore(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.user".into(),
+            }]))
         );
+        policy.complete_restore(false);
+        let restored = endpoints("render.user", "render.user-multimedia", "render.comms");
+        assert!(policy.pending_restore_complete(&restored));
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn already_selected_virtual_route_recovers_failed_refresh_and_restores_new_default() {
+        let virtual_sink = "render.virtual";
+        let mut defaults = endpoints(virtual_sink, "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        assert_eq!(
+            policy.acquire_with_tracking(virtual_sink, &defaults, true),
+            Ok(AcquirePlan::Tracked)
+        );
+
+        // A user changes Console while this capture is active. A policy
+        // interface failure must not forget either the choice or the retry.
+        defaults[DefaultRole::Console.index()] = Some("render.user".into());
+        let refresh = policy.refresh_assignments(virtual_sink, &defaults).unwrap();
+        assert_eq!(refresh.len(), 1);
+        assert_eq!(refresh[0].role, DefaultRole::Console);
+        assert_eq!(
+            policy.refresh_assignments(virtual_sink, &defaults).unwrap(),
+            refresh
+        );
+        policy
+            .attempt_refresh_assignment(
+                virtual_sink,
+                DefaultRole::Console,
+                Some("render.user"),
+                || Err("audio_route_change_failed"),
+            )
+            .unwrap_err();
+        assert_eq!(
+            policy.refresh_assignments(virtual_sink, &defaults).unwrap(),
+            refresh
+        );
+
+        policy
+            .attempt_refresh_assignment(
+                virtual_sink,
+                DefaultRole::Console,
+                Some("render.user"),
+                || {
+                    defaults[DefaultRole::Console.index()] = Some(virtual_sink.into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            policy
+                .refresh_assignments(virtual_sink, &defaults)
+                .unwrap()
+                .is_empty()
+        );
+        defaults[DefaultRole::Console.index()] = Some("render.latest".into());
+        assert_eq!(
+            policy.refresh_assignments(virtual_sink, &defaults).unwrap(),
+            refresh
+        );
+        policy
+            .attempt_refresh_assignment(
+                virtual_sink,
+                DefaultRole::Console,
+                Some("render.latest"),
+                || {
+                    defaults[DefaultRole::Console.index()] = Some(virtual_sink.into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            policy.release(virtual_sink, &defaults),
+            Ok(ReleasePlan::Restore(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.latest".into(),
+            }]))
+        );
+        defaults[DefaultRole::Console.index()] = Some("render.latest".into());
+        assert!(policy.pending_restore_complete(&defaults));
         policy.complete_restore(true);
         assert_eq!(policy.endpoint_with_pending_restore(), None);
     }
