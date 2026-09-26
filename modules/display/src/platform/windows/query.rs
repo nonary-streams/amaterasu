@@ -155,6 +155,7 @@ pub fn check_legacy_hdr_recovery(snapshot: &Snapshot) -> DisplayResult<()> {
         return Ok(());
     }
     let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+    let mut observed_legacy_targets = Vec::new();
     for path in &active.paths {
         let id = names(path)?.id;
         if !snapshot
@@ -164,12 +165,43 @@ pub fn check_legacy_hdr_recovery(snapshot: &Snapshot) -> DisplayResult<()> {
         {
             continue;
         }
+        observed_legacy_targets.push(id.clone());
         if snapshot.legacy_hdr_target_conflicts(&id, advanced_color_enabled(path)?) {
             return Err(DisplayError::new(
                 "recovery_blocked",
                 "HDR was enabled outside the old SDR recovery journal",
             ));
         }
+    }
+    if snapshot.paths.iter().any(|saved| {
+        saved.hdr_enabled.is_none()
+            && !observed_legacy_targets
+                .iter()
+                .any(|id| saved.id.eq_ignore_ascii_case(id))
+    }) {
+        return Err(DisplayError::new(
+            "recovery_blocked",
+            "old SDR journal target is inactive; its HDR state cannot be checked before reactivation",
+        ));
+    }
+    Ok(())
+}
+
+/// An inactive target has no saved HDR baseline. Inspect the state after CCD
+/// activation without changing HDR; rollback restores the prior topology if
+/// Windows activated the target with HDR already enabled.
+pub fn verify_newly_active_hdr_is_off(id: &str) -> DisplayResult<()> {
+    let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+    let path = active
+        .paths
+        .iter()
+        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+        .ok_or_else(|| DisplayError::new("topology_changed", "requested target is not active"))?;
+    if advanced_color_enabled(path)? == Some(true) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "newly active target enabled HDR without a saved recovery baseline",
+        ));
     }
     Ok(())
 }

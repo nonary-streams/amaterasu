@@ -88,6 +88,7 @@ struct FakePlatform {
     available_modes: Vec<crate::model::AvailableMode>,
     mode_queries: usize,
     inactive: bool,
+    inactive_activation_hdr: bool,
     hdr_supported: bool,
     hdr_state: bool,
     hdr_mutations: usize,
@@ -118,18 +119,15 @@ impl Platform for FakePlatform {
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let display = &configuration.displays[0];
-        if display.hdr_enabled == Some(true) && !self.hdr_supported {
+        if display.hdr_enabled == Some(true) && (!self.hdr_supported || self.inactive) {
             return Err(DisplayError::new("unsupported_display", "HDR unavailable"));
-        }
-        if display.hdr_enabled.is_some() && self.inactive {
-            return Err(DisplayError::new(
-                "unsupported_display",
-                "HDR target inactive",
-            ));
         }
         self.prepared_hdr = Some(display.hdr_enabled);
         self.prepared_mode = Some((display.width, display.height, display.refresh));
         let mut before = snapshot();
+        if self.inactive {
+            before.paths[0].id = "monitor.other".into();
+        }
         before.paths[0].hdr_enabled = self.hdr_supported.then_some(self.hdr_state);
         Ok(before)
     }
@@ -145,12 +143,28 @@ impl Platform for FakePlatform {
         }
         guard()?;
         let display = &configuration.displays[0];
+        let was_active = before
+            .paths
+            .iter()
+            .any(|path| path.id.eq_ignore_ascii_case(&display.id));
+        if self.inactive {
+            self.inactive = false;
+            self.hdr_state = self.inactive_activation_hdr;
+        }
         self.applied_mode = Some((display.width, display.height, display.refresh));
-        if let Some(enabled) = display.hdr_enabled.filter(|_| self.hdr_supported) {
+        if let Some(enabled) = display
+            .hdr_enabled
+            .filter(|_| self.hdr_supported && was_active)
+        {
             self.hdr_state = enabled;
             self.hdr_mutations += 1;
         }
         self.effects.push("apply");
+        if display.hdr_enabled == Some(false) && !was_active && self.hdr_state {
+            return Err(
+                DisplayError::new("verification_failed", "new target enabled HDR").after_mutation(),
+            );
+        }
         if self.apply_failure {
             return Err(
                 DisplayError::new("platform_error", "partial native failure").after_mutation(),
@@ -163,6 +177,17 @@ impl Platform for FakePlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
+        if self.inactive
+            && before
+                .paths
+                .iter()
+                .any(|path| path.hdr_enabled.is_none() && path.id == "monitor.one")
+        {
+            return Err(DisplayError::new(
+                "recovery_blocked",
+                "old journal target inactive",
+            ));
+        }
         if before.legacy_hdr_target_conflicts(
             "monitor.one",
             self.hdr_supported.then_some(self.hdr_state),
@@ -180,6 +205,7 @@ impl Platform for FakePlatform {
         if let Some(enabled) = before.paths[0].hdr_enabled {
             self.hdr_state = enabled;
         }
+        self.inactive = before.paths[0].id != "monitor.one";
         Ok(())
     }
 }
@@ -389,6 +415,53 @@ fn hdr_auto_sdr_request_is_a_noop_on_unsupported_active_target() {
 }
 
 #[test]
+fn hdr_auto_sdr_request_activates_inactive_target_without_unsaved_hdr_mutation() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            inactive: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(false)));
+    assert_eq!(applied["applied"], true);
+    assert!(!pipeline.platform.inactive);
+    assert_eq!(pipeline.platform.hdr_mutations, 0);
+    assert_eq!(
+        state.journal.as_ref().unwrap()["snapshot"]["paths"][0]["id"],
+        "monitor.other"
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(pipeline.platform.inactive);
+}
+
+#[test]
+fn inactive_target_activating_with_hdr_rolls_back_without_changing_unsaved_hdr() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            inactive: true,
+            hdr_supported: true,
+            inactive_activation_hdr: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let failed = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(false)));
+    assert_eq!(failed["error"]["code"], "verification_failed");
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert_eq!(pipeline.platform.hdr_mutations, 0);
+    assert!(pipeline.platform.inactive);
+    assert!(state.journal.is_none());
+}
+
+#[test]
 fn old_sdr_journal_refuses_external_hdr_before_restore_mutation() {
     let mut state = State {
         revision: 1,
@@ -428,6 +501,36 @@ fn old_sdr_journal_refuses_external_hdr_before_restore_mutation() {
     );
     assert_eq!(restored["restored"], true);
     assert_eq!(pipeline.platform.effects, ["restore"]);
+}
+
+#[test]
+fn old_sdr_journal_refuses_inactive_saved_target_before_restore_mutation() {
+    let mut old = serde_json::to_value(snapshot()).unwrap();
+    old["paths"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("hdr_enabled");
+    let mut state = State {
+        revision: 1,
+        journal: Some(json!({"owner":"owner","lease":"legacy-lease","snapshot":old})),
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            inactive: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let blocked = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":"legacy-lease"}),
+    );
+    assert_eq!(blocked["error"]["code"], "recovery_blocked");
+    assert_eq!(blocked["recovery_required"], true);
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_some());
 }
 
 #[test]

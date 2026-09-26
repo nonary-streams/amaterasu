@@ -60,10 +60,10 @@ impl Platform for WindowsPlatform {
                 .paths
                 .iter()
                 .find(|path| path.id.eq_ignore_ascii_case(&display.id));
-            if display.hdr_enabled.is_some() && active.is_none() {
+            if display.hdr_enabled == Some(true) && active.is_none() {
                 return Err(DisplayError::new(
                     "unsupported_display",
-                    "HDR changes require an active target",
+                    "HDR enablement requires an active target with a recoverable baseline",
                 ));
             }
             if display.hdr_enabled == Some(true)
@@ -110,8 +110,18 @@ impl Platform for WindowsPlatform {
         }
         for display in &configuration.displays {
             if let Some(enabled) = display.hdr_enabled {
-                query::set_advanced_color(&display.id, enabled)
-                    .map_err(DisplayError::after_mutation)?;
+                if !enabled
+                    && !before
+                        .paths
+                        .iter()
+                        .any(|path| path.id.eq_ignore_ascii_case(&display.id))
+                {
+                    query::verify_newly_active_hdr_is_off(&display.id)
+                        .map_err(DisplayError::after_mutation)?;
+                } else {
+                    query::set_advanced_color(&display.id, enabled)
+                        .map_err(DisplayError::after_mutation)?;
+                }
             }
         }
         Ok(())
