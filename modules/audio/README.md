@@ -44,6 +44,11 @@ library can unload; a blocked Windows policy COM call can delay unload. Opening
 `default` does not change default roles. The provider does not change volume or
 mute state.
 
+While an assigned virtual sink is capturing, the worker checks the render
+defaults every 100 ms and reapplies that sink if another application changes a
+role. The final lease still restores the defaults captured before the virtual
+sink was assigned. A transient policy call failure is retried at the next check.
+
 An open with `virtual_sink` selects a managed virtual render endpoint before the
 regular `endpoint`. `virtual_sink:null` or omission allows the audio policy to
 choose automatically. `host_audio_enabled` defaults to false; on Windows that

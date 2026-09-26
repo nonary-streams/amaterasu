@@ -210,6 +210,29 @@ impl RouteLease {
             }
         }
     }
+
+    fn refresh_virtual_sink(&self, enumerator: &IMMDeviceEnumerator) -> AudioResult<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let mutex = ROUTE_POLICY.get().ok_or("audio_route_unavailable")?;
+        let mut policy = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = default_endpoints(enumerator)?;
+        let assignments = policy.refresh_assignments(&self.endpoint, &current)?;
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let endpoint_policy = PolicyConfig::new()?;
+        for assignment in assignments {
+            if role_endpoint(enumerator, assignment.role)?.as_deref() != Some(&self.endpoint) {
+                endpoint_policy.set_default(&self.endpoint, assignment.role)?;
+                policy.record_assignment(&self.endpoint, assignment.role)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RouteLease {
@@ -812,6 +835,7 @@ pub struct Capture {
     client: IAudioClient,
     endpoint: String,
     follow_console_default: bool,
+    route_virtual_sink: bool,
     next_console_default_check: Instant,
     format: Format,
     timeline: Timeline,
@@ -974,6 +998,7 @@ impl Capture {
             capture_sink_without_routing,
             follow_console_default,
         } = options;
+        let route_virtual_sink = desired_layout.is_some();
         // SAFETY: the caller created this device and enumerator in the live
         // worker apartment; all COM operations remain on that thread.
         unsafe {
@@ -1048,6 +1073,7 @@ impl Capture {
                 client,
                 endpoint,
                 follow_console_default,
+                route_virtual_sink,
                 next_console_default_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
                 format,
                 timeline: Timeline::new(),
@@ -1067,10 +1093,20 @@ impl Capture {
     }
 
     pub fn read(&mut self) -> AudioResult<Option<Packet>> {
-        if self.follow_console_default && Instant::now() >= self.next_console_default_check {
+        if (self.follow_console_default || self.route_virtual_sink)
+            && Instant::now() >= self.next_console_default_check
+        {
             self.next_console_default_check = Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL;
-            if !self.is_current_console_default() {
+            if self.follow_console_default && !self.is_current_console_default() {
                 return Err("default_endpoint_changed");
+            }
+            if self.route_virtual_sink
+                && let Ok(enumerator) = enumerator()
+            {
+                // A virtual sink routed for this capture remains the active
+                // render default while the stream owns its lease. Retry a
+                // transient policy failure at the next poll.
+                let _ = self._route_lease.refresh_virtual_sink(&enumerator);
             }
         }
         // SAFETY: GetBuffer/ReleaseBuffer are paired on the same worker thread;

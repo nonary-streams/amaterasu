@@ -127,7 +127,7 @@ impl RoutePolicy {
         role: DefaultRole,
     ) -> Result<(), &'static str> {
         let active = self.active.as_mut().ok_or("audio_route_unavailable")?;
-        if active.endpoint != endpoint || active.references != 1 {
+        if active.endpoint != endpoint || active.references == 0 {
             return Err("audio_route_unavailable");
         }
         active.assigned_roles[role.index()] = true;
@@ -177,6 +177,32 @@ impl RoutePolicy {
     ) -> Option<Vec<RoleAssignment>> {
         let active = self.active.as_ref()?;
         (active.references == 0).then(|| restore_assignments(active, current))
+    }
+
+    /// A routed virtual sink remains selected while its capture is active.
+    /// Preserve the initial snapshot for final restoration, even if another
+    /// application changes a default role during the stream.
+    pub fn refresh_assignments(
+        &self,
+        endpoint: &str,
+        current: &DefaultEndpoints,
+    ) -> Result<Vec<RoleAssignment>, &'static str> {
+        let active = self.active.as_ref().ok_or("audio_route_unavailable")?;
+        if active.endpoint != endpoint || active.references == 0 {
+            return Err("audio_route_unavailable");
+        }
+        Ok(DefaultRole::ALL
+            .into_iter()
+            .filter(|role| {
+                active.original[role.index()].is_some()
+                    && current[role.index()].is_some()
+                    && current[role.index()].as_deref() != Some(endpoint)
+            })
+            .map(|role| RoleAssignment {
+                role,
+                endpoint: endpoint.to_owned(),
+            })
+            .collect())
     }
 
     pub fn complete_restore(&mut self, succeeded: bool) {
@@ -354,6 +380,49 @@ mod tests {
                 RoleAssignment {
                     role: DefaultRole::Communications,
                     endpoint: "render.comms".into(),
+                },
+            ]))
+        );
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn virtual_sink_reasserts_changed_roles_then_restores_initial_defaults() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        policy.acquire("render.virtual", &original).unwrap();
+        for role in DefaultRole::ALL {
+            policy.record_assignment("render.virtual", role).unwrap();
+        }
+
+        let changed = endpoints("render.user", "render.virtual", "render.virtual");
+        assert_eq!(
+            policy
+                .refresh_assignments("render.virtual", &changed)
+                .unwrap(),
+            vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.virtual".into(),
+            }]
+        );
+        assert_eq!(
+            policy.release(
+                "render.virtual",
+                &endpoints("render.virtual", "render.virtual", "render.virtual")
+            ),
+            Ok(ReleasePlan::Restore(vec![
+                RoleAssignment {
+                    role: DefaultRole::Console,
+                    endpoint: "render.console".into()
+                },
+                RoleAssignment {
+                    role: DefaultRole::Multimedia,
+                    endpoint: "render.multimedia".into()
+                },
+                RoleAssignment {
+                    role: DefaultRole::Communications,
+                    endpoint: "render.comms".into()
                 },
             ]))
         );
