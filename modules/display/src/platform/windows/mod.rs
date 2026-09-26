@@ -691,6 +691,34 @@ mod tests {
     }
 
     #[test]
+    fn newly_activated_route_readback_rejects_wrong_physical_path_as_mutated() {
+        let selected = readback_path("monitor.two", 1920, Some(false));
+        let route = RouteBinding {
+            id: selected.id.clone(),
+            source_name: selected.source_name.clone(),
+            source_address: selected.source_address.clone(),
+            target_address: selected.target_address.clone(),
+            output_technology: selected.output_technology,
+        };
+        let mut readback = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false)), selected],
+        };
+        assert!(verify_activated_route(&route, &readback).is_ok());
+
+        readback.paths[1].target_address.id += 1;
+        let error = verify_activated_route(&route, &readback).unwrap_err();
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+
+        readback.paths[1].target_address = route.target_address.clone();
+        readback.paths[1].source_address.id += 1;
+        let error = verify_activated_route(&route, &readback).unwrap_err();
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
     fn final_readback_failure_is_also_mutated() {
         let readback_error = DisplayError::new("topology_changed", "late hotplug");
         let error = verify_applied_configuration(&requested(), Err(readback_error)).unwrap_err();
