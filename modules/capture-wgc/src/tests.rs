@@ -708,6 +708,44 @@ fn lost_authoritative_geometry_cannot_deliver_a_fresh_frame() {
 }
 
 #[test]
+fn frame_read_without_advertised_geometry_keeps_capture_available() {
+    let later_geometry = CaptureGeometry::new(
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(0, 0, 1920, 1080).unwrap(),
+    )
+    .unwrap();
+    let geometries = Arc::new(Mutex::new(VecDeque::from([
+        Err(CaptureError::new(
+            "geometry_unavailable",
+            "topology unavailable at Open",
+        )),
+        Ok(Some(later_geometry)),
+    ])));
+    let backend = FakeBackend {
+        events: Arc::new(Mutex::new(VecDeque::from([Ok(Some(frame(
+            1,
+            1,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        )))]))),
+        geometries: geometries.clone(),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+        drops: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut controller = Controller::new(backend, true);
+    let stream = open(&mut controller, "owner");
+    assert!(controller.read("owner", stream, 0).unwrap().is_some());
+    assert_eq!(geometries.lock().unwrap().len(), 1);
+    assert_eq!(
+        controller.handle("owner", Operation::Status, &mut || Ok(()))["streams"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    controller.close("owner", stream).unwrap();
+}
+
+#[test]
 fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
     let (controller, drops) = setup(true);
     let mut controller = controller.lock().unwrap();

@@ -307,16 +307,18 @@ impl<B: Backend> Controller<B> {
                 }
             }
         };
-        if result.as_ref().is_ok_and(Option::is_some) {
+        if result.as_ref().is_ok_and(Option::is_some)
+            && self
+                .streams
+                .get(&id)
+                .is_some_and(|stream| stream.geometry.is_some())
+        {
             // The frame pool checks pixel dimensions, but an output can move on
             // the desktop without changing its size. Verify the Open snapshot
             // before publishing either a fresh frame or a cached repeat.
             let stream = self.streams.get_mut(&id).expect("authorized stream");
             let geometry_result = match stream.session.geometry() {
                 Ok(current) if current == stream.geometry => Ok(()),
-                Err(error) if error.code == "geometry_unavailable" && stream.geometry.is_none() => {
-                    Ok(())
-                }
                 Ok(_)
                 | Err(CaptureError {
                     code: "geometry_unavailable",
