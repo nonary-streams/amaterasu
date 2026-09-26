@@ -215,6 +215,10 @@ impl Pipeline {
             rpc::complete(send, request, error("audio_configuration_mismatch"));
             return;
         }
+        if !configuration.matches_prepared_frame_limiter(&record.config) {
+            rpc::complete(send, request, error("frame_limiter_configuration_mismatch"));
+            return;
+        }
         if !configuration.matches_prepared_encryption(&record.config) {
             rpc::complete(send, request, error("encryption_configuration_mismatch"));
             return;

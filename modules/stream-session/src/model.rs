@@ -740,6 +740,20 @@ pub struct StartConfig {
     pub host_audio_enabled: bool,
 }
 impl StartConfig {
+    pub fn matches_prepared_frame_limiter(&self, prepared: &PrepareConfig) -> bool {
+        prepared
+            .frame_limiter_settings
+            .as_ref()
+            .is_none_or(|snapshot| {
+                self.configuration
+                    .fps
+                    .checked_mul(1_000)
+                    .is_some_and(|fps| {
+                        snapshot["requested_stream_fps_millihz"].as_u64() == Some(u64::from(fps))
+                    })
+            })
+    }
+
     pub fn matches_prepared_audio(&self, prepared: &PrepareConfig) -> bool {
         !prepared.stream_audio
             || prepared.audio.channels == 2 && self.channels.is_none()

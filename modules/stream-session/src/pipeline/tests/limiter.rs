@@ -31,6 +31,62 @@ fn limiter_prepare() -> (Value, Value) {
 }
 
 #[test]
+fn start_rate_must_match_the_frozen_frame_limiter_snapshot() {
+    let mut host = Harness::new();
+    let (request, snapshot) = limiter_prepare();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    let mut mismatched = start(id);
+    mismatched["configuration"]["configuration"]["fps"] = json!(120);
+    assert_eq!(
+        host.response(2, mismatched)["code"],
+        "frame_limiter_configuration_mismatch"
+    );
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "apply"
+    }));
+    let started = host.response(3, start(id));
+    assert_eq!(started["state"], "active");
+    assert_eq!(started["frame_limiter_applied"], true);
+    assert_eq!(host.response(4, start(id))["state"], "active");
+    let apply = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "apply"
+        })
+        .unwrap();
+    assert_eq!(
+        apply.payload["requested_stream_fps_millihz"],
+        snapshot["requested_stream_fps_millihz"]
+    );
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| {
+                call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "apply"
+            })
+            .count(),
+        1
+    );
+
+    let mut fractional_host = Harness::new();
+    let (mut fractional_request, _) = limiter_prepare();
+    fractional_request["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(59_940);
+    let fractional_id = fractional_host.response(5, fractional_request)["session"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        fractional_host.response(6, start(fractional_id))["code"],
+        "frame_limiter_configuration_mismatch"
+    );
+    assert!(!fractional_host.broker.calls.iter().any(|call| {
+        call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "apply"
+    }));
+}
+
+#[test]
 fn frozen_apply_precedes_video_and_restores_after_media_close() {
     let mut host = Harness::new();
     let (request, snapshot) = limiter_prepare();
