@@ -276,6 +276,8 @@ pub struct Credential {
 pub struct ApiToken {
     pub token_id: String,
     pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<u64>,
     pub scopes: BTreeSet<String>,
     pub issued_at: u64,
     pub expires_at: u64,

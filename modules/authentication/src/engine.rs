@@ -192,7 +192,7 @@ impl Engine {
             } => self.issue_token(document, caller, scopes, ttl_seconds, now),
             Operation::RevokeToken { token_id } => Self::revoke_token(document, caller, token_id),
             Operation::ListTokens {} => Ok(Change::Read(
-                json!({"ok":true,"tokens":document.tokens.iter().filter(|token| token.owner == caller).collect::<Vec<_>>()}),
+                json!({"ok":true,"tokens":document.tokens.iter().filter(|token| token.owner == caller && self.token_is_active(token, now)).collect::<Vec<_>>()}),
             )),
         }
     }
@@ -515,7 +515,7 @@ impl Engine {
         let token = document
             .tokens
             .iter()
-            .find(|token| token.token_id == digest && token.expires_at > now)
+            .find(|token| token.token_id == digest && self.token_is_active(token, now))
             .ok_or("unauthorized")?;
         self.authorize_scopes(&token.scopes, &required_scopes)?;
         Ok(Change::Read(
@@ -535,7 +535,9 @@ impl Engine {
             return Err("not_initialized");
         }
         self.authorize_scopes(&scopes, &scopes)?;
-        document.tokens.retain(|token| token.expires_at > now);
+        document
+            .tokens
+            .retain(|token| self.token_is_active(token, now));
         if document.tokens.len() >= MAX_TOKENS {
             return Err("token_limit");
         }
@@ -545,6 +547,7 @@ impl Engine {
         document.tokens.push(ApiToken {
             token_id,
             owner: caller.into(),
+            policy_generation: Some(self.settings.authorization_policy_generation),
             scopes,
             issued_at: now,
             expires_at,
@@ -589,6 +592,15 @@ impl Engine {
             return Err("unauthorized");
         }
         Ok(())
+    }
+
+    fn token_is_active(&self, token: &ApiToken, now: u64) -> bool {
+        token.expires_at > now
+            && token.policy_generation == Some(self.settings.authorization_policy_generation)
+            && self
+                .settings
+                .administrator_principals
+                .contains(&token.owner)
     }
 
     fn write(document: Document, response: Value) -> Result<Change, &'static str> {

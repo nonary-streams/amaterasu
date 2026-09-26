@@ -504,6 +504,136 @@ fn durable_token_digest_scope_expiry_and_foreign_revoke() {
 }
 
 #[test]
+fn api_tokens_do_not_revive_when_an_administrator_principal_is_restored() {
+    let mut state = StateHarness::new();
+    let mut original_settings = settings();
+    original_settings.authorization_policy_generation = 41;
+    let mut pipeline = Pipeline::new(original_settings.clone());
+    state.setup(&mut pipeline);
+    let issued = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"issue_token","scopes":["catalog.read"],"ttl_seconds":600}),
+        100,
+    );
+    assert_eq!(issued["ok"], true);
+    assert_eq!(
+        state.stored.as_ref().unwrap()["tokens"][0]["policy_generation"],
+        41
+    );
+
+    let verify =
+        json!({"action":"verify","bearer":issued["bearer"],"required_scopes":["catalog.read"]});
+    let mut removed_settings = original_settings.clone();
+    removed_settings.administrator_principals.remove("console");
+    removed_settings.authorization_policy_generation = 42;
+    let mut after_removal = Pipeline::new(removed_settings);
+    assert_eq!(
+        state.request(&mut after_removal, "frontend", verify.clone(), 101),
+        error("unauthorized")
+    );
+
+    let mut restored_settings = original_settings;
+    restored_settings.authorization_policy_generation = 43;
+    let mut after_restoration = Pipeline::new(restored_settings);
+    assert_eq!(
+        state.request(&mut after_restoration, "frontend", verify, 102),
+        error("unauthorized")
+    );
+    assert_eq!(
+        state.request(
+            &mut after_restoration,
+            "console",
+            json!({"action":"list_tokens"}),
+            102,
+        )["tokens"],
+        json!([])
+    );
+    let replacement = state.request(
+        &mut after_restoration,
+        "console",
+        json!({"action":"issue_token","scopes":["catalog.read"],"ttl_seconds":600}),
+        102,
+    );
+    assert_eq!(replacement["ok"], true);
+    assert_eq!(
+        state.stored.as_ref().unwrap()["tokens"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut restarted = Pipeline::new(Settings {
+        authorization_policy_generation: 43,
+        ..settings()
+    });
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":replacement["bearer"],"required_scopes":["catalog.read"]}),
+            103,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":issued["bearer"],"required_scopes":[]}),
+            103,
+        ),
+        error("unauthorized")
+    );
+}
+
+#[test]
+fn api_tokens_without_a_policy_generation_are_not_trusted_after_restart() {
+    let mut state = StateHarness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let issued = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"issue_token","scopes":["catalog.read"],"ttl_seconds":600}),
+        100,
+    );
+    state.stored.as_mut().unwrap()["tokens"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("policy_generation");
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":issued["bearer"],"required_scopes":[]}),
+            101,
+        ),
+        error("unauthorized")
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "console",
+            json!({"action":"list_tokens"}),
+            101
+        )["tokens"],
+        json!([])
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "console",
+            json!({"action":"revoke_token","token_id":issued["token_id"]}),
+            101,
+        )["ok"],
+        true
+    );
+    assert_eq!(state.stored.as_ref().unwrap()["tokens"], json!([]));
+}
+
+#[test]
 fn no_success_before_persistence_and_cancelled_commit_remains_durable() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());

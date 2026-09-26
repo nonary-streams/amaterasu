@@ -42,8 +42,13 @@ generation. This preserves revocation across a policy change and revert that
 occurs while the authentication module is stopped or receives no request. A
 session is bound to the generation at login; the first later auth request under
 a different generation durably prunes the old session before processing the
-request. A new login uses the current bootstrap scopes and generation. The
-scope digest remains an additional check when a policy change is observed even
+request. A new login uses the current bootstrap scopes and generation. Newly
+issued API tokens also bind to that generation and their issuing administrator
+principal. Changing and later restoring the policy revokes those tokens across
+module restarts. API token records written before this binding have no
+generation; they remain readable as state but fail verification on upgrade.
+Issue new tokens after upgrading if older tokens must be replaced. The scope
+digest remains an additional check when a policy change is observed even
 if the generation was not advanced. This counter is part of module startup
 settings and is separate from the product-document revision for token lifetimes.
 
@@ -153,10 +158,12 @@ including otherwise valid requests for a smaller subset.
 
 Token issuance returns `ok`, the one-time `bearer`, its `token_id`, `scopes`, and
 `expires_at`. The ID is the SHA-256 bearer digest and may be used for revocation;
-it is not a bearer. Lifetimes range from 1 second to 30 days. Expired tokens are
-rejected and pruned on issuance. At most 32 API tokens are retained, subject also
-to a 12,000-byte document bound. Listing returns owned metadata including token
-IDs and expiration, never bearer secrets or password hashes. Revoked token
+it is not a bearer. Lifetimes range from 1 second to 30 days. Expired or
+policy-revoked tokens are rejected and pruned on issuance. At most 32 API tokens
+are retained, subject also to a 12,000-byte document bound. Listing returns
+only currently valid owned metadata including token IDs and expiration, never
+bearer secrets or password hashes. An authorized original issuer can still
+revoke a retained stale token by ID before the next issuance. Revoked token
 records are removed and verification reloads state, so cached token authorization
 cannot outlive acknowledged revocation.
 
