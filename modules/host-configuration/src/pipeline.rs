@@ -300,10 +300,15 @@ impl Pipeline {
                     pending.request_id,
                     application_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
                 ),
+                Stage::Saving { response, .. } => complete(
+                    send,
+                    pending.request_id,
+                    save_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
+                ),
                 Stage::RollingBack { saved_revision, .. } => complete(
                     send,
                     pending.request_id,
-                    rollback_failed(
+                    rollback_unconfirmed(
                         saved_revision,
                         format!("state service failure ({code}): {message}"),
                     ),
@@ -328,10 +333,20 @@ impl Pipeline {
                             response["revision"].as_u64().unwrap_or_default(),
                             send,
                         ),
-                        Stage::RollingBack { saved_revision, .. } => complete(
+                        Stage::RollingBack { saved_revision, .. } => {
+                            let response = if payload.pointer("/error/code").and_then(Value::as_str)
+                                == Some("revision_conflict")
+                            {
+                                rollback_failed(saved_revision, message)
+                            } else {
+                                rollback_unconfirmed(saved_revision, message)
+                            };
+                            complete(send, pending.request_id, response)
+                        }
+                        Stage::Saving { response, .. } => complete(
                             send,
                             pending.request_id,
-                            rollback_failed(saved_revision, message),
+                            save_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
                         ),
                         _ => complete(send, pending.request_id, unavailable(message)),
                     };
@@ -759,7 +774,7 @@ fn rollback_failed(saved_revision: u64, message: impl Into<String>) -> Value {
     json!({
         "ok":false,
         "error":{"code":"logging_rollback_failed","message":format!("{}; GET configuration and diagnostics status before retrying", message.into())},
-        "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"saved_not_applied"}
+        "logging":{"saved_revision":saved_revision,"applied_revision":null,"status":"rollback_failed"}
     })
 }
 
