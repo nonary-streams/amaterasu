@@ -159,11 +159,12 @@ including otherwise valid requests for a smaller subset.
 When all 16 session slots are occupied, a login with a valid password makes
 room by revoking the session with the earliest absolute refresh expiry. If
 expiries match, the lexicographically smallest session digest is selected.
-Invalid credentials do not evict a session. The replacement and eviction take
-effect only after the revised session document is durably acknowledged; the
-evicted bearer and refresh token then fail verification and refresh. This keeps
-password login available when earlier sessions are no longer accessible to the
-user, including sessions whose token delivery was cancelled.
+Invalid credentials do not evict a session. The replacement and eviction share
+one revision-checked session document write; login reports success only after
+durability is acknowledged. The evicted bearer and refresh token then fail
+verification and refresh. This keeps password login available when earlier
+sessions are no longer accessible to the user, including sessions whose token
+delivery was cancelled.
 
 Backend restart does not itself end a valid administrator session. The current
 browser client holds bearer and refresh tokens only in memory, so reloading or
@@ -220,7 +221,7 @@ an independent trusted clock or rollback-resistant storage.
 
 Errors include `invalid_request`, `forbidden`, `unauthorized`, `rate_limited`,
 `already_initialized`, `not_initialized`, `token_not_found`, `token_limit`,
-`session_limit`, `resource_limit`, `invalid_state`, `state_unavailable`,
+`resource_limit`, `invalid_state`, `state_unavailable`,
 `deadline_exceeded`, `entropy_unavailable`, `credential_failure`, and
 `clock_failure`. Unknown fields are rejected; request JSON is bounded to 4096
 serialized bytes. Error replies are `{"ok":false,"code":"..."}`.
