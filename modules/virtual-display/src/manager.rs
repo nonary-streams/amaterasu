@@ -236,6 +236,11 @@ impl<D: Driver> Manager<D> {
         let Some(monitor) = self.monitors.get_mut(&(caller.into(), identity.into())) else {
             return json!({"ok":true,"removed":true,"identity":identity});
         };
+        if monitor.state == "cleanup_failed" {
+            // Only an explicit request by the owning caller opens another
+            // bounded removal window for this exact lease and display.
+            monitor.remove_attempts = 0;
+        }
         monitor.begin_cleanup(None);
         monitor.response()
     }

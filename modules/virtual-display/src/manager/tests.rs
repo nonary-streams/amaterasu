@@ -12,6 +12,8 @@ struct Calls {
     removes: Vec<(u64, u64)>,
     feeds: Vec<u64>,
     ambiguous_create: bool,
+    remove_failure: bool,
+    remove_completes: bool,
     exists: bool,
     pending: bool,
     ready: bool,
@@ -57,7 +59,15 @@ impl Driver for Fake {
         Ok(())
     }
     fn remove(&mut self, lease: u64, display: u64) -> Result<(), &'static str> {
-        self.0.borrow_mut().removes.push((lease, display));
+        let mut calls = self.0.borrow_mut();
+        calls.removes.push((lease, display));
+        if calls.remove_failure {
+            return Err("remove_failed");
+        }
+        if calls.remove_completes {
+            calls.exists = false;
+            calls.pending = false;
+        }
         Ok(())
     }
 }
@@ -459,6 +469,60 @@ fn ambiguous_create_is_not_replayed_and_cleanup_waits_for_departure() {
     );
     calls.borrow_mut().pending = false;
     tick(&mut manager);
+    assert!(manager.monitors.is_empty());
+    assert!(calls.borrow().feeds.is_empty());
+}
+#[test]
+fn only_owned_explicit_remove_retries_exhausted_exact_cleanup() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create());
+    let owned = calls.borrow().creates[0];
+    calls.borrow_mut().remove_failure = true;
+    manager.handle(
+        "alice",
+        Operation::Remove {
+            identity: ID.into(),
+        },
+    );
+    for _ in 0..5 {
+        tick(&mut manager);
+    }
+    assert_eq!(calls.borrow().removes, vec![owned; 3]);
+    assert_eq!(
+        manager.monitors.values().next().unwrap().state,
+        "cleanup_failed"
+    );
+    assert!(calls.borrow().feeds.is_empty());
+
+    manager.handle(
+        "bob",
+        Operation::Remove {
+            identity: ID.into(),
+        },
+    );
+    manager.handle(
+        "alice",
+        Operation::Remove {
+            identity: "00000000-0000-0000-0000-000000000002".into(),
+        },
+    );
+    tick(&mut manager);
+    assert_eq!(calls.borrow().removes, vec![owned; 3]);
+    assert_eq!(
+        manager.monitors.values().next().unwrap().state,
+        "cleanup_failed"
+    );
+
+    calls.borrow_mut().remove_failure = false;
+    calls.borrow_mut().remove_completes = true;
+    manager.handle(
+        "alice",
+        Operation::Remove {
+            identity: ID.into(),
+        },
+    );
+    tick(&mut manager);
+    assert_eq!(calls.borrow().removes, vec![owned; 4]);
     assert!(manager.monitors.is_empty());
     assert!(calls.borrow().feeds.is_empty());
 }

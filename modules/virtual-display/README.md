@@ -124,9 +124,10 @@ No background thread can outlive this DLL. These limits are not a real-time prom
 
 A ten-second lease is fed once per second while healthy. One monitor is maintained
 per tick, with 200 ms polling. Ambiguous creation is never replayed: it enters exact
-lease/display cleanup. Cleanup makes at most three native removal attempts and keeps
-its record until state and pending-departure queries confirm removal. Failed cleanup
-stops lease feeding. Drop makes one best-effort exact removal per owned record;
+lease/display cleanup. Cleanup makes at most three native removal attempts per
+window; an explicit Remove by the owning caller can retry a failed window. The
+manager keeps its record until state and pending-departure queries confirm removal.
+Failed cleanup stops lease feeding. Drop makes one best-effort exact removal per owned record;
 there is no remove-all command. A newly admitted create whose completion is cancelled or cannot be delivered enters
 exact cleanup and stops feeding; failed completion of an idempotent retry leaves
 the previously admitted monitor intact. Crash/cancellation after create can leave a
