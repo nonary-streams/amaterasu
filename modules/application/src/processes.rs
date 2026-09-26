@@ -1,4 +1,4 @@
-use crate::commands::prepare_detached_commands;
+use crate::commands::{DetachedCommandRequest, prepare_detached_requests};
 use crate::containment::{ContainedChild, DetachedChild};
 use crate::lifecycle::ApplicationLifecycle;
 use crate::protocol::{
@@ -63,7 +63,7 @@ struct ProcessRecord {
     #[serde(skip)]
     spec: LaunchSpec,
     #[serde(skip)]
-    detached_command_texts: Vec<String>,
+    detached_requests: Vec<DetachedCommandRequest>,
     #[serde(skip)]
     child: Option<ContainedChild>,
     #[serde(skip)]
@@ -90,7 +90,7 @@ impl ProcessRecord {
         caller: &str,
         operation_id: String,
         spec: LaunchSpec,
-        detached_command_texts: Vec<String>,
+        detached_requests: Vec<DetachedCommandRequest>,
     ) -> Self {
         let lifecycle = ApplicationLifecycle::new_with_context(
             spec.preparation.clone(),
@@ -105,7 +105,7 @@ impl ProcessRecord {
             lifecycle,
             owner: caller.into(),
             spec,
-            detached_command_texts,
+            detached_requests,
             child: None,
             stop_deadline: None,
             completion: None,
@@ -182,11 +182,11 @@ impl ProcessRecord {
             command
                 .args(&detached.args)
                 .env_clear()
-                .envs(&self.spec.environment)
+                .envs(&detached.environment)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            if let Some(cwd) = &self.spec.cwd {
+            if let Some(cwd) = detached.cwd.as_ref().or(self.spec.cwd.as_ref()) {
                 command.current_dir(cwd);
             } else if let Some(cwd) = std::path::Path::new(&detached.executable)
                 .parent()
@@ -742,21 +742,23 @@ impl ProcessManager {
                 detached,
                 preparation,
             } => {
-                let detached_command_texts = detached;
+                let detached_requests = detached
+                    .into_iter()
+                    .map(DetachedCommandRequest::from)
+                    .collect::<Vec<_>>();
                 let cached_detached = self
                     .records
                     .values()
                     .find(|record| {
                         record.owner == caller
                             && record.operation_id == operation_id
-                            && record.detached_command_texts.as_slice()
-                                == detached_command_texts.as_slice()
+                            && record.detached_requests.as_slice() == detached_requests.as_slice()
                     })
                     .map(|record| record.spec.detached.clone());
                 let detached = match cached_detached {
                     Some(detached) => detached,
-                    None => prepare_detached_commands(
-                        &detached_command_texts,
+                    None => prepare_detached_requests(
+                        &detached_requests,
                         &environment,
                         host_environment_lookup,
                     )
@@ -778,7 +780,7 @@ impl ProcessManager {
                     preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
-                self.launch(caller, operation_id, spec, detached_command_texts)
+                self.launch(caller, operation_id, spec, detached_requests)
             }
             Action::Lookup { operation_id } => {
                 let record = self
@@ -835,7 +837,7 @@ impl ProcessManager {
         caller: &str,
         operation_id: String,
         spec: LaunchSpec,
-        detached_command_texts: Vec<String>,
+        detached_requests: Vec<DetachedCommandRequest>,
     ) -> Result<Value, &'static str> {
         if self
             .preparations
@@ -865,13 +867,7 @@ impl ProcessManager {
             return Err("process_limit");
         }
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
-        let record = ProcessRecord::new(
-            process_id,
-            caller,
-            operation_id,
-            spec,
-            detached_command_texts,
-        );
+        let record = ProcessRecord::new(process_id, caller, operation_id, spec, detached_requests);
         let response = json!({"ok":true,"process":record});
         self.records.insert(process_id, record);
         self.next_id = process_id;

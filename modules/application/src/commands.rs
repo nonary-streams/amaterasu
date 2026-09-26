@@ -1,4 +1,7 @@
+use crate::lifecycle::validate_environment;
+use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path as CommandPath;
 #[cfg(all(windows, test))]
 use std::path::Path;
 
@@ -11,6 +14,80 @@ const MAX_DETACHED_ARGUMENT_BYTES: usize = 8192;
 pub(crate) struct DetachedCommand {
     pub executable: String,
     pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum DetachedCommandInput {
+    Legacy(String),
+    Typed(DetachedCommandRequest),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DetachedCommandRequest {
+    pub command: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, alias = "working_directory")]
+    pub cwd: Option<String>,
+}
+
+impl From<DetachedCommandInput> for DetachedCommandRequest {
+    fn from(value: DetachedCommandInput) -> Self {
+        match value {
+            DetachedCommandInput::Legacy(command) => Self {
+                command,
+                environment: BTreeMap::new(),
+                cwd: None,
+            },
+            DetachedCommandInput::Typed(request) => request,
+        }
+    }
+}
+
+pub(crate) fn prepare_detached_requests(
+    requests: &[DetachedCommandRequest],
+    launch_environment: &BTreeMap<String, String>,
+    host_environment_lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<DetachedCommand>, &'static str> {
+    validate_detached_command_texts(
+        &requests
+            .iter()
+            .map(|request| request.command.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    requests
+        .iter()
+        .map(|request| {
+            validate_environment(&request.environment)?;
+            if request.cwd.as_deref().is_some_and(|cwd| {
+                cwd.is_empty()
+                    || cwd.len() > 1024
+                    || cwd.contains('\0')
+                    || !CommandPath::new(cwd).is_absolute()
+            }) {
+                return Err("detached cwd must be an absolute path");
+            }
+            let expanded =
+                expand_environment_references(&request.command, &request.environment, &|name| {
+                    environment_reference_value(name, launch_environment, host_environment_lookup)
+                })?;
+            let mut command = parse_detached_commands(vec![expanded])?.remove(0);
+            command.environment = launch_environment.clone();
+            for (key, value) in &request.environment {
+                #[cfg(windows)]
+                command
+                    .environment
+                    .retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+                command.environment.insert(key.clone(), value.clone());
+            }
+            command.cwd = request.cwd.clone();
+            Ok(command)
+        })
+        .collect()
 }
 
 pub(crate) fn parse_detached_commands(
@@ -35,6 +112,8 @@ pub(crate) fn parse_detached_commands(
             Ok(DetachedCommand {
                 executable,
                 args: arguments,
+                environment: BTreeMap::new(),
+                cwd: None,
             })
         })
         .collect()
@@ -56,6 +135,7 @@ pub(crate) fn validate_detached_command_texts(commands: &[String]) -> Result<(),
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_detached_commands(
     command_texts: &[String],
     environment: &BTreeMap<String, String>,
@@ -253,6 +333,29 @@ mod tests {
                 "literal=$HOME",
             ]
         );
+    }
+
+    #[test]
+    fn typed_command_expansion_prefers_override_then_launch_then_host() {
+        let launch = BTreeMap::from([
+            ("OVERRIDE".into(), "launch value".into()),
+            ("LAUNCH".into(), "launch only".into()),
+        ]);
+        let requests = [DetachedCommandRequest {
+            command: "tool \"$(OVERRIDE)\" \"$(LAUNCH)\" \"$(HOST)\"".into(),
+            environment: BTreeMap::from([("OVERRIDE".into(), "command value".into())]),
+            cwd: None,
+        }];
+        let commands = prepare_detached_requests(&requests, &launch, &|name| {
+            (name == "HOST").then(|| "host only".into())
+        })
+        .unwrap();
+        assert_eq!(
+            commands[0].args,
+            ["command value", "launch only", "host only"]
+        );
+        assert_eq!(commands[0].environment["OVERRIDE"], "command value");
+        assert_eq!(commands[0].environment["LAUNCH"], "launch only");
     }
 
     #[test]

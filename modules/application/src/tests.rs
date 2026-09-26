@@ -94,6 +94,12 @@ fn controlled_child() {
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
             std::fs::write(marker, b"detached").unwrap();
         }
+        "capture-env-cwd" => {
+            let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
+            let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
+            let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+            std::fs::write(marker, format!("{value}|{}", cwd.display())).unwrap();
+        }
         "tree" | "tree_exit" | "branch" | "leaf" => tree_child(),
         "trace" | "trace_fail" | "trace_sleep" | "trace_fail_once" => trace_child(),
         #[cfg(unix)]
@@ -496,6 +502,15 @@ fn detached_environment_retries_reuse_resolution_and_reject_changed_launch_field
     });
     assert_eq!(replay, first);
 
+    let mut typed_equivalent = request.clone();
+    typed_equivalent["detached"] = json!([{"command":request["detached"][0]}]);
+    assert_eq!(
+        manager.handle_with_environment_lookup("alice", typed_equivalent, &|name| {
+            (name == HOST_VARIABLE).then(|| "newer host value".to_owned())
+        }),
+        first
+    );
+
     let mut changed_detached = request.clone();
     changed_detached["detached"] = json!([format!(
         "amaterasu-missing-detached-command \"$({HOST_VARIABLE})\" --changed"
@@ -687,7 +702,7 @@ fn detached_commands_outlive_the_primary_application_and_are_reaped() {
     let marker = directory.join("detached-finished");
     let mut manager = ProcessManager::default();
     let mut request = launch("detached-commands", "sleep");
-    request["detached"] = json!([detached_command_for_current_test()]);
+    request["detached"] = json!([{"command":detached_command_for_current_test(),"environment":{}}]);
     request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
 
     let started = manager.handle("alice", request);
@@ -768,6 +783,101 @@ fn detached_commands_expand_configured_values_before_platform_parsing() {
         expected_arguments
     );
     manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn typed_detached_commands_isolate_environment_and_cwd_from_primary_and_each_other() {
+    let directory = test_directory("typed-detached");
+    let primary_cwd = directory.join("primary");
+    let first_cwd = directory.join("first");
+    let second_cwd = directory.join("second");
+    for cwd in [&primary_cwd, &first_cwd, &second_cwd] {
+        std::fs::create_dir(cwd).unwrap();
+    }
+    let primary_marker = directory.join("primary-marker");
+    let first_marker = directory.join("first-marker");
+    let second_marker = directory.join("second-marker");
+    let command = detached_command_for_current_test_with_arguments(&[]);
+
+    let mut request = launch("typed-detached", "capture-env-cwd");
+    request["cwd"] = json!(primary_cwd);
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(primary_marker);
+    request["environment"]["AMATERASU_TEST_VALUE"] = json!("primary");
+    request["detached"] = json!([
+        {"command":command,"cwd":first_cwd,"environment":{"AMATERASU_TEST_MARKER":first_marker,"AMATERASU_TEST_VALUE":"first"}},
+        {"command":command,"working_directory":second_cwd,"environment":{"AMATERASU_TEST_MARKER":second_marker,"AMATERASU_TEST_VALUE":"second"}}
+    ]);
+    let mut manager = ProcessManager::default();
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["ok"], true, "{started}");
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(wait_for_exit(&mut manager, id)["process"]["success"], true);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !first_marker.exists() || !second_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "detached commands did not write markers"
+        );
+        manager.reap_exited().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for (marker, value, cwd) in [
+        (&primary_marker, "primary", &primary_cwd),
+        (&first_marker, "first", &first_cwd),
+        (&second_marker, "second", &second_cwd),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            format!("{value}|{}", cwd.canonicalize().unwrap().display())
+        );
+    }
+
+    let mut alias_retry = request.clone();
+    let alias_cwd = alias_retry["detached"][1]["working_directory"].clone();
+    alias_retry["detached"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("working_directory");
+    alias_retry["detached"][1]["cwd"] = alias_cwd;
+    assert_eq!(
+        manager.handle("alice", alias_retry)["process"]["process_id"],
+        id
+    );
+    let mut changed = request;
+    changed["detached"][0]["environment"]["AMATERASU_TEST_VALUE"] = json!("changed");
+    assert_eq!(
+        manager.handle("alice", changed)["code"],
+        "operation_conflict"
+    );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn invalid_typed_detached_override_rejects_before_any_process_is_spawned() {
+    let directory = test_directory("invalid-typed-detached");
+    let marker = directory.join("primary-marker");
+    let command = detached_command_for_current_test_with_arguments(&[]);
+    let mut manager = ProcessManager::default();
+    let mut request = launch("invalid-typed-detached", "capture-env-cwd");
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["environment"]["AMATERASU_TEST_VALUE"] = json!("primary");
+    request["detached"] = json!([{"command":command,"environment":{"BAD=KEY":"invalid"}}]);
+    assert_eq!(
+        manager.handle("alice", request.clone())["code"],
+        "invalid_launch"
+    );
+    assert!(!marker.exists());
+    request["detached"][0]["environment"] = json!({});
+    request["detached"][0]["cwd"] = json!("relative/path");
+    assert_eq!(manager.handle("alice", request)["code"], "invalid_launch");
+    assert!(!marker.exists());
+    assert_eq!(
+        manager.handle("alice", json!({"action":"list"}))["processes"],
+        json!([])
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 

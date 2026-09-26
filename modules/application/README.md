@@ -21,20 +21,25 @@ For example, on a Unix host:
 
 Launch policy also accepts `auto_detach` (default `true`), `wait_all` (default
 `true`), `exit_timeout_seconds` (default 10, maximum 300), and an ordered
-`detached` list of up to 16 command strings. `wait_all` keeps the app active while
+`detached` list of up to 16 command strings or typed command objects. `wait_all` keeps the app active while
 any process in its contained group remains after the root exits. `auto_detach`
 keeps a successful root that exits within five seconds as a status-driven app,
 after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
-Before argv parsing, `$(NAME)` expands from the app environment and then the
+The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path"}`;
+`working_directory` is an alias for `cwd`. The per-command environment overlays
+the launch environment for that detached process only; its cwd overrides the
+launch cwd. The primary process and other detached commands keep their own
+settings. Both forms may appear in one list. Before argv parsing, `$(NAME)`
+expands from the command override, then the launch environment, then the
 host process environment; `$$` produces a literal dollar sign, and absent names
 produce an empty string. Other dollar text remains literal, and an unclosed
 `$(...)` reference is invalid. Expansion is bounded and is not shell evaluation:
 the expanded string still goes through the host platform's argv parser and
-existing count, length, and argument limits. Detached commands have no
-per-command environment overrides, output redirection, or independent elevation
+existing count, length, and argument limits. All overrides are validated before
+any command starts. Detached commands have no output redirection or independent elevation
 field; they receive the same launch-level `elevated` flag as the primary
 application. A detached-command spawn failure does not fail the main launch.
 
@@ -147,6 +152,10 @@ a retained failure or exit, without spawning again. Changing its executable,
 argument array, environment map, cwd, detached commands, or preparation steps
 yields `operation_conflict`. Defaulted empty args/environment/preparation/detached
 list, policy defaults, and absent/null cwd are normalized before comparison;
+legacy detached strings and typed objects with empty overrides have the same
+retry identity; `working_directory` and `cwd` also normalize to the same value.
+Changing a detached override conflicts with the original operation. Host
+environment references resolved for the original request are retained on retry;
 paths are not canonicalized. Retries never
 rerun completed preparation or undo, and repeated termination of a terminal
 record is inert. Terminal and cleanup-failed records are retained and cannot be
@@ -163,8 +172,10 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
 - Executable and optional cwd: absolute paths, 1–1,024 bytes, no NUL.
 - `exit_timeout_seconds`: integer from 0 through 300; `wait_all` and
   `auto_detach` are booleans.
-- `detached`: up to 16 command strings, each at most 2,048 printable bytes, with
-  up to 64 parsed arguments and 8,192 argument bytes combined.
+- `detached`: up to 16 command strings or typed objects, each command at most
+  2,048 printable bytes, with up to 64 parsed arguments and 8,192 argument
+  bytes combined. Each typed environment has the same bounds as launch
+  environment; each typed cwd must be an absolute path of 1–1,024 bytes.
 - Args: at most 64, each at most 1,024 bytes, 8,192 bytes combined, no NUL.
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
@@ -235,7 +246,7 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
 Detached launchers are a bounded argv-only subset: output handling and
-per-command environment overrides remain parity gaps. Desktop pseudo-apps, URI
+per-command elevation remain parity gaps. Desktop pseudo-apps, URI
 launch, and launcher-specific behavior also remain unimplemented.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural

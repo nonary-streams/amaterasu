@@ -1,4 +1,4 @@
-use crate::commands::DetachedCommand;
+use crate::commands::{DetachedCommand, DetachedCommandInput};
 use crate::lifecycle::{PreparationStep, validate_environment};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,7 +30,7 @@ pub(crate) enum Action {
         #[serde(default)]
         steam_install_dir: Option<String>,
         #[serde(default)]
-        detached: Vec<String>,
+        detached: Vec<DetachedCommandInput>,
         #[serde(default)]
         preparation: Box<[PreparationStep]>,
     },
