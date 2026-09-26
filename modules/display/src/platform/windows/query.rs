@@ -197,10 +197,10 @@ pub fn verify_newly_active_hdr_is_off(id: &str) -> DisplayResult<()> {
         .iter()
         .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
         .ok_or_else(|| DisplayError::new("topology_changed", "requested target is not active"))?;
-    if advanced_color_enabled(path)? == Some(true) {
+    if advanced_color_enabled(path)? != Some(false) {
         return Err(DisplayError::new(
             "verification_failed",
-            "newly active target enabled HDR without a saved recovery baseline",
+            "newly active target has HDR enabled or an unknown HDR baseline",
         ));
     }
     Ok(())

@@ -1,6 +1,8 @@
 use super::conversion::{address, native_rational, native_signal, native_source};
 use super::query::{ConfigurationBuffers, check, names, query};
-use crate::model::{Configuration, DisplayError, DisplayResult, Rotation, Snapshot, SourceMode};
+use crate::model::{
+    Configuration, DisplayError, DisplayResult, Rotation, RouteBinding, Snapshot, SourceMode,
+};
 use std::collections::BTreeMap;
 use windows_sys::Win32::Devices::Display::*;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -181,9 +183,232 @@ pub fn preserving(
     configuration: &Configuration,
     before: &Snapshot,
     selected: &str,
+    route: Option<&RouteBinding>,
 ) -> DisplayResult<ConfigurationBuffers> {
     let bound = restoration(before)?;
-    preserve_bound(bound, configuration, before, selected)
+    match route {
+        Some(route) => append_inactive(bound, configuration, before, selected, route),
+        None => preserve_bound(bound, configuration, before, selected),
+    }
+}
+
+pub fn bind_inactive(display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
+    before.configuration()?;
+    if before
+        .paths
+        .iter()
+        .any(|path| path.id.eq_ignore_ascii_case(display))
+    {
+        return Err(DisplayError::new(
+            "invalid_request",
+            "selected display is already active",
+        ));
+    }
+    let (path, device) = select_inactive_route(display, before, "unsupported_topology")?;
+    Ok(RouteBinding {
+        id: device.id,
+        source_name: device.source,
+        source_address: address(path.sourceInfo.adapterId, path.sourceInfo.id),
+        target_address: address(path.targetInfo.adapterId, path.targetInfo.id),
+        output_technology: path.targetInfo.outputTechnology,
+    })
+}
+
+pub fn bound_inactive_path(
+    route: &RouteBinding,
+    before: &Snapshot,
+) -> DisplayResult<DISPLAYCONFIG_PATH_INFO> {
+    let (path, device) = select_inactive_route(&route.id, before, "topology_changed")?;
+    if device.source != route.source_name
+        || address(path.sourceInfo.adapterId, path.sourceInfo.id) != route.source_address
+        || address(path.targetInfo.adapterId, path.targetInfo.id) != route.target_address
+        || path.targetInfo.outputTechnology != route.output_technology
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "inactive target route changed",
+        ));
+    }
+    Ok(path)
+}
+
+fn select_inactive_route(
+    display: &str,
+    before: &Snapshot,
+    ambiguous_code: &'static str,
+) -> DisplayResult<(DISPLAYCONFIG_PATH_INFO, super::query::DeviceNames)> {
+    let available = query(QDC_ALL_PATHS)?;
+    let mut candidates = Vec::new();
+    for path in &available.paths {
+        if path.targetInfo.targetAvailable == 0 {
+            continue;
+        }
+        let device = names(path)?;
+        if device.id.eq_ignore_ascii_case(display) {
+            candidates.push((*path, device));
+        }
+    }
+    select_candidate_route(candidates, before, ambiguous_code)
+}
+
+pub(super) fn select_candidate_route(
+    candidates: Vec<(DISPLAYCONFIG_PATH_INFO, super::query::DeviceNames)>,
+    before: &Snapshot,
+    ambiguous_code: &'static str,
+) -> DisplayResult<(DISPLAYCONFIG_PATH_INFO, super::query::DeviceNames)> {
+    let mut physical_targets = std::collections::BTreeSet::new();
+    let mut eligible: Vec<(
+        (u32, i32, u32),
+        DISPLAYCONFIG_PATH_INFO,
+        super::query::DeviceNames,
+    )> = Vec::new();
+    for (path, device) in candidates {
+        let target = address(path.targetInfo.adapterId, path.targetInfo.id);
+        physical_targets.insert((target.adapter_low, target.adapter_high, target.id));
+        if matches!(
+            path.targetInfo.outputTechnology,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
+                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
+                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
+        ) {
+            return Err(DisplayError::new(
+                ambiguous_code,
+                "inactive indirect or wireless route is unsupported",
+            ));
+        }
+        let source = address(path.sourceInfo.adapterId, path.sourceInfo.id);
+        if before
+            .paths
+            .iter()
+            .any(|active| active.source_address == source)
+        {
+            continue;
+        }
+        let key = (source.adapter_low, source.adapter_high, source.id);
+        if let Some((_, old_path, old_device)) =
+            eligible.iter().find(|(old_key, _, _)| *old_key == key)
+        {
+            if old_device.source != device.source
+                || old_path.targetInfo.outputTechnology != path.targetInfo.outputTechnology
+            {
+                return Err(DisplayError::new(
+                    ambiguous_code,
+                    "inactive route has conflicting source identity",
+                ));
+            }
+        } else {
+            eligible.push((key, path, device));
+        }
+    }
+    if physical_targets.len() != 1 || eligible.len() != 1 {
+        return Err(DisplayError::new(
+            ambiguous_code,
+            "inactive display lacks one unambiguous free physical route",
+        ));
+    }
+    let (_, path, device) = eligible.pop().expect("one eligible route");
+    Ok((path, device))
+}
+
+fn append_inactive(
+    bound: ConfigurationBuffers,
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+    route: &RouteBinding,
+) -> DisplayResult<ConfigurationBuffers> {
+    let path = bound_inactive_path(route, before)?;
+    append_bound_inactive(bound, configuration, before, selected, route, path)
+}
+
+pub(super) fn append_bound_inactive(
+    mut bound: ConfigurationBuffers,
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+    route: &RouteBinding,
+    mut path: DISPLAYCONFIG_PATH_INFO,
+) -> DisplayResult<ConfigurationBuffers> {
+    configuration.validate()?;
+    before.configuration()?;
+    if !route.id.eq_ignore_ascii_case(selected)
+        || bound.paths.len() != before.paths.len()
+        || configuration.displays.len() != before.paths.len() + 1
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "inactive selected route does not match complete desired topology",
+        ));
+    }
+    for saved in &before.paths {
+        let wanted = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_topology", "active display was omitted")
+            })?;
+        if saved.source.width != wanted.width
+            || saved.source.height != wanted.height
+            || saved.source.x != wanted.x
+            || saved.source.y != wanted.y
+            || !saved.refresh.equivalent(wanted.refresh)
+            || saved.rotation != rotation(wanted.rotation)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "inactive activation must preserve every active path",
+            ));
+        }
+    }
+    let wanted = configuration
+        .displays
+        .iter()
+        .find(|display| display.id.eq_ignore_ascii_case(selected))
+        .ok_or_else(|| {
+            DisplayError::new(
+                "unsupported_display",
+                "inactive target is missing from request",
+            )
+        })?;
+    if wanted.hdr_enabled == Some(true) {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "inactive HDR target has no recoverable baseline",
+        ));
+    }
+    if address(path.sourceInfo.adapterId, path.sourceInfo.id) != route.source_address
+        || address(path.targetInfo.adapterId, path.targetInfo.id) != route.target_address
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "bound inactive path differs from journal route",
+        ));
+    }
+    path.sourceInfo.Anonymous.modeInfoIdx = bound.modes.len() as u32;
+    bound.modes.push(DISPLAYCONFIG_MODE_INFO {
+        infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        id: path.sourceInfo.id,
+        adapterId: path.sourceInfo.adapterId,
+        Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+            sourceMode: native_source(&SourceMode {
+                width: wanted.width,
+                height: wanted.height,
+                pixel_format: DISPLAYCONFIG_PIXELFORMAT_32BPP,
+                x: wanted.x,
+                y: wanted.y,
+            }),
+        },
+    });
+    path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    path.targetInfo.refreshRate = native_rational(wanted.refresh);
+    path.targetInfo.rotation = rotation(wanted.rotation);
+    path.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
+    path.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_UNSPECIFIED;
+    path.flags = DISPLAYCONFIG_PATH_ACTIVE;
+    bound.paths.push(path);
+    compact_modes(&mut bound)?;
+    Ok(bound)
 }
 
 pub(super) fn preserve_bound(

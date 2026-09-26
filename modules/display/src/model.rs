@@ -511,6 +511,17 @@ pub struct Journal {
     pub requested_configuration: Option<Configuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_topology_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_route: Option<RouteBinding>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteBinding {
+    pub id: String,
+    pub source_name: String,
+    pub source_address: Address,
+    pub target_address: Address,
+    pub output_technology: i32,
 }
 impl Journal {
     pub fn validate(&self) -> Result<(), DisplayError> {
@@ -525,6 +536,12 @@ impl Journal {
                 .requested_configuration
                 .as_ref()
                 .is_some_and(|configuration| configuration.validate().is_err())
+            || self.pending_route.as_ref().is_some_and(|route| {
+                route.id.is_empty()
+                    || route.id.len() > 1024
+                    || route.source_name.is_empty()
+                    || route.source_name.len() > 128
+            })
         {
             return Err(DisplayError::new(
                 "invalid_journal",

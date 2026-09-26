@@ -3,7 +3,9 @@ mod conversion;
 mod query;
 
 use super::Platform;
-use crate::model::{AvailableMode, Configuration, DisplayError, DisplayResult, Snapshot};
+use crate::model::{
+    AvailableMode, Configuration, DisplayError, DisplayResult, RouteBinding, Snapshot,
+};
 use serde_json::{Value, json};
 #[derive(Default)]
 pub struct WindowsPlatform;
@@ -54,14 +56,18 @@ impl Platform for WindowsPlatform {
         Ok(json!({"ok":true,"platform":self.name(),"entries":rows,"next_offset":next}))
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
-        prepare_configuration(configuration, None)
+        prepare_configuration(configuration, None, None)
+    }
+    fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
+        apply::bind_inactive(display, before)
     }
     fn prepare_preserving(
         &mut self,
         configuration: &Configuration,
         selected: &str,
+        route: Option<&RouteBinding>,
     ) -> DisplayResult<Snapshot> {
-        prepare_configuration(configuration, Some(selected))
+        prepare_configuration(configuration, Some(selected), route)
     }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         let first = query::snapshot()?;
@@ -83,16 +89,17 @@ impl Platform for WindowsPlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        apply_configuration(configuration, before, None, guard)
+        apply_configuration(configuration, before, None, None, guard)
     }
     fn apply_preserving(
         &mut self,
         configuration: &Configuration,
         before: &Snapshot,
         selected: &str,
+        route: Option<&RouteBinding>,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        apply_configuration(configuration, before, Some(selected), guard)
+        apply_configuration(configuration, before, Some(selected), route, guard)
     }
     fn restore(
         &mut self,
@@ -124,6 +131,7 @@ impl Platform for WindowsPlatform {
 fn prepare_configuration(
     configuration: &Configuration,
     selected: Option<&str>,
+    route: Option<&RouteBinding>,
 ) -> DisplayResult<Snapshot> {
     let before = query::snapshot()?;
     for display in &configuration.displays {
@@ -147,7 +155,7 @@ fn prepare_configuration(
         }
     }
     let requested = match selected {
-        Some(selected) => apply::preserving(configuration, &before, selected)?,
+        Some(selected) => apply::preserving(configuration, &before, selected, route)?,
         None => apply::requested(configuration)?,
     };
     apply::set(&requested, false)?;
@@ -158,6 +166,7 @@ fn apply_configuration(
     configuration: &Configuration,
     before: &Snapshot,
     selected: Option<&str>,
+    route: Option<&RouteBinding>,
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
     if before.revision()? != query::snapshot()?.revision()? {
@@ -167,7 +176,7 @@ fn apply_configuration(
         ));
     }
     let requested = match selected {
-        Some(selected) => apply::preserving(configuration, before, selected)?,
+        Some(selected) => apply::preserving(configuration, before, selected, route)?,
         None => apply::requested(configuration)?,
     };
     apply::set(&requested, false)?;
@@ -178,8 +187,14 @@ fn apply_configuration(
             "display topology changed after native validation",
         ));
     }
+    if let Some(route) = route {
+        apply::bound_inactive_path(route, before)?;
+    }
     apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
-    verify_applied_configuration(configuration, query::snapshot())?;
+    let initial_state = verify_applied_configuration(configuration, query::snapshot())?;
+    if let Some(route) = route {
+        verify_activated_route(route, &initial_state)?;
+    }
     for display in &configuration.displays {
         if selected.is_some_and(|id| !display.id.eq_ignore_ascii_case(id)) {
             continue;
@@ -199,14 +214,42 @@ fn apply_configuration(
             }
         }
     }
+    if let Some(route) = route {
+        query::verify_newly_active_hdr_is_off(&route.id).map_err(DisplayError::after_mutation)?;
+    }
     let final_state = verify_applied_configuration(configuration, query::snapshot())?;
     verify_requested_hdr(configuration, &final_state)?;
+    if let Some(route) = route {
+        verify_activated_route(route, &final_state)?;
+    }
     if let Some(selected) = selected
         && !apply::verifies_untouched(configuration, before, &final_state, selected)
     {
         return Err(DisplayError::new(
             "verification_failed",
             "untouched Windows display path changed during apply",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+fn verify_activated_route(route: &RouteBinding, readback: &Snapshot) -> DisplayResult<()> {
+    let actual = readback
+        .paths
+        .iter()
+        .find(|path| path.id.eq_ignore_ascii_case(&route.id))
+        .ok_or_else(|| {
+            DisplayError::new("verification_failed", "newly active display disappeared")
+                .after_mutation()
+        })?;
+    if actual.source_name != route.source_name
+        || actual.source_address != route.source_address
+        || actual.target_address != route.target_address
+    {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "activated display used a different physical route",
         )
         .after_mutation());
     }
@@ -462,6 +505,160 @@ mod tests {
             &after,
             "monitor.two"
         ));
+    }
+
+    #[test]
+    fn inactive_builder_appends_one_bound_route_and_rejects_ambiguous_candidates() {
+        let mut saved = readback_path("monitor.one", 0, Some(false));
+        saved.source.pixel_format = 7;
+        saved.scaling = 3;
+        saved.signal.pixel_rate = 123_456_789;
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![saved.clone()],
+        };
+        let mut configuration = before.configuration().unwrap();
+        let mut selected = configuration.displays[0].clone();
+        selected.id = "monitor.two".into();
+        selected.width = 1280;
+        selected.x = 1920;
+        selected.hdr_enabled = None;
+        configuration.displays.push(selected);
+        let route = RouteBinding {
+            id: "monitor.two".into(),
+            source_name: "DISPLAY2".into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 42,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 43,
+            },
+            output_technology: 0,
+        };
+        let mut path = DISPLAYCONFIG_PATH_INFO::default();
+        path.sourceInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.sourceInfo.id = 42;
+        path.targetInfo.adapterId = LUID {
+            LowPart: 1,
+            HighPart: 0,
+        };
+        path.targetInfo.id = 43;
+        path.targetInfo.targetAvailable = 1;
+        let bound = apply::append_bound_inactive(
+            synthetic_bound(&before),
+            &configuration,
+            &before,
+            "monitor.two",
+            &route,
+            path,
+        )
+        .unwrap();
+        assert_eq!(bound.paths.len(), 2);
+        assert_eq!(bound.modes.len(), 3);
+        assert_eq!(bound.paths[0].targetInfo.scaling, 3);
+        assert_eq!(bound.paths[0].flags, saved.path_flags);
+        // SAFETY: append_bound_inactive compacts and type-checks every mode
+        // index before returning these initialized SOURCE/TARGET records.
+        let source_index = unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let target_index = unsafe { bound.paths[0].targetInfo.Anonymous.modeInfoIdx } as usize;
+        assert_eq!(
+            unsafe { bound.modes[source_index].Anonymous.sourceMode }.pixelFormat,
+            7
+        );
+        assert_eq!(
+            unsafe { bound.modes[target_index].Anonymous.targetMode }
+                .targetVideoSignalInfo
+                .pixelRate,
+            123_456_789
+        );
+        assert_eq!(
+            bound.paths[1].targetInfo.scanLineOrdering,
+            DISPLAYCONFIG_SCANLINE_ORDERING_UNSPECIFIED
+        );
+        assert_eq!(
+            unsafe { bound.paths[1].targetInfo.Anonymous.modeInfoIdx },
+            DISPLAYCONFIG_PATH_MODE_IDX_INVALID
+        );
+        let selected_index = unsafe { bound.paths[1].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        assert_eq!(
+            unsafe { bound.modes[selected_index].Anonymous.sourceMode }.width,
+            1280
+        );
+        let device = || query::DeviceNames {
+            id: "monitor.two".into(),
+            friendly: String::new(),
+            source: "DISPLAY2".into(),
+        };
+        let mut occupied = path;
+        occupied.sourceInfo.id = saved.source_address.id;
+        let accepted = apply::select_candidate_route(
+            vec![(occupied, device()), (path, device())],
+            &before,
+            "unsupported_topology",
+        )
+        .unwrap();
+        assert_eq!(accepted.0.sourceInfo.id, 42);
+        let mut other_target = path;
+        other_target.targetInfo.id = 44;
+        assert_eq!(
+            apply::select_candidate_route(
+                vec![(path, device()), (other_target, device())],
+                &before,
+                "unsupported_topology"
+            )
+            .err()
+            .unwrap()
+            .code,
+            "unsupported_topology"
+        );
+        let mut other_source = path;
+        other_source.sourceInfo.id = 45;
+        assert_eq!(
+            apply::select_candidate_route(
+                vec![(path, device()), (other_source, device())],
+                &before,
+                "unsupported_topology"
+            )
+            .err()
+            .unwrap()
+            .code,
+            "unsupported_topology"
+        );
+        let mut wireless = path;
+        wireless.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST;
+        assert_eq!(
+            apply::select_candidate_route(
+                vec![(wireless, device())],
+                &before,
+                "unsupported_topology"
+            )
+            .err()
+            .unwrap()
+            .code,
+            "unsupported_topology"
+        );
+        let conflicting_name = query::DeviceNames {
+            source: "DISPLAY-OTHER".into(),
+            ..device()
+        };
+        assert_eq!(
+            apply::select_candidate_route(
+                vec![(path, device()), (path, conflicting_name)],
+                &before,
+                "unsupported_topology"
+            )
+            .err()
+            .unwrap()
+            .code,
+            "unsupported_topology"
+        );
     }
 
     fn requested() -> Configuration {

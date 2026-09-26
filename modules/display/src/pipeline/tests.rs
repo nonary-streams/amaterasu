@@ -155,6 +155,8 @@ struct FakePlatform {
     current_snapshot: Option<Snapshot>,
     prepared_configuration: Option<Configuration>,
     preserving_selected: Vec<String>,
+    inactive_route_ambiguous: bool,
+    inactive_route_changed: bool,
     effects: Vec<&'static str>,
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
@@ -184,6 +186,36 @@ impl Platform for FakePlatform {
     }
     fn supported(&self) -> bool {
         true
+    }
+    fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding> {
+        if self.inactive_route_ambiguous {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "ambiguous inactive route",
+            ));
+        }
+        if before
+            .paths
+            .iter()
+            .any(|path| path.id.eq_ignore_ascii_case(display))
+        {
+            return Err(DisplayError::new("unsupported_display", "target is active"));
+        }
+        Ok(RouteBinding {
+            id: display.into(),
+            source_name: "DISPLAY-INACTIVE".into(),
+            source_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 42,
+            },
+            target_address: Address {
+                adapter_low: 1,
+                adapter_high: 0,
+                id: 43,
+            },
+            output_technology: 5,
+        })
     }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         if let Some(current) = &self.current_snapshot {
@@ -269,7 +301,11 @@ impl Platform for FakePlatform {
         &mut self,
         configuration: &Configuration,
         selected: &str,
+        route: Option<&RouteBinding>,
     ) -> DisplayResult<Snapshot> {
+        if route.is_some_and(|route| !route.id.eq_ignore_ascii_case(selected)) {
+            return Err(DisplayError::new("topology_changed", "route mismatch"));
+        }
         self.preserving_selected.push(format!("prepare:{selected}"));
         self.prepare(configuration)
     }
@@ -346,8 +382,15 @@ impl Platform for FakePlatform {
         configuration: &Configuration,
         before: &Snapshot,
         selected: &str,
+        route: Option<&RouteBinding>,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
+        if route.is_some() && self.inactive_route_changed {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "inactive route changed after journal",
+            ));
+        }
         self.preserving_selected.push(format!("apply:{selected}"));
         self.apply(configuration, before, guard)
     }
@@ -869,7 +912,7 @@ fn ensure_only_display_drops_other_and_exactly_restores_baseline() {
 }
 
 #[test]
-fn ensure_active_inactive_target_requires_native_route_preservation() {
+fn ensure_active_inactive_target_persists_route_and_restores_baseline() {
     let mut state = State::default();
     let mut baseline = snapshot();
     baseline.paths[0].id = "monitor.other".into();
@@ -888,9 +931,129 @@ fn ensure_active_inactive_target_requires_native_route_preservation() {
         "owner",
         mutating_option_request("ensure_active", "monitor.one", configuration(), &revision),
     );
-    assert_eq!(applied["error"]["code"], "unsupported_topology");
-    assert!(state.journal.is_none());
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(
+        state.journal.as_ref().unwrap()["pending_route"]["id"],
+        "monitor.one"
+    );
+    let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    assert_eq!(prepared.displays.len(), 2);
+    assert_eq!(prepared.displays[0].id, "monitor.other");
+    assert_eq!(prepared.displays[1].id, "monitor.one");
+    assert_eq!(prepared.displays[1].x, 1920);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(pipeline.platform.inactive);
+}
+
+#[test]
+fn inactive_route_ambiguity_hdr_and_post_journal_drift_fail_closed() {
+    let mut baseline = snapshot();
+    baseline.paths[0].id = "monitor.other".into();
+    for (ambiguous, changed, expected) in [
+        (true, false, "unsupported_topology"),
+        (false, true, "topology_changed"),
+    ] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                current_snapshot: Some(baseline.clone()),
+                inactive: true,
+                hdr_supported: true,
+                inactive_route_ambiguous: ambiguous,
+                inactive_route_changed: changed,
+                ..Default::default()
+            },
+            true,
+        );
+        let revision = json!(baseline.revision().unwrap());
+        let reply = state.run(
+            &mut pipeline,
+            "owner",
+            mutating_option_request("ensure_active", "monitor.one", configuration(), &revision),
+        );
+        assert_eq!(reply["error"]["code"], expected);
+        assert!(state.journal.is_none());
+        assert!(pipeline.platform.effects.is_empty());
+        assert_eq!(state.revision, if changed { 2 } else { 0 });
+    }
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            inactive: true,
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut hdr = configuration();
+    hdr["displays"][0]["hdr_enabled"] = json!(true);
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_active",
+            "monitor.one",
+            hdr,
+            &json!(baseline.revision().unwrap()),
+        ),
+    );
+    assert_eq!(reply["error"]["code"], "unsupported_display");
+    assert_eq!(state.revision, 0);
     assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn pending_inactive_route_restart_recovers_only_saved_active_baseline() {
+    let mut baseline = snapshot();
+    baseline.paths[0].id = "monitor.other".into();
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            inactive: true,
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_active",
+            "monitor.one",
+            configuration(),
+            &json!(baseline.revision().unwrap()),
+        ),
+    );
+    assert_eq!(applied["applied"], true);
+    let saved = state.journal.as_ref().unwrap().clone();
+    assert_eq!(saved["pending_route"]["id"], "monitor.one");
+    assert_eq!(saved["snapshot"]["paths"][0]["id"], "monitor.other");
+    let mut restarted = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let status = state.run(&mut restarted, "owner", json!({"action":"status"}));
+    assert_eq!(status["state"], "recovery_required");
+    let recovered = state.run(
+        &mut restarted,
+        "owner",
+        json!({"action":"recover","lease":applied["lease"]}),
+    );
+    assert_eq!(recovered["restored"], true);
+    assert_eq!(restarted.platform.effects, ["restore"]);
+    assert!(state.journal.is_none());
 }
 
 #[test]
@@ -2139,6 +2302,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         operation_id: None,
         requested_configuration: None,
         expected_topology_revision: None,
+        pending_route: None,
     };
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);
     pipeline.pending = Some(Pending {
@@ -2202,6 +2366,7 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
             operation_id: None,
             requested_configuration: None,
             expected_topology_revision: None,
+            pending_route: None,
         })
         .unwrap(),
     );

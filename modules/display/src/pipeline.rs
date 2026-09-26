@@ -1,5 +1,7 @@
 use crate::configuration_option::DisplayConfigurationOption;
-use crate::model::{Configuration, DisplayError, DisplayResult, Journal, Operation, Snapshot};
+use crate::model::{
+    Configuration, DisplayError, DisplayResult, Journal, Operation, RouteBinding, Snapshot,
+};
 use crate::platform::Platform;
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
@@ -23,6 +25,7 @@ struct PrepareIntent {
     operation_id: Option<String>,
     topology_change: bool,
     preserve_target: Option<String>,
+    pending_route: Option<RouteBinding>,
 }
 struct Pending {
     context: Context,
@@ -432,6 +435,7 @@ impl<P: Platform> Pipeline<P> {
                     )
                 );
                 let mut preserve_target = None;
+                let mut pending_route = None;
                 if topology_change {
                     let Some(expected) = expected_topology_revision.as_deref() else {
                         return complete(
@@ -467,6 +471,35 @@ impl<P: Platform> Pipeline<P> {
                     {
                         preserve_target =
                             mode_policy.as_ref().map(|policy| policy.display_id.clone());
+                    }
+                    if topology_option == Some(DisplayConfigurationOption::EnsureActive)
+                        && let Some(policy) = mode_policy.as_ref()
+                        && !snapshot
+                            .paths
+                            .iter()
+                            .any(|path| path.id.eq_ignore_ascii_case(&policy.display_id))
+                    {
+                        if configuration.displays.iter().any(|display| {
+                            display.id.eq_ignore_ascii_case(&policy.display_id)
+                                && display.hdr_enabled == Some(true)
+                        }) {
+                            return complete(
+                                send,
+                                context.request,
+                                failure(
+                                    "unsupported_display",
+                                    "inactive HDR target has no recoverable baseline",
+                                ),
+                            );
+                        }
+                        pending_route = match self
+                            .platform
+                            .bind_inactive(&policy.display_id, &snapshot)
+                        {
+                            Ok(route) => Some(route),
+                            Err(error) => return complete(send, context.request, error.payload()),
+                        };
+                        preserve_target = Some(policy.display_id.clone());
                     }
                     configuration = match compose_configuration(
                         &configuration,
@@ -504,6 +537,21 @@ impl<P: Platform> Pipeline<P> {
                         return complete(send, context.request, error.payload());
                     }
                 }
+                if pending_route.as_ref().is_some_and(|route| {
+                    configuration.displays.iter().any(|display| {
+                        display.id.eq_ignore_ascii_case(&route.id)
+                            && display.hdr_enabled == Some(true)
+                    })
+                }) {
+                    return complete(
+                        send,
+                        context.request,
+                        failure(
+                            "unsupported_display",
+                            "inactive HDR target has no recoverable baseline",
+                        ),
+                    );
+                }
                 self.prepare(
                     context,
                     revision,
@@ -513,6 +561,7 @@ impl<P: Platform> Pipeline<P> {
                         operation_id,
                         topology_change,
                         preserve_target,
+                        pending_route,
                     },
                     send,
                 )
@@ -568,12 +617,16 @@ impl<P: Platform> Pipeline<P> {
             operation_id,
             topology_change,
             preserve_target,
+            pending_route,
         } = intent;
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
         }
         let prepared = match preserve_target.as_deref() {
-            Some(selected) => self.platform.prepare_preserving(&configuration, selected),
+            Some(selected) => {
+                self.platform
+                    .prepare_preserving(&configuration, selected, pending_route.as_ref())
+            }
             None => self.platform.prepare(&configuration),
         };
         let snapshot = match prepared {
@@ -629,6 +682,7 @@ impl<P: Platform> Pipeline<P> {
             operation_id,
             requested_configuration: Some(configuration.clone()),
             expected_topology_revision,
+            pending_route,
         };
         if journal.validate().is_err()
             || serde_json::to_vec(&journal).map_or(true, |bytes| bytes.len() > 12_000)
@@ -665,10 +719,13 @@ impl<P: Platform> Pipeline<P> {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         let result = if let Some(selected) = preserve_target.as_deref() {
-            self.platform
-                .apply_preserving(&configuration, &journal.snapshot, selected, &mut || {
-                    check_request(send, &context)
-                })
+            self.platform.apply_preserving(
+                &configuration,
+                &journal.snapshot,
+                selected,
+                journal.pending_route.as_ref(),
+                &mut || check_request(send, &context),
+            )
         } else {
             self.platform
                 .apply(&configuration, &journal.snapshot, &mut || {
@@ -805,6 +862,24 @@ fn compose_configuration(
             }
             configuration
         }
+        Some(DisplayConfigurationOption::EnsureActive) => {
+            let mut configuration = active;
+            selected.x = configuration
+                .displays
+                .iter()
+                .try_fold(0_i32, |right, display| {
+                    display
+                        .x
+                        .checked_add(i32::try_from(display.width).ok()?)
+                        .map(|edge| right.max(edge))
+                })
+                .ok_or_else(|| {
+                    DisplayError::new("invalid_request", "active desktop coordinate overflow")
+                })?;
+            selected.y = 0;
+            configuration.displays.push(selected);
+            configuration
+        }
         Some(DisplayConfigurationOption::EnsureOnlyDisplay) if existing.is_some() => {
             selected.x = 0;
             selected.y = 0;
@@ -813,8 +888,7 @@ fn compose_configuration(
             }
         }
         Some(
-            DisplayConfigurationOption::EnsureActive
-            | DisplayConfigurationOption::EnsurePrimary
+            DisplayConfigurationOption::EnsurePrimary
             | DisplayConfigurationOption::EnsureOnlyDisplay,
         ) => {
             return Err(DisplayError::new(

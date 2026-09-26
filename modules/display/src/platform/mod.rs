@@ -1,4 +1,4 @@
-use crate::model::{AvailableMode, Configuration, DisplayResult, Snapshot};
+use crate::model::{AvailableMode, Configuration, DisplayResult, RouteBinding, Snapshot};
 use serde_json::Value;
 
 pub trait Platform {
@@ -13,10 +13,12 @@ pub trait Platform {
     fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>>;
     fn snapshot(&mut self) -> DisplayResult<Snapshot>;
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
+    fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding>;
     fn prepare_preserving(
         &mut self,
         configuration: &Configuration,
         selected: &str,
+        route: Option<&RouteBinding>,
     ) -> DisplayResult<Snapshot>;
     fn apply(
         &mut self,
@@ -29,6 +31,7 @@ pub trait Platform {
         configuration: &Configuration,
         before: &Snapshot,
         selected: &str,
+        route: Option<&RouteBinding>,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()>;
     fn restore(
@@ -64,7 +67,15 @@ impl Platform for NativePlatform {
     fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {
         unsupported()
     }
-    fn prepare_preserving(&mut self, _: &Configuration, _: &str) -> DisplayResult<Snapshot> {
+    fn bind_inactive(&mut self, _: &str, _: &Snapshot) -> DisplayResult<RouteBinding> {
+        unsupported()
+    }
+    fn prepare_preserving(
+        &mut self,
+        _: &Configuration,
+        _: &str,
+        _: Option<&RouteBinding>,
+    ) -> DisplayResult<Snapshot> {
         unsupported()
     }
     fn apply(
@@ -80,6 +91,7 @@ impl Platform for NativePlatform {
         _: &Configuration,
         _: &Snapshot,
         _: &str,
+        _: Option<&RouteBinding>,
         _: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         unsupported()
