@@ -1208,6 +1208,51 @@ fn default_auxiliary_state_login_fields_do_not_request_authentication_approval()
 }
 
 #[test]
+fn default_primary_file_keeps_login_role_when_named_as_auxiliary() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"vibeshine_file_state = sunshine_state.json\n",
+    );
+    write(
+        &predecessor.join("sunshine_state.json"),
+        br#"{"username":"admin","password":"verifier","salt":"salt","root":{"api_tokens":[]}}"#,
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).unwrap();
+    assert!(
+        plan.critical_items
+            .iter()
+            .any(|item| item.item == "legacy_administrator_credential")
+    );
+}
+
+#[test]
+fn nested_auxiliary_with_primary_filename_does_not_gain_login_role() {
+    let fixture = TemporaryDirectory::new();
+    let predecessor = fixture.path().join("Sunshine");
+    write(
+        &predecessor.join("sunshine.conf"),
+        b"vibeshine_file_state = private/sunshine_state.json\n",
+    );
+    write(
+        &predecessor.join("private/sunshine_state.json"),
+        br#"{"username":"auxiliary","password":"verifier","salt":"salt"}"#,
+    );
+
+    let plan =
+        analyze_legacy_configuration(&[source(LegacyProduct::Sunshine, &predecessor)]).unwrap();
+    assert!(
+        !plan
+            .critical_items
+            .iter()
+            .any(|item| item.item == "legacy_administrator_credential")
+    );
+}
+
+#[test]
 fn configured_conf_target_retains_listener_critical_setting_after_pairing_approval() {
     let fixture = TemporaryDirectory::new();
     let predecessor = fixture.path().join("Vibeshine");

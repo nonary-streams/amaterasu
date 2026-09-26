@@ -189,6 +189,7 @@ fn run() -> Result<(), String> {
                         })
                         .collect();
                     let copied_validation = validate_sensitive_sources(&copied_sources)?;
+                    ensure_copied_sensitive_requirements(&validation, &copied_validation)?;
                     let copied_plan = preflight_legacy_configuration_with_sensitive_sources(
                         &copied_sources,
                         &copied_validation.approvals,
@@ -364,8 +365,11 @@ fn validate_sensitive_sources(
     sources: &[LegacyConfigSource],
 ) -> Result<SensitiveValidation, String> {
     let mut checks = Vec::new();
+    let mut critical_items = Vec::new();
     for source in sources {
-        let (needs_pairing, needs_authentication) = sensitive_needs(source)?;
+        let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
+        let (needs_pairing, needs_authentication) = sensitive_needs_in_plan(&plan);
+        critical_items.extend(plan.critical_items);
         checks.push(SourceValidation {
             product: source.product,
             pairing_needed: needs_pairing,
@@ -386,13 +390,20 @@ fn validate_sensitive_sources(
                 )?,
         });
     }
+    critical_items.sort();
+    critical_items.dedup();
     let approvals = aggregate_sensitive_approvals(&checks);
-    Ok(SensitiveValidation { checks, approvals })
+    Ok(SensitiveValidation {
+        checks,
+        approvals,
+        critical_items,
+    })
 }
 
 struct SensitiveValidation {
     checks: Vec<SourceValidation>,
     approvals: Vec<ValidatedSensitiveSource>,
+    critical_items: Vec<amaterasu_package::migration::PlanItem>,
 }
 
 struct SourceValidation {
@@ -401,6 +412,27 @@ struct SourceValidation {
     authentication_needed: bool,
     pairing_valid: bool,
     authentication_valid: bool,
+}
+
+fn ensure_copied_sensitive_requirements(
+    original: &SensitiveValidation,
+    copied: &SensitiveValidation,
+) -> Result<(), String> {
+    let requirements = |validation: &SensitiveValidation| {
+        let mut by_product = std::collections::BTreeMap::<LegacyProduct, (bool, bool)>::new();
+        for check in &validation.checks {
+            let entry = by_product.entry(check.product).or_default();
+            entry.0 |= check.pairing_needed;
+            entry.1 |= check.authentication_needed;
+        }
+        by_product
+    };
+    if requirements(original) != requirements(copied)
+        || original.critical_items != copied.critical_items
+    {
+        return Err("predecessor sensitive state changed while being imported".into());
+    }
+    Ok(())
 }
 
 fn aggregate_sensitive_approvals(checks: &[SourceValidation]) -> Vec<ValidatedSensitiveSource> {
@@ -436,8 +468,13 @@ fn aggregate_sensitive_approvals(checks: &[SourceValidation]) -> Vec<ValidatedSe
         .collect()
 }
 
+#[cfg(test)]
 fn sensitive_needs(source: &LegacyConfigSource) -> Result<(bool, bool), String> {
     let plan = analyze_legacy_configuration(std::slice::from_ref(source))?;
+    Ok(sensitive_needs_in_plan(&plan))
+}
+
+fn sensitive_needs_in_plan(plan: &amaterasu_package::migration::ImportPlan) -> (bool, bool) {
     let pairing = plan.critical_items.iter().any(|item| {
         matches!(
             item.item.as_str(),
@@ -450,7 +487,7 @@ fn sensitive_needs(source: &LegacyConfigSource) -> Result<(bool, bool), String> 
             "credentials_file" | "legacy_administrator_credential"
         )
     });
-    Ok((pairing, authentication))
+    (pairing, authentication)
 }
 
 fn seed_sensitive_sources(
@@ -1424,6 +1461,95 @@ mod handoff_cli_tests {
     use super::*;
 
     #[test]
+    fn missing_default_login_in_copied_snapshot_cannot_authorize_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-missing-copied-login-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("predecessor");
+        let copied_root = root.join("copied");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&copied_root).unwrap();
+        let configuration = b"fps = 120\n";
+        fs::write(source_root.join("sunshine.conf"), configuration).unwrap();
+        fs::write(copied_root.join("sunshine.conf"), configuration).unwrap();
+        fs::write(
+            source_root.join("sunshine_state.json"),
+            br#"{"username":"admin","password":"verifier","salt":"salt"}"#,
+        )
+        .unwrap();
+        let source = LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: source_root,
+        };
+        let copied = LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: copied_root,
+        };
+        let original_needs = sensitive_needs(&source).unwrap();
+        let copied_needs = sensitive_needs(&copied).unwrap();
+        assert_eq!(original_needs, (true, true));
+        assert_eq!(copied_needs, (false, false));
+        let approved = [ValidatedSensitiveSource {
+            product: LegacyProduct::Sunshine,
+            pairing: true,
+            authentication: true,
+        }];
+        let original_plan = preflight_legacy_configuration_with_sensitive_sources(
+            std::slice::from_ref(&source),
+            &approved,
+        )
+        .unwrap();
+        let copied_plan = preflight_legacy_configuration_with_sensitive_sources(
+            std::slice::from_ref(&copied),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            original_plan, copied_plan,
+            "cleared plans conceal lost state"
+        );
+        let original_validation = SensitiveValidation {
+            approvals: approved.to_vec(),
+            critical_items: analyze_legacy_configuration(std::slice::from_ref(&source))
+                .unwrap()
+                .critical_items,
+            checks: vec![SourceValidation {
+                product: LegacyProduct::Sunshine,
+                pairing_needed: original_needs.0,
+                authentication_needed: original_needs.1,
+                pairing_valid: true,
+                authentication_valid: true,
+            }],
+        };
+        let mut copied_validation = SensitiveValidation {
+            approvals: Vec::new(),
+            critical_items: analyze_legacy_configuration(std::slice::from_ref(&copied))
+                .unwrap()
+                .critical_items,
+            checks: vec![SourceValidation {
+                product: LegacyProduct::Sunshine,
+                pairing_needed: copied_needs.0,
+                authentication_needed: copied_needs.1,
+                pairing_valid: true,
+                authentication_valid: true,
+            }],
+        };
+        assert!(
+            ensure_copied_sensitive_requirements(&original_validation, &copied_validation).is_err()
+        );
+        copied_validation.checks[0].pairing_needed = true;
+        copied_validation.checks[0].authentication_needed = true;
+        assert!(
+            ensure_copied_sensitive_requirements(&original_validation, &copied_validation).is_err(),
+            "raw critical items must still expose the missing login"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_materialization_can_retry_with_updated_predecessor_credential() {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-credential-retry-{}-{:?}",
@@ -1519,6 +1645,7 @@ mod handoff_cli_tests {
         };
         let validation = SensitiveValidation {
             approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
+            critical_items: Vec::new(),
             checks: vec![check],
         };
         assert!(
@@ -1566,6 +1693,7 @@ mod handoff_cli_tests {
         };
         let validation = SensitiveValidation {
             approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
+            critical_items: Vec::new(),
             checks: vec![check],
         };
         amaterasu_package::migration::import_legacy_configuration_with_sensitive_sources(

@@ -11,6 +11,85 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+#[ignore = "requires separately built authentication and pairing import helpers"]
+fn default_primary_named_as_auxiliary_still_seeds_login() {
+    let authentication_helper = PathBuf::from(
+        std::env::var_os("AMATERASU_AUTHENTICATION_IMPORT_EXE")
+            .expect("set AMATERASU_AUTHENTICATION_IMPORT_EXE"),
+    );
+    let pairing_helper = PathBuf::from(
+        std::env::var_os("AMATERASU_PAIRING_IMPORT_EXE").expect("set AMATERASU_PAIRING_IMPORT_EXE"),
+    );
+    let root = unique_fixture_root();
+    let binaries = root.join("bin");
+    let source = root.join("predecessor");
+    let destination = root.join("data");
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&binaries).unwrap();
+    fs::create_dir_all(source.join("credentials")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    let migration = binaries.join(format!(
+        "amaterasu-migration{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::copy(env!("CARGO_BIN_EXE_amaterasu-migration"), &migration).unwrap();
+    fs::copy(
+        authentication_helper,
+        binaries.join(format!(
+            "amaterasu-authentication-import{}",
+            std::env::consts::EXE_SUFFIX
+        )),
+    )
+    .unwrap();
+    fs::copy(
+        pairing_helper,
+        binaries.join(format!(
+            "amaterasu-pairing-import{}",
+            std::env::consts::EXE_SUFFIX
+        )),
+    )
+    .unwrap();
+    fs::write(
+        source.join("sunshine.conf"),
+        "vibeshine_file_state = sunshine_state.json\nfps = 120\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("credentials/cakey.pem"),
+        include_str!("../../../modules/pairing/tests/fixtures/host-key.pem"),
+    )
+    .unwrap();
+    fs::write(
+        source.join("credentials/cacert.pem"),
+        include_str!("../../../modules/pairing/tests/fixtures/host-cert.pem"),
+    )
+    .unwrap();
+    let verifier = "0123456789abcdef".repeat(4);
+    fs::write(
+        source.join("sunshine_state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "username": "admin",
+            "password": verifier,
+            "salt": "1234567890abcdef",
+            "root": {"uniqueid": "12345678-1234-4234-8234-123456789abc", "named_devices": []}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = import(&migration, &source, &destination, &runtime);
+    assert!(result.status.success(), "{}", output_text(&result));
+    let state: Value =
+        serde_json::from_slice(&fs::read(authentication_namespace(&runtime)).unwrap()).unwrap();
+    assert_eq!(
+        state["values"]["authentication/v1"]["credential"]["password_hash"],
+        verifier
+    );
+    assert!(runtime.join("installer-import-validated.json").is_file());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "requires a separately built authentication import helper"]
 fn credential_import_seeds_runtime_and_failed_retry_revokes_handoff_approval() {
     let helper = PathBuf::from(

@@ -258,6 +258,8 @@ pub fn analyze_legacy_configuration(sources: &[LegacyConfigSource]) -> PackageRe
             analyze_source_file(
                 source.product,
                 &source.root.join(relative),
+                relative == Path::new("apollo_state.json")
+                    || relative == Path::new("sunshine_state.json"),
                 collected.configured_state_files.contains(relative),
                 collected.auxiliary_state_files.contains(relative),
                 collected.configured_authentication_files.contains(relative),
@@ -471,6 +473,7 @@ pub fn rollback_legacy_configuration(receipt: &MigrationReceipt) -> PackageResul
 fn analyze_source_file(
     product: LegacyProduct,
     path: &Path,
+    is_default_primary_state_file: bool,
     is_configured_state_file: bool,
     is_auxiliary_state_file: bool,
     is_configured_authentication_file: bool,
@@ -491,6 +494,7 @@ fn analyze_source_file(
             product,
             path,
             is_configured_authentication_file
+                || is_default_primary_state_file
                 || (!is_auxiliary_state_file
                     && (is_configured_state_file
                         || !matches!(filename, "vibeshine_state.json" | "vibepollo_state.json"))),
