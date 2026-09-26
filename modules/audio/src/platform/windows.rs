@@ -170,6 +170,7 @@ impl RouteLease {
         enumerator: &IMMDeviceEnumerator,
         endpoint: &str,
         capture_sink_without_routing: bool,
+        virtual_sink: bool,
     ) -> AudioResult<Self> {
         if capture_sink_without_routing || endpoint == "default" {
             return Ok(Self::unchanged(endpoint));
@@ -185,9 +186,9 @@ impl RouteLease {
             return Err("audio_route_restore_failed");
         }
         let original = default_endpoints(enumerator)?;
-        match policy.acquire(endpoint, &original)? {
+        match policy.acquire_with_tracking(endpoint, &original, virtual_sink)? {
             AcquirePlan::Unchanged => Ok(Self::unchanged(endpoint)),
-            AcquirePlan::Shared => Ok(Self {
+            AcquirePlan::Tracked | AcquirePlan::Shared => Ok(Self {
                 endpoint: endpoint.to_owned(),
                 active: true,
             }),
@@ -1006,6 +1007,7 @@ impl Capture {
                 enumerator,
                 &endpoint,
                 capture_sink_without_routing || follow_console_default,
+                route_virtual_sink,
             )?;
             let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
                 (Some(layout), Some(valid_bits)) => {

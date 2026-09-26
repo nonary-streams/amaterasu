@@ -42,6 +42,7 @@ pub fn assignments_reached_target(
 #[derive(Debug, Eq, PartialEq)]
 pub enum AcquirePlan {
     Unchanged,
+    Tracked,
     Shared,
     Assign(Vec<RoleAssignment>),
 }
@@ -69,10 +70,20 @@ impl RoutePolicy {
         Self { active: None }
     }
 
+    #[cfg(test)]
     pub fn acquire(
         &mut self,
         endpoint: &str,
         current: &DefaultEndpoints,
+    ) -> Result<AcquirePlan, &'static str> {
+        self.acquire_with_tracking(endpoint, current, false)
+    }
+
+    pub fn acquire_with_tracking(
+        &mut self,
+        endpoint: &str,
+        current: &DefaultEndpoints,
+        route_virtual_sink: bool,
     ) -> Result<AcquirePlan, &'static str> {
         if let Some(active) = &mut self.active {
             if active.references == 0 {
@@ -88,10 +99,20 @@ impl RoutePolicy {
             return Ok(AcquirePlan::Shared);
         }
 
-        // Vibeshine leaves all roles alone when the selected endpoint is the
-        // current console default, even when multimedia or communications use
-        // another device.
+        // The pinned source skips set_sink when its selected sink equals the
+        // current host sink. Ordinary opens need no lease. A virtual open keeps
+        // a passive lease so later changes to its selected roles can be
+        // reasserted without altering other roles at the first poll.
         if current[DefaultRole::Console.index()].as_deref() == Some(endpoint) {
+            if route_virtual_sink {
+                self.active = Some(ActiveLease {
+                    endpoint: endpoint.to_owned(),
+                    original: current.clone(),
+                    assigned_roles: [false; 3],
+                    references: 1,
+                });
+                return Ok(AcquirePlan::Tracked);
+            }
             return Ok(AcquirePlan::Unchanged);
         }
 
@@ -194,7 +215,8 @@ impl RoutePolicy {
         Ok(DefaultRole::ALL
             .into_iter()
             .filter(|role| {
-                active.original[role.index()].is_some()
+                (active.assigned_roles[role.index()]
+                    || active.original[role.index()].as_deref() == Some(endpoint))
                     && current[role.index()].is_some()
                     && current[role.index()].as_deref() != Some(endpoint)
             })
@@ -428,6 +450,71 @@ mod tests {
         );
         policy.complete_restore(true);
         assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn virtual_sink_already_default_tracks_shared_reassertion_and_final_release() {
+        let original = endpoints("render.virtual", "render.multimedia", "render.comms");
+        let changed = endpoints("render.user", "render.user-multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        assert_eq!(
+            policy.acquire_with_tracking("render.virtual", &original, true),
+            Ok(AcquirePlan::Tracked)
+        );
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &original),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            policy.acquire_with_tracking("render.virtual", &original, true),
+            Ok(AcquirePlan::Shared)
+        );
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &changed),
+            Ok(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.virtual".into(),
+            }])
+        );
+        policy
+            .record_assignment("render.virtual", DefaultRole::Console)
+            .unwrap();
+        let reasserted = endpoints("render.virtual", "render.user-multimedia", "render.comms");
+        assert_eq!(
+            policy.release("render.virtual", &reasserted),
+            Ok(ReleasePlan::Shared)
+        );
+        assert_eq!(
+            policy.release("render.virtual", &reasserted),
+            Ok(ReleasePlan::Restore(Vec::new()))
+        );
+        policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn virtual_sink_with_every_role_already_selected_tracks_future_changes() {
+        let original = endpoints("render.virtual", "render.virtual", "render.virtual");
+        let mut policy = RoutePolicy::new();
+        assert_eq!(
+            policy.acquire_with_tracking("render.virtual", &original, true),
+            Ok(AcquirePlan::Tracked)
+        );
+        let changed = endpoints("render.virtual", "render.user", "render.virtual");
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &changed),
+            Ok(vec![RoleAssignment {
+                role: DefaultRole::Multimedia,
+                endpoint: "render.virtual".into(),
+            }])
+        );
+        policy
+            .record_assignment("render.virtual", DefaultRole::Multimedia)
+            .unwrap();
+        assert_eq!(
+            policy.release("render.virtual", &original),
+            Ok(ReleasePlan::Restore(Vec::new()))
+        );
     }
 
     #[test]
