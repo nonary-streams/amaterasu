@@ -253,8 +253,12 @@ impl HistoryActivities {
                         super::error("history_activity_end_unconfirmed"),
                     );
                 }
-                entry.phase = Phase::CleanupExpired;
-                entry.terminal_at.get_or_insert(now);
+                if let Phase::Ending(pending) = &mut entry.phase
+                    && pending.shutdown(send)
+                {
+                    entry.phase = Phase::CleanupExpired;
+                    entry.terminal_at.get_or_insert(now);
+                }
                 continue;
             }
             if now < entry.retry_at {
@@ -388,12 +392,13 @@ impl HistoryActivities {
     }
 
     pub(super) fn shutdown(&mut self, send: &mut rpc::Send<'_>) -> bool {
-        self.entries
-            .values_mut()
-            .all(|entry| match &mut entry.phase {
-                Phase::Beginning(pending) | Phase::Ending(pending) => pending.shutdown(send),
-                _ => true,
-            })
+        let mut settled = true;
+        for entry in self.entries.values_mut() {
+            if let Phase::Beginning(pending) | Phase::Ending(pending) = &mut entry.phase {
+                settled &= pending.shutdown(send);
+            }
+        }
+        settled
     }
 }
 

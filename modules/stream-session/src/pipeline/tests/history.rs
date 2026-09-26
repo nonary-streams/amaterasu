@@ -399,12 +399,19 @@ fn expired_end_does_not_strand_waiting_release_caller() {
         "activity_id":activity,"rtsp_operation_id":activity}),
     );
     host.tick();
+    host.tick();
+    assert_eq!(host.broker.history_requests.len(), 1);
+    host.broker.fail_cancel = true;
     host.now += 600_001;
     host.tick();
     assert_eq!(
         host.broker.replies.remove(&2).unwrap()["code"],
         "history_activity_end_unconfirmed"
     );
+    assert_eq!(host.broker.history_requests.len(), 1);
+    host.broker.fail_cancel = false;
+    host.tick();
+    assert!(host.broker.history_requests.is_empty());
 }
 
 fn prepare_and_start(host: &mut Harness) -> u64 {
