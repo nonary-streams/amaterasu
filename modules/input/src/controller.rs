@@ -1087,7 +1087,6 @@ impl<B: Backend> Controller<B> {
                     // Keep the latest sample for cancellation if injection is
                     // accepted by the OS but its acknowledgement is lost.
                     contact.last_event = event.clone();
-                    contact.last_move = Some(event.clone());
                 }
                 PenTouchPhase::Up | PenTouchPhase::Cancel => {
                     let Some(index) = contact_index else {
@@ -1101,6 +1100,14 @@ impl<B: Backend> Controller<B> {
             }
 
             self.backend.inject(event)?;
+            if matches!(phase, PenTouchPhase::Move) {
+                let contact = self
+                    .pen_touch_contacts
+                    .iter_mut()
+                    .find(|contact| (contact.device, contact.pointer_id) == identity)
+                    .expect("validated move retains its contact");
+                contact.last_move = Some(event.clone());
+            }
             if matches!(phase, PenTouchPhase::Up | PenTouchPhase::Cancel) {
                 self.pen_touch_contacts
                     .retain(|contact| (contact.device, contact.pointer_id) != identity);

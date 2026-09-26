@@ -3471,6 +3471,62 @@ fn failed_pen_touch_down_is_conservatively_cancelled() {
 }
 
 #[test]
+fn failed_pen_touch_move_is_retried_before_deduplication_and_released() {
+    for (pointer_id, device) in [
+        (PEN_POINTER_ID, PenTouchDevice::Pen),
+        (42, PenTouchDevice::Touch),
+    ] {
+        let mut controller = Controller::new(
+            FakeBackend {
+                supports_pen_touch: true,
+                failed_pen_touch_events: vec![(pointer_id, PenTouchPhase::Move)],
+                ..Default::default()
+            },
+            true,
+        );
+        let now = Instant::now();
+        let token = acquire(&mut controller, now);
+        let down = pen_touch(pointer_id, device, PenTouchPhase::Down, 10, 20);
+        let move_event = pen_touch(pointer_id, device, PenTouchPhase::Move, 30, 40);
+        controller.inject(&down).unwrap();
+
+        assert_eq!(
+            controller.inject(&move_event).unwrap_err().code,
+            "injection_failed"
+        );
+        assert_eq!(controller.pen_touch_contacts[0].last_event, move_event);
+        assert!(controller.pen_touch_contacts[0].last_move.is_none());
+
+        controller.inject(&move_event).unwrap();
+        controller.inject(&move_event).unwrap();
+        assert_eq!(
+            controller.pen_touch_contacts[0].last_move,
+            Some(move_event.clone())
+        );
+
+        let released = controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            now,
+            &mut || Ok(()),
+        );
+        assert_eq!(released["released"], true);
+        assert!(controller.pen_touch_contacts.is_empty());
+        assert!(controller.lease.is_none());
+
+        let mut cancel = move_event.clone();
+        let Event::PenTouch { phase, .. } = &mut cancel else {
+            unreachable!();
+        };
+        *phase = PenTouchPhase::Cancel;
+        assert_eq!(
+            *controller.backend.trace.borrow(),
+            [down, move_event.clone(), move_event, cancel]
+        );
+    }
+}
+
+#[test]
 fn failed_pen_touch_release_retries_only_the_contact_whose_cancel_failed() {
     let mut controller = Controller::new(
         FakeBackend {
