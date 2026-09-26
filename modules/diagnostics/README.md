@@ -48,9 +48,12 @@ values never wrap, and overflow leaves the previous value intact. Errors are
 `record_too_large`, `invalid_name`, `invalid_limit`, `invalid_cursor`,
 `invalid_caller`, `caller_limit`, `counter_limit`, `counter_overflow`,
 `sequence_exhausted`, and `not_ready` while logging policy hydration is pending.
-The `status` action returns `{"ok":true,"ready":false}` until hydration
-completes. Query and counter responses remain available during hydration and
-include `ready:false`.
+The `status` action returns `{"ok":true,"ready":false,"logging_configuration_revision":null}`
+until hydration completes. A successfully applied persisted logging policy sets
+`ready:true` and reports its positive `logging_configuration_revision`. A legacy
+bootstrap policy has `ready:true` and a null revision. Failed refreshes keep the
+previous effective policy and revision. Query and counter responses remain
+available during hydration and include `ready:false`.
 
 At most 64 callers can create state, with caller identities bounded to 128 bytes.
 Reads do not allocate caller slots. Caller slots and counters persist until module

@@ -23,6 +23,7 @@ pub struct Journal {
     callers: BTreeMap<String, CallerDiagnostics>,
     logger: SessionLogger,
     ready: bool,
+    logging_configuration_revision: Option<u64>,
 }
 
 impl Default for Journal {
@@ -31,6 +32,7 @@ impl Default for Journal {
             callers: BTreeMap::new(),
             logger: SessionLogger::default(),
             ready: true,
+            logging_configuration_revision: None,
         }
     }
 }
@@ -54,6 +56,31 @@ impl Journal {
         let (logger, warning) = SessionLogger::open(settings);
         self.logger = logger;
         warning
+    }
+
+    /// Keep the effective policy and its revision together when a refreshed sink fails.
+    pub(crate) fn apply_persisted_logging(
+        &mut self,
+        settings: LoggingSettings,
+        revision: u64,
+    ) -> std::result::Result<(), String> {
+        if revision == 0 {
+            return Err("host configuration revision must be positive".into());
+        }
+        if self
+            .logging_configuration_revision
+            .is_some_and(|applied| revision <= applied)
+        {
+            return Err("host configuration revision must advance".into());
+        }
+        let (logger, warning) = SessionLogger::open(settings);
+        if let Some(warning) = warning {
+            return Err(warning);
+        }
+        self.logger = logger;
+        self.logging_configuration_revision = Some(revision);
+        self.ready = true;
+        Ok(())
     }
 
     pub(crate) fn set_ready(&mut self, ready: bool) {
@@ -121,7 +148,11 @@ impl Journal {
                 }
                 self.caller_mut(caller)?.increment(name, amount)
             }
-            Action::Status {} => Ok(json!({"ok":true,"ready":self.ready})),
+            Action::Status {} => Ok(json!({
+                "ok":true,
+                "ready":self.ready,
+                "logging_configuration_revision":self.logging_configuration_revision,
+            })),
         }
     }
 
@@ -233,7 +264,7 @@ mod hydration_tests {
         assert!(journal.callers.is_empty());
         assert_eq!(
             journal.handle("capture", json!({"action":"status"})),
-            json!({"ok":true,"ready":false})
+            json!({"ok":true,"ready":false,"logging_configuration_revision":null})
         );
     }
 
@@ -248,7 +279,7 @@ mod hydration_tests {
         assert!(journal.is_ready());
         assert_eq!(
             journal.handle("capture", json!({"action":"status"})),
-            json!({"ok":true,"ready":true})
+            json!({"ok":true,"ready":true,"logging_configuration_revision":null})
         );
         assert_eq!(
             journal.handle(
@@ -262,6 +293,83 @@ mod hydration_tests {
             ),
             json!({"ok":true,"sequence":1,"dropped_total":0})
         );
+    }
+
+    #[test]
+    fn successful_refresh_advances_revision_and_failed_sink_keeps_effective_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-status-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut journal = Journal::unready();
+        let settings = |path: &str| {
+            LoggingSettings::from_value(json!({
+                "min_log_level":2,
+                "log_path":path,
+                "state_root":root,
+            }))
+            .unwrap()
+        };
+
+        journal
+            .apply_persisted_logging(settings("first.log"), 3)
+            .unwrap();
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"})),
+            json!({
+                "ok":true,"ready":true,"logging_configuration_revision":3
+            })
+        );
+        assert!(
+            journal
+                .apply_persisted_logging(settings("stale.log"), 3)
+                .is_err()
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"}))["logging_configuration_revision"],
+            3
+        );
+
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"file blocks a log directory").unwrap();
+        assert!(
+            journal
+                .apply_persisted_logging(settings("blocked/failed.log"), 4)
+                .is_err()
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"}))["logging_configuration_revision"],
+            3
+        );
+        journal.handle("capture", json!({
+            "action":"record","level":"error","target":"capture","message":"after failed refresh"
+        }));
+        let first_log = std::fs::read_dir(root.join("logs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("first-")
+            })
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(first_log)
+                .unwrap()
+                .contains("after failed refresh")
+        );
+
+        journal
+            .apply_persisted_logging(settings("second.log"), 4)
+            .unwrap();
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"}))["logging_configuration_revision"],
+            4
+        );
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

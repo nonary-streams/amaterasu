@@ -54,14 +54,18 @@ impl ManagedModule for DiagnosticsModule {
         {
             match persisted_logging_settings(&configuration, self.logging_state_root.as_deref()) {
                 Ok((settings, revision)) => {
-                    if let Some(warning) = self.journal.configure_logging(settings) {
-                        eprintln!(
-                            "amaterasu diagnostics: persisted file logging unavailable: {warning}"
-                        );
+                    match self.journal.apply_persisted_logging(settings, revision) {
+                        Ok(()) => {
+                            self.host_logging.adopt_configuration(revision);
+                            self.bootstrap_logging = None;
+                        }
+                        Err(warning) => {
+                            eprintln!(
+                                "amaterasu diagnostics: persisted file logging unavailable: {warning}"
+                            );
+                            self.host_logging.reject_configuration(now);
+                        }
                     }
-                    self.journal.set_ready(true);
-                    self.host_logging.adopt_configuration(revision);
-                    self.bootstrap_logging = None;
                 }
                 Err(warning) => {
                     eprintln!("amaterasu diagnostics: persisted logging policy ignored: {warning}");
@@ -213,11 +217,14 @@ mod hydration_tests {
         let mut reader = HostLoggingConfigurationReader::default();
         reader.adopt_configuration(revision);
         let mut journal = Journal::unready();
-        journal.configure_logging(settings);
-        journal.set_ready(true);
+        journal.apply_persisted_logging(settings, revision).unwrap();
         assert_eq!(
             journal.handle("capture", json!({"action":"status"}))["ready"],
             true
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"status"}))["logging_configuration_revision"],
+            4
         );
         assert_eq!(
             journal.handle(
