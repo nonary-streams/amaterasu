@@ -119,6 +119,8 @@ test("history runtime status reports readiness, deferred settings, failures and 
   assert.match(describe(historyStatus()), /deleted 2 sessions/);
   assert.match(describe(historyStatus({ enabled: false, effective_enabled: true })), /disable is deferred until active streams end; new streams still use the enabled policy/);
   assert.match(describe(historyStatus({ enabled: true, effective_enabled: false })), /enable is deferred until active streams end; new streams still use the disabled policy/);
+  assert.match(describe(historyStatus({ enabled: false, effective_enabled: false })), /Automatic retention and deletion are paused/);
+  assert.doesNotMatch(describe(historyStatus()), /retention and deletion are paused/);
   assert.match(describe(historyStatus({ configuration_ready: false, degraded: true })), /configuration is not ready/);
   assert.match(describe(historyStatus({ available: false, configuration_ready: false })), /storage is unavailable/);
   assert.match(describe(historyStatus({ degraded: true, failed_operations: 3 })), /3 history storage operations have failed/);

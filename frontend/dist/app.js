@@ -2225,9 +2225,12 @@ var Amaterasu;
             : runtime.effective_enabled
                 ? "Recording is enabled for new streams."
                 : "Recording is disabled for new streams.";
+        const retention = runtime.effective_enabled
+            ? ""
+            : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";
         return runtime.degraded
-            ? `Saved history settings confirmed. ${policy} History runtime is degraded; check failed operations and retention status.`
-            : `Saved history settings confirmed. ${policy}`;
+            ? `Saved history settings confirmed. ${policy}${retention} History runtime is degraded; check failed operations and retention status.`
+            : `Saved history settings confirmed. ${policy}${retention}`;
     }
     Amaterasu.historySettingsRuntimeDescription = historySettingsRuntimeDescription;
     async function saveAuthTokenLifetimes(api, revision, sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
@@ -4270,7 +4273,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save history settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Record session history", enabled, "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy."), Amaterasu.el("p", "muted", "Retention changes apply immediately to stored ended sessions, including while recording is disabled."), ttlField, sizeField, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${reply.revision}`)));
+                form.append(Amaterasu.field("Record session history", enabled, "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy."), Amaterasu.el("p", "muted", "Retention limits are saved while recording is disabled. Stored sessions remain readable, but automatic pruning and deletion resume only after recording is enabled."), ttlField, sizeField, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${reply.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
@@ -5110,6 +5113,8 @@ var Amaterasu;
                         : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
                 : "History configuration is not ready; recording is not confirmed."];
         lines.push(`${status.active_streams} active streams · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
+        if (status.configuration_ready && !status.effective_enabled)
+            lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");
         lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);
         if (status.last_prune.size_limit_unmet)
             lines.push("The retention size limit remains unmet; active sessions are preserved.");

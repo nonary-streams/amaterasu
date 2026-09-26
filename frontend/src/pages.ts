@@ -163,6 +163,8 @@ namespace Amaterasu {
           : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
       : "History configuration is not ready; recording is not confirmed."];
     lines.push(`${status.active_streams} active streams · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
+    if (status.configuration_ready && !status.effective_enabled)
+      lines.push("Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.");
     lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);
     if (status.last_prune.size_limit_unmet)
       lines.push("The retention size limit remains unmet; active sessions are preserved.");

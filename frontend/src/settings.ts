@@ -178,9 +178,12 @@ namespace Amaterasu {
       : runtime.effective_enabled
         ? "Recording is enabled for new streams."
         : "Recording is disabled for new streams.";
+    const retention = runtime.effective_enabled
+      ? ""
+      : " Stored sessions remain readable. Automatic retention and deletion are paused until recording is enabled.";
     return runtime.degraded
-      ? `Saved history settings confirmed. ${policy} History runtime is degraded; check failed operations and retention status.`
-      : `Saved history settings confirmed. ${policy}`;
+      ? `Saved history settings confirmed. ${policy}${retention} History runtime is degraded; check failed operations and retention status.`
+      : `Saved history settings confirmed. ${policy}${retention}`;
   }
 
   export async function saveAuthTokenLifetimes(
@@ -2797,7 +2800,7 @@ namespace Amaterasu {
             enabled,
             "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy.",
           ),
-          el("p", "muted", "Retention changes apply immediately to stored ended sessions, including while recording is disabled."),
+          el("p", "muted", "Retention limits are saved while recording is disabled. Stored sessions remain readable, but automatic pruning and deletion resume only after recording is enabled."),
           ttlField,
           sizeField,
           status,

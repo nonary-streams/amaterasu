@@ -576,7 +576,7 @@ test("history editor ignores stale loads and errors after a newer load or save b
   assert.equal((await reloaded).settings.revision, 9);
 });
 
-test("history editor confirms deferred toggles, immediate retention and durable restart readback", async () => {
+test("history editor confirms deferred toggles and durable restart readback", async () => {
   let stored = { ok: true, revision: 4, settings: { enabled: false, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: false };
   let runtime = {
     ok: true,
@@ -609,6 +609,7 @@ test("history editor confirms deferred toggles, immediate retention and durable 
   assert.deepEqual(calls, [["history/settings_get", {}], ["history/history_status", {}]]);
   assert.equal(initial.runtime?.available, true);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(initial.settings, initial.runtime), /Recording is disabled for new streams/);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(initial.settings, initial.runtime), /Automatic retention and deletion are paused/);
   const saved = await context.Amaterasu.saveHistorySettingsState(api, initial.settings, true, 14, 20);
   assert.equal(saved.settings.revision, 5);
   assert.equal(saved.settings.effective_enabled, false);
@@ -628,6 +629,7 @@ test("history editor confirms deferred toggles, immediate retention and durable 
   const reloaded = await context.Amaterasu.readHistorySettingsState(api);
   assert.equal(reloaded.settings.effective_enabled, true);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /Recording is enabled for new streams/);
+  assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /retention and deletion are paused/);
   runtime = { ...runtime, status: { ...runtime.status, active_streams: 1 } };
   const disabled = await context.Amaterasu.saveHistorySettingsState(api, reloaded.settings, false, 7, 10);
   assert.equal(disabled.settings.revision, 6);
@@ -771,7 +773,7 @@ test("history form keeps retention controls visible and saves them while recordi
   assert.notEqual(find(form, (node) => node.children?.includes(ttl)).hidden, true);
   assert.notEqual(find(form, (node) => node.children?.includes(size)).hidden, true);
   assert.match(form.textContent, /New streams started while a change is pending use the previous recording policy/);
-  assert.match(form.textContent, /Retention changes apply immediately to stored ended sessions/);
+  assert.match(form.textContent, /automatic pruning and deletion resume only after recording is enabled/);
   ttl.value = "7";
   size.value = "10";
   form.fire("submit", { preventDefault() {} });
