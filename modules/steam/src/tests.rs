@@ -23,6 +23,7 @@ fn upgrade_game(app_id: u32, needs_upgrade: bool) -> Game {
         last_updated: 123,
         app_type: Some("game".into()),
         last_played: None,
+        playtime_minutes: None,
         artwork_revision: Some("local-42".into()),
         artwork_source_path: Some("C:/steam/appcache/42.png".into()),
         artwork_is_remote: false,

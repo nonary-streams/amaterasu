@@ -374,6 +374,8 @@ fn uninstalled_history_game(app_id: u32, root: &Path, state: LocalAppState) -> G
         artwork_source_path: None,
         artwork_is_remote: false,
         artwork_candidate_signature: String::new(),
+        artwork_local_revision: None,
+        artwork_needs_remote_upgrade: false,
     }
 }
 
