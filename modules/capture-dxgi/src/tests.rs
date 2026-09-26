@@ -323,7 +323,18 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             status["streams"][0]["touch_surface"],
             reply["touch_surface"]
         );
+        assert_eq!(
+            controller.handle("foreign", Operation::Status, &mut || Ok(()))["streams"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         let stream = reply["stream"].as_u64().unwrap();
+        assert_eq!(
+            controller.read("foreign", stream, 0).err().unwrap().code,
+            "not_found"
+        );
         assert!(controller.read("owner", stream, 0).unwrap().is_none());
         controller.close("owner", stream).unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -560,6 +571,84 @@ fn rotated_duplication_surfaces_produce_tight_desktop_oriented_pixels() {
             .collect::<Vec<_>>(),
         [4, 1, 5, 2, 6, 3]
     );
+}
+
+#[test]
+fn rotated_output_modes_match_verified_touch_rectangles_and_reject_drift() {
+    for (rotation, width, height) in [(1, 3, 2), (2, 2, 3), (3, 3, 2), (4, 2, 3)] {
+        let opened = Output {
+            id: "adapter/display".into(),
+            adapter: "adapter".into(),
+            adapter_vendor_id: 0,
+            adapter_device_id: 0,
+            adapter_description: String::new(),
+            device_name: "display".into(),
+            attached: true,
+            left: -20,
+            top: 10,
+            width,
+            height,
+            rotation,
+        };
+        let geometry = CaptureGeometry::new(
+            DesktopRect::new(-20, 10, width, height).unwrap(),
+            DesktopRect::new(-20, 0, width + 20, height + 10).unwrap(),
+        )
+        .unwrap();
+        assert!(model::verify_output_mode(&opened, &opened, geometry).is_ok());
+
+        let mut changed = opened.clone();
+        changed.rotation = if rotation == 2 { 4 } else { 2 };
+        assert_eq!(
+            model::verify_output_mode(&opened, &changed, geometry)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        changed = opened.clone();
+        changed.width += 1;
+        assert_eq!(
+            model::verify_output_mode(&opened, &changed, geometry)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        changed = opened.clone();
+        changed.left += 1;
+        assert_eq!(
+            model::verify_output_mode(&opened, &changed, geometry)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        changed = opened.clone();
+        changed.id.push_str("-new-target");
+        assert_eq!(
+            model::verify_output_mode(&opened, &changed, geometry)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        changed = opened.clone();
+        changed.attached = false;
+        assert_eq!(
+            model::verify_output_mode(&opened, &changed, geometry)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+        let wrong_rectangle = CaptureGeometry::new(
+            DesktopRect::new(-19, 10, width, height).unwrap(),
+            DesktopRect::new(-19, 0, width + 20, height + 10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            model::verify_output_mode(&opened, &opened, wrong_rectangle)
+                .unwrap_err()
+                .code,
+            "access_lost"
+        );
+    }
 }
 
 #[test]

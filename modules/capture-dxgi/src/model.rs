@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+use amaterasu_media::CaptureGeometry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -39,6 +41,34 @@ pub struct Output {
     pub width: u32,
     pub height: u32,
     pub rotation: u32,
+}
+
+#[cfg(any(windows, test))]
+pub fn verify_output_mode(
+    opened: &Output,
+    current: &Output,
+    geometry: CaptureGeometry,
+) -> CaptureResult<()> {
+    let rectangle = geometry.output;
+    if !opened.attached
+        || !current.attached
+        || opened.id != current.id
+        || opened.rotation != current.rotation
+        || opened.left != current.left
+        || opened.top != current.top
+        || opened.width != current.width
+        || opened.height != current.height
+        || rectangle.left != current.left
+        || rectangle.top != current.top
+        || rectangle.width != current.width
+        || rectangle.height != current.height
+    {
+        return Err(CaptureError::new(
+            "access_lost",
+            "captured output mode changed; enumerate and reopen",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

@@ -1,5 +1,7 @@
 use super::{Backend, CaptureSession, TouchSurface};
-use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows};
+use crate::model::{
+    CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows, verify_output_mode,
+};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
     GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
@@ -379,12 +381,7 @@ impl CaptureSession for Session {
             return Ok(None);
         };
         let (selection, output) = resolve_output(&self.output_id, Some(target_id))?;
-        if output.metadata.rotation != self.adapter.rotation {
-            return Err(CaptureError::new(
-                "access_lost",
-                "captured output rotation changed; enumerate and reopen",
-            ));
-        }
+        verify_output_mode(&self.adapter, &output.metadata, selection.geometry)?;
         Ok(Some(selection.geometry))
     }
 
@@ -392,18 +389,8 @@ impl CaptureSession for Session {
         let Some(target_id) = &self.target_id else {
             return Ok(None);
         };
-        let (_, output) = resolve_output(&self.output_id, Some(target_id))?;
-        if output.metadata.rotation != DXGI_MODE_ROTATION_IDENTITY.0 as u32 {
-            return Ok(None);
-        }
-        if output.metadata.width != self.adapter.width
-            || output.metadata.height != self.adapter.height
-        {
-            return Err(CaptureError::new(
-                "access_lost",
-                "capture output dimensions changed; enumerate and reopen",
-            ));
-        }
+        let (selection, output) = resolve_output(&self.output_id, Some(target_id))?;
+        verify_output_mode(&self.adapter, &output.metadata, selection.geometry)?;
         // The verified topology runs in physical per-monitor DPI coordinates.
         // Windows absolute pointer input uses those same physical desktop units.
         let width = output.metadata.width;

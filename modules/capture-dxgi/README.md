@@ -25,6 +25,8 @@ Native modules are trusted code; these grants are not a native-code sandbox.
   units; no stream letterboxing is claimed. The field is omitted if geometry
   or that mapping cannot be verified. IDs are opaque JSON unsigned 64-bit
   integers; clients must preserve integer precision.
+  Rotated outputs use the desktop rectangle's oriented dimensions for both
+  frames and `touch_surface`; a changed mode or target closes the stream.
 - Open accepts optional `operation_id` (1..128 UTF-8 bytes). Repeating the same
   caller/output/operation ID returns the existing live stream; changing output
   returns `operation_conflict`. `{"action":"lookup","operation_id":"start-1"}`
