@@ -70,6 +70,52 @@ fn malformed_or_absent_display_request_never_mutates() {
 }
 
 #[test]
+fn incomplete_duplicate_and_unknown_display_policies_are_rejected() {
+    let complete = display_request();
+    let mut variants = Vec::new();
+    let mut no_policy = complete.clone();
+    no_policy.as_object_mut().unwrap().remove("mode_policies");
+    variants.push(no_policy);
+    let mut missing_target = complete.clone();
+    missing_target["mode_policies"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    variants.push(missing_target);
+    let mut duplicate_target = complete.clone();
+    duplicate_target["mode_policies"][1]["display_id"] = json!("FIRST");
+    variants.push(duplicate_target);
+    let mut unknown_display_field = complete.clone();
+    unknown_display_field["configuration"]["displays"][0]["unexpected"] = json!(true);
+    variants.push(unknown_display_field);
+    let mut unknown_policy_field = complete.clone();
+    unknown_policy_field["mode_policies"][0]["unexpected"] = json!(true);
+    variants.push(unknown_policy_field);
+    let mut unknown_context_field = complete.clone();
+    unknown_context_field["mode_policies"][0]["context"]["unexpected"] = json!(true);
+    variants.push(unknown_context_field);
+    let mut unknown_remapping_field = complete.clone();
+    unknown_remapping_field["mode_policies"][0]["remapping"]["unexpected"] = json!([]);
+    variants.push(unknown_remapping_field);
+    let mut unknown_rule_field = complete.clone();
+    unknown_rule_field["mode_policies"][0]["remapping"]["mixed"] = json!([{"unexpected":true}]);
+    variants.push(unknown_rule_field);
+    for display_request in variants {
+        let mut request = prepare();
+        request["display_request"] = display_request;
+        let mut host = Harness::new();
+        assert_eq!(host.response(1, request)["code"], "invalid_display_request");
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == "amaterasu.display/1")
+        );
+    }
+}
+
+#[test]
 fn rejected_apply_keeps_stream_alive_without_lease() {
     let mut host = Harness::new();
     host.broker.display_apply_failure = true;
@@ -85,7 +131,7 @@ fn rejected_apply_keeps_stream_alive_without_lease() {
 }
 
 #[test]
-fn lost_apply_result_uses_status_and_does_not_apply_twice() {
+fn lost_apply_result_does_not_adopt_unbound_status_lease() {
     let mut host = Harness::new();
     let mut request = prepare();
     request["display_request"] = display_request();
@@ -93,16 +139,8 @@ fn lost_apply_result_uses_status_and_does_not_apply_twice() {
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
     let response = host.response(2, start(id));
     assert_eq!(response["state"], "active");
-    assert!(
-        host.pipeline.records[&id].display_lease.is_some(),
-        "response={response}; calls={:?}",
-        host.broker
-            .calls
-            .iter()
-            .filter(|call| call.service == "amaterasu.display/1")
-            .map(|call| call.payload.clone())
-            .collect::<Vec<_>>()
-    );
+    assert!(host.pipeline.records[&id].display_lease.is_none());
+    assert_eq!(response["display_state"], "status_unverified");
     assert_eq!(
         host.broker
             .calls
@@ -115,7 +153,48 @@ fn lost_apply_result_uses_status_and_does_not_apply_twice() {
     );
     assert_eq!(
         host.response(3, json!({"action":"stop","session":id}))["state"],
-        "stopped"
+        "cleanup_failed"
+    );
+    assert!(host.broker.display_lease.is_some());
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.display/1"
+                && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+    );
+}
+
+#[test]
+fn concurrent_owner_lease_after_preflight_is_never_restored_by_this_session() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.display_race_on_lost_apply = true;
+    host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::BeforeMutation));
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    assert_eq!(
+        host.pipeline.records[&id].display_state,
+        "status_unverified"
+    );
+    assert!(host.pipeline.records[&id].display_lease.is_none());
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "cleanup_failed"
+    );
+    assert_eq!(
+        host.broker.display_lease.as_deref(),
+        Some("display-0000000000000002")
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.display/1"
+                && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
     );
 }
 

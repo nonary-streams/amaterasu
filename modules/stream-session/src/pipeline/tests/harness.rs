@@ -95,6 +95,7 @@ pub struct Broker {
     pub display_apply_failure: bool,
     pub display_restore_failures: usize,
     pub display_unavailable: bool,
+    pub display_race_on_lost_apply: bool,
 }
 
 impl Broker {
@@ -244,6 +245,12 @@ impl Broker {
                     .map(|(_, mode)| *mode);
                 if matches!(fault, Some(Fault::BeforeMutation)) {
                     self.fault = None;
+                    if self.display_race_on_lost_apply
+                        && pending.call.service == "amaterasu.display/1"
+                        && pending.call.payload["action"] == "apply"
+                    {
+                        self.display_lease = Some("display-0000000000000002".into());
+                    }
                     self.requests.insert(request, pending);
                     return Err("lost result before provider dispatch".into());
                 }

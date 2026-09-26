@@ -55,11 +55,12 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> bool {
             true
         }
         Some("leased" | "recovery_required") if response["owned_by_caller"] == true => {
-            if let Some(lease) = response["lease"]
-                .as_str()
-                .filter(|lease| valid_lease(lease))
+            // Status is scoped to the module caller, not to this stream session.
+            // An unknown lease may belong to another module instance that won
+            // the race after our preflight. Never adopt or restore that lease.
+            if record.display_lease.as_deref().is_some_and(valid_lease)
+                && response["lease"].as_str() == record.display_lease.as_deref()
             {
-                record.display_lease = Some(lease.into());
                 record.display_state = response["state"].as_str().unwrap().into();
                 return true;
             }

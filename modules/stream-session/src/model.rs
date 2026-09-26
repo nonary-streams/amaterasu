@@ -114,98 +114,159 @@ pub struct DisplayRequest {
     pub mode_policies: Option<Vec<Value>>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayTopology {
+    displays: Vec<DisplayMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayMode {
+    id: String,
+    width: u32,
+    height: u32,
+    refresh: DisplayRefresh,
+    #[serde(rename = "x")]
+    _x: i32,
+    #[serde(rename = "y")]
+    _y: i32,
+    rotation: Option<String>,
+    #[serde(rename = "hdr_enabled")]
+    _hdr_enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRefresh {
+    numerator: u32,
+    denominator: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayModePolicy {
+    display_id: String,
+    #[serde(rename = "remapping")]
+    _remapping: DisplayRemapping,
+    #[serde(rename = "context")]
+    _context: DisplayModeContext,
+    resolution_option: Option<String>,
+    #[serde(rename = "manual_resolution")]
+    _manual_resolution: Option<String>,
+    refresh_rate_option: Option<String>,
+    #[serde(rename = "manual_refresh_rate")]
+    _manual_refresh_rate: Option<String>,
+    hdr_option: Option<String>,
+    #[serde(rename = "effective_client_hdr_request")]
+    _effective_client_hdr_request: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRemapping {
+    #[serde(default)]
+    #[serde(rename = "mixed")]
+    _mixed: Vec<DisplayRemappingEntry>,
+    #[serde(default)]
+    #[serde(rename = "resolution_only")]
+    _resolution_only: Vec<DisplayRemappingEntry>,
+    #[serde(default)]
+    #[serde(rename = "refresh_rate_only")]
+    _refresh_rate_only: Vec<DisplayRemappingEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayRemappingEntry {
+    #[serde(default)]
+    #[serde(rename = "requested_resolution")]
+    _requested_resolution: String,
+    #[serde(default)]
+    #[serde(rename = "requested_fps")]
+    _requested_fps: String,
+    #[serde(default)]
+    #[serde(rename = "final_resolution")]
+    _final_resolution: String,
+    #[serde(default)]
+    #[serde(rename = "final_refresh_rate")]
+    _final_refresh_rate: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayModeContext {
+    #[serde(rename = "resolution_is_automatic")]
+    _resolution_is_automatic: bool,
+    #[serde(rename = "refresh_rate_is_automatic")]
+    _refresh_rate_is_automatic: bool,
+    #[serde(rename = "client_display_mode_override")]
+    _client_display_mode_override: bool,
+    #[serde(rename = "optimize_game_settings")]
+    _optimize_game_settings: bool,
+}
+
 impl DisplayRequest {
     fn validate(&self) -> Result<(), &'static str> {
-        let displays = self
-            .configuration
-            .get("displays")
-            .and_then(Value::as_array)
-            .filter(|displays| !displays.is_empty() && displays.len() <= 16)
-            .ok_or("invalid_display_request")?;
-        if !self.configuration.is_object()
-            || self.mode_policy.is_some() && self.mode_policies.is_some()
-        {
+        let topology: DisplayTopology = serde_json::from_value(self.configuration.clone())
+            .map_err(|_| "invalid_display_request")?;
+        if topology.displays.is_empty() || topology.displays.len() > 16 {
             return Err("invalid_display_request");
         }
-        if self
-            .configuration
-            .as_object()
-            .is_none_or(|object| object.len() != 1)
-        {
-            return Err("invalid_display_request");
-        }
-        let identities: Vec<&str> = displays
-            .iter()
-            .map(|display| {
-                let mode = display.get("refresh").ok_or("invalid_display_request")?;
-                if display
-                    .get("width")
-                    .and_then(Value::as_u64)
-                    .is_none_or(|value| value == 0 || value > u32::MAX as u64)
-                    || display
-                        .get("height")
-                        .and_then(Value::as_u64)
-                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
-                    || mode
-                        .get("numerator")
-                        .and_then(Value::as_u64)
-                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
-                    || mode
-                        .get("denominator")
-                        .and_then(Value::as_u64)
-                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
-                    || display
-                        .get("x")
-                        .and_then(Value::as_i64)
-                        .is_none_or(|value| i32::try_from(value).is_err())
-                    || display
-                        .get("y")
-                        .and_then(Value::as_i64)
-                        .is_none_or(|value| i32::try_from(value).is_err())
-                {
-                    return Err("invalid_display_request");
-                }
-                display
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty() && id.len() <= 4096)
-                    .ok_or("invalid_display_request")
-            })
-            .collect::<Result<_, _>>()?;
-        if identities.iter().enumerate().any(|(index, id)| {
-            identities[..index]
-                .iter()
-                .any(|prior| prior.eq_ignore_ascii_case(id))
-        }) {
-            return Err("invalid_display_request");
-        }
-        let policies: Vec<&Value> = self
-            .mode_policy
-            .iter()
-            .chain(self.mode_policies.iter().flatten())
-            .collect();
-        if policies.iter().any(|policy| {
-            policy
-                .get("display_id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| {
-                    !identities
-                        .iter()
-                        .any(|target| target.eq_ignore_ascii_case(id))
+        let mut identities = Vec::with_capacity(topology.displays.len());
+        for display in &topology.displays {
+            if display.id.is_empty()
+                || display.id.len() > 4096
+                || display.width == 0
+                || display.height == 0
+                || display.refresh.numerator == 0
+                || display.refresh.denominator == 0
+                || display.rotation.as_deref().is_some_and(|rotation| {
+                    !matches!(
+                        rotation,
+                        "identity" | "rotate90" | "rotate180" | "rotate270"
+                    )
                 })
-                || !policy.get("remapping").is_some_and(Value::is_object)
-                || !policy.get("context").is_some_and(|context| {
-                    [
-                        "resolution_is_automatic",
-                        "refresh_rate_is_automatic",
-                        "client_display_mode_override",
-                        "optimize_game_settings",
-                    ]
+                || identities
                     .iter()
-                    .all(|key| context.get(key).is_some_and(Value::is_boolean))
+                    .any(|prior: &&str| prior.eq_ignore_ascii_case(&display.id))
+            {
+                return Err("invalid_display_request");
+            }
+            identities.push(display.id.as_str());
+        }
+        let raw_policies: Vec<&Value> = match (&self.mode_policy, &self.mode_policies) {
+            (Some(policy), None) if identities.len() == 1 => vec![policy],
+            (None, Some(policies)) if policies.len() == identities.len() => {
+                policies.iter().collect()
+            }
+            _ => return Err("invalid_display_request"),
+        };
+        let mut targets: Vec<String> = Vec::with_capacity(raw_policies.len());
+        for raw_policy in raw_policies {
+            let policy: DisplayModePolicy = serde_json::from_value(raw_policy.clone())
+                .map_err(|_| "invalid_display_request")?;
+            if !identities
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&policy.display_id))
+                || targets
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&policy.display_id))
+                || policy
+                    .resolution_option
+                    .as_deref()
+                    .is_some_and(|option| !matches!(option, "auto" | "disabled" | "manual"))
+                || policy.refresh_rate_option.as_deref().is_some_and(|option| {
+                    !matches!(option, "auto" | "disabled" | "manual" | "prefer_highest")
                 })
-        }) {
-            return Err("invalid_display_request");
+                || policy
+                    .hdr_option
+                    .as_deref()
+                    .is_some_and(|option| !matches!(option, "auto" | "disabled"))
+            {
+                return Err("invalid_display_request");
+            }
+            targets.push(policy.display_id);
         }
         Ok(())
     }
