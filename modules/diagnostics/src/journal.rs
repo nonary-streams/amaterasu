@@ -451,6 +451,73 @@ mod hydration_tests {
     }
 
     #[test]
+    fn blocked_log_directory_recovers_without_changing_the_logging_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-blocked-directory-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"file blocks a log directory").unwrap();
+        let settings = LoggingSettings::from_value(json!({
+            "min_log_level":3,
+            "log_path":"blocked/capture.log",
+            "state_root":root,
+        }))
+        .unwrap();
+        let mut journal = Journal::default();
+        assert!(journal.configure_logging(settings).is_some());
+        let record = |level, message| json!({"action":"record","level":level,"target":"capture","message":message});
+        let status = |journal: &mut Journal| journal.handle("capture", json!({"action":"status"}));
+
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"open"})
+        );
+        assert_eq!(
+            journal.handle("capture", record("info", "below threshold"))["sequence"],
+            1
+        );
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"open"})
+        );
+        assert_eq!(
+            journal.handle("capture", record("warn", "still blocked"))["sequence"],
+            2
+        );
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"open"})
+        );
+
+        std::fs::remove_file(blocked).unwrap();
+        assert_eq!(
+            journal.handle("capture", record("warn", "after recovery"))["sequence"],
+            3
+        );
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"healthy","failure":null})
+        );
+        let log_path = journal.logger.active_path_for_test().to_path_buf();
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(contents.contains("after recovery"));
+        assert!(!contents.contains("still blocked"));
+        assert!(!contents.contains("below threshold"));
+        assert_eq!(
+            journal.handle("capture", json!({"action":"query"}))["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn queries_and_counter_actions_remain_available_while_unready() {
         let mut journal = Journal::unready();
 
