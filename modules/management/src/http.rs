@@ -8,8 +8,23 @@ pub const MAX_BODY: usize = 12_000;
 pub const MAX_INPUT: usize = MAX_HEADERS + MAX_BODY;
 pub const MAX_RESPONSE: usize = 24_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    Plaintext,
+    Tls,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserAuth {
+    Login,
+    Refresh,
+    Logout,
+    Session,
+}
+
 pub enum RequestTarget {
     Api(Route),
+    BrowserAuth(BrowserAuth),
     Asset(String),
     /// A deliberately tiny loopback-only readiness surface. It has no
     /// credentials, identifiers, or mutable operations and exists solely for
@@ -38,10 +53,20 @@ impl Failure {
     }
 }
 
+#[cfg(test)]
 pub fn parse(
     bytes: &[u8],
     authority: &str,
     origins: &[String],
+) -> Result<Option<Request>, Failure> {
+    parse_transport(bytes, authority, origins, Transport::Plaintext)
+}
+
+pub fn parse_transport(
+    bytes: &[u8],
+    authority: &str,
+    origins: &[String],
+    transport: Transport,
 ) -> Result<Option<Request>, Failure> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut request = httparse::Request::new(&mut headers);
@@ -62,7 +87,7 @@ pub fn parse(
     if request.version != Some(1) || fields.host != Some(authority) {
         return Err(Failure::new(400, "invalid_host_or_version"));
     }
-    validate_origin(&fields, authority, origins)?;
+    validate_origin(&fields, authority, origins, transport)?;
     if request.method == Some("GET") {
         return asset_request(
             request.path.unwrap_or_default(),
@@ -72,8 +97,22 @@ pub fn parse(
         )
         .map(Some);
     }
-    let route = routes::resolve(request.path.unwrap_or_default())
-        .ok_or(Failure::new(404, "route_not_found"))?;
+    let path = request.path.unwrap_or_default();
+    let browser_auth = match path {
+        "/v1/auth/browser/login" => Some(BrowserAuth::Login),
+        "/v1/auth/browser/refresh" => Some(BrowserAuth::Refresh),
+        "/v1/auth/browser/logout" => Some(BrowserAuth::Logout),
+        "/v1/auth/browser/session" => Some(BrowserAuth::Session),
+        _ => None,
+    };
+    if browser_auth.is_some() && transport != Transport::Tls {
+        return Err(Failure::new(404, "route_not_found"));
+    }
+    let route = if browser_auth.is_none() {
+        Some(routes::resolve(path).ok_or(Failure::new(404, "route_not_found"))?)
+    } else {
+        None
+    };
     let preflight = validate_browser_request(&fields, request.method)?;
     let length = body_length(&fields, preflight)?;
     let expected = header_end + length;
@@ -83,15 +122,32 @@ pub fn parse(
     if bytes.len() != expected {
         return Err(Failure::new(400, "pipelining_forbidden"));
     }
-    build_request(route, &fields, preflight, &bytes[header_end..]).map(Some)
+    if let Some(action) = browser_auth {
+        return browser_request(action, &fields, preflight, &bytes[header_end..], authority)
+            .map(Some);
+    }
+    build_request(
+        route.expect("ordinary route resolved"),
+        &fields,
+        preflight,
+        &bytes[header_end..],
+        transport,
+    )
+    .map(Some)
 }
 
 fn validate_origin(
     fields: &Fields<'_>,
     authority: &str,
     origins: &[String],
+    transport: Transport,
 ) -> Result<(), Failure> {
-    let same_origin = format!("http://{authority}");
+    let scheme = if transport == Transport::Tls {
+        "https"
+    } else {
+        "http"
+    };
+    let same_origin = format!("{scheme}://{authority}");
     if fields.origin.is_some_and(|origin| {
         origin != same_origin && !origins.iter().any(|allowed| allowed == origin)
     }) || (fields.fetch_site == Some("cross-site") && fields.origin.is_none())
@@ -190,11 +246,23 @@ fn build_request(
     fields: &Fields<'_>,
     preflight: bool,
     body: &[u8],
+    transport: Transport,
 ) -> Result<Request, Failure> {
+    if transport == Transport::Tls && fields.authorization.is_none() && fields.cookie.is_some() {
+        require_cookie_origin(
+            fields,
+            &format!("https://{}", fields.host.unwrap_or_default()),
+        )?;
+    }
     let bearer = if !preflight && route.scope.is_some() {
         let bearer = fields
             .authorization
             .and_then(|value| value.strip_prefix("Bearer "))
+            .or_else(|| {
+                (transport == Transport::Tls)
+                    .then(|| cookie(fields.cookie, "__Secure-amaterasu-access"))
+                    .flatten()
+            })
             .filter(|value| {
                 !value.is_empty()
                     && value.len() <= 128
@@ -219,6 +287,85 @@ fn build_request(
     })
 }
 
+fn browser_request(
+    action: BrowserAuth,
+    fields: &Fields<'_>,
+    preflight: bool,
+    body: &[u8],
+    authority: &str,
+) -> Result<Request, Failure> {
+    if preflight {
+        return Err(Failure::new(403, "preflight_denied"));
+    }
+    require_cookie_origin(fields, &format!("https://{authority}"))?;
+    let route = match action {
+        BrowserAuth::Login => routes::resolve("/v1/auth/login"),
+        BrowserAuth::Refresh => routes::resolve("/v1/auth/refresh"),
+        BrowserAuth::Logout => routes::resolve("/v1/auth/logout"),
+        BrowserAuth::Session => None,
+    };
+    let mut payload = if let Some(route) = route.filter(|_| action == BrowserAuth::Login) {
+        routes::payload(route, body).map_err(|_| Failure::new(400, "invalid_json_body"))?
+    } else if body == b"{}" {
+        json!({})
+    } else {
+        return Err(Failure::new(400, "invalid_json_body"));
+    };
+    if action != BrowserAuth::Login {
+        let name = if action == BrowserAuth::Refresh || action == BrowserAuth::Logout {
+            "__Secure-amaterasu-refresh"
+        } else {
+            "__Secure-amaterasu-access"
+        };
+        let token = cookie(fields.cookie, name)
+            .filter(|value| valid_token(value))
+            .ok_or(Failure::new(401, "unauthorized"))?;
+        payload = match action {
+            BrowserAuth::Refresh => json!({"action":"refresh","refresh_token":token}),
+            BrowserAuth::Logout => json!({"action":"logout","refresh_token":token}),
+            BrowserAuth::Session => json!({"action":"verify","bearer":token,"required_scopes":[]}),
+            BrowserAuth::Login => unreachable!(),
+        };
+    }
+    Ok(Request {
+        target: RequestTarget::BrowserAuth(action),
+        payload,
+        bearer: None,
+        origin: fields.origin.map(str::to_owned),
+        preflight: false,
+    })
+}
+
+fn require_cookie_origin(fields: &Fields<'_>, expected: &str) -> Result<(), Failure> {
+    if fields.origin != Some(expected) || fields.csrf != Some("1") {
+        return Err(Failure::new(403, "csrf_denied"));
+    }
+    Ok(())
+}
+
+fn valid_token(value: &str) -> bool {
+    value.strip_prefix("ama_").is_some_and(|suffix| {
+        suffix.len() == 64
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn cookie<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    for part in header?.split(';') {
+        let (key, value) = part.trim().split_once('=')?;
+        if key == name {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
+}
+
 #[derive(Default)]
 struct Fields<'a> {
     host: Option<&'a str>,
@@ -229,6 +376,8 @@ struct Fields<'a> {
     fetch_site: Option<&'a str>,
     request_method: Option<&'a str>,
     request_headers: Option<&'a str>,
+    cookie: Option<&'a str>,
+    csrf: Option<&'a str>,
 }
 
 impl<'a> Fields<'a> {
@@ -251,6 +400,8 @@ impl<'a> Fields<'a> {
                 "sec-fetch-site" => fields.fetch_site = Some(value),
                 "access-control-request-method" => fields.request_method = Some(value),
                 "access-control-request-headers" => fields.request_headers = Some(value),
+                "cookie" => fields.cookie = Some(value),
+                "x-amaterasu-csrf" => fields.csrf = Some(value),
                 "transfer-encoding" | "expect" | "upgrade" => {
                     return Err(Failure::new(400, "unsupported_framing"));
                 }
@@ -275,12 +426,22 @@ pub fn valid_origin(origin: &str) -> bool {
 }
 
 pub fn response(status: u16, payload: &Value, origin: Option<&str>) -> Vec<u8> {
+    response_with_cookies(status, payload, origin, &[])
+}
+
+pub fn response_with_cookies(
+    status: u16,
+    payload: &Value,
+    origin: Option<&str>,
+    cookies: &[String],
+) -> Vec<u8> {
     let body = serde_json::to_vec(payload).unwrap_or_default();
     if body.len() > MAX_RESPONSE {
-        return response(
+        return response_with_cookies(
             502,
             &json!({"ok":false,"code":"response_too_large"}),
             origin,
+            &[],
         );
     }
     let reason = match status {
@@ -312,6 +473,11 @@ pub fn response(status: u16, payload: &Value, origin: Option<&str>) -> Vec<u8> {
     );
     if let Some(origin) = origin {
         header.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: authorization, content-type\r\n"));
+    }
+    for cookie in cookies {
+        header.push_str("Set-Cookie: ");
+        header.push_str(cookie);
+        header.push_str("\r\n");
     }
     header.push_str("\r\n");
     let mut bytes = header.into_bytes();
@@ -441,6 +607,68 @@ mod tests {
                 RequestTarget::Api(Route { scope: None, .. })
             ));
         }
+    }
+
+    #[test]
+    fn browser_cookie_routes_require_tls_exact_origin_and_csrf() {
+        let token = format!("ama_{}", "a".repeat(64));
+        let request = |path: &str, origin: &str, csrf: &str| {
+            format!(
+                "POST /v1/auth/browser/{path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: {origin}\r\nX-Amaterasu-CSRF: {csrf}\r\nCookie: __Secure-amaterasu-refresh={token}; __Secure-amaterasu-access={token}\r\n\r\n{{}}"
+            )
+        };
+        let valid = request("refresh", &format!("https://{HOST}"), "1");
+        assert_eq!(
+            parse(valid.as_bytes(), HOST, &[]).err().unwrap().status,
+            403
+        );
+        let parsed = parse_transport(valid.as_bytes(), HOST, &[], Transport::Tls)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            parsed.target,
+            RequestTarget::BrowserAuth(BrowserAuth::Refresh)
+        ));
+        assert_eq!(parsed.payload["refresh_token"], token);
+        for invalid in [
+            request("refresh", &format!("http://{HOST}"), "1"),
+            request("refresh", "https://attacker.example", "1"),
+            request("refresh", &format!("https://{HOST}"), "0"),
+        ] {
+            assert_eq!(
+                parse_transport(invalid.as_bytes(), HOST, &[], Transport::Tls)
+                    .err()
+                    .unwrap()
+                    .status,
+                403
+            );
+        }
+    }
+
+    #[test]
+    fn protected_cookie_authorization_requires_csrf_and_does_not_accept_plaintext() {
+        let token = format!("ama_{}", "b".repeat(64));
+        let request = |csrf: &str| {
+            format!(
+                "POST /v1/catalog/list HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://{HOST}\r\nX-Amaterasu-CSRF: {csrf}\r\nCookie: __Secure-amaterasu-access={token}\r\n\r\n{{}}"
+            )
+        };
+        let valid = request("1");
+        let parsed = parse_transport(valid.as_bytes(), HOST, &[], Transport::Tls)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.bearer.as_deref(), Some(token.as_str()));
+        assert_eq!(
+            parse_transport(request("0").as_bytes(), HOST, &[], Transport::Tls)
+                .err()
+                .unwrap()
+                .status,
+            403
+        );
+        assert_eq!(
+            parse(valid.as_bytes(), HOST, &[]).err().unwrap().status,
+            403
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ amaterasu-module-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 httparse.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@ mod http;
 mod route_payload;
 mod routes;
 mod server;
+mod tls;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::Deserialize;
@@ -21,6 +22,9 @@ struct Settings {
     #[serde(default)]
     enabled: bool,
     bind: Option<SocketAddr>,
+    tls_bind: Option<SocketAddr>,
+    tls_certificate_path: Option<String>,
+    tls_private_key_path: Option<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
     web: Option<assets::WebSettings>,
@@ -56,6 +60,15 @@ impl ManagedModule for ManagementModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         validate_settings(&settings)?;
+        let tls_configuration = match (
+            &settings.tls_certificate_path,
+            &settings.tls_private_key_path,
+        ) {
+            (Some(certificate), Some(private_key)) if settings.enabled => {
+                Some(tls::configuration(certificate, private_key)?)
+            }
+            _ => None,
+        };
         let server = if settings.enabled {
             Some(Server::bind(
                 settings
@@ -63,6 +76,8 @@ impl ManagedModule for ManagementModule {
                     .ok_or("enabled management requires an explicit loopback bind")?,
                 settings.allowed_origins,
                 settings.web.map(assets::Assets::new).transpose()?,
+                settings.tls_bind,
+                tls_configuration,
             )?)
         } else {
             None
@@ -102,7 +117,7 @@ impl ManagedModule for ManagementModule {
                     return self.begin_operational_health(id, remaining_ms);
                 }
                 let payload = if payload == json!({"action":"status"}) {
-                    json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address)})
+                    json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
                 } else {
                     json!({"ok":false,"code":"invalid_request"})
                 };
@@ -288,6 +303,19 @@ fn validate_settings(settings: &Settings) -> ModuleResult<()> {
     {
         return Err("management bind must be explicitly loopback".into());
     }
+    if settings
+        .tls_bind
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        return Err("management TLS bind must be explicitly loopback".into());
+    }
+    if settings.tls_bind.is_some() != settings.tls_certificate_path.is_some()
+        || settings.tls_bind.is_some() != settings.tls_private_key_path.is_some()
+    {
+        return Err(
+            "management TLS bind, certificate and private key must be configured together".into(),
+        );
+    }
     if settings.allowed_origins.len() > 16
         || settings
             .allowed_origins
@@ -313,6 +341,9 @@ mod tests {
         for settings in [
             json!({"bind":"0.0.0.0:1234"}),
             json!({"bind":"[::]:1234"}),
+            json!({"tls_bind":"0.0.0.0:1234","tls_certificate_path":"C:/cert.pem","tls_private_key_path":"C:/key.pem"}),
+            json!({"tls_bind":"127.0.0.1:1234"}),
+            json!({"tls_certificate_path":"C:/cert.pem","tls_private_key_path":"C:/key.pem"}),
             json!({"allowed_origins":["*"]}),
             json!({"allowed_origins":["https://host/path"]}),
         ] {

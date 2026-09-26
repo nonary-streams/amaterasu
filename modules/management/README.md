@@ -1,9 +1,10 @@
-# Development HTTP management module
+# Loopback management module
 
 `amaterasu-management` is a native cdylib/rlib providing `amaterasu.management/1`.
 The generic host does not implement HTTP or product routing. This module uses
 `httparse` for HTTP framing, the Rust standard library's nonblocking TCP sockets,
-and the module SDK/serde/serde_json. No networking thread outlives the library.
+rustls for optional browser HTTPS, and the module SDK/serde/serde_json. No
+networking thread outlives the library.
 
 The listener is disabled by default. Development bootstrap settings for principal
 `amaterasu.management` can explicitly enable it:
@@ -21,6 +22,16 @@ settings. At most 16 exact HTTP(S) origins without paths are accepted; empty mea
 all browser Origin headers are denied. `Host` must exactly match the bound numeric
 address and port, including IPv6 brackets. DNS names such as `localhost` are
 intentionally rejected to prevent DNS rebinding.
+
+An opt-in browser HTTPS listener uses three signed bootstrap settings together:
+`tls_bind` (loopback socket address), `tls_certificate_path` (absolute PEM chain),
+and `tls_private_key_path` (absolute PEM key). The TLS files are bounded at load
+time and rustls checks that the key matches the leaf certificate. The trusted
+console status includes `tls_address` when bound. A deployment must provision a
+separate browser-valid leaf with loopback IP SANs, serverAuth EKU, a browser-trusted
+issuer, and private-key file access restricted to the host account and admins.
+Replace certificate and key atomically and restart management to rotate them.
+The Moonlight pairing identity and its certificate are not browser TLS material.
 
 ## Authentication and routes
 
@@ -41,16 +52,25 @@ and refresh pair. `POST /v1/auth/logout` accepts exactly one of `bearer` or
 header because login and refresh establish the credential; the refresh secret is
 validated by the authentication module. Successful login returns the auth
 library's JSON, including both token secrets. Every other protected route requires
-`Authorization: Bearer ama_<opaque token>`; cookies, query parameters and body
-fields do not provide authentication. Before each business request, the module
+`Authorization: Bearer ama_<opaque token>` or, over HTTPS only, the access cookie
+with same-origin CSRF checks. Query parameters and body fields do not provide
+authentication. Before each business request, the module
 calls auth `verify` with `bearer` and `required_scopes:[scope]`, requires an explicit
 successful result containing the exact scope, then dispatches the action.
 
-The frontend keeps ordinary sessions in tab memory and renews access through the
-refresh endpoint. With `remember_me`, it also stores the bearer and refresh pair
-in browser local storage and can restore the session after reload. Remembered
-sessions require Web Locks to serialize refresh and logout across tabs. The
-stored secrets are readable by page JavaScript; they are not HTTP-only cookies.
+The legacy token endpoints above remain available for API clients. On HTTPS,
+`/v1/auth/browser/login` accepts the login body, while `/browser/refresh`,
+`/browser/logout`, and `/browser/session` accept `{}` and use HttpOnly cookies.
+Successful browser login and refresh return session metadata without token secrets,
+and set host-only Secure, HttpOnly, SameSite=Strict access and refresh cookies scoped
+to `/v1` and `/v1/auth/browser` respectively. Remembered refresh cookies persist
+until the signed authentication expiry. Browser session verifies the access cookie;
+a remembered client can refresh after a browser restart when that session cookie
+is absent. Logout revokes the refresh pair and clears both cookies. A failed
+refresh never clears cookies because another tab may have completed rotation.
+Cookie-authenticated POSTs require an exact same HTTPS Origin and
+`X-Amaterasu-CSRF: 1`; browser routes do not send credentialed CORS headers.
+Plaintext requests cannot use browser cookie routes or cookie authentication.
 
 | Route prefix | Actions | Required scope |
 | --- | --- | --- |
