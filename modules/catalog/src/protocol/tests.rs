@@ -330,7 +330,7 @@ fn manual_mutations_cannot_forge_lutris_artwork() {
     let mut artwork_entry = entry("Lutris artwork");
     artwork_entry.artwork = Some(crate::model::ArtworkReference::Lutris {
         game_id: 42,
-        revision: "17".into(),
+        revision: "a".repeat(64),
     });
     let create_error = apply(
         Operation::Create {

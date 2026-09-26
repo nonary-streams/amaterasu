@@ -77,12 +77,11 @@ impl ArtworkReference {
                 }
             }
             Self::Lutris { game_id, revision } => {
-                let parsed_revision = revision.parse::<u64>().ok();
                 if *game_id <= 0
-                    || revision.is_empty()
-                    || revision.len() > 20
-                    || !revision.bytes().all(|byte| byte.is_ascii_digit())
-                    || parsed_revision.is_none_or(|number| number.to_string() != *revision)
+                    || revision.len() != 64
+                    || !revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 {
                     return Err("invalid Lutris artwork reference");
                 }
@@ -1607,8 +1606,8 @@ mod tests {
     }
 
     #[test]
-    fn lutris_artwork_references_require_positive_ids_and_decimal_revisions() {
-        let revision = "18446744073709551615";
+    fn lutris_artwork_references_require_positive_ids_and_digest_revisions() {
+        let revision = "a".repeat(64);
         let valid: Entry = serde_json::from_value(json!({
             "name":"Lutris game",
             "artwork":{"provider":"lutris","game_id":42,"revision":revision},
@@ -1621,8 +1620,9 @@ mod tests {
             json!({"provider":"lutris","game_id":0,"revision":revision}),
             json!({"provider":"lutris","game_id":-1,"revision":revision}),
             json!({"provider":"lutris","game_id":42,"revision":""}),
-            json!({"provider":"lutris","game_id":42,"revision":"01"}),
-            json!({"provider":"lutris","game_id":42,"revision":"18446744073709551616"}),
+            json!({"provider":"lutris","game_id":42,"revision":"a"}),
+            json!({"provider":"lutris","game_id":42,"revision":"A".repeat(64)}),
+            json!({"provider":"lutris","game_id":42,"revision":"/".repeat(64)}),
             json!({"provider":"lutris","game_id":42,"revision":"12x"}),
         ] {
             let entry: Entry = serde_json::from_value(json!({
