@@ -160,10 +160,11 @@ restart loading, refresh rotation, and expiry. Host defaults are 7,200 seconds f
 `global:remember_me_refresh_token_ttl_seconds`. Vibeshine's host defaults match,
 but its web settings merge shows 86,400 seconds for an unset session TTL. Its
 secure HTTP-only cookies and persisted server-side session state survive browser
-reload and host restart; Amaterasu keeps bearer strings and session digests only
-in memory, requiring sign-in after reload or module restart. The active-session
-TTL arithmetic matches, but these visible fallback and retention differences
-keep both IDs pending.
+reload and host restart. Amaterasu now persists session digests in a versioned
+private sidecar and restores remembered browser sessions under a Web Locks guard.
+It still uses explicit bearer tokens instead of the reference's cookie flow;
+live multi-tab and installed-host restart qualification and the web fallback
+difference keep both IDs pending.
 
 Session-history settings now use the central `amaterasu.configuration/1`
 revision for signed compare-and-swap updates. Startup migrates older SQLite
