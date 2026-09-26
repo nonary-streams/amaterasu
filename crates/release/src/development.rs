@@ -1,4 +1,5 @@
 //! Local-only publisher tooling. Generated keys are not production release identities.
+use amaterasu_contracts::Grants;
 use amaterasu_package::{
     ActivationState, BootstrapConfig, ComponentManifest, PackageResult, ReleaseManifest,
     ReleaseSignature, RootLock, VerificationPolicy, create_machine_private_directory,
@@ -9,7 +10,7 @@ use amaterasu_package::{
 use amaterasu_storage::write_atomically;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::profiles::{
     ComponentDefinition, PackageProfile, RUNTIME_ID, development_policy, installer_policy,
@@ -239,8 +240,8 @@ pub fn install_installer_root(template: &Path, package: &Path, root: &Path) -> P
 }
 
 /// Transitions installer-owned development roots and exact generated production
-/// authorization policies under the same signer. Locally customized policy and
-/// key rotation require an explicit migration rather than an MSI self-upgrade.
+/// authorization settings and host grants under the same signer. Locally
+/// customized policy and key rotation require an explicit migration.
 fn install_existing_installer_root(
     template: &Path,
     package: &Path,
@@ -277,11 +278,22 @@ fn install_existing_installer_root(
     }
     verify_installer_web_bundle(template, &candidate)?;
 
-    // A generated production authorization policy may gain a scope under the
-    // same signer. Everything else in an established root stays local.
+    // Exact generated production grants and authorization settings may gain
+    // capabilities under the same signer. Everything else stays local.
     if !current.development {
-        let (upgraded, authorization_result) =
+        let (upgraded_auth, authorization_result) =
             production_authorization_upgrade(&current, &candidate);
+        let (upgraded_host, host_result) =
+            production_host_configuration_upgrade(&current, &candidate);
+        let has_upgrade = upgraded_auth.is_some() || upgraded_host.is_some();
+        let mut upgraded = upgraded_auth.unwrap_or_else(|| current.clone());
+        if let Some(grants) = upgraded_host {
+            upgraded
+                .policy
+                .principals
+                .insert("amaterasu.host-configuration".into(), grants);
+        }
+        let upgraded = has_upgrade.then_some(upgraded);
         if let Some(upgraded) = upgraded {
             transition_installer_policy(
                 root,
@@ -316,6 +328,7 @@ fn install_existing_installer_root(
             )?;
         }
         eprintln!("installer authorization policy: {authorization_result}");
+        eprintln!("installer host configuration grant: {host_result}");
         return Ok(());
     }
 
@@ -329,6 +342,65 @@ fn install_existing_installer_root(
         &bootstrap_bytes,
         &selection_bytes,
         inject_failure_after_switch,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostConfigurationGrantResult {
+    Upgraded,
+    AlreadyAvailable,
+    PreservedWithoutDiagnosticsGrant,
+}
+
+impl std::fmt::Display for HostConfigurationGrantResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Upgraded => write!(
+                formatter,
+                "generated grant upgraded; diagnostics apply available"
+            ),
+            Self::AlreadyAvailable => write!(
+                formatter,
+                "local grant preserved; diagnostics apply available"
+            ),
+            Self::PreservedWithoutDiagnosticsGrant => write!(
+                formatter,
+                "local grant preserved; diagnostics apply remains unavailable"
+            ),
+        }
+    }
+}
+
+fn production_host_configuration_upgrade(
+    current: &BootstrapConfig,
+    candidate: &BootstrapConfig,
+) -> (Option<Grants>, HostConfigurationGrantResult) {
+    let name = "amaterasu.host-configuration";
+    // Exact generated grants before host logging could call diagnostics.
+    let previous = Grants {
+        provide: BTreeSet::from(["amaterasu.host-configuration/1".into()]),
+        call: BTreeSet::from(["amaterasu.state/1".into()]),
+        ..Default::default()
+    };
+    let mut expected = previous.clone();
+    expected.call.insert("amaterasu.diagnostics/1".into());
+    let installed = current.policy.principals.get(name);
+    let offered = candidate.policy.principals.get(name);
+    let matches = |actual: Option<&Grants>, expected: &Grants| {
+        actual.and_then(|grants| serde_json::to_value(grants).ok())
+            == serde_json::to_value(expected).ok()
+    };
+    if matches(installed, &previous) && matches(offered, &expected) {
+        return (Some(expected), HostConfigurationGrantResult::Upgraded);
+    }
+    let has_grant = installed.is_some_and(|grants| grants.call.contains("amaterasu.diagnostics/1"));
+    (
+        None,
+        if has_grant {
+            HostConfigurationGrantResult::AlreadyAvailable
+        } else {
+            HostConfigurationGrantResult::PreservedWithoutDiagnosticsGrant
+        },
     )
 }
 
@@ -989,8 +1061,41 @@ mod provision_tests {
             .as_array_mut()
             .unwrap()
             .retain(|scope| scope != "lutris.read");
+        bootstrap
+            .policy
+            .principals
+            .get_mut("amaterasu.host-configuration")
+            .unwrap()
+            .call
+            .remove("amaterasu.diagnostics/1");
         write_json_atomically(&runtime.join("bootstrap.json"), &bootstrap).unwrap();
         runtime
+    }
+
+    fn offer_host_configuration_diagnostics_grant(seed: &Path) {
+        let template_path = seed.join("bootstrap-template.json");
+        let mut template: BootstrapConfig = read_json(&template_path).unwrap();
+        template
+            .policy
+            .principals
+            .get_mut("amaterasu.host-configuration")
+            .unwrap()
+            .call
+            .insert("amaterasu.diagnostics/1".into());
+        write_json_atomically(&template_path, &template).unwrap();
+    }
+
+    fn offer_historical_host_configuration_grant(seed: &Path) {
+        let template_path = seed.join("bootstrap-template.json");
+        let mut template: BootstrapConfig = read_json(&template_path).unwrap();
+        template
+            .policy
+            .principals
+            .get_mut("amaterasu.host-configuration")
+            .unwrap()
+            .call
+            .remove("amaterasu.diagnostics/1");
+        write_json_atomically(&template_path, &template).unwrap();
     }
 
     #[test]
@@ -1018,6 +1123,7 @@ mod provision_tests {
         )
         .unwrap();
         let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        offer_host_configuration_diagnostics_grant(&update);
         install_installer_root(
             &update.join("bootstrap-template.json"),
             &update.join("package"),
@@ -1032,6 +1138,13 @@ mod provision_tests {
                 ["amaterasu.authentication"]
                 .clone(),
         );
+        expected
+            .policy
+            .principals
+            .get_mut("amaterasu.host-configuration")
+            .unwrap()
+            .call
+            .insert("amaterasu.diagnostics/1".into());
         assert_eq!(
             serde_json::to_value(&after).unwrap(),
             serde_json::to_value(&expected).unwrap()
@@ -1088,6 +1201,7 @@ mod provision_tests {
             .get_mut("amaterasu.authentication")
             .unwrap()["session_token_ttl_seconds"] = serde_json::json!(3600);
         write_json_atomically(&runtime.join("bootstrap.json"), &before).unwrap();
+        offer_host_configuration_diagnostics_grant(&seed);
         let candidate =
             materialize_installer_bootstrap(&seed.join("bootstrap-template.json"), &runtime)
                 .unwrap();
@@ -1102,6 +1216,10 @@ mod provision_tests {
                 .to_string()
                 .contains("lutris.read remains unavailable")
         );
+        let (host_upgrade, host_result) =
+            production_host_configuration_upgrade(&before, &candidate);
+        assert_eq!(host_result, HostConfigurationGrantResult::Upgraded);
+        assert!(host_upgrade.is_some());
         let bootstrap_bytes = fs::read(runtime.join("bootstrap.json")).unwrap();
         install_installer_root(
             &seed.join("bootstrap-template.json"),
@@ -1109,11 +1227,72 @@ mod provision_tests {
             &runtime,
         )
         .unwrap();
+        let after: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        assert_eq!(
+            after.policy.settings["amaterasu.authentication"],
+            before.policy.settings["amaterasu.authentication"]
+        );
+        assert!(
+            after.policy.principals["amaterasu.host-configuration"]
+                .call
+                .contains("amaterasu.diagnostics/1")
+        );
+        assert!(runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        unprovision_if_created(&runtime).unwrap();
         assert_eq!(
             fs::read(runtime.join("bootstrap.json")).unwrap(),
             bootstrap_bytes
         );
-        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn customized_host_configuration_grant_is_not_widened() {
+        let root = fixture("production-custom-host-grant");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[26; 32]));
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut before: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        before
+            .policy
+            .principals
+            .get_mut("amaterasu.host-configuration")
+            .unwrap()
+            .call
+            .insert("amaterasu.extra/1".into());
+        write_json_atomically(&runtime.join("bootstrap.json"), &before).unwrap();
+        offer_host_configuration_diagnostics_grant(&seed);
+        let candidate =
+            materialize_installer_bootstrap(&seed.join("bootstrap-template.json"), &runtime)
+                .unwrap();
+        let (upgrade, result) = production_host_configuration_upgrade(&before, &candidate);
+        assert!(upgrade.is_none());
+        assert_eq!(
+            result,
+            HostConfigurationGrantResult::PreservedWithoutDiagnosticsGrant
+        );
+        assert!(
+            result
+                .to_string()
+                .contains("diagnostics apply remains unavailable")
+        );
+        install_installer_root(
+            &seed.join("bootstrap-template.json"),
+            &seed.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        let after: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.policy.principals["amaterasu.host-configuration"]).unwrap(),
+            serde_json::to_value(&before.policy.principals["amaterasu.host-configuration"])
+                .unwrap()
+        );
+        assert_eq!(
+            after.policy.settings["amaterasu.authentication"]["authorization_policy_generation"],
+            3
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1144,6 +1323,7 @@ mod provision_tests {
         )
         .unwrap();
         let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        offer_historical_host_configuration_grant(&update);
         install_installer_root(
             &update.join("bootstrap-template.json"),
             &update.join("package"),
@@ -1195,6 +1375,7 @@ mod provision_tests {
         )
         .unwrap();
         let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        offer_host_configuration_diagnostics_grant(&update);
         {
             let _lock = RootLock::acquire(&runtime).unwrap();
             assert!(
