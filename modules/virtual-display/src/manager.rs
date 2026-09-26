@@ -292,6 +292,9 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
         monitor.next_feed = now + FEED_INTERVAL;
     }
     match driver.inspect(monitor.lease, monitor.display_id, monitor.binding) {
+        Ok(observation) if observation.pending_departure => {
+            monitor.begin_cleanup(Some("lease_departing"));
+        }
         Ok(observation) if observation.exists && observation.ready.is_some() => {
             monitor.ready = observation.ready;
             monitor.state = "ready";

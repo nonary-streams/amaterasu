@@ -530,6 +530,50 @@ fn prolonged_published_identity_loss_cleans_only_the_owned_lease() {
 }
 
 #[test]
+fn departing_lease_revokes_readiness_and_stops_feeding_until_departure() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create());
+    let owned = calls.borrow().creates[0];
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
+
+    calls.borrow_mut().pending = true;
+    tick(&mut manager);
+    let departing = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(departing["monitors"][0]["state"], "removing");
+    assert_eq!(departing["monitors"][0]["error"], "lease_departing");
+    assert!(departing["monitors"][0]["ready"].is_null());
+
+    manager.monitors.values_mut().next().unwrap().next_feed = Instant::now();
+    tick(&mut manager);
+    assert_eq!(calls.borrow().removes, vec![owned]);
+    assert!(calls.borrow().feeds.is_empty());
+    assert_eq!(manager.monitors.len(), 1);
+
+    calls.borrow_mut().exists = false;
+    tick(&mut manager);
+    assert_eq!(manager.monitors.len(), 1);
+    calls.borrow_mut().pending = false;
+    tick(&mut manager);
+    assert!(manager.monitors.is_empty());
+}
+
+#[test]
+fn departing_lease_during_creation_does_not_wait_for_readiness_timeout() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("alice", create());
+    calls.borrow_mut().pending = true;
+    tick(&mut manager);
+
+    let departing = manager.handle("alice", Operation::Status { identity: None });
+    assert_eq!(departing["monitors"][0]["state"], "removing");
+    assert_eq!(departing["monitors"][0]["error"], "lease_departing");
+    assert!(departing["monitors"][0]["ready"].is_null());
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
 fn lost_completion_cleans_new_monitor_but_preserves_idempotent_retry() {
     let (mut manager, calls) = setup(true);
     let (_, admission) = manager.admit("alice", create());
