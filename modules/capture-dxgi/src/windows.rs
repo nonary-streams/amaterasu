@@ -3,6 +3,7 @@ use crate::cursor::{CursorState, Shape, ShapeKind};
 use crate::model::{
     CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows, verify_output_mode,
 };
+use crate::staging::{StagingKey, StagingLifecycle};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
     GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
@@ -187,6 +188,7 @@ fn native_error(error: windows::core::Error) -> CaptureError {
 
 struct PendingTexture {
     texture: ID3D11Texture2D,
+    key: StagingKey,
     width: u32,
     height: u32,
     timestamp_us: u64,
@@ -200,7 +202,7 @@ struct Session {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    pending: Option<PendingTexture>,
+    staging: StagingLifecycle<ID3D11Texture2D, PendingTexture>,
     started: Instant,
     sequence: u64,
     cursor: CursorState,
@@ -244,7 +246,7 @@ impl Session {
             device,
             context,
             duplication,
-            pending: None,
+            staging: StagingLifecycle::default(),
             started: Instant::now(),
             sequence: 0,
             cursor: CursorState::default(),
@@ -262,21 +264,36 @@ impl Session {
         } {
             Ok(()) => (),
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
-            Err(error) => return Err(native_error(error)),
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(native_error(error));
+            }
         }
         // The guard releases ownership on every error and unwind path.
-        let frame = AcquiredFrame(&self.duplication);
+        let frame = AcquiredFrame {
+            duplication: self.duplication.clone(),
+            released: false,
+        };
         let result = self.capture_frame(resource, &info);
         let release = frame.release();
-        release?;
-        let (pending, cursor) = result?;
+        if let Err(error) = release {
+            self.staging.invalidate();
+            return Err(error);
+        }
+        let (pending, cursor) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(error);
+            }
+        };
         self.cursor = cursor;
-        self.pending = Some(pending);
+        self.staging.submit(pending);
         Ok(true)
     }
 
     fn capture_frame(
-        &self,
+        &mut self,
         resource: Option<IDXGIResource>,
         info: &DXGI_OUTDUPL_FRAME_INFO,
     ) -> CaptureResult<(PendingTexture, CursorState)> {
@@ -342,7 +359,7 @@ impl Session {
         Shape::new(kind, info.Width, info.Height, info.Pitch, bytes)
     }
 
-    fn copy_resource(&self, resource: Option<IDXGIResource>) -> CaptureResult<PendingTexture> {
+    fn copy_resource(&mut self, resource: Option<IDXGIResource>) -> CaptureResult<PendingTexture> {
         let source: ID3D11Texture2D = resource
             .ok_or_else(|| CaptureError::new("backend_error", "DXGI returned no frame resource"))?
             .cast()
@@ -350,12 +367,16 @@ impl Session {
         let mut description = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: source is a valid texture; description is a writable local.
         unsafe { source.GetDesc(&mut description) };
-        frame_layout(description.Width, description.Height)?;
+        if let Err(error) = frame_layout(description.Width, description.Height) {
+            self.staging.invalidate();
+            return Err(error);
+        }
         if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
             || description.SampleDesc.Count != 1
             || description.ArraySize != 1
             || description.MipLevels != 1
         {
+            self.staging.invalidate();
             return Err(CaptureError::new(
                 "unsupported_format",
                 "duplication texture must be single-plane BGRA8",
@@ -365,24 +386,34 @@ impl Session {
         description.BindFlags = 0;
         description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         description.MiscFlags = 0;
-        let mut texture = None;
+        let key = StagingKey {
+            width: description.Width,
+            height: description.Height,
+            format: description.Format.0 as u32,
+        };
+        let mut created = None;
         // SAFETY: description is initialized and destination output slot lives
         // through creation. CopyResource retains GPU dependencies internally;
         // source is not used again after duplication ReleaseFrame.
-        unsafe {
-            self.device
-                .CreateTexture2D(&description, None, Some(&mut texture))
-        }
-        .map_err(native_error)?;
-        let texture = texture.ok_or_else(|| {
-            CaptureError::new("backend_error", "D3D11 returned no staging texture")
-        })?;
+        let texture = if let Some(texture) = self.staging.take_idle(key) {
+            texture
+        } else {
+            unsafe {
+                self.device
+                    .CreateTexture2D(&description, None, Some(&mut created))
+            }
+            .map_err(native_error)?;
+            created.ok_or_else(|| {
+                CaptureError::new("backend_error", "D3D11 returned no staging texture")
+            })?
+        };
         unsafe {
             self.context.CopyResource(&texture, &source);
             self.context.Flush();
         }
         Ok(PendingTexture {
             texture,
+            key,
             width: description.Width,
             height: description.Height,
             timestamp_us: self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
@@ -391,7 +422,7 @@ impl Session {
     }
 
     fn read_pending(&mut self) -> CaptureResult<Option<Frame>> {
-        let pending = self.pending.as_ref().expect("pending texture");
+        let pending = self.staging.pending().expect("pending texture");
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: pending texture is CPU-readable staging memory. Map writes a
         // borrowed pointer valid until Unmap; the guard encloses every read.
@@ -406,7 +437,10 @@ impl Session {
         } {
             Ok(()) => (),
             Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => return Ok(None),
-            Err(error) => return Err(native_error(error)),
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(native_error(error));
+            }
         }
         let mapping = MappedTexture {
             context: &self.context,
@@ -416,7 +450,7 @@ impl Session {
         // SAFETY: D3D11 guarantees initialized pixel bytes at each mapped
         // texture row. The map guard outlives all copying, and row padding
         // is never included in borrowed slices or the returned frame.
-        let mut bytes = unsafe {
+        let bytes = unsafe {
             orient_bgra_rows(
                 pending.width,
                 pending.height,
@@ -426,10 +460,21 @@ impl Session {
                 self.adapter.height,
                 self.adapter.rotation,
             )
-        }?;
-        if let Some((shape, x, y)) = &pending.cursor {
-            shape.compose(&mut bytes, self.adapter.width, self.adapter.height, *x, *y)?;
-        }
+        };
+        let bytes = bytes.and_then(|mut bytes| {
+            if let Some((shape, x, y)) = &pending.cursor {
+                shape.compose(&mut bytes, self.adapter.width, self.adapter.height, *x, *y)?;
+            }
+            Ok(bytes)
+        });
+        drop(mapping);
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(error);
+            }
+        };
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
             width: self.adapter.width,
@@ -439,15 +484,15 @@ impl Session {
             timestamp_us: pending.timestamp_us,
             sequence: self.sequence,
         };
-        drop(mapping);
-        self.pending = None;
+        let completed = self.staging.take_pending().expect("mapped pending texture");
+        self.staging.store_idle(completed.key, completed.texture);
         Ok(Some(result))
     }
 }
 
 impl CaptureSession for Session {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
-        if self.pending.is_none() && !self.acquire(wait_ms)? {
+        if self.staging.pending().is_none() && !self.acquire(wait_ms)? {
             return Ok(None);
         }
         self.read_pending()
@@ -545,21 +590,27 @@ fn capture_geometry_error(error: GeometryError) -> CaptureError {
     }
 }
 
-struct AcquiredFrame<'a>(&'a IDXGIOutputDuplication);
-impl AcquiredFrame<'_> {
-    fn release(self) -> CaptureResult<()> {
+struct AcquiredFrame {
+    duplication: IDXGIOutputDuplication,
+    released: bool,
+}
+impl AcquiredFrame {
+    fn release(mut self) -> CaptureResult<()> {
         // SAFETY: this guard exists only after a successful acquire and is
-        // consumed exactly once. Forget prevents a duplicate ReleaseFrame.
-        let result = unsafe { self.0.ReleaseFrame() }.map_err(native_error);
-        std::mem::forget(self);
+        // consumed exactly once. Mark it released even when DXGI reports an
+        // error so Drop cannot issue a second ReleaseFrame.
+        let result = unsafe { self.duplication.ReleaseFrame() }.map_err(native_error);
+        self.released = true;
         result
     }
 }
 
-impl Drop for AcquiredFrame<'_> {
+impl Drop for AcquiredFrame {
     fn drop(&mut self) {
         // SAFETY: the unconsumed guard owns this acquired duplication frame.
-        let _ = unsafe { self.0.ReleaseFrame() };
+        if !self.released {
+            let _ = unsafe { self.duplication.ReleaseFrame() };
+        }
     }
 }
 

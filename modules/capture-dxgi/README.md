@@ -112,7 +112,8 @@ The Windows backend uses official `windows` 0.62 COM wrappers:
 adapter, `IDXGIOutput1::DuplicateOutput`, and `AcquireNextFrame(0)`. A successful
 acquisition is always paired with `ReleaseFrame`, including error/unwind paths.
 The source is copied into a CPU-readable D3D11 staging texture. `Map` uses
-`DO_NOT_WAIT`; pending staging textures remain owned until a later read.
+`DO_NOT_WAIT`; pending staging textures remain owned until a later read. One
+completed staging texture is retained and reused for compatible frames.
 `Unmap` is guarded on every path. Windows API/driver creation and submission calls
 can still stall internally; nonblocking polling is not a hard real-time guarantee.
 
@@ -130,8 +131,9 @@ Current limitations are explicit:
   validation, including rotated monitors and driver-specific shape formats.
 - HDR preservation/tone mapping, dirty/move rectangles, protected-content
   diagnostics, zero-copy GPU frames, and GPU resource sharing are not implemented.
-- CPU frames require a new staging texture and allocation per capture. This is a
-  correctness path, not yet a benchmarked low-latency GPU pipeline.
+- CPU frames reuse one compatible staging texture after readback. Mode changes,
+  readback errors, and stream teardown discard it. This remains an unbenchmarked
+  CPU readback path.
 - Linux/macOS report `unsupported_platform`; there is no fallback capture backend.
 
 Tests use fake sessions and owned byte arrays only. They cover rotation through
