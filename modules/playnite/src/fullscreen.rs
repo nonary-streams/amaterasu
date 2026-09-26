@@ -1992,6 +1992,88 @@ mod tests {
     }
 
     #[test]
+    fn reconnected_running_game_returns_only_after_verified_exit() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let other_id = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+        let processes = [fullscreen_process(80), extension.clone()];
+
+        sessions.by_ticket[&ticket]
+            .watch_event_sender
+            .send(FullscreenWatchEvent::Disconnected {
+                extension_process: extension.clone(),
+            })
+            .unwrap();
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStarted, Some(game_id)),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            &processes,
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("replay cannot relaunch over a running game"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStarted, Some(game_id)),
+            extension.clone(),
+        );
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStopped, Some(other_id)),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(3),
+            &processes,
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("duplicate and unrelated events cannot authorize return"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+
+        queue_status(
+            &sessions,
+            &ticket,
+            status(FullscreenStatusKind::GameStopped, Some(game_id)),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(4),
+            &processes,
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("stop status cannot override live process evidence"),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(5),
+            &processes,
+            Some(&[]),
+            |_| true,
+            |_| panic!("exit grace must elapse"),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(8),
+            &processes,
+            Some(&[]),
+            |_| true,
+            |_| panic!("verified ticket UI should be reused"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "running");
+    }
+
+    #[test]
     fn queued_shutdown_handoff_precedes_disconnect_and_later_old_events_are_discarded() {
         let now = Instant::now();
         let mut sessions = FullscreenSessions::default();

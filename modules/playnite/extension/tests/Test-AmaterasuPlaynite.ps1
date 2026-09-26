@@ -28,6 +28,7 @@ class MockDispatcher {
     [bool] $Access
     MockDispatcher([bool] $access) { $this.Access = $access }
     [bool] CheckAccess() { return $this.Access }
+    [object] Invoke([Func[object]] $action) { return $action.Invoke() }
 }
 
 function New-MockApi([bool]$OnUiThread) {
@@ -46,6 +47,7 @@ function New-MockApi([bool]$OnUiThread) {
                 PluginId = 'plugin.one'
                 LastActivity = [datetime]'2026-01-02T03:04:05Z'
                 IsInstalled = $true
+                IsRunning = $false
             })
         }
     }
@@ -93,6 +95,29 @@ try {
     $old = New-MockConnection ('a' * 32) $cache
     $new = New-MockConnection ('b' * 32) $cache
     try {
+        $api.Database.Games[0].IsRunning = $true
+        foreach ($connection in @($old, $new)) {
+            $connection.Role = 'launcher'
+            $connection.Mode = 'fullscreen'
+            $connection.Api = $api
+            $connection.Dispatcher = $api.MainView.UIDispatcher
+            $connection.Stream = [System.IO.MemoryStream]::new()
+        }
+        & $extension { param($connection) Replay-RunningGame $connection } $old
+        & $extension { param($connection) Replay-RunningGame $connection } $new
+        Assert-Equal (($old.Queue.Take())[0] | ConvertFrom-Json).status.id '60000000-0000-0000-0000-000000000001' 'active game missing on first connection'
+        Assert-Equal (($new.Queue.Take())[0] | ConvertFrom-Json).status.name 'gameStarted' 'active game missing on reconnect'
+        $api.Database.Games[0].IsRunning = $false
+        & $extension { param($connection) Replay-RunningGame $connection } $new
+        Assert-Equal $new.Queue.Count 0 'stopped game was replayed after reconnect'
+        $api.Database.Games[0].IsRunning = $true
+        $api.Database.Games += [pscustomobject]@{ Id='60000000-0000-0000-0000-000000000002'; IsRunning=$true; InstallDirectory='C:\Games\Other'; GameActions=@() }
+        & $extension { param($connection) Replay-RunningGame $connection } $new
+        $ambiguous = [string[]]($new.Queue.Take())
+        Assert-Equal $ambiguous.Count 2 'ambiguous running games were not both reported'
+        Assert-True (($ambiguous[0] | ConvertFrom-Json).status.id -cne ($ambiguous[1] | ConvertFrom-Json).status.id) 'ambiguous games collapsed into one status'
+        $api.Database.Games = @($api.Database.Games[0])
+        $api.Database.Games[0].IsRunning = $false
         $requestId = 'c' * 32
         $oldFrame = @(& $extension { param($connection, $id) New-SnapshotFrame $connection $id } $old $requestId)
         Assert-Equal $oldFrame.Count 5 'snapshot bracket length'
@@ -149,6 +174,8 @@ try {
         Assert-True (-not (& $extension { param($connection) Add-Frame $connection @('overflow') } $new)) 'full queue accepted a partial frame'
         Assert-Equal $new.Queue.Count 8 'queue bound changed'
     } finally {
+        $old.Stream.Dispose()
+        $new.Stream.Dispose()
         $old.Queue.Dispose()
         $new.Queue.Dispose()
     }

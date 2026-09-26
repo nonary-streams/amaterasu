@@ -211,16 +211,29 @@ function Send-Status([string]$Name, $Game) {
 }
 
 function Replay-RunningGame($Connection) {
-    if ($Connection.Role -ne 'launcher' -or -not $Connection.GameId) { return }
+    if ($Connection.Role -ne 'launcher') { return }
+    if ($Connection.Mode -ne 'fullscreen' -and -not $Connection.GameId) { return }
     try {
-        $id = [Guid]::Parse($Connection.GameId)
         $api = $Connection.Api
-        $status = $Connection.Dispatcher.Invoke([Func[object]]{
-            $game = $api.Database.Games.Get($id)
-            if (-not $game -or -not $game.IsRunning) { return $null }
-            return @{ type='status'; status=@{ name='gameStarted'; id=[string]$game.Id; installDir=[string]$game.InstallDirectory; exe=(Get-GameExecutable $game) } }
+        $id = if ($Connection.Mode -eq 'fullscreen') { [Guid]::Empty } else { [Guid]::Parse($Connection.GameId) }
+        $queued = $Connection.Dispatcher.Invoke([Func[object]]{
+            $running = if ($Connection.Mode -eq 'fullscreen') {
+                # Two distinct games are enough for the watcher to reject an
+                # ambiguous return. Queue both in one frame on the UI thread,
+                # ordered with OnGameStarted and OnGameStopped callbacks.
+                @($api.Database.Games | Where-Object { $_.IsRunning } | Select-Object -First 2)
+            } else {
+                $game = $api.Database.Games.Get($id)
+                if ($game -and $game.IsRunning) { @($game) } else { @() }
+            }
+            $lines = [System.Collections.Generic.List[string]]::new()
+            foreach ($game in $running) {
+                $lines.Add((Convert-FrameLine @{ type='status'; status=@{ name='gameStarted'; id=[string]$game.Id; installDir=[string]$game.InstallDirectory; exe=(Get-GameExecutable $game) } }))
+            }
+            if ($lines.Count -eq 0) { return $true }
+            return (Add-Frame $Connection $lines.ToArray())
         })
-        if ($status -and -not (Add-Frame $Connection @((Convert-FrameLine $status)))) { throw 'running-game replay queue full' }
+        if (-not $queued) { throw 'running-game replay queue full' }
     } catch { $Connection.Stream.Dispose() }
 }
 
