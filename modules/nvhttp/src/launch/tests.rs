@@ -973,6 +973,37 @@ fn surround_without_virtual_sink_or_supported_bitrate_stops_before_launch() {
         }
         assert!(!broker.actions().iter().any(|(service, action)|
             *service == "amaterasu.rtsp/1" && *action == "open"));
+        assert!(!broker.actions().iter().any(|(service, action)|
+            *service == "amaterasu.launch/1" && *action == "launch_export"));
+    }
+}
+
+#[test]
+fn surround_uses_frozen_application_sink_and_stream_audio_before_launch() {
+    for application_stream_audio in [Some(false), Some(true)] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.profile.audio_bitrate = 256_000;
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut broker = Broker {
+            application_virtual_sink: Some("virtual.application".into()),
+            application_stream_audio,
+            ..Broker::default()
+        };
+        let mut stream = request(7);
+        stream.audio_channels = 6;
+        assert!(controller.launch(10, stream, peer(7), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        if application_stream_audio == Some(false) {
+            assert_ne!(reply.status, 200);
+            assert!(!broker.actions().iter().any(|(service, action)|
+                *service == "amaterasu.launch/1" && *action == "launch_export"));
+        } else {
+            assert_eq!(reply.status, 200);
+            let open = opened_rtsp_payload(&broker);
+            assert_eq!(open["virtual_sink"], "virtual.application");
+            assert_eq!(open["channels"], 6);
+        }
     }
 }
 

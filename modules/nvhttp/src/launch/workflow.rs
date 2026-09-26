@@ -366,6 +366,18 @@ impl Controller {
                     ));
                     record.display_policy_snapshot = Some(display_policy_snapshot(record));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
+                    let frozen_overrides = record
+                        .application_preflight_overrides
+                        .as_ref()
+                        .expect("validated preflight overrides");
+                    if record.request.audio_channels != 2
+                        && (!effective_stream_audio(record, frozen_overrides)
+                            || resolved_virtual_sink(record, frozen_overrides).is_none())
+                    {
+                        fail_record(record, "surround_audio_requires_stream_sink", now);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
                     match record
                         .display_policy_snapshot
                         .as_ref()
@@ -502,11 +514,8 @@ impl Controller {
                                     .unwrap_or(record.global_video_max_batch_size_kb);
                                 record.application_stream_audio =
                                     application_overrides.stream_audio;
-                                record.effective_stream_audio = record
-                                    .peer
-                                    .client_stream_audio
-                                    .or(application_overrides.stream_audio)
-                                    .unwrap_or(record.global_stream_audio);
+                                record.effective_stream_audio =
+                                    effective_stream_audio(record, &application_overrides);
                                 let scoped_audio_sink = record
                                     .peer
                                     .client_audio_sink
@@ -515,15 +524,8 @@ impl Controller {
                                 // An explicit virtual selector wins over regular endpoint settings.
                                 // Empty means no managed selector; source host-audio fallback is
                                 // unavailable because Amaterasu has no host-audio toggle yet.
-                                let configured_virtual_sink = record
-                                    .peer
-                                    .client_virtual_sink
-                                    .as_deref()
-                                    .or(application_overrides.virtual_sink.as_deref())
-                                    .or(record.global_configured_virtual_sink.as_deref());
-                                record.resolved_virtual_sink = configured_virtual_sink
-                                    .filter(|value| !value.is_empty())
-                                    .map(str::to_owned);
+                                record.resolved_virtual_sink =
+                                    resolved_virtual_sink(record, &application_overrides);
                                 let resolved_configured_audio_sink =
                                     if record.resolved_virtual_sink.is_some() {
                                         None
@@ -1366,6 +1368,28 @@ pub(super) struct ApplicationConfigOverrides {
     key_rightalt_to_key_win: Option<bool>,
     key_repeat_delay: Option<u32>,
     key_repeat_frequency: Option<f64>,
+}
+
+fn effective_stream_audio(record: &Record, application: &ApplicationConfigOverrides) -> bool {
+    record
+        .peer
+        .client_stream_audio
+        .or(application.stream_audio)
+        .unwrap_or(record.global_stream_audio)
+}
+
+fn resolved_virtual_sink(
+    record: &Record,
+    application: &ApplicationConfigOverrides,
+) -> Option<String> {
+    record
+        .peer
+        .client_virtual_sink
+        .as_deref()
+        .or(application.virtual_sink.as_deref())
+        .or(record.global_configured_virtual_sink.as_deref())
+        .filter(|selector| !selector.is_empty())
+        .map(str::to_owned)
 }
 
 impl ApplicationConfigOverrides {
