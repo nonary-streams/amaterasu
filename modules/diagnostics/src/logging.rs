@@ -25,7 +25,7 @@ struct RawSettings {
     state_root: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LoggingSettings {
     pub(crate) minimum_level: u8,
     pub(crate) log_path: Option<PathBuf>,

@@ -862,6 +862,40 @@ mod tests {
     }
 
     #[test]
+    fn signed_apply_revision_blocks_an_older_in_flight_provider_read() {
+        let started = Instant::now();
+        let mut reader = HostLoggingConfigurationReader::default();
+        assert!(
+            reader
+                .tick(started, |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 11 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        reader.adopt_configuration(5);
+        assert!(
+            reader
+                .tick(started + Duration::from_secs(1), |command| match command {
+                    Command::TakeResult { request: 11 } => Ok(Response::Result {
+                        payload: ready_configuration(4)
+                    }),
+                    Command::ReleaseResult { request: 11 } => Ok(Response::Ok),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(6), 12, 4),
+            None
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, started + Duration::from_secs(37), 13, 6),
+            Some(ready_configuration(6))
+        );
+    }
+
+    #[test]
     fn a_denial_after_a_lost_acknowledgement_cannot_enable_legacy_bootstrap() {
         let started = Instant::now();
         let mut reader = HostLoggingConfigurationReader::default();

@@ -24,6 +24,7 @@ pub struct Journal {
     logger: SessionLogger,
     ready: bool,
     logging_configuration_revision: Option<u64>,
+    persisted_logging_settings: Option<LoggingSettings>,
 }
 
 impl Default for Journal {
@@ -33,6 +34,7 @@ impl Default for Journal {
             logger: SessionLogger::default(),
             ready: true,
             logging_configuration_revision: None,
+            persisted_logging_settings: None,
         }
     }
 }
@@ -73,12 +75,13 @@ impl Journal {
         {
             return Err("host configuration revision must advance".into());
         }
-        let (logger, warning) = SessionLogger::open(settings);
+        let (logger, warning) = SessionLogger::open(settings.clone());
         if let Some(warning) = warning {
             return Err(warning);
         }
         self.logger = logger;
         self.logging_configuration_revision = Some(revision);
+        self.persisted_logging_settings = Some(settings);
         self.ready = true;
         Ok(())
     }
@@ -93,6 +96,10 @@ impl Journal {
 
     pub(crate) fn logging_configuration_revision(&self) -> Option<u64> {
         self.logging_configuration_revision
+    }
+
+    pub(crate) fn persisted_settings_match(&self, settings: &LoggingSettings) -> bool {
+        self.persisted_logging_settings.as_ref() == Some(settings)
     }
 
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {

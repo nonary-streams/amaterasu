@@ -154,6 +154,17 @@ requests cannot install an older policy. Callers confirm application with a
 separate `status` read of the exact revision and sink health. A rollback is a new
 host configuration update with a newer revision.
 
+The host configuration provider also calls
+`{"action":"apply_host_logging","configuration":<GET response>}` after a
+durable update. Only the broker identity `amaterasu.host-configuration` may use
+this action. Diagnostics validates the full response shape, positive revision,
+effective log path against its trusted state root, and sink readiness before
+swapping the active policy. Success returns `{"ok":true,"applied_revision":N}`.
+An identical revision and policy is idempotent without reopening the sink;
+older or conflicting revisions and failed sink preparation leave the previous
+logger and revision in place. The asynchronous reader also refuses to replace
+this policy with an older GET result that was in flight before the apply.
+
 The diagnostics reader uses the caller-scoped operation ID
 `diagnostics.host-configuration.logging.read` for each serialized GET cycle.
 If the diagnostics module restarts while its broker request is still retained,

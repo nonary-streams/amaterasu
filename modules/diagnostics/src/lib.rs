@@ -15,12 +15,20 @@ use std::time::Instant;
 
 pub const SERVICE: &str = "amaterasu.diagnostics/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const HOST_CONFIGURATION_CALLER: &str = "amaterasu.host-configuration";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RefreshLoggingRequest {
     action: String,
     minimum_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyHostLoggingRequest {
+    action: String,
+    configuration: Value,
 }
 
 pub struct DiagnosticsModule {
@@ -106,6 +114,7 @@ impl ManagedModule for DiagnosticsModule {
                     &caller,
                     payload,
                     now,
+                    self.logging_state_root.as_deref(),
                 );
                 // A cancellation after dispatch does not undo an accepted record/counter.
                 match self.runtime.send(Command::Complete {
@@ -133,7 +142,11 @@ fn handle_request(
     caller: &str,
     payload: Value,
     now: Instant,
+    state_root: Option<&Path>,
 ) -> Value {
+    if payload.get("action").and_then(Value::as_str) == Some("apply_host_logging") {
+        return apply_host_logging(journal, host_logging, caller, payload, state_root);
+    }
     if payload.get("action").and_then(Value::as_str) != Some("refresh_logging") {
         return journal.handle(caller, payload);
     }
@@ -156,10 +169,50 @@ fn handle_request(
     })
 }
 
+fn apply_host_logging(
+    journal: &mut Journal,
+    host_logging: &mut HostLoggingConfigurationReader,
+    caller: &str,
+    payload: Value,
+    state_root: Option<&Path>,
+) -> Value {
+    if caller != HOST_CONFIGURATION_CALLER {
+        return json!({"ok":false,"code":"permission_denied"});
+    }
+    let Ok(request) = serde_json::from_value::<ApplyHostLoggingRequest>(payload) else {
+        return json!({"ok":false,"code":"invalid_request"});
+    };
+    if request.action != "apply_host_logging" {
+        return json!({"ok":false,"code":"invalid_request"});
+    }
+    let Ok((settings, revision)) = persisted_logging_settings(&request.configuration, state_root)
+    else {
+        return json!({"ok":false,"code":"invalid_configuration"});
+    };
+    if let Some(applied) = journal.logging_configuration_revision() {
+        if revision < applied {
+            return json!({"ok":false,"code":"stale_revision"});
+        }
+        if revision == applied {
+            return if journal.persisted_settings_match(&settings) {
+                json!({"ok":true,"applied_revision":revision})
+            } else {
+                json!({"ok":false,"code":"revision_conflict"})
+            };
+        }
+    }
+    if journal.apply_persisted_logging(settings, revision).is_err() {
+        return json!({"ok":false,"code":"logging_unavailable"});
+    }
+    host_logging.adopt_configuration(revision);
+    json!({"ok":true,"applied_revision":revision})
+}
+
 fn persisted_logging_settings(
     payload: &Value,
     state_root: Option<&Path>,
 ) -> Result<(logging::LoggingSettings, u64), String> {
+    validate_configuration_shape(payload)?;
     validate_effective_log_path(payload, state_root)?;
     let settings = logging::LoggingSettings::from_host_configuration(payload, state_root)?;
     let revision = payload
@@ -168,6 +221,47 @@ fn persisted_logging_settings(
         .filter(|revision| *revision > 0)
         .ok_or("host configuration revision must be positive")?;
     Ok((settings, revision))
+}
+
+fn validate_configuration_shape(payload: &Value) -> Result<(), String> {
+    let values = payload
+        .get("values")
+        .and_then(Value::as_object)
+        .ok_or("host configuration values are missing")?;
+    let effective = payload
+        .get("effective")
+        .and_then(Value::as_object)
+        .ok_or("host configuration effective values are missing")?;
+    for key in [
+        "file_state",
+        "vibeshine_file_state",
+        "credentials_file",
+        "pkey",
+        "cert",
+        "log_path",
+    ] {
+        if values.get(key).and_then(Value::as_str).is_none()
+            || effective.get(key).and_then(Value::as_str).is_none()
+        {
+            return Err(format!("host configuration omitted {key}"));
+        }
+    }
+    if !matches!(
+        values.get("min_log_level").and_then(Value::as_str),
+        Some(
+            "product_default"
+                | "verbose"
+                | "debug"
+                | "info"
+                | "warning"
+                | "error"
+                | "fatal"
+                | "none"
+        )
+    ) {
+        return Err("host configuration minimum log level is invalid".into());
+    }
+    Ok(())
 }
 
 fn validate_effective_log_path(payload: &Value, state_root: Option<&Path>) -> Result<(), String> {
@@ -230,6 +324,25 @@ mod hydration_tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn configuration(root: &Path, revision: u64, log_path: &str) -> Value {
+        let effective = |path: &str| root.join(path).to_string_lossy().into_owned();
+        json!({
+            "ok":true,"ready":true,"version":1,"revision":revision,
+            "values":{
+                "file_state":"state.json","vibeshine_file_state":"legacy.json",
+                "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+                "log_path":log_path,"min_log_level":"warning"
+            },
+            "effective":{
+                "file_state":effective("state.json"),
+                "vibeshine_file_state":effective("legacy.json"),
+                "credentials_file":effective("state.json"),
+                "pkey":effective("key.pem"),"cert":effective("cert.pem"),
+                "log_path":effective(log_path),"min_log_level":"warning"
+            }
+        })
+    }
+
     #[test]
     fn refresh_logging_requires_management_and_reports_pending_application() {
         let now = Instant::now();
@@ -238,7 +351,14 @@ mod hydration_tests {
         let refresh = json!({"action":"refresh_logging","minimum_revision":7});
 
         assert_eq!(
-            handle_request(&mut journal, &mut reader, "untrusted", refresh.clone(), now),
+            handle_request(
+                &mut journal,
+                &mut reader,
+                "untrusted",
+                refresh.clone(),
+                now,
+                None
+            ),
             json!({"ok":false,"code":"permission_denied"})
         );
         for invalid in [
@@ -246,12 +366,26 @@ mod hydration_tests {
             json!({"action":"refresh_logging","minimum_revision":7,"caller":"amaterasu.management"}),
         ] {
             assert_eq!(
-                handle_request(&mut journal, &mut reader, MANAGEMENT_CALLER, invalid, now),
+                handle_request(
+                    &mut journal,
+                    &mut reader,
+                    MANAGEMENT_CALLER,
+                    invalid,
+                    now,
+                    None
+                ),
                 json!({"ok":false,"code":"invalid_request"})
             );
         }
         assert_eq!(
-            handle_request(&mut journal, &mut reader, MANAGEMENT_CALLER, refresh, now),
+            handle_request(
+                &mut journal,
+                &mut reader,
+                MANAGEMENT_CALLER,
+                refresh,
+                now,
+                None
+            ),
             json!({"ok":true,"requested_revision":7,"logging_configuration_revision":null,"ready":false})
         );
         assert!(
@@ -268,6 +402,139 @@ mod hydration_tests {
     }
 
     #[test]
+    fn signed_host_apply_is_idempotent_and_preserves_policy_on_rejection() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-signed-apply-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut journal = Journal::unready();
+        let mut reader = HostLoggingConfigurationReader::default();
+        let now = Instant::now();
+        let apply = |revision, path| {
+            json!({
+                "action":"apply_host_logging",
+                "configuration":configuration(&root, revision, path)
+            })
+        };
+
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                MANAGEMENT_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"permission_denied"})
+        );
+        let mut incomplete = apply(2, "first.log");
+        incomplete["configuration"]["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("file_state");
+        for invalid in [apply(0, "first.log"), incomplete] {
+            assert_eq!(
+                handle_request(
+                    &mut journal,
+                    &mut reader,
+                    HOST_CONFIGURATION_CALLER,
+                    invalid,
+                    now,
+                    Some(&root)
+                ),
+                json!({"ok":false,"code":"invalid_configuration"})
+            );
+        }
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":true,"applied_revision":2})
+        );
+        let log_directory = root.join("logs");
+        let files_before_duplicate = std::fs::read_dir(&log_directory).unwrap().count();
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":true,"applied_revision":2})
+        );
+        assert_eq!(
+            std::fs::read_dir(&log_directory).unwrap().count(),
+            files_before_duplicate
+        );
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(1, "older.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"stale_revision"})
+        );
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "different.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"revision_conflict"})
+        );
+        let mut bad_path = apply(3, "third.log");
+        bad_path["configuration"]["effective"]["log_path"] =
+            json!(root.join("elsewhere.log").to_string_lossy());
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                bad_path,
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"invalid_configuration"})
+        );
+        std::fs::write(root.join("blocked"), "not a directory").unwrap();
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(3, "blocked/failure.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"logging_unavailable"})
+        );
+        let status = journal.handle("capture", json!({"action":"status"}));
+        assert_eq!(status["logging_configuration_revision"], 2);
+        assert_eq!(status["logging_sink"]["state"], "healthy");
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn valid_provider_configuration_enables_readiness_after_path_validation() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -278,18 +545,7 @@ mod hydration_tests {
             std::process::id()
         ));
         std::fs::create_dir(&state_root).unwrap();
-        let configured = "amaterasu.log";
-        let payload = json!({
-            "ok":true,
-            "ready":true,
-            "version":1,
-            "revision":4,
-            "values":{"log_path":configured},
-            "effective":{
-                "log_path":state_root.join(configured).to_string_lossy(),
-                "min_log_level":"warning",
-            },
-        });
+        let payload = configuration(&state_root, 4, "amaterasu.log");
 
         let (settings, revision) = persisted_logging_settings(&payload, Some(&state_root)).unwrap();
         assert_eq!(revision, 4);
@@ -326,17 +582,9 @@ mod hydration_tests {
     #[test]
     fn mismatched_effective_path_rejects_provider_configuration() {
         let state_root = std::env::temp_dir().join("amaterasu-diagnostics-trusted-root");
-        let payload = json!({
-            "ok":true,
-            "ready":true,
-            "version":1,
-            "revision":4,
-            "values":{"log_path":"amaterasu.log"},
-            "effective":{
-                "log_path":state_root.join("elsewhere.log").to_string_lossy(),
-                "min_log_level":"warning",
-            },
-        });
+        let mut payload = configuration(&state_root, 4, "amaterasu.log");
+        payload["effective"]["log_path"] =
+            json!(state_root.join("elsewhere.log").to_string_lossy());
 
         assert!(persisted_logging_settings(&payload, Some(&state_root)).is_err());
     }
