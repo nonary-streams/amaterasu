@@ -2,6 +2,281 @@ use super::*;
 
 const HISTORY_SERVICE: &str = "amaterasu.session-history/1";
 
+#[test]
+fn reserved_activity_binds_signed_prepare_and_history_session_id() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let reserve = json!({"action":"reserve_history_activity", "activity_id":"launch-activity",
+        "rtsp_operation_id":"launch-activity"});
+    assert_eq!(
+        host.response_from(1, "other", reserve.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        host.response_from(2, "amaterasu.nvhttp", reserve.clone())["reserved"],
+        true
+    );
+    assert_eq!(
+        host.response_from(3, "amaterasu.nvhttp", reserve)["reserved"],
+        true
+    );
+    assert_eq!(host.broker.history_activities.len(), 1);
+
+    let mut tagged = prepare();
+    tagged["history_activity_id"] = json!("launch-activity");
+    tagged["rtsp_operation_id"] = json!("launch-activity");
+    assert_eq!(
+        host.response_from(4, "owner", tagged.clone())["code"],
+        "permission_denied"
+    );
+    let mut wrong = tagged.clone();
+    wrong["rtsp_operation_id"] = json!("wrong-operation");
+    assert_eq!(
+        host.response_from(5, "amaterasu.rtsp", wrong)["code"],
+        "invalid_history_activity"
+    );
+    let prepared = host.response_from(6, "amaterasu.rtsp", tagged.clone());
+    assert_eq!(prepared["history_activity_id"], "launch-activity");
+    assert_eq!(prepared["rtsp_operation_id"], "launch-activity");
+    let session = prepared["session"].as_u64().unwrap();
+    assert_eq!(
+        host.response_from(7, "amaterasu.rtsp", tagged)["session"],
+        session
+    );
+    assert_eq!(
+        host.response_from(
+            8,
+            "amaterasu.nvhttp",
+            json!({"action":"release_history_activity",
+        "activity_id":"launch-activity","rtsp_operation_id":"launch-activity"})
+        )["code"],
+        "history_activity_in_use"
+    );
+    assert_eq!(
+        host.response_from(9, "amaterasu.rtsp", start(session))["state"],
+        "active"
+    );
+    host.idle();
+    assert_eq!(
+        host.broker.history_begins[0]["metadata"]["session_id"],
+        "launch-activity"
+    );
+    assert_eq!(
+        host.response_from(
+            10,
+            "amaterasu.rtsp",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+    host.idle();
+    assert_eq!(host.broker.history_ends[0]["session_id"], "launch-activity");
+    let release = json!({"action":"release_history_activity", "activity_id":"launch-activity",
+        "rtsp_operation_id":"launch-activity"});
+    assert_eq!(
+        host.response_from(11, "amaterasu.nvhttp", release.clone())["released"],
+        true
+    );
+    assert_eq!(
+        host.response_from(12, "amaterasu.nvhttp", release)["released"],
+        false
+    );
+    assert!(host.broker.history_activities.is_empty());
+}
+
+#[test]
+fn unavailable_reservation_is_nonfatal_and_cannot_prepare_tagged_stream() {
+    let mut host = Harness::new();
+    let reserve = json!({"action":"reserve_history_activity", "activity_id":"activity",
+        "rtsp_operation_id":"activity"});
+    assert_eq!(
+        host.response_from(1, "amaterasu.nvhttp", reserve)["reserved"],
+        false
+    );
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let mut tagged = prepare();
+    tagged["history_activity_id"] = json!("activity");
+    tagged["rtsp_operation_id"] = json!("activity");
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", tagged)["code"],
+        "history_activity_unavailable"
+    );
+    assert_eq!(
+        host.response_from(3, "owner", prepare())["state"],
+        "prepared"
+    );
+}
+
+#[test]
+fn active_activity_outlives_pending_ttl_and_release_waits_for_history_end() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let activity = "rtsp-long-running";
+    assert_eq!(
+        host.response_from(
+            1,
+            "amaterasu.nvhttp",
+            json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["reserved"],
+        true
+    );
+    let mut tagged = prepare();
+    tagged["history_activity_id"] = json!(activity);
+    tagged["rtsp_operation_id"] = json!(activity);
+    let prepared = host.response_from(2, "amaterasu.rtsp", tagged);
+    let session = prepared["session"].as_u64().unwrap();
+    assert_eq!(
+        host.response_from(3, "amaterasu.rtsp", start(session))["state"],
+        "active"
+    );
+    host.now += 300_100;
+    host.tick();
+    assert!(host.broker.history_activities.contains(activity));
+    assert_eq!(
+        host.response_from(
+            4,
+            "amaterasu.nvhttp",
+            json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["code"],
+        "history_activity_in_use"
+    );
+    host.broker.history_pending_polls = usize::MAX;
+    assert_eq!(
+        host.response_from(
+            5,
+            "amaterasu.rtsp",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+    assert_eq!(
+        host.response_from(
+            6,
+            "amaterasu.nvhttp",
+            json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["code"],
+        "history_activity_in_use"
+    );
+    host.broker.history_pending_polls = 0;
+    host.idle();
+    assert_eq!(
+        host.response_from(
+            7,
+            "amaterasu.nvhttp",
+            json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["released"],
+        true
+    );
+    assert!(
+        history_call_index(&host, "session_end") < history_call_index(&host, "stream_activity_end")
+    );
+}
+
+#[test]
+fn abandoned_uncertain_begin_is_ended_after_late_completion() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let activity = "rtsp-lost-begin";
+    host.broker.fault = Some((
+        format!("{HISTORY_SERVICE}:stream_activity_begin"),
+        Fault::AfterMutation,
+    ));
+    host.broker.enqueue(
+        1,
+        "amaterasu.nvhttp",
+        json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity}),
+    );
+    for _ in 0..5 {
+        host.tick();
+    }
+    assert!(host.broker.history_activities.contains(activity));
+    host.now += 10_001;
+    host.tick();
+    assert_eq!(host.broker.replies.remove(&1).unwrap()["reserved"], false);
+    host.broker.enqueue(
+        2,
+        "amaterasu.nvhttp",
+        json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity}),
+    );
+    for _ in 0..8 {
+        host.now += 1_001;
+        host.tick();
+        if host.broker.replies.contains_key(&2) {
+            break;
+        }
+    }
+    assert_eq!(host.broker.replies.remove(&2).unwrap()["released"], true);
+    assert!(host.broker.history_activities.is_empty());
+    assert!(
+        history_call_index(&host, "stream_activity_begin")
+            < history_call_index(&host, "stream_activity_end")
+    );
+}
+
+#[test]
+fn pending_end_timeout_is_not_reported_as_confirmed_release() {
+    let mut host = Harness::new();
+    host.broker.history_available = true;
+    let activity = "rtsp-slow-end";
+    assert_eq!(
+        host.response_from(
+            1,
+            "amaterasu.nvhttp",
+            json!({"action":"reserve_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["reserved"],
+        true
+    );
+    host.broker.history_pending_polls = usize::MAX;
+    host.broker.enqueue(
+        2,
+        "amaterasu.nvhttp",
+        json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity}),
+    );
+    host.tick();
+    host.tick();
+    host.now += 10_001;
+    host.tick();
+    let timeout = host
+        .broker
+        .replies
+        .remove(&2)
+        .expect("bounded release response");
+    assert_eq!(timeout["ok"], false);
+    assert_eq!(timeout["code"], "history_activity_end_unconfirmed");
+    assert!(host.broker.history_activities.contains(activity));
+    host.broker.history_pending_polls = 0;
+    host.idle();
+    assert!(host.broker.history_activities.is_empty());
+    assert_eq!(
+        host.response_from(
+            3,
+            "amaterasu.nvhttp",
+            json!({"action":"release_history_activity",
+        "activity_id":activity,"rtsp_operation_id":activity})
+        )["released"],
+        false
+    );
+}
+
 fn prepare_and_start(host: &mut Harness) -> u64 {
     let prepared = host.response(1, prepare());
     let session = prepared["session"].as_u64().expect("prepared session id");

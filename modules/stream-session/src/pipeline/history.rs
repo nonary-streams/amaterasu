@@ -53,6 +53,7 @@ enum Phase {
 
 pub(super) struct SessionHistory {
     record_id: u64,
+    session_id: String,
     phase: Phase,
     started_at_unix: Option<i64>,
     ended_at_unix: Option<i64>,
@@ -67,9 +68,10 @@ pub(super) struct SessionHistory {
 }
 
 impl SessionHistory {
-    pub(super) fn new(record_id: u64) -> Self {
+    pub(super) fn new(record_id: u64, activity_id: Option<String>) -> Self {
         Self {
             record_id,
+            session_id: activity_id.unwrap_or_else(|| history_session_id(record_id)),
             phase: Phase::NotStarted,
             started_at_unix: None,
             ended_at_unix: None,
@@ -193,6 +195,10 @@ impl SessionHistory {
         }
     }
 
+    pub(super) fn started(&self) -> bool {
+        self.started_at_unix.is_some()
+    }
+
     pub(super) fn queued_request(
         &self,
         owner: &str,
@@ -207,7 +213,7 @@ impl SessionHistory {
                     payload: json!({
                         "action":"session_begin",
                         "metadata":{
-                            "session_id":history_session_id(self.record_id),
+                            "session_id":self.session_id,
                             "protocol":"sunshine-modern",
                             "client_name":bounded_text(owner, 128),
                             "device_name":bounded_text(
@@ -435,7 +441,7 @@ impl SessionHistory {
                 payload: json!({
                     "action":"record_event",
                     "event":{
-                        "session_id":history_session_id(self.record_id),
+                        "session_id":self.session_id,
                         "recorded_at_unix":unix_time_seconds(),
                         "event_type":event_type,
                         "payload":payload
@@ -501,7 +507,7 @@ impl SessionHistory {
             payload: json!({
                 "action":"record_sample",
                 "sample":{
-                    "session_id":history_session_id(self.record_id),
+                    "session_id":self.session_id,
                     "recorded_at_unix":unix_time_seconds(),
                     "frames_sent":sqlite_counter(self.frames_sent),
                     "bytes_sent":sqlite_counter(self.bytes_sent),
@@ -563,7 +569,7 @@ impl SessionHistory {
             operation_id: history_operation_id(self.record_id, "end"),
             payload: json!({
                 "action":"session_end",
-                "session_id":history_session_id(self.record_id),
+                "session_id":self.session_id,
                 "ended_at_unix":ended_at_unix
             }),
         }
@@ -672,7 +678,7 @@ mod tests {
 
     #[test]
     fn unsent_samples_coalesce_into_the_latest_cumulative_snapshot() {
-        let mut history = SessionHistory::new(7);
+        let mut history = SessionHistory::new(7, None);
         history.phase = Phase::Begun;
         history.last_sample_scheduled = Some(SamplePoint {
             at_ms: 0,
@@ -698,7 +704,7 @@ mod tests {
 
     #[test]
     fn queued_history_updates_never_exceed_the_session_bound() {
-        let mut history = SessionHistory::new(9);
+        let mut history = SessionHistory::new(9, None);
         for index in 0..MAX_QUEUED_UPDATES + 4 {
             history.queue_event("test", json!({"index":index}));
         }
@@ -708,7 +714,7 @@ mod tests {
 
     #[test]
     fn zero_duration_final_sample_is_numeric_and_explicitly_limited() {
-        let mut history = SessionHistory::new(11);
+        let mut history = SessionHistory::new(11, None);
         history.activated(42);
         history.observe_media(1, 321, 0);
 

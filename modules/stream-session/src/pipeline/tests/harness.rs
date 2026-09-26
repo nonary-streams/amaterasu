@@ -84,6 +84,8 @@ pub struct Broker {
     pub history_ends: Vec<Value>,
     pub history_samples: Vec<Value>,
     pub history_events: Vec<Value>,
+    pub history_activities: BTreeSet<String>,
+    pub history_activity_ends: Vec<Value>,
     pub limiter_unavailable: bool,
     pub limiter_admission_unavailable: bool,
     pub limiter_restore_failures: usize,
@@ -314,6 +316,26 @@ impl Broker {
         let service = call.service.as_str();
         if service == "amaterasu.session-history/1" {
             return match action {
+                "stream_activity_begin" => {
+                    let id = call.payload["session_id"].as_str().unwrap().to_owned();
+                    if self.history_storage_degraded {
+                        json!({"ok":true,"reserved":false})
+                    } else {
+                        self.history_activities.insert(id);
+                        json!({"ok":true,"reserved":true})
+                    }
+                }
+                "stream_activity_end" => {
+                    self.history_activity_ends.push(call.payload.clone());
+                    if self.history_storage_degraded {
+                        json!({"ok":false,"code":"storage_unavailable"})
+                    } else {
+                        let ended = self
+                            .history_activities
+                            .remove(call.payload["session_id"].as_str().unwrap());
+                        json!({"ok":true,"ended":ended})
+                    }
+                }
                 "session_begin" => {
                     self.history_begins.push(call.payload.clone());
                     if self.history_storage_degraded {
@@ -918,7 +940,10 @@ impl Harness {
             .unwrap();
     }
     pub fn response(&mut self, request: u64, payload: Value) -> Value {
-        self.broker.enqueue(request, "owner", payload);
+        self.response_from(request, "owner", payload)
+    }
+    pub fn response_from(&mut self, request: u64, owner: &str, payload: Value) -> Value {
+        self.broker.enqueue(request, owner, payload);
         for _ in 0..600 {
             self.tick();
             if let Some(value) = self.broker.replies.remove(&request) {

@@ -132,7 +132,7 @@ impl Record {
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         Self {
             id,
-            history: super::history::SessionHistory::new(id),
+            history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
             owner,
             config,
             start: None,
@@ -258,6 +258,8 @@ impl Record {
         json!({
             "ok": true,
             "session": self.id,
+            "history_activity_id": self.config.history_activity_id,
+            "rtsp_operation_id": self.config.rtsp_operation_id,
             "state": self.state,
             "stream_audio": self.config.stream_audio,
             "audio": self.config.audio,

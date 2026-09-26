@@ -2,6 +2,7 @@ mod actions;
 mod cleanup;
 mod display;
 mod history;
+mod history_activity;
 mod input;
 mod lifecycle;
 mod limiter;
@@ -57,6 +58,7 @@ pub struct Pipeline {
     background_turn: bool,
     control_after: u64,
     history_after: u64,
+    history_activities: history_activity::HistoryActivities,
 }
 
 impl Pipeline {
@@ -71,6 +73,7 @@ impl Pipeline {
             background_turn: false,
             control_after: 0,
             history_after: 0,
+            history_activities: history_activity::HistoryActivities::default(),
         })
     }
 
@@ -141,6 +144,7 @@ impl Pipeline {
             settled &= limiter::shutdown(record, send);
             settled &= display::shutdown(record, send);
         }
+        settled &= self.history_activities.shutdown(send);
         if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
             settled &= pending.shutdown(send);
         }
@@ -165,6 +169,7 @@ impl Pipeline {
         factory: &mut Factory<'_>,
     ) -> ModuleResult<()> {
         self.pump(now);
+        self.history_activities.progress(now, &self.records, send);
         if let Some(job) = self.job.as_mut()
             && job.step == Step::WaitDrain
             && self.records[&job.session].audio_recovery_needed

@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{PrepareConfig, StartConfig};
+use crate::model::{PrepareConfig, StartConfig, valid_name};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartMode {
@@ -41,7 +41,44 @@ impl Pipeline {
             remaining,
         };
         match operation {
-            Operation::Prepare(config) => self.prepare(input, config, send),
+            Operation::ReserveHistoryActivity {
+                activity_id,
+                rtsp_operation_id,
+            } => {
+                if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
+                    rpc::complete(send, input.request, error("permission_denied"));
+                } else if !valid_name(&activity_id) || activity_id != rtsp_operation_id {
+                    rpc::complete(send, input.request, error("invalid_history_activity"));
+                } else {
+                    self.history_activities.reserve(
+                        input.request,
+                        activity_id,
+                        rtsp_operation_id,
+                        input.now,
+                        send,
+                    );
+                }
+            }
+            Operation::ReleaseHistoryActivity {
+                activity_id,
+                rtsp_operation_id,
+            } => {
+                if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
+                    rpc::complete(send, input.request, error("permission_denied"));
+                } else if !valid_name(&activity_id) || activity_id != rtsp_operation_id {
+                    rpc::complete(send, input.request, error("invalid_history_activity"));
+                } else {
+                    self.history_activities.release(
+                        input.request,
+                        &activity_id,
+                        &rtsp_operation_id,
+                        input.now,
+                        &self.records,
+                        send,
+                    );
+                }
+            }
+            Operation::Prepare(config) => self.prepare(input, *config, send),
             Operation::Start {
                 session,
                 configuration,
@@ -101,6 +138,21 @@ impl Pipeline {
             };
             rpc::complete(send, request, reply);
             return;
+        }
+        if let (Some(activity_id), Some(rtsp_operation_id)) =
+            (&config.history_activity_id, &config.rtsp_operation_id)
+        {
+            if owner != "amaterasu.rtsp" {
+                rpc::complete(send, request, error("permission_denied"));
+                return;
+            }
+            if !self
+                .history_activities
+                .matches(activity_id, rtsp_operation_id, now)
+            {
+                rpc::complete(send, request, error("history_activity_unavailable"));
+                return;
+            }
         }
         if self.records.len() >= 128
             || self

@@ -326,6 +326,11 @@ impl DisplayRequest {
 #[serde(deny_unknown_fields)]
 pub struct PrepareConfig {
     pub peer_ip: IpAddr,
+    /// Prelaunch History reservation, bound to the signed RTSP operation.
+    #[serde(default)]
+    pub history_activity_id: Option<String>,
+    #[serde(default)]
+    pub rtsp_operation_id: Option<String>,
     /// Complete, frozen display Apply request from the authenticated launch.
     #[serde(default)]
     pub display_request: Option<Box<DisplayRequest>>,
@@ -373,6 +378,11 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        match (&self.history_activity_id, &self.rtsp_operation_id) {
+            (None, None) => {}
+            (Some(activity), Some(operation)) if valid_name(activity) && activity == operation => {}
+            _ => return Err("invalid_history_activity"),
+        }
         if let Some(request) = &self.display_request {
             request.validate()?;
         }
@@ -854,7 +864,15 @@ impl VideoConfiguration {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
-    Prepare(PrepareConfig),
+    ReserveHistoryActivity {
+        activity_id: String,
+        rtsp_operation_id: String,
+    },
+    ReleaseHistoryActivity {
+        activity_id: String,
+        rtsp_operation_id: String,
+    },
+    Prepare(Box<PrepareConfig>),
     Start {
         session: u64,
         configuration: StartConfig,
