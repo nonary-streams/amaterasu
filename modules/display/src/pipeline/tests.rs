@@ -52,11 +52,30 @@ fn snapshot() -> Snapshot {
             source_flags: 0,
             target_flags: 0,
             path_flags: 1,
+            hdr_enabled: Some(false),
         }],
     }
 }
 fn configuration() -> Value {
     json!({"displays":[{"id":"monitor.one","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]})
+}
+fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
+    json!({
+        "action":"apply",
+        "configuration":configuration(),
+        "mode_policy":{
+            "display_id":"monitor.one",
+            "context":{
+                "resolution_is_automatic":true,
+                "refresh_rate_is_automatic":true,
+                "client_display_mode_override":false,
+                "optimize_game_settings":false
+            },
+            "remapping":{},
+            "hdr_option":option,
+            "effective_client_hdr_request":requested
+        }
+    })
 }
 #[derive(Default)]
 struct FakePlatform {
@@ -69,6 +88,9 @@ struct FakePlatform {
     available_modes: Vec<crate::model::AvailableMode>,
     mode_queries: usize,
     inactive: bool,
+    hdr_supported: bool,
+    hdr_state: bool,
+    prepared_hdr: Option<Option<bool>>,
 }
 impl Platform for FakePlatform {
     fn name(&self) -> &'static str {
@@ -95,8 +117,14 @@ impl Platform for FakePlatform {
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let display = &configuration.displays[0];
+        if display.hdr_enabled.is_some() && !self.hdr_supported {
+            return Err(DisplayError::new("unsupported_display", "HDR unavailable"));
+        }
+        self.prepared_hdr = Some(display.hdr_enabled);
         self.prepared_mode = Some((display.width, display.height, display.refresh));
-        Ok(snapshot())
+        let mut before = snapshot();
+        before.paths[0].hdr_enabled = self.hdr_supported.then_some(self.hdr_state);
+        Ok(before)
     }
     fn apply(
         &mut self,
@@ -104,13 +132,16 @@ impl Platform for FakePlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        assert!(before.equivalent(&snapshot()));
+        assert_eq!(before.paths[0].hdr_enabled.unwrap_or(false), self.hdr_state);
         if self.topology_changed {
             return Err(DisplayError::new("topology_changed", "external change"));
         }
         guard()?;
         let display = &configuration.displays[0];
         self.applied_mode = Some((display.width, display.height, display.refresh));
+        if let Some(enabled) = display.hdr_enabled {
+            self.hdr_state = enabled;
+        }
         self.effects.push("apply");
         if self.apply_failure {
             return Err(
@@ -124,11 +155,13 @@ impl Platform for FakePlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        assert!(before.equivalent(&snapshot()));
         guard()?;
         self.effects.push("restore");
         if self.restore_failure {
             return Err(DisplayError::new("platform_error", "restore failed").after_mutation());
+        }
+        if let Some(enabled) = before.paths[0].hdr_enabled {
+            self.hdr_state = enabled;
         }
         Ok(())
     }
@@ -232,6 +265,140 @@ fn durable_journal_precedes_effects_and_only_owner_can_restore() {
     );
     assert_eq!(restored["restored"], true);
     assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert!(state.journal.is_none());
+}
+#[test]
+fn hdr_auto_enables_after_journal_and_restore_recovers_sdr() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(true)));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(pipeline.platform.prepared_hdr, Some(Some(true)));
+    assert!(pipeline.platform.hdr_state);
+    assert_eq!(
+        state.journal.as_ref().unwrap()["snapshot"]["paths"][0]["hdr_enabled"],
+        false
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(!pipeline.platform.hdr_state);
+}
+
+#[test]
+fn hdr_auto_disables_and_restore_recovers_hdr() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            hdr_state: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(false)));
+    assert_eq!(applied["applied"], true);
+    assert!(!pipeline.platform.hdr_state);
+    assert_eq!(
+        state.journal.as_ref().unwrap()["snapshot"]["paths"][0]["hdr_enabled"],
+        true
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(pipeline.platform.hdr_state);
+}
+
+#[test]
+fn disabled_hdr_policy_leaves_hdr_untouched() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            hdr_state: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("disabled", Some(false)));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(pipeline.platform.prepared_hdr, Some(None));
+    assert!(pipeline.platform.hdr_state);
+}
+
+#[test]
+fn unsupported_hdr_and_missing_client_request_cannot_claim_success() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let unsupported = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(true)));
+    assert_eq!(unsupported["error"]["code"], "unsupported_display");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    let missing = state.run(&mut pipeline, "owner", hdr_apply("auto", None));
+    assert_eq!(missing["error"]["code"], "invalid_request");
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn failed_hdr_apply_rolls_back_baseline_before_clearing_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            apply_failure: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let result = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(true)));
+    assert_eq!(result["error"]["code"], "platform_error");
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert!(!pipeline.platform.hdr_state);
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn failed_hdr_restore_keeps_recovery_lease_until_verified() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            restore_failure: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(true)));
+    assert_eq!(applied["applied"], true);
+    let failed = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(failed["error"]["code"], "platform_error");
+    assert_eq!(failed["recovery_required"], true);
+    assert!(pipeline.platform.hdr_state);
+    assert!(state.journal.is_some());
+    pipeline.platform.restore_failure = false;
+    let recovered = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":applied["lease"]}),
+    );
+    assert_eq!(recovered["restored"], true);
+    assert!(!pipeline.platform.hdr_state);
     assert!(state.journal.is_none());
 }
 #[test]

@@ -112,7 +112,9 @@ pub fn names(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<DeviceNames> {
     })
 }
 
-pub fn advanced_color_enabled(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<bool> {
+/// Returns None when the target has no advanced-color control. The bitfield's
+/// support and enabled bits are distinct; support alone must not imply HDR.
+pub fn advanced_color_enabled(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<Option<bool>> {
     let mut packet = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
         header: device_header(
             DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
@@ -125,24 +127,73 @@ pub fn advanced_color_enabled(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<b
     // SAFETY: the initialized packet owns the output storage described by header.
     let result = unsafe { DisplayConfigGetDeviceInfo(&mut packet.header) };
     if result == ERROR_NOT_SUPPORTED as i32 {
-        return Ok(false);
+        return Ok(None);
     }
     check(result, "DisplayConfigGetDeviceInfo(advanced color)")?;
     // SAFETY: value is the documented raw bitfield view of this initialized union.
     let flags = unsafe { packet.Anonymous.value };
-    Ok(flags & (2 | 4) != 0)
+    if flags & 4 != 0 {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "wide-color-gamut state cannot be restored by the HDR recovery journal",
+        ));
+    }
+    Ok((flags & 1 != 0).then_some(flags & 2 != 0))
+}
+
+pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
+    let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+    let path = active
+        .paths
+        .iter()
+        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+        .ok_or_else(|| DisplayError::new("unsupported_display", "HDR target is not active"))?;
+    match advanced_color_enabled(path)? {
+        Some(current) if current == enabled => return Ok(()),
+        Some(_) => {}
+        None => {
+            return Err(DisplayError::new(
+                "unsupported_display",
+                "HDR control is unavailable for this target",
+            ));
+        }
+    }
+    let packet = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE {
+        header: device_header(
+            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+            std::mem::size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>(),
+            path.targetInfo.adapterId,
+            path.targetInfo.id,
+        ),
+        Anonymous: DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE_0 {
+            value: u32::from(enabled),
+        },
+    };
+    // SAFETY: the initialized repr(C) packet owns the input bytes described by
+    // its header; Windows consumes them synchronously and retains no pointer.
+    check(
+        unsafe { DisplayConfigSetDeviceInfo(&packet.header) },
+        "DisplayConfigSetDeviceInfo(advanced color)",
+    )?;
+    let current = query(QDC_ONLY_ACTIVE_PATHS)?;
+    let current = current
+        .paths
+        .iter()
+        .find(|path| names(path).is_ok_and(|device| device.id.eq_ignore_ascii_case(id)))
+        .ok_or_else(|| DisplayError::new("topology_changed", "HDR target disappeared"))?;
+    if advanced_color_enabled(current)? != Some(enabled) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "Windows HDR state differs from the requested state",
+        ));
+    }
+    Ok(())
 }
 
 pub fn snapshot() -> DisplayResult<Snapshot> {
     let buffers = query(QDC_ONLY_ACTIVE_PATHS)?;
     let mut paths = Vec::new();
     for path in &buffers.paths {
-        if advanced_color_enabled(path)? {
-            return Err(DisplayError::new(
-                "unsupported_display",
-                "advanced color/HDR is active; its complete state is outside this CCD recovery format",
-            ));
-        }
         if matches!(
             path.targetInfo.outputTechnology,
             DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
@@ -154,7 +205,9 @@ pub fn snapshot() -> DisplayResult<Snapshot> {
                 "indirect and wireless displays require a dedicated adapter",
             ));
         }
-        paths.push(decode_path(path, &buffers.modes, names(path)?)?);
+        let mut decoded = decode_path(path, &buffers.modes, names(path)?)?;
+        decoded.hdr_enabled = advanced_color_enabled(path)?;
+        paths.push(decoded);
     }
     let snapshot = Snapshot {
         format_version: 1,
@@ -185,7 +238,7 @@ pub fn monitors() -> DisplayResult<Vec<Value>> {
         let mode = current
             .map(|path| decode_path(path, &active.modes, names(path)?))
             .transpose()?;
-        monitors.insert(device.id.clone(), json!({"id":device.id,"name":device.friendly,"active":current.is_some(),"source":device.source,"advanced_color_enabled":advanced_color_enabled(path).ok(),"current":mode.map(|path| json!({"width":path.source.width,"height":path.source.height,"x":path.source.x,"y":path.source.y,"rotation":path.rotation,"refresh":path.refresh}))}));
+        monitors.insert(device.id.clone(), json!({"id":device.id,"name":device.friendly,"active":current.is_some(),"source":device.source,"advanced_color_enabled":advanced_color_enabled(path).ok().flatten(),"current":mode.map(|path| json!({"width":path.source.width,"height":path.source.height,"x":path.source.x,"y":path.source.y,"rotation":path.rotation,"refresh":path.refresh}))}));
     }
     Ok(monitors.into_values().collect())
 }

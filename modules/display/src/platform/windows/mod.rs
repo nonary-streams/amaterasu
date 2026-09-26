@@ -55,6 +55,18 @@ impl Platform for WindowsPlatform {
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let before = query::snapshot()?;
+        for display in &configuration.displays {
+            if display.hdr_enabled.is_some()
+                && !before.paths.iter().any(|path| {
+                    path.id.eq_ignore_ascii_case(&display.id) && path.hdr_enabled.is_some()
+                })
+            {
+                return Err(DisplayError::new(
+                    "unsupported_display",
+                    "HDR changes require an active target with queryable HDR state",
+                ));
+            }
+        }
         let requested = apply::requested(configuration)?;
         apply::set(&requested, false)?;
         Ok(before)
@@ -88,6 +100,12 @@ impl Platform for WindowsPlatform {
             )
             .after_mutation());
         }
+        for display in &configuration.displays {
+            if let Some(enabled) = display.hdr_enabled {
+                query::set_advanced_color(&display.id, enabled)
+                    .map_err(DisplayError::after_mutation)?;
+            }
+        }
         Ok(())
     }
     fn restore(
@@ -99,6 +117,12 @@ impl Platform for WindowsPlatform {
         apply::set(&requested, false)?;
         guard()?;
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
+        for path in &snapshot.paths {
+            if let Some(enabled) = path.hdr_enabled {
+                query::set_advanced_color(&path.id, enabled)
+                    .map_err(DisplayError::after_mutation)?;
+            }
+        }
         if !snapshot.equivalent(&query::snapshot().map_err(DisplayError::after_mutation)?) {
             return Err(DisplayError::new(
                 "verification_failed",

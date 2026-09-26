@@ -1,5 +1,5 @@
 use super::conversion::{address, native_rational, native_signal, native_source};
-use super::query::{ConfigurationBuffers, advanced_color_enabled, check, names, query};
+use super::query::{ConfigurationBuffers, check, names, query};
 use crate::model::{Configuration, DisplayError, DisplayResult, Rotation, Snapshot, SourceMode};
 use std::collections::BTreeMap;
 use windows_sys::Win32::Devices::Display::*;
@@ -33,12 +33,6 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
                     "display is missing or has no independent source route",
                 )
             })?;
-        if path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 && advanced_color_enabled(&path)? {
-            return Err(DisplayError::new(
-                "unsupported_display",
-                "advanced color/HDR paths are not supported for mutations",
-            ));
-        }
         if matches!(
             path.targetInfo.outputTechnology,
             DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
@@ -102,12 +96,6 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
                 format!("saved monitor/source route is unavailable: {}", saved.id),
             )
         })?;
-        if path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 && advanced_color_enabled(&path)? {
-            return Err(DisplayError::new(
-                "recovery_blocked",
-                "advanced color changed outside this module; recovery requires an SDR path",
-            ));
-        }
         let source_key = (
             path.sourceInfo.adapterId.LowPart,
             path.sourceInfo.adapterId.HighPart,

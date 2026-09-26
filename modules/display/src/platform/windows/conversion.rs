@@ -130,5 +130,6 @@ pub fn decode_path(
         source_flags: path.sourceInfo.statusFlags,
         target_flags: path.targetInfo.statusFlags,
         path_flags: path.flags,
+        hdr_enabled: None,
     })
 }

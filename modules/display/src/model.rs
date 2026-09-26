@@ -1,3 +1,4 @@
+use crate::hdr_option::{DisplayHdrOption, resolve_hdr_configuration};
 use crate::mode_remapping::{DisplayMode, ModeRemapping, Resolution, ResolverContext};
 use crate::refresh_rate_option::{RefreshRateOption, parse_manual_refresh_rate};
 use crate::resolution_option::{ManualResolution, ResolutionOption, select_additional_resolution};
@@ -43,6 +44,10 @@ pub struct ModePolicy {
     pub refresh_rate_option: Option<RefreshRateOption>,
     #[serde(default)]
     pub manual_refresh_rate: Option<String>,
+    #[serde(default)]
+    pub hdr_option: Option<DisplayHdrOption>,
+    #[serde(default)]
+    pub effective_client_hdr_request: Option<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +65,9 @@ pub struct DisplaySetting {
     pub y: i32,
     #[serde(default)]
     pub rotation: Rotation,
+    /// Requested HDR state; None leaves the current state untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +230,23 @@ impl Configuration {
         if let Some(refresh_rate) = resolved.refresh_rate {
             display.refresh = refresh_rate;
         }
+        if let Some(option) = policy.hdr_option {
+            display.hdr_enabled = match option {
+                DisplayHdrOption::Auto => Some(
+                    resolve_hdr_configuration(
+                        option,
+                        policy.effective_client_hdr_request.ok_or_else(|| {
+                            DisplayError::new(
+                                "invalid_request",
+                                "auto HDR policy requires the effective client HDR request",
+                            )
+                        })?,
+                    )
+                    .expect("auto HDR resolves to a state"),
+                ),
+                DisplayHdrOption::Disabled => None,
+            };
+        }
         self.validate()
     }
     pub fn validate(&self) -> Result<(), DisplayError> {
@@ -331,6 +356,9 @@ pub struct DisplayPath {
     pub source_flags: u32,
     pub target_flags: u32,
     pub path_flags: u32,
+    /// None denotes a target without a queryable HDR state (including old journals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -380,6 +408,8 @@ impl Snapshot {
                     && left.scaling == right.scaling
                     && left.refresh.equivalent(right.refresh)
                     && left.scan_line_ordering == right.scan_line_ordering
+                    && (left.hdr_enabled == right.hdr_enabled
+                        || (left.hdr_enabled.is_none() && right.hdr_enabled == Some(false)))
             })
     }
 }
