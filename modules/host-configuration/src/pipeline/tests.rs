@@ -390,6 +390,84 @@ fn timed_out_logging_apply_reports_saved_revision_without_claiming_rollback() {
 }
 
 #[test]
+fn accepted_state_errors_preserve_uncertain_save_and_rollback_outcomes() {
+    let check = |stage: Stage, outcome: ChildOutcome, expected_code: &str| {
+        let pending = Pending {
+            request_id: 7,
+            deadline: Instant::now() + Duration::from_secs(30),
+            state_request_id: 25,
+            stage,
+            phase: PendingPhase::Waiting,
+        };
+        let mut completed = None;
+        Pipeline::new(Err("unused trusted root".into()))
+            .consume(pending, outcome, &mut |command| match command {
+                Command::Complete { payload, .. } => {
+                    completed = Some(payload);
+                    Ok(Response::Ok)
+                }
+                command => panic!("uncertain result issued unexpected command: {command:?}"),
+            })
+            .unwrap();
+        let response = completed.unwrap();
+        assert_eq!(response["error"]["code"], expected_code);
+        let expected_status = match expected_code {
+            "logging_rollback_unconfirmed" => "rollback_unconfirmed",
+            "logging_rollback_failed" => "rollback_failed",
+            _ => "save_unconfirmed",
+        };
+        assert_eq!(response["logging"]["status"], expected_status);
+        assert_eq!(
+            response["logging"]["saved_revision"],
+            if expected_code == "save_unconfirmed" {
+                Value::Null
+            } else {
+                json!(6)
+            }
+        );
+    };
+
+    let saving = || Stage::Saving {
+        expected_state_revision: 12,
+        response: json!({"revision":6}),
+        previous: Document::default(),
+    };
+    let rollback = || Stage::RollingBack {
+        saved_revision: 6,
+        expected_state_revision: 13,
+    };
+    let transport_failure = || ChildOutcome::Failure {
+        code: "deadline_exceeded".into(),
+        message: "result expired after persistence".into(),
+    };
+    let storage_failure = || {
+        ChildOutcome::Payload(json!({
+            "ok":false,"error":{"code":"storage_error","message":"directory sync failed"}
+        }))
+    };
+
+    check(saving(), transport_failure(), "save_unconfirmed");
+    check(saving(), storage_failure(), "save_unconfirmed");
+    check(
+        rollback(),
+        transport_failure(),
+        "logging_rollback_unconfirmed",
+    );
+    check(
+        rollback(),
+        storage_failure(),
+        "logging_rollback_unconfirmed",
+    );
+    check(
+        rollback(),
+        ChildOutcome::Payload(json!({
+            "ok":false,"error":{"code":"revision_conflict","message":"CAS rejected"}
+        })),
+        "logging_rollback_failed",
+    );
+}
+
+#[test]
 fn missing_or_invalid_trusted_root_fails_readiness_closed() {
     let mut pipeline = Pipeline::new(Err("trusted root missing".into()));
     let mut incoming = Some(request("consumer.module", json!({"action":"readiness"})));

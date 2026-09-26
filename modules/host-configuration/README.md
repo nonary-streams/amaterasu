@@ -137,7 +137,7 @@ then restores the previous settings through another state CAS, using the next
 document revision to keep revisions monotonic. A confirmed compensation reports
 `logging_apply_failed` with `logging.status: "rolled_back"`. If the
 compensating write is explicitly rejected, it reports `logging_rollback_failed`
-with `logging.status: "saved_not_applied"`. An ambiguous compensation reports
+with `logging.status: "rollback_failed"`. An ambiguous compensation reports
 `logging_rollback_unconfirmed`. When a write or diagnostics apply
 has an ambiguous transport or timeout outcome, the provider does not claim
 success or issue a speculative rollback. It reports `save_unconfirmed` or
