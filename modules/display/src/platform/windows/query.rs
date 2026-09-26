@@ -5,6 +5,7 @@ use crate::model::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use windows_sys::Win32::Devices::Display::*;
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_SUPPORTED, LUID};
 use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, EnumDisplaySettingsExW};
@@ -230,6 +231,72 @@ fn verify_advanced_color_route(
     Ok(())
 }
 
+const HDR_SETTLE_ATTEMPTS: usize = 6;
+const HDR_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+
+struct AdvancedColorReadback {
+    target: Address,
+    output_technology: i32,
+    enabled: Option<bool>,
+}
+
+fn settle_advanced_color(
+    saved_target: &Address,
+    saved_output_technology: i32,
+    enabled: bool,
+    mut read: impl FnMut() -> DisplayResult<AdvancedColorReadback>,
+    mut wait: impl FnMut(),
+) -> DisplayResult<()> {
+    for attempt in 0..HDR_SETTLE_ATTEMPTS {
+        let current = read().map_err(DisplayError::after_mutation)?;
+        verify_advanced_color_route(
+            saved_target,
+            saved_output_technology,
+            current.target,
+            current.output_technology,
+        )
+        .map_err(DisplayError::after_mutation)?;
+        match current.enabled {
+            Some(current) if current == enabled => return Ok(()),
+            Some(_) => {}
+            None => {
+                return Err(DisplayError::new(
+                    "unsupported_display",
+                    "HDR control disappeared after the native write",
+                )
+                .after_mutation());
+            }
+        }
+        if attempt + 1 == HDR_SETTLE_ATTEMPTS {
+            return Err(DisplayError::new(
+                "verification_failed",
+                "Windows HDR state differs from the requested state",
+            )
+            .after_mutation());
+        }
+        wait();
+    }
+    unreachable!("bounded HDR settling returns on its last attempt")
+}
+
+fn read_advanced_color(saved: &DisplayPath) -> DisplayResult<AdvancedColorReadback> {
+    let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+    let current = unique_active_target(&active, &saved.id)?
+        .ok_or_else(|| DisplayError::new("topology_changed", "HDR target disappeared"))?;
+    let target = address(current.targetInfo.adapterId, current.targetInfo.id);
+    verify_advanced_color_route(
+        &saved.target_address,
+        saved.output_technology,
+        target.clone(),
+        current.targetInfo.outputTechnology,
+    )?;
+    Ok(AdvancedColorReadback {
+        target,
+        output_technology: current.targetInfo.outputTechnology,
+        enabled: advanced_color_enabled(current)?,
+    })
+}
+
 pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<()> {
     let active = query(QDC_ONLY_ACTIVE_PATHS)?;
     let path = unique_active_target(&active, &saved.id)?
@@ -268,22 +335,13 @@ pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<(
         unsafe { DisplayConfigSetDeviceInfo(&packet.header) },
         "DisplayConfigSetDeviceInfo(advanced color)",
     )?;
-    let current = query(QDC_ONLY_ACTIVE_PATHS)?;
-    let current = unique_active_target(&current, &saved.id)?
-        .ok_or_else(|| DisplayError::new("topology_changed", "HDR target disappeared"))?;
-    verify_advanced_color_route(
+    settle_advanced_color(
         &saved.target_address,
         saved.output_technology,
-        address(current.targetInfo.adapterId, current.targetInfo.id),
-        current.targetInfo.outputTechnology,
-    )?;
-    if advanced_color_enabled(current)? != Some(enabled) {
-        return Err(DisplayError::new(
-            "verification_failed",
-            "Windows HDR state differs from the requested state",
-        ));
-    }
-    Ok(())
+        enabled,
+        || read_advanced_color(saved),
+        || std::thread::sleep(HDR_SETTLE_INTERVAL),
+    )
 }
 
 fn unique_active_target<'a>(
@@ -489,8 +547,114 @@ pub fn check(code: i32, operation: &str) -> DisplayResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_advanced_color_flags, verify_advanced_color_route};
-    use crate::model::Address;
+    use super::{
+        AdvancedColorReadback, HDR_SETTLE_ATTEMPTS, decode_advanced_color_flags,
+        settle_advanced_color, verify_advanced_color_route,
+    };
+    use crate::model::{Address, DisplayError};
+
+    fn saved_target() -> Address {
+        Address {
+            adapter_low: 1,
+            adapter_high: 2,
+            id: 3,
+        }
+    }
+
+    fn readback(target: &Address, enabled: Option<bool>) -> AdvancedColorReadback {
+        AdvancedColorReadback {
+            target: target.clone(),
+            output_technology: 4,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn advanced_color_readback_waits_for_exact_hdr_bit() {
+        let target = saved_target();
+        let mut reads = 0;
+        let mut waits = 0;
+        settle_advanced_color(
+            &target,
+            4,
+            true,
+            || {
+                reads += 1;
+                Ok(readback(&target, Some(reads >= 3)))
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!((reads, waits), (3, 2));
+    }
+
+    #[test]
+    fn advanced_color_readback_never_accepts_unconverged_bit() {
+        let target = saved_target();
+        let mut reads = 0;
+        let error = settle_advanced_color(
+            &target,
+            4,
+            true,
+            || {
+                reads += 1;
+                Ok(readback(&target, Some(false)))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(reads, HDR_SETTLE_ATTEMPTS);
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn advanced_color_readback_rejects_wrong_target_without_retry() {
+        let target = saved_target();
+        let mut wrong = target.clone();
+        wrong.id += 1;
+        let mut reads = 0;
+        let error = settle_advanced_color(
+            &target,
+            4,
+            true,
+            || {
+                reads += 1;
+                Ok(readback(&wrong, Some(true)))
+            },
+            || panic!("wrong HDR target must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn advanced_color_readback_rejects_lost_support_and_query_failure() {
+        let target = saved_target();
+        let unsupported = settle_advanced_color(
+            &target,
+            4,
+            false,
+            || Ok(readback(&target, None)),
+            || panic!("lost HDR support must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(unsupported.code, "unsupported_display");
+        assert!(unsupported.may_have_changed);
+
+        let query_error = settle_advanced_color(
+            &target,
+            4,
+            true,
+            || Err(DisplayError::new("topology_changed", "ambiguous HDR route")),
+            || panic!("native query failure must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(query_error.code, "topology_changed");
+        assert!(query_error.may_have_changed);
+    }
 
     #[test]
     fn advanced_color_support_and_enablement_bits_are_distinct() {
