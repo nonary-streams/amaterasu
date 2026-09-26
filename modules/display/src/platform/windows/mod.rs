@@ -92,12 +92,29 @@ fn reject_foreign_apply_state(
 fn reject_foreign_restore_state(
     saved: &Snapshot,
     previous: &Snapshot,
+    rebound_targets: &[(String, Address)],
     current: &Snapshot,
 ) -> DisplayResult<()> {
     if current.paths.iter().any(|path| {
-        !saved.paths.iter().chain(&previous.paths).any(|expected| {
-            expected.id.eq_ignore_ascii_case(&path.id) && expected.source_name == path.source_name
-        })
+        let old = previous
+            .paths
+            .iter()
+            .find(|old| old.id.eq_ignore_ascii_case(&path.id));
+        let baseline = saved
+            .paths
+            .iter()
+            .find(|baseline| baseline.id.eq_ignore_ascii_case(&path.id));
+        let expected_target = rebound_targets
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(&path.id));
+        let known_route = old
+            .or(baseline)
+            .is_some_and(|known| known.source_name == path.source_name);
+        !known_route
+            || old.is_some_and(|known| known.target_address != path.target_address)
+            || (old.is_none()
+                && baseline.is_some()
+                && expected_target.is_none_or(|(_, target)| *target != path.target_address))
     }) {
         return Err(DisplayError::new(
             "topology_changed",
@@ -218,11 +235,22 @@ impl Platform for WindowsPlatform {
         query::check_legacy_hdr_recovery(snapshot)?;
         let previous = query::snapshot()?;
         let requested = apply::restoration(snapshot)?;
+        let rebound_targets: Vec<_> = snapshot
+            .paths
+            .iter()
+            .zip(&requested.paths)
+            .map(|(saved, native)| {
+                (
+                    saved.id.clone(),
+                    conversion::address(native.targetInfo.adapterId, native.targetInfo.id),
+                )
+            })
+            .collect();
         apply::set(&requested, false)?;
         guard()?;
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
         let rebound = settle(
-            |current| reject_foreign_restore_state(snapshot, &previous, current),
+            |current| reject_foreign_restore_state(snapshot, &previous, &rebound_targets, current),
             |current| verify_restoration_routes(snapshot, current),
         )?;
         for path in &snapshot.paths {
@@ -237,7 +265,7 @@ impl Platform for WindowsPlatform {
             }
         }
         settle(
-            |current| reject_foreign_restore_state(snapshot, &previous, current),
+            |current| reject_foreign_restore_state(snapshot, &previous, &rebound_targets, current),
             |current| {
                 if snapshot.equivalent(current) {
                     Ok(())
@@ -1414,6 +1442,10 @@ mod tests {
         previous
             .paths
             .push(readback_path("monitor.two", 1920, Some(false)));
+        let rebound_targets = vec![(
+            saved.paths[0].id.clone(),
+            saved.paths[0].target_address.clone(),
+        )];
         let mut reads = 0;
         let result = settled_readback(
             || {
@@ -1424,7 +1456,7 @@ mod tests {
                     saved.clone()
                 })
             },
-            |current| reject_foreign_restore_state(&saved, &previous, current),
+            |current| reject_foreign_restore_state(&saved, &previous, &rebound_targets, current),
             |current| {
                 if saved.equivalent(current) {
                     Ok(())
@@ -1448,19 +1480,84 @@ mod tests {
             paths: vec![readback_path("monitor.one", 0, Some(false))],
         };
         let previous = saved.clone();
+        let rebound_targets = vec![(
+            saved.paths[0].id.clone(),
+            saved.paths[0].target_address.clone(),
+        )];
         let foreign = Snapshot {
             format_version: 1,
             paths: vec![readback_path("monitor.foreign", 0, Some(false))],
         };
         let error = settled_readback(
             || Ok(foreign.clone()),
-            |current| reject_foreign_restore_state(&saved, &previous, current),
+            |current| reject_foreign_restore_state(&saved, &previous, &rebound_targets, current),
             |_| Ok(()),
             || panic!("foreign restore route must not be retried"),
         )
         .unwrap_err();
         assert_eq!(error.code, "topology_changed");
         assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_restore_rejects_changed_native_target_even_when_saved_mode_matches() {
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let previous = saved.clone();
+        let rebound_targets = vec![(
+            saved.paths[0].id.clone(),
+            saved.paths[0].target_address.clone(),
+        )];
+        let mut wrong = saved.clone();
+        wrong.paths[0].target_address.id += 1;
+        assert!(
+            saved.equivalent(&wrong),
+            "mode equivalence alone cannot prove the native route"
+        );
+        let mut reads = 0;
+        let error = settled_readback(
+            || {
+                reads += 1;
+                Ok(wrong.clone())
+            },
+            |current| reject_foreign_restore_state(&saved, &previous, &rebound_targets, current),
+            |_| Ok(()),
+            || panic!("wrong native target must fail immediately"),
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn ccd_restore_accepts_rebound_target_after_restart() {
+        let saved = Snapshot {
+            format_version: 1,
+            paths: vec![readback_path("monitor.one", 0, Some(false))],
+        };
+        let previous = Snapshot {
+            format_version: 1,
+            paths: vec![],
+        };
+        let mut rebound = saved.clone();
+        rebound.paths[0].target_address.id += 1;
+        let rebound_targets = vec![(
+            saved.paths[0].id.clone(),
+            rebound.paths[0].target_address.clone(),
+        )];
+        assert!(
+            reject_foreign_restore_state(&saved, &previous, &rebound_targets, &rebound).is_ok()
+        );
+        rebound.paths[0].target_address.id += 1;
+        assert_eq!(
+            reject_foreign_restore_state(&saved, &previous, &rebound_targets, &rebound)
+                .unwrap_err()
+                .code,
+            "topology_changed"
+        );
     }
 
     #[test]
