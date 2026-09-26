@@ -118,10 +118,10 @@ impl Shape {
                         let color = &self.bytes[src..src + 4];
                         let alpha = u32::from(color[3]);
                         for channel in 0..3 {
-                            pixel[channel] = ((u32::from(color[channel]) * alpha
-                                + u32::from(pixel[channel]) * (255 - alpha)
-                                + 127)
-                                / 255) as u8;
+                            // DXGI color pixels are premultiplied by alpha.
+                            pixel[channel] = (u32::from(color[channel])
+                                + (u32::from(pixel[channel]) * (255 - alpha) + 127) / 255)
+                                .min(255) as u8;
                         }
                     }
                     ShapeKind::MaskedColor => {
@@ -176,6 +176,10 @@ mod tests {
         let mut frame = vec![0, 0, 100, 255, 0, 0, 100, 255];
         shape.compose(&mut frame, 2, 1, -1, 0).unwrap();
         assert_eq!(frame, vec![0, 0, 200, 255, 0, 0, 100, 255]);
+        let translucent = Shape::new(ShapeKind::Color, 1, 1, 4, vec![50, 0, 0, 128]).unwrap();
+        let mut frame = vec![100, 0, 0, 255];
+        translucent.compose(&mut frame, 1, 1, 0, 0).unwrap();
+        assert_eq!(frame, vec![100, 0, 0, 255]);
     }
 
     #[test]
