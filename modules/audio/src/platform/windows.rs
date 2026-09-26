@@ -49,6 +49,26 @@ static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
 static VIRTUAL_FORMAT_POLICY: OnceLock<Mutex<VirtualFormatPolicy>> = OnceLock::new();
 static ROUTE_RESTORE_WORKER: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 static ROUTE_RESTORE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static ROUTE_RESTORE_LIFECYCLE: Mutex<RouteRestoreLifecycle> =
+    Mutex::new(RouteRestoreLifecycle { active_modules: 0 });
+
+struct RouteRestoreLifecycle {
+    active_modules: usize,
+}
+
+impl RouteRestoreLifecycle {
+    fn start(&mut self) -> bool {
+        let first = self.active_modules == 0;
+        self.active_modules += 1;
+        first
+    }
+
+    fn stop(&mut self) -> bool {
+        debug_assert!(self.active_modules > 0);
+        self.active_modules -= 1;
+        self.active_modules == 0
+    }
+}
 
 // IPolicyConfig is an undocumented Windows COM interface. The ten method
 // slots after IUnknown precede SetDefaultEndpoint in the pinned interface ABI.
@@ -491,7 +511,25 @@ fn stop_worker_then_restore_once(
     }
 }
 
+pub fn startup() {
+    let mut lifecycle = ROUTE_RESTORE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if lifecycle.start() {
+        // The final prior shutdown joined its retry worker while holding this
+        // lifecycle lock, so no worker from that generation can outlive reset.
+        ROUTE_RESTORE_SHUTTING_DOWN.store(false, Ordering::Release);
+        schedule_route_restore_retry_if_pending();
+    }
+}
+
 pub fn shutdown() {
+    let mut lifecycle = ROUTE_RESTORE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !lifecycle.stop() {
+        return;
+    }
     ROUTE_RESTORE_SHUTTING_DOWN.store(true, Ordering::Release);
     let worker = ROUTE_RESTORE_WORKER.get().and_then(|worker_state| {
         worker_state
@@ -1482,6 +1520,20 @@ fn buffer_error_requires_recovery(first_error: &mut Option<Instant>, now: Instan
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn route_retry_lifecycle_preserves_peer_and_rearms_after_final_release() {
+        let mut lifecycle = RouteRestoreLifecycle { active_modules: 0 };
+        assert!(lifecycle.start(), "first module owns retry startup");
+        assert!(!lifecycle.start(), "a peer shares the active retry worker");
+        assert!(
+            !lifecycle.stop(),
+            "closing one peer cannot stop restoration"
+        );
+        assert!(lifecycle.stop(), "the final release joins the retry worker");
+        assert!(lifecycle.start(), "reload re-arms a pending restoration");
+        assert!(lifecycle.stop());
+    }
 
     #[test]
     fn virtual_route_refresh_retries_ambiguous_and_ineffective_assignments() {

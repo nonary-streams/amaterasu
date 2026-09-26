@@ -31,6 +31,7 @@ struct AudioModule {
     runtime: RuntimeClient,
     controller: native::Shared,
     _factory: Box<native::Factory>,
+    platform_started: bool,
 }
 
 impl ManagedModule for AudioModule {
@@ -51,10 +52,12 @@ impl ManagedModule for AudioModule {
         unsafe {
             runtime.register_native(SERVICE, &factory.api)?;
         }
+        platform::startup();
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
+            platform_started: true,
         })
     }
 
@@ -119,7 +122,9 @@ impl Drop for AudioModule {
                 controller.shutdown();
             }
         }
-        platform::shutdown();
+        if self.platform_started {
+            platform::shutdown();
+        }
     }
 }
 

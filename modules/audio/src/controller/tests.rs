@@ -1240,6 +1240,7 @@ fn cancelled_open_completion_rolls_back_only_newly_created_streams() {
         runtime: client,
         controller: shared.clone(),
         _factory: Factory::new(shared.clone()),
+        platform_started: false,
     };
     let request = |payload| Response::Request {
         id: 1,

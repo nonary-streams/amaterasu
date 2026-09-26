@@ -1,9 +1,9 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::shutdown;
-#[cfg(windows)]
 pub use windows::{Capture, enumerate, route_restore_pending};
+#[cfg(windows)]
+pub use windows::{shutdown, startup};
 
 #[derive(Clone, Debug)]
 pub struct RecoveryConfig {
@@ -102,3 +102,6 @@ pub use unsupported::{Capture, enumerate, route_restore_pending};
 
 #[cfg(not(windows))]
 pub fn shutdown() {}
+
+#[cfg(not(windows))]
+pub fn startup() {}
