@@ -370,13 +370,14 @@ fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
 }
 
 fn enqueue(sender: &SyncSender<Packet>, health: &Mutex<Health>, packet: Packet) -> bool {
-    if packet.flags & AUDIO_DISCONTINUITY != 0
-        && let Ok(mut health) = health.lock()
-    {
-        health.discontinuities = health.discontinuities.saturating_add(1);
-    }
+    let discontinuity = packet.flags & AUDIO_DISCONTINUITY != 0;
     match sender.try_send(packet) {
-        Ok(()) => true,
+        Ok(()) => {
+            if discontinuity && let Ok(mut health) = health.lock() {
+                health.discontinuities = health.discontinuities.saturating_add(1);
+            }
+            true
+        }
         Err(TrySendError::Full(_)) => {
             if let Ok(mut health) = health.lock() {
                 health.failure = Some("audio_queue_overflow");
@@ -507,8 +508,58 @@ mod tests {
         let health = health.lock().unwrap();
         assert_eq!(health.failure, Some("audio_queue_overflow"));
         assert_eq!(health.dropped_packets, 1);
-        assert_eq!(health.discontinuities, 2);
+        assert_eq!(health.discontinuities, 1);
         assert_eq!(receiver.try_recv().unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn overflow_drains_accepted_pcm_without_counting_dropped_discontinuity() {
+        let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut accepted = packet(1_000, 0);
+        accepted.flags = AUDIO_DISCONTINUITY;
+        let mut dropped = packet(2_000, 1);
+        dropped.flags = AUDIO_DISCONTINUITY;
+        let capture = FakeCapture::new(format, [Ok(Some(accepted)), Ok(Some(dropped))])
+            .with_drop_counter(drops.clone());
+        let (sender, packets) = mpsc::sync_channel(1);
+        let health = Arc::new(Mutex::new(Health::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_health = health.clone();
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            run_capture_loop(
+                Box::new(capture),
+                || panic!("queue overflow must not reopen capture"),
+                &sender,
+                &thread_health,
+                &thread_stop,
+                RecoveryPolicy {
+                    expected_endpoint: "render.fixed".into(),
+                    expected_format: format,
+                    follow_console_default: false,
+                    retry_delay: Duration::ZERO,
+                },
+            );
+        });
+        let mut worker = Worker {
+            packets,
+            health,
+            stop,
+            thread: Some(thread),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while worker.health().failure.is_none() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let health = worker.health();
+        assert_eq!(health.failure, Some("audio_queue_overflow"));
+        assert_eq!(health.dropped_packets, 1);
+        assert_eq!(health.discontinuities, 1);
+        assert_eq!(worker.read().unwrap().unwrap().sequence, 0);
+        assert_eq!(worker.read().err(), Some("audio_queue_overflow"));
+        drop(worker);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
