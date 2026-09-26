@@ -294,8 +294,9 @@ impl RoutePolicy {
     }
 
     /// A routed virtual sink remains selected while its capture is active.
-    /// Preserve the initial snapshot for final restoration, even if another
-    /// application changes a default role during the stream.
+    /// Reassert a role this lease assigned even when it becomes unset; leave
+    /// roles that were absent at acquisition alone. Preserve the initial
+    /// snapshot for final restoration.
     pub fn refresh_assignments(
         &self,
         endpoint: &str,
@@ -309,8 +310,8 @@ impl RoutePolicy {
             .into_iter()
             .filter(|role| {
                 (active.assigned_roles[role.index()]
-                    || active.original[role.index()].as_deref() == Some(endpoint))
-                    && current[role.index()].is_some()
+                    || (active.original[role.index()].as_deref() == Some(endpoint)
+                        && current[role.index()].is_some()))
                     && current[role.index()].as_deref() != Some(endpoint)
             })
             .map(|role| RoleAssignment {
@@ -543,6 +544,49 @@ mod tests {
         );
         policy.complete_restore(true);
         assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn virtual_sink_reasserts_an_unset_owned_role_but_not_an_initially_absent_role() {
+        let original = [
+            Some("render.console".into()),
+            Some("render.multimedia".into()),
+            None,
+        ];
+        let mut policy = RoutePolicy::new();
+        let AcquirePlan::Assign(assignments) = policy
+            .acquire_with_tracking("render.virtual", &original, true)
+            .unwrap()
+        else {
+            panic!("virtual sink must route the available roles");
+        };
+        for assignment in assignments {
+            policy
+                .record_assignment("render.virtual", assignment.role)
+                .unwrap();
+        }
+        let missing = [None, Some("render.virtual".into()), None];
+        assert_eq!(
+            policy.refresh_assignments("render.virtual", &missing),
+            Ok(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.virtual".into(),
+            }])
+        );
+        let routed = [Some("render.virtual".into()), missing[1].clone(), None];
+        assert_eq!(
+            policy.release("render.virtual", &routed),
+            Ok(ReleasePlan::Restore(vec![
+                RoleAssignment {
+                    role: DefaultRole::Console,
+                    endpoint: "render.console".into(),
+                },
+                RoleAssignment {
+                    role: DefaultRole::Multimedia,
+                    endpoint: "render.multimedia".into(),
+                },
+            ]))
+        );
     }
 
     #[test]

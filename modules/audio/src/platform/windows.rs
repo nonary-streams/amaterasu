@@ -1557,6 +1557,54 @@ mod tests {
     }
 
     #[test]
+    fn virtual_route_refresh_recovers_an_unset_owned_default_role() {
+        let endpoint = "render.virtual";
+        let original = [Some("render.console".to_owned()), None, None];
+        let mut policy = RoutePolicy::new();
+        let AcquirePlan::Assign(assignments) = policy
+            .acquire_with_tracking(endpoint, &original, true)
+            .unwrap()
+        else {
+            panic!("virtual sink must route the console role");
+        };
+        for assignment in assignments {
+            policy.record_assignment(endpoint, assignment.role).unwrap();
+        }
+        let current = RefCell::new([None, None, None]);
+        let assigned = Cell::new(0);
+        let snapshot = current.borrow().clone();
+        refresh_virtual_route(
+            &mut policy,
+            endpoint,
+            &snapshot,
+            |role| Ok(current.borrow()[role.index()].clone()),
+            |role| {
+                assigned.set(assigned.get() + 1);
+                current.borrow_mut()[role.index()] = Some(endpoint.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(assigned.get(), 1);
+        assert_eq!(
+            current.borrow()[DefaultRole::Console.index()].as_deref(),
+            Some(endpoint)
+        );
+        let ReleasePlan::Restore(assignments) =
+            policy.release(endpoint, &current.borrow()).unwrap()
+        else {
+            panic!("the final lease must restore its console role");
+        };
+        assert_eq!(
+            assignments,
+            vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.console".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn inactive_endpoint_requires_recovery_but_query_failures_are_retried() {
         assert!(endpoint_state_is_active(Ok(DEVICE_STATE_ACTIVE)));
         assert!(!endpoint_state_is_active(Ok(DEVICE_STATE(0))));
