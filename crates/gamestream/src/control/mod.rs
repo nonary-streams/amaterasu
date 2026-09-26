@@ -5,7 +5,7 @@ mod tests;
 mod translate;
 
 use crate::crypto::{Direction, MAX_CONTROL_PAYLOAD_BYTES};
-pub use input::{ControllerState, Input};
+pub use input::{ControllerState, Input, PenTouch, PointerDevice, PointerEvent};
 pub use translate::{
     AbsoluteViewport, InputBatch, InputEvent, InputTranslator, KeyState as TranslatedKeyState,
     MouseButton, ScrollAxis, TranslationError, VirtualKeyMapping, virtual_key_mapping,

@@ -1,10 +1,52 @@
 use super::record::{Record, State};
 use amaterasu_gamestream::control::{
-    AbsoluteViewport, Input, InputEvent, InputTranslator, MouseButton, ScrollAxis,
-    TranslatedKeyState, TranslationError,
+    AbsoluteViewport, Input, InputEvent, InputTranslator, MouseButton, PenTouch, PointerDevice,
+    PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TouchPort {
+    width: f32,
+    height: f32,
+    client_offset_x: f32,
+    client_offset_y: f32,
+    logical_width: f32,
+    logical_height: f32,
+}
+
+impl TouchPort {
+    fn from_video_response(response: &Value) -> Option<Self> {
+        let value = response.get("touch_port")?.as_object()?;
+        if value.len() != 6 {
+            return None;
+        }
+        let dimension = |name: &str| -> Option<f32> {
+            value
+                .get(name)?
+                .as_u64()
+                .filter(|value| (1..=1_000_000).contains(value))
+                .map(|value| value as f32)
+        };
+        let offset = |name: &str| -> Option<f32> {
+            let number = value.get(name)?.as_f64()?;
+            (number.is_finite() && (0.0..=1_000_000.0).contains(&number)).then_some(number as f32)
+        };
+        let port = Self {
+            width: dimension("width")?,
+            height: dimension("height")?,
+            client_offset_x: offset("client_offset_x")?,
+            client_offset_y: offset("client_offset_y")?,
+            logical_width: dimension("logical_width")?,
+            logical_height: dimension("logical_height")?,
+        };
+        if port.client_offset_x * 2.0 >= port.width || port.client_offset_y * 2.0 >= port.height {
+            return None;
+        }
+        Some(port)
+    }
+}
 
 const MAX_QUEUED_EVENTS: usize = 128;
 pub(super) const MAX_BATCH_EVENTS: usize = 64;
@@ -31,6 +73,7 @@ pub(super) fn configure_absolute_input(
         .and_then(|object| object.get("desktop_geometry"))
     else {
         record.capture_geometry = None;
+        record.touch_port = None;
         record.input_absolute_pointer = false;
         record.input_translator = InputTranslator::default();
         return Ok(());
@@ -40,6 +83,7 @@ pub(super) fn configure_absolute_input(
     geometry
         .normalized_output()
         .map_err(|_| "invalid_capture_geometry")?;
+    record.touch_port = TouchPort::from_video_response(video_response);
     record.capture_geometry = Some(geometry);
     record.input_absolute_pointer = false;
     record.input_translator = InputTranslator::default();
@@ -63,6 +107,26 @@ pub(super) fn queue_control_input(
     // without virtual gamepad support can keep processing keyboard and mouse.
     if matches!(&input, Input::Controller(_)) && !record.input_controller_supported {
         record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+        return Ok(());
+    }
+    if let Input::PenTouch(packet) = input {
+        if !record.input_pen_touch_supported || !record.input_native_pen_touch {
+            record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+            return Ok(());
+        }
+        let Some(port) = record.touch_port else {
+            record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+            return Ok(());
+        };
+        let Some(geometry) = record.capture_geometry else {
+            record.unsupported_controls = record.unsupported_controls.saturating_add(1);
+            return Ok(());
+        };
+        let event = pen_touch_payload(packet, port, geometry)?;
+        if record.input_events.len() >= MAX_QUEUED_EVENTS {
+            return Err("input_queue_overflow");
+        }
+        record.input_events.push_back(event);
         return Ok(());
     }
     let batch = match record.input_translator.translate(input) {
@@ -150,6 +214,8 @@ pub(super) fn accept_input_lease(
     };
     record.input_lease = Some(lease.to_owned());
     record.input_controller_supported = controller_input_supported;
+    record.input_pen_touch_supported = optional_bool(payload, "pen_touch_supported")?;
+    record.input_native_pen_touch = optional_bool(payload, "native_pen_touch")?;
     record.input_expires_at = now.saturating_add(expires_in_ms).min(
         record
             .input_request_started_at
@@ -304,9 +370,76 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_renew_at = 0;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
+    record.input_pen_touch_supported = false;
+    record.input_native_pen_touch = false;
+    record.touch_port = None;
     record.input_events.clear();
     record.input_inflight = 0;
     record.input_translator = Default::default();
+}
+
+fn optional_bool(payload: &Value, name: &str) -> Result<bool, &'static str> {
+    match payload.get(name) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(false),
+        Some(_) => Err("invalid_input_response"),
+    }
+}
+
+fn pen_touch_payload(
+    packet: PenTouch,
+    port: TouchPort,
+    geometry: CaptureGeometry,
+) -> Result<Value, &'static str> {
+    let normalized = geometry
+        .normalized_output()
+        .map_err(|_| "invalid_capture_geometry")?;
+    let x = f32::from_bits(packet.x).clamp(0.0, 1.0);
+    let y = f32::from_bits(packet.y).clamp(0.0, 1.0);
+    let local_x = (x * port.width).clamp(port.client_offset_x, port.width - port.client_offset_x)
+        - port.client_offset_x;
+    let local_y = (y * port.height).clamp(port.client_offset_y, port.height - port.client_offset_y)
+        - port.client_offset_y;
+    let map = |value: f32, extent: f32, first: u16, last: u16| -> u16 {
+        (f32::from(first) + value / extent * f32::from(last - first))
+            .round()
+            .clamp(0.0, 65535.0) as u16
+    };
+    let rotation = (packet.rotation != 0xffff).then_some(packet.rotation % 360);
+    let angle = f32::from(rotation.unwrap_or(45)).to_radians();
+    let major = f32::from_bits(packet.contact_major).clamp(0.0, 1.0);
+    let minor = f32::from_bits(packet.contact_minor).clamp(0.0, 1.0);
+    let minor = if minor == 0.0 { major } else { minor };
+    let scale = |radius: f32, radians: f32| -> f32 {
+        let horizontal = radius * radians.cos() * port.logical_width / 65535.0;
+        let vertical = radius * radians.sin() * port.logical_height / 65535.0;
+        horizontal.hypot(vertical)
+    };
+    let mut value = json!({
+        "kind":"pen_touch", "pointer_id":packet.pointer_id,
+        "device":match packet.device { PointerDevice::Pen => "pen", PointerDevice::Touch => "touch" },
+        "phase":match packet.event { PointerEvent::Down => "down", PointerEvent::Move => "move", PointerEvent::Up => "up", PointerEvent::Cancel => "cancel" },
+        "x":map(local_x, port.width - 2.0 * port.client_offset_x, normalized.left, normalized.right),
+        "y":map(local_y, port.height - 2.0 * port.client_offset_y, normalized.top, normalized.bottom),
+        "pressure":f32::from_bits(packet.pressure).clamp(0.0, 1.0),
+        "contact_area_major":scale(major, angle),
+        "contact_area_minor":scale(minor, angle + std::f32::consts::FRAC_PI_2),
+    });
+    if let Some(rotation) = rotation {
+        value["rotation_degrees"] = json!(rotation);
+    }
+    if packet.device == PointerDevice::Pen {
+        value["pen_tool"] = json!(match packet.tool {
+            Some(1) => "pen",
+            Some(2) => "eraser",
+            _ => "unknown",
+        });
+        value["pen_buttons"] = json!(packet.buttons);
+        if let Some(tilt) = packet.tilt.filter(|tilt| *tilt != 0xff) {
+            value["tilt"] = json!(tilt);
+        }
+    }
+    Ok(value)
 }
 
 fn configure_translator(record: &mut Record, absolute_pointer: bool) -> Result<(), &'static str> {

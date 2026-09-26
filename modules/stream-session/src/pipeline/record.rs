@@ -1,3 +1,4 @@
+use super::input::TouchPort;
 use super::{Drive, rpc};
 use crate::{
     model::{PrepareConfig, StartConfig},
@@ -97,6 +98,9 @@ pub(super) struct Record {
     pub capture_geometry: Option<CaptureGeometry>,
     pub input_absolute_pointer: bool,
     pub input_controller_supported: bool,
+    pub input_pen_touch_supported: bool,
+    pub input_native_pen_touch: bool,
+    pub touch_port: Option<TouchPort>,
     pub input_translator: InputTranslator,
     pub input_attempted: bool,
     pub input_lookup_required: bool,
@@ -152,6 +156,9 @@ impl Record {
             capture_geometry: None,
             input_absolute_pointer: false,
             input_controller_supported: false,
+            input_pen_touch_supported: false,
+            input_native_pen_touch: false,
+            touch_port: None,
             input_translator: InputTranslator::default(),
             input_attempted: false,
             input_lookup_required: false,

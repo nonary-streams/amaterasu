@@ -338,6 +338,153 @@ fn desktop_geometry() -> Value {
     })
 }
 
+fn touch_packet(magic: u32, event: u8, pointer_id: u32) -> crate::plane::ControlRecord {
+    let mut payload = vec![0u8; 36];
+    payload[..4].copy_from_slice(&32u32.to_be_bytes());
+    payload[4..8].copy_from_slice(&magic.to_le_bytes());
+    payload[8] = event;
+    if magic == 0x55000002 {
+        payload[12..16].copy_from_slice(&pointer_id.to_le_bytes());
+        for offset in [16, 20, 24, 28, 32] {
+            payload[offset..offset + 4].copy_from_slice(&0.5f32.to_bits().to_le_bytes());
+        }
+    } else {
+        payload[9] = 1;
+        payload[10] = 3;
+        payload[26] = 30;
+        for offset in [12, 16, 20, 28, 32] {
+            payload[offset..offset + 4].copy_from_slice(&0.5f32.to_bits().to_le_bytes());
+        }
+    }
+    crate::plane::ControlRecord {
+        message_type: 0x0206,
+        payload,
+        sequence: u64::from(event),
+    }
+}
+
+fn touch_port() -> Value {
+    json!({"width":1920,"height":1080,"client_offset_x":0,"client_offset_y":0,
+        "logical_width":1920,"logical_height":1080})
+}
+
+#[test]
+fn inset_touchport_reaches_both_capture_edges_and_bad_metadata_fails_closed() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.desktop_geometry = Some(desktop_geometry());
+    host.broker.touch_port = Some(json!({"width":1920,"height":1080,
+        "client_offset_x":120,"client_offset_y":60,
+        "logical_width":1920,"logical_height":1080}));
+    host.broker.input_pen_touch_supported = Some(json!(true));
+    host.broker.input_native_pen_touch = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    let mut left = touch_packet(0x55000002, 1, 7);
+    left.payload[16..20].copy_from_slice(&0f32.to_bits().to_le_bytes());
+    left.payload[20..24].copy_from_slice(&0f32.to_bits().to_le_bytes());
+    let mut right = touch_packet(0x55000002, 3, 7);
+    right.payload[16..20].copy_from_slice(&1f32.to_bits().to_le_bytes());
+    right.payload[20..24].copy_from_slice(&1f32.to_bits().to_le_bytes());
+    host.plane.borrow_mut().controls.extend([left, right]);
+    host.idle();
+    let rect = serde_json::from_value::<amaterasu_media::CaptureGeometry>(desktop_geometry())
+        .unwrap()
+        .normalized_output()
+        .unwrap();
+    assert_eq!(
+        (
+            host.broker.input_events[0]["x"].as_u64(),
+            host.broker.input_events[0]["y"].as_u64()
+        ),
+        (Some(u64::from(rect.left)), Some(u64::from(rect.top)))
+    );
+    assert_eq!(
+        (
+            host.broker.input_events[1]["x"].as_u64(),
+            host.broker.input_events[1]["y"].as_u64()
+        ),
+        (Some(u64::from(rect.right)), Some(u64::from(rect.bottom)))
+    );
+
+    for bad in [
+        json!({"width":1920.5,"height":1080,"client_offset_x":0,"client_offset_y":0,"logical_width":1920,"logical_height":1080}),
+        json!({"width":-1,"height":1080,"client_offset_x":0,"client_offset_y":0,"logical_width":1920,"logical_height":1080}),
+        json!({"width":1920,"height":1080,"client_offset_x":960,"client_offset_y":0,"logical_width":1920,"logical_height":1080}),
+        json!({"width":1920,"height":1080,"client_offset_x":0,"client_offset_y":0,"logical_width":1920,"logical_height":1080,"extra":true}),
+    ] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        host.broker.desktop_geometry = Some(desktop_geometry());
+        host.broker.touch_port = Some(bad);
+        host.broker.input_pen_touch_supported = Some(json!(true));
+        host.broker.input_native_pen_touch = Some(json!(true));
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["state"], "active");
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(touch_packet(0x55000002, 1, 7));
+        host.idle();
+        assert!(host.broker.input_events.is_empty());
+    }
+}
+
+#[test]
+fn authenticated_pen_touch_requires_capability_policy_and_authoritative_port() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.desktop_geometry = Some(desktop_geometry());
+    host.broker.touch_port = Some(touch_port());
+    host.broker.input_pen_touch_supported = Some(json!(true));
+    host.broker.input_native_pen_touch = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.plane.borrow_mut().controls.extend([
+        touch_packet(0x55000002, 1, 42),
+        touch_packet(0x55000003, 1, 0),
+        touch_packet(0x55000002, 4, 42),
+    ]);
+    host.idle();
+    assert_eq!(host.broker.input_events.len(), 3);
+    assert_eq!(host.broker.input_events[0]["pointer_id"], 42);
+    assert_eq!(host.broker.input_events[0]["phase"], "down");
+    assert_eq!(host.broker.input_events[1]["pointer_id"], 1);
+    assert_eq!(host.broker.input_events[1]["device"], "pen");
+    assert_eq!(host.broker.input_events[1]["pen_buttons"], 3);
+    assert_eq!(host.broker.input_events[2]["phase"], "cancel");
+    assert!(host.broker.input_events[0]["x"].as_u64().unwrap() < 32768);
+    assert!(
+        host.broker.input_events[0]["contact_area_major"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.input_lease.is_none());
+
+    for blocked in ["capability", "policy", "port"] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        host.broker.desktop_geometry = Some(desktop_geometry());
+        host.broker.touch_port = (blocked != "port").then(touch_port);
+        host.broker.input_pen_touch_supported = Some(json!(blocked != "capability"));
+        host.broker.input_native_pen_touch = Some(json!(blocked != "policy"));
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["state"], "active");
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(touch_packet(0x55000002, 1, 42));
+        host.idle();
+        assert!(host.broker.input_events.is_empty(), "{blocked}");
+        assert_eq!(host.pipeline.records[&id].unsupported_controls, 1);
+    }
+}
+
 #[test]
 fn active_input_is_batched_and_released_before_media_drain() {
     let mut host = Harness::new();

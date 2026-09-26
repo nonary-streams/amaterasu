@@ -55,6 +55,7 @@ pub struct Broker {
     pub discovered_audio_port: Option<u16>,
     pub media_failure: bool,
     pub desktop_geometry: Option<Value>,
+    pub touch_port: Option<Value>,
     pub input_operation: Option<String>,
     pub input_lease: Option<String>,
     pub input_ttl_ms: u64,
@@ -66,6 +67,8 @@ pub struct Broker {
     pub input_expires_in_ms: Option<u64>,
     pub input_absolute_pointer: Option<Value>,
     pub input_controller_supported: Option<Value>,
+    pub input_pen_touch_supported: Option<Value>,
+    pub input_native_pen_touch: Option<Value>,
     pub history_available: bool,
     pub history_storage_degraded: bool,
     pub history_recording_disabled: bool,
@@ -604,6 +607,12 @@ impl Broker {
         if let Some(supported) = &self.input_controller_supported {
             reply["controller_input"] = supported.clone();
         }
+        if let Some(supported) = &self.input_pen_touch_supported {
+            reply["pen_touch_supported"] = supported.clone();
+        }
+        if let Some(enabled) = &self.input_native_pen_touch {
+            reply["native_pen_touch"] = enabled.clone();
+        }
         reply
     }
 
@@ -648,6 +657,9 @@ impl Broker {
                 let mut reply = json!({"ok":true,"stream":id,"state":if allocation.state=="closing" {"closing"} else {"running"},"packet_boundaries":true});
                 if let Some(geometry) = &self.desktop_geometry {
                     reply["desktop_geometry"] = geometry.clone();
+                }
+                if let Some(port) = &self.touch_port {
+                    reply["touch_port"] = port.clone();
                 }
                 reply
             }

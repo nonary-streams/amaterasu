@@ -30,6 +30,7 @@ pub enum Input<'a> {
     },
     Text(&'a str),
     Controller(ControllerState),
+    PenTouch(PenTouch),
     EnableHaptics {
         enabled: bool,
     },
@@ -37,6 +38,38 @@ pub enum Input<'a> {
         magic: u32,
         payload: &'a [u8],
     },
+}
+
+/// Authenticated Moonlight pen/touch payload. Floating fields remain as their
+/// little-endian IEEE-754 bits so malformed values can be rejected at ingress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PenTouch {
+    pub device: PointerDevice,
+    pub event: PointerEvent,
+    pub pointer_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub pressure: u32,
+    pub contact_major: u32,
+    pub contact_minor: u32,
+    pub rotation: u16,
+    pub tool: Option<u8>,
+    pub buttons: Option<u8>,
+    pub tilt: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerDevice {
+    Touch,
+    Pen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerEvent {
+    Down,
+    Up,
+    Move,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,11 +137,77 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Input<'_>, DecodeError> {
                 enabled: enabled == 1,
             })
         }
+        0x55000002 | 0x55000003 => pen_touch(magic, body).map(Input::PenTouch),
         _ => Ok(Input::Unsupported {
             magic,
             payload: body,
         }),
     }
+}
+
+fn pen_touch(magic: u32, body: &[u8]) -> Result<PenTouch, DecodeError> {
+    exact(body, 28)?;
+    let event = match body[0] {
+        1 => PointerEvent::Down,
+        2 => PointerEvent::Up,
+        3 => PointerEvent::Move,
+        4 => PointerEvent::Cancel,
+        _ => return Err(DecodeError::InvalidValue),
+    };
+    let pen = magic == 0x55000003;
+    if (pen
+        && (body[3] != 0
+            || body[19] != 0
+            || body[1] > 2
+            || body[2] & !7 != 0
+            || (body[18] > 90 && body[18] != 0xff)))
+        || (!pen && body[1] != 0)
+    {
+        return Err(DecodeError::InvalidValue);
+    }
+    let (x, y, pressure, major, minor, rotation) = if pen {
+        (
+            le32(body, 4),
+            le32(body, 8),
+            le32(body, 12),
+            le32(body, 20),
+            le32(body, 24),
+            le16(body, 16),
+        )
+    } else {
+        (
+            le32(body, 8),
+            le32(body, 12),
+            le32(body, 16),
+            le32(body, 20),
+            le32(body, 24),
+            le16(body, 2),
+        )
+    };
+    if [x, y, pressure, major, minor]
+        .into_iter()
+        .any(|bits| !f32::from_bits(bits).is_finite())
+    {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(PenTouch {
+        device: if pen {
+            PointerDevice::Pen
+        } else {
+            PointerDevice::Touch
+        },
+        event,
+        pointer_id: if pen { 1 } else { le32(body, 4) },
+        x,
+        y,
+        pressure,
+        contact_major: major,
+        contact_minor: minor,
+        rotation,
+        tool: pen.then_some(body[1]),
+        buttons: pen.then_some(body[2]),
+        tilt: pen.then_some(body[18]),
+    })
 }
 
 fn keyboard(pressed: bool, body: &[u8]) -> Result<Input<'_>, DecodeError> {

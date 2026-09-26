@@ -157,7 +157,10 @@ impl InputTranslator {
                 vec![InputEvent::Controller(state)]
             }
             Input::Controller(_) => return Err(TranslationError::InvalidController),
-            Input::Text(_) | Input::EnableHaptics { .. } | Input::Unsupported { .. } => {
+            Input::Text(_)
+            | Input::EnableHaptics { .. }
+            | Input::PenTouch(_)
+            | Input::Unsupported { .. } => {
                 return Err(TranslationError::UnsupportedInput);
             }
         };

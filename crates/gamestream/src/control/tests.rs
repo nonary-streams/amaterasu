@@ -1,5 +1,57 @@
 use super::*;
 
+#[test]
+fn authenticated_touch_and_pen_records_preserve_identity_and_reject_malformed_data() {
+    let mut touch = vec![0u8; 36];
+    touch[..4].copy_from_slice(&32u32.to_be_bytes());
+    touch[4..8].copy_from_slice(&0x55000002u32.to_le_bytes());
+    touch[8] = 1;
+    touch[12..16].copy_from_slice(&0x12345678u32.to_le_bytes());
+    for offset in [16, 20, 24, 28, 32] {
+        touch[offset..offset + 4].copy_from_slice(&0.5f32.to_bits().to_le_bytes());
+    }
+    assert!(matches!(
+        client(0x0206, &touch),
+        Ok(Message::Input(Input::PenTouch(PenTouch {
+            pointer_id: 0x12345678,
+            device: PointerDevice::Touch,
+            event: PointerEvent::Down,
+            ..
+        })))
+    ));
+    touch[8] = 0;
+    assert_eq!(client(0x0206, &touch), Err(DecodeError::InvalidValue));
+    touch[8] = 1;
+    touch[16..20].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+    assert_eq!(client(0x0206, &touch), Err(DecodeError::InvalidValue));
+    touch.pop();
+    assert_eq!(client(0x0206, &touch), Err(DecodeError::InvalidLength));
+
+    let mut pen = vec![0u8; 36];
+    pen[..4].copy_from_slice(&32u32.to_be_bytes());
+    pen[4..8].copy_from_slice(&0x55000003u32.to_le_bytes());
+    pen[8] = 4;
+    pen[9] = 2;
+    pen[10] = 5;
+    pen[26] = 0xff;
+    pen[24..26].copy_from_slice(&0xffffu16.to_le_bytes());
+    assert!(matches!(
+        client(0x0206, &pen),
+        Ok(Message::Input(Input::PenTouch(PenTouch {
+            pointer_id: 1,
+            device: PointerDevice::Pen,
+            event: PointerEvent::Cancel,
+            tool: Some(2),
+            buttons: Some(5),
+            tilt: Some(0xff),
+            rotation: 0xffff,
+            ..
+        })))
+    ));
+    pen[10] = 8;
+    assert_eq!(client(0x0206, &pen), Err(DecodeError::InvalidValue));
+}
+
 fn fixture(name: &str) -> (u16, Vec<u8>) {
     let row = include_str!("vectors.txt")
         .lines()
