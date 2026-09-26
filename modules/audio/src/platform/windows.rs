@@ -1141,15 +1141,25 @@ impl Capture {
 
     fn is_current_console_default(&self) -> bool {
         let Ok(enumerator) = enumerator() else {
-            // A failed check triggers the worker's recoverable default reopen.
-            return false;
+            // A transient policy query failure does not prove that the
+            // capture endpoint changed. Retry the query at the next poll.
+            return true;
         };
-        // SAFETY: this read-only query runs on the capture's live apartment
-        // thread; no COM interface leaves the worker.
-        let Ok(device) = (unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }) else {
-            return false;
-        };
-        identifier(&device).is_ok_and(|endpoint| endpoint == self.endpoint)
+        console_default_matches_capture(
+            role_endpoint(&enumerator, DefaultRole::Console),
+            &self.endpoint,
+        )
+    }
+}
+
+fn console_default_matches_capture(
+    current: AudioResult<Option<String>>,
+    captured_endpoint: &str,
+) -> bool {
+    match current {
+        Ok(Some(endpoint)) => endpoint == captured_endpoint,
+        Ok(None) => false,
+        Err(_) => true,
     }
 }
 
@@ -1233,6 +1243,23 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_default_poll_reopens_only_for_a_confirmed_change() {
+        assert!(console_default_matches_capture(
+            Ok(Some("render.current".into())),
+            "render.current"
+        ));
+        assert!(!console_default_matches_capture(
+            Ok(Some("render.new".into())),
+            "render.current"
+        ));
+        assert!(!console_default_matches_capture(Ok(None), "render.current"));
+        assert!(console_default_matches_capture(
+            Err("audio_route_snapshot_failed"),
+            "render.current"
+        ));
+    }
 
     #[derive(Default)]
     struct FakeCaptureBuffer {
