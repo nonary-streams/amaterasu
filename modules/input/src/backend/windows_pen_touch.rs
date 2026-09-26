@@ -308,6 +308,7 @@ impl WindowsPenTouch {
 
     fn refresh_active_contacts(&mut self) -> InputResult<()> {
         let virtual_desktop = self.api.virtual_desktop()?;
+        let mut first_error = None;
         for device in [PenTouchDevice::Pen, PenTouchDevice::Touch] {
             let Some(state) = self.device_state(device) else {
                 continue;
@@ -315,10 +316,19 @@ impl WindowsPenTouch {
             if state.contacts.is_empty() {
                 continue;
             }
-            let records = build_pointer_frame(device, &state.contacts, None, virtual_desktop)?;
-            self.api.inject(state.handle, &records)?;
+            let frame = build_pointer_frame(device, &state.contacts, None, virtual_desktop)
+                .map(|records| (state.handle, records));
+            let result = match frame {
+                Ok((handle, records)) => self.api.inject(handle, &records),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn device_state(&self, device: PenTouchDevice) -> Option<&PointerDeviceState> {
@@ -1657,6 +1667,53 @@ mod tests {
             refresh.pointerInfo.pointerFlags,
             POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE
         );
+    }
+
+    #[test]
+    fn failed_pen_keepalive_does_not_skip_healthy_touch_device() {
+        let (mut backend, state) = backend();
+        backend
+            .inject(&event(
+                PEN_POINTER_ID,
+                PenTouchDevice::Pen,
+                PenTouchPhase::Down,
+                100,
+                200,
+            ))
+            .unwrap();
+        backend
+            .inject(&event(
+                42,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                300,
+                400,
+            ))
+            .unwrap();
+
+        let deadline = backend.next_keepalive.unwrap();
+        state.borrow_mut().fail_next_injection = true;
+        assert_eq!(
+            backend.advance(deadline).unwrap_err().code,
+            "injection_failed"
+        );
+        {
+            let state = state.borrow();
+            assert_eq!(state.frames.len(), 3);
+            assert_eq!(state.frames[2].0, PenTouchDevice::Touch);
+            let refresh = touch_info(&state.frames[2].1[0]);
+            assert_eq!(refresh.pointerInfo.pointerId, 42);
+            assert_eq!(
+                refresh.pointerInfo.pointerFlags,
+                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE
+            );
+        }
+
+        backend.advance(backend.next_keepalive.unwrap()).unwrap();
+        let state = state.borrow();
+        assert_eq!(state.frames.len(), 5);
+        assert_eq!(state.frames[3].0, PenTouchDevice::Pen);
+        assert_eq!(state.frames[4].0, PenTouchDevice::Touch);
     }
 
     #[test]
