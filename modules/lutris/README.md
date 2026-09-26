@@ -36,8 +36,11 @@ protected `/usr/bin/flatpak` or `/usr/local/bin/flatpak` launcher. A bounded
 one stable app reference. The Catalog launch is the verified launcher with
 `run --user --branch=stable --arch=<host architecture> net.lutris.Lutris
 lutris:rungameid/<id>` as fixed argv, without a shell. Failed or timed-out
-probes leave the Catalog unchanged. Status reports
-local database and executable hints; the discovery probe authorizes an import.
+probes leave the Catalog unchanged. Status also checks the bounded current-user
+app probe before reporting a Flatpak source available; database and executable
+fields remain local hints. A child whose exit is not confirmed after a bounded
+kill attempt remains owned for the next probe to retry. Persistent OS failure
+or module unload can prevent confirmed reaping.
 Native database plus native client take precedence. A native executable with
 only Flatpak data uses the verified Flatpak pair. Machine services do not
 infer another user's installation. Flatpak-only launch is an Amaterasu addition

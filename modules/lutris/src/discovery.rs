@@ -4,7 +4,9 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +19,10 @@ const MAX_SCAN_TIME: Duration = Duration::from_secs(8);
 const FLATPAK_APP_ID: &str = "net.lutris.Lutris";
 #[cfg(target_os = "linux")]
 const FLATPAK_PROBE_TIME: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const FLATPAK_PROBE_CLEANUP_TIME: Duration = Duration::from_millis(250);
+#[cfg(target_os = "linux")]
+static UNSETTLED_FLATPAK_PROBE: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchKind {
@@ -119,10 +125,7 @@ pub fn availability() -> Availability {
     let flatpak_executable_available = flatpak_executable.is_some();
     #[cfg(target_os = "linux")]
     let flatpak_installed = !(native_database && native_executable)
-        && flatpak_database_available
-        && flatpak_executable
-            .as_deref()
-            .is_some_and(flatpak_user_app_installed);
+        && flatpak_pair_available(flatpak_database_available, flatpak_executable.as_deref());
     #[cfg(not(target_os = "linux"))]
     let flatpak_installed = false;
     Availability {
@@ -251,11 +254,44 @@ fn select_flatpak_executable(
 }
 
 #[cfg(target_os = "linux")]
+fn flatpak_pair_available(database_available: bool, executable: Option<&Path>) -> bool {
+    database_available && executable.is_some_and(flatpak_user_app_installed)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_probe_child(child: &mut Child) -> bool {
+    let _ = child.kill();
+    let deadline = Instant::now() + FLATPAK_PROBE_CLEANUP_TIME;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn flatpak_user_app_installed(executable: &Path) -> bool {
     // Query the same per-user installation that the projected launch will use.
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+    // An unconfirmed prior child remains owned here. Reap it before another
+    // probe can start; a stuck child makes current availability fail closed.
+    let mut unsettled = match UNSETTLED_FLATPAK_PROBE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    if let Some(child) = unsettled.as_mut() {
+        if !stop_probe_child(child) {
+            return false;
+        }
+        *unsettled = None;
+    }
     let nonce = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(time) => time.as_nanos(),
         Err(_) => return false,
@@ -295,8 +331,9 @@ fn flatpak_user_app_installed(executable: &Path) -> bool {
     };
     // The descriptors survive unlinking; a descendant cannot hold a pipe read open.
     if std::fs::remove_file(&output_path).is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
+        if !stop_probe_child(&mut child) {
+            *unsettled = Some(child);
+        }
         return false;
     }
     let deadline = Instant::now() + FLATPAK_PROBE_TIME;
@@ -305,8 +342,9 @@ fn flatpak_user_app_installed(executable: &Path) -> bool {
             .metadata()
             .map_or(true, |metadata| metadata.len() > 256)
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !stop_probe_child(&mut child) {
+                *unsettled = Some(child);
+            }
             return false;
         }
         match child.try_wait() {
@@ -321,8 +359,9 @@ fn flatpak_user_app_installed(executable: &Path) -> bool {
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if !stop_probe_child(&mut child) {
+                    *unsettled = Some(child);
+                }
                 return false;
             }
         }
@@ -897,10 +936,16 @@ mod tests {
         assert_eq!(source.games[0].id, 7);
         assert_eq!(source.launch_kind, LaunchKind::FlatpakUser);
         assert!(flatpak_database_path(&home, uid.saturating_add(1)).is_none());
-        std::fs::write(&launcher, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 5\n").unwrap();
         let started = Instant::now();
-        assert!(!flatpak_user_app_installed(&launcher));
-        assert!(started.elapsed() < Duration::from_secs(4));
+        let installed = flatpak_pair_available(true, Some(&launcher));
+        assert!(!paired_source_available(
+            false, false, true, true, installed
+        ));
+        assert!(
+            started.elapsed()
+                < FLATPAK_PROBE_TIME + FLATPAK_PROBE_CLEANUP_TIME + Duration::from_secs(1)
+        );
         std::fs::write(
             &launcher,
             "#!/bin/sh\nprintf 'app/other/x86_64/stable\\n'\n",
