@@ -24,6 +24,142 @@ fn absent_document() -> Value {
     })
 }
 
+struct StartupBroker {
+    retained: Option<Value>,
+    current: Value,
+    fresh_requests: usize,
+}
+
+impl StartupBroker {
+    fn send(&mut self, command: Command) -> ModuleResult<Response> {
+        match command {
+            Command::Request {
+                payload,
+                operation_id,
+                ..
+            } => {
+                assert_eq!(payload, product_get());
+                assert_eq!(operation_id, "session-history.configuration.startup.0");
+                if self.retained.is_some() {
+                    Ok(Response::Accepted { id: 7 })
+                } else {
+                    self.fresh_requests += 1;
+                    Ok(Response::Accepted { id: 8 })
+                }
+            }
+            Command::TakeResult { request: 7 } => Ok(Response::Result {
+                payload: self.retained.clone().expect("retained result remains"),
+            }),
+            Command::TakeResult { request: 8 } => Ok(Response::Result {
+                payload: self.current.clone(),
+            }),
+            Command::ReleaseResult { request: 7 } => {
+                self.retained = None;
+                Ok(Response::Ok)
+            }
+            Command::ReleaseResult { request: 8 } => Ok(Response::Ok),
+            _ => panic!("unexpected startup broker command"),
+        }
+    }
+}
+
+fn advance_startup(settings: &mut ProductSettings, broker: &mut StartupBroker) {
+    settings
+        .advance(&mut |command| broker.send(command))
+        .unwrap();
+}
+
+#[test]
+fn restart_releases_retained_document_before_reading_current_revision() {
+    let stale = HistorySettings {
+        enabled: false,
+        ttl_days: 12,
+        db_size_limit_mb: 10,
+    };
+    let current = HistorySettings {
+        enabled: true,
+        ttl_days: 3,
+        db_size_limit_mb: 20,
+    };
+    let mut settings = ProductSettings::new(Some(stale.clone()));
+    let mut broker = StartupBroker {
+        retained: Some(document(&stale, 2)),
+        current: document(&current, 4),
+        fresh_requests: 0,
+    };
+
+    for _ in 0..3 {
+        advance_startup(&mut settings, &mut broker);
+    }
+    assert!(!settings.is_ready());
+    assert_eq!(settings.settings(), (&HistorySettings::default(), 0));
+    assert_eq!(broker.fresh_requests, 0);
+
+    for _ in 0..3 {
+        advance_startup(&mut settings, &mut broker);
+    }
+    assert_eq!(broker.fresh_requests, 1);
+    assert_eq!(settings.settings(), (&current, 4));
+    assert!(settings.is_ready());
+    assert!(!settings.busy());
+}
+
+#[test]
+fn restart_migrates_only_after_fresh_absent_document() {
+    let legacy = HistorySettings {
+        enabled: false,
+        ttl_days: 13,
+        db_size_limit_mb: 24,
+    };
+    let mut settings = ProductSettings::new(Some(legacy.clone()));
+    let mut broker = StartupBroker {
+        retained: Some(absent_document()),
+        current: absent_document(),
+        fresh_requests: 0,
+    };
+    for _ in 0..3 {
+        advance_startup(&mut settings, &mut broker);
+    }
+    assert!(!settings.is_ready());
+    assert!(matches!(
+        settings.pending.as_ref().unwrap().work,
+        Work::ReconcileStartup { .. }
+    ));
+    for _ in 0..3 {
+        advance_startup(&mut settings, &mut broker);
+    }
+    assert_eq!(broker.fresh_requests, 1);
+    assert!(matches!(
+        settings.pending.as_ref().unwrap().work,
+        Work::Initialize { .. }
+    ));
+    let Call::Submit { payload, .. } = &settings.pending.as_ref().unwrap().call else {
+        panic!("fresh absence should start migration");
+    };
+    assert_eq!(payload, &product_update(&legacy, 0));
+}
+
+#[test]
+fn retained_absence_cannot_migrate_over_new_policy() {
+    let legacy = HistorySettings::default();
+    let current = HistorySettings {
+        enabled: false,
+        ttl_days: 2,
+        db_size_limit_mb: 8,
+    };
+    let mut settings = ProductSettings::new(Some(legacy));
+    let mut broker = StartupBroker {
+        retained: Some(absent_document()),
+        current: document(&current, 2),
+        fresh_requests: 0,
+    };
+    for _ in 0..6 {
+        advance_startup(&mut settings, &mut broker);
+    }
+    assert_eq!(settings.settings(), (&current, 2));
+    assert!(!settings.busy());
+}
+
 #[test]
 fn startup_imports_legacy_values_through_revision_zero_cas() {
     let legacy = HistorySettings {

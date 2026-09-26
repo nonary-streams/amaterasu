@@ -10,6 +10,9 @@ const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
 enum Work {
+    StartupProbe {
+        candidate: Option<HistorySettings>,
+    },
     Initialize {
         candidate: HistorySettings,
     },
@@ -83,7 +86,7 @@ impl ProductSettings {
             ready: false,
             next_operation: 1,
             pending: Some(Pending {
-                work: Work::ReconcileStartup {
+                work: Work::StartupProbe {
                     candidate: migration_candidate,
                 },
                 call: Call::Submit {
@@ -257,6 +260,7 @@ impl ProductSettings {
 
     fn on_submit_error(&mut self, work: Work, code: &str) {
         match work {
+            Work::StartupProbe { candidate } => self.retry_startup_probe(candidate, 20),
             Work::Initialize { candidate } if code == "revision_conflict" => {
                 self.start_startup_reconciliation(Some(candidate))
             }
@@ -287,6 +291,7 @@ impl ProductSettings {
 
     fn on_child_missing(&mut self, work: Work) {
         match work {
+            Work::StartupProbe { candidate } => self.start_startup_reconciliation(candidate),
             Work::Initialize { candidate } => self.start_startup_reconciliation(Some(candidate)),
             Work::ReconcileStartup { candidate } => self.start_startup_reconciliation(candidate),
             Work::Update {
@@ -308,6 +313,9 @@ impl ProductSettings {
             return;
         };
         match work {
+            // The stable startup operation ID may reconnect to a result from the
+            // previous process. Only the GET submitted after its release is current.
+            Work::StartupProbe { candidate } => self.start_startup_reconciliation(candidate),
             Work::ReconcileStartup { candidate } => match read_document(&payload) {
                 Ok(Document::Found(settings, revision)) => self.adopt(settings, revision),
                 Ok(Document::Absent) => match candidate {
@@ -425,7 +433,7 @@ impl ProductSettings {
             work: Work::ReconcileStartup { candidate },
             call: Call::Submit {
                 payload: product_get(),
-                operation_id: self.next_operation_id("startup-reconcile"),
+                operation_id: "session-history.configuration.startup.0".into(),
                 parent: None,
                 retry_ticks: 0,
             },
@@ -480,7 +488,7 @@ impl ProductSettings {
             work: Work::ReconcileStartup { candidate },
             call: Call::Submit {
                 payload: product_get(),
-                operation_id: self.next_operation_id("startup-get"),
+                operation_id: "session-history.configuration.startup.0".into(),
                 parent: None,
                 retry_ticks,
             },
@@ -503,6 +511,7 @@ impl ProductSettings {
 
     fn retry_work(&mut self, work: Work, retry_ticks: u8) {
         match work {
+            Work::StartupProbe { candidate } => self.retry_startup_probe(candidate, retry_ticks),
             Work::Initialize { candidate } => self.retry_migration(candidate, retry_ticks),
             Work::Update {
                 management_request,
@@ -537,6 +546,18 @@ impl ProductSettings {
                 retry_ticks,
             ),
         }
+    }
+
+    fn retry_startup_probe(&mut self, candidate: Option<HistorySettings>, retry_ticks: u8) {
+        self.pending = Some(Pending {
+            work: Work::StartupProbe { candidate },
+            call: Call::Submit {
+                payload: product_get(),
+                operation_id: "session-history.configuration.startup.0".into(),
+                parent: None,
+                retry_ticks,
+            },
+        });
     }
 
     fn complete_failure(&mut self, request: u64, response: Value) {
