@@ -101,6 +101,8 @@ pub struct Broker {
     pub display_unavailable: bool,
     pub display_race_on_lost_apply: bool,
     pub display_restart_on_lost_apply: bool,
+    pub display_inactive_target: Option<String>,
+    pub display_active_ids: Vec<String>,
 }
 
 impl Broker {
@@ -526,6 +528,35 @@ impl Broker {
             "apply" => {
                 if self.display_apply_failure {
                     return error("invalid_configuration");
+                }
+                if let Some(inactive) = self.display_inactive_target.as_deref() {
+                    let Some(policy) = payload.get("mode_policy") else {
+                        return error("unsupported_topology");
+                    };
+                    if policy["display_id"] != inactive
+                        || policy["configuration_option"] != "ensure_active"
+                        || payload.get("mode_policies").is_some()
+                    {
+                        return error("unsupported_topology");
+                    }
+                    let Some(displays) = payload["configuration"]["displays"].as_array() else {
+                        return error("invalid_configuration");
+                    };
+                    let active: Vec<_> = displays
+                        .iter()
+                        .filter_map(|display| display["id"].as_str())
+                        .filter(|id| *id != inactive)
+                        .collect();
+                    if active.len() != self.display_active_ids.len()
+                        || !active.iter().all(|id| {
+                            self.display_active_ids
+                                .iter()
+                                .any(|expected| expected == id)
+                        })
+                        || !displays.iter().any(|display| display["id"] == inactive)
+                    {
+                        return error("unsupported_topology");
+                    }
                 }
                 assert_eq!(
                     payload["expected_topology_revision"],

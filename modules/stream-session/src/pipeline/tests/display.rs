@@ -11,6 +11,184 @@ fn display_request() -> Value {
     ]})
 }
 
+fn inactive_ensure_active_request() -> Value {
+    json!({
+        "expected_topology_revision":"0123456789abcdef0123456789abcdef",
+        "configuration":{"displays":[
+            {"id":"active-one","width":1920,"height":1080,
+                "refresh":{"numerator":60,"denominator":1},"x":0,"y":0,
+                "rotation":"identity","hdr_enabled":false},
+            {"id":"active-two","width":1280,"height":720,
+                "refresh":{"numerator":60,"denominator":1},"x":1920,"y":0,
+                "rotation":"identity","hdr_enabled":false},
+            {"id":"inactive-target","width":2560,"height":1440,
+                "refresh":{"numerator":60000,"denominator":1000},"x":3200,"y":0,
+                "rotation":"identity","hdr_enabled":false}
+        ]},
+        "mode_policy":{"display_id":"inactive-target",
+            "configuration_option":"ensure_active","remapping":{},
+            "context":{"resolution_is_automatic":false,"refresh_rate_is_automatic":false,
+                "client_display_mode_override":true,"optimize_game_settings":false}}
+    })
+}
+
+fn inactive_broker(host: &mut Harness) {
+    host.broker.display_inactive_target = Some("inactive-target".into());
+    host.broker.display_active_ids = vec!["active-one".into(), "active-two".into()];
+}
+
+#[test]
+fn inactive_ensure_active_preserves_full_request_and_owned_lease_lifecycle() {
+    let mut host = Harness::new();
+    inactive_broker(&mut host);
+    let mut request = prepare();
+    request["display_request"] = inactive_ensure_active_request();
+    let prepared = host.response(1, request.clone());
+    let id = prepared["session"].as_u64().unwrap();
+    assert_eq!(prepared["display_request"], request["display_request"]);
+    assert_eq!(host.response(2, start(id))["display_state"], "applied");
+    let operation = host.pipeline.records[&id].display_operation();
+    let apply = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply")
+        .unwrap();
+    assert_eq!(
+        apply.payload["configuration"],
+        request["display_request"]["configuration"]
+    );
+    assert_eq!(
+        apply.payload["mode_policy"],
+        request["display_request"]["mode_policy"]
+    );
+    assert_eq!(
+        apply.payload["expected_topology_revision"],
+        request["display_request"]["expected_topology_revision"]
+    );
+    assert_eq!(apply.payload["operation_id"], operation);
+    assert!(apply.payload.get("mode_policies").is_none());
+    let status = host.response(3, json!({"action":"status","session":id}));
+    assert_eq!(status["display_state"], "applied");
+    assert_eq!(status["display_applied"], true);
+    assert_eq!(status["display_request"], request["display_request"]);
+    assert_eq!(
+        host.broker.display_operation.as_deref(),
+        Some(operation.as_str())
+    );
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.display_lease.is_none());
+    assert!(
+        host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "status"
+        )
+    );
+    assert!(
+        host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "restore"
+        )
+    );
+}
+
+#[test]
+fn inactive_ensure_active_lost_result_reconciles_same_operation_and_restores() {
+    let mut host = Harness::new();
+    inactive_broker(&mut host);
+    let mut request = prepare();
+    request["display_request"] = inactive_ensure_active_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.display_restart_on_lost_apply = true;
+    host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
+    let started = host.response(2, start(id));
+    assert_eq!(started["state"], "active");
+    assert_eq!(started["display_state"], "recovery_required");
+    assert_eq!(
+        host.broker.display_operation.as_deref(),
+        Some(host.pipeline.records[&id].display_operation().as_str())
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"status","session":id}))["display_state"],
+        "recovery_required"
+    );
+    assert_eq!(
+        host.response(4, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.display_lease.is_none());
+    assert!(
+        host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
+        )
+    );
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(
+                |call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn inactive_target_other_options_and_wrong_operation_do_not_restore() {
+    for option in ["ensure_primary", "ensure_only_display"] {
+        let mut host = Harness::new();
+        inactive_broker(&mut host);
+        let mut request = prepare();
+        request["display_request"] = inactive_ensure_active_request();
+        request["display_request"]["mode_policy"]["configuration_option"] = json!(option);
+        let id = host.response(1, request)["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["state"], "active");
+        assert!(host.broker.display_lease.is_none());
+        assert_eq!(
+            host.response(3, json!({"action":"stop","session":id}))["state"],
+            "stopped"
+        );
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == "amaterasu.display/1"
+                    && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+        );
+    }
+
+    let mut host = Harness::new();
+    inactive_broker(&mut host);
+    let mut request = prepare();
+    request["display_request"] = inactive_ensure_active_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.display_race_on_lost_apply = true;
+    host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::BeforeMutation));
+    assert_eq!(
+        host.response(2, start(id))["display_state"],
+        "status_unverified"
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "cleanup_failed"
+    );
+    assert_eq!(
+        host.broker.display_operation.as_deref(),
+        Some("another-session-display")
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.display/1"
+                && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+    );
+}
+
 #[test]
 fn selected_display_configuration_options_reach_apply_and_cleanup() {
     let mut two_monitor = display_request();
