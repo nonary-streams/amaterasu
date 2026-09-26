@@ -554,7 +554,9 @@ impl Controller {
         let Ok(stream) = self.owned(owner, id) else {
             return MEDIA_CLOSED;
         };
-        if stream.failure.or(stream.source.health().failure).is_some() {
+        // A packet already handed to the sink remains owned by this stream
+        // until the sink accepts it, even if capture fails in the meantime.
+        if stream.pending.is_none() && stream.failure.or(stream.source.health().failure).is_some() {
             return MEDIA_BACKEND_ERROR;
         }
         if stream.pending.is_none() {

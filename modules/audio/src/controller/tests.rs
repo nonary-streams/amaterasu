@@ -904,6 +904,54 @@ fn read_failure_overrides_recovery_status_until_close_and_reacquire() {
     assert_eq!(observed.opens.lock().unwrap().len(), 2);
 }
 
+#[test]
+fn rejected_packet_can_be_delivered_after_capture_fails_then_stream_is_released() {
+    let (mut controller, observed) = controller(true);
+    let stream_id = controller.handle("alice", open()).unwrap().created.unwrap();
+    let mut sink = Sink {
+        reject: true,
+        packets: Vec::new(),
+    };
+    let callback = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+
+    // SAFETY: callback context and the retained provider packet outlive each read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BUSY
+    );
+    observed.health.lock().unwrap().failure = Some("device_lost");
+    assert_eq!(
+        controller.status("alice", Some(stream_id))["streams"][0]["state"],
+        "failed"
+    );
+    sink.reject = false;
+    // SAFETY: callback context remains live through the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        STATUS_OK
+    );
+    assert_eq!(
+        sink.packets,
+        [(AUDIO_SILENT | AUDIO_DISCONTINUITY, 1, 100, 7, vec![0; 8])]
+    );
+    // The accepted packet is delivered once; the failed capture cannot supply another.
+    // SAFETY: callback context remains live through the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BACKEND_ERROR
+    );
+    controller.close("alice", stream_id).unwrap();
+    assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    // SAFETY: callback context remains live through the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_CLOSED
+    );
+}
+
 unsafe fn bind(factory: &Factory, owner: &str) -> *const AudioCaptureApi {
     let query = NativeInterfaceQuery {
         header: AbiHeader::of::<NativeInterfaceQuery>(),
