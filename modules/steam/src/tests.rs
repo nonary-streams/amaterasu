@@ -700,6 +700,10 @@ struct FakeHost {
     catalog_generation: u64,
     catalog_next_sequence: u64,
     catalog_finish_failures_remaining: u8,
+    catalog_hold_next_request: bool,
+    catalog_cancel_failures_remaining: u8,
+    catalog_release_failures_remaining: u8,
+    canceled: Vec<u64>,
 }
 
 impl FakeHost {
@@ -741,6 +745,11 @@ impl FakeHost {
                     }
                 } else if service == "amaterasu.catalog/1" {
                     self.catalog_requests.push(payload.clone());
+                    if self.catalog_hold_next_request {
+                        self.catalog_hold_next_request = false;
+                        self.child_results.insert(request, Response::Pending);
+                        return Response::Accepted { id: request };
+                    }
                     let result = match action {
                         "provider_snapshot_begin" => {
                             self.catalog_generation += 1;
@@ -800,11 +809,33 @@ impl FakeHost {
                 .cloned()
                 .unwrap_or_else(|| Response::error("not_found", "result was released")),
             Command::ReleaseResult { request } => {
+                if self.catalog_release_failures_remaining > 0 {
+                    self.catalog_release_failures_remaining -= 1;
+                    return Response::error("unavailable", "release failed in fake host");
+                }
+                if matches!(self.child_results.get(&request), Some(Response::Pending)) {
+                    return Response::error("request_pending", "request is still active");
+                }
                 if self.child_results.remove(&request).is_some() {
                     self.released.push(request);
                     Response::Ok
                 } else {
                     Response::error("not_found", "result was already released")
+                }
+            }
+            Command::Cancel { request } => {
+                if self.catalog_cancel_failures_remaining > 0 {
+                    self.catalog_cancel_failures_remaining -= 1;
+                    return Response::error("unavailable", "cancel failed in fake host");
+                }
+                if let Some(result) = self.child_results.get_mut(&request) {
+                    self.canceled.push(request);
+                    if matches!(result, Response::Pending) {
+                        *result = Response::error("cancelled", "request cancelled");
+                    }
+                    Response::Ok
+                } else {
+                    Response::error("not_found", "request was already released")
                 }
             }
             Command::Complete { request, payload } => {
@@ -1499,6 +1530,83 @@ fn automatic_sync_skips_an_identical_new_revision_and_imports_changed_output() {
     assert_eq!(
         host.catalog_requests[3]["action"],
         "provider_snapshot_begin"
+    );
+}
+
+#[test]
+fn interrupted_scan_settles_pending_catalog_child_before_current_reconciliation() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_auto_sync(json!([]), 2));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    let settings = module.configuration.settings().clone();
+    set_complete_test_snapshot(&mut module.provider, 1, "Old membership");
+    host.catalog_hold_next_request = true;
+    let now = Instant::now();
+
+    for _ in 0..3 {
+        module
+            .catalog_sync
+            .tick_at(&module.runtime, &mut module.provider, &settings, now)
+            .unwrap();
+        if host.catalog_requests.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        host.catalog_requests[0]["action"],
+        "provider_snapshot_begin"
+    );
+    let old_request = host.next_child;
+    assert_eq!(module.catalog_sync.status()["syncing"], true);
+
+    module.provider.scan = Some(Scan::new(&[]));
+    host.catalog_cancel_failures_remaining = 1;
+    host.catalog_release_failures_remaining = 2;
+    module
+        .catalog_sync
+        .tick_at(&module.runtime, &mut module.provider, &settings, now)
+        .unwrap();
+    assert!(host.canceled.is_empty());
+    assert_eq!(module.catalog_sync.status()["syncing"], true);
+    assert!(matches!(
+        host.child_results.get(&old_request),
+        Some(Response::Pending)
+    ));
+    module
+        .catalog_sync
+        .tick_at(&module.runtime, &mut module.provider, &settings, now)
+        .unwrap();
+    assert_eq!(host.canceled, vec![old_request]);
+    assert_eq!(module.catalog_sync.status()["syncing"], true);
+    module
+        .catalog_sync
+        .tick_at(&module.runtime, &mut module.provider, &settings, now)
+        .unwrap();
+    assert!(!module.catalog_sync.status()["syncing"].as_bool().unwrap());
+    assert!(host.released.contains(&old_request));
+    assert_eq!(host.catalog_requests.len(), 1);
+
+    set_complete_test_snapshot(&mut module.provider, 2, "Current membership");
+    for _ in 0..8 {
+        module
+            .catalog_sync
+            .tick_at(&module.runtime, &mut module.provider, &settings, now)
+            .unwrap();
+    }
+    assert_eq!(
+        host.catalog_requests[1]["action"],
+        "provider_snapshot_begin"
+    );
+    assert_eq!(
+        host.catalog_requests[2]["entries"][0]["entry"]["name"],
+        "Current membership"
+    );
+    assert_eq!(
+        host.catalog_requests[3]["action"],
+        "provider_snapshot_finish"
     );
 }
 

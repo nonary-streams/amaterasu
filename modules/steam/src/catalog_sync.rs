@@ -635,8 +635,15 @@ impl CatalogSync {
         let Some(transaction) = self.transaction.as_mut() else {
             return Ok(());
         };
-        if transaction.cancel_after_call && transaction.call == CallState::Submit {
-            self.transaction = None;
+        if transaction.cancel_after_call {
+            match transaction.call {
+                CallState::Submit => self.transaction = None,
+                CallState::Waiting { request } => {
+                    if settle_canceled_request(runtime, request) {
+                        self.transaction = None;
+                    }
+                }
+            }
             return Ok(());
         }
         if transaction.delay_ticks > 0 {
@@ -679,10 +686,6 @@ impl CatalogSync {
                 let response = match runtime.send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => return Ok(()),
                     Ok(Response::Error { code, .. }) if code == "not_found" => {
-                        if transaction.cancel_after_call {
-                            self.transaction = None;
-                            return Ok(());
-                        }
                         transaction.call = CallState::Submit;
                         self.handle_retry("catalog child result expired; replaying snapshot step");
                         return Ok(());
@@ -699,10 +702,6 @@ impl CatalogSync {
                     transaction.delay_ticks = 1;
                     return Ok(());
                 };
-                if transaction.cancel_after_call {
-                    self.transaction = None;
-                    return Ok(());
-                }
                 match response {
                     Response::Result { payload } => self.consume_payload(payload, now),
                     Response::Error { code, message } => {
@@ -779,6 +778,17 @@ impl CatalogSync {
         }
         self.last_error = Some(message);
         self.schedule_next_scan(now);
+    }
+}
+
+fn settle_canceled_request(runtime: &RuntimeClient, request: u64) -> bool {
+    // A failed or lost Cancel response can still have canceled the child. Try
+    // ReleaseResult independently; retain ownership until release is confirmed.
+    let _ = runtime.send(Command::Cancel { request });
+    match runtime.send(Command::ReleaseResult { request }) {
+        Ok(Response::Ok) => true,
+        Ok(Response::Error { code, .. }) if code == "not_found" => true,
+        _ => false,
     }
 }
 
