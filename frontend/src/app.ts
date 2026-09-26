@@ -324,25 +324,30 @@ namespace Amaterasu {
       const logout = button(
         "Sign out",
         () => {
-          void this.api.logout().catch((error) => {
-            const card = this.root.querySelector(".login-card");
-            if (card) {
-              const warning = el(
-                "p",
-                "error",
-                error instanceof Error
-                  ? error.message
-                  : "Could not confirm sign-out. Retry when the host is reachable.",
-              );
-              warning.setAttribute("role", "alert");
-              card.prepend(warning);
+          logout.disabled = true;
+          void this.api.logout().then(() => {
+            clearTimeout(this.notificationTimer);
+            document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+            this.loginScreen();
+          }).catch((error) => {
+            const message = error instanceof Error
+              ? error.message
+              : "Could not confirm sign-out. Retry when the host is reachable.";
+            if (
+              error instanceof ApiError && error.code === "storage_unavailable" &&
+              this.api.subject
+            ) {
+              logout.disabled = false;
+              this.notify(message);
+              return;
             }
+            clearTimeout(this.notificationTimer);
+            document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+            this.loginScreen();
+            const warning = el("p", "error", message);
+            warning.setAttribute("role", "alert");
+            this.root.querySelector(".login-card")?.prepend(warning);
           });
-          clearTimeout(this.notificationTimer);
-          document
-            .querySelectorAll("dialog")
-            .forEach((dialog) => dialog.remove());
-          this.loginScreen();
         },
         "quiet",
       );

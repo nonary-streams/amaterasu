@@ -689,12 +689,20 @@ var Amaterasu;
             this.assertCookieStorageAvailable();
             if (!this.webLocks())
                 throw this.rememberedRefreshLockError();
-            const generation = this.authGeneration;
+            let generation = this.authGeneration;
             await this.withSessionLock(async () => {
-                await this.finishPendingCookieLogout();
+                if (await this.finishPendingCookieLogout())
+                    throw new Error("The sign-in attempt was cancelled by a pending sign-out.");
                 if (generation !== this.authGeneration)
                     throw new Error("The sign-in attempt was cancelled.");
+                await this.completeCookieLogout(this.markCookieLogoutPending());
+                this.resetMemory(true);
+                generation = this.authGeneration;
                 const reply = await this.send("auth/browser/login", { username, password, remember_me: rememberMe }, false, "", true);
+                if (this.pendingCookieLogout()) {
+                    await this.finishPendingCookieLogout();
+                    throw new Error("The sign-in attempt was cancelled by a pending sign-out.");
+                }
                 if (generation !== this.authGeneration) {
                     await this.completeCookieLogout(this.markCookieLogoutPending());
                     throw new Error("The sign-in attempt was cancelled.");
@@ -762,6 +770,8 @@ var Amaterasu;
             }
         }
         async postWithCookies(route, payload) {
+            if (this.pendingCookieLogout())
+                throw new ApiError("Sign-out is still pending. Retry when the host is reachable.", "logout_unconfirmed", 503);
             if (this.accessExpiresAt - Date.now() / 1000 <= 60)
                 await this.refreshCookieSession();
             if (!this.cookieSession || this.loggingOut)
@@ -826,10 +836,12 @@ var Amaterasu;
         async logoutCookieSession() {
             if (this.logoutInFlight)
                 return this.logoutInFlight;
-            this.loggingOut = true;
             const marker = this.markCookieLogoutPending();
-            this.resetMemory(true);
+            this.loggingOut = true;
+            this.resetMemory(true, true);
             const pending = this.withSessionLock(async () => {
+                if (this.readPendingCookieLogout() !== marker)
+                    return;
                 await this.completeCookieLogout(marker);
             });
             this.logoutInFlight = pending;
@@ -842,22 +854,32 @@ var Amaterasu;
             }
         }
         markCookieLogoutPending() {
+            if (this.pendingCookieLogout())
+                throw new ApiError("Another sign-out is pending. Retry after it completes.", "logout_unconfirmed", 503);
             const marker = `${Date.now()}:${crypto.randomUUID()}`;
             try {
                 localStorage.setItem(this.cookiePendingLogoutKey, marker);
-            }
-            catch {
-            }
-            return marker;
-        }
-        async finishPendingCookieLogout() {
-            let marker;
-            try {
-                marker = localStorage.getItem(this.cookiePendingLogoutKey);
+                if (localStorage.getItem(this.cookiePendingLogoutKey) !== marker)
+                    throw new Error("Browser storage did not retain the logout marker.");
             }
             catch {
                 throw this.cookieStorageError();
             }
+            return marker;
+        }
+        pendingCookieLogout() {
+            return this.readPendingCookieLogout() !== null;
+        }
+        readPendingCookieLogout() {
+            try {
+                return localStorage.getItem(this.cookiePendingLogoutKey);
+            }
+            catch {
+                throw this.cookieStorageError();
+            }
+        }
+        async finishPendingCookieLogout() {
+            const marker = this.readPendingCookieLogout();
             if (marker === null)
                 return false;
             await this.completeCookieLogout(marker);
@@ -889,8 +911,16 @@ var Amaterasu;
                     throw new ApiError("Could not confirm sign-out. The browser may still hold session cookies; retry when the host is reachable.", "logout_unconfirmed", 503);
             }
             try {
-                if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+                if (localStorage.getItem(this.cookiePendingLogoutKey) === marker) {
                     localStorage.removeItem(this.cookiePendingLogoutKey);
+                    if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+                        throw new Error("Browser storage retained the logout marker.");
+                }
+            }
+            catch {
+                throw this.cookieStorageError();
+            }
+            try {
                 localStorage.setItem(this.cookieLogoutKey, `${Date.now()}:${crypto.randomUUID()}`);
             }
             catch {
@@ -1410,7 +1440,7 @@ var Amaterasu;
             catch {
             }
         }
-        resetMemory(invalidatePersistence) {
+        resetMemory(invalidatePersistence, preserveRefresh = false) {
             this.authGeneration += 1;
             this.tokenGeneration += 1;
             if (invalidatePersistence)
@@ -1425,7 +1455,7 @@ var Amaterasu;
             this.cookieRefreshInFlight = null;
             this.sessionId = null;
             this.refreshInFlight = null;
-            this.abortRequests();
+            this.abortRequests(preserveRefresh);
         }
         abortRequests(preserveRefresh = false) {
             for (const request of this.requests) {
@@ -1440,7 +1470,7 @@ var Amaterasu;
             const controller = new AbortController();
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
-            if (route === "auth/refresh")
+            if (route === "auth/refresh" || route === "auth/browser/refresh")
                 this.refreshRequests.add(controller);
             try {
                 const headers = {
@@ -6419,21 +6449,28 @@ var Amaterasu;
             menu.setAttribute("aria-label", "Toggle navigation");
             menu.setAttribute("aria-expanded", "false");
             const logout = Amaterasu.button("Sign out", () => {
-                void this.api.logout().catch((error) => {
-                    const card = this.root.querySelector(".login-card");
-                    if (card) {
-                        const warning = Amaterasu.el("p", "error", error instanceof Error
-                            ? error.message
-                            : "Could not confirm sign-out. Retry when the host is reachable.");
-                        warning.setAttribute("role", "alert");
-                        card.prepend(warning);
+                logout.disabled = true;
+                void this.api.logout().then(() => {
+                    clearTimeout(this.notificationTimer);
+                    document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+                    this.loginScreen();
+                }).catch((error) => {
+                    const message = error instanceof Error
+                        ? error.message
+                        : "Could not confirm sign-out. Retry when the host is reachable.";
+                    if (error instanceof Amaterasu.ApiError && error.code === "storage_unavailable" &&
+                        this.api.subject) {
+                        logout.disabled = false;
+                        this.notify(message);
+                        return;
                     }
+                    clearTimeout(this.notificationTimer);
+                    document.querySelectorAll("dialog").forEach((dialog) => dialog.remove());
+                    this.loginScreen();
+                    const warning = Amaterasu.el("p", "error", message);
+                    warning.setAttribute("role", "alert");
+                    this.root.querySelector(".login-card")?.prepend(warning);
                 });
-                clearTimeout(this.notificationTimer);
-                document
-                    .querySelectorAll("dialog")
-                    .forEach((dialog) => dialog.remove());
-                this.loginScreen();
             }, "quiet");
             const top = Amaterasu.el("header", "topbar", Amaterasu.el("div", "actions", menu, Amaterasu.el("span", "topbar-label", "Host workspace")), Amaterasu.el("div", "account", Amaterasu.el("span", "account-avatar", this.api.subject.slice(0, 1).toUpperCase()), Amaterasu.el("span", "account-name", this.api.subject), Amaterasu.mountLocaleSelector(this.api), logout));
             this.notification = Amaterasu.el("div", "toast");

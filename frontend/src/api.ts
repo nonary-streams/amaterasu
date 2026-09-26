@@ -378,11 +378,17 @@ namespace Amaterasu {
     ): Promise<void> {
       this.assertCookieStorageAvailable();
       if (!this.webLocks()) throw this.rememberedRefreshLockError();
-      const generation = this.authGeneration;
+      let generation = this.authGeneration;
       await this.withSessionLock(async () => {
-        await this.finishPendingCookieLogout();
+        if (await this.finishPendingCookieLogout())
+          throw new Error("The sign-in attempt was cancelled by a pending sign-out.");
         if (generation !== this.authGeneration)
           throw new Error("The sign-in attempt was cancelled.");
+        // HttpOnly cookies cannot tell script whether an earlier session is
+        // still present. Confirm its revocation before replacing the pair.
+        await this.completeCookieLogout(this.markCookieLogoutPending());
+        this.resetMemory(true);
+        generation = this.authGeneration;
         const reply = await this.send<BrowserSession>(
           "auth/browser/login",
           { username, password, remember_me: rememberMe },
@@ -390,6 +396,10 @@ namespace Amaterasu {
           "",
           true,
         );
+        if (this.pendingCookieLogout()) {
+          await this.finishPendingCookieLogout();
+          throw new Error("The sign-in attempt was cancelled by a pending sign-out.");
+        }
         if (generation !== this.authGeneration) {
           await this.completeCookieLogout(this.markCookieLogoutPending());
           throw new Error("The sign-in attempt was cancelled.");
@@ -454,6 +464,12 @@ namespace Amaterasu {
     }
 
     private async postWithCookies<T>(route: string, payload: Payload): Promise<T> {
+      if (this.pendingCookieLogout())
+        throw new ApiError(
+          "Sign-out is still pending. Retry when the host is reachable.",
+          "logout_unconfirmed",
+          503,
+        );
       if (this.accessExpiresAt - Date.now() / 1000 <= 60)
         await this.refreshCookieSession();
       if (!this.cookieSession || this.loggingOut)
@@ -527,10 +543,11 @@ namespace Amaterasu {
 
     private async logoutCookieSession(): Promise<void> {
       if (this.logoutInFlight) return this.logoutInFlight;
-      this.loggingOut = true;
       const marker = this.markCookieLogoutPending();
-      this.resetMemory(true);
+      this.loggingOut = true;
+      this.resetMemory(true, true);
       const pending = this.withSessionLock(async () => {
+        if (this.readPendingCookieLogout() !== marker) return;
         await this.completeCookieLogout(marker);
       });
       this.logoutInFlight = pending;
@@ -543,22 +560,37 @@ namespace Amaterasu {
     }
 
     private markCookieLogoutPending(): string {
+      if (this.pendingCookieLogout())
+        throw new ApiError(
+          "Another sign-out is pending. Retry after it completes.",
+          "logout_unconfirmed",
+          503,
+        );
       const marker = `${Date.now()}:${crypto.randomUUID()}`;
       try {
         localStorage.setItem(this.cookiePendingLogoutKey, marker);
+        if (localStorage.getItem(this.cookiePendingLogoutKey) !== marker)
+          throw new Error("Browser storage did not retain the logout marker.");
       } catch {
-        // A failed request cannot be retried on reload without storage.
+        throw this.cookieStorageError();
       }
       return marker;
     }
 
-    private async finishPendingCookieLogout(): Promise<boolean> {
-      let marker: string | null;
+    private pendingCookieLogout(): boolean {
+      return this.readPendingCookieLogout() !== null;
+    }
+
+    private readPendingCookieLogout(): string | null {
       try {
-        marker = localStorage.getItem(this.cookiePendingLogoutKey);
+        return localStorage.getItem(this.cookiePendingLogoutKey);
       } catch {
         throw this.cookieStorageError();
       }
+    }
+
+    private async finishPendingCookieLogout(): Promise<boolean> {
+      const marker = this.readPendingCookieLogout();
       if (marker === null) return false;
       await this.completeCookieLogout(marker);
       return true;
@@ -600,14 +632,21 @@ namespace Amaterasu {
           );
       }
       try {
-        if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+        if (localStorage.getItem(this.cookiePendingLogoutKey) === marker) {
           localStorage.removeItem(this.cookiePendingLogoutKey);
+          if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+            throw new Error("Browser storage retained the logout marker.");
+        }
+      } catch {
+        throw this.cookieStorageError();
+      }
+      try {
         localStorage.setItem(
           this.cookieLogoutKey,
           `${Date.now()}:${crypto.randomUUID()}`,
         );
       } catch {
-        // Confirmed server revocation is sufficient when storage is denied.
+        // Confirmed server revocation is sufficient if peer signal fails.
       }
     }
 
@@ -1277,7 +1316,10 @@ namespace Amaterasu {
       }
     }
 
-    private resetMemory(invalidatePersistence: boolean): void {
+    private resetMemory(
+      invalidatePersistence: boolean,
+      preserveRefresh = false,
+    ): void {
       this.authGeneration += 1;
       this.tokenGeneration += 1;
       if (invalidatePersistence) this.persistenceGeneration += 1;
@@ -1291,7 +1333,7 @@ namespace Amaterasu {
       this.cookieRefreshInFlight = null;
       this.sessionId = null;
       this.refreshInFlight = null;
-      this.abortRequests();
+      this.abortRequests(preserveRefresh);
     }
 
     private abortRequests(preserveRefresh = false): void {
@@ -1314,7 +1356,8 @@ namespace Amaterasu {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 12_000);
       this.requests.add(controller);
-      if (route === "auth/refresh") this.refreshRequests.add(controller);
+      if (route === "auth/refresh" || route === "auth/browser/refresh")
+        this.refreshRequests.add(controller);
       try {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
