@@ -4,7 +4,7 @@ use crate::model::{
     SessionEvent, SessionMetadata, SessionSample, SessionSummary, validate_text,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +14,8 @@ const PRUNE_INTERVAL_SECONDS: i64 = 3_600;
 const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 // The broker rejects completed response payloads above this serialized size.
 const MAX_DETAIL_RESPONSE_BYTES: usize = 16_384;
+const ACTIVITY_RESERVATION_SECONDS: i64 = 300;
+const MAX_ACTIVITY_IDS: usize = 4096;
 
 #[derive(Debug)]
 pub enum HistoryError {
@@ -55,6 +57,9 @@ pub struct HistoryStore {
     configuration_ready: bool,
     effective_enabled: bool,
     active_streams: BTreeSet<String>,
+    pending_activities: BTreeMap<String, i64>,
+    terminal_activities: BTreeSet<String>,
+    terminal_order: VecDeque<String>,
     failed_operations: u64,
     last_prune: PruneReport,
     next_prune_at_unix: Option<i64>,
@@ -89,6 +94,9 @@ impl HistoryStore {
             #[cfg(test)]
             fail_next_read_only_open: false,
             active_streams: BTreeSet::new(),
+            pending_activities: BTreeMap::new(),
+            terminal_activities: BTreeSet::new(),
+            terminal_order: VecDeque::new(),
             failed_operations: 0,
             last_prune: empty_prune_report(),
             next_prune_at_unix: None,
@@ -139,7 +147,8 @@ impl HistoryStore {
         self.configuration_ready = true;
         // Keep the recording decision stable for every stream in the current
         // cohort. Retention reads the new settings immediately below.
-        if self.active_streams.is_empty() {
+        self.expire_stream_activities(now_unix);
+        if self.activity_cohort_drained() {
             self.transition_writer(now_unix)?;
         }
         if self.effective_enabled {
@@ -152,13 +161,14 @@ impl HistoryStore {
     /// Periodic retention also runs when no further sessions end. Failed
     /// attempts count as degraded operations and retry at the next interval.
     pub fn prune_if_due(&mut self, now_unix: i64) {
+        self.expire_stream_activities(now_unix);
         if self.configuration_ready
             && (self.writer_open != self.settings.enabled
                 || self.effective_enabled != self.settings.enabled)
         {
             // A failed connection transition is retried without changing the
             // policy or dropping admitted writes.
-            if self.active_streams.is_empty() && self.transition_writer(now_unix).is_err() {
+            if self.activity_cohort_drained() && self.transition_writer(now_unix).is_err() {
                 self.record_failure();
             }
         }
@@ -191,12 +201,74 @@ impl HistoryStore {
         Ok(true)
     }
 
+    /// Reserve the current recording policy while a stream is being launched.
+    /// Repeated begin calls keep the first expiry; only volatile state is used.
+    pub fn begin_stream_activity(
+        &mut self,
+        session_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, HistoryError> {
+        validate_activity_id(session_id)?;
+        self.expire_stream_activities(now_unix);
+        if self.terminal_activities.contains(session_id) {
+            return Err(HistoryError::Invalid("stream activity has already ended"));
+        }
+        if !self.configuration_ready {
+            return Ok(false);
+        }
+        if self.active_streams.contains(session_id)
+            || self.pending_activities.contains_key(session_id)
+        {
+            return Ok(true);
+        }
+        if self.pending_activities.len() >= MAX_ACTIVITY_IDS {
+            return Err(HistoryError::Invalid("too many pending stream activities"));
+        }
+        self.pending_activities.insert(
+            session_id.to_owned(),
+            now_unix.saturating_add(ACTIVITY_RESERVATION_SECONDS),
+        );
+        Ok(true)
+    }
+
+    /// Ends a pending launch without creating a history event. An attached
+    /// active stream is left for session_end to close in the usual order.
+    pub fn end_stream_activity(
+        &mut self,
+        session_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, HistoryError> {
+        validate_activity_id(session_id)?;
+        self.expire_stream_activities(now_unix);
+        if self.terminal_activities.contains(session_id) {
+            return Ok(false);
+        }
+        self.pending_activities.remove(session_id);
+        self.mark_activity_terminal(session_id);
+        self.finish_drained_transition(now_unix);
+        Ok(true)
+    }
+
+    #[cfg(test)]
     pub fn begin_session(
         &mut self,
         metadata: &SessionMetadata,
         started_at_unix: i64,
     ) -> Result<bool, HistoryError> {
+        self.begin_session_at(metadata, started_at_unix, started_at_unix)
+    }
+
+    pub fn begin_session_at(
+        &mut self,
+        metadata: &SessionMetadata,
+        started_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, HistoryError> {
         metadata.validate().map_err(HistoryError::Invalid)?;
+        self.expire_stream_activities(now_unix);
+        if self.terminal_activities.contains(&metadata.session_id) {
+            return Err(HistoryError::Invalid("stream activity has already ended"));
+        }
         if self.active_streams.contains(&metadata.session_id) {
             return Ok(false);
         }
@@ -208,6 +280,7 @@ impl HistoryStore {
 
         if !self.effective_enabled {
             self.active_streams.insert(metadata.session_id.clone());
+            self.pending_activities.remove(&metadata.session_id);
             return Ok(false);
         }
         let transaction = self
@@ -240,6 +313,7 @@ impl HistoryStore {
         trim_events(&transaction, &metadata.session_id)?;
         transaction.commit()?;
         self.active_streams.insert(metadata.session_id.clone());
+        self.pending_activities.remove(&metadata.session_id);
         Ok(true)
     }
 
@@ -285,10 +359,14 @@ impl HistoryStore {
         if was_active {
             self.active_streams.remove(session_id);
         }
+        // Even an end that raced ahead of begin is final for this ID. A late
+        // begin must not resurrect a session after its terminal signal.
+        self.pending_activities.remove(session_id);
+        self.mark_activity_terminal(session_id);
         if self.effective_enabled && (self.settings.enabled || ended) {
             self.prune_best_effort(retention_now_unix);
         }
-        if self.active_streams.is_empty()
+        if self.activity_cohort_drained()
             && (self.writer_open != self.settings.enabled
                 || self.effective_enabled != self.settings.enabled)
             && self.transition_writer(retention_now_unix).is_err()
@@ -576,6 +654,44 @@ impl HistoryStore {
         self.failed_operations = self.failed_operations.saturating_add(1);
     }
 
+    fn activity_cohort_drained(&self) -> bool {
+        self.active_streams.is_empty() && self.pending_activities.is_empty()
+    }
+
+    fn expire_stream_activities(&mut self, now_unix: i64) {
+        let expired: Vec<_> = self
+            .pending_activities
+            .iter()
+            .filter(|(_, deadline)| now_unix >= **deadline)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for session_id in expired {
+            self.pending_activities.remove(&session_id);
+            self.mark_activity_terminal(&session_id);
+        }
+    }
+
+    fn mark_activity_terminal(&mut self, session_id: &str) {
+        if self.terminal_activities.insert(session_id.to_owned()) {
+            self.terminal_order.push_back(session_id.to_owned());
+        }
+        while self.terminal_order.len() > MAX_ACTIVITY_IDS {
+            if let Some(oldest) = self.terminal_order.pop_front() {
+                self.terminal_activities.remove(&oldest);
+            }
+        }
+    }
+
+    fn finish_drained_transition(&mut self, now_unix: i64) {
+        if self.activity_cohort_drained()
+            && (self.writer_open != self.settings.enabled
+                || self.effective_enabled != self.settings.enabled)
+            && self.transition_writer(now_unix).is_err()
+        {
+            self.record_failure();
+        }
+    }
+
     fn prune_best_effort(&mut self, now_unix: i64) {
         if self.configuration_ready && self.effective_enabled && self.prune(now_unix).is_err() {
             self.record_failure();
@@ -636,6 +752,16 @@ impl HistoryStore {
 fn recover_existing_rows(connection: &mut Connection, now_unix: i64) -> Result<(), HistoryError> {
     close_interrupted_sessions(connection, now_unix)?;
     trim_existing_rows(connection)
+}
+
+fn validate_activity_id(session_id: &str) -> Result<(), HistoryError> {
+    validate_text(
+        session_id,
+        1,
+        crate::model::MAX_SESSION_ID_BYTES,
+        "session_id",
+    )
+    .map_err(HistoryError::Invalid)
 }
 
 fn close_interrupted_sessions(
@@ -1051,6 +1177,155 @@ mod tests {
 
     fn configure(store: &mut HistoryStore, settings: HistorySettings, now_unix: i64) {
         store.apply_configuration(settings, now_unix).unwrap();
+    }
+
+    #[test]
+    fn pending_launch_holds_recording_policy_until_attached_stream_ends() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        assert!(store.begin_stream_activity("launch", 101).unwrap());
+        assert!(store.begin_stream_activity("launch", 200).unwrap());
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            201,
+        );
+        assert!(store.settings().1);
+        assert!(
+            store
+                .begin_session_at(&metadata("launch"), 210, 210)
+                .unwrap()
+        );
+        assert_eq!(store.status().unwrap().events, 1);
+        assert!(store.end_session("launch", 220, 220).unwrap());
+        assert!(!store.settings().1);
+        assert_eq!(store.status().unwrap().events, 2);
+        assert!(!store.end_stream_activity("launch", 221).unwrap());
+        assert!(!store.end_stream_activity("launch", 222).unwrap());
+        assert!(store.begin_stream_activity("launch", 223).is_err());
+    }
+
+    #[test]
+    fn cancelled_and_expired_launches_release_policy_without_late_recording() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        assert!(store.begin_stream_activity("cancelled", 101).unwrap());
+        assert!(store.begin_stream_activity("expired", 102).unwrap());
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            103,
+        );
+        assert!(store.end_stream_activity("cancelled", 104).unwrap());
+        assert!(store.settings().1);
+        // A retry cannot extend the first deadline of 402.
+        assert!(store.begin_stream_activity("expired", 401).unwrap());
+        store.prune_if_due(402);
+        assert!(!store.settings().1);
+        assert!(store.begin_stream_activity("expired", 403).is_err());
+        assert!(
+            store
+                .begin_session_at(&metadata("expired"), 403, 403)
+                .is_err()
+        );
+        assert!(!store.end_stream_activity("expired", 404).unwrap());
+        assert_eq!(store.status().unwrap().sessions, 0);
+    }
+
+    #[test]
+    fn disabled_launch_holds_disabled_policy_and_restart_clears_reservations() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let mut store = HistoryStore::open(&path, 100).unwrap();
+        assert!(!store.begin_stream_activity("not-ready", 100).unwrap());
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            101,
+        );
+        assert!(store.begin_stream_activity("launch", 102).unwrap());
+        configure(&mut store, HistorySettings::default(), 103);
+        assert!(!store.settings().1);
+        assert!(
+            !store
+                .begin_session_at(&metadata("launch"), 104, 104)
+                .unwrap()
+        );
+        assert!(!store.end_session("launch", 105, 105).unwrap());
+        assert!(store.settings().1);
+        assert!(!store.end_stream_activity("launch", 106).unwrap());
+        assert!(store.begin_stream_activity("launch", 106).is_err());
+        drop(store);
+        let mut reopened = HistoryStore::open(&path, 107).unwrap();
+        configure(&mut reopened, HistorySettings::default(), 107);
+        assert!(reopened.begin_stream_activity("launch", 108).unwrap());
+    }
+
+    #[test]
+    fn end_before_begin_and_terminal_capacity_are_bounded() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            100,
+        );
+        assert!(store.end_stream_activity("cancelled", 101).unwrap());
+        assert!(!store.end_stream_activity("cancelled", 102).unwrap());
+        assert!(store.begin_stream_activity("cancelled", 103).is_err());
+        assert!(!store.end_session("early-end", 103, 103).unwrap());
+        assert!(store.begin_stream_activity("early-end", 104).is_err());
+        assert!(
+            store
+                .begin_session_at(&metadata("early-end"), 104, 104)
+                .is_err()
+        );
+        for index in 0..=MAX_ACTIVITY_IDS {
+            store
+                .end_stream_activity(&format!("unused-{index}"), 104)
+                .unwrap();
+        }
+        assert_eq!(store.terminal_activities.len(), MAX_ACTIVITY_IDS);
+        assert_eq!(store.terminal_order.len(), MAX_ACTIVITY_IDS);
+    }
+
+    #[test]
+    fn attached_stream_does_not_expire_with_its_launch_reservation() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        assert!(store.begin_stream_activity("attached", 101).unwrap());
+        assert!(
+            store
+                .begin_session_at(&metadata("attached"), 102, 102)
+                .unwrap()
+        );
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            103,
+        );
+        store.prune_if_due(1000);
+        assert!(store.settings().1);
+        assert!(store.end_session("attached", 1001, 1001).unwrap());
+        assert!(!store.settings().1);
     }
 
     #[test]

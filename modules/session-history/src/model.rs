@@ -141,6 +141,12 @@ pub enum Operation {
         settings: HistorySettings,
         expected_revision: u64,
     },
+    StreamActivityBegin {
+        session_id: String,
+    },
+    StreamActivityEnd {
+        session_id: String,
+    },
     SessionBegin {
         metadata: SessionMetadata,
         #[serde(default)]

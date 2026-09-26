@@ -297,7 +297,9 @@ impl SessionHistoryModule {
 
 fn is_authorized(caller: &str, operation: &Operation) -> bool {
     match operation {
-        Operation::SessionBegin { .. }
+        Operation::StreamActivityBegin { .. }
+        | Operation::StreamActivityEnd { .. }
+        | Operation::SessionBegin { .. }
         | Operation::SessionEnd { .. }
         | Operation::RecordSample { .. }
         | Operation::RecordEvent { .. } => caller == STREAM_SESSION_CALLER,
@@ -314,12 +316,20 @@ fn execute(
         Operation::SettingsGet {} | Operation::SettingsUpdate { .. } => Err(HistoryError::Invalid(
             "history settings are handled by the configuration client",
         )),
+        Operation::StreamActivityBegin { session_id } => Ok(json!({
+            "ok": true,
+            "reserved": store.begin_stream_activity(&session_id, now_unix)?,
+        })),
+        Operation::StreamActivityEnd { session_id } => Ok(json!({
+            "ok": true,
+            "ended": store.end_stream_activity(&session_id, now_unix)?,
+        })),
         Operation::SessionBegin {
             metadata,
             started_at_unix,
         } => Ok(json!({
             "ok": true,
-            "recorded": store.begin_session(&metadata, started_at_unix.unwrap_or(now_unix))?,
+            "recorded": store.begin_session_at(&metadata, started_at_unix.unwrap_or(now_unix), now_unix)?,
         })),
         Operation::SessionEnd {
             session_id,

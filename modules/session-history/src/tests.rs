@@ -11,7 +11,11 @@ fn operation(action: &str) -> Operation {
             payload["expected_revision"] = json!(1);
         }
         "session_begin" => payload["metadata"] = json!({"session_id":"id","protocol":"rtsp"}),
-        "session_end" | "session_detail" | "delete_session" => {
+        "stream_activity_begin"
+        | "stream_activity_end"
+        | "session_end"
+        | "session_detail"
+        | "delete_session" => {
             payload["session_id"] = json!("id");
         }
         "record_sample" => {
@@ -45,6 +49,8 @@ fn rpc_access_is_split_between_management_and_stream_lifecycle() {
     }
 
     for action in [
+        "stream_activity_begin",
+        "stream_activity_end",
         "session_begin",
         "session_end",
         "record_sample",
