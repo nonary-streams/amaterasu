@@ -80,8 +80,10 @@ Authenticated `SS_TOUCH` and `SS_PEN` records are decoded with exact sizes and
 preserve touch pointer IDs, the fixed pen identity, contact fields, and pen
 metadata. Hover remains unsupported. Stream-session forwards these records only
 with an active input lease, native pen/touch capability and policy, and valid
-`touch_port` metadata from video. Current production video providers do not emit
-that metadata, so live pen/touch input remains disabled until they do.
+`touch_port` metadata from video. Windows DXGI and WGC capture can now supply
+that mapping for verified physical monitor topology through video; other or
+unverified capture paths omit it and leave pen/touch input disabled. Live device
+and coordinate qualification remains pending.
 
 Controller arrival/motion/touch/battery, host rumble/LED/HDR feedback, legacy
 startup/input, loss-stat messages, and old termination variants are not
