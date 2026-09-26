@@ -5,9 +5,8 @@ use amaterasu_package::handoff::{
 use amaterasu_package::importer::{materialize_import_plan, runtime_state_directory};
 use amaterasu_package::migration::{
     LegacyConfigSource, LegacyProduct, LegacySearchPaths, MigrationReceipt,
-    ValidatedSensitiveSource,
-    analyze_legacy_configuration, canonical_existing_source_root, discover_legacy_sources,
-    import_legacy_configuration_with_sensitive_sources,
+    ValidatedSensitiveSource, analyze_legacy_configuration, canonical_existing_source_root,
+    discover_legacy_sources, import_legacy_configuration_with_sensitive_sources,
     preflight_legacy_configuration_with_sensitive_sources, rollback_legacy_configuration,
 };
 use serde::{Deserialize, Serialize};
@@ -177,13 +176,12 @@ fn run() -> Result<(), String> {
                 &validation.approvals,
             )?;
             if let Some(runtime) = runtime {
-                let materialized = finish_import(&receipt, || {
-                    let materialized = materialize_import_plan(&runtime, &receipt.plan)?;
-                    let state = runtime_state_directory(&runtime)?;
-                    seed_sensitive_sources(&destination, &validation, &state)?;
-                    write_import_validation(&runtime, &sources)?;
-                    Ok(materialized)
+                let materialized = finish_materialization(&receipt, || {
+                    materialize_import_plan(&runtime, &receipt.plan)
                 })?;
+                let state = runtime_state_directory(&runtime)?;
+                seed_sensitive_sources(&destination, &validation, &state)?;
+                write_import_validation(&runtime, &sources)?;
                 println!(
                     "migration runtime state materialized: {} application(s), {} setting(s)",
                     materialized.applications, materialized.settings
@@ -323,10 +321,11 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// A failed runtime handoff must leave the copied import retryable. Namespace
-/// seeds are idempotent and may have completed before the failure; the receipt
-/// removes only files this attempt created and keeps its source backup.
-fn finish_import<T>(
+/// Materialization either publishes its plan fully or rolls its own state back.
+/// Only at this stage can we also remove the new copied files for a clean retry.
+/// Later seed failures may already have committed a namespace, so their source
+/// snapshot must remain available for diagnosis and recovery.
+fn finish_materialization<T>(
     receipt: &MigrationReceipt,
     handoff: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
@@ -1405,7 +1404,7 @@ mod handoff_cli_tests {
     use super::*;
 
     #[test]
-    fn failed_credential_handoff_can_retry_with_updated_predecessor_file() {
+    fn failed_materialization_can_retry_with_updated_predecessor_credential() {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-credential-retry-{}-{:?}",
             std::process::id(),
@@ -1418,7 +1417,7 @@ mod handoff_cli_tests {
         fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
         fs::write(
             source_root.join("sunshine.conf"),
-            b"credentials_file = credentials/login.json\n",
+            b"credentials_file = credentials/login.json\nfps = 120\n",
         )
         .unwrap();
         fs::write(&credential_path, b"first verifier").unwrap();
@@ -1437,18 +1436,33 @@ mod handoff_cli_tests {
                 .unwrap();
         let imported = destination.join("legacy-imports/sunshine/credentials/login.json");
         assert_eq!(fs::read(&imported).unwrap(), b"first verifier");
-        assert_eq!(
-            finish_import(&first, || Err::<(), _>("credential seed failed".into())),
-            Err("credential seed failed".into())
+        let occupied_runtime = root.join("occupied-runtime");
+        fs::create_dir_all(&occupied_runtime).unwrap();
+        let mut occupied_plan = empty_plan();
+        occupied_plan
+            .settings
+            .insert("stream.default_fps".into(), "60".into());
+        materialize_import_plan(&occupied_runtime, &occupied_plan).unwrap();
+        assert!(
+            finish_materialization(&first, || {
+                materialize_import_plan(&occupied_runtime, &first.plan)
+            })
+            .is_err()
         );
         assert!(!imported.exists());
         assert!(first.backup_directory.join("receipt.json").is_file());
 
         fs::write(&credential_path, b"corrected verifier").unwrap();
+        let available_runtime = root.join("available-runtime");
+        fs::create_dir_all(&available_runtime).unwrap();
         let second =
             import_legacy_configuration_with_sensitive_sources(&destination, &sources, &validated)
                 .unwrap();
-        finish_import(&second, || Ok(())).unwrap();
+        let materialized = finish_materialization(&second, || {
+            materialize_import_plan(&available_runtime, &second.plan)
+        })
+        .unwrap();
+        assert_eq!(materialized.settings, 1);
         assert_eq!(fs::read(&imported).unwrap(), b"corrected verifier");
         let _ = fs::remove_dir_all(root);
     }
