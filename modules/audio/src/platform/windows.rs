@@ -511,46 +511,76 @@ fn stop_worker_then_restore_once(
     }
 }
 
-pub fn startup() {
-    let mut lifecycle = ROUTE_RESTORE_LIFECYCLE
+fn start_route_restore_lifecycle(
+    lifecycle: &Mutex<RouteRestoreLifecycle>,
+    shutting_down: &AtomicBool,
+    has_pending_restore: impl FnOnce() -> bool,
+    schedule_retry: impl FnOnce(),
+) {
+    let mut lifecycle = lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if lifecycle.start() {
         // The final prior shutdown joined its retry worker while holding this
         // lifecycle lock, so no worker from that generation can outlive reset.
-        ROUTE_RESTORE_SHUTTING_DOWN.store(false, Ordering::Release);
-        schedule_route_restore_retry_if_pending();
+        shutting_down.store(false, Ordering::Release);
+        if has_pending_restore() {
+            schedule_retry();
+        }
     }
 }
 
-pub fn shutdown() {
-    let mut lifecycle = ROUTE_RESTORE_LIFECYCLE
+fn stop_route_restore_lifecycle(
+    lifecycle: &Mutex<RouteRestoreLifecycle>,
+    shutting_down: &AtomicBool,
+    stop_worker_and_restore: impl FnOnce(),
+) {
+    let mut lifecycle = lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !lifecycle.stop() {
         return;
     }
-    ROUTE_RESTORE_SHUTTING_DOWN.store(true, Ordering::Release);
-    let worker = ROUTE_RESTORE_WORKER.get().and_then(|worker_state| {
-        worker_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    });
+    shutting_down.store(true, Ordering::Release);
+    stop_worker_and_restore();
+}
 
-    // Do not hold either policy state or worker state while joining. Shutdown
-    // needs a final attempt because the retry worker exits when its stop flag
-    // is set, potentially before it next examines pending route restoration.
-    stop_worker_then_restore_once(worker, route_restore_pending, || {
-        // Shutdown may run on a caller's incompatible COM apartment.
-        // Open a fresh STA for the final, bounded restoration attempt.
-        if let Ok(final_worker) = thread::Builder::new()
-            .name("audio-route-final-restore".to_owned())
-            .spawn(retry_pending_route_restore_once)
-        {
-            let _ = final_worker.join();
-        }
-    });
+pub fn startup() {
+    start_route_restore_lifecycle(
+        &ROUTE_RESTORE_LIFECYCLE,
+        &ROUTE_RESTORE_SHUTTING_DOWN,
+        route_restore_pending,
+        schedule_route_restore_retry_if_pending,
+    );
+}
+
+pub fn shutdown() {
+    stop_route_restore_lifecycle(
+        &ROUTE_RESTORE_LIFECYCLE,
+        &ROUTE_RESTORE_SHUTTING_DOWN,
+        || {
+            let worker = ROUTE_RESTORE_WORKER.get().and_then(|worker_state| {
+                worker_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            });
+
+            // Do not hold either policy state or worker state while joining. Shutdown
+            // needs a final attempt because the retry worker exits when its stop flag
+            // is set, potentially before it next examines pending route restoration.
+            stop_worker_then_restore_once(worker, route_restore_pending, || {
+                // Shutdown may run on a caller's incompatible COM apartment.
+                // Open a fresh STA for the final, bounded restoration attempt.
+                if let Ok(final_worker) = thread::Builder::new()
+                    .name("audio-route-final-restore".to_owned())
+                    .spawn(retry_pending_route_restore_once)
+                {
+                    let _ = final_worker.join();
+                }
+            });
+        },
+    );
 }
 
 fn retry_pending_route_restore_once() -> bool {
@@ -1523,16 +1553,58 @@ mod tests {
 
     #[test]
     fn route_retry_lifecycle_preserves_peer_and_rearms_after_final_release() {
-        let mut lifecycle = RouteRestoreLifecycle { active_modules: 0 };
-        assert!(lifecycle.start(), "first module owns retry startup");
-        assert!(!lifecycle.start(), "a peer shares the active retry worker");
-        assert!(
-            !lifecycle.stop(),
-            "closing one peer cannot stop restoration"
+        let lifecycle = Mutex::new(RouteRestoreLifecycle { active_modules: 0 });
+        let shutting_down = AtomicBool::new(true);
+        let pending_restore = Cell::new(false);
+        let scheduled_retries = Cell::new(0);
+        let final_restores = Cell::new(0);
+        let start = || {
+            start_route_restore_lifecycle(
+                &lifecycle,
+                &shutting_down,
+                || pending_restore.get(),
+                || {
+                    scheduled_retries.set(scheduled_retries.get() + 1);
+                    pending_restore.set(false);
+                },
+            );
+        };
+        let stop = || {
+            stop_route_restore_lifecycle(&lifecycle, &shutting_down, || {
+                final_restores.set(final_restores.get() + 1);
+            });
+        };
+
+        start();
+        assert!(!shutting_down.load(Ordering::Acquire));
+        assert_eq!(scheduled_retries.get(), 0);
+        pending_restore.set(true);
+        start();
+        assert_eq!(scheduled_retries.get(), 0, "peer reuses the current worker");
+        stop();
+        assert!(!shutting_down.load(Ordering::Acquire));
+        assert_eq!(
+            final_restores.get(),
+            0,
+            "peer close cannot stop restoration"
         );
-        assert!(lifecycle.stop(), "the final release joins the retry worker");
-        assert!(lifecycle.start(), "reload re-arms a pending restoration");
-        assert!(lifecycle.stop());
+        stop();
+        assert!(shutting_down.load(Ordering::Acquire));
+        assert_eq!(final_restores.get(), 1);
+        assert!(
+            pending_restore.get(),
+            "failed final restore remains pending"
+        );
+
+        start();
+        assert!(!shutting_down.load(Ordering::Acquire));
+        assert_eq!(scheduled_retries.get(), 1, "reload schedules pending retry");
+        assert!(!pending_restore.get(), "retry recovers the pending restore");
+        stop();
+        assert_eq!(final_restores.get(), 2);
+        start();
+        assert_eq!(scheduled_retries.get(), 1, "clean reload needs no retry");
+        stop();
     }
 
     #[test]
