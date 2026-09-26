@@ -214,6 +214,10 @@ impl Engine {
         let original_version = session_document.version;
         session_document.sessions.retain(|session| {
             Some(session.credential_digest.as_str()) == credential_digest.as_deref()
+                && credential_document
+                    .credential
+                    .as_ref()
+                    .is_some_and(|credential| session.subject == credential.username)
                 && session.scope_digest == scope_digest
                 && session.policy_generation == Some(self.settings.authorization_policy_generation)
                 && session.refresh_expires_at > now.max(self.latest_time)

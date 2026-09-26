@@ -1486,6 +1486,68 @@ fn legacy_credential_upgrade_persists_session_at_shared_namespace_revision() {
 }
 
 #[test]
+fn restart_prunes_sessions_with_a_subject_different_from_the_imported_administrator() {
+    let mut state = StateHarness::new();
+    let salt = "AbCdEfGhIjKlMnOp";
+    let password = "correct horse battery staple";
+    state.stored = Some(json!({
+        "credential": {
+            "username": "Admin",
+            "password_hash": crate::crypto::token_digest(&format!("{password}{salt}")),
+            "legacy_salt": salt,
+            "case_insensitive_username": true
+        },
+        "tokens": []
+    }));
+    state.revision = 1;
+
+    let mut pipeline = Pipeline::new(settings());
+    let login = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password}),
+        100,
+    );
+    assert_eq!(login["subject"], "Admin");
+
+    // An older module version recorded the login spelling as the session
+    // subject. A restart must not restore that stale identity claim.
+    state.session_stored.as_mut().unwrap()["sessions"][0]["subject"] = json!("ADMIN");
+    let mut restarted = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":[]}),
+            101,
+        ),
+        error("unauthorized")
+    );
+    assert_eq!(
+        state.session_stored.as_ref().unwrap()["sessions"],
+        json!([])
+    );
+
+    let fresh = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"login","username":"ADMIN","password":password}),
+        102,
+    );
+    assert_eq!(fresh["subject"], "Admin");
+    let mut restarted_again = Pipeline::new(settings());
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"verify","bearer":fresh["bearer"],"required_scopes":[]}),
+            103,
+        )["subject"],
+        "Admin"
+    );
+}
+
+#[test]
 fn default_refresh_lifetime_and_logout_revoke_the_entire_token_pair() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());
