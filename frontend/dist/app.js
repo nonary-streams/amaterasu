@@ -4247,6 +4247,7 @@ var Amaterasu;
         let offset = 0;
         const history = [0];
         let savedOffset = 0;
+        const savedHistory = [0];
         context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect and stop sessions owned by this management console.", Amaterasu.button("Refresh", () => {
             void load();
             void loadSaved();
@@ -4345,14 +4346,16 @@ var Amaterasu;
                 });
                 savedArea.replaceChildren(reply.sessions.length
                     ? Amaterasu.table(["Application / client", "Started", "Duration", "Actions"], rows)
-                    : Amaterasu.empty("No recorded streams", "Completed streams appear here when history recording is enabled."), Amaterasu.pager(savedOffset > 0
+                    : Amaterasu.empty("No recorded streams", "Completed streams appear here when history recording is enabled."), Amaterasu.pager(savedHistory.length > 1
                     ? () => {
-                        savedOffset = Math.max(0, savedOffset - 25);
+                        savedHistory.pop();
+                        savedOffset = savedHistory[savedHistory.length - 1] ?? 0;
                         void loadSaved();
                     }
-                    : null, reply.sessions.length === 25
+                    : null, reply.next_offset != null
                     ? () => {
-                        savedOffset += 25;
+                        savedOffset = reply.next_offset;
+                        savedHistory.push(savedOffset);
                         void loadSaved();
                     }
                     : null, `Showing from ${savedOffset + 1}`));
