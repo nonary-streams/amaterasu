@@ -1164,6 +1164,8 @@ fn correct_login_reclaims_one_full_remembered_session_durably() {
 
     let mut restarted = Pipeline::new(configured_settings.clone());
     let stored_before_failure = state.session_stored.clone();
+    let revision_before_failure = state.revision;
+    let session_revision_before_failure = state.session_revision;
     assert_eq!(
         state.request(
             &mut restarted,
@@ -1174,12 +1176,16 @@ fn correct_login_reclaims_one_full_remembered_session_durably() {
         "unauthorized"
     );
     assert_eq!(state.session_stored, stored_before_failure);
+    assert_eq!(state.revision, revision_before_failure);
+    assert_eq!(state.session_revision, session_revision_before_failure);
     state.fail_session_write = true;
     assert_eq!(
         state.request(&mut restarted, "frontend", login.clone(), 1_077),
         error("state_unavailable")
     );
     assert_eq!(state.session_stored, stored_before_failure);
+    assert_eq!(state.revision, revision_before_failure);
+    assert_eq!(state.session_revision, session_revision_before_failure);
     state.fail_session_write = false;
     assert_eq!(
         state.request(
@@ -1210,6 +1216,14 @@ fn correct_login_reclaims_one_full_remembered_session_durably() {
             .len(),
         16
     );
+    let serialized_sidecar = state.session_stored.as_ref().unwrap().to_string();
+    for token in original_sessions
+        .iter()
+        .chain(std::iter::once(&replacement))
+    {
+        assert!(!serialized_sidecar.contains(token["bearer"].as_str().unwrap()));
+        assert!(!serialized_sidecar.contains(token["refresh_token"].as_str().unwrap()));
+    }
 
     let mut after_replacement = Pipeline::new(configured_settings.clone());
     assert_eq!(
