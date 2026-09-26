@@ -42,7 +42,7 @@ separately so real progress remains visible without overstating completion.
 ## Build-enabled teams and workers
 
 The user approved build-enabled worktrees. Team and child worktrees use _large
-branch/directory names and manifest-recorded isolated build directories. The
+directory names and manifest-recorded isolated build directories. The
 Worktree provisioner creates them. Each child gets its own checkout and
 CARGO_TARGET_DIR=<manifest BuildDirectory>/cargo-target, with CARGO_BUILD_JOBS=2.
 Children must not inherit their coordinator's target directory for compilation.
@@ -127,8 +127,11 @@ slice or review; do not keep rediscovering the complete inventory.
 
 ## Prepared team roots and dispatch
 
-Team roots are D:/sources/worktrees/amaterasu-feature-N_large with branch
-config-throughput/feature-N_large, N=1..6. Child worktrees are
+Team roots are D:/sources/worktrees/amaterasu-feature-N_large, N=1..6. Their
+initial branches are config-throughput/feature-N_large; a coordinator may
+continue on a slot-specific feature-N respin branch when its manifest records
+that exact current branch. Relaunch the preserved clean checkout without
+switching it back or discarding commits. Child worktrees are
 D:/sources/worktrees/amaterasu-team-N-worker-M_large, M=1..3, with branch
 config-throughput/team-N-worker-M_large. Their manifests are under
 D:/sources/worktrees/.large-manifests. Build directories are the matching names

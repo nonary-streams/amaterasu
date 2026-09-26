@@ -18,7 +18,7 @@ function Read-WorktreeGit([string]$Worktree, [string[]]$GitArguments) {
 for ($slot = 1; $slot -le 6; $slot++) {
     $teamPath = Join-Path $runPath "team-$slot"
     $worktree = "D:/sources/worktrees/amaterasu-feature-${slot}_large"
-    $branch = "config-throughput/feature-${slot}_large"
+    $branch = Read-WorktreeGit $worktree @('branch', '--show-current')
     $slotLockPath = Join-Path $runPath "slot-$slot.lock"
     try {
         $slotLock = [IO.File]::Open($slotLockPath, 'OpenOrCreate', 'ReadWrite', 'None')
@@ -39,8 +39,8 @@ for ($slot = 1; $slot -le 6; $slot++) {
         }
     }
 
-    if ((Read-WorktreeGit $worktree @('branch', '--show-current')) -ne $branch) {
-        throw "Slot $slot branch does not match $branch"
+    if ($branch -notmatch "^config-throughput/feature-${slot}(?:_|-)") {
+        throw "Slot $slot is on an unexpected branch: $branch"
     }
     $head = Read-WorktreeGit $worktree @('rev-parse', 'HEAD')
     $dirty = @(Read-WorktreeGit $worktree @('status', '--porcelain')) | Where-Object { $_ }

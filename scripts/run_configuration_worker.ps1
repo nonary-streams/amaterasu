@@ -28,8 +28,8 @@ $runPath = [IO.Path]::GetFullPath($RunDirectory)
 if (!$Coordinator -and (Test-Path -LiteralPath (Join-Path $runPath 'coordinators-required.json'))) {
     throw 'This run now requires six coordinators with three workers each. Read the current configuration-execution-plan.md and use the team run directory with -Coordinator.'
 }
-if (!(Split-Path -Leaf $worktreePath).EndsWith('_large') -or !$ExpectedBranch.EndsWith('_large')) {
-    throw 'Workers require an explicitly provisioned _large worktree and branch.'
+if (!(Split-Path -Leaf $worktreePath).EndsWith('_large')) {
+    throw 'Workers require an explicitly provisioned _large worktree.'
 }
 $manifestPath = Join-Path (Split-Path -Parent $worktreePath) ('.large-manifests/' + (Split-Path -Leaf $worktreePath) + '.json')
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
