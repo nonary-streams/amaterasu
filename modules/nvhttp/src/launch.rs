@@ -8,7 +8,10 @@ mod record;
 mod workflow;
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("launch/tests.rs");
+    include!("launch/audio_tests.rs");
+}
 
 use crate::frame_limiter::FrameLimiterSettings;
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
@@ -460,7 +463,7 @@ impl StreamProfile {
             || !(100..=100_000).contains(&self.bitrate_kbps)
             || self.max_reference_frames > 1
             || !matches!(self.packet_ms, 5 | 10)
-            || !(6_000..=256_000).contains(&self.audio_bitrate)
+            || !(6_000..=512_000).contains(&self.audio_bitrate)
         {
             return Err("invalid_streaming_profile");
         }
