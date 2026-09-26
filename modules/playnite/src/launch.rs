@@ -84,7 +84,7 @@ impl Launches {
                     Err(TryRecvError::Disconnected) => {
                         launch.events = None;
                         if !launch.state.terminal() {
-                            launch.apply_state(State::CleanupFailed);
+                            launch.fail_cleanup();
                         }
                         break;
                     }
@@ -193,7 +193,7 @@ impl Launches {
                 let Ok(processes) =
                     refresh_processes_for_install(&existing.trusted_install_roots, processes)
                 else {
-                    existing.apply_state(State::CleanupFailed);
+                    existing.fail_cleanup();
                     return existing.response();
                 };
                 existing.processes = processes.clone();
@@ -205,7 +205,7 @@ impl Launches {
                         })
                         .is_err()
                 }) {
-                    existing.apply_state(State::CleanupFailed);
+                    existing.fail_cleanup();
                     return existing.response();
                 }
                 existing.stop_requested = true;
@@ -300,7 +300,7 @@ impl Launches {
             let Ok(processes) =
                 refresh_processes_for_install(&launch.trusted_install_roots, processes)
             else {
-                launch.apply_state(State::CleanupFailed);
+                launch.fail_cleanup();
                 return launch.response();
             };
             launch.processes = processes.clone();
@@ -312,7 +312,7 @@ impl Launches {
                     })
                     .is_err()
             }) {
-                launch.apply_state(State::CleanupFailed);
+                launch.fail_cleanup();
                 return launch.response();
             }
             launch.stop_requested = true;
@@ -324,13 +324,21 @@ impl Launches {
     fn prune(&mut self) {
         let now = Instant::now();
         self.by_ticket.retain(|_, launch| {
-            !launch.state.terminal() || now.duration_since(launch.changed_at) < LAUNCH_RETENTION
+            !launch.state.terminal()
+                || launch
+                    ._worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+                || now.duration_since(launch.changed_at) < LAUNCH_RETENTION
         });
     }
 }
 
 impl Launch {
     fn start_worker(&mut self, recovery: bool, timeout_seconds: Option<u64>) {
+        if !self.retire_previous_worker() {
+            return;
+        }
         let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
         let (event_sender, events) = mpsc::channel();
         if let Some(timeout_seconds) = timeout_seconds {
@@ -362,6 +370,27 @@ impl Launch {
         };
         self.stop_requested = recovery;
         self.changed_at = Instant::now();
+    }
+
+    fn retire_previous_worker(&mut self) -> bool {
+        self.stop_sender = None;
+        if self
+            ._worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return false;
+        }
+        if let Some(worker) = self._worker.take() {
+            let _ = worker.join();
+        }
+        self.events = None;
+        true
+    }
+
+    fn fail_cleanup(&mut self) {
+        self.stop_sender = None;
+        self.apply_state(State::CleanupFailed);
     }
 
     fn apply_state(&mut self, state: State) {
@@ -599,6 +628,76 @@ mod tests {
         let response = launches.stop(&ticket, 30, vec![unrelated]);
         assert_eq!(response["state"], "cleanup_failed");
         assert!(observed.recv_timeout(Duration::from_millis(20)).is_err());
+    }
+
+    #[test]
+    fn reconnect_waits_for_the_old_watcher_after_a_failed_stop() {
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        let original = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+        let unrelated = process(73, r"D:\Untrusted\Playnite\Playnite.DesktopApp.exe");
+        let restarted = process(91, r"C:\Program Files\Playnite\Playnite.FullscreenApp.exe");
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        let (cancelled_sender, cancelled_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (_event_sender, events) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            assert!(stop_receiver.recv().is_err());
+            cancelled_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        let ticket = "ab".repeat(24);
+        let mut launches = Launches::default();
+        launches.by_ticket.insert(
+            ticket.clone(),
+            Launch {
+                operation_id: "launch-operation".into(),
+                game_id: game_id.into(),
+                processes: vec![original.clone()],
+                trusted_install_roots: installation_roots(&[original]),
+                focus_policy: FocusPolicy::default(),
+                ticket: ticket.clone(),
+                state: State::Running,
+                stop_requested: false,
+                changed_at: Instant::now(),
+                stop_sender: Some(stop_sender),
+                events: Some(events),
+                _worker: Some(worker),
+            },
+        );
+
+        assert_eq!(
+            launches.stop(&ticket, 30, vec![unrelated])["state"],
+            "cleanup_failed"
+        );
+        cancelled_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            launches.recover_stop("launch-operation", game_id, 30, vec![restarted.clone()])["state"],
+            "cleanup_failed"
+        );
+        assert!(launches.by_ticket[&ticket].stop_sender.is_none());
+        launches.by_ticket.get_mut(&ticket).unwrap().changed_at =
+            Instant::now() - LAUNCH_RETENTION - Duration::from_secs(1);
+        launches.advance();
+        assert!(launches.by_ticket.contains_key(&ticket));
+        launches.by_ticket.get_mut(&ticket).unwrap().changed_at = Instant::now();
+        release_sender.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !launches.by_ticket[&ticket]
+            ._worker
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline, "old watcher did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            launches.recover_stop("launch-operation", game_id, 30, vec![restarted])["state"],
+            "stopping"
+        );
+        assert!(launches.by_ticket[&ticket].stop_sender.is_some());
     }
 
     #[test]
