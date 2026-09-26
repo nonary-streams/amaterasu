@@ -549,7 +549,7 @@ fn valid_ping_payload(value: &str) -> bool {
 
 impl AudioWire {
     fn validate(&self) -> Result<(), &'static str> {
-        if !matches!(self.packet_ms, 5 | 10) || !(6000..=256000).contains(&self.bitrate) {
+        if !matches!(self.packet_ms, 5 | 10) || !(6000..=512000).contains(&self.bitrate) {
             return Err("invalid_audio_configuration");
         }
         Ok(())
@@ -1195,7 +1195,7 @@ mod tests {
             ("audio", json!({"packet_ms":20})),
             ("audio", json!({"packet_ms":0})),
             ("audio", json!({"bitrate":5999})),
-            ("audio", json!({"bitrate":256001})),
+            ("audio", json!({"bitrate":512001})),
             ("video", json!({"packet_size":0})),
             ("video", json!({"packet_size":65535})),
             ("video", json!({"max_fec_blocks":0})),
@@ -1226,7 +1226,7 @@ mod tests {
         config.operation_id = "\n".into();
         assert_eq!(config.validate(false), Err("invalid_operation_id"));
         for packet_ms in [5, 10] {
-            for bitrate in [6000, 256000] {
+            for bitrate in [6000, 256000, 512000] {
                 let mut config = prepare();
                 config.audio = AudioWire { packet_ms, bitrate };
                 assert!(config.validate(false).is_ok());

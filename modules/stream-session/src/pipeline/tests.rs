@@ -8,6 +8,65 @@ use super::*;
 use harness::*;
 
 #[test]
+fn stereo_512k_prepare_reaches_encoder_with_bounded_packet_size() {
+    for (packet_ms, packet_bytes) in [(5, 320), (10, 640)] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["audio"] = json!({"packet_ms":packet_ms,"bitrate":512000});
+        let prepared = host.response(1, request);
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        assert_eq!(
+            prepared["audio"],
+            json!({"packet_ms":packet_ms,"bitrate":512000})
+        );
+        assert_eq!(prepared["packet_bytes"], packet_bytes);
+        assert!(packet_bytes <= 1275);
+        assert_eq!(
+            prepared["wire_audio_bytes"],
+            if packet_ms == 5 { 336 } else { 656 }
+        );
+        let encoder = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::AudioEncoder.service() && call.payload["action"] == "open"
+            })
+            .expect("audio encoder opened");
+        assert_eq!(encoder.payload["channels"], 2);
+        assert_eq!(encoder.payload["packet_ms"], packet_ms);
+        assert_eq!(encoder.payload["bitrate"], 512000);
+        let media = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Media.service() && call.payload["action"] == "open"
+            })
+            .expect("media transport opened");
+        assert_eq!(
+            media.payload["audio"]["wire_payload_bytes"],
+            prepared["wire_audio_bytes"]
+        );
+    }
+
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["audio"] = json!({"packet_ms":10,"bitrate":512001});
+    assert_eq!(
+        host.response(1, request)["code"],
+        "invalid_audio_configuration"
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioEncoder.service())
+    );
+}
+
+#[test]
 fn active_audio_failure_recovers_same_encoder_stream_before_more_media() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

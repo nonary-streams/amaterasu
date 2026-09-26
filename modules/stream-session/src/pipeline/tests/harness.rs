@@ -722,7 +722,10 @@ impl Broker {
                 json!({"ok":true,"sessions":[{"id":id,"key":allocation.key,"state":allocation.state,"leases":allocation.leases}]})
             }
             "amaterasu.audio-encode/1" => {
-                json!({"ok":true,"stream":id,"sample_rate":48000,"channels":2,"packet_bytes":160,"constant_bitrate":true})
+                let bitrate = allocation.request["bitrate"].as_u64().unwrap();
+                let packet_ms = allocation.request["packet_ms"].as_u64().unwrap();
+                let packet_bytes = bitrate * packet_ms / 8_000;
+                json!({"ok":true,"stream":id,"sample_rate":48000,"channels":2,"packet_bytes":packet_bytes,"constant_bitrate":true})
             }
             "amaterasu.media-transport/1" => {
                 let request = &allocation.request;

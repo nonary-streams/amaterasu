@@ -257,6 +257,7 @@ impl Record {
             "session": self.id,
             "state": self.state,
             "stream_audio": self.config.stream_audio,
+            "audio": self.config.audio,
             "frame_limiter_settings": self.config.frame_limiter_settings,
             "frame_limiter_executable_path": self.config.frame_limiter_executable_path,
             "frame_limiter_state": self.limiter_state,
