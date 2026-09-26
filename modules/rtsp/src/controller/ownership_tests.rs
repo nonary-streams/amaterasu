@@ -322,6 +322,41 @@ fn successful_prepare_and_exact_retry_share_one_owned_allocation() {
 }
 
 #[test]
+fn unattested_display_request_never_prepares_a_stream_or_mutates_a_display() {
+    let mut endpoint = Endpoint::default();
+    let mut request = open("display-without-snapshot");
+    request["display_request"] = json!({
+        "configuration":{"displays":[{
+            "id":"monitor.one","width":1920,"height":1080,
+            "refresh":{"numerator":60,"denominator":1},"x":0,"y":0
+        }]},
+        "mode_policy":{"display_id":"monitor.one","remapping":{},"context":{
+            "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
+            "client_display_mode_override":false,"optimize_game_settings":false
+        }}
+    });
+    endpoint.enqueue(1, "owner", request.clone());
+    request["operation_id"] = json!("display-with-snapshot");
+    request["display_policy_snapshot"] = json!({
+        "catalog_revision":7,
+        "certificate_id":"ab".repeat(32),
+        "application_overrides":{},
+        "client_overrides":{},
+        "effective_overrides":{}
+    });
+    endpoint.enqueue(2, "owner", request);
+    let runtime = runtime(&mut endpoint);
+    let mut controller = Controller::new(settings(true, &["owner"])).unwrap();
+    tick(&mut controller, &runtime, 0);
+    tick(&mut controller, &runtime, 1);
+
+    assert_eq!(endpoint.completed(1)["code"], "display_request_unattested");
+    assert_eq!(endpoint.completed(2)["code"], "display_request_unattested");
+    assert!(controller.records.is_empty());
+    assert!(endpoint.downstream_requests().is_empty());
+}
+
+#[test]
 fn ready_ticket_uses_configured_ping_timeout_after_preparation() {
     for timeout in [250, 10_000] {
         let mut endpoint = Endpoint::default();

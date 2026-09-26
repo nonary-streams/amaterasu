@@ -429,8 +429,8 @@ pub struct Open {
     pub frame_limiter_settings: Option<serde_json::Value>,
     #[serde(default)]
     pub frame_limiter_executable_path: Option<String>,
-    /// Frozen, admitted full display configuration and policy for this stream.
-    /// None leaves the host display topology untouched.
+    /// Reserved for an attested full display configuration. Open rejects every
+    /// non-null value until launch provenance can be verified at this boundary.
     #[serde(default)]
     pub display_request: Option<serde_json::Value>,
     /// Frozen sparse source policy for exact readback; this alone never changes a display.
@@ -500,12 +500,8 @@ impl Open {
         if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
             return Err("invalid_frame_limiter_snapshot");
         }
-        if self
-            .display_request
-            .as_ref()
-            .is_some_and(|request| !valid_display_request(request))
-        {
-            return Err("invalid_display_request");
+        if self.display_request.is_some() {
+            return Err("display_request_unattested");
         }
         if self
             .display_policy_snapshot
@@ -695,9 +691,6 @@ impl Open {
         if let Some(path) = &self.frame_limiter_executable_path {
             payload["frame_limiter_executable_path"] = serde_json::json!(path);
         }
-        if let Some(request) = &self.display_request {
-            payload["display_request"] = request.clone();
-        }
         payload
     }
 
@@ -755,56 +748,6 @@ impl Open {
         payload["configuration"]["encrypt_audio"] = serde_json::json!(encryption.audio);
         payload
     }
-}
-
-fn valid_display_request(request: &serde_json::Value) -> bool {
-    let Some(object) = request.as_object() else {
-        return false;
-    };
-    let Some(displays) = request["configuration"]["displays"].as_array() else {
-        return false;
-    };
-    if displays.is_empty()
-        || displays.len() > 16
-        || object.len() != 2
-        || !object.contains_key("configuration")
-        || !request["configuration"]
-            .as_object()
-            .is_some_and(|fields| fields.len() == 1)
-    {
-        return false;
-    }
-    let policies = match (object.get("mode_policy"), object.get("mode_policies")) {
-        (Some(policy), None) => vec![policy],
-        (None, Some(serde_json::Value::Array(policies))) if !policies.is_empty() => {
-            policies.iter().collect()
-        }
-        _ => return false,
-    };
-    let mut display_ids = std::collections::BTreeSet::new();
-    for display in displays {
-        let Some(id) = display["id"].as_str().filter(|id| !id.is_empty()) else {
-            return false;
-        };
-        if !display_ids.insert(id.to_ascii_lowercase()) {
-            return false;
-        }
-    }
-    let mut policy_ids = std::collections::BTreeSet::new();
-    for policy in policies {
-        let Some(id) = policy["display_id"].as_str() else {
-            return false;
-        };
-        let id = id.to_ascii_lowercase();
-        if !display_ids.contains(&id)
-            || !policy_ids.insert(id)
-            || !policy["remapping"].is_object()
-            || !policy["context"].is_object()
-        {
-            return false;
-        }
-    }
-    policy_ids == display_ids
 }
 
 fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
@@ -1054,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_display_request_reaches_stream_prepare_without_reconstruction() {
+    fn complete_display_request_is_rejected_even_with_a_policy_snapshot() {
         let mut input = open_json();
         let display_request = json!({
             "configuration":{"displays":[
@@ -1068,13 +1011,24 @@ mod tests {
                 {"display_id":"monitor.two","remapping":{},"context":{}}
             ]
         });
-        input["display_request"] = display_request.clone();
-        let request: Open = serde_json::from_value(input).unwrap();
-        request.validate(false).unwrap();
-        assert_eq!(
-            request.prepare("prepare", None)["display_request"],
-            display_request
+        input["display_request"] = display_request;
+        let request: Open = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(request.validate(false), Err("display_request_unattested"));
+        assert!(
+            request
+                .prepare("prepare", None)
+                .get("display_request")
+                .is_none()
         );
+        input["display_policy_snapshot"] = json!({
+            "catalog_revision":7,
+            "certificate_id":"ab".repeat(32),
+            "application_overrides":{},
+            "client_overrides":{},
+            "effective_overrides":{}
+        });
+        let request: Open = serde_json::from_value(input).unwrap();
+        assert_eq!(request.validate(false), Err("display_request_unattested"));
         assert!(
             open()
                 .prepare("prepare", None)
@@ -1112,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_or_ambiguous_display_request_is_rejected_before_prepare() {
+    fn incomplete_or_ambiguous_display_request_is_also_rejected() {
         let mut input = open_json();
         for display_request in [
             json!({"configuration":{"displays":[]},"mode_policies":[]}),
@@ -1124,7 +1078,7 @@ mod tests {
         ] {
             input["display_request"] = display_request;
             let request: Open = serde_json::from_value(input.clone()).unwrap();
-            assert_eq!(request.validate(false), Err("invalid_display_request"));
+            assert_eq!(request.validate(false), Err("display_request_unattested"));
         }
     }
 
