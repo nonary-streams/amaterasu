@@ -1232,6 +1232,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
   let stored = nvhttpHostSettings();
   const routes = [];
   let updates = 0;
+  let secondSubmittedRevision;
   dom.Amaterasu.renderSettings({
     content,
     notify: (message) => notices.push(message),
@@ -1243,7 +1244,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
         if (route === "nvhttp/settings_update") {
           updates += 1;
           if (updates === 2) {
-            assert.equal(body.expected_revision, 9);
+            secondSubmittedRevision = body.expected_revision;
             throw new Error("second update intentionally rejected");
           }
           stored = { ...nvhttpUpdatedHost(), active_http_port: null, active_rtsp_port: null,
@@ -1273,6 +1274,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
   freshForm.fire("submit", { preventDefault() {} });
   await new Promise(setImmediate);
   assert.equal(updates, 2);
+  assert.equal(secondSubmittedRevision, 9);
 });
 
 test("capture output selection preserves exact IDs and automatic reset", () => {
