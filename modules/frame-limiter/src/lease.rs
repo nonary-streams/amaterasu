@@ -2171,4 +2171,40 @@ mod tests {
         assert_eq!(restored["lease"], lease);
         assert_eq!(restored["leases"][0]["applied"], true);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn wire_retry_and_status_do_not_claim_unrestorable_legacy_effect() {
+        let mut manager = LeaseManager::in_memory(FakeProvider::new());
+        let request = runtime_apply_request();
+        let applied = handle_runtime_operation("caller.a", request.clone(), &mut manager);
+        let lease = applied["lease"].as_str().unwrap().to_owned();
+        manager.provider.mutation_supported = false;
+
+        let retry = handle_runtime_operation("caller.a", request, &mut manager);
+        assert_eq!(retry["state"], "runtime_unavailable");
+        assert_eq!(retry["applied"], false);
+        assert_eq!(retry["leases"][0]["lease"], lease);
+        assert_eq!(retry["leases"][0]["state"], "stale_lease");
+        assert_eq!(retry["leases"][0]["applied"], false);
+
+        let status = handle_runtime_operation(
+            "caller.a",
+            serde_json::json!({"action":"status","version":crate::CONTRACT_VERSION}),
+            &mut manager,
+        );
+        assert_eq!(status["state"], "stale_lease");
+        assert_eq!(status["applied"], false);
+        assert_eq!(status["leases"][0]["lease"], lease);
+
+        let restored = handle_runtime_operation(
+            "caller.a",
+            serde_json::json!({"action":"restore","version":crate::CONTRACT_VERSION,"lease":lease}),
+            &mut manager,
+        );
+        assert_eq!(restored["state"], "restore_failed");
+        assert_eq!(restored["applied"], false);
+        assert_eq!(restored["leases"][0]["state"], "stale_lease");
+        assert_eq!(manager.records().len(), 1);
+    }
 }
