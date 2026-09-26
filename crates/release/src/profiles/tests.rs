@@ -59,6 +59,111 @@ fn management_loads_after_its_nvhttp_settings_provider() {
 }
 
 #[test]
+fn signed_platform_grants_preserve_display_and_launch_parent_authority() {
+    let policy = installer_policy("__WEB__", BTreeMap::new());
+    let display = "amaterasu.display/1";
+    let state = "amaterasu.state/1";
+    let launch = "amaterasu.launch/1";
+    let chain = [NVHTTP, RTSP, STREAM_SESSION];
+
+    for component in chain {
+        assert!(
+            policy.principals[component.id].call.contains(display),
+            "{} cannot delegate display Apply/Status",
+            component.id
+        );
+        assert!(component.dependencies.contains(&DISPLAY.id));
+        assert!(
+            policy.principals[component.id].call.contains(state),
+            "{} cannot delegate display journal state",
+            component.id
+        );
+        assert!(component.dependencies.contains(&STATE.id));
+    }
+    for component in [NVHTTP, RTSP] {
+        assert!(policy.principals[component.id].call.contains(launch));
+        assert!(component.dependencies.contains(&LAUNCH.id));
+    }
+    assert!(policy.principals[DISPLAY.id].call.contains(state));
+    assert_eq!(policy.settings[DISPLAY.id]["allow_mutation"], false);
+    for component in [PLAYNITE, LUTRIS, AUTHENTICATION, PAIRING, INPUT] {
+        assert!(!policy.principals[component.id].call.contains(display));
+        assert!(!policy.principals[component.id].call.contains(launch));
+    }
+
+    let probe = PackageProfile::StreamProbe.components();
+    assert!(probe.iter().any(|component| component.id == DISPLAY.id));
+    assert!(STREAM_SESSION_PROBE.dependencies.contains(&DISPLAY.id));
+    assert!(STREAM_SESSION_PROBE.dependencies.contains(&STATE.id));
+}
+
+#[test]
+fn signed_platform_call_intersections_cover_active_and_cleanup_display_paths() {
+    fn delegates(policy: &RuntimeConfig, origin: &str, calls: &[(&str, &str)]) -> bool {
+        let Some(origin_grants) = policy.principals.get(origin) else {
+            return false;
+        };
+        let mut allowed_services = origin_grants.call.clone();
+        for (caller, service) in calls {
+            let Some(grants) = policy.principals.get(*caller) else {
+                return false;
+            };
+            if !allowed_services.contains(*service) || !grants.call.contains(*service) {
+                return false;
+            }
+            allowed_services = allowed_services
+                .intersection(&grants.call)
+                .cloned()
+                .collect();
+        }
+        true
+    }
+
+    let policy = installer_policy("__WEB__", BTreeMap::new());
+    let active_display = [
+        (NVHTTP.id, "amaterasu.rtsp/1"),
+        (RTSP.id, "amaterasu.stream-session/1"),
+        (STREAM_SESSION.id, "amaterasu.display/1"),
+        (DISPLAY.id, "amaterasu.state/1"),
+    ];
+    assert!(delegates(&policy, NVHTTP.id, &active_display));
+    assert!(delegates(
+        &policy,
+        STREAM_SESSION.id,
+        &[
+            (STREAM_SESSION.id, "amaterasu.display/1"),
+            (DISPLAY.id, "amaterasu.state/1"),
+        ],
+    ));
+    assert!(delegates(
+        &policy,
+        NVHTTP.id,
+        &[
+            (NVHTTP.id, "amaterasu.rtsp/1"),
+            (RTSP.id, "amaterasu.launch/1"),
+        ],
+    ));
+
+    for unrelated in [PLAYNITE.id, LUTRIS.id, AUTHENTICATION.id, INPUT.id] {
+        assert!(!delegates(
+            &policy,
+            unrelated,
+            &[(unrelated, "amaterasu.display/1")],
+        ));
+    }
+    for ancestor in [NVHTTP.id, RTSP.id, STREAM_SESSION.id] {
+        let mut narrowed = policy.clone();
+        narrowed
+            .principals
+            .get_mut(ancestor)
+            .unwrap()
+            .call
+            .remove("amaterasu.display/1");
+        assert!(!delegates(&narrowed, NVHTTP.id, &active_display));
+    }
+}
+
+#[test]
 fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
     let platform = PackageProfile::Platform.components();
     let provider = platform
