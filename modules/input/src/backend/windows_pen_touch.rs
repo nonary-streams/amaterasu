@@ -253,16 +253,16 @@ impl WindowsPenTouch {
     }
 
     pub(super) fn stop(&mut self) -> InputResult<()> {
-        let mut first_error = None;
         for device in [PenTouchDevice::Pen, PenTouchDevice::Touch] {
             let pointer_ids = self
                 .device_state(device)
                 .map(|state| state.contacts.keys().copied().collect::<Vec<_>>())
                 .unwrap_or_default();
             for pointer_id in pointer_ids {
-                if let Err(error) = self.cancel_pointer(device, pointer_id) {
-                    first_error.get_or_insert(error);
-                }
+                // An injection failure can mean the synthetic handle was lost.
+                // Destroying the owned handle below is the final release, so a
+                // failed best-effort cancel must not strand the lease in cleanup.
+                let _ = self.cancel_pointer(device, pointer_id);
             }
         }
 
@@ -273,7 +273,7 @@ impl WindowsPenTouch {
         }
         self.next_keepalive = None;
 
-        first_error.map_or(Ok(()), Err)
+        Ok(())
     }
 
     fn cancel_pointer(&mut self, device: PenTouchDevice, pointer_id: u32) -> InputResult<()> {
@@ -1718,6 +1718,60 @@ mod tests {
         assert_eq!(state.frames.len(), frame_count);
         assert!(backend.pen.is_none());
         assert!(backend.touch.is_none());
+    }
+
+    #[test]
+    fn failed_shutdown_cancel_releases_device_and_allows_reacquisition() {
+        let (mut backend, state) = backend();
+        backend
+            .inject(&event(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                10,
+                20,
+            ))
+            .unwrap();
+        backend
+            .inject(&event(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Move,
+                11,
+                21,
+            ))
+            .unwrap();
+
+        state.borrow_mut().fail_next_injection = true;
+        backend.stop().unwrap();
+        assert!(backend.touch.is_none());
+        assert_eq!(state.borrow().destroyed, vec![1]);
+
+        backend.start().unwrap();
+        backend
+            .inject(&event(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Down,
+                30,
+                40,
+            ))
+            .unwrap();
+        backend
+            .inject(&event(
+                7,
+                PenTouchDevice::Touch,
+                PenTouchPhase::Move,
+                31,
+                41,
+            ))
+            .unwrap();
+        backend.stop().unwrap();
+
+        let state = state.borrow();
+        assert_eq!(state.created.len(), 2);
+        assert_eq!(state.destroyed, vec![1, 2]);
+        assert_eq!(state.frames.len(), 5);
     }
 
     #[test]
