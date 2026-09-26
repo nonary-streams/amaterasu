@@ -250,8 +250,10 @@ It rejects duplicates, truncated documents, NUL, directives/includes, excessive
 nesting or tokens. The binary appinfo parser reads only Steam's bounded app
 records and extracts `common.type`. Manifests are bounded to 1 MiB, localconfig
 files to 16 MiB, appinfo caches to 2 GiB (streamed), the appinfo key table to
-16 MiB, and an individual appinfo record to 16 MiB. Parsers cap nesting at 16,
-string keys at 8192 bytes and values per record at 32768. A scan visits at most
+16 MiB, and an individual appinfo record to 16 MiB. Text KeyValues parsing caps
+nesting at 16 and fields at 32768; manifests allow 8192-byte tokens and
+localconfig allows 64 KiB tokens. Binary appinfo keys are capped at 8192 bytes
+and each record at 32768 nodes. A scan visits at most
 100000 directory entries, retains at most 20000 apps, and reads at most 64 user
 accounts per root and 256 localconfig files per scan. Limit exhaustion makes
 the relevant metadata source incomplete, so catalog cleanup waits for another
