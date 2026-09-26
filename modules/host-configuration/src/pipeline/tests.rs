@@ -169,7 +169,7 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
     let mut state_write_payload = None;
     let mut completed = None;
 
-    for tick_number in 1..=4 {
+    for tick_number in 1..=5 {
         pipeline
             .tick(|command| match (tick_number, command) {
                 (1, Command::Poll {}) => Ok(incoming.take().unwrap_or(Response::Pending)),
@@ -198,18 +198,12 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
                         service, payload, ..
                     },
                 ) => {
-                    assert_eq!(service, crate::STATE_SERVICE);
-                    assert_eq!(payload["action"], "set");
-                    assert_eq!(payload["key"], STATE_KEY);
-                    assert_eq!(payload["expected_revision"], 12);
-                    assert_eq!(payload["value"]["revision"], 6);
-                    assert_eq!(payload["value"]["min_log_level"], "warning");
-                    state_read_revision = Some(12);
-                    state_write_payload = Some(payload);
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload, json!({"action":"status"}));
                     Ok(Response::Accepted { id: 23 })
                 }
                 (3, Command::TakeResult { request: 23 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"revision":13}),
+                    payload: json!({"ok":true,"ready":true,"applied_revision":5}),
                 }),
                 (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
                 (
@@ -218,16 +212,36 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
                         service, payload, ..
                     },
                 ) => {
-                    assert_eq!(service, DIAGNOSTICS_SERVICE);
-                    assert_eq!(payload["action"], "apply_host_logging");
-                    assert_eq!(payload["configuration"]["revision"], 6);
+                    assert_eq!(service, crate::STATE_SERVICE);
+                    assert_eq!(payload["action"], "set");
+                    assert_eq!(payload["key"], STATE_KEY);
+                    assert_eq!(payload["expected_revision"], 12);
+                    assert_eq!(payload["value"]["revision"], 6);
+                    assert_eq!(payload["value"]["min_log_level"], "warning");
+                    state_read_revision = Some(12);
+                    state_write_payload = Some(payload);
                     Ok(Response::Accepted { id: 24 })
                 }
                 (4, Command::TakeResult { request: 24 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"applied_revision":6}),
+                    payload: json!({"ok":true,"revision":13}),
                 }),
                 (4, Command::ReleaseResult { request: 24 }) => Ok(Response::Ok),
-                (4, Command::Complete { payload, .. }) => {
+                (
+                    4,
+                    Command::Request {
+                        service, payload, ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload["action"], "apply_host_logging");
+                    assert_eq!(payload["configuration"]["revision"], 6);
+                    Ok(Response::Accepted { id: 25 })
+                }
+                (5, Command::TakeResult { request: 25 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"applied_revision":6}),
+                }),
+                (5, Command::ReleaseResult { request: 25 }) => Ok(Response::Ok),
+                (5, Command::Complete { payload, .. }) => {
                     completed = Some(payload);
                     Ok(Response::Ok)
                 }
@@ -252,7 +266,7 @@ fn management_update_uses_store_revision_cas_and_returns_only_after_confirmation
 }
 
 #[test]
-fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
+fn denied_diagnostics_preflight_never_writes_configuration() {
     let root = test_root();
     let mut pipeline = Pipeline::new(Ok(root.clone()));
     let mut incoming = Some(request(
@@ -266,7 +280,7 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
     ));
     let mut completed = None;
 
-    for tick_number in 1..=5 {
+    for tick_number in 1..=2 {
         pipeline
             .tick(|command| match (tick_number, command) {
                 (1, Command::Poll {}) => Ok(incoming.take().unwrap()),
@@ -287,18 +301,97 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
                     }),
                 }),
                 (2, Command::ReleaseResult { request: 22 }) => Ok(Response::Ok),
-                (2, Command::Request { payload, .. }) => {
-                    assert_eq!(payload["action"], "set");
-                    assert_eq!(payload["expected_revision"], 12);
-                    assert_eq!(payload["value"]["revision"], 6);
+                (
+                    2,
+                    Command::Request {
+                        service, payload, ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload, json!({"action":"status"}));
+                    Ok(Response::error("permission_denied", "grant absent"))
+                }
+                (2, Command::Complete { payload, .. }) => {
+                    completed = Some(payload);
+                    Ok(Response::Ok)
+                }
+                (_, Command::Poll {}) => Ok(Response::Pending),
+                (_, Command::Request { service, .. }) if service == crate::STATE_SERVICE => {
+                    panic!("preflight denial must not save configuration")
+                }
+                (_, command) => panic!("unexpected preflight command: {command:?}"),
+            })
+            .unwrap();
+    }
+
+    let response = completed.unwrap();
+    assert_eq!(response["error"]["code"], "configuration_unavailable");
+    assert_eq!(response["ready"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
+    let root = test_root();
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    let mut incoming = Some(request(
+        "amaterasu.management",
+        json!({
+            "action":"update","expected_revision":5,
+            "file_state":"state.json","vibeshine_file_state":"legacy.json",
+            "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+            "log_path":"service.log","min_log_level":"warning"
+        }),
+    ));
+    let mut completed = None;
+
+    for tick_number in 1..=6 {
+        pipeline
+            .tick(|command| match (tick_number, command) {
+                (1, Command::Poll {}) => Ok(incoming.take().unwrap()),
+                (
+                    1,
+                    Command::Request {
+                        service, payload, ..
+                    },
+                ) => {
+                    assert_eq!(service, crate::STATE_SERVICE);
+                    assert_eq!(payload["action"], "get");
+                    Ok(Response::Accepted { id: 22 })
+                }
+                (2, Command::TakeResult { request: 22 }) => Ok(Response::Result {
+                    payload: json!({
+                        "ok":true,"revision":12,"found":true,
+                        "value":Document::from_settings(5, crate::settings::Settings::default())
+                    }),
+                }),
+                (2, Command::ReleaseResult { request: 22 }) => Ok(Response::Ok),
+                (
+                    2,
+                    Command::Request {
+                        service, payload, ..
+                    },
+                ) => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload, json!({"action":"status"}));
                     Ok(Response::Accepted { id: 23 })
                 }
                 (3, Command::TakeResult { request: 23 }) => Ok(Response::Result {
-                    payload: json!({"ok":true,"revision":13}),
+                    payload: json!({"ok":true,"ready":true}),
                 }),
                 (3, Command::ReleaseResult { request: 23 }) => Ok(Response::Ok),
+                (3, Command::Request { payload, .. }) => {
+                    assert_eq!(payload["action"], "set");
+                    assert_eq!(payload["expected_revision"], 12);
+                    assert_eq!(payload["value"]["revision"], 6);
+                    Ok(Response::Accepted { id: 24 })
+                }
+                (4, Command::TakeResult { request: 24 }) => Ok(Response::Result {
+                    payload: json!({"ok":true,"revision":13}),
+                }),
+                (4, Command::ReleaseResult { request: 24 }) => Ok(Response::Ok),
                 (
-                    3,
+                    4,
                     Command::Request {
                         service,
                         payload,
@@ -309,14 +402,14 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
                     assert_eq!(service, DIAGNOSTICS_SERVICE);
                     assert_eq!(payload["configuration"]["revision"], 6);
                     assert_eq!(parent, Some(7));
-                    Ok(Response::Accepted { id: 24 })
+                    Ok(Response::Accepted { id: 25 })
                 }
-                (4, Command::TakeResult { request: 24 }) => Ok(Response::Result {
+                (5, Command::TakeResult { request: 25 }) => Ok(Response::Result {
                     payload: json!({"ok":false,"error":{"code":"sink_unavailable"}}),
                 }),
-                (4, Command::ReleaseResult { request: 24 }) => Ok(Response::Ok),
+                (5, Command::ReleaseResult { request: 25 }) => Ok(Response::Ok),
                 (
-                    4,
+                    5,
                     Command::Request {
                         service,
                         payload,
@@ -331,13 +424,13 @@ fn failed_logging_apply_restores_previous_document_with_a_new_revision() {
                     assert_eq!(payload["value"]["revision"], 7);
                     assert_eq!(payload["value"]["log_path"], "amaterasu.log");
                     assert_eq!(payload["value"]["min_log_level"], "product_default");
-                    Ok(Response::Accepted { id: 25 })
+                    Ok(Response::Accepted { id: 26 })
                 }
-                (5, Command::TakeResult { request: 25 }) => Ok(Response::Result {
+                (6, Command::TakeResult { request: 26 }) => Ok(Response::Result {
                     payload: json!({"ok":true,"revision":14}),
                 }),
-                (5, Command::ReleaseResult { request: 25 }) => Ok(Response::Ok),
-                (5, Command::Complete { payload, .. }) => {
+                (6, Command::ReleaseResult { request: 26 }) => Ok(Response::Ok),
+                (6, Command::Complete { payload, .. }) => {
                     completed = Some(payload);
                     Ok(Response::Ok)
                 }

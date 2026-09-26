@@ -110,8 +110,11 @@ If a caller times out while the state service is persisting an update, the write
 may still have committed; read the current revision before retrying.
 
 `update` is a full replacement. `expected_revision` compares to the document
-revision; the provider increments it once and writes with the state namespace's
-revision as `expected_revision` in the state CAS. After that durable write,
+revision. Before writing, the provider requires a ready `status` response from
+diagnostics under its signed call grant. Missing grants or unavailable diagnostics
+leave the document unchanged. The provider then increments its revision once and
+writes with the state namespace's revision as `expected_revision` in the state CAS.
+After that durable write,
 the provider sends the GET-shaped configuration to diagnostics as
 `apply_host_logging`. Success requires diagnostics to confirm the same applied
 revision, after opening the requested logging sink:

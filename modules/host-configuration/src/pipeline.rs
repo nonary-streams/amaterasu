@@ -39,6 +39,7 @@ struct Pending {
 
 enum Stage {
     Loading(Operation),
+    Preflighting(UpdateToSave),
     Saving {
         expected_state_revision: u64,
         response: Value,
@@ -201,6 +202,9 @@ impl Pipeline {
                 Stage::Loading(_) => {
                     error("deadline_exceeded", "host configuration request expired")
                 }
+                Stage::Preflighting(_) => unavailable(
+                    "diagnostics status preflight expired before configuration was saved",
+                ),
             };
             return complete(send, pending.request_id, response);
         }
@@ -313,6 +317,13 @@ impl Pipeline {
                         format!("state service failure ({code}): {message}"),
                     ),
                 ),
+                Stage::Preflighting(_) => complete(
+                    send,
+                    pending.request_id,
+                    unavailable(format!(
+                        "diagnostics status preflight failed ({code}): {message}"
+                    )),
+                ),
                 _ => self.finish_child_failure(pending.request_id, code, message, send),
             },
             ChildOutcome::Payload(payload) => {
@@ -348,8 +359,23 @@ impl Pipeline {
                             pending.request_id,
                             save_unconfirmed(response["revision"].as_u64().unwrap_or_default()),
                         ),
+                        Stage::Preflighting(_) => complete(
+                            send,
+                            pending.request_id,
+                            unavailable("diagnostics status preflight did not confirm readiness"),
+                        ),
                         _ => complete(send, pending.request_id, unavailable(message)),
                     };
+                }
+                if let Stage::Preflighting(update) = pending.stage {
+                    if payload.get("ready").and_then(Value::as_bool) != Some(true) {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            unavailable("diagnostics status preflight is not ready"),
+                        );
+                    }
+                    return self.save(update, send);
                 }
                 if let Stage::Applying {
                     response,
@@ -462,6 +488,7 @@ impl Pipeline {
                         )
                     }
                     Stage::Applying { .. } => unreachable!(),
+                    Stage::Preflighting(_) => unreachable!(),
                 }
             }
         }
@@ -570,7 +597,7 @@ impl Pipeline {
                         ),
                     );
                 }
-                self.save(
+                self.preflight(
                     UpdateToSave {
                         request_id,
                         deadline,
@@ -583,6 +610,38 @@ impl Pipeline {
                 )
             }
         }
+    }
+
+    fn preflight(
+        &mut self,
+        update: UpdateToSave,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let request = submit_child(
+            send,
+            update.request_id,
+            update.deadline,
+            "diagnostics-status",
+            DIAGNOSTICS_SERVICE,
+            json!({"action":"status"}),
+        );
+        let Some(child_id) = request.ok().flatten() else {
+            return complete(
+                send,
+                update.request_id,
+                unavailable(
+                    "diagnostics status preflight was not accepted; configuration was not saved",
+                ),
+            );
+        };
+        self.pending = Some(Pending {
+            request_id: update.request_id,
+            deadline: update.deadline,
+            state_request_id: child_id,
+            stage: Stage::Preflighting(update),
+            phase: PendingPhase::Waiting,
+        });
+        Ok(())
     }
 
     fn save(
