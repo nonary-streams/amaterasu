@@ -236,6 +236,9 @@ impl VigemConnection {
             (self.functions.target_x360_update)(self.client.as_ptr(), target.as_ptr(), report)
         };
         if !vigem_succeeded(status) {
+            if is_connection_failure(status) {
+                self.reconnect_required.set(true);
+            }
             return Err(vigem_error("x360_update", status));
         }
         Ok(())
@@ -258,6 +261,9 @@ impl VigemConnection {
         // connection, and Ds4Report matches the SDK's 10-byte DS4_REPORT ABI.
         let status = unsafe { update(self.client.as_ptr(), target.as_ptr(), report) };
         if !vigem_succeeded(status) {
+            if is_connection_failure(status) {
+                self.reconnect_required.set(true);
+            }
             return Err(vigem_error("ds4_update", status));
         }
         Ok(())
@@ -436,7 +442,13 @@ impl GamepadDevice for VigemGamepad {
         self.ds4_back_as_touchpad_click = enabled;
     }
 
-    fn recover_after_update_failure(&mut self, _error: InputError) -> InputResult<()> {
+    fn recover_after_update_failure(&mut self, error: InputError) -> InputResult<()> {
+        // A bus or client failure invalidates every target on this connection.
+        // Let the owner disconnect the whole generation, including other slots,
+        // instead of creating another target on the same broken client.
+        if self.connection()?.reconnect_required.get() {
+            return Err(error);
+        }
         // Removal is the boundary after which a possibly applied report can no
         // longer reach applications. Retain the old target if detach fails so
         // lease cleanup can retry it; never allocate a replacement first.
@@ -955,7 +967,8 @@ mod tests {
         attached: usize,
         freed: usize,
         disconnects: usize,
-        fail_next_update: bool,
+        removals: usize,
+        fail_next_update: Option<VigemError>,
         fail_remove: bool,
         updates: Vec<(u8, u16)>,
     }
@@ -1022,6 +1035,7 @@ mod tests {
         // SAFETY: the client remains owned by its VigemConnection.
         let client = unsafe { &*client.cast::<FakeClient>() };
         let mut trace = client.trace.borrow_mut();
+        trace.removals += 1;
         if trace.fail_remove {
             return 0xE000_0004;
         }
@@ -1037,14 +1051,37 @@ mod tests {
         // SAFETY: the client remains owned by its VigemConnection.
         let client = unsafe { &*client.cast::<FakeClient>() };
         let mut trace = client.trace.borrow_mut();
-        if std::mem::take(&mut trace.fail_next_update) {
-            return VIGEM_ERROR_WINAPI;
+        if let Some(status) = trace.fail_next_update.take() {
+            return status;
+        }
+        trace.updates.push((client.generation, report.buttons));
+        VIGEM_ERROR_NONE
+    }
+
+    unsafe extern "C" fn fake_ds4_update(
+        client: VigemClient,
+        _: VigemTarget,
+        report: Ds4Report,
+    ) -> VigemError {
+        // SAFETY: the client remains owned by its VigemConnection.
+        let client = unsafe { &*client.cast::<FakeClient>() };
+        let mut trace = client.trace.borrow_mut();
+        if let Some(status) = trace.fail_next_update.take() {
+            return status;
         }
         trace.updates.push((client.generation, report.buttons));
         VIGEM_ERROR_NONE
     }
 
     fn fake_connection(generation: u8, trace: Rc<RefCell<FakeBusTrace>>) -> VigemConnection {
+        fake_connection_with_ds4(generation, trace, false)
+    }
+
+    fn fake_connection_with_ds4(
+        generation: u8,
+        trace: Rc<RefCell<FakeBusTrace>>,
+        ds4: bool,
+    ) -> VigemConnection {
         let client = Box::into_raw(Box::new(FakeClient { generation, trace })).cast();
         VigemConnection {
             // A null library handle is test-only; Drop skips FreeLibrary for it.
@@ -1060,8 +1097,8 @@ mod tests {
                 target_add: fake_target_add,
                 target_remove: fake_target_remove,
                 target_x360_update: fake_x360_update,
-                target_ds4_alloc: None,
-                target_ds4_update: None,
+                target_ds4_alloc: ds4.then_some(fake_target_alloc),
+                target_ds4_update: ds4.then_some(fake_ds4_update),
             },
             allocated_targets: RefCell::new(HashSet::new()),
             reconnect_required: Cell::new(false),
@@ -1083,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_update_and_remove_reconnect_both_active_slots_without_wrong_generation_free() {
+    fn failed_x360_update_reconnects_both_slots_without_old_target_removal() {
         let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
         let mut gamepads = WindowsGamepads::new();
         gamepads
@@ -1098,10 +1135,11 @@ mod tests {
         gamepads.inject(&controller_event(1, 3, 1 << 13)).unwrap();
         assert_eq!(trace.borrow().attached, 2);
 
-        trace.borrow_mut().fail_next_update = true;
+        trace.borrow_mut().fail_next_update = Some(VIGEM_ERROR_WINAPI);
         trace.borrow_mut().fail_remove = true;
         assert!(gamepads.inject(&controller_event(1, 3, 1 << 14)).is_err());
         assert!(!gamepads.supported());
+        assert_eq!(trace.borrow().removals, 0);
         assert_eq!(trace.borrow().attached, 0);
         assert_eq!(trace.borrow().disconnects, 1);
         assert_eq!(trace.borrow().freed, 2);
@@ -1134,7 +1172,7 @@ mod tests {
             })
             .unwrap();
         gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
-        trace.borrow_mut().fail_next_update = true;
+        trace.borrow_mut().fail_next_update = Some(VIGEM_ERROR_WINAPI);
         trace.borrow_mut().fail_remove = true;
         assert!(gamepads.inject(&controller_event(0, 1, 1 << 13)).is_err());
         assert!(gamepads.reconnect_at.is_some());
@@ -1152,6 +1190,55 @@ mod tests {
         gamepads.advance(Instant::now() + Duration::from_secs(2));
         assert!(!gamepads.supported());
         assert_eq!(trace.borrow().disconnects, 1);
+    }
+
+    #[test]
+    fn ds4_bus_failure_retires_all_targets_and_replays_state_on_new_client() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::Ds4, || {
+                Ok(fake_connection_with_ds4(1, trace.clone(), true))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        gamepads.inject(&controller_event(1, 3, 1 << 13)).unwrap();
+
+        trace.borrow_mut().fail_next_update = Some(VIGEM_ERROR_BUS_INVALID_HANDLE);
+        assert!(gamepads.inject(&controller_event(1, 3, 1 << 14)).is_err());
+        assert!(!gamepads.supported());
+        assert_eq!(trace.borrow().removals, 0);
+        assert_eq!(trace.borrow().disconnects, 1);
+        assert_eq!(trace.borrow().freed, 2);
+
+        let now = Instant::now();
+        gamepads.reconnect_with(now, || Ok(fake_connection_with_ds4(2, trace.clone(), true)));
+        gamepads.advance(now);
+        assert_eq!(trace.borrow().attached, 2);
+        assert_eq!(gamepads.effective_profile(), Some("ds4"));
+        assert!(trace.borrow().updates.contains(&(2, 0x0028)));
+        assert!(trace.borrow().updates.contains(&(2, 0x0018)));
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().attached, 0);
+    }
+
+    #[test]
+    fn non_bus_update_failure_recreates_only_its_target() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads.inject(&controller_event(0, 1, 1 << 12)).unwrap();
+        trace.borrow_mut().fail_next_update = Some(0xE000_0004);
+        gamepads.inject(&controller_event(0, 1, 1 << 13)).unwrap();
+        assert!(gamepads.supported());
+        assert_eq!(trace.borrow().removals, 1);
+        assert_eq!(trace.borrow().attached, 1);
+        assert_eq!(trace.borrow().disconnects, 0);
+        gamepads.stop().unwrap();
     }
 
     #[test]
