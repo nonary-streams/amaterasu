@@ -320,6 +320,7 @@ impl GamepadDevice for UinputGamepad {
         let prior_state = self.state;
         let result = release_owned_device(
             &mut self.device,
+            self.recovery_required,
             |device| {
                 let events = controller_state_events(prior_state, ControllerSnapshot::default());
                 self.state = possible_controller_state_after_write_failure(
@@ -690,7 +691,7 @@ impl Backend for LinuxBackend {
         // Keep each descriptor after a failed UI_DEV_DESTROY so a later lease
         // cleanup can retry the same device without reopening /dev/uinput.
         let probe_result =
-            release_owned_device(&mut self.gamepad_probe, |_| Ok(()), Device::destroy);
+            release_owned_device(&mut self.gamepad_probe, false, |_| Ok(()), Device::destroy);
         let input_result =
             release_input_pair(&mut self.keyboard, &mut self.pointer, Device::destroy);
         self.held_virtual_keycodes.clear();

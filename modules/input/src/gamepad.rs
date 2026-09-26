@@ -248,11 +248,16 @@ pub(crate) fn replace_failed_device<Device>(
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn release_owned_device<Device>(
     device: &mut Option<Device>,
+    report_uncertain: bool,
     mut neutralize: impl FnMut(&mut Device) -> InputResult<()>,
     mut detach: impl FnMut(&mut Device) -> InputResult<()>,
 ) -> InputResult<()> {
     if let Some(existing) = device.as_mut() {
-        let _ = neutralize(existing);
+        // Another frame could complete a partial report if the previous
+        // write failed before SYN_REPORT. Detach that device directly.
+        if !report_uncertain {
+            let _ = neutralize(existing);
+        }
         detach(existing)?;
         *device = None;
     }
@@ -1770,6 +1775,7 @@ mod tests {
         let neutral_trace = trace.clone();
         release_owned_device(
             &mut device,
+            false,
             |_| {
                 neutral_trace.borrow_mut().push("neutral failed");
                 Err(InputError::new("injection_failed", "write failed"))
@@ -1789,14 +1795,135 @@ mod tests {
         let mut device = Some(1_u8);
         let error = release_owned_device(
             &mut device,
+            false,
             |_| Err(InputError::new("injection_failed", "write failed")),
             |_| Err(InputError::new("release_failed", "destroy failed")),
         )
         .unwrap_err();
         assert_eq!(error.code, "release_failed");
         assert_eq!(device, Some(1));
-        release_owned_device(&mut device, |_| Ok(()), |_| Ok(())).unwrap();
+        release_owned_device(&mut device, false, |_| Ok(()), |_| Ok(())).unwrap();
         assert_eq!(device, None);
+    }
+
+    #[test]
+    fn uncertain_uinput_slot_detaches_without_another_frame_and_keeps_peer_active() {
+        use std::cell::Cell;
+
+        struct FakeUinput {
+            number: u8,
+            device: Option<u8>,
+            uncertain: bool,
+            fail_first_write: Rc<Cell<bool>>,
+            remaining_detach_failures: Rc<Cell<u8>>,
+            trace: Rc<RefCell<Vec<(u8, &'static str)>>>,
+        }
+
+        impl GamepadDevice for FakeUinput {
+            fn update(&mut self, _: ControllerSnapshot) -> InputResult<()> {
+                if self.uncertain {
+                    panic!("an uncertain uinput descriptor must not receive another frame");
+                }
+                if self.number == 0 && self.fail_first_write.replace(false) {
+                    self.uncertain = true;
+                    self.trace.borrow_mut().push((self.number, "partial write"));
+                    return Err(InputError::new("injection_failed", "partial report"));
+                }
+                self.trace.borrow_mut().push((self.number, "update"));
+                Ok(())
+            }
+
+            fn recover_after_update_failure(&mut self, _: InputError) -> InputResult<()> {
+                replace_failed_device(
+                    &mut self.device,
+                    |_| {
+                        self.trace.borrow_mut().push((self.number, "detach"));
+                        let remaining = self.remaining_detach_failures.get();
+                        if remaining > 0 {
+                            self.remaining_detach_failures.set(remaining - 1);
+                            Err(InputError::new("release_failed", "detach failed"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || Ok(self.number),
+                )?;
+                self.uncertain = false;
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                release_owned_device(
+                    &mut self.device,
+                    self.uncertain,
+                    |_| {
+                        self.trace.borrow_mut().push((self.number, "neutral"));
+                        Ok(())
+                    },
+                    |_| {
+                        self.trace.borrow_mut().push((self.number, "detach"));
+                        let remaining = self.remaining_detach_failures.get();
+                        if self.number == 0 && remaining > 0 {
+                            self.remaining_detach_failures.set(remaining - 1);
+                            Err(InputError::new("release_failed", "detach failed"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let fail_first_write = Rc::new(Cell::new(true));
+        let remaining_detach_failures = Rc::new(Cell::new(2));
+        let mut slots = GamepadSlots::new();
+        let now = Instant::now();
+        let mut create = |number| {
+            Ok(FakeUinput {
+                number,
+                device: Some(number),
+                uncertain: false,
+                fail_first_write: fail_first_write.clone(),
+                remaining_detach_failures: remaining_detach_failures.clone(),
+                trace: trace.clone(),
+            })
+        };
+
+        assert_eq!(
+            slots
+                .apply(
+                    0,
+                    0b01,
+                    ControllerSnapshot {
+                        buttons: 1,
+                        ..ControllerSnapshot::default()
+                    },
+                    -1,
+                    now,
+                    &mut create,
+                )
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        slots
+            .apply(1, 0b11, ControllerSnapshot::default(), -1, now, &mut create)
+            .unwrap();
+        assert_eq!(
+            slots
+                .apply(1, 0b10, ControllerSnapshot::default(), -1, now, &mut create)
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        assert_eq!(remaining_detach_failures.get(), 0);
+        slots.advance(now).unwrap();
+        assert!(slots.devices[0].is_none());
+        assert!(slots.devices[1].is_some());
+        assert!(!trace.borrow().contains(&(0, "neutral")));
+        assert!(trace.borrow().contains(&(1, "update")));
+        slots.stop().unwrap();
     }
 
     #[test]
