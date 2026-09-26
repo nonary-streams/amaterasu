@@ -478,11 +478,76 @@ fn valid_display_mode_remapping(value: &serde_json::Value) -> bool {
                             ) && value.as_str().is_some_and(|text| {
                                 text.len() <= 64 && !text.chars().any(char::is_control)
                             })
-                        })
+                        }) && valid_display_rule(kind, fields)
                     })
                 })
         })
     })
+}
+
+fn valid_display_rule(kind: &str, fields: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let resolution = matches!(kind, "mixed" | "resolution_only");
+    let refresh = matches!(kind, "mixed" | "refresh_rate_only");
+    let final_resolution = field("final_resolution");
+    let final_refresh = field("final_refresh_rate");
+    (resolution && !final_resolution.trim().is_empty()
+        || refresh && !final_refresh.trim().is_empty())
+        && (!resolution
+            || valid_rule_resolution(field("requested_resolution"))
+                && valid_rule_resolution(final_resolution))
+        && (!refresh
+            || valid_rule_rate(field("requested_fps"), false)
+                && valid_rule_rate(final_refresh, true))
+        && (resolution || field("requested_resolution").is_empty() && final_resolution.is_empty())
+        && (refresh || field("requested_fps").is_empty() && final_refresh.is_empty())
+}
+
+fn valid_rule_resolution(value: &str) -> bool {
+    let normalized = value.trim().replace('×', "x");
+    if normalized.is_empty() {
+        return true;
+    }
+    let Some((width, height)) = normalized.split_once('x') else {
+        return false;
+    };
+    !width.is_empty()
+        && !height.is_empty()
+        && width.bytes().all(|byte| byte.is_ascii_digit())
+        && height.bytes().all(|byte| byte.is_ascii_digit())
+        && width.parse::<u32>().is_ok_and(|value| value > 0)
+        && height.parse::<u32>().is_ok_and(|value| value > 0)
+}
+
+fn valid_rule_rate(value: &str, allow_fraction: bool) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || parts.next().is_some()
+        || !allow_fraction && fraction.is_some()
+        || fraction.is_some_and(|digits| {
+            digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.unwrap_or_default().trim_end_matches('0');
+    let numerator = format!("{whole}{fraction}");
+    numerator.parse::<u32>().is_ok_and(|value| value > 0)
+        && (fraction.is_empty() || 10_u32.checked_pow(fraction.len() as u32).is_some())
 }
 
 fn valid_manual_resolution(value: &str) -> bool {
@@ -497,26 +562,54 @@ fn valid_manual_resolution(value: &str) -> bool {
         part.is_some_and(|part| {
             !part.is_empty()
                 && part.bytes().all(|byte| byte.is_ascii_digit())
-                && part.parse::<u32>().is_ok_and(|size| size > 0)
+                && part.parse::<u32>().is_ok()
         })
     };
     valid_dimension(parts.next()) && valid_dimension(parts.next()) && parts.next().is_none()
 }
 
 fn valid_manual_refresh_rate(value: &str) -> bool {
+    let value = value.trim();
     if value.is_empty() {
         return true;
     }
-    if value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    if value.len() > 64 {
+        return false;
+    }
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || value.contains('.') && fraction.is_empty()
     {
         return false;
     }
-    value
-        .parse::<f64>()
-        .is_ok_and(|refresh| refresh.is_finite() && refresh > 0.0 && refresh <= 1000.0)
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let Ok(integer) = whole.parse::<u32>() else {
+        return false;
+    };
+    let significant = fraction.trim_end_matches('0');
+    if significant.is_empty() {
+        return true;
+    }
+    if significant.len() > 31 {
+        return false;
+    }
+    let (Ok(fraction), Some(denominator)) = (
+        significant.parse::<u128>(),
+        10_u128.checked_pow(significant.len() as u32),
+    ) else {
+        return false;
+    };
+    let mut left = fraction;
+    let mut right = denominator;
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    let reduced_denominator = denominator / left;
+    reduced_denominator <= u32::MAX as u128
+        && (u128::from(integer) * reduced_denominator + fraction / left) <= u32::MAX as u128
 }
 
 fn valid_frame_limiter_fps_limit(fps: f64) -> bool {
@@ -1307,10 +1400,16 @@ mod tests {
             json!({"dd_mode_remapping":{"unknown":[]}}),
             json!({"dd_mode_remapping":{"mixed":[{"requested_fps":60}]}}),
             json!({"dd_mode_remapping":{"mixed":[{"final_resolution":"bad\nvalue"}]}}),
+            json!({"dd_mode_remapping":{"mixed":[{}]}}),
+            json!({"dd_mode_remapping":{"mixed":[{"requested_fps":"59.94","final_resolution":"1280x720"}]}}),
+            json!({"dd_mode_remapping":{"resolution_only":[{"final_refresh_rate":"120"}]}}),
+            json!({"dd_mode_remapping":{"refresh_rate_only":[{"final_refresh_rate":"120","requested_resolution":"1920x1080"}]}}),
+            json!({"dd_mode_remapping":{"mixed":[{"final_resolution":"0x720"}]}}),
             json!({"dd_resolution_option":"highest"}),
-            json!({"dd_manual_resolution":"1920x0"}),
+            json!({"dd_manual_resolution":"1920x"}),
             json!({"dd_refresh_rate_option":"unknown"}),
             json!({"dd_manual_refresh_rate":"NaN"}),
+            json!({"dd_manual_refresh_rate":"0.0000000001"}),
             json!({"dd_hdr_option":"force_on"}),
             json!({"dd_configuration_option":"unknown"}),
             json!({"dd_hdr_request_override":"disabled"}),
@@ -1324,5 +1423,8 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }
+        let zero_resolution: ClientConfigOverrides =
+            serde_json::from_value(json!({"dd_manual_resolution":"1920x0"})).unwrap();
+        zero_resolution.validate().unwrap();
     }
 }
