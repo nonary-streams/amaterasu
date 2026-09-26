@@ -459,6 +459,11 @@ var Amaterasu;
         base;
         storageKey;
         refreshLockName;
+        cookieLogoutKey;
+        cookiePendingLogoutKey;
+        usesSecureCookies;
+        cookieSession = false;
+        cookieRefreshInFlight = null;
         remembered = false;
         sessionId = null;
         loggingOut = false;
@@ -474,8 +479,12 @@ var Amaterasu;
                 url.hash)
                 throw new Error("The API address must be an HTTP(S) origin.");
             this.base = url.origin;
+            this.usesSecureCookies =
+                url.protocol === "https:" && this.base === location.origin;
             this.storageKey = `amaterasu.session.${encodeURIComponent(this.base)}`;
             this.refreshLockName = `amaterasu.session.refresh:${this.base}`;
+            this.cookieLogoutKey = `amaterasu.session.cookie-logout.${encodeURIComponent(this.base)}`;
+            this.cookiePendingLogoutKey = `amaterasu.session.cookie-pending-logout.${encodeURIComponent(this.base)}`;
             if (typeof window !== "undefined" &&
                 typeof window.addEventListener === "function") {
                 window.addEventListener("storage", (event) => this.handleStorageChange(event));
@@ -484,6 +493,10 @@ var Amaterasu;
         async login(username, password, rememberMe = false) {
             if (this.loggingOut) {
                 throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
+            }
+            if (this.usesSecureCookies) {
+                await this.loginWithCookies(username, password, rememberMe);
+                return;
             }
             if (rememberMe && !this.webLocks())
                 throw this.rememberedRefreshLockError();
@@ -494,6 +507,8 @@ var Amaterasu;
         async restoreSession() {
             if (this.loggingOut)
                 return false;
+            if (this.usesSecureCookies)
+                return this.restoreCookieSession();
             this.resetMemory(true);
             if (!this.webLocks()) {
                 return false;
@@ -536,6 +551,8 @@ var Amaterasu;
         async logout() {
             if (this.logoutInFlight)
                 return this.logoutInFlight;
+            if (this.cookieSession)
+                return this.logoutCookieSession();
             this.loggingOut = true;
             this.subject = "";
             this.scopes = null;
@@ -592,6 +609,10 @@ var Amaterasu;
                 await this.revokeSession({ bearer: bearerToken });
         }
         async clear() {
+            if (this.cookieSession) {
+                await this.logoutCookieSession();
+                return;
+            }
             const sessionId = this.remembered ? this.sessionId : null;
             this.resetMemory(true);
             await this.removeStoredSessionForIdentity(sessionId);
@@ -603,6 +624,8 @@ var Amaterasu;
             if (this.loggingOut) {
                 throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
             }
+            if (protectedRoute && this.cookieSession)
+                return this.postWithCookies(route, payload);
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             if (protectedRoute &&
@@ -640,6 +663,237 @@ var Amaterasu;
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
                 return response;
+            }
+        }
+        validateBrowserSession(reply) {
+            if (reply.ok !== true ||
+                typeof reply.subject !== "string" ||
+                !Array.isArray(reply.scopes) ||
+                !reply.scopes.every((scope) => typeof scope === "string") ||
+                !Number.isSafeInteger(reply.expires_at) ||
+                reply.expires_at <= 0 ||
+                Object.hasOwn(reply, "bearer") ||
+                Object.hasOwn(reply, "refresh_token"))
+                throw new ApiError("The host returned an invalid authentication response.", "invalid_response", 502);
+            return reply;
+        }
+        applyBrowserSession(reply) {
+            const session = this.validateBrowserSession(reply);
+            this.cookieSession = true;
+            this.accessExpiresAt = session.expires_at;
+            this.subject = session.subject;
+            this.scopes = [...session.scopes];
+            this.tokenGeneration += 1;
+        }
+        async loginWithCookies(username, password, rememberMe) {
+            this.assertCookieStorageAvailable();
+            if (!this.webLocks())
+                throw this.rememberedRefreshLockError();
+            const generation = this.authGeneration;
+            await this.withSessionLock(async () => {
+                await this.finishPendingCookieLogout();
+                if (generation !== this.authGeneration)
+                    throw new Error("The sign-in attempt was cancelled.");
+                const reply = await this.send("auth/browser/login", { username, password, remember_me: rememberMe }, false, "", true);
+                if (generation !== this.authGeneration) {
+                    await this.completeCookieLogout(this.markCookieLogoutPending());
+                    throw new Error("The sign-in attempt was cancelled.");
+                }
+                try {
+                    this.applyBrowserSession(reply);
+                }
+                catch (error) {
+                    await this.completeCookieLogout(this.markCookieLogoutPending());
+                    throw error;
+                }
+                this.authGeneration += 1;
+            });
+        }
+        async restoreCookieSession() {
+            this.resetMemory(true);
+            this.assertCookieStorageAvailable();
+            if (!this.webLocks())
+                return false;
+            const generation = this.authGeneration;
+            return this.withSessionLock(async () => {
+                if (await this.finishPendingCookieLogout())
+                    return false;
+                try {
+                    const reply = await this.readCookieSession();
+                    if (generation !== this.authGeneration || this.loggingOut)
+                        return false;
+                    this.applyBrowserSession(reply);
+                    return true;
+                }
+                catch (error) {
+                    if (error instanceof ApiError && error.status === 401)
+                        return false;
+                    throw error;
+                }
+            });
+        }
+        async refreshCookieSession() {
+            if (this.cookieRefreshInFlight)
+                return this.cookieRefreshInFlight;
+            const generation = this.authGeneration;
+            const pending = this.withSessionLock(async () => {
+                if (generation !== this.authGeneration || this.loggingOut)
+                    return;
+                const reply = await this.readCookieSession();
+                if (generation === this.authGeneration && !this.loggingOut)
+                    this.applyBrowserSession(reply);
+            });
+            this.cookieRefreshInFlight = pending;
+            try {
+                await pending;
+            }
+            catch (error) {
+                if (error instanceof ApiError &&
+                    (error.status === 401 || error.code === "logout_unconfirmed") &&
+                    generation === this.authGeneration && !this.loggingOut) {
+                    this.resetMemory(true);
+                    this.onAuthenticationLost?.();
+                }
+                throw error;
+            }
+            finally {
+                if (this.cookieRefreshInFlight === pending)
+                    this.cookieRefreshInFlight = null;
+            }
+        }
+        async postWithCookies(route, payload) {
+            if (this.accessExpiresAt - Date.now() / 1000 <= 60)
+                await this.refreshCookieSession();
+            if (!this.cookieSession || this.loggingOut)
+                throw new ApiError("Sign in to continue.", "unauthorized", 401);
+            const generation = this.authGeneration;
+            const tokenGeneration = this.tokenGeneration;
+            try {
+                const reply = await this.send(route, payload, true, "", true);
+                if (generation !== this.authGeneration || this.loggingOut)
+                    throw new ApiError("Sign in to continue.", "unauthorized", 401);
+                return reply;
+            }
+            catch (error) {
+                if (!(error instanceof ApiError) || error.status !== 401 ||
+                    generation !== this.authGeneration || this.loggingOut)
+                    throw error;
+                if (tokenGeneration === this.tokenGeneration)
+                    await this.refreshCookieSession();
+                if (!this.cookieSession || generation !== this.authGeneration)
+                    throw error;
+                try {
+                    const reply = await this.send(route, payload, true, "", true);
+                    if (generation !== this.authGeneration || this.loggingOut)
+                        throw new ApiError("Sign in to continue.", "unauthorized", 401);
+                    return reply;
+                }
+                catch (retryError) {
+                    if (retryError instanceof ApiError &&
+                        retryError.status === 401 &&
+                        generation === this.authGeneration) {
+                        this.resetMemory(true);
+                        this.onAuthenticationLost?.();
+                    }
+                    throw retryError;
+                }
+            }
+        }
+        async requestCookieRefresh() {
+            try {
+                return this.validateBrowserSession(await this.send("auth/browser/refresh", {}, false, "", true));
+            }
+            catch (error) {
+                if (error instanceof ApiError && error.status === 401)
+                    await this.completeCookieLogout(this.markCookieLogoutPending());
+                throw error;
+            }
+        }
+        async readCookieSession() {
+            let reply;
+            try {
+                reply = this.validateBrowserSession(await this.send("auth/browser/session", {}, false, "", true));
+            }
+            catch (error) {
+                if (!(error instanceof ApiError) || error.status !== 401)
+                    throw error;
+                return this.requestCookieRefresh();
+            }
+            if (reply.expires_at - Date.now() / 1000 <= 60)
+                return this.requestCookieRefresh();
+            return reply;
+        }
+        async logoutCookieSession() {
+            if (this.logoutInFlight)
+                return this.logoutInFlight;
+            this.loggingOut = true;
+            const marker = this.markCookieLogoutPending();
+            this.resetMemory(true);
+            const pending = this.withSessionLock(async () => {
+                await this.completeCookieLogout(marker);
+            });
+            this.logoutInFlight = pending;
+            try {
+                await pending;
+            }
+            finally {
+                this.logoutInFlight = null;
+                this.loggingOut = false;
+            }
+        }
+        markCookieLogoutPending() {
+            const marker = `${Date.now()}:${crypto.randomUUID()}`;
+            try {
+                localStorage.setItem(this.cookiePendingLogoutKey, marker);
+            }
+            catch {
+            }
+            return marker;
+        }
+        async finishPendingCookieLogout() {
+            let marker;
+            try {
+                marker = localStorage.getItem(this.cookiePendingLogoutKey);
+            }
+            catch {
+                throw this.cookieStorageError();
+            }
+            if (marker === null)
+                return false;
+            await this.completeCookieLogout(marker);
+            return true;
+        }
+        assertCookieStorageAvailable() {
+            const probeKey = `${this.cookiePendingLogoutKey}.probe`;
+            const probe = crypto.randomUUID();
+            try {
+                localStorage.setItem(probeKey, probe);
+                if (localStorage.getItem(probeKey) !== probe)
+                    throw new Error("Browser storage did not retain the logout marker.");
+                localStorage.removeItem(probeKey);
+            }
+            catch {
+                throw this.cookieStorageError();
+            }
+        }
+        cookieStorageError() {
+            return new ApiError("Secure browser sign-in requires writable storage to recover an unconfirmed sign-out after reload.", "storage_unavailable", 503);
+        }
+        async completeCookieLogout(marker) {
+            try {
+                await this.send("auth/browser/logout", {}, false, "", true);
+            }
+            catch (error) {
+                if (!(error instanceof ApiError) || error.status !== 401 ||
+                    error.code !== "session_missing")
+                    throw new ApiError("Could not confirm sign-out. The browser may still hold session cookies; retry when the host is reachable.", "logout_unconfirmed", 503);
+            }
+            try {
+                if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+                    localStorage.removeItem(this.cookiePendingLogoutKey);
+                localStorage.setItem(this.cookieLogoutKey, `${Date.now()}:${crypto.randomUUID()}`);
+            }
+            catch {
             }
         }
         async refreshOrClear(expectedGeneration = this.authGeneration, expectedToken = this.refreshToken, expectedPersistenceGeneration = this.persistenceGeneration) {
@@ -1073,7 +1327,31 @@ var Amaterasu;
         handleStorageChange(event) {
             if (this.loggingOut)
                 return;
+            if (event.key === this.cookiePendingLogoutKey &&
+                event.newValue !== null && this.cookieSession) {
+                let stillPending = true;
+                try {
+                    stillPending =
+                        localStorage.getItem(this.cookiePendingLogoutKey) === event.newValue;
+                }
+                catch {
+                }
+                if (stillPending) {
+                    this.resetMemory(true);
+                    this.onAuthenticationLost?.();
+                }
+                else {
+                    void this.checkCookieSessionAfterPeerLogout();
+                }
+                return;
+            }
+            if (event.key === this.cookieLogoutKey && this.cookieSession) {
+                void this.checkCookieSessionAfterPeerLogout();
+                return;
+            }
             if (event.key !== null && event.key !== this.storageKey)
+                return;
+            if (this.usesSecureCookies)
                 return;
             let currentRaw;
             try {
@@ -1107,6 +1385,31 @@ var Amaterasu;
             if (this.remembered)
                 this.installStoredSession(stored);
         }
+        async checkCookieSessionAfterPeerLogout() {
+            const generation = this.authGeneration;
+            try {
+                await this.withSessionLock(async () => {
+                    if (!this.cookieSession || generation !== this.authGeneration)
+                        return;
+                    try {
+                        const reply = await this.send("auth/browser/session", {}, false, "", true);
+                        if (generation === this.authGeneration)
+                            this.applyBrowserSession(reply);
+                    }
+                    catch (error) {
+                        if (!(error instanceof ApiError) ||
+                            (error.status !== 401 && error.code !== "invalid_response"))
+                            return;
+                        if (generation === this.authGeneration) {
+                            this.resetMemory(true);
+                            this.onAuthenticationLost?.();
+                        }
+                    }
+                });
+            }
+            catch {
+            }
+        }
         resetMemory(invalidatePersistence) {
             this.authGeneration += 1;
             this.tokenGeneration += 1;
@@ -1118,6 +1421,8 @@ var Amaterasu;
             this.subject = "";
             this.scopes = null;
             this.remembered = false;
+            this.cookieSession = false;
+            this.cookieRefreshInFlight = null;
             this.sessionId = null;
             this.refreshInFlight = null;
             this.abortRequests();
@@ -1131,7 +1436,7 @@ var Amaterasu;
                 }
             }
         }
-        async send(route, payload, protectedRoute, bearer) {
+        async send(route, payload, protectedRoute, bearer, cookieAuth = false) {
             const controller = new AbortController();
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
@@ -1141,14 +1446,16 @@ var Amaterasu;
                 const headers = {
                     "Content-Type": "application/json",
                 };
-                if (protectedRoute)
+                if (cookieAuth)
+                    headers["X-Amaterasu-CSRF"] = "1";
+                else if (protectedRoute)
                     headers.Authorization = `Bearer ${bearer}`;
                 const response = await fetch(`${this.base}/v1/${route}`, {
                     method: "POST",
                     headers,
                     body: JSON.stringify(payload),
                     signal: controller.signal,
-                    credentials: "omit",
+                    credentials: cookieAuth ? "same-origin" : "omit",
                     cache: "no-store",
                     referrerPolicy: "no-referrer",
                 });
@@ -6027,7 +6334,9 @@ var Amaterasu;
             password.autocomplete = "current-password";
             password.required = true;
             const rememberMe = Amaterasu.input("remember_me", "", "checkbox");
-            const rememberField = Amaterasu.field("Remember this browser", rememberMe, "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.");
+            const rememberField = Amaterasu.field("Remember this browser", rememberMe, this.api.usesSecureCookies
+                ? "Keep this signed-in browser session across restarts. Session cookies are protected from scripts."
+                : "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.");
             const token = Amaterasu.input("token", "", "password");
             token.autocomplete = "off";
             token.spellcheck = false;
@@ -6072,7 +6381,9 @@ var Amaterasu;
                 });
             });
             const setup = Amaterasu.el("details", "setup-note", Amaterasu.el("summary", "", "First time setting up this host?"), Amaterasu.el("p", "", "An administrator must create the initial credentials through the trusted local console. Password setup is not available in this browser."), Amaterasu.el("p", "muted", "The management listener must be enabled and this browser origin allowed. Contact the person who configured the host."));
-            card.append(form, setup, Amaterasu.el("div", "login-security", Amaterasu.el("span", "status-dot"), Amaterasu.el("span", "", "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.")));
+            card.append(form, setup, Amaterasu.el("div", "login-security", Amaterasu.el("span", "status-dot"), Amaterasu.el("span", "", this.api.usesSecureCookies
+                ? "Your browser sends protected session cookies only to this HTTPS host."
+                : "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.")));
             main.append(intro, Amaterasu.el("div", "login-side", card));
             this.root.replaceChildren(main);
             username.focus();
@@ -6108,7 +6419,16 @@ var Amaterasu;
             menu.setAttribute("aria-label", "Toggle navigation");
             menu.setAttribute("aria-expanded", "false");
             const logout = Amaterasu.button("Sign out", () => {
-                void this.api.logout();
+                void this.api.logout().catch((error) => {
+                    const card = this.root.querySelector(".login-card");
+                    if (card) {
+                        const warning = Amaterasu.el("p", "error", error instanceof Error
+                            ? error.message
+                            : "Could not confirm sign-out. Retry when the host is reachable.");
+                        warning.setAttribute("role", "alert");
+                        card.prepend(warning);
+                    }
+                });
                 clearTimeout(this.notificationTimer);
                 document
                     .querySelectorAll("dialog")

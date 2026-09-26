@@ -163,7 +163,9 @@ namespace Amaterasu {
       const rememberField = field(
         "Remember this browser",
         rememberMe,
-        "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.",
+        this.api.usesSecureCookies
+          ? "Keep this signed-in browser session across restarts. Session cookies are protected from scripts."
+          : "Store raw tokens in one localStorage record across reloads and restarts. Same-origin scripts can read it. Remember me requires Web Locks in a secure browser context; sign in without it when unavailable.",
       );
       const token = input("token", "", "password");
       token.autocomplete = "off";
@@ -254,11 +256,9 @@ namespace Amaterasu {
           "div",
           "login-security",
           el("span", "status-dot"),
-          el(
-            "span",
-            "",
-            "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox.",
-          ),
+          el("span", "", this.api.usesSecureCookies
+            ? "Your browser sends protected session cookies only to this HTTPS host."
+            : "Same-origin scripts can read remembered tokens; localStorage is not HttpOnly protection or a native-code sandbox."),
         ),
       );
       main.append(intro, el("div", "login-side", card));
@@ -324,7 +324,20 @@ namespace Amaterasu {
       const logout = button(
         "Sign out",
         () => {
-          void this.api.logout();
+          void this.api.logout().catch((error) => {
+            const card = this.root.querySelector(".login-card");
+            if (card) {
+              const warning = el(
+                "p",
+                "error",
+                error instanceof Error
+                  ? error.message
+                  : "Could not confirm sign-out. Retry when the host is reachable.",
+              );
+              warning.setAttribute("role", "alert");
+              card.prepend(warning);
+            }
+          });
           clearTimeout(this.notificationTimer);
           document
             .querySelectorAll("dialog")

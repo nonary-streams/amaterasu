@@ -22,6 +22,13 @@ namespace Amaterasu {
     refreshing: boolean;
   };
 
+  type BrowserSession = {
+    ok: true;
+    subject: string;
+    scopes: string[];
+    expires_at: number;
+  };
+
   const SESSION_STORAGE_VERSION = 1;
 
   export class ApiError extends Error {
@@ -48,6 +55,11 @@ namespace Amaterasu {
     private readonly base: string;
     private readonly storageKey: string;
     private readonly refreshLockName: string;
+    private readonly cookieLogoutKey: string;
+    private readonly cookiePendingLogoutKey: string;
+    readonly usesSecureCookies: boolean;
+    private cookieSession = false;
+    private cookieRefreshInFlight: Promise<void> | null = null;
     private remembered = false;
     private sessionId: string | null = null;
     private loggingOut = false;
@@ -66,8 +78,12 @@ namespace Amaterasu {
       )
         throw new Error("The API address must be an HTTP(S) origin.");
       this.base = url.origin;
+      this.usesSecureCookies =
+        url.protocol === "https:" && this.base === location.origin;
       this.storageKey = `amaterasu.session.${encodeURIComponent(this.base)}`;
       this.refreshLockName = `amaterasu.session.refresh:${this.base}`;
+      this.cookieLogoutKey = `amaterasu.session.cookie-logout.${encodeURIComponent(this.base)}`;
+      this.cookiePendingLogoutKey = `amaterasu.session.cookie-pending-logout.${encodeURIComponent(this.base)}`;
       if (
         typeof window !== "undefined" &&
         typeof window.addEventListener === "function"
@@ -90,6 +106,10 @@ namespace Amaterasu {
           401,
         );
       }
+      if (this.usesSecureCookies) {
+        await this.loginWithCookies(username, password, rememberMe);
+        return;
+      }
       if (rememberMe && !this.webLocks())
         throw this.rememberedRefreshLockError();
       const generation = this.authGeneration;
@@ -103,6 +123,7 @@ namespace Amaterasu {
 
     async restoreSession(): Promise<boolean> {
       if (this.loggingOut) return false;
+      if (this.usesSecureCookies) return this.restoreCookieSession();
       this.resetMemory(true);
       if (!this.webLocks()) {
         // A remembered bearer cannot be used safely when this browser cannot
@@ -162,6 +183,8 @@ namespace Amaterasu {
 
     async logout(): Promise<void> {
       if (this.logoutInFlight) return this.logoutInFlight;
+
+      if (this.cookieSession) return this.logoutCookieSession();
 
       this.loggingOut = true;
       this.subject = "";
@@ -234,6 +257,10 @@ namespace Amaterasu {
     }
 
     async clear(): Promise<void> {
+      if (this.cookieSession) {
+        await this.logoutCookieSession();
+        return;
+      }
       const sessionId = this.remembered ? this.sessionId : null;
       this.resetMemory(true);
       await this.removeStoredSessionForIdentity(sessionId);
@@ -255,6 +282,8 @@ namespace Amaterasu {
           401,
         );
       }
+      if (protectedRoute && this.cookieSession)
+        return this.postWithCookies<T>(route, payload);
       if (protectedRoute && !this.bearer)
         throw new ApiError("Sign in to continue.", "unauthorized", 401);
 
@@ -311,6 +340,274 @@ namespace Amaterasu {
           );
         }
         return response;
+      }
+    }
+
+    private validateBrowserSession(reply: BrowserSession): BrowserSession {
+      if (
+        reply.ok !== true ||
+        typeof reply.subject !== "string" ||
+        !Array.isArray(reply.scopes) ||
+        !reply.scopes.every((scope) => typeof scope === "string") ||
+        !Number.isSafeInteger(reply.expires_at) ||
+        reply.expires_at <= 0 ||
+        Object.hasOwn(reply, "bearer") ||
+        Object.hasOwn(reply, "refresh_token")
+      )
+        throw new ApiError(
+          "The host returned an invalid authentication response.",
+          "invalid_response",
+          502,
+        );
+      return reply;
+    }
+
+    private applyBrowserSession(reply: BrowserSession): void {
+      const session = this.validateBrowserSession(reply);
+      this.cookieSession = true;
+      this.accessExpiresAt = session.expires_at;
+      this.subject = session.subject;
+      this.scopes = [...session.scopes];
+      this.tokenGeneration += 1;
+    }
+
+    private async loginWithCookies(
+      username: string,
+      password: string,
+      rememberMe: boolean,
+    ): Promise<void> {
+      this.assertCookieStorageAvailable();
+      if (!this.webLocks()) throw this.rememberedRefreshLockError();
+      const generation = this.authGeneration;
+      await this.withSessionLock(async () => {
+        await this.finishPendingCookieLogout();
+        if (generation !== this.authGeneration)
+          throw new Error("The sign-in attempt was cancelled.");
+        const reply = await this.send<BrowserSession>(
+          "auth/browser/login",
+          { username, password, remember_me: rememberMe },
+          false,
+          "",
+          true,
+        );
+        if (generation !== this.authGeneration) {
+          await this.completeCookieLogout(this.markCookieLogoutPending());
+          throw new Error("The sign-in attempt was cancelled.");
+        }
+        try {
+          this.applyBrowserSession(reply);
+        } catch (error) {
+          await this.completeCookieLogout(this.markCookieLogoutPending());
+          throw error;
+        }
+        this.authGeneration += 1;
+      });
+    }
+
+    private async restoreCookieSession(): Promise<boolean> {
+      this.resetMemory(true);
+      this.assertCookieStorageAvailable();
+      if (!this.webLocks()) return false;
+      const generation = this.authGeneration;
+      return this.withSessionLock(async () => {
+        if (await this.finishPendingCookieLogout()) return false;
+        try {
+          const reply = await this.readCookieSession();
+          if (generation !== this.authGeneration || this.loggingOut)
+            return false;
+          this.applyBrowserSession(reply);
+          return true;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 401)
+            return false;
+          throw error;
+        }
+      });
+    }
+
+    private async refreshCookieSession(): Promise<void> {
+      if (this.cookieRefreshInFlight) return this.cookieRefreshInFlight;
+      const generation = this.authGeneration;
+      const pending = this.withSessionLock(async () => {
+        if (generation !== this.authGeneration || this.loggingOut) return;
+        const reply = await this.readCookieSession();
+        if (generation === this.authGeneration && !this.loggingOut)
+          this.applyBrowserSession(reply);
+      });
+      this.cookieRefreshInFlight = pending;
+      try {
+        await pending;
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          (error.status === 401 || error.code === "logout_unconfirmed") &&
+          generation === this.authGeneration && !this.loggingOut
+        ) {
+          this.resetMemory(true);
+          this.onAuthenticationLost?.();
+        }
+        throw error;
+      } finally {
+        if (this.cookieRefreshInFlight === pending)
+          this.cookieRefreshInFlight = null;
+      }
+    }
+
+    private async postWithCookies<T>(route: string, payload: Payload): Promise<T> {
+      if (this.accessExpiresAt - Date.now() / 1000 <= 60)
+        await this.refreshCookieSession();
+      if (!this.cookieSession || this.loggingOut)
+        throw new ApiError("Sign in to continue.", "unauthorized", 401);
+      const generation = this.authGeneration;
+      const tokenGeneration = this.tokenGeneration;
+      try {
+        const reply = await this.send<T>(route, payload, true, "", true);
+        if (generation !== this.authGeneration || this.loggingOut)
+          throw new ApiError("Sign in to continue.", "unauthorized", 401);
+        return reply;
+      } catch (error) {
+        if (
+          !(error instanceof ApiError) || error.status !== 401 ||
+          generation !== this.authGeneration || this.loggingOut
+        ) throw error;
+        if (tokenGeneration === this.tokenGeneration)
+          await this.refreshCookieSession();
+        if (!this.cookieSession || generation !== this.authGeneration)
+          throw error;
+        try {
+          const reply = await this.send<T>(route, payload, true, "", true);
+          if (generation !== this.authGeneration || this.loggingOut)
+            throw new ApiError("Sign in to continue.", "unauthorized", 401);
+          return reply;
+        } catch (retryError) {
+          if (
+            retryError instanceof ApiError &&
+            retryError.status === 401 &&
+            generation === this.authGeneration
+          ) {
+            this.resetMemory(true);
+            this.onAuthenticationLost?.();
+          }
+          throw retryError;
+        }
+      }
+    }
+
+    private async requestCookieRefresh(): Promise<BrowserSession> {
+      try {
+        return this.validateBrowserSession(
+          await this.send<BrowserSession>(
+            "auth/browser/refresh", {}, false, "", true,
+          ),
+        );
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401)
+          await this.completeCookieLogout(this.markCookieLogoutPending());
+        throw error;
+      }
+    }
+
+    private async readCookieSession(): Promise<BrowserSession> {
+      let reply: BrowserSession;
+      try {
+        reply = this.validateBrowserSession(
+          await this.send<BrowserSession>(
+            "auth/browser/session", {}, false, "", true,
+          ),
+        );
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 401)
+          throw error;
+        return this.requestCookieRefresh();
+      }
+      if (reply.expires_at - Date.now() / 1000 <= 60)
+        return this.requestCookieRefresh();
+      return reply;
+    }
+
+    private async logoutCookieSession(): Promise<void> {
+      if (this.logoutInFlight) return this.logoutInFlight;
+      this.loggingOut = true;
+      const marker = this.markCookieLogoutPending();
+      this.resetMemory(true);
+      const pending = this.withSessionLock(async () => {
+        await this.completeCookieLogout(marker);
+      });
+      this.logoutInFlight = pending;
+      try {
+        await pending;
+      } finally {
+        this.logoutInFlight = null;
+        this.loggingOut = false;
+      }
+    }
+
+    private markCookieLogoutPending(): string {
+      const marker = `${Date.now()}:${crypto.randomUUID()}`;
+      try {
+        localStorage.setItem(this.cookiePendingLogoutKey, marker);
+      } catch {
+        // A failed request cannot be retried on reload without storage.
+      }
+      return marker;
+    }
+
+    private async finishPendingCookieLogout(): Promise<boolean> {
+      let marker: string | null;
+      try {
+        marker = localStorage.getItem(this.cookiePendingLogoutKey);
+      } catch {
+        throw this.cookieStorageError();
+      }
+      if (marker === null) return false;
+      await this.completeCookieLogout(marker);
+      return true;
+    }
+
+    private assertCookieStorageAvailable(): void {
+      const probeKey = `${this.cookiePendingLogoutKey}.probe`;
+      const probe = crypto.randomUUID();
+      try {
+        localStorage.setItem(probeKey, probe);
+        if (localStorage.getItem(probeKey) !== probe)
+          throw new Error("Browser storage did not retain the logout marker.");
+        localStorage.removeItem(probeKey);
+      } catch {
+        throw this.cookieStorageError();
+      }
+    }
+
+    private cookieStorageError(): ApiError {
+      return new ApiError(
+        "Secure browser sign-in requires writable storage to recover an unconfirmed sign-out after reload.",
+        "storage_unavailable",
+        503,
+      );
+    }
+
+    private async completeCookieLogout(marker: string): Promise<void> {
+      try {
+        await this.send("auth/browser/logout", {}, false, "", true);
+      } catch (error) {
+        if (
+          !(error instanceof ApiError) || error.status !== 401 ||
+          error.code !== "session_missing"
+        )
+          throw new ApiError(
+            "Could not confirm sign-out. The browser may still hold session cookies; retry when the host is reachable.",
+            "logout_unconfirmed",
+            503,
+          );
+      }
+      try {
+        if (localStorage.getItem(this.cookiePendingLogoutKey) === marker)
+          localStorage.removeItem(this.cookiePendingLogoutKey);
+        localStorage.setItem(
+          this.cookieLogoutKey,
+          `${Date.now()}:${crypto.randomUUID()}`,
+        );
+      } catch {
+        // Confirmed server revocation is sufficient when storage is denied.
       }
     }
 
@@ -894,9 +1191,33 @@ namespace Amaterasu {
 
     private handleStorageChange(event: StorageEvent): void {
       if (this.loggingOut) return;
+      if (
+        event.key === this.cookiePendingLogoutKey &&
+        event.newValue !== null && this.cookieSession
+      ) {
+        let stillPending = true;
+        try {
+          stillPending =
+            localStorage.getItem(this.cookiePendingLogoutKey) === event.newValue;
+        } catch {
+          // Storage denial means the peer's pending sign-out is unobservable.
+        }
+        if (stillPending) {
+          this.resetMemory(true);
+          this.onAuthenticationLost?.();
+        } else {
+          void this.checkCookieSessionAfterPeerLogout();
+        }
+        return;
+      }
+      if (event.key === this.cookieLogoutKey && this.cookieSession) {
+        void this.checkCookieSessionAfterPeerLogout();
+        return;
+      }
       // Storage.clear() broadcasts a null key. Re-read our record below so a
       // peer tab cannot keep using a remembered bearer after that clear.
       if (event.key !== null && event.key !== this.storageKey) return;
+      if (this.usesSecureCookies) return;
       let currentRaw: string | null;
       try {
         currentRaw = this.readStoredSessionRaw();
@@ -928,6 +1249,34 @@ namespace Amaterasu {
       if (this.remembered) this.installStoredSession(stored);
     }
 
+    private async checkCookieSessionAfterPeerLogout(): Promise<void> {
+      const generation = this.authGeneration;
+      try {
+        await this.withSessionLock(async () => {
+          if (!this.cookieSession || generation !== this.authGeneration) return;
+          try {
+            const reply = await this.send<BrowserSession>(
+              "auth/browser/session", {}, false, "", true,
+            );
+            if (generation === this.authGeneration)
+              this.applyBrowserSession(reply);
+          } catch (error) {
+            if (
+              !(error instanceof ApiError) ||
+              (error.status !== 401 && error.code !== "invalid_response")
+            )
+              return;
+            if (generation === this.authGeneration) {
+              this.resetMemory(true);
+              this.onAuthenticationLost?.();
+            }
+          }
+        });
+      } catch {
+        // A failed peer check is retried by the next protected request.
+      }
+    }
+
     private resetMemory(invalidatePersistence: boolean): void {
       this.authGeneration += 1;
       this.tokenGeneration += 1;
@@ -938,6 +1287,8 @@ namespace Amaterasu {
       this.subject = "";
       this.scopes = null;
       this.remembered = false;
+      this.cookieSession = false;
+      this.cookieRefreshInFlight = null;
       this.sessionId = null;
       this.refreshInFlight = null;
       this.abortRequests();
@@ -958,6 +1309,7 @@ namespace Amaterasu {
       payload: Payload,
       protectedRoute: boolean,
       bearer: string,
+      cookieAuth = false,
     ): Promise<T> {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 12_000);
@@ -967,13 +1319,14 @@ namespace Amaterasu {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
         };
-        if (protectedRoute) headers.Authorization = `Bearer ${bearer}`;
+        if (cookieAuth) headers["X-Amaterasu-CSRF"] = "1";
+        else if (protectedRoute) headers.Authorization = `Bearer ${bearer}`;
         const response = await fetch(`${this.base}/v1/${route}`, {
           method: "POST",
           headers,
           body: JSON.stringify(payload),
           signal: controller.signal,
-          credentials: "omit",
+          credentials: cookieAuth ? "same-origin" : "omit",
           cache: "no-store",
           referrerPolicy: "no-referrer",
         });

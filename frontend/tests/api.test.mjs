@@ -22,6 +22,14 @@ function sessionReply(bearer, refreshToken, expiry, refreshExpiry, overrides = {
   };
 }
 
+const browserReply = (expiry, overrides = {}) => ({
+  ok: true,
+  subject: "admin",
+  scopes: ["catalog.read"],
+  expires_at: expiry,
+  ...overrides,
+});
+
 function memoryStorage(failures = {}) {
   const values = new Map();
   return {
@@ -74,7 +82,7 @@ function apiHarness(responder, options = {}) {
     clearTimeout,
     localStorage: storage,
     navigator: options.locks === null ? undefined : { locks: options.locks ?? lockManager() },
-    location: { origin: "http://127.0.0.1:5000" },
+    location: { origin: options.origin ?? "http://127.0.0.1:5000" },
     window: {
       setTimeout,
       addEventListener: (name, listener) => {
@@ -1139,6 +1147,330 @@ test("session-only login remains in memory when the localStorage getter is denie
 
   assert.equal(api.subject, "admin");
   assert.equal(calls.length, 1);
+});
+
+test("HTTPS same-origin login and reload use only HttpOnly cookie routes", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const locks = lockManager();
+  const responder = (url) => Response.json(
+    url.endsWith("/catalog/list") ? { ok: true, entries: [] } : browserReply(future(3600)),
+  );
+  const first = apiHarness(responder, { origin, storage, locks });
+  assert.equal(first.api.usesSecureCookies, true);
+  await first.api.login("admin", "password", true);
+  const second = apiHarness(responder, { origin, storage, locks });
+  assert.equal(await second.api.restoreSession(), true);
+  await second.api.post("catalog/list");
+  assert.equal(first.calls[0].url, `${origin}/v1/auth/browser/login`);
+  assert.equal(second.calls[0].url, `${origin}/v1/auth/browser/session`);
+  assert.equal(second.calls[1].url, `${origin}/v1/catalog/list`);
+  for (const { options } of [...first.calls, ...second.calls]) {
+    assert.equal(options.credentials, "same-origin");
+    assert.equal(options.headers["X-Amaterasu-CSRF"], "1");
+    assert.equal(options.headers.Authorization, undefined);
+    assert.equal(options.referrerPolicy, "no-referrer");
+  }
+  assert.equal(storage.values.size, 0);
+});
+
+test("expired HTTPS cookie reload refreshes once and rejects token-bearing metadata", async () => {
+  const origin = "https://host.example";
+  let refreshes = 0;
+  const responder = (url) => {
+    if (url.endsWith("/browser/session"))
+      return Response.json({ ok: false, code: "unauthorized" }, { status: 401 });
+    if (url.endsWith("/browser/refresh")) {
+      refreshes += 1;
+      return Response.json(browserReply(future(3600)));
+    }
+    return Response.json({ ok: true });
+  };
+  const { api, calls } = apiHarness(responder, { origin });
+  assert.equal(await api.restoreSession(), true);
+  assert.equal(refreshes, 1);
+  assert.equal(calls.length, 2);
+  const malformed = apiHarness(
+    () => Response.json(browserReply(future(3600), { bearer: secret("a") })),
+    { origin },
+  );
+  await assert.rejects(malformed.api.login("admin", "password", true), {
+    code: "invalid_response",
+  });
+  assert.equal(malformed.api.subject, "");
+});
+
+test("concurrent HTTPS requests adopt peer rotation under one Web Lock", async () => {
+  const origin = "https://host.example";
+  const locks = lockManager();
+  let expiry = future(5);
+  let refreshes = 0;
+  const responder = (url) => {
+    if (url.endsWith("/browser/refresh")) {
+      refreshes += 1;
+      expiry = future(3600);
+    }
+    return Response.json(
+      url.endsWith("/catalog/list") ? { ok: true, entries: [] } : browserReply(expiry),
+    );
+  };
+  const first = apiHarness(responder, { origin, locks });
+  const second = apiHarness(responder, { origin, locks });
+  await first.api.login("admin", "password", true);
+  await second.api.login("admin", "password", true);
+  await Promise.all([
+    first.api.post("catalog/list"),
+    second.api.post("catalog/list"),
+  ]);
+  assert.equal(refreshes, 1);
+  assert.equal(
+    [...first.calls, ...second.calls].filter((call) =>
+      call.url.endsWith("/browser/refresh")
+    ).length,
+    1,
+  );
+});
+
+test("HTTPS logout revokes cookies and peers confirm lost authentication", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const locks = lockManager();
+  let active = true;
+  const responder = (url) => {
+    if (url.endsWith("/browser/logout")) {
+      active = false;
+      return Response.json({ ok: true });
+    }
+    return active
+      ? Response.json(browserReply(future(3600)))
+      : Response.json({ ok: false, code: "unauthorized" }, { status: 401 });
+  };
+  const first = apiHarness(responder, { origin, storage, locks });
+  const second = apiHarness(responder, { origin, storage, locks });
+  await first.api.login("admin", "password", true);
+  await second.api.restoreSession();
+  let lost = 0;
+  second.api.onAuthenticationLost = () => lost += 1;
+  await first.api.logout();
+  second.dispatchStorage(`amaterasu.session.cookie-logout.${encodeURIComponent(origin)}`, "signal");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(second.api.subject, "");
+  assert.equal(lost, 1);
+  assert.equal(first.calls.at(-1).url, `${origin}/v1/auth/browser/logout`);
+  assert.equal(storage.values.size, 1);
+  assert.ok(!JSON.stringify([...storage.values]).includes("ama_"));
+});
+
+test("HTTPS cookie login fails closed when browser storage is denied", async () => {
+  const origin = "https://host.example";
+  const { api, calls } = apiHarness(
+    (url) => Response.json(
+      url.endsWith("/browser/logout")
+        ? { ok: true }
+        : browserReply(future(3600)),
+    ),
+    { origin, storageGetterThrows: true },
+  );
+  await assert.rejects(api.login("admin", "password", true), {
+    code: "storage_unavailable",
+  });
+  assert.equal(api.subject, "");
+  await assert.rejects(api.restoreSession(), { code: "storage_unavailable" });
+  assert.equal(calls.length, 0);
+});
+
+test("HTTPS cookie mode fails closed without Web Locks", async () => {
+  const origin = "https://host.example";
+  const { api, calls } = apiHarness(
+    () => Response.json(browserReply(future(3600))),
+    { origin, locks: null },
+  );
+  await assert.rejects(api.login("admin", "password", true), /Web Locks/);
+  assert.equal(await api.restoreSession(), false);
+  assert.equal(calls.length, 0);
+});
+
+test("rejected HTTPS cookie refresh clears local session and reports auth loss", async () => {
+  const origin = "https://host.example";
+  let signedIn = true;
+  const responder = (url) => {
+    if (url.endsWith("/browser/login"))
+      return Response.json(browserReply(future(5)));
+    if (url.endsWith("/browser/session"))
+      return Response.json(
+        signedIn ? browserReply(future(5)) : { ok: false, code: "unauthorized" },
+        { status: signedIn ? 200 : 401 },
+      );
+    if (url.endsWith("/browser/logout")) return Response.json({ ok: true });
+    return Response.json({ ok: false, code: "token_not_found" }, { status: 401 });
+  };
+  const { api, calls } = apiHarness(responder, { origin });
+  await api.login("admin", "password", true);
+  let lost = 0;
+  api.onAuthenticationLost = () => lost += 1;
+  signedIn = false;
+  await assert.rejects(api.post("catalog/list"), { code: "token_not_found" });
+  assert.equal(api.subject, "");
+  assert.equal(lost, 1);
+  assert.equal(calls.at(-2).url, `${origin}/v1/auth/browser/refresh`);
+  assert.equal(calls.at(-1).url, `${origin}/v1/auth/browser/logout`);
+});
+
+test("HTTPS logout waits for in-flight rotation then revokes the cookie", async () => {
+  const origin = "https://host.example";
+  let refreshStarted;
+  const started = new Promise((resolve) => refreshStarted = resolve);
+  let finishRefresh;
+  const refreshReply = new Promise((resolve) => finishRefresh = resolve);
+  const responder = (url) => {
+    if (url.endsWith("/browser/login") || url.endsWith("/browser/session"))
+      return Response.json(browserReply(future(5)));
+    if (url.endsWith("/browser/refresh")) {
+      refreshStarted();
+      return refreshReply;
+    }
+    return Response.json({ ok: true });
+  };
+  const { api, calls } = apiHarness(responder, { origin });
+  await api.login("admin", "password", true);
+  const request = api.post("catalog/list");
+  await started;
+  const logout = api.logout();
+  assert.equal(api.subject, "");
+  finishRefresh(Response.json(browserReply(future(3600))));
+  await assert.rejects(request, { code: "unauthorized" });
+  await logout;
+  assert.equal(calls.at(-1).url, `${origin}/v1/auth/browser/logout`);
+  assert.equal(calls.some((call) => call.url.endsWith("/catalog/list")), false);
+});
+
+test("queued stale HTTPS login cannot overwrite a newer cookie session", async () => {
+  const origin = "https://host.example";
+  const locks = lockManager();
+  let release;
+  let acquired;
+  const lockAcquired = new Promise((resolve) => acquired = resolve);
+  const blocker = locks.request(
+    `amaterasu.session.refresh:${origin}`,
+    { mode: "exclusive" },
+    () => new Promise((resolve) => {
+      release = resolve;
+      acquired();
+    }),
+  );
+  const { api, calls } = apiHarness(
+    () => Response.json(browserReply(future(3600))),
+    { origin, locks },
+  );
+  const winner = api.login("admin", "password", true);
+  const stale = api.login("old", "password", true);
+  await lockAcquired;
+  release();
+  await blocker;
+  await winner;
+  await assert.rejects(stale, /cancelled/);
+  assert.equal(api.subject, "admin");
+  assert.equal(calls.filter((call) => call.url.endsWith("/browser/login")).length, 1);
+});
+
+test("unconfirmed HTTPS logout blocks reload until revocation succeeds", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const locks = lockManager();
+  let available = false;
+  const responder = (url) => {
+    if (url.endsWith("/browser/logout"))
+      return Response.json(
+        available ? { ok: true } : { ok: false, code: "unavailable" },
+        { status: available ? 200 : 503 },
+      );
+    return Response.json(browserReply(future(3600)));
+  };
+  const first = apiHarness(responder, { origin, storage, locks });
+  await first.api.login("admin", "password", true);
+  await assert.rejects(first.api.logout(), { code: "logout_unconfirmed" });
+  assert.equal(first.api.subject, "");
+  const pendingKey = `amaterasu.session.cookie-pending-logout.${encodeURIComponent(origin)}`;
+  assert.ok(storage.getItem(pendingKey));
+
+  available = true;
+  const reloaded = apiHarness(responder, { origin, storage, locks });
+  assert.equal(await reloaded.api.restoreSession(), false);
+  assert.equal(reloaded.calls.length, 1);
+  assert.equal(reloaded.calls[0].url, `${origin}/v1/auth/browser/logout`);
+  assert.equal(storage.getItem(pendingKey), null);
+});
+
+test("denied storage surfaces unconfirmed HTTPS logout", async () => {
+  const origin = "https://host.example";
+  const failures = {};
+  const storage = memoryStorage(failures);
+  const { api } = apiHarness(
+    (url) => Response.json(
+      url.endsWith("/browser/logout")
+        ? { ok: false, code: "unavailable" }
+        : browserReply(future(3600)),
+      { status: url.endsWith("/browser/logout") ? 503 : 200 },
+    ),
+    { origin, storage },
+  );
+  await api.login("admin", "password", true);
+  failures.get = true;
+  failures.set = true;
+  await assert.rejects(api.logout(), {
+    code: "logout_unconfirmed",
+    message: /may still hold session cookies/,
+  });
+  assert.equal(api.subject, "");
+  const reloaded = apiHarness(
+    () => Response.json(browserReply(future(3600))),
+    { origin, storage },
+  );
+  await assert.rejects(reloaded.api.restoreSession(), {
+    code: "storage_unavailable",
+  });
+  assert.equal(reloaded.calls.length, 0);
+});
+
+test("HTTPS logout keeps a retry marker when 401 does not prove cookie clearing", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const { api } = apiHarness(
+    (url) => Response.json(
+      url.endsWith("/browser/logout")
+        ? { ok: false, code: "token_not_found" }
+        : browserReply(future(3600)),
+      { status: url.endsWith("/browser/logout") ? 401 : 200 },
+    ),
+    { origin, storage },
+  );
+  await api.login("admin", "password", true);
+  await assert.rejects(api.logout(), { code: "logout_unconfirmed" });
+  assert.equal(api.subject, "");
+  assert.ok(
+    storage.getItem(`amaterasu.session.cookie-pending-logout.${encodeURIComponent(origin)}`),
+  );
+});
+
+test("HTTPS logout accepts session_missing 401 with cleared cookies", async () => {
+  const origin = "https://host.example";
+  const storage = memoryStorage();
+  const { api } = apiHarness(
+    (url) => Response.json(
+      url.endsWith("/browser/logout")
+        ? { ok: false, code: "session_missing" }
+        : browserReply(future(3600)),
+      { status: url.endsWith("/browser/logout") ? 401 : 200 },
+    ),
+    { origin, storage },
+  );
+  await api.login("admin", "password", true);
+  await api.logout();
+  assert.equal(api.subject, "");
+  assert.equal(
+    storage.getItem(`amaterasu.session.cookie-pending-logout.${encodeURIComponent(origin)}`),
+    null,
+  );
 });
 
 test("session-only login remains in memory when storage methods throw", async () => {
