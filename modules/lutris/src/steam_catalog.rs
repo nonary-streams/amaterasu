@@ -10,6 +10,7 @@ use crate::configuration::release_terminal_child_result;
 const SERVICE: &str = "amaterasu.catalog/1";
 const TIMEOUT_MS: u64 = 30_000;
 const RESULT_GRACE: Duration = Duration::from_secs(5);
+const MAX_SETTLEMENT_ATTEMPTS: u8 = 4;
 const PAGE_SIZE: usize = 32;
 const MAX_STEAM_IDS: usize = 20_000;
 const MAX_CATALOG_CURSOR_BYTES: usize = 256;
@@ -18,6 +19,7 @@ const MAX_CATALOG_CURSOR_BYTES: usize = 256;
 enum Call {
     Submit { operation_id: String },
     Waiting { request: u64, deadline: Instant },
+    Settling { request: u64, attempts: u8 },
     Delay { ticks: u8 },
 }
 
@@ -97,7 +99,11 @@ impl SteamCatalogRead {
             },
             Call::Waiting { request, deadline } => {
                 if now >= deadline {
-                    return Ok(Progress::Failed("Steam-ID catalog result timed out".into()));
+                    self.call = Call::Settling {
+                        request,
+                        attempts: 0,
+                    };
+                    return Ok(self.settle_timed_out(request, 0, &mut send));
                 }
                 let response = match send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => return Ok(Progress::Pending),
@@ -119,6 +125,39 @@ impl SteamCatalogRead {
                     ))),
                 }
             }
+            Call::Settling { request, attempts } => {
+                Ok(self.settle_timed_out(request, attempts, &mut send))
+            }
+        }
+    }
+
+    fn settle_timed_out(
+        &mut self,
+        request: u64,
+        attempts: u8,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> Progress {
+        let settled = [
+            Command::Cancel { request },
+            Command::ReleaseResult { request },
+        ]
+        .into_iter()
+        .all(|command| match send(command) {
+            Ok(Response::Ok) => true,
+            Ok(Response::Error { code, .. }) if code == "not_found" => true,
+            _ => false,
+        });
+        if settled {
+            return Progress::Failed("Steam-ID catalog result timed out".into());
+        }
+        let attempts = attempts + 1;
+        if attempts >= MAX_SETTLEMENT_ATTEMPTS {
+            Progress::Failed(
+                "Steam-ID catalog result timed out; child settlement unconfirmed".into(),
+            )
+        } else {
+            self.call = Call::Settling { request, attempts };
+            Progress::Pending
         }
     }
 
@@ -278,14 +317,128 @@ mod tests {
             .unwrap(),
             Progress::Pending
         );
+        let mut settlement = Vec::new();
         assert_eq!(
-            read.advance_with(started + Duration::from_secs(35), |_| {
-                panic!("expired child result must not be polled")
+            read.advance_with(started + Duration::from_secs(35), |command| {
+                settlement.push(command);
+                Ok(Response::Ok)
             })
             .unwrap(),
             Progress::Failed("Steam-ID catalog result timed out".into())
         );
+        assert!(matches!(settlement[0], Command::Cancel { request: 17 }));
+        assert!(matches!(
+            settlement[1],
+            Command::ReleaseResult { request: 17 }
+        ));
+        assert_eq!(settlement.len(), 2);
         assert!(matches!(SteamCatalogRead::new().call, Call::Submit { .. }));
+    }
+
+    #[test]
+    fn timed_out_child_retries_cancel_then_release_in_order() {
+        let mut read = SteamCatalogRead::new();
+        let started = Instant::now();
+        read.advance_with(started, |_| Ok(Response::Accepted { id: 19 }))
+            .unwrap();
+        let mut commands = Vec::new();
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(35), |command| {
+                commands.push(command);
+                Err("transport unavailable".into())
+            })
+            .unwrap(),
+            Progress::Pending
+        );
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Cancel { request: 19 }]
+        ));
+
+        commands.clear();
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(36), |command| {
+                commands.push(command.clone());
+                match command {
+                    Command::Cancel { request: 19 } => Ok(Response::Ok),
+                    Command::ReleaseResult { request: 19 } => Err("release unavailable".into()),
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            })
+            .unwrap(),
+            Progress::Pending
+        );
+        assert!(matches!(commands[0], Command::Cancel { request: 19 }));
+        assert!(matches!(
+            commands[1],
+            Command::ReleaseResult { request: 19 }
+        ));
+
+        commands.clear();
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(37), |command| {
+                commands.push(command);
+                Ok(Response::Ok)
+            })
+            .unwrap(),
+            Progress::Failed("Steam-ID catalog result timed out".into())
+        );
+        assert!(matches!(commands[0], Command::Cancel { request: 19 }));
+        assert!(matches!(
+            commands[1],
+            Command::ReleaseResult { request: 19 }
+        ));
+    }
+
+    #[test]
+    fn late_terminal_result_is_released_and_settlement_retries_are_bounded() {
+        let started = Instant::now();
+        let mut late = SteamCatalogRead::new();
+        late.advance_with(started, |_| Ok(Response::Accepted { id: 21 }))
+            .unwrap();
+        let mut commands = Vec::new();
+        let outcome = late
+            .advance_with(started + Duration::from_secs(34), |command| {
+                commands.push(command.clone());
+                match command {
+                    Command::TakeResult { request: 21 } => Ok(Response::Error {
+                        code: "deadline_exceeded".into(),
+                        message: "request expired".into(),
+                    }),
+                    Command::ReleaseResult { request: 21 } => Ok(Response::Ok),
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            })
+            .unwrap();
+        assert!(matches!(outcome, Progress::Failed(_)));
+        assert!(matches!(commands[0], Command::TakeResult { request: 21 }));
+        assert!(matches!(
+            commands[1],
+            Command::ReleaseResult { request: 21 }
+        ));
+
+        let mut stuck = SteamCatalogRead::new();
+        stuck
+            .advance_with(started, |_| Ok(Response::Accepted { id: 22 }))
+            .unwrap();
+        for attempt in 1..=MAX_SETTLEMENT_ATTEMPTS {
+            let result = stuck
+                .advance_with(
+                    started + Duration::from_secs(35 + u64::from(attempt)),
+                    |_| Err("transport unavailable".into()),
+                )
+                .unwrap();
+            if attempt == MAX_SETTLEMENT_ATTEMPTS {
+                assert_eq!(
+                    result,
+                    Progress::Failed(
+                        "Steam-ID catalog result timed out; child settlement unconfirmed".into()
+                    )
+                );
+            } else {
+                assert_eq!(result, Progress::Pending);
+            }
+        }
     }
 
     #[test]

@@ -43,7 +43,9 @@ catalog revision, and a continuation cursor. Lutris deduplicates repeated
 IDs and abandons the scan if a page is malformed, the catalog revision changes,
 or the export is unavailable or exceeds its bounds. A child result that remains
 unavailable after its request timeout and grace period fails the scan, allowing
-the next automatic discovery to retry. Profiles must grant this catalog export
+the next automatic discovery to retry. Timeout cleanup cancels and releases the
+accepted child request in order, with bounded retries if transport fails.
+Profiles must grant this catalog export
 before the setting can reconcile successfully. A Lutris Steam entry whose app ID
 already has a direct catalog row is omitted, so a Steam app
 that was discovered but not selected into the direct catalog does not suppress
