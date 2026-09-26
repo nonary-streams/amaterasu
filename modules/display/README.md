@@ -40,9 +40,16 @@ pinned meanings are:
   display supports it.
 - `disabled` performs no additional HDR configuration.
 
-This model does not persist settings, project scoped values into a runtime
-request, or perform provider/native HDR effects. Platform behavior remains
-unqualified.
+For `apply`, `mode_policy.hdr_option` selects HDR for its `display_id`.
+`auto` requires `effective_client_hdr_request` (a boolean already resolved by
+the caller) and sets that display's requested `hdr_enabled` state. `disabled`
+clears the HDR request. A display in the concrete configuration may instead
+specify optional `hdr_enabled`: `true` requests HDR on, `false` requests it off,
+and omission requests no separate HDR operation. A supplied `hdr_option`
+overrides that display's concrete HDR field. The caller must resolve
+higher-priority forced HDR/SDR policies before sending the effective request.
+This module does not derive client/session facts or project stored global,
+application, or client settings into the service request.
 
 ## Display configuration option model
 
@@ -93,6 +100,7 @@ Moonlight gate.
 {"action":"enumerate","offset":0,"limit":16}
 {"action":"enumerate","display":"<id returned by enumeration>","offset":0,"limit":32}
 {"action":"apply","configuration":{"displays":[{"id":"<id returned by enumeration>","width":1920,"height":1080,"refresh":{"numerator":60000,"denominator":1001},"x":0,"y":0,"rotation":"identity"}]}}
+{"action":"apply","configuration":{"displays":[{"id":"<id returned by enumeration>","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}]},"mode_policy":{"display_id":"<same id>","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false},"hdr_option":"auto","effective_client_hdr_request":true}}
 {"action":"restore","lease":"display-0000000000000001"}
 {"action":"recover","lease":"display-0000000000000001"}
 ```
@@ -128,6 +136,12 @@ Dimensions, positions, rational refresh rates and duplicate identities are
 validated before persistence. Windows must validate the supplied configuration
 without silently changing requested settings. Success returns `applied:true`
 and an opaque lease. A second apply fails `display_busy` until restore completes.
+On Windows, HDR-on requires a currently active target with queryable HDR
+support. HDR-off is a no-op on an active target without HDR support. An
+inactive target may be activated with HDR-off requested: its HDR state is
+checked after CCD activation without changing an unjournaled HDR baseline.
+If it comes up HDR-on, apply fails and rolls back. This service reports
+`applied:true` only after CCD and requested HDR state verification.
 
 Both restore and recover require the authenticated immediate caller that owns
 the journal and its exact lease. Request payloads cannot replace that identity.
@@ -140,8 +154,9 @@ If the saved monitor/source route is unavailable, the journal remains armed.
 ## Recovery transaction
 
 1. Capture every active classic CCD path, including source modes/positions,
-   target signal timings, rotation, scaling, refresh, clone-source association
-   and path priority. Perform native `SDC_VALIDATE` without effects.
+   target signal timings, rotation, scaling, refresh, clone-source association,
+   path priority, and queryable per-target HDR state. Perform native
+   `SDC_VALIDATE` without effects.
 2. Store the full recovery snapshot, owner and generated lease in
    `physical-display/recovery`, using the state namespace revision CAS. Require
    a successful durable acknowledgement before any native apply.
@@ -151,15 +166,19 @@ If the saved monitor/source route is unavailable, the journal remains armed.
 4. Apply temporary CCD state with `SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY`;
    force the mode set through the driver. Do not save session settings to the
    Windows persistence database and do not use `SDC_ALLOW_CHANGES`.
-5. Query and verify the requested mode/topology. A potentially partial failed
-   apply attempts rollback to the durable snapshot. Failed rollback retains the
-   journal and reports `recovery_required:true` with the lease.
+5. Query and verify the requested mode/topology. Apply any HDR request with
+   `DisplayConfigSetDeviceInfo` and read back its state. A potentially partial
+   failed apply attempts rollback to the durable snapshot. Failed rollback
+   retains the journal and reports `recovery_required:true` with the lease.
 6. Explicit restore rebinds saved monitor identities to current adapter IDs,
    validates and applies every recorded CCD mode/path, then checks the restored
-   state against the snapshot. Clear the journal only after that succeeds.
+   mode and saved HDR state against the snapshot. For older SDR journals without
+   HDR fields, recovery blocks before mutation if a saved target is inactive
+   or now has HDR enabled. Clear the journal only after verification succeeds.
 
 Snapshot comparison checks ordered monitor/source associations, source sizes,
-positions/pixel formats, target signal timings, rotation, scaling and refresh.
+positions/pixel formats, target signal timings, rotation, scaling, refresh and
+recorded HDR state.
 Transient adapter addresses and read-only status flags are not identity. Source
 GDI routes must still match on recovery; an OS restart that renumbers them may
 require manual intervention rather than an unsafe guessed restoration.
@@ -181,19 +200,21 @@ rolled back. Explicit recovery intentionally restores the saved baseline.
 ## Native implementation and remaining gates
 
 Windows uses `GetDisplayConfigBufferSizes`, `QueryDisplayConfig`,
-`DisplayConfigGetDeviceInfo`, `EnumDisplaySettingsExW`, and `SetDisplayConfig` from
+`DisplayConfigGetDeviceInfo`, `DisplayConfigSetDeviceInfo`,
+`EnumDisplaySettingsExW`, and `SetDisplayConfig` from
 `windows-sys`. All native buffers are owned for the duration of synchronous calls.
 Union tags/indexes are validated, and snapshots serialize individual fields;
 no native struct padding or raw pointer is persisted.
 
-This implementation uses the classic CCD compatibility view. Active HDR/advanced
-color, indirect/virtual/wireless displays, and unsupported/incomplete path data
-are rejected for mutation. HDR/WCG state restoration, virtual-mode/virtual-refresh
+This implementation uses the classic CCD compatibility view and journals the
+queryable HDR on/off state of active paths. Active HDR can be restored; enforced
+wide-color-gamut state, indirect/virtual/wireless displays, and unsupported or
+incomplete path data remain outside this provider. Virtual-mode/virtual-refresh
 awareness, DPI scaling, color profiles, driver configuration, primary clone-group
 requests, virtual-display drivers, display-stack resets, topology settling and
 retry policy remain unimplemented. Existing clone topology can be captured and
 restored, but requested clone creation is not supported. Windows service-session,
-privilege, display-driver and hardware behavior still require native acceptance.
+privilege, display-driver and HDR hardware behavior still require native acceptance.
 
 The behavioral reference was Vibeshine commit
 `aa292c4cb097f22beab19d6ebf0307367f9bf449`, its display-helper interfaces and history
@@ -201,17 +222,23 @@ concerning physical restore gaps and rotation refresh. No implementation source
 was copied or translated. These references motivate capture-before-effects,
 verified restore, retained recovery state and forced mode setting; they do not
 establish parity with its complete helper.
+The HDR option behavior was also checked against pinned Vibeshine commit
+`457237db7e57f9c4be21c35bb07e28d1c100eb7d`; its higher-priority forced
+states and effective client HDR decision still require caller integration here.
 
 Validation includes fake-platform transaction tests for state failure before
 effects, cancellation at acknowledgement/native boundaries, caller ownership,
 restart recovery, failed journal deletion, partial native failure/rollback, and
-external changes. Windows native source cross-compiles on the development macOS
-host. **No test applies OS display changes on the developer desktop.** This is
-not a Windows hardware pass. Hardware acceptance must run an explicitly reviewed
+external changes, HDR enable/disable/readback, unsupported and inactive targets,
+rollback, and legacy-journal safety. The Windows native source and strict Clippy
+pass on the development Windows host. **No test applies OS display changes on
+the developer desktop.** This is not an HDR hardware pass. Hardware acceptance
+must run an explicitly reviewed
 apply/restore/restart-recovery sequence on a disposable Windows test setup with
 an independent way to recover the console.
 
 API references: [QueryDisplayConfig](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-querydisplayconfig),
 [SetDisplayConfig](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setdisplayconfig),
 [DisplayConfigGetDeviceInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfiggetdeviceinfo),
+[DisplayConfigSetDeviceInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfigsetdeviceinfo),
 [EnumDisplaySettingsExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumdisplaysettingsexw).
