@@ -325,6 +325,10 @@ impl ContainedChild {
 const MAX_JOB_PROCESS_IDS: usize = 65_536;
 
 fn process_ids_in_job(job: HANDLE) -> io::Result<Vec<u32>> {
+    #[cfg(test)]
+    if FAIL_NEXT_JOB_PROCESS_QUERY.with(|failure| failure.replace(false)) {
+        return Err(io::Error::other("injected job process query failure"));
+    }
     let header_size = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
     let max_bytes = header_size + (MAX_JOB_PROCESS_IDS - 1) * std::mem::size_of::<usize>();
     let mut storage = vec![0usize; header_size.div_ceil(std::mem::size_of::<usize>())];
@@ -377,6 +381,16 @@ fn process_ids_in_job(job: HANDLE) -> io::Result<Vec<u32>> {
         }
         storage.resize(required_size.div_ceil(std::mem::size_of::<usize>()), 0);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_JOB_PROCESS_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_job_process_query() {
+    FAIL_NEXT_JOB_PROCESS_QUERY.with(|failure| failure.set(true));
 }
 
 struct CloseWindowsContext {

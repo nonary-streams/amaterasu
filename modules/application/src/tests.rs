@@ -1263,6 +1263,58 @@ fn failed_launch_is_retained_and_caller_scoped_capacity_is_bounded() {
 }
 
 #[test]
+#[cfg(windows)]
+fn shutdown_recovers_after_a_transient_job_process_query_failure() {
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", launch("transient-job-query", "sleep"));
+    assert_eq!(launched["process"]["state"], "running", "{launched}");
+    let process_id = launched["process"]["process_id"].as_u64().unwrap();
+
+    crate::containment::fail_next_job_process_query();
+    assert_eq!(manager.shutdown(), Ok(()));
+    let settled = status(&mut manager, "alice", process_id);
+    assert_eq!(settled["process"]["state"], "cancelled", "{settled}");
+
+    let recovered = manager.handle("alice", launch("after-job-query", "exit"));
+    assert_eq!(recovered["process"]["state"], "running", "{recovered}");
+    let recovered_id = recovered["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(
+        wait_for_exit(&mut manager, recovered_id)["process"]["success"],
+        true
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_job_process_query_keeps_the_child_owned_for_stop_retry() {
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", launch("job-query-retry", "sleep"));
+    assert_eq!(launched["process"]["state"], "running", "{launched}");
+    let process_id = launched["process"]["process_id"].as_u64().unwrap();
+
+    crate::containment::fail_next_job_process_query();
+    let failed = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(failed["code"], "process_kill_failed", "{failed}");
+    let retained = status(&mut manager, "alice", process_id);
+    assert_eq!(retained["process"]["state"], "running", "{retained}");
+
+    let retry = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(retry["process"]["state"], "stopping", "{retry}");
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", process_id, "cancelled")["process"]["state"],
+        "cancelled"
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn malformed_paths_arguments_environment_and_payload_are_rejected() {
     let mut manager = ProcessManager::default();
     let base = launch("validation", "exit");

@@ -1061,7 +1061,7 @@ impl ProcessManager {
                 return if cleanup_failed {
                     Err(failure.unwrap_or("process_cleanup_failed"))
                 } else {
-                    failure.map_or(Ok(()), Err)
+                    Ok(())
                 };
             }
             if Instant::now() >= deadline {
