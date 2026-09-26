@@ -954,6 +954,18 @@ fn success_reply(record: &Record) -> Reply {
         ("physicalDisplayWidth", physical_width.as_str()),
         ("physicalDisplayHeight", physical_height.as_str()),
         ("physicalDisplayRefreshMilliHz", physical_refresh.as_str()),
+        (
+            "verifiedDisplayId",
+            record.verified_display_id.as_deref().unwrap_or_default(),
+        ),
+        (
+            "displayTopologyRevision",
+            record
+                .display_topology_revision
+                .as_deref()
+                .filter(|_| record.verified_display_id.is_some())
+                .unwrap_or_default(),
+        ),
     ];
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;

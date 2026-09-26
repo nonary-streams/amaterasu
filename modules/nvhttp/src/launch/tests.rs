@@ -993,6 +993,10 @@ struct Broker {
     wrong_rtsp_snapshot: bool,
     wrong_rtsp_display_policy_snapshot: bool,
     wrong_application_display_overrides: bool,
+    display_entries: Vec<Value>,
+    display_snapshot_ids: Vec<String>,
+    display_revision_drift: bool,
+    display_snapshot_calls: usize,
 }
 
 impl Default for Broker {
@@ -1036,6 +1040,10 @@ impl Default for Broker {
             wrong_rtsp_snapshot: false,
             wrong_rtsp_display_policy_snapshot: false,
             wrong_application_display_overrides: false,
+            display_entries: Vec::new(),
+            display_snapshot_ids: Vec::new(),
+            display_revision_drift: false,
+            display_snapshot_calls: 0,
         }
     }
 }
@@ -1093,6 +1101,42 @@ impl Broker {
 
     fn response(&mut self, service: &str, payload: &Value) -> Value {
         let action = payload["action"].as_str().unwrap_or_default();
+        if service == "amaterasu.display/1" {
+            return match action {
+                "snapshot" => {
+                    self.display_snapshot_calls += 1;
+                    let revision = if self.display_revision_drift && self.display_snapshot_calls > 1
+                    {
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    } else {
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    };
+                    json!({
+                        "ok":true,
+                        "topology_revision":revision,
+                        "configuration":{"displays":self.display_snapshot_ids.iter().map(|id| json!({
+                            "id":id,"width":1920,"height":1080,
+                            "refresh":{"numerator":60,"denominator":1},
+                            "x":0,"y":0
+                        })).collect::<Vec<_>>()}
+                    })
+                }
+                "enumerate" => {
+                    let offset = payload["offset"].as_u64().unwrap() as usize;
+                    let rows: Vec<_> = self
+                        .display_entries
+                        .iter()
+                        .skip(offset)
+                        .take(32)
+                        .cloned()
+                        .collect();
+                    let next = (offset + rows.len() < self.display_entries.len())
+                        .then_some(offset + rows.len());
+                    json!({"ok":true,"entries":rows,"next_offset":next})
+                }
+                _ => panic!("unexpected display mutation: {action}"),
+            };
+        }
         if service == "amaterasu.rtsp/1" && action == "open" {
             self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
@@ -2663,8 +2707,14 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
             },
         )
         .unwrap();
-    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut streaming = config();
+    streaming.capture.output = "00000000:00000001/\\\\.\\DISPLAY1".into();
+    let mut controller = Controller::new(Some(streaming)).unwrap();
     let mut broker = Broker {
+        display_snapshot_ids: vec!["monitor.one".into()],
+        display_entries: vec![json!({
+            "id":"monitor.one","source":"\\\\.\\DISPLAY1","active":true
+        })],
         application_input_overrides: Some(json!({
             "dd_refresh_rate_option":"manual",
             "dd_manual_refresh_rate":"59.94",
@@ -2675,6 +2725,11 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
     assert!(controller.launch(10, request(13), paired, now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(reply.status, 200);
+    assert!(
+        String::from_utf8(reply.body.clone())
+            .unwrap()
+            .contains("<verifiedDisplayId>monitor.one</verifiedDisplayId>")
+    );
     let snapshot = &opened_rtsp_payload(&broker)["display_policy_snapshot"];
     assert_eq!(
         snapshot["application_overrides"]["dd_refresh_rate_option"],
@@ -2707,6 +2762,157 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
             .get("display_request")
             .is_none()
     );
+}
+
+#[test]
+fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactly() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.capture.capture_provider = CaptureProvider::Wgc;
+    streaming.capture.output = "\\\\.\\DISPLAY2".into();
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+    let mut broker = Broker {
+        display_snapshot_ids: vec!["monitor.one".into(), "monitor.two".into()],
+        display_entries: vec![
+            json!({"id":"monitor.one","source":"\\\\.\\DISPLAY1","active":true}),
+            json!({"id":"monitor.two","source":"\\\\.\\DISPLAY2","active":true}),
+        ],
+        ..Default::default()
+    };
+    let paired = peer(22);
+    let stream = request(22);
+    assert!(
+        controller
+            .launch(10, stream.clone(), paired.clone(), now)
+            .is_none()
+    );
+    controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).unwrap();
+    assert!(body.contains("<verifiedDisplayId>monitor.two</verifiedDisplayId>"));
+    assert!(body.contains(
+        "<displayTopologyRevision>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</displayTopologyRevision>"
+    ));
+    assert_eq!(broker.display_snapshot_calls, 2);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|(service, _)| *service == "amaterasu.display/1")
+            .count(),
+        3
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, action)| *service == "amaterasu.display/1" && *action == "apply")
+    );
+    assert!(
+        opened_rtsp_payload(&broker)
+            .get("display_request")
+            .is_none()
+    );
+    controller.reply_delivered(10, now);
+    let retry = controller
+        .launch(11, stream, paired, now)
+        .expect("ready retry");
+    assert_eq!(String::from_utf8(retry.body).unwrap(), body);
+}
+
+#[test]
+fn verify_only_fails_before_application_for_missing_ambiguous_inactive_or_changed_output() {
+    let cases = [
+        (
+            "missing",
+            vec![json!({"id":"monitor.one","source":"\\\\.\\DISPLAY1","active":true})],
+            vec!["monitor.one"],
+            false,
+        ),
+        (
+            "ambiguous",
+            vec![
+                json!({"id":"monitor.one","source":"\\\\.\\DISPLAY2","active":true}),
+                json!({"id":"monitor.two","source":"\\\\.\\DISPLAY2","active":true}),
+            ],
+            vec!["monitor.one", "monitor.two"],
+            false,
+        ),
+        (
+            "inactive",
+            vec![json!({"id":"monitor.one","source":"\\\\.\\DISPLAY2","active":false})],
+            vec!["monitor.one"],
+            false,
+        ),
+        (
+            "changed",
+            vec![json!({"id":"monitor.one","source":"\\\\.\\DISPLAY2","active":true})],
+            vec!["monitor.one"],
+            true,
+        ),
+    ];
+    for (case, entries, ids, drift) in cases {
+        let now = Instant::now();
+        let mut streaming = config();
+        streaming.capture.capture_provider = CaptureProvider::Wgc;
+        streaming.capture.output = "\\\\.\\DISPLAY2".into();
+        let mut controller = Controller::new(Some(streaming)).unwrap();
+        controller.set_global_display_policy(9, json!({"dd_configuration_option":"verify_only"}));
+        let mut broker = Broker {
+            display_entries: entries,
+            display_snapshot_ids: ids.into_iter().map(str::to_owned).collect(),
+            display_revision_drift: drift,
+            ..Default::default()
+        };
+        assert!(controller.launch(10, request(23), peer(23), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200, "{case}");
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(|(service, action)| (*service == "amaterasu.launch/1"
+                    && *action == "launch_export")
+                    || (*service == "amaterasu.display/1" && *action == "apply")),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn disabled_display_policy_skips_provider_and_mutating_policy_fails_before_launch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(24), peer(24), now).is_none());
+    assert_eq!(
+        poll_until_reply(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.display/1")
+    );
+
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(9, json!({"dd_configuration_option":"ensure_active"}));
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(25), peer(25), now).is_none());
+    assert_ne!(
+        poll_until_reply(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, _)| *service == "amaterasu.display/1")
+    );
+    assert!(!broker.actions().iter().any(|(service, action)| *service == "amaterasu.launch/1" && *action == "launch_export"));
 }
 
 #[test]

@@ -33,6 +33,9 @@ impl State {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     PreflightApplication,
+    SnapshotDisplay,
+    EnumerateDisplay,
+    ConfirmDisplay,
     LaunchApplication,
     OpenRtsp,
     AwaitingDelivery,
@@ -70,6 +73,11 @@ pub struct Record {
     pub global_display_revision: Option<u64>,
     pub global_display_policy: Value,
     pub display_policy_snapshot: Option<Value>,
+    pub display_topology_revision: Option<String>,
+    pub verified_display_id: Option<String>,
+    pub display_snapshot_ids: Vec<String>,
+    pub display_enumeration_offset: usize,
+    pub display_match_id: Option<String>,
     /// Authorized complete display request, absent until admission supplies all facts.
     pub display_request: Option<Value>,
     pub application_preflight_token: Option<String>,
@@ -198,6 +206,11 @@ impl Record {
             global_display_revision: None,
             global_display_policy: serde_json::json!({}),
             display_policy_snapshot: None,
+            display_topology_revision: None,
+            verified_display_id: None,
+            display_snapshot_ids: Vec::new(),
+            display_enumeration_offset: 0,
+            display_match_id: None,
             display_request: None,
             application_preflight_token: None,
             application_catalog_revision: None,

@@ -13,10 +13,14 @@ use std::time::Instant;
 
 const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
+const DISPLAY_SERVICE: &str = "amaterasu.display/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     PreflightApplication,
+    SnapshotDisplay,
+    EnumerateDisplay,
+    ConfirmDisplay,
     LaunchApplication,
     LookupApplication,
     OpenRtsp,
@@ -110,7 +114,10 @@ impl Controller {
                     | Phase::LookupApplication => {
                         record.application_cleanup_blocked = true;
                     }
-                    Phase::PreflightApplication => {}
+                    Phase::PreflightApplication
+                    | Phase::SnapshotDisplay
+                    | Phase::EnumerateDisplay
+                    | Phase::ConfirmDisplay => {}
                     Phase::MonitorApplication | Phase::MonitorRtsp => {}
                     Phase::VerifyRtspStopped => record.rtsp_cleanup_blocked = true,
                     Phase::VerifyApplicationStopped => {
@@ -145,6 +152,18 @@ impl Controller {
                     "legacy_global_preparation": record.legacy_global_preparation,
                 }),
                 10_000,
+            ),
+            Phase::SnapshotDisplay | Phase::ConfirmDisplay => {
+                (DISPLAY_SERVICE, json!({"action":"snapshot"}), 5_000)
+            }
+            Phase::EnumerateDisplay => (
+                DISPLAY_SERVICE,
+                json!({
+                    "action":"enumerate",
+                    "offset":record.display_enumeration_offset,
+                    "limit":32,
+                }),
+                5_000,
             ),
             Phase::LaunchApplication => {
                 record.application_requested = true;
@@ -313,9 +332,50 @@ impl Controller {
                     ));
                     record.display_policy_snapshot = Some(display_policy_snapshot(record));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
-                    record.stage = Stage::LaunchApplication;
+                    match record
+                        .display_policy_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| {
+                            snapshot["effective_overrides"]["dd_configuration_option"].as_str()
+                        }) {
+                        Some("verify_only") => record.stage = Stage::SnapshotDisplay,
+                        None | Some("disabled") => record.stage = Stage::LaunchApplication,
+                        Some(_) => fail_record(record, "display_mutation_unavailable", now),
+                    }
                 }
                 Ok(_) => fail_record(record, "application_preflight_unavailable", now),
+                Err(code) => fail_record(record, code, now),
+            },
+            Phase::SnapshotDisplay => match display_snapshot(&payload) {
+                Ok((revision, ids)) if record.state == State::Starting => {
+                    record.display_topology_revision = Some(revision);
+                    record.display_snapshot_ids = ids;
+                    record.stage = Stage::EnumerateDisplay;
+                }
+                Ok(_) => fail_record(record, "display_snapshot_unavailable", now),
+                Err(code) => fail_record(record, code, now),
+            },
+            Phase::EnumerateDisplay if record.state == State::Starting => {
+                match display_enumeration(record, &payload) {
+                    Ok(Some(next_offset)) => {
+                        record.display_enumeration_offset = next_offset;
+                    }
+                    Ok(None) => record.stage = Stage::ConfirmDisplay,
+                    Err(code) => fail_record(record, code, now),
+                }
+            }
+            Phase::EnumerateDisplay => fail_record(record, "display_enumeration_unavailable", now),
+            Phase::ConfirmDisplay => match display_snapshot(&payload) {
+                Ok((revision, ids))
+                    if record.state == State::Starting
+                        && record.display_match_id.is_some()
+                        && record.display_topology_revision.as_deref() == Some(&revision)
+                        && ids == record.display_snapshot_ids =>
+                {
+                    record.verified_display_id = record.display_match_id.clone();
+                    record.stage = Stage::LaunchApplication;
+                }
+                Ok(_) => fail_record(record, "display_topology_changed", now),
                 Err(code) => fail_record(record, code, now),
             },
             Phase::LaunchApplication | Phase::LookupApplication => {
@@ -617,7 +677,10 @@ impl Controller {
                 fail_record(record, "application_launch_rejected", now);
             }
             Phase::PreflightApplication => {
-                fail_record(record, "application_preflight_rejected", now);
+                fail_record(record, "application_preflight_rejected", now)
+            }
+            Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
+                fail_record(record, "display_verification_unavailable", now)
             }
             Phase::OpenRtsp => {
                 record.rtsp_requested = false;
@@ -634,6 +697,12 @@ impl Controller {
             Phase::PreflightApplication => {
                 record.request_cleanup(
                     Some("application_preflight_unavailable"),
+                    now + CLEANUP_DEADLINE,
+                );
+            }
+            Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
+                record.request_cleanup(
+                    Some("display_preflight_unavailable"),
                     now + CLEANUP_DEADLINE,
                 );
             }
@@ -669,7 +738,13 @@ impl Controller {
         if record.state == State::Starting && now >= record.deadline {
             record.request_cleanup(Some("launch_deadline_exceeded"), now + CLEANUP_DEADLINE);
         }
-        if job.phase == Phase::PreflightApplication {
+        if matches!(
+            job.phase,
+            Phase::PreflightApplication
+                | Phase::SnapshotDisplay
+                | Phase::EnumerateDisplay
+                | Phase::ConfirmDisplay
+        ) {
             self.finish_or_retain(job.record, now, replies);
         }
     }
@@ -707,6 +782,9 @@ impl Phase {
     fn name(self) -> &'static str {
         match self {
             Self::PreflightApplication => "preflight-launch",
+            Self::SnapshotDisplay => "snapshot-display",
+            Self::EnumerateDisplay => "enumerate-display",
+            Self::ConfirmDisplay => "confirm-display",
             Self::LaunchApplication => "launch",
             Self::LookupApplication => "find-launch",
             Self::OpenRtsp => "open-rtsp",
@@ -730,7 +808,12 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     }
     matches!(
         record.stage,
-        Stage::PreflightApplication | Stage::LaunchApplication | Stage::OpenRtsp
+        Stage::PreflightApplication
+            | Stage::SnapshotDisplay
+            | Stage::EnumerateDisplay
+            | Stage::ConfirmDisplay
+            | Stage::LaunchApplication
+            | Stage::OpenRtsp
     ) || (record.stage == Stage::Live && now >= record.next_monitor)
         || matches!(
             record.stage,
@@ -747,6 +830,9 @@ fn next_phase(record: &Record) -> Phase {
     }
     match record.stage {
         Stage::PreflightApplication => Phase::PreflightApplication,
+        Stage::SnapshotDisplay => Phase::SnapshotDisplay,
+        Stage::EnumerateDisplay => Phase::EnumerateDisplay,
+        Stage::ConfirmDisplay => Phase::ConfirmDisplay,
         Stage::LaunchApplication => Phase::LaunchApplication,
         Stage::OpenRtsp => Phase::OpenRtsp,
         Stage::Live if record.monitor_application_next => Phase::MonitorApplication,
@@ -776,6 +862,145 @@ fn next_phase(record: &Record) -> Phase {
         Stage::VerifyRtspCleanup => Phase::VerifyRtspStopped,
         Stage::VerifyApplicationCleanup => Phase::VerifyApplicationStopped,
         _ => unreachable!("scheduled record has work"),
+    }
+}
+
+fn display_snapshot(payload: &Value) -> Result<(String, Vec<String>), &'static str> {
+    if payload["ok"] != true {
+        return Err("display_snapshot_unavailable");
+    }
+    let revision = payload["topology_revision"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or("invalid_display_snapshot")?;
+    let displays = payload["configuration"]["displays"]
+        .as_array()
+        .filter(|displays| !displays.is_empty() && displays.len() <= 16)
+        .ok_or("invalid_display_snapshot")?;
+    let mut ids = Vec::with_capacity(displays.len());
+    for display in displays {
+        let id = display["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 512)
+            .ok_or("invalid_display_snapshot")?;
+        let positive_u32 = |value: &Value| {
+            value
+                .as_u64()
+                .is_some_and(|number| number > 0 && number <= u32::MAX as u64)
+        };
+        if !positive_u32(&display["width"])
+            || !positive_u32(&display["height"])
+            || !positive_u32(&display["refresh"]["numerator"])
+            || !positive_u32(&display["refresh"]["denominator"])
+            || !display["x"]
+                .as_i64()
+                .is_some_and(|number| i32::try_from(number).is_ok())
+            || !display["y"]
+                .as_i64()
+                .is_some_and(|number| i32::try_from(number).is_ok())
+        {
+            return Err("invalid_display_snapshot");
+        }
+        if ids
+            .iter()
+            .any(|known: &String| known.eq_ignore_ascii_case(id))
+        {
+            return Err("invalid_display_snapshot");
+        }
+        ids.push(id.to_ascii_lowercase());
+    }
+    ids.sort();
+    Ok((revision.to_owned(), ids))
+}
+
+fn capture_source(record: &Record) -> Result<&str, &'static str> {
+    let output = record.capture_output.as_str();
+    let source = match record.capture_provider {
+        super::CaptureProvider::Wgc => output,
+        super::CaptureProvider::Dxgi => {
+            let (luid, source) = output.split_once('/').ok_or("invalid_capture_output")?;
+            let Some((high, low)) = luid.split_once(':') else {
+                return Err("invalid_capture_output");
+            };
+            if high.len() != 8
+                || low.len() != 8
+                || !high
+                    .bytes()
+                    .chain(low.bytes())
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("invalid_capture_output");
+            }
+            source
+        }
+    };
+    if source.is_empty() || source.len() > 128 || source.contains('/') {
+        return Err("invalid_capture_output");
+    }
+    Ok(source)
+}
+
+fn display_enumeration(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<Option<usize>, &'static str> {
+    if payload["ok"] != true {
+        return Err("display_enumeration_unavailable");
+    }
+    let source = capture_source(record)?;
+    let entries = payload["entries"]
+        .as_array()
+        .filter(|entries| entries.len() <= 32)
+        .ok_or("invalid_display_enumeration")?;
+    let mut match_id = record.display_match_id.clone();
+    for entry in entries {
+        let id = entry["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("invalid_display_enumeration")?;
+        let entry_source = entry["source"]
+            .as_str()
+            .ok_or("invalid_display_enumeration")?;
+        let active = entry["active"]
+            .as_bool()
+            .ok_or("invalid_display_enumeration")?;
+        if entry_source.eq_ignore_ascii_case(source) {
+            if !active
+                || !record
+                    .display_snapshot_ids
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(id))
+            {
+                return Err("inactive_capture_output");
+            }
+            if match_id.is_some() {
+                return Err("ambiguous_capture_output");
+            }
+            match_id = Some(id.to_ascii_lowercase());
+        }
+    }
+    record.display_match_id = match_id;
+    match payload.get("next_offset") {
+        None | Some(Value::Null) if record.display_match_id.is_some() => Ok(None),
+        None | Some(Value::Null) => Err("capture_output_not_found"),
+        Some(value) => {
+            let next = value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or("invalid_display_enumeration")?;
+            if entries.is_empty()
+                || next != record.display_enumeration_offset + entries.len()
+                || next > 4096
+            {
+                return Err("invalid_display_enumeration");
+            }
+            Ok(Some(next))
+        }
     }
 }
 
