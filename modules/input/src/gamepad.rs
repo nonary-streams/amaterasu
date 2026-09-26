@@ -219,7 +219,10 @@ pub(crate) trait GamepadDevice {
         Err(error)
     }
 
-    fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) {}
+    /// Returns whether the active native report needs to be projected again.
+    fn set_ds4_back_as_touchpad_click(&mut self, _enabled: bool) -> bool {
+        false
+    }
 
     fn release(&mut self) -> InputResult<()> {
         self.update(ControllerSnapshot::default())
@@ -380,7 +383,9 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
     }
 
     fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
-        self.device.set_ds4_back_as_touchpad_click(enabled);
+        // The next tick must project the new mapping even if the client keeps
+        // holding Back and sends no further controller snapshot.
+        self.dirty |= self.device.set_ds4_back_as_touchpad_click(enabled);
     }
 }
 

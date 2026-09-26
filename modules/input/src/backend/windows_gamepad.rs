@@ -469,8 +469,11 @@ impl GamepadDevice for VigemGamepad {
         }
     }
 
-    fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) {
+    fn set_ds4_back_as_touchpad_click(&mut self, enabled: bool) -> bool {
+        let changed =
+            self.profile == GamepadProfile::Ds4 && self.ds4_back_as_touchpad_click != enabled;
         self.ds4_back_as_touchpad_click = enabled;
+        changed
     }
 
     fn recover_after_update_failure(&mut self, error: InputError) -> InputResult<()> {
@@ -1000,6 +1003,7 @@ mod tests {
         fail_remove_on_attempt: Option<usize>,
         stale_reports: usize,
         updates: Vec<(u8, u16)>,
+        ds4_special_updates: Vec<u8>,
     }
 
     struct FakeClient {
@@ -1123,6 +1127,7 @@ mod tests {
             return status;
         }
         trace.updates.push((client.generation, report.buttons));
+        trace.ds4_special_updates.push(report.special_buttons);
         VIGEM_ERROR_NONE
     }
 
@@ -1273,6 +1278,69 @@ mod tests {
         assert!(trace.borrow().updates.contains(&(2, 0x0018)));
         gamepads.stop().unwrap();
         assert_eq!(trace.borrow().attached, 0);
+    }
+
+    #[test]
+    fn held_ds4_back_mapping_replays_on_tick_and_recovers_a_failed_report() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::Ds4, || {
+                Ok(fake_connection_with_ds4(1, trace.clone(), true))
+            })
+            .unwrap();
+        gamepads
+            .inject(&controller_event(0, 1, BACK_BUTTON_MASK))
+            .unwrap();
+        assert_eq!(trace.borrow().ds4_special_updates, [DS4_SPECIAL_TOUCHPAD]);
+
+        gamepads.set_ds4_back_as_touchpad_click(false);
+        gamepads.advance(Instant::now());
+        assert_eq!(
+            trace.borrow().ds4_special_updates,
+            [DS4_SPECIAL_TOUCHPAD, 0]
+        );
+
+        trace.borrow_mut().fail_next_update = Some(0xE000_0004);
+        gamepads.set_ds4_back_as_touchpad_click(true);
+        gamepads.advance(Instant::now());
+        assert_eq!(trace.borrow().removals, 1);
+        assert_eq!(trace.borrow().attached, 1);
+        assert_eq!(trace.borrow().disconnects, 0);
+        assert_eq!(
+            trace.borrow().ds4_special_updates,
+            [DS4_SPECIAL_TOUCHPAD, 0, DS4_SPECIAL_TOUCHPAD]
+        );
+        assert_eq!(trace.borrow().stale_reports, 0);
+
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 2);
+        assert_eq!(trace.borrow().disconnects, 1);
+    }
+
+    #[test]
+    fn ds4_mapping_change_does_not_replay_an_x360_report() {
+        let trace = Rc::new(RefCell::new(FakeBusTrace::default()));
+        let mut gamepads = WindowsGamepads::new();
+        gamepads
+            .start_with_profile(GamepadProfile::X360, || {
+                Ok(fake_connection(1, trace.clone()))
+            })
+            .unwrap();
+        gamepads
+            .inject(&controller_event(0, 1, BACK_BUTTON_MASK))
+            .unwrap();
+        assert_eq!(trace.borrow().updates, [(1, 0x0020)]);
+
+        gamepads.set_ds4_back_as_touchpad_click(false);
+        gamepads.advance(Instant::now());
+        assert_eq!(trace.borrow().updates, [(1, 0x0020)]);
+        assert_eq!(trace.borrow().removals, 0);
+
+        gamepads.stop().unwrap();
+        assert_eq!(trace.borrow().attached, 0);
+        assert_eq!(trace.borrow().freed, 1);
     }
 
     #[test]
