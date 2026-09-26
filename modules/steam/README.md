@@ -173,8 +173,10 @@ only an `amaterasu-steam-artwork-v1` child of that root; it never enumerates or
 removes files in the parent. Cache entries are bounded and validated before
 serving. A corrupt ordinary entry falls back to the CDN and is atomically
 replaced after a valid fetch. Crash leftovers cannot block a new write because
-temporary names are unique; only cache entries in the versioned child count
-toward its four-image eviction limit. The host must overwrite any
+temporary names are unique. Before every disk write, the provider reclaims
+its own temporary files older than one hour in the versioned child and refuses
+new writes while 64 newer temporary files remain. Only completed cache entries
+count toward the four-image eviction limit. The host must overwrite any
 package-supplied value with its own dedicated, access-controlled private root.
 Path checks reject links and reparse points, but filesystem checks cannot
 eliminate races if another process can mutate that root. Without host-enforced

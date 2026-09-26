@@ -18,6 +18,9 @@ pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const REMOTE_CACHE_DIRECTORY: &str = "amaterasu-steam-artwork-v1";
 const MAX_TEMP_NAME_ATTEMPTS: u64 = 8;
+const MAX_REMOTE_CACHE_TEMP_FILES: usize = 64;
+const MAX_REMOTE_CACHE_DIRECTORY_ENTRIES: usize = 1024;
+const REMOTE_TEMP_GRACE: Duration = Duration::from_secs(60 * 60);
 static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(0);
 const MAX_REMOTE_FAILURES: usize = 64;
 const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
@@ -291,6 +294,9 @@ impl RemoteArtworkCache {
         if !validate_remote_artwork(bytes) || bytes.len() as u64 > MAX_ARTWORK_BYTES {
             return;
         }
+        if !self.reclaim_or_bound_temporary_files() {
+            return;
+        }
         // Keep each attempt private to this provider-owned child. A crashed
         // writer's old temporary name cannot permanently block future writes.
         let Some((temporary, mut file)) = self.create_temporary(&path) else {
@@ -324,6 +330,60 @@ impl RemoteArtworkCache {
             }
         }
         None
+    }
+
+    fn reclaim_or_bound_temporary_files(&self) -> bool {
+        let Some(root) = &self.disk_root else {
+            return false;
+        };
+        if !self.disk_directory_valid() {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            return false;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut temporary_count = 0;
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_REMOTE_CACHE_DIRECTORY_ENTRIES {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".tmp") {
+                continue;
+            }
+            let Some(created_at) = owned_temporary_timestamp(name) else {
+                // Unknown temporary files are not ours to delete, but they
+                // count against the bound on writes into this child.
+                temporary_count += 1;
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if metadata.is_file()
+                && !is_link_or_reparse(&metadata)
+                && path.canonicalize().ok().as_ref() == Some(&path)
+                && now.saturating_sub(created_at) >= REMOTE_TEMP_GRACE.as_nanos()
+            {
+                if !self.disk_directory_valid() || fs::remove_file(&path).is_err() {
+                    return false;
+                }
+            } else {
+                temporary_count += 1;
+            }
+        }
+        temporary_count < MAX_REMOTE_CACHE_TEMP_FILES
     }
 
     fn can_replace_entry(&self, path: &Path) -> bool {
@@ -377,7 +437,7 @@ impl RemoteArtworkCache {
         };
         let mut images = Vec::new();
         for (index, entry) in entries.enumerate() {
-            if index >= 256 {
+            if index >= MAX_REMOTE_CACHE_DIRECTORY_ENTRIES {
                 return false;
             }
             let Ok(entry) = entry else {
@@ -431,6 +491,32 @@ impl RemoteArtworkCache {
         self.failed_until
             .insert(app_id, now + REMOTE_FAILURE_COOLDOWN);
     }
+}
+
+fn owned_temporary_timestamp(name: &str) -> Option<u128> {
+    let stem = name.strip_suffix(".tmp")?;
+    let mut parts = stem.split('.');
+    let (app_id, revision) = parts.next()?.split_once('-')?;
+    let pid = parts.next()?;
+    let clock = parts.next()?;
+    let serial = parts.next()?;
+    if parts.next().is_some()
+        || app_id
+            .parse::<u32>()
+            .ok()
+            .filter(|id| *id != 0)?
+            .to_string()
+            != app_id
+        || revision.is_empty()
+        || revision.len() > 20
+        || !revision.bytes().all(|byte| byte.is_ascii_digit())
+        || pid.parse::<u32>().ok()?.to_string() != pid
+        || serial.parse::<u64>().ok()?.to_string() != serial
+    {
+        return None;
+    }
+    let timestamp = clock.parse::<u128>().ok()?;
+    (timestamp.to_string() == clock).then_some(timestamp)
 }
 
 fn regular_directory(path: &Path) -> bool {
@@ -1541,6 +1627,70 @@ mod tests {
         assert_eq!(
             fs::read(abandoned).unwrap(),
             b"abandoned previous process write"
+        );
+    }
+
+    #[test]
+    fn aged_temporary_files_are_reclaimed_before_corrupt_entry_replacement() {
+        let root = TemporaryRoot::new();
+        let child = root.0.join(REMOTE_CACHE_DIRECTORY);
+        let revision = remote_revision(42, 123).unwrap();
+        let entry = child.join(format!("42-{revision}.jpg"));
+        let cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        fs::write(&entry, b"corrupt").unwrap();
+        let active_clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let active = child.join(format!("42-{revision}.999.{active_clock}.0.tmp"));
+        fs::write(&active, b"active writer").unwrap();
+        for serial in 0..100 {
+            fs::write(
+                child.join(format!("42-{revision}.999.1.{serial}.tmp")),
+                b"orphan",
+            )
+            .unwrap();
+        }
+        let unrelated = root.0.join(format!("42-{revision}.999.1.0.tmp"));
+        fs::write(&unrelated, b"unrelated parent").unwrap();
+        let mut cache = cache;
+        let bytes = synthetic_jpeg(600, 900, 64);
+        cache
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes.clone()))
+            .unwrap();
+        assert_eq!(fs::read(entry).unwrap(), bytes);
+        assert_eq!(fs::read(active).unwrap(), b"active writer");
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated parent");
+        assert_eq!(fs::read_dir(&child).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn current_temporary_file_cap_prevents_unbounded_disk_writes() {
+        let root = TemporaryRoot::new();
+        let child = root.0.join(REMOTE_CACHE_DIRECTORY);
+        let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        let revision = remote_revision(42, 123).unwrap();
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for serial in 0..MAX_REMOTE_CACHE_TEMP_FILES {
+            fs::write(
+                child.join(format!("42-{revision}.999.{clock}.{serial}.tmp")),
+                b"active",
+            )
+            .unwrap();
+        }
+        let bytes = synthetic_jpeg(600, 900, 64);
+        assert!(
+            cache
+                .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes))
+                .is_ok()
+        );
+        assert!(!child.join(format!("42-{revision}.jpg")).exists());
+        assert_eq!(
+            fs::read_dir(child).unwrap().count(),
+            MAX_REMOTE_CACHE_TEMP_FILES
         );
     }
 
