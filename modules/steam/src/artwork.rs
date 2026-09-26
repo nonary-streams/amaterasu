@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -17,6 +17,8 @@ const MAX_DIMENSION_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const REMOTE_CACHE_DIRECTORY: &str = "amaterasu-steam-artwork-v1";
+const MAX_TEMP_NAME_ATTEMPTS: u64 = 8;
+static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(0);
 const MAX_REMOTE_FAILURES: usize = 64;
 const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
 const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
@@ -289,28 +291,81 @@ impl RemoteArtworkCache {
         if !validate_remote_artwork(bytes) || bytes.len() as u64 > MAX_ARTWORK_BYTES {
             return;
         }
-        // Existing entries are never removed here. A corrupt file falls back
-        // to the network and cannot authorize deletion of a swapped target.
-        if fs::symlink_metadata(&path).is_ok() {
-            return;
-        }
-        if !self.make_disk_room() {
-            return;
-        }
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let Ok(mut file) = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        else {
+        // Keep each attempt private to this provider-owned child. A crashed
+        // writer's old temporary name cannot permanently block future writes.
+        let Some((temporary, mut file)) = self.create_temporary(&path) else {
             return;
         };
         let written = file.write_all(bytes).and_then(|_| file.sync_all()).is_ok();
         drop(file);
-        if written && fs::symlink_metadata(&path).is_err() {
+        if written && self.can_replace_entry(&path) {
             let _ = fs::rename(&temporary, &path);
         }
         let _ = fs::remove_file(temporary);
+    }
+
+    fn create_temporary(&self, entry: &Path) -> Option<(PathBuf, File)> {
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        for _ in 0..MAX_TEMP_NAME_ATTEMPTS {
+            let serial = NEXT_REMOTE_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                entry.with_extension(format!("{}.{}.{}.tmp", std::process::id(), clock, serial));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => return Some((temporary, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn can_replace_entry(&self, path: &Path) -> bool {
+        if !self.disk_directory_valid() {
+            return false;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                // Only an ordinary entry inside our private child can be
+                // replaced. A linked/reparse entry is left untouched.
+                metadata.is_file()
+                    && !is_link_or_reparse(&metadata)
+                    && path.canonicalize().ok().as_deref() == Some(path)
+                    && self.read_disk_entry_is_invalid(path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.make_disk_room(),
+            Err(_) => false,
+        }
+    }
+
+    fn read_disk_entry_is_invalid(&self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() || is_link_or_reparse(&metadata) {
+            return false;
+        }
+        if metadata.len() > MAX_ARTWORK_BYTES {
+            return true;
+        }
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_ARTWORK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return false;
+        }
+        !validate_remote_artwork(&bytes)
     }
 
     fn make_disk_room(&self) -> bool {
@@ -1457,8 +1512,36 @@ mod tests {
         recovered
             .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
             .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"corrupt");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(recovered.images.len(), 1);
+        let mut after_recovery = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        after_recovery
+            .read_chunk_with(42, 123, &revision, 0, now, |_| {
+                panic!("recovered portrait must survive another restart")
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn abandoned_temporary_file_does_not_block_a_new_portrait() {
+        let root = TemporaryRoot::new();
+        let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        let revision = remote_revision(42, 123).unwrap();
+        let child = root.0.join(REMOTE_CACHE_DIRECTORY);
+        let abandoned = child.join(format!("42-{revision}.{}.tmp", std::process::id()));
+        fs::write(&abandoned, b"abandoned previous process write").unwrap();
+        let bytes = synthetic_jpeg(600, 900, 64);
+        cache
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(bytes.clone()))
+            .unwrap();
+        assert_eq!(
+            fs::read(child.join(format!("42-{revision}.jpg"))).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(abandoned).unwrap(),
+            b"abandoned previous process write"
+        );
     }
 
     #[test]
