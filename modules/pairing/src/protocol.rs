@@ -73,7 +73,7 @@ pub enum Operation {
     },
     UpdateClientConfigOverrides {
         certificate_id: String,
-        config_overrides: ClientConfigOverrides,
+        config_overrides: Box<ClientConfigOverrides>,
         expected_revision: u64,
     },
     CheckClientCertificate {
@@ -220,6 +220,22 @@ pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_mode_remapping: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_resolution_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_refresh_rate_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_refresh_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_configuration_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_request_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_fps_limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_limiter_enable: Option<bool>,
@@ -299,6 +315,52 @@ impl ClientConfigOverrides {
             return Err("invalid_config_overrides");
         }
         if self
+            .dd_mode_remapping
+            .as_ref()
+            .is_some_and(|rules| !valid_display_mode_remapping(rules))
+            || self
+                .dd_resolution_option
+                .as_deref()
+                .is_some_and(|option| !matches!(option, "auto" | "disabled" | "manual"))
+            || self
+                .dd_manual_resolution
+                .as_deref()
+                .is_some_and(|resolution| !valid_manual_resolution(resolution))
+            || self
+                .dd_refresh_rate_option
+                .as_deref()
+                .is_some_and(|option| {
+                    !matches!(option, "auto" | "disabled" | "manual" | "prefer_highest")
+                })
+            || self
+                .dd_manual_refresh_rate
+                .as_deref()
+                .is_some_and(|refresh| !valid_manual_refresh_rate(refresh))
+            || self
+                .dd_hdr_option
+                .as_deref()
+                .is_some_and(|option| !matches!(option, "auto" | "disabled"))
+            || self
+                .dd_configuration_option
+                .as_deref()
+                .is_some_and(|option| {
+                    !matches!(
+                        option,
+                        "disabled"
+                            | "verify_only"
+                            | "ensure_active"
+                            | "ensure_primary"
+                            | "ensure_only_display"
+                    )
+                })
+            || self
+                .dd_hdr_request_override
+                .as_deref()
+                .is_some_and(|option| !matches!(option, "auto" | "force_on" | "force_off"))
+        {
+            return Err("invalid_config_overrides");
+        }
+        if self
             .audio_sink
             .as_deref()
             .is_some_and(|endpoint| endpoint.len() > 4096 || endpoint.chars().any(char::is_control))
@@ -336,6 +398,14 @@ impl ClientConfigOverrides {
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
+            && self.dd_mode_remapping.is_none()
+            && self.dd_resolution_option.is_none()
+            && self.dd_manual_resolution.is_none()
+            && self.dd_refresh_rate_option.is_none()
+            && self.dd_manual_refresh_rate.is_none()
+            && self.dd_hdr_option.is_none()
+            && self.dd_configuration_option.is_none()
+            && self.dd_hdr_request_override.is_none()
             && self.frame_limiter_fps_limit.is_none()
             && self.frame_limiter_enable.is_none()
             && self.frame_limiter_provider.is_none()
@@ -384,6 +454,69 @@ impl ClientConfigOverrides {
                 || self.rtss_frame_limit_type.is_some()
         }
     }
+}
+
+fn valid_display_mode_remapping(value: &serde_json::Value) -> bool {
+    let Some(lists) = value.as_object() else {
+        return false;
+    };
+    lists.iter().all(|(kind, entries)| {
+        matches!(
+            kind.as_str(),
+            "mixed" | "resolution_only" | "refresh_rate_only"
+        ) && entries.as_array().is_some_and(|entries| {
+            entries.len() <= 128
+                && entries.iter().all(|entry| {
+                    entry.as_object().is_some_and(|fields| {
+                        fields.iter().all(|(name, value)| {
+                            matches!(
+                                name.as_str(),
+                                "requested_resolution"
+                                    | "requested_fps"
+                                    | "final_resolution"
+                                    | "final_refresh_rate"
+                            ) && value.as_str().is_some_and(|text| {
+                                text.len() <= 64 && !text.chars().any(char::is_control)
+                            })
+                        })
+                    })
+                })
+        })
+    })
+}
+
+fn valid_manual_resolution(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 32 {
+        return false;
+    }
+    let mut parts = value.split(['x', '×']);
+    let valid_dimension = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u32>().is_ok_and(|size| size > 0)
+        })
+    };
+    valid_dimension(parts.next()) && valid_dimension(parts.next()) && parts.next().is_none()
+}
+
+fn valid_manual_refresh_rate(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return false;
+    }
+    value
+        .parse::<f64>()
+        .is_ok_and(|refresh| refresh.is_finite() && refresh > 0.0 && refresh <= 1000.0)
 }
 
 fn valid_frame_limiter_fps_limit(fps: f64) -> bool {
@@ -1131,6 +1264,63 @@ mod tests {
             json!({"high_resolution_scrolling": 1}),
             json!({"key_repeat_delay": 1.5}),
             json!({"key_repeat_frequency": "24.9"}),
+        ] {
+            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_display_policy_roundtrips_sparse_values_and_rejects_malformed_rules() {
+        let absent: ClientConfigOverrides = serde_json::from_value(json!({})).unwrap();
+        let inherited: ClientConfigOverrides = serde_json::from_value(json!({
+            "dd_mode_remapping":null,
+            "dd_refresh_rate_option":null,
+            "dd_configuration_option":null
+        }))
+        .unwrap();
+        assert!(absent.is_empty());
+        assert!(inherited.is_empty());
+        assert_eq!(serde_json::to_value(inherited).unwrap(), json!({}));
+
+        let selected = json!({
+            "dd_mode_remapping":{"mixed":[{
+                "requested_resolution":"1920x1080",
+                "requested_fps":"60",
+                "final_resolution":"1280x720",
+                "final_refresh_rate":"59.94"
+            }]},
+            "dd_resolution_option":"manual",
+            "dd_manual_resolution":"1920x1080",
+            "dd_refresh_rate_option":"manual",
+            "dd_manual_refresh_rate":"59.94",
+            "dd_hdr_option":"disabled",
+            "dd_configuration_option":"ensure_active",
+            "dd_hdr_request_override":"force_off"
+        });
+        let overrides: ClientConfigOverrides = serde_json::from_value(selected.clone()).unwrap();
+        overrides.validate().unwrap();
+        assert!(!overrides.is_empty());
+        assert_eq!(serde_json::to_value(overrides).unwrap(), selected);
+
+        for invalid in [
+            json!({"dd_mode_remapping":[]}),
+            json!({"dd_mode_remapping":{"unknown":[]}}),
+            json!({"dd_mode_remapping":{"mixed":[{"requested_fps":60}]}}),
+            json!({"dd_mode_remapping":{"mixed":[{"final_resolution":"bad\nvalue"}]}}),
+            json!({"dd_resolution_option":"highest"}),
+            json!({"dd_manual_resolution":"1920x0"}),
+            json!({"dd_refresh_rate_option":"unknown"}),
+            json!({"dd_manual_refresh_rate":"NaN"}),
+            json!({"dd_hdr_option":"force_on"}),
+            json!({"dd_configuration_option":"unknown"}),
+            json!({"dd_hdr_request_override":"disabled"}),
+        ] {
+            let decoded: ClientConfigOverrides = serde_json::from_value(invalid).unwrap();
+            assert_eq!(decoded.validate(), Err("invalid_config_overrides"));
+        }
+        for invalid in [
+            json!({"dd_refresh_rate_option":false}),
+            json!({"dd_configuration_option":{}}),
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }

@@ -129,7 +129,7 @@ impl Engine {
             } => Self::update_client_config_overrides(
                 document,
                 &certificate_id,
-                config_overrides,
+                *config_overrides,
                 now,
             ),
             Operation::CheckClientCertificate { certificate_pem } => {

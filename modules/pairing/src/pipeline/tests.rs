@@ -727,6 +727,19 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     );
     assert_eq!(invalid_stream_override["code"], "invalid_request");
     assert_eq!(state.writes, writes_before_transport_attempt);
+    let invalid_display_override = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"update_client_config_overrides",
+            "certificate_id":certificate_id,
+            "expected_revision":initial_revision,
+            "config_overrides":{"dd_configuration_option":"unknown"}
+        }),
+        now(),
+    );
+    assert_eq!(invalid_display_override["code"], "invalid_request");
+    assert_eq!(state.writes, writes_before_transport_attempt);
     let unchanged_revision = state.request(
         &mut pipeline,
         "console",
@@ -748,6 +761,12 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
                 "max_bitrate":-15000,
                 "minimum_fps_target":0.0,
                 "video_max_batch_size_kb":0,
+                "dd_mode_remapping":{"mixed":[]},
+                "dd_resolution_option":"manual",
+                "dd_manual_resolution":"1920x1080",
+                "dd_refresh_rate_option":"prefer_highest",
+                "dd_hdr_option":"disabled",
+                "dd_configuration_option":"verify_only",
                 "stream_audio":false,
                 "native_pen_touch":false,
                 "nvenc_spatial_aq":false,
@@ -781,6 +800,14 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(
         certificate_readback["config_overrides"]["video_max_batch_size_kb"],
         0
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["dd_mode_remapping"],
+        json!({"mixed":[]})
+    );
+    assert_eq!(
+        certificate_readback["config_overrides"]["dd_configuration_option"],
+        "verify_only"
     );
     assert_eq!(
         certificate_readback["config_overrides"]["stream_audio"],
@@ -834,6 +861,14 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         0
     );
     assert_eq!(
+        persisted["clients"][0]["config_overrides"]["dd_manual_resolution"],
+        "1920x1080"
+    );
+    assert_eq!(
+        persisted["clients"][0]["config_overrides"]["dd_refresh_rate_option"],
+        "prefer_highest"
+    );
+    assert_eq!(
         persisted["clients"][0]["config_overrides"]["stream_audio"],
         false
     );
@@ -881,6 +916,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
     assert_eq!(unchanged["config_overrides"]["max_bitrate"], -15000);
     assert_eq!(unchanged["config_overrides"]["minimum_fps_target"], 0.0);
     assert_eq!(unchanged["config_overrides"]["video_max_batch_size_kb"], 0);
+    assert_eq!(
+        unchanged["config_overrides"]["dd_configuration_option"],
+        "verify_only"
+    );
     assert_eq!(unchanged["config_overrides"]["stream_audio"], false);
     assert_eq!(unchanged["config_overrides"]["native_pen_touch"], false);
     assert_eq!(
