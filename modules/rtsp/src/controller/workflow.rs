@@ -124,6 +124,14 @@ impl Controller {
             {
                 return Err("display_lease_unverified");
             }
+            if record.config.frame_limiter_settings.is_some()
+                && (payload.get("frame_limiter_settings")
+                    != record.config.frame_limiter_settings.as_ref()
+                    || payload["frame_limiter_executable_path"].as_str()
+                        != record.config.frame_limiter_executable_path.as_deref())
+            {
+                return Err("frame_limiter_snapshot_unverified");
+            }
             if record.display_prepare_timeout_ms.is_some_and(|expected| {
                 payload["display_prepare_timeout_ms"].as_u64() != Some(u64::from(expected))
             }) {

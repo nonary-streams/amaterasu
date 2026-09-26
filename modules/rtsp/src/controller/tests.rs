@@ -715,6 +715,87 @@ fn ticket_readback_keeps_the_admitted_frame_limiter_snapshot() {
 }
 
 #[test]
+fn stream_prepare_must_read_back_the_frozen_frame_limiter_snapshot() {
+    let snapshot = json!({
+        "version":1,
+        "settings":{
+            "frame_limiter_enable":true,
+            "frame_limiter_fps_limit_millihz":60000,
+            "frame_limiter_provider":"rtss",
+            "frame_limiter_disable_vsync":false,
+            "frame_limiter_auto_virtual_framegen":"enabled",
+            "rtss_frame_limit_type":"back edge sync",
+            "rtss_allow_virtual_display_override":false,
+            "rtss_install_path":"",
+            "mangohud_limiter_method":"late",
+            "mangohud_preset":"custom",
+            "mangohud_always_show_graph":false
+        },
+        "requested_stream_fps_millihz":60000,
+        "client_display_mode_override_millihz":null,
+        "lossless_scaling_limit_millihz":null,
+        "virtual_display_active":null,
+        "physical_framegen_capture":null,
+        "game_frame_generation_mode":null,
+        "rtss_frame_limit_type_explicit_override":true
+    });
+    for response in ["missing", "changed", "wrong_path", "exact"] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]
+        }))
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let mut record = record(State::Preparing);
+        record.config.frame_limiter_settings = Some(snapshot.clone());
+        record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
+        let job = Job {
+            ticket: record.id,
+            phase: Phase::Prepare,
+            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
+            caller: Some(19),
+            network: None,
+            deadline: 5_000,
+        };
+        let mut prepared = json!({
+            "ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002",
+            "control_local":"127.0.0.1:51004",
+            "frame_limiter_settings":snapshot,
+            "frame_limiter_executable_path":"C:\\Games\\Example.exe",
+        });
+        match response {
+            "missing" => {
+                prepared
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("frame_limiter_settings");
+            }
+            "changed" => {
+                prepared["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"] =
+                    json!("async");
+            }
+            "wrong_path" => {
+                prepared["frame_limiter_executable_path"] = json!("C:\\Games\\Other.exe");
+            }
+            _ => {}
+        }
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.prepared(&mut record, job, &prepared, 10, &runtime);
+        if response == "exact" {
+            assert!(record.state == State::Ready);
+            assert_eq!(record.response()["frame_limiter_settings"], snapshot);
+        } else {
+            assert!(record.state == State::Closing, "{response}");
+            assert_eq!(record.failure, Some("frame_limiter_snapshot_unverified"));
+        }
+    }
+}
+
+#[test]
 fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let config = open();
