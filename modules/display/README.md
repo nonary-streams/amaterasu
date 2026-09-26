@@ -180,9 +180,10 @@ snapshot cursors; restart enumeration after hotplug or external display changes.
 Native buffer counts and driver mode enumeration have finite admission limits.
 
 Apply specifies the **entire desired active display set**. Omitted displays are
-disabled. Each display must use an independent source, rectangles must not
-overlap, and one display must begin at `(0,0)`. Rotation is `identity`, `rotate90`,
-`rotate180`, or `rotate270`; dimensions describe the resulting desktop source.
+disabled. Different source groups use disjoint rectangles; cloned targets occupy
+the same rectangle and share one CCD source. One display must begin at `(0,0)`.
+Rotation is `identity`, `rotate90`, `rotate180`, or `rotate270`; dimensions
+describe the resulting desktop source.
 The optional `mode_policy` retains the single-display wire format. Use optional
 `mode_policies` to resolve several display policies in one configuration. Supplying
 both fields is an `invalid_request`, even when the list is empty. Policy targets
@@ -193,7 +194,9 @@ transaction. An empty list applies the concrete configuration as given.
 Dimensions, positions, rational refresh rates and duplicate identities are
 validated before persistence. Windows must validate the supplied configuration
 without silently changing requested settings. Success returns `applied:true`
-and an opaque lease. A second apply fails `display_busy` until restore completes.
+and an opaque lease. A different apply fails `display_busy` until restore completes;
+an exact same-owner operation ID retry returns the existing lease with
+`recovery_required` and `applied:false` until recovery verifies native state.
 On Windows, HDR-on requires a currently active target with queryable HDR
 support. HDR-off is a no-op on an active target without HDR support. An
 inactive target may be activated with HDR-off requested: its HDR state is
@@ -283,8 +286,12 @@ wide-color-gamut state, indirect/virtual/wireless displays, and unsupported or
 incomplete path data remain outside this provider. Virtual-mode/virtual-refresh
 awareness, DPI scaling, color profiles, driver configuration, primary clone-group
 requests, virtual-display drivers, display-stack resets, topology settling and
-retry policy remain unimplemented. Existing clone topology can be captured and
-restored, but requested clone creation is not supported. Windows service-session,
+retry policy remain unimplemented. Existing clone sources can be remapped and
+restored while keeping each target's refresh, rotation and HDR state. A revisioned
+Apply can add one inactive physical target as a clone of an active source when its
+route is uniquely bound and journaled; detected route drift fails before native
+mutation.
+Arbitrary clone-group reconfiguration remains unsupported. Windows service-session,
 privilege, display-driver and HDR hardware behavior still require native acceptance.
 
 The behavioral reference was Vibeshine commit
