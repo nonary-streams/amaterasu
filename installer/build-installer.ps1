@@ -13,7 +13,7 @@ function Get-ApprovedPlayniteExtension {
 
     $expectedHashes = [ordered]@{
         'extension.yaml' = '0E3507A22AC5C24F1E0573CAAFF52F572BC1AF9C1C18270905B2694EBFEBA72D'
-        'AmaterasuPlaynite.psm1' = '264D97199DCC36E772E739DA9B2E4311A27C9350D9436AE2BB647D1572EE1715'
+        'AmaterasuPlaynite.psm1' = '96B57FBABD7D98F09BE9A939E1EFB2E8BE7735CBE47C91D223D18EB5175387EF'
     }
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     $approved = [ordered]@{}
