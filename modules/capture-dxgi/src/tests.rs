@@ -84,9 +84,18 @@ fn setup_with_surfaces(
     geometries: VecDeque<CaptureResult<Option<CaptureGeometry>>>,
     touch_surfaces: VecDeque<CaptureResult<Option<TouchSurface>>>,
 ) -> (Arc<Mutex<Controller<FakeBackend>>>, Arc<AtomicUsize>) {
+    setup_with_frames_and_geometry(enabled, VecDeque::new(), geometries, touch_surfaces)
+}
+
+fn setup_with_frames_and_geometry(
+    enabled: bool,
+    events: VecDeque<CaptureResult<Option<Frame>>>,
+    geometries: VecDeque<CaptureResult<Option<CaptureGeometry>>>,
+    touch_surfaces: VecDeque<CaptureResult<Option<TouchSurface>>>,
+) -> (Arc<Mutex<Controller<FakeBackend>>>, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     let backend = FakeBackend {
-        events: Arc::new(Mutex::new(VecDeque::new())),
+        events: Arc::new(Mutex::new(events)),
         geometries: Arc::new(Mutex::new(geometries)),
         touch_surfaces: Arc::new(Mutex::new(touch_surfaces)),
         drops: drops.clone(),
@@ -95,6 +104,83 @@ fn setup_with_surfaces(
         Arc::new(Mutex::new(Controller::new(backend, enabled))),
         drops,
     )
+}
+
+fn sample_geometry(left: i32) -> CaptureGeometry {
+    CaptureGeometry::new(
+        DesktopRect::new(left, 0, 1920, 1080).unwrap(),
+        DesktopRect::new(left, 0, 3840, 1080).unwrap(),
+    )
+    .unwrap()
+}
+
+fn sample_frame() -> Frame {
+    Frame {
+        width: 1,
+        height: 1,
+        stride: 4,
+        timestamp_us: 1,
+        sequence: 1,
+        bytes: vec![1, 2, 3, 4],
+    }
+}
+
+#[test]
+fn frame_read_rechecks_published_geometry_before_delivering_pixels() {
+    let initial = sample_geometry(-1920);
+    let moved = sample_geometry(0);
+    for (current, expected_status, expected_bytes, closes) in [
+        (Ok(Some(moved)), MEDIA_CLOSED, Vec::new(), true),
+        (Ok(Some(initial)), STATUS_OK, sample_frame().bytes, false),
+        (
+            Err(CaptureError::new("access_lost", "provider lost output")),
+            MEDIA_CLOSED,
+            Vec::new(),
+            true,
+        ),
+    ] {
+        let (controller, drops) = setup_with_frames_and_geometry(
+            true,
+            VecDeque::from([Ok(Some(sample_frame()))]),
+            VecDeque::from([Ok(Some(initial)), current]),
+            VecDeque::new(),
+        );
+        let stream = open(&mut controller.lock().unwrap(), "owner");
+        let factory = native::Factory::new(controller.clone());
+        let binding = TestBinding::new(&factory, "owner");
+        let mut bytes = Vec::new();
+        assert_eq!(binding.read(stream, &mut bytes), expected_status);
+        assert_eq!(bytes, expected_bytes);
+        assert_eq!(drops.load(Ordering::SeqCst), usize::from(closes));
+        if closes {
+            assert_eq!(binding.read(stream, &mut bytes), MEDIA_CLOSED);
+            let status = controller
+                .lock()
+                .unwrap()
+                .handle("owner", Operation::Status, &mut || Ok(()));
+            assert!(status["streams"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn frame_read_without_advertised_geometry_keeps_capture_available() {
+    let (controller, drops) = setup_with_frames_and_geometry(
+        true,
+        VecDeque::from([Ok(Some(sample_frame()))]),
+        VecDeque::from([Err(CaptureError::new(
+            "geometry_unavailable",
+            "topology unavailable",
+        ))]),
+        VecDeque::new(),
+    );
+    let stream = open(&mut controller.lock().unwrap(), "owner");
+    let factory = native::Factory::new(controller);
+    let binding = TestBinding::new(&factory, "owner");
+    let mut bytes = Vec::new();
+    assert_eq!(binding.read(stream, &mut bytes), STATUS_OK);
+    assert_eq!(bytes, sample_frame().bytes);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
 }
 
 #[test]

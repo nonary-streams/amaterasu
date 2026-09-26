@@ -207,7 +207,18 @@ impl<B: Backend> Controller<B> {
         {
             self.streams.remove(&id);
         }
-        result
+        let frame = result?;
+        if frame.is_some()
+            && self
+                .streams
+                .get(&id)
+                .is_some_and(|stream| stream.geometry.is_some())
+        {
+            // A successful read can follow a same-size output move. Verify the
+            // published coordinates before exposing any pixels to the caller.
+            self.geometry(caller, id)?;
+        }
+        Ok(frame)
     }
 
     pub fn geometry(&mut self, caller: &str, id: u64) -> CaptureResult<Option<CaptureGeometry>> {

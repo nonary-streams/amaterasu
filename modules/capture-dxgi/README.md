@@ -56,8 +56,12 @@ as the unchanged prefix for older consumers. The 1.1 `geometry` callback returns
 the open stream's validated `CaptureGeometry`, or `MEDIA_UNSUPPORTED` when open
 could not prove geometry. Once geometry was advertised, a changed rectangle,
 missing display, or changed physical target closes the stream rather than
-returning stale coordinates. `MEDIA_BUSY` means another controller operation is
-in progress and the caller may retry without consuming a frame.
+returning stale coordinates. A successful frame read also rechecks that complete
+geometry before calling the pixel sink; a moved output closes the stream even
+when its pixel dimensions stay the same. If Open could not prove geometry,
+frame capture remains available without a touch mapping. `MEDIA_BUSY` means
+another controller operation is in progress and the caller may retry without
+consuming a frame.
 
 The broker supplies the
 immediate authenticated consumer identity at bind time. The provider copies it
@@ -97,7 +101,7 @@ run under a scoped per-monitor-v2 thread DPI context and restore the previous
 context before returning. If any source is inconsistent or unavailable, capture
 may continue without `desktop_geometry`; absolute pointer input remains disabled.
 Topology can still change immediately after the last validation, so the mapping
-is revalidated at capture cadence and is not an atomic snapshot with a frame.
+is revalidated before each delivered frame and is not an atomic snapshot with a frame.
 
 ## Windows implementation and remaining hardware gates
 
