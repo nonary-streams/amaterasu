@@ -125,6 +125,65 @@ mod steam_artwork_tests {
     }
 }
 
+#[cfg(test)]
+mod lutris_artwork_tests {
+    use crate::routes::{payload, resolve};
+    use serde_json::json;
+
+    #[test]
+    fn artwork_payload_matches_provider_bounds_and_rejects_overrides() {
+        let route = resolve("/v1/lutris/artwork_read").unwrap();
+        let revision = "a".repeat(64);
+        for (game_id, offset) in [
+            (1_i64, 0_u64),
+            (i64::MAX, 8192),
+            (42, 16 * 1024 * 1024 - 8192),
+        ] {
+            let request = json!({"game_id":game_id,"revision":revision,"offset":offset});
+            let forwarded = payload(route, request.to_string().as_bytes()).unwrap();
+            assert_eq!(forwarded["action"], "artwork_read");
+            assert_eq!(forwarded["game_id"], game_id);
+            assert_eq!(forwarded["offset"], offset);
+        }
+        let valid = json!({"game_id":42,"revision":revision,"offset":8192});
+        for (field, value) in [
+            ("game_id", json!(0)),
+            ("game_id", json!(-1)),
+            ("game_id", json!(u64::MAX)),
+            ("game_id", json!("42")),
+            ("revision", json!("a".repeat(63))),
+            ("revision", json!("A".repeat(64))),
+            ("revision", json!("g".repeat(64))),
+            ("offset", json!(-1)),
+            ("offset", json!(1)),
+            ("offset", json!(16 * 1024 * 1024)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(
+                payload(route, invalid.to_string().as_bytes()).is_err(),
+                "{field}: {invalid}"
+            );
+        }
+        for extra in ["action", "path", "caller", "service", "app_id"] {
+            let mut invalid = valid.clone();
+            invalid[extra] = json!("override");
+            assert!(
+                payload(route, invalid.to_string().as_bytes()).is_err(),
+                "{extra}"
+            );
+        }
+        for missing in ["game_id", "revision", "offset"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            assert!(
+                payload(route, invalid.to_string().as_bytes()).is_err(),
+                "{missing}"
+            );
+        }
+    }
+}
+
 fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" => fields(object, &[], &[]),
@@ -345,6 +404,30 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
 fn lutris(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "settings_get" | "status" | "refresh" => fields(object, &[], &[]),
+        "artwork_read" => {
+            fields(object, &["game_id", "revision", "offset"], &[])?;
+            if !object
+                .get("game_id")
+                .and_then(Value::as_i64)
+                .is_some_and(|game_id| game_id > 0)
+                || !object
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .is_some_and(|revision| {
+                        revision.len() == 64
+                            && revision
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+                || !object
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|offset| offset < 16 * 1024 * 1024 && offset % 8192 == 0)
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "settings_update" => {
             fields(
                 object,

@@ -329,6 +329,56 @@ mod tests {
     }
 
     #[test]
+    fn lutris_artwork_requires_bearer_and_forwards_only_validated_fields() {
+        let body = serde_json::json!({
+            "game_id":42,
+            "revision":"a".repeat(64),
+            "offset":8192
+        })
+        .to_string();
+        let request = |authorization: &str, body: &str| {
+            format!(
+                "POST /v1/lutris/artwork_read HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}\r\n{body}",
+                body.len()
+            )
+        };
+        assert_eq!(
+            parse(request("", &body).as_bytes(), HOST, &[])
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        let authorized = request("Authorization: Bearer test-token\r\n", &body);
+        let parsed = parse(authorized.as_bytes(), HOST, &[]).unwrap().unwrap();
+        assert_eq!(parsed.bearer.as_deref(), Some("test-token"));
+        assert!(matches!(
+            parsed.target,
+            RequestTarget::Api(Route {
+                service: "amaterasu.lutris/1",
+                action: "artwork_read",
+                scope: Some("lutris.read"),
+                ..
+            })
+        ));
+        assert_eq!(parsed.payload["game_id"], 42);
+        assert_eq!(parsed.payload["action"], "artwork_read");
+        let bad_body =
+            serde_json::json!({"game_id":42,"revision":"A".repeat(64),"offset":0}).to_string();
+        assert_eq!(
+            parse(
+                request("Authorization: Bearer test-token\r\n", &bad_body).as_bytes(),
+                HOST,
+                &[]
+            )
+            .err()
+            .unwrap()
+            .status,
+            400
+        );
+    }
+
+    #[test]
     fn pairing_and_display_remain_protected_post_routes() {
         for path in [
             "/v1/pairing/pending",

@@ -126,6 +126,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         ),
         ("lutris", "status") => ("amaterasu.lutris/1", "status", Some("configuration.read")),
         ("lutris", "refresh") => ("amaterasu.lutris/1", "refresh", Some("configuration.write")),
+        ("lutris", "artwork_read") => ("amaterasu.lutris/1", "artwork_read", Some("lutris.read")),
         ("playnite", "settings") => (
             "amaterasu.playnite/1",
             "settings_get",
@@ -296,6 +297,17 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lutris_artwork_route_pins_provider_action_and_read_scope() {
+        let route = resolve("/v1/lutris/artwork_read").unwrap();
+        assert_eq!(route.service, "amaterasu.lutris/1");
+        assert_eq!(route.action, "artwork_read");
+        assert_eq!(route.scope, Some("lutris.read"));
+        assert!(!route.requires_empty_body);
+        assert!(resolve("/v1/lutris/artwork_get").is_none());
+        assert!(resolve("/v1/lutris/artwork_update").is_none());
+    }
 
     #[test]
     fn history_routes_expose_only_management_operations_with_bounded_fields() {

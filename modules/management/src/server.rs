@@ -445,4 +445,25 @@ mod tests {
         ));
         assert!(!authorized(&json!({"ok":true,"scopes":[null]}), None));
     }
+
+    #[test]
+    fn lutris_artwork_scope_cannot_be_satisfied_by_configuration_or_steam_read() {
+        let scope = request_scope(&http::Request {
+            target: http::RequestTarget::Api(
+                crate::routes::resolve("/v1/lutris/artwork_read").unwrap(),
+            ),
+            payload: json!({}),
+            bearer: None,
+            origin: None,
+            preflight: false,
+        });
+        assert_eq!(scope, Some("lutris.read"));
+        for granted in ["configuration.read", "steam.read", "catalog.read", "*"] {
+            assert!(!authorized(&json!({"ok":true,"scopes":[granted]}), scope));
+        }
+        assert!(authorized(
+            &json!({"ok":true,"scopes":["lutris.read"]}),
+            scope
+        ));
+    }
 }

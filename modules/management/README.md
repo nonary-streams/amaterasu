@@ -71,6 +71,7 @@ stored secrets are readable by page JavaScript; they are not HTTP-only cookies.
 | `/v1/history/` | settings_update | `configuration.write` |
 | `/v1/history/` | list_sessions, session_detail, active_sessions, history_status | `session.read` |
 | `/v1/history/` | delete_session | `session.write` |
+| `/v1/lutris/` | artwork_read | `lutris.read` |
 | `/v1/diagnostics/` | query, counters, status | `diagnostics.read` |
 | `/v1/diagnostics/` | record, increment | `diagnostics.write` |
 | `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
@@ -103,6 +104,11 @@ dispatches the fixed `force_sync` action to `amaterasu.steam/1` as
 `amaterasu.management`. This is an in-memory, one-shot request; it does not add
 a persisted force-sync setting or require a Steam schema version change. It is
 available even when automatic catalog sync is disabled.
+
+`POST /v1/lutris/artwork_read` accepts exactly `game_id` (positive signed 64-bit
+integer), `revision` (64 lowercase SHA-256 hex digits), and `offset` (an 8 KiB
+multiple below 16 MiB). It forwards a bounded artwork chunk to
+`amaterasu.lutris/1` after verifying `lutris.read`.
 
 Business service JSON is returned unchanged with HTTP 200, including domain errors
 such as revision conflicts; clients must inspect `ok`. Missing bearer yields 401,
