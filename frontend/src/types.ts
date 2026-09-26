@@ -142,7 +142,9 @@ namespace Amaterasu {
     rtsp_addresses: string[] | null;
     active_http_port: number | null;
     active_https_port: number | null;
+    active_rtsp_port: number | null;
     listener_error: string | null;
+    rtsp_listener_error: string | null;
   }
   export interface SteamSettings {
     revision: number;

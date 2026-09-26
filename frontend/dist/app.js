@@ -2343,6 +2343,95 @@ var Amaterasu;
         }
     }
     Amaterasu.RegisteredConfigurationLoadGate = RegisteredConfigurationLoadGate;
+    function parseNvhttpSettingsReply(value) {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Moonlight host settings reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            typeof reply.configured_hostname !== "string" ||
+            !Number.isSafeInteger(reply.port) ||
+            !Array.isArray(reply.configured_global_preparation))
+            throw new Error("Moonlight host settings reply is invalid.");
+        return reply;
+    }
+    Amaterasu.parseNvhttpSettingsReply = parseNvhttpSettingsReply;
+    function normalizedPreparationSteps(value) {
+        if (!Array.isArray(value))
+            return value;
+        const command = (raw) => ({
+            executable: raw.executable,
+            args: raw.args ?? [],
+            environment: raw.environment ?? {},
+            cwd: raw.cwd ?? null,
+            timeout_ms: raw.timeout_ms ?? 10_000,
+        });
+        return value.map((step) => ({
+            run: command(step.run),
+            undo: step.undo ? command(step.undo) : null,
+        }));
+    }
+    async function saveNvhttpHostSettings(api, current, values) {
+        const preserved = ["port", "stream_audio", "audio_sink_capture_only", "nvenc_spatial_aq",
+            "lan_encryption_mode", "wan_encryption_mode"];
+        const expected = {};
+        for (const [key, value] of Object.entries(current))
+            if (key.startsWith("configured_") || preserved.includes(key))
+                expected[key] = value;
+        Object.assign(expected, {
+            configured_hostname: values.hostname,
+            port: values.port,
+            configured_address_family: values.address_family,
+            configured_bind_address: values.bind_address,
+            configured_capture: values.capture,
+            configured_output_name: values.output_name === "" ? null : values.output_name,
+            stream_audio: values.stream_audio,
+            configured_video_max_batch_size_kb: values.video_max_batch_size_kb,
+            configured_max_bitrate: values.max_bitrate,
+            configured_minimum_fps_target: values.minimum_fps_target,
+            configured_ping_timeout_ms: values.ping_timeout_ms === -1 ? null : values.ping_timeout_ms,
+            configured_audio_sink: values.audio_sink,
+            configured_virtual_sink: values.virtual_sink,
+            audio_sink_capture_only: values.audio_sink_capture_only,
+            configured_external_ip: values.external_ip,
+            configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
+            configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
+        });
+        const confirms = (reply) => reply.revision === current.revision + 1 &&
+            Object.entries(expected).every(([key, value]) => sameConfigurationValue(reply[key], value));
+        const updated = parseNvhttpSettingsReply(await api.post("nvhttp/settings_update", {
+            ...values,
+            expected_revision: current.revision,
+        }));
+        if (!confirms(updated))
+            throw new Error("Moonlight host update could not be confirmed. Refresh and check the current values.");
+        const saved = parseNvhttpSettingsReply(await api.post("nvhttp/settings"));
+        if (!confirms(saved))
+            throw new Error("Moonlight host settings could not be confirmed after saving. Refresh and check the current values.");
+        return saved;
+    }
+    Amaterasu.saveNvhttpHostSettings = saveNvhttpHostSettings;
+    class NvhttpSettingsLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        isCurrent(generation) {
+            return generation === this.generation;
+        }
+        async read(api) {
+            const generation = ++this.generation;
+            try {
+                const settings = parseNvhttpSettingsReply(await api.post("nvhttp/settings"));
+                return this.isCurrent(generation) ? { settings, generation } : null;
+            }
+            catch (error) {
+                if (!this.isCurrent(generation))
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.NvhttpSettingsLoadGate = NvhttpSettingsLoadGate;
     const hostLogLevels = [
         "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
     ];
@@ -3037,6 +3126,7 @@ var Amaterasu;
         const hostLoggingArea = Amaterasu.el("div");
         const hostLoggingLoads = new HostLoggingLoadGate();
         const hostArea = Amaterasu.el("div");
+        const hostLoads = new NvhttpSettingsLoadGate();
         const steamArea = Amaterasu.el("div");
         const lutrisArea = Amaterasu.el("div");
         const playniteArea = Amaterasu.el("div");
@@ -3787,8 +3877,13 @@ var Amaterasu;
         }
         async function loadHost() {
             hostArea.replaceChildren(Amaterasu.el("p", "muted", "Loading host name…"));
+            let generation = null;
             try {
-                const settings = await context.api.post("nvhttp/settings");
+                const loaded = await hostLoads.read(context.api);
+                if (loaded === null)
+                    return;
+                const { settings } = loaded;
+                generation = loaded.generation;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3842,7 +3937,7 @@ var Amaterasu;
                 if (settings.capture_provider && context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post(`media/${settings.capture_provider}_outputs`);
-                        if (!context.content.isConnected)
+                        if (!context.content.isConnected || !hostLoads.isCurrent(generation))
                             return;
                         for (const output of discovered.outputs) {
                             try {
@@ -3897,7 +3992,7 @@ var Amaterasu;
                 if (context.api.allows("media.read")) {
                     try {
                         const discovered = await context.api.post("media/audio_endpoints");
-                        if (!context.content.isConnected)
+                        if (!context.content.isConnected || !hostLoads.isCurrent(generation))
                             return;
                         for (const endpoint of discovered.endpoints) {
                             try {
@@ -3991,14 +4086,14 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, `The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, `Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit Windows modes fail if unavailable. Save and reopen settings to list outputs for a new backend.`), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("WGC pacing smoothing", wgcPacing, `Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`), Amaterasu.field("Audio capture endpoint", audioSink, `Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, `Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, `A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, `On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, `Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`), Amaterasu.el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
                         return;
                     void Amaterasu.runAction(save, status, async () => {
                         const network = parseNvhttpNetworkOverrides(addressFamily.value, useStartupBindAddress.checked, bindAddress.value);
-                        await context.api.post("nvhttp/settings_update", {
+                        const values = {
                             hostname: hostname.value,
                             port: port.valueAsNumber,
                             ...network,
@@ -4015,16 +4110,30 @@ var Amaterasu;
                             external_ip: parseExternalIp(externalIp.value),
                             wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
                             global_preparation: Amaterasu.parsePreparationSteps(globalPreparation.value),
-                            expected_revision: settings.revision,
-                        });
-                        context.notify("Host settings saved.");
-                        await loadHost();
+                        };
+                        hostLoads.invalidate();
+                        try {
+                            await saveNvhttpHostSettings(context.api, settings, values);
+                            context.notify("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below.");
+                            await loadHost();
+                        }
+                        catch (error) {
+                            if (error instanceof Amaterasu.ApiError && ["revision_conflict", "listener_apply_pending", "listener_apply_failed"].includes(error.code)) {
+                                await loadHost();
+                                context.notify(error.code === "revision_conflict"
+                                    ? "Host settings changed elsewhere. Review the latest values before saving."
+                                    : "Host settings may have been stored, but listener application is not confirmed. Review the active ports and listener error.");
+                                return;
+                            }
+                            throw error;
+                        }
                     });
                 });
-                hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form));
+                if (hostLoads.isCurrent(generation))
+                    hostArea.replaceChildren(Amaterasu.panel("Moonlight host settings", form));
             }
             catch (error) {
-                if (context.content.isConnected)
+                if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
                     hostArea.replaceChildren(Amaterasu.errorPanel(error, loadHost));
             }
         }

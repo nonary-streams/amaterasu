@@ -1004,6 +1004,134 @@ test("NVHTTP network settings preserve startup null and explicit blank overrides
   }
 });
 
+function nvhttpHostSettings(revision = 8) {
+  return {
+    ok: true, revision,
+    hostname: "Computer Name", configured_hostname: "",
+    port: 47989, configured_address_family: null, configured_bind_address: null,
+    configured_capture: "auto", configured_output_name: "DISPLAY1",
+    stream_audio: false, configured_video_max_batch_size_kb: null,
+    configured_max_bitrate: null, configured_minimum_fps_target: null,
+    configured_ping_timeout_ms: null, configured_audio_sink: null,
+    configured_virtual_sink: null, audio_sink_capture_only: false,
+    configured_external_ip: null, configured_wgc_pacing_smoothing: null,
+    configured_global_preparation: [],
+    configured_legacy_global_preparation: [{ do: "old command", elevated: false }],
+    configured_frame_limiter: { frame_limiter_enable: false, frame_limiter_fps_limit_millihz: null },
+    nvenc_spatial_aq: true, lan_encryption_mode: 1, wan_encryption_mode: 2,
+    active_http_port: 47989, active_rtsp_port: 47989,
+    listener_error: null, rtsp_listener_error: null,
+    effective_output_name: "DISPLAY1",
+  };
+}
+
+function nvhttpHostUpdate() {
+  return {
+    hostname: "Living Room", port: 47989,
+    address_family: null, bind_address: null,
+    capture: "auto", output_name: "", stream_audio: true,
+    video_max_batch_size_kb: null, max_bitrate: null,
+    minimum_fps_target: null, ping_timeout_ms: -1,
+    audio_sink: null, virtual_sink: "",
+    audio_sink_capture_only: false, external_ip: null,
+    wgc_pacing_smoothing: null,
+    global_preparation: [{ run: { executable: "C:/tools/prepare.exe" } }],
+  };
+}
+
+function nvhttpUpdatedHost() {
+  return {
+    ...nvhttpHostSettings(9),
+    configured_hostname: "Living Room", configured_output_name: null,
+    stream_audio: true, configured_virtual_sink: "",
+    configured_global_preparation: [{
+      run: {
+        executable: "C:/tools/prepare.exe", args: [], environment: {},
+        cwd: null, timeout_ms: 10000,
+      }, undo: null,
+    }],
+  };
+}
+
+test("Moonlight host editor confirms signed update and GET with canonical preparation and dynamic listeners", async () => {
+  const current = nvhttpHostSettings();
+  const values = nvhttpHostUpdate();
+  const updated = nvhttpUpdatedHost();
+  const readback = { ...updated, active_http_port: null, active_rtsp_port: null,
+    rtsp_listener_error: "listener apply pending", effective_output_name: "Startup output" };
+  const calls = [];
+  const api = { async post(route, body = {}) {
+    calls.push([route, ordinary(body)]);
+    return route === "nvhttp/settings_update" ? updated : readback;
+  } };
+  const saved = await context.Amaterasu.saveNvhttpHostSettings(api, current, values);
+  assert.deepEqual(ordinary(saved), readback);
+  assert.deepEqual(calls, [
+    ["nvhttp/settings_update", { ...values, expected_revision: 8 }],
+    ["nvhttp/settings", {}],
+  ]);
+});
+
+test("Moonlight host editor rejects mismatched configured or unrelated fields and concurrent readback", async () => {
+  const current = nvhttpHostSettings();
+  const values = nvhttpHostUpdate();
+  const updated = nvhttpUpdatedHost();
+  for (const rejected of [
+    { ok: false, code: "revision_conflict" },
+    { ...updated, revision: 10 },
+    { ...updated, configured_virtual_sink: null },
+    { ...updated, configured_ping_timeout_ms: -1 },
+    { ...updated, configured_frame_limiter: { frame_limiter_enable: true } },
+    { ...updated, configured_legacy_global_preparation: [] },
+    { ...updated, lan_encryption_mode: 0 },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveNvhttpHostSettings({ async post(route) {
+      routes.push(route);
+      return rejected;
+    } }, current, values));
+    assert.deepEqual(routes, ["nvhttp/settings_update"]);
+  }
+  for (const stale of [
+    current,
+    { ...updated, revision: 10 },
+    { ...updated, configured_audio_sink: "other device" },
+    { ...updated, wan_encryption_mode: 0 },
+  ]) {
+    const routes = [];
+    await assert.rejects(context.Amaterasu.saveNvhttpHostSettings({ async post(route) {
+      routes.push(route);
+      return route === "nvhttp/settings_update" ? updated : stale;
+    } }, current, values), /could not be confirmed/);
+    assert.deepEqual(routes, ["nvhttp/settings_update", "nvhttp/settings"]);
+  }
+});
+
+test("Moonlight host editor ignores delayed loads and errors after a newer refresh or save", async () => {
+  const gate = new context.Amaterasu.NvhttpSettingsLoadGate();
+  const pending = [];
+  const api = { post(route) {
+    assert.equal(route, "nvhttp/settings");
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  } };
+  const old = gate.read(api);
+  const latest = gate.read(api);
+  pending[1].resolve(nvhttpHostSettings(9));
+  const current = await latest;
+  assert.equal(current.settings.revision, 9);
+  assert.equal(gate.isCurrent(current.generation), true);
+  pending[0].resolve(nvhttpHostSettings(8));
+  assert.equal(await old, null);
+  const duringSave = gate.read(api);
+  gate.invalidate();
+  assert.equal(gate.isCurrent(current.generation), false);
+  pending[2].reject(new Error("old load failed"));
+  assert.equal(await duringSave, null);
+  const reloaded = gate.read(api);
+  pending[3].resolve(nvhttpHostSettings(10));
+  assert.equal((await reloaded).settings.revision, 10);
+});
+
 test("capture output selection preserves exact IDs and automatic reset", () => {
   const parse = context.Amaterasu.parseOutputNameSelection;
   assert.equal(parse(""), "");

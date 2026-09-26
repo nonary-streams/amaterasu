@@ -316,6 +316,101 @@ namespace Amaterasu {
     }
   }
 
+  export function parseNvhttpSettingsReply(value: unknown): NvhttpSettings {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Moonlight host settings reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || (reply.revision as number) < 0 ||
+        typeof reply.configured_hostname !== "string" ||
+        !Number.isSafeInteger(reply.port) ||
+        !Array.isArray(reply.configured_global_preparation))
+      throw new Error("Moonlight host settings reply is invalid.");
+    return reply as unknown as NvhttpSettings;
+  }
+
+  function normalizedPreparationSteps(value: unknown): unknown {
+    if (!Array.isArray(value)) return value;
+    const command = (raw: Record<string, unknown>): Record<string, unknown> => ({
+      executable: raw.executable,
+      args: raw.args ?? [],
+      environment: raw.environment ?? {},
+      cwd: raw.cwd ?? null,
+      timeout_ms: raw.timeout_ms ?? 10_000,
+    });
+    return value.map((step: PreparationStep) => ({
+      run: command(step.run as unknown as Record<string, unknown>),
+      undo: step.undo ? command(step.undo as unknown as Record<string, unknown>) : null,
+    }));
+  }
+
+  export async function saveNvhttpHostSettings(
+    api: Pick<Api, "post">,
+    current: NvhttpSettings,
+    values: Payload,
+  ): Promise<NvhttpSettings> {
+    const preserved = ["port", "stream_audio", "audio_sink_capture_only", "nvenc_spatial_aq",
+      "lan_encryption_mode", "wan_encryption_mode"];
+    const expected: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(current))
+      if (key.startsWith("configured_") || preserved.includes(key)) expected[key] = value;
+    Object.assign(expected, {
+      configured_hostname: values.hostname,
+      port: values.port,
+      configured_address_family: values.address_family,
+      configured_bind_address: values.bind_address,
+      configured_capture: values.capture,
+      configured_output_name: values.output_name === "" ? null : values.output_name,
+      stream_audio: values.stream_audio,
+      configured_video_max_batch_size_kb: values.video_max_batch_size_kb,
+      configured_max_bitrate: values.max_bitrate,
+      configured_minimum_fps_target: values.minimum_fps_target,
+      configured_ping_timeout_ms: values.ping_timeout_ms === -1 ? null : values.ping_timeout_ms,
+      configured_audio_sink: values.audio_sink,
+      configured_virtual_sink: values.virtual_sink,
+      audio_sink_capture_only: values.audio_sink_capture_only,
+      configured_external_ip: values.external_ip,
+      configured_wgc_pacing_smoothing: values.wgc_pacing_smoothing,
+      configured_global_preparation: normalizedPreparationSteps(values.global_preparation),
+    });
+    const confirms = (reply: NvhttpSettings): boolean =>
+      reply.revision === current.revision + 1 &&
+      Object.entries(expected).every(([key, value]) =>
+        sameConfigurationValue((reply as unknown as Record<string, unknown>)[key], value));
+    const updated = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings_update", {
+      ...values,
+      expected_revision: current.revision,
+    }));
+    if (!confirms(updated))
+      throw new Error("Moonlight host update could not be confirmed. Refresh and check the current values.");
+    const saved = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings"));
+    if (!confirms(saved))
+      throw new Error("Moonlight host settings could not be confirmed after saving. Refresh and check the current values.");
+    return saved;
+  }
+
+  export class NvhttpSettingsLoadGate {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    isCurrent(generation: number): boolean {
+      return generation === this.generation;
+    }
+
+    async read(api: Pick<Api, "post">): Promise<{ settings: NvhttpSettings; generation: number } | null> {
+      const generation = ++this.generation;
+      try {
+        const settings = parseNvhttpSettingsReply(await api.post<unknown>("nvhttp/settings"));
+        return this.isCurrent(generation) ? { settings, generation } : null;
+      } catch (error) {
+        if (!this.isCurrent(generation)) return null;
+        throw error;
+      }
+    }
+  }
+
   const hostLogLevels: HostLogLevel[] = [
     "product_default", "verbose", "debug", "info", "warning", "error", "fatal", "none",
   ];
@@ -1118,6 +1213,7 @@ namespace Amaterasu {
     const hostLoggingArea = el("div");
     const hostLoggingLoads = new HostLoggingLoadGate();
     const hostArea = el("div");
+    const hostLoads = new NvhttpSettingsLoadGate();
     const steamArea = el("div");
     const lutrisArea = el("div");
     const playniteArea = el("div");
@@ -2365,10 +2461,12 @@ namespace Amaterasu {
     }
     async function loadHost(): Promise<void> {
       hostArea.replaceChildren(el("p", "muted", "Loading host name…"));
+      let generation: number | null = null;
       try {
-        const settings = await context.api.post<NvhttpSettings>(
-          "nvhttp/settings",
-        );
+        const loaded = await hostLoads.read(context.api);
+        if (loaded === null) return;
+        const { settings } = loaded;
+        generation = loaded.generation;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const hostname = input("hostname", settings.configured_hostname);
@@ -2430,7 +2528,7 @@ namespace Amaterasu {
             const discovered = await context.api.post<{
               outputs: Array<{ id: string; device_name: string; attached: boolean }>;
             }>(`media/${settings.capture_provider}_outputs`);
-            if (!context.content.isConnected) return;
+            if (!context.content.isConnected || !hostLoads.isCurrent(generation)) return;
             for (const output of discovered.outputs) {
               try {
                 if (!output.attached || !output.id || parseOutputNameSelection(output.id) !== output.id)
@@ -2485,7 +2583,7 @@ namespace Amaterasu {
             const discovered = await context.api.post<{
               endpoints: Array<{ id: string; name: string; default_multimedia: boolean }>;
             }>("media/audio_endpoints");
-            if (!context.content.isConnected) return;
+            if (!context.content.isConnected || !hostLoads.isCurrent(generation)) return;
             for (const endpoint of discovered.endpoints) {
               try {
                 if (!endpoint.id || parseAudioSinkSelection(endpoint.id) !== endpoint.id)
@@ -2664,8 +2762,9 @@ namespace Amaterasu {
             "muted",
             `Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`,
           ),
-          el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}`),
+          el("p", "muted", `Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`),
           ...(settings.listener_error ? [el("p", "error", settings.listener_error)] : []),
+          ...(settings.rtsp_listener_error ? [el("p", "error", settings.rtsp_listener_error)] : []),
           status,
           el("div", "actions", save, badge(`Revision ${settings.revision}`)),
         );
@@ -2678,7 +2777,7 @@ namespace Amaterasu {
               useStartupBindAddress.checked,
               bindAddress.value,
             );
-            await context.api.post("nvhttp/settings_update", {
+            const values: Payload = {
               hostname: hostname.value,
               port: port.valueAsNumber,
               ...network,
@@ -2695,15 +2794,28 @@ namespace Amaterasu {
               external_ip: parseExternalIp(externalIp.value),
               wgc_pacing_smoothing: parseWgcPacingSmoothing(wgcPacing.value),
               global_preparation: parsePreparationSteps(globalPreparation.value),
-              expected_revision: settings.revision,
-            });
-            context.notify("Host settings saved.");
-            await loadHost();
+            };
+            hostLoads.invalidate();
+            try {
+              await saveNvhttpHostSettings(context.api, settings, values);
+              context.notify("Host settings saved and read back. Future-stream options apply to new streams; check active listener status below.");
+              await loadHost();
+            } catch (error) {
+              if (error instanceof ApiError && ["revision_conflict", "listener_apply_pending", "listener_apply_failed"].includes(error.code)) {
+                await loadHost();
+                context.notify(error.code === "revision_conflict"
+                  ? "Host settings changed elsewhere. Review the latest values before saving."
+                  : "Host settings may have been stored, but listener application is not confirmed. Review the active ports and listener error.");
+                return;
+              }
+              throw error;
+            }
           });
         });
-        hostArea.replaceChildren(panel("Moonlight host settings", form));
+        if (hostLoads.isCurrent(generation))
+          hostArea.replaceChildren(panel("Moonlight host settings", form));
       } catch (error) {
-        if (context.content.isConnected)
+        if (context.content.isConnected && (generation === null || hostLoads.isCurrent(generation)))
           hostArea.replaceChildren(errorPanel(error, loadHost));
       }
     }
