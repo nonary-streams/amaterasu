@@ -56,8 +56,8 @@ impl WindowsBackend {
     }
 
     fn moonlight_key_identity(key: &Key) -> Option<u8> {
-        match key {
-            Key::MoonlightVk { code, .. } => Some(*code),
+        match key.canonical() {
+            Key::MoonlightVk { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -639,6 +639,86 @@ mod tests {
             })
             .unwrap();
         assert!(!backend.held_key_plans.contains_key(&0x41));
+    }
+
+    #[test]
+    fn generic_modifier_aliases_keep_the_original_plan_through_release_retry() {
+        for (generic, left) in [(0x10, 0xa0), (0x11, 0xa2), (0x12, 0xa4)] {
+            let mut backend = WindowsBackend::new(String::new());
+            backend.set_always_send_scancodes(false);
+            let plan = KeyboardPlan::Virtual {
+                code: generic,
+                extended: false,
+            };
+            let down = key(generic, false, KeyState::Down);
+            backend
+                .inject_with_sender(&down, |input, held| {
+                    assert_eq!(held, Some(plan));
+                    assert_eq!(keyboard_record_ref(input).wVk, u16::from(generic));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(backend.held_key_plans.get(&left), Some(&plan));
+            backend
+                .inject_with_sender(&key(0x41, false, KeyState::Down), |_, _| Ok(()))
+                .unwrap();
+            let unrelated_plan = backend.held_key_plans[&0x41];
+
+            backend.set_always_send_scancodes(true);
+            let repeat = key(left, true, KeyState::Repeat);
+            backend
+                .inject_with_sender(&repeat, |input, held| {
+                    assert_eq!(held, Some(plan));
+                    assert_eq!(keyboard_record_ref(input).wVk, u16::from(generic));
+                    Ok(())
+                })
+                .unwrap();
+
+            let up = key(left, true, KeyState::Up);
+            let failed = backend.inject_with_sender(&up, |input, held| {
+                assert_eq!(held, Some(plan));
+                assert_eq!(keyboard_record_ref(input).wVk, u16::from(generic));
+                Err(InputError::new(
+                    "injection_failed",
+                    "simulated release failure",
+                ))
+            });
+            assert!(failed.is_err());
+            assert_eq!(backend.held_key_plans.get(&left), Some(&plan));
+
+            backend
+                .inject_with_sender(&up, |input, held| {
+                    assert_eq!(held, Some(plan));
+                    assert_eq!(keyboard_record_ref(input).wVk, u16::from(generic));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(backend.held_key_plans.len(), 1);
+            assert_eq!(backend.held_key_plans.get(&0x41), Some(&unrelated_plan));
+            backend
+                .inject_with_sender(&key(0x41, false, KeyState::Up), |_, held| {
+                    assert_eq!(held, Some(unrelated_plan));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(backend.held_key_plans.is_empty());
+
+            backend.set_always_send_scancodes(false);
+            backend
+                .inject_with_sender(&key(left, false, KeyState::Down), |input, held| {
+                    assert_eq!(
+                        held,
+                        Some(KeyboardPlan::Virtual {
+                            code: left,
+                            extended: false
+                        })
+                    );
+                    assert_eq!(keyboard_record_ref(input).wVk, u16::from(left));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(backend.held_key_plans.len(), 1);
+        }
     }
 
     #[test]

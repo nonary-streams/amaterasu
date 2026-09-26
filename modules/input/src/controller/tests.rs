@@ -1856,6 +1856,65 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
     assert_eq!(controller.backend.stops, 1);
 }
 #[test]
+fn modifier_alias_release_failure_preserves_owner_until_recovery() {
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    let down = moonlight_key(0x10, KeyState::Down, 0, false);
+    let up = moonlight_key(0xa0, KeyState::Up, 0, false);
+    assert_eq!(
+        batch(&mut controller, &token, vec![down.clone()])["ok"],
+        true
+    );
+    assert_eq!(controller.pressed.len(), 1);
+
+    let unrelated = controller.handle(
+        "other",
+        Operation::Release {
+            lease: token.clone(),
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(unrelated["error"]["code"], "permission_denied");
+    assert_eq!(controller.pressed.len(), 1);
+
+    controller.backend.fail_release = true;
+    let failed = batch(&mut controller, &token, vec![up.clone()]);
+    assert_eq!(failed["error"]["code"], "injection_failed");
+    assert_eq!(failed["cleanup_required"], true);
+    assert_eq!(controller.pressed.len(), 1);
+    assert_eq!(
+        controller.handle("other", acquire_operation(), now, &mut || Ok(()))["error"]["code"],
+        "input_busy"
+    );
+
+    controller.backend.fail_release = false;
+    controller.expire(now + Duration::from_millis(101));
+    assert!(controller.lease.is_none());
+    assert!(controller.pressed.is_empty());
+    let trace = controller.backend.trace.borrow();
+    let cleanup_up = moonlight_key(0x10, KeyState::Up, 0, false);
+    assert_eq!(
+        trace.as_slice(),
+        &[down, up, cleanup_up.clone(), cleanup_up]
+    );
+    drop(trace);
+
+    let replacement = controller.handle("other", acquire_operation(), now, &mut || Ok(()));
+    assert_eq!(replacement["ok"], true);
+    assert_ne!(replacement["lease"], token);
+    assert_eq!(
+        controller.handle(
+            "owner",
+            Operation::Release { lease: token },
+            now,
+            &mut || Ok(()),
+        )["error"]["code"],
+        "permission_denied"
+    );
+}
+#[test]
 fn completed_request_cancellation_and_shutdown_release_owned_state() {
     let trace = Rc::new(RefCell::new(Vec::new()));
     {
