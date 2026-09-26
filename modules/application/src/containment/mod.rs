@@ -1,4 +1,16 @@
 //! Platform ownership keeps OS identifiers live until the final tree signal.
+use std::io;
+
+pub(crate) struct SpawnError {
+    pub error: io::Error,
+    pub child: Option<ContainedChild>,
+}
+
+impl From<io::Error> for SpawnError {
+    fn from(error: io::Error) -> Self {
+        Self { error, child: None }
+    }
+}
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -11,6 +23,8 @@ mod windows;
 pub(crate) use windows::ContainedChild;
 #[cfg(windows)]
 pub(crate) use windows::DetachedChild;
+#[cfg(all(test, windows))]
+pub(crate) use windows::fail_next_failed_spawn_termination;
 #[cfg(all(test, windows))]
 pub(crate) use windows::fail_next_job_assignment;
 #[cfg(all(test, windows))]

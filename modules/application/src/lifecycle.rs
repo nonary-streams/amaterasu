@@ -592,13 +592,24 @@ struct CommandTask {
     outcome: Option<CommandFailure>,
 }
 
+struct TaskSpawnError {
+    error: std::io::Error,
+    task: Option<Box<CommandTask>>,
+}
+
+impl From<std::io::Error> for TaskSpawnError {
+    fn from(error: std::io::Error) -> Self {
+        Self { error, task: None }
+    }
+}
+
 impl CommandTask {
     fn spawn(
         spec: PreparationCommand<'_>,
         environment: &BTreeMap<String, String>,
         application_working_directory: Option<&str>,
         now: Instant,
-    ) -> Result<Self, std::io::Error> {
+    ) -> Result<Self, TaskSpawnError> {
         let (mut command, timeout_ms, elevated) = match spec {
             PreparationCommand::Structured(spec) => {
                 let mut command = Command::new(&spec.executable);
@@ -641,14 +652,29 @@ impl CommandTask {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        Ok(Self {
-            child: ContainedChild::spawn(&mut command, elevated)?,
-            execution_deadline: now + Duration::from_millis(timeout_ms),
-            stop_requested_at: None,
-            force_requested: false,
-            observed_exit: false,
-            outcome: None,
-        })
+        match ContainedChild::spawn(&mut command, elevated) {
+            Ok(child) => Ok(Self {
+                child,
+                execution_deadline: now + Duration::from_millis(timeout_ms),
+                stop_requested_at: None,
+                force_requested: false,
+                observed_exit: false,
+                outcome: None,
+            }),
+            Err(failure) => Err(TaskSpawnError {
+                task: failure.child.map(|child| {
+                    Box::new(Self {
+                        child,
+                        execution_deadline: now,
+                        stop_requested_at: Some(now.checked_sub(COMMAND_STOP_GRACE).unwrap_or(now)),
+                        force_requested: false,
+                        observed_exit: true,
+                        outcome: Some(CommandFailure::spawn(&failure.error)),
+                    })
+                }),
+                error: failure.error,
+            }),
+        }
     }
 
     fn cancel(&mut self) {
@@ -900,9 +926,17 @@ impl ApplicationLifecycle {
                         task,
                     });
                 }
-                Err(error) => {
+                Err(failure) => {
                     self.preparation.failure =
-                        Some(CommandFailure::spawn(&error).at("preparation", index));
+                        Some(CommandFailure::spawn(&failure.error).at("preparation", index));
+                    if let Some(task) = failure.task {
+                        self.pending_undo.push(index);
+                        self.cleanup.remaining = self.pending_undo.len();
+                        self.active = Some(ActiveCommand {
+                            purpose: CommandPurpose::Preparation(index),
+                            task: *task,
+                        });
+                    }
                     self.begin_cleanup();
                 }
             }
@@ -937,8 +971,16 @@ impl ApplicationLifecycle {
                     task,
                 });
             }
-            Err(error) => {
-                self.record_undo_failure(index, CommandFailure::spawn(&error));
+            Err(failure) => {
+                self.record_undo_failure(index, CommandFailure::spawn(&failure.error));
+                if let Some(task) = failure.task {
+                    self.active = Some(ActiveCommand {
+                        purpose: CommandPurpose::UndoRetry(index),
+                        task: *task,
+                    });
+                    self.cleanup.state = CleanupState::Failed;
+                    self.phase = Phase::CleanupFailed;
+                }
             }
         }
     }

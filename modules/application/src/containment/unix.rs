@@ -8,7 +8,7 @@ pub(crate) struct ContainedChild {
 }
 
 impl ContainedChild {
-    pub fn spawn(command: &mut Command, _elevated: bool) -> io::Result<Self> {
+    pub fn spawn(command: &mut Command, _elevated: bool) -> Result<Self, super::SpawnError> {
         // std sets the group before exec; no allocating pre_exec callback is needed.
         let child = command.process_group(0).spawn()?;
         Ok(Self {

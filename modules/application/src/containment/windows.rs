@@ -3,11 +3,11 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
-use std::time::{Duration, Instant};
 #[path = "windows_user_process.rs"]
 mod windows_user_process;
+use super::SpawnError;
 use windows_sys::Win32::Foundation::{
-    ERROR_MORE_DATA, ERROR_TIMEOUT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
+    ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LPARAM,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
@@ -24,6 +24,8 @@ pub(crate) struct ContainedChild {
     child: SuspendedProcess,
     job: OwnedHandle,
     group_finished: bool,
+    failed_setup: bool,
+    job_assigned: bool,
 }
 
 enum ProcessHandle {
@@ -168,7 +170,7 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 }
 
 impl ContainedChild {
-    pub fn spawn(command: &mut Command, elevated: bool) -> io::Result<Self> {
+    pub fn spawn(command: &mut Command, elevated: bool) -> Result<Self, SpawnError> {
         // SAFETY: null security attributes/name create an unnamed, non-inheritable
         // job. OwnedHandle closes the sole handle even on error or host termination.
         let job = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
@@ -184,7 +186,7 @@ impl ContainedChild {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
         // The active user's process token is used when this module host is SYSTEM.
         // A standard non-admin account retains the token unchanged even when the
@@ -227,45 +229,37 @@ impl ContainedChild {
             child.resume()
         };
         if let Err(error) = setup {
-            // Assignment/resume errors fail closed: never run an uncontained child.
-            let job_termination = if assigned != 0 {
+            // Assignment/resume errors retain the suspended process even when
+            // the immediate termination request does not settle it.
+            if assigned != 0 {
                 // SAFETY: the job owns this child and kill-on-close is enabled.
-                if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
-                    Some(io::Error::last_os_error())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let process_termination = child.terminate().err();
-            // Termination is asynchronous. Retain the process handle through a
-            // bounded confirmation attempt; report an unsettled child explicitly.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut wait_failure = None;
-            loop {
-                match child.process.try_wait() {
-                    Ok(Some(_)) => return Err(error),
-                    Ok(None) => {}
-                    Err(wait_error) => wait_failure = Some(wait_error),
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
+                let _ = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
             }
-            eprintln!(
-                "Application launch could not confirm child exit after {error} (job termination: {job_termination:?}, process termination: {process_termination:?}, last wait error: {wait_failure:?})"
-            );
-            // The manager retains raw OS errors in launch_failed records. Use
-            // ERROR_TIMEOUT so the caller can distinguish unsettled ownership
-            // from the original assignment or resume error.
-            return Err(io::Error::from_raw_os_error(ERROR_TIMEOUT as i32));
+            #[cfg(test)]
+            let skip_termination =
+                FAIL_NEXT_FAILED_SPAWN_TERMINATION.with(|failure| failure.replace(false));
+            #[cfg(not(test))]
+            let skip_termination = false;
+            if !skip_termination {
+                let _ = child.terminate();
+            }
+            return Err(SpawnError {
+                error,
+                child: Some(Self {
+                    child,
+                    job,
+                    group_finished: false,
+                    failed_setup: true,
+                    job_assigned: assigned != 0,
+                }),
+            });
         }
         Ok(Self {
             child,
             job,
             group_finished: false,
+            failed_setup: false,
+            job_assigned: true,
         })
     }
 
@@ -283,6 +277,13 @@ impl ContainedChild {
             .map(|status| status.success()))
     }
     pub fn group_running(&self) -> io::Result<bool> {
+        if self.failed_setup && !self.job_assigned {
+            return Err(io::Error::other("failed launch has no running job group"));
+        }
+        self.job_running()
+    }
+
+    fn job_running(&self) -> io::Result<bool> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: the owned job remains live and the writable buffer and size
         // match JobObjectBasicAccountingInformation.
@@ -305,6 +306,9 @@ impl ContainedChild {
     // Ask every top-level window in the job to close, matching the sibling's
     // GUI shutdown behavior; callers force the owned job if none accepts it.
     pub fn request_stop(&mut self) -> io::Result<bool> {
+        if self.failed_setup {
+            return Ok(false);
+        }
         // A failed job query cannot establish that there are no windows. Keep
         // the job owned and let the caller retry instead of forcing it to stop.
         let process_ids = process_ids_in_job(self.job.as_raw_handle())?;
@@ -326,6 +330,25 @@ impl ContainedChild {
         Ok(context.requested_exit)
     }
     pub fn force_stop(&mut self) -> io::Result<()> {
+        if self.failed_setup {
+            #[cfg(test)]
+            if FAIL_NEXT_FAILED_SPAWN_FORCE_STOP.with(|failure| failure.replace(false)) {
+                return Err(io::Error::other(
+                    "injected failed-spawn termination failure",
+                ));
+            }
+            if self.job_assigned {
+                // SAFETY: this owned job contains the failed-resume child.
+                if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if self.child.process.try_wait()?.is_none() {
+                self.child.terminate()?;
+            }
+            self.group_finished = true;
+            return Ok(());
+        }
         if !self.group_finished {
             // SAFETY: use the owned job, never a recycled numeric process ID.
             if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
@@ -336,6 +359,13 @@ impl ContainedChild {
         Ok(())
     }
     pub fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.failed_setup {
+            // An unassigned job being empty says nothing about this child.
+            if self.job_assigned && self.job_running()? {
+                return Ok(None);
+            }
+            return self.child.process.try_wait();
+        }
         if !self.group_finished {
             return Ok(None);
         }
@@ -427,6 +457,8 @@ fn process_ids_in_job(job: HANDLE) -> io::Result<Vec<u32>> {
 thread_local! {
     static FAIL_NEXT_JOB_PROCESS_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_JOB_ASSIGNMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_FAILED_SPAWN_TERMINATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_FAILED_SPAWN_FORCE_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -437,6 +469,12 @@ pub(crate) fn fail_next_job_process_query() {
 #[cfg(test)]
 pub(crate) fn fail_next_job_assignment() {
     FAIL_NEXT_JOB_ASSIGNMENT.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_failed_spawn_termination() {
+    FAIL_NEXT_FAILED_SPAWN_TERMINATION.with(|failure| failure.set(true));
+    FAIL_NEXT_FAILED_SPAWN_FORCE_STOP.with(|failure| failure.set(true));
 }
 
 struct CloseWindowsContext {

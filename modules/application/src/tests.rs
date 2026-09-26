@@ -1271,9 +1271,38 @@ fn failed_job_assignment_never_runs_the_suspended_application() {
     let mut manager = ProcessManager::default();
 
     crate::containment::fail_next_job_assignment();
+    crate::containment::fail_next_failed_spawn_termination();
     let failed = manager.handle("alice", request);
-    assert_eq!(failed["process"]["state"], "launch_failed", "{failed}");
+    assert_eq!(failed["process"]["state"], "cleanup_failed", "{failed}");
+    assert_eq!(failed["process"]["outcome"], "launch_failed");
+    let process_id = failed["process"]["process_id"].as_u64().unwrap();
     assert!(!marker.exists(), "application ran before job assignment");
+
+    let stopping = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(stopping["process"]["state"], "stopping", "{stopping}");
+    let still_owned = status(&mut manager, "alice", process_id);
+    assert_eq!(
+        still_owned["process"]["state"], "cleanup_failed",
+        "{still_owned}"
+    );
+    assert!(
+        !marker.exists(),
+        "unassigned child resumed during failed cleanup"
+    );
+
+    let retry = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(retry["process"]["state"], "stopping", "{retry}");
+    assert_eq!(
+        wait_for_state(&mut manager, "alice", process_id, "launch_failed")["process"]["state"],
+        "launch_failed"
+    );
+    assert!(!marker.exists(), "unassigned child ran during retry");
 
     let recovered = manager.handle("alice", launch("after-job-assignment", "exit"));
     assert_eq!(recovered["process"]["state"], "running", "{recovered}");
@@ -1282,6 +1311,44 @@ fn failed_job_assignment_never_runs_the_suspended_application() {
         wait_for_exit(&mut manager, recovered_id)["process"]["success"],
         true
     );
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_preparation_spawn_retains_the_suspended_child_for_retry() {
+    let marker = test_directory("failed-preparation-assignment").join("ran");
+    let mut request = launch("failed-preparation-assignment", "exit");
+    request["preparation"] = json!([{
+        "run": {
+            "executable": std::env::current_exe().unwrap(),
+            "args": ["--exact", "tests::controlled_child", "--ignored"],
+            "environment": {
+                "AMATERASU_TEST_CHILD": "exit",
+                "AMATERASU_TEST_MARKER": marker,
+            },
+            "timeout_ms": 1000,
+        }
+    }]);
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", request);
+    let process_id = launched["process"]["process_id"].as_u64().unwrap();
+
+    crate::containment::fail_next_job_assignment();
+    crate::containment::fail_next_failed_spawn_termination();
+    let failed = wait_for_state(&mut manager, "alice", process_id, "cleanup_failed");
+    assert_eq!(failed["process"]["outcome"], "launch_failed", "{failed}");
+    assert!(!marker.exists());
+
+    let retry = manager.handle(
+        "alice",
+        json!({"action":"terminate","process_id":process_id}),
+    );
+    assert_eq!(retry["process"]["state"], "stopping", "{retry}");
+    let settled = wait_for_state(&mut manager, "alice", process_id, "launch_failed");
+    assert_eq!(settled["process"]["cleanup"]["state"], "complete");
+    assert!(!marker.exists());
     manager.shutdown().unwrap();
     std::fs::remove_dir_all(marker.parent().unwrap()).unwrap();
 }

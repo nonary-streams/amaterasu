@@ -227,9 +227,20 @@ impl ProcessRecord {
                 self.application_started_at = Some(Instant::now());
                 self.state = ProcessState::Running;
             }
-            Err(error) => self.complete_or_clean(Completion::LaunchFailed {
-                os_error: error.raw_os_error(),
-            }),
+            Err(failure) => {
+                let completion = Completion::LaunchFailed {
+                    os_error: failure.error.raw_os_error(),
+                };
+                if let Some(child) = failure.child {
+                    self.pid = Some(child.id());
+                    self.child = Some(child);
+                    self.stop_deadline = Some(Instant::now());
+                    self.completion = Some(completion);
+                    self.mark_cleanup_failed();
+                } else {
+                    self.complete_or_clean(completion);
+                }
+            }
         }
     }
 

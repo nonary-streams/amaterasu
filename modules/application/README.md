@@ -230,7 +230,9 @@ OS parent/reaper; this module waits only for its own root.
 On Windows, launches are created suspended and assigned to a private Job Object
 before their primary thread is resumed. The job forbids breakaway and has
 KILL_ON_JOB_CLOSE; descendants remain owned even after root exit. Failure to
-assign or resume fails the launch closed. The standard library still constructs
+assign or resume fails the launch closed. An unsettled suspended child remains
+owned by its process or preparation record as `cleanup_failed` until a terminate
+retry or manager shutdown confirms exit. The standard library still constructs
 the command line and environment; Toolhelp locates the suspended primary thread.
 `wait_all` uses job accounting, so a root exit with active descendants remains
 running until the job becomes empty. Graceful shutdown enumerates top-level
