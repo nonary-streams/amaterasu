@@ -246,10 +246,12 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
             STREAM_SESSION
                 .calls
                 .iter()
-                .filter(|service| **service != "amaterasu.session-history/1")
+                .filter(|service| {
+                    !["amaterasu.session-history/1", "amaterasu.frame-limiter/1"].contains(service)
+                })
                 .all(|service| rtsp.calls.contains(service))
         );
-        // History is internal to stream-session; RTSP has no direct grant.
+        // History and frame limiter are internal to stream-session; RTSP has no direct grant.
         assert!(
             STREAM_SESSION
                 .calls
@@ -257,6 +259,66 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
         );
         assert!(!rtsp.calls.contains(&"amaterasu.session-history/1"));
         assert!(rtsp.native_uses.is_empty());
+    }
+}
+
+#[test]
+fn stream_profiles_register_frame_limiter_with_only_stream_session_call_grant() {
+    let service = "amaterasu.frame-limiter/1";
+    assert_eq!(FRAME_LIMITER.library, "amaterasu_frame_limiter");
+    assert_eq!(FRAME_LIMITER.provides, &[service]);
+    assert_eq!(FRAME_LIMITER.dependencies, &[RUNTIME_ID]);
+    assert!(FRAME_LIMITER.calls.is_empty());
+
+    for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
+        let components = profile.components();
+        assert!(
+            components
+                .iter()
+                .any(|component| component.id == FRAME_LIMITER.id)
+        );
+        let session = components
+            .iter()
+            .find(|component| component.id == STREAM_SESSION.id)
+            .unwrap();
+        assert!(session.dependencies.contains(&FRAME_LIMITER.id));
+        assert!(session.calls.contains(&service));
+        for component in components
+            .iter()
+            .filter(|component| component.id != STREAM_SESSION.id)
+        {
+            assert!(
+                !component.calls.contains(&service),
+                "{} has frame limiter grant",
+                component.id
+            );
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-frame-limiter-profile-{}",
+        std::process::id()
+    ));
+    let development = development_policy(&root).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let installer = installer_policy(
+        "__WEB__",
+        [("installer-release".into(), "11".repeat(32))].into(),
+    );
+    for policy in [development, installer] {
+        assert_eq!(
+            policy.principals[FRAME_LIMITER.id].provide,
+            names(&[service])
+        );
+        assert!(policy.principals[STREAM_SESSION.id].call.contains(service));
+        for (principal, grants) in &policy.principals {
+            if principal != STREAM_SESSION.id && principal != "amaterasu.console" {
+                assert!(
+                    !grants.call.contains(service),
+                    "{principal} has frame limiter grant"
+                );
+            }
+        }
     }
 }
 

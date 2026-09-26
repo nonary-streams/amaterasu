@@ -433,6 +433,16 @@ const CONTROL_TRANSPORT: ComponentDefinition = ComponentDefinition {
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
 };
+const FRAME_LIMITER: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.frame-limiter",
+    library: "amaterasu_frame_limiter",
+    provides: &["amaterasu.frame-limiter/1"],
+    calls: &[],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
 const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.stream-session",
     library: "amaterasu_stream_session",
@@ -449,6 +459,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-wgc/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
+        "amaterasu.frame-limiter/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -469,6 +480,7 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode",
         "amaterasu.media-transport",
         "amaterasu.control-transport",
+        "amaterasu.frame-limiter",
     ],
 };
 const STREAM_SOURCE: ComponentDefinition = ComponentDefinition {
@@ -517,6 +529,7 @@ const STREAM_SESSION_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.audio-encode",
         "amaterasu.media-transport",
         "amaterasu.control-transport",
+        "amaterasu.frame-limiter",
     ],
     ..STREAM_SESSION
 };
@@ -660,6 +673,7 @@ impl PackageProfile {
                 AUDIO_ENCODE,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
+                FRAME_LIMITER,
                 STREAM_SESSION_PROBE,
                 RTSP,
             ],
@@ -692,6 +706,7 @@ impl PackageProfile {
                 VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
+                FRAME_LIMITER,
                 STREAM_SESSION,
                 RTSP,
             ],
