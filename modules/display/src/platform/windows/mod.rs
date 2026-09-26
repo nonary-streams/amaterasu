@@ -98,16 +98,7 @@ impl Platform for WindowsPlatform {
         apply::set(&requested, false)?;
         guard()?;
         apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
-        if !apply::verifies(
-            configuration,
-            &query::snapshot().map_err(DisplayError::after_mutation)?,
-        ) {
-            return Err(DisplayError::new(
-                "verification_failed",
-                "Windows display state differs from the requested configuration",
-            )
-            .after_mutation());
-        }
+        verify_applied_configuration(configuration, query::snapshot())?;
         for display in &configuration.displays {
             if let Some(enabled) = display.hdr_enabled {
                 if !enabled
@@ -124,7 +115,9 @@ impl Platform for WindowsPlatform {
                 }
             }
         }
-        Ok(())
+        // HDR changes can cause a driver to renegotiate its mode or topology.
+        // Verify the complete CCD request again after the last HDR operation.
+        verify_applied_configuration(configuration, query::snapshot())
     }
     fn restore(
         &mut self,
@@ -150,5 +143,65 @@ impl Platform for WindowsPlatform {
             .after_mutation());
         }
         Ok(())
+    }
+}
+
+fn verify_applied_configuration(
+    configuration: &Configuration,
+    readback: DisplayResult<Snapshot>,
+) -> DisplayResult<()> {
+    if !apply::verifies(
+        configuration,
+        &readback.map_err(DisplayError::after_mutation)?,
+    ) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "Windows display state differs from the requested configuration",
+        )
+        .after_mutation());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DisplaySetting, Rational, Rotation};
+
+    fn requested() -> Configuration {
+        Configuration {
+            displays: vec![DisplaySetting {
+                id: "monitor.one".into(),
+                width: 1920,
+                height: 1080,
+                refresh: Rational {
+                    numerator: 60,
+                    denominator: 1,
+                },
+                x: 0,
+                y: 0,
+                rotation: Rotation::Identity,
+                hdr_enabled: Some(true),
+            }],
+        }
+    }
+
+    #[test]
+    fn final_readback_rejects_late_topology_drift_as_mutated() {
+        let empty_topology = Snapshot {
+            format_version: 1,
+            paths: vec![],
+        };
+        let error = verify_applied_configuration(&requested(), Ok(empty_topology)).unwrap_err();
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.may_have_changed);
+    }
+
+    #[test]
+    fn final_readback_failure_is_also_mutated() {
+        let readback_error = DisplayError::new("topology_changed", "late hotplug");
+        let error = verify_applied_configuration(&requested(), Err(readback_error)).unwrap_err();
+        assert_eq!(error.code, "topology_changed");
+        assert!(error.may_have_changed);
     }
 }

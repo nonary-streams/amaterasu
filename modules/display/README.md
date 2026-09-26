@@ -141,7 +141,10 @@ support. HDR-off is a no-op on an active target without HDR support. An
 inactive target may be activated with HDR-off requested: its HDR state is
 checked after CCD activation without changing an unjournaled HDR baseline.
 If it comes up HDR-on, apply fails and rolls back. This service reports
-`applied:true` only after CCD and requested HDR state verification.
+`applied:true` only after CCD and requested HDR state verification. The requested
+mode and topology are read back again after the final HDR operation because an
+HDR change may cause the driver to renegotiate either. A late mismatch fails
+apply and enters the journaled rollback path.
 
 Both restore and recover require the authenticated immediate caller that owns
 the journal and its exact lease. Request payloads cannot replace that identity.
@@ -167,7 +170,8 @@ If the saved monitor/source route is unavailable, the journal remains armed.
    force the mode set through the driver. Do not save session settings to the
    Windows persistence database and do not use `SDC_ALLOW_CHANGES`.
 5. Query and verify the requested mode/topology. Apply any HDR request with
-   `DisplayConfigSetDeviceInfo` and read back its state. A potentially partial
+   `DisplayConfigSetDeviceInfo` and read back its state, then verify the requested
+   mode/topology again. A potentially partial
    failed apply attempts rollback to the durable snapshot. Failed rollback
    retains the journal and reports `recovery_required:true` with the lease.
 6. Explicit restore rebinds saved monitor identities to current adapter IDs,

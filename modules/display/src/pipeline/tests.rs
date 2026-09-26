@@ -94,6 +94,7 @@ struct FakePlatform {
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
     apply_failure: bool,
+    late_mode_drift: bool,
     restore_failure: bool,
     topology_changed: bool,
     available_modes: Vec<crate::model::AvailableMode>,
@@ -192,6 +193,14 @@ impl Platform for FakePlatform {
             return Err(
                 DisplayError::new("platform_error", "partial native failure").after_mutation(),
             );
+        }
+        if self.late_mode_drift {
+            self.applied_mode = Some((1024, 768, display.refresh));
+            return Err(DisplayError::new(
+                "verification_failed",
+                "HDR changed the requested mode after the first readback",
+            )
+            .after_mutation());
         }
         Ok(())
     }
@@ -666,6 +675,33 @@ fn failed_hdr_apply_rolls_back_baseline_before_clearing_journal() {
     assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
     assert!(!pipeline.platform.hdr_state);
     assert!(state.journal.is_none());
+}
+
+#[test]
+fn late_hdr_mode_drift_rolls_back_or_retains_recovery_journal() {
+    for restore_failure in [false, true] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                hdr_supported: true,
+                late_mode_drift: true,
+                restore_failure,
+                ..Default::default()
+            },
+            true,
+        );
+        let result = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(true)));
+        assert_eq!(result["error"]["code"], "verification_failed");
+        assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+        assert_eq!(state.journal.is_some(), restore_failure);
+        if restore_failure {
+            assert_eq!(result["recovery_required"], true);
+            assert!(pipeline.platform.hdr_state);
+        } else {
+            assert!(!pipeline.platform.hdr_state);
+            assert_eq!(pipeline.platform.applied_mode.unwrap().0, 1920);
+        }
+    }
 }
 
 #[test]
