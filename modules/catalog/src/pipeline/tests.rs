@@ -1742,6 +1742,71 @@ fn exported_launch_resolution_rejects_malformed_stored_frame_limiter() {
     assert_eq!(result["error"]["code"], "invalid_state_response");
 }
 
+#[test]
+fn exported_display_overrides_are_sparse_revisioned_and_strict() {
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::from(["launch".into()]),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let id = "app-0000000000000001";
+    let mut backend = Backend {
+        revision: 1,
+        metadata: json!({"revision":1,"next_id":2}),
+        entries: BTreeMap::from([(
+            id.into(),
+            json!({
+                "name":"Display game", "launch":{"kind":"executable","program":"/games/display"},
+                "config_overrides":{"dd_resolution_option":"manual","dd_manual_resolution":"2560x1440","dd_hdr_option":null}
+            }),
+        )]),
+        ..Default::default()
+    };
+    let resolve = json!({"action":"resolve_exported_launch","id":id});
+    let first = backend.run_for(
+        &mut pipeline,
+        resolve.clone(),
+        "launch",
+        "nvhttp",
+        "management",
+    );
+    assert_eq!(first["revision"], 1);
+    assert_eq!(first["catalog_owner"], "management");
+    assert_eq!(
+        first["entry"]["config_overrides"],
+        json!({"dd_resolution_option":"manual","dd_manual_resolution":"2560x1440"})
+    );
+
+    backend.entries.get_mut(id).unwrap()["config_overrides"] =
+        json!({"dd_resolution_option":"disabled"});
+    backend.metadata["revision"] = json!(2);
+    backend.revision += 1;
+    let second = backend.run_for(
+        &mut pipeline,
+        resolve.clone(),
+        "launch",
+        "nvhttp",
+        "management",
+    );
+    assert_eq!(second["revision"], 2);
+    assert_eq!(
+        second["entry"]["config_overrides"],
+        json!({"dd_resolution_option":"disabled"})
+    );
+    assert_eq!(
+        first["entry"]["config_overrides"]["dd_resolution_option"],
+        "manual"
+    );
+
+    backend.entries.get_mut(id).unwrap()["config_overrides"] =
+        json!({"dd_configuration_option":"unknown"});
+    assert_eq!(
+        backend.run_for(&mut pipeline, resolve, "launch", "nvhttp", "management")["error"]["code"],
+        "invalid_state_response"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn exported_launch_preflight_preserves_sparse_rtss_limit_types() {

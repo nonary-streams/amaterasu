@@ -62,6 +62,7 @@ pub struct Record {
     pub frame_limiter_settings: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
+    pub application_display_overrides: BTreeMap<String, Value>,
     #[serde(skip)]
     pub preflight_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,7 +96,7 @@ impl Record {
         json!({"ok":true,"launch":self})
     }
     pub fn preflight_response(&self) -> Value {
-        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"executable_path":self.executable_path})
+        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"executable_path":self.executable_path})
     }
 }
 pub struct Records {
@@ -204,6 +205,7 @@ impl Records {
                 executable_path: None,
                 frame_limiter_settings: None,
                 client_frame_limiter_overrides: None,
+                application_display_overrides: BTreeMap::new(),
                 preflight_token: None,
                 catalog_revision: None,
                 preflight_ready: false,

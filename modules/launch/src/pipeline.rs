@@ -451,7 +451,21 @@ impl Pipeline {
                 preflight_token,
                 frame_limiter_settings,
                 client_frame_limiter_overrides,
+                application_display_overrides,
             } => {
+                if application_display_overrides.is_some() && preflight_token.is_none() {
+                    return complete(send, request, error("preflight_required"));
+                }
+                if application_display_overrides
+                    .as_ref()
+                    .is_some_and(|overrides| !valid_application_display_overrides(overrides))
+                {
+                    return complete(
+                        send,
+                        request,
+                        error("invalid_application_display_overrides"),
+                    );
+                }
                 if frame_limiter_settings.is_some() && preflight_token.is_none() {
                     return complete(send, request, error("preflight_required"));
                 }
@@ -503,6 +517,15 @@ impl Pipeline {
                             || (record.preflight_token.is_some() && !record.preflight_ready)
                         {
                             return complete(send, request, error("preflight_mismatch"));
+                        }
+                        if record.application_display_overrides
+                            != application_display_overrides.clone().unwrap_or_default()
+                        {
+                            return complete(
+                                send,
+                                request,
+                                error("application_display_policy_mismatch"),
+                            );
                         }
                         if let Some(settings) = &frame_limiter_settings
                             && !snapshot_matches_application_policy(
@@ -790,6 +813,11 @@ impl Pipeline {
                 };
                 record.config_overrides =
                     (!config_overrides.is_empty()).then_some(config_overrides);
+                record.application_display_overrides = record
+                    .config_overrides
+                    .as_ref()
+                    .map(|overrides| overrides.display_overrides())
+                    .unwrap_or_default();
                 let Some(revision) = payload.get("revision").and_then(Value::as_u64) else {
                     return self.dependency_failed(job, "invalid_catalog_response", send);
                 };

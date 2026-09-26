@@ -67,7 +67,7 @@ enum Stage {
     },
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
-    ProviderOverrideEntry(ProviderOverrideEntry),
+    ProviderOverrideEntry(Box<ProviderOverrideEntry>),
 }
 
 struct ProviderOverrideEntry {
@@ -854,14 +854,14 @@ impl Pipeline {
         self.submit(
             context,
             payload,
-            Stage::ProviderOverrideEntry(ProviderOverrideEntry {
+            Stage::ProviderOverrideEntry(Box::new(ProviderOverrideEntry {
                 session,
                 id,
                 expected_revision,
                 config_overrides,
                 marker_key,
                 marker,
-            }),
+            })),
             send,
         )
     }
@@ -1997,7 +1997,7 @@ impl Pipeline {
                 complete(send, context.request_id, save.reply)
             }
             Stage::ProviderOverrideEntry(update) => {
-                self.finish_provider_override(context, state_revision, payload, update, send)
+                self.finish_provider_override(context, state_revision, payload, *update, send)
             }
             Stage::ProviderFullscreenEntryRow(update) => self.finish_playnite_fullscreen_entry(
                 context,

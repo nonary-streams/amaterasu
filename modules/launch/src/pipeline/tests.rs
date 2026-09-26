@@ -946,6 +946,120 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
 }
 
 #[test]
+fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
+    let mut harness = Harness::new();
+    let display = json!({
+        "dd_mode_remapping":{"mixed":[{"requested_resolution":"1920x1080","final_resolution":"2560x1440"}]},
+        "dd_resolution_option":"manual",
+        "dd_manual_resolution":"2560x1440",
+        "dd_refresh_rate_option":"prefer_highest",
+        "dd_manual_refresh_rate":"59.94",
+        "dd_hdr_option":"auto",
+        "dd_configuration_option":"ensure_primary",
+        "dd_hdr_request_override":"force_off"
+    });
+    harness.catalog_config_overrides = Some(display.clone());
+    let mut pipeline = pipeline();
+    let preflight = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({
+            "action":"preflight_export","operation_id":"frozen-display-policy",
+            "app_id":"app-0000000000000001"
+        }),
+    );
+    assert_eq!(preflight["catalog_revision"], 1);
+    assert_eq!(preflight["application_display_overrides"], display);
+    assert_eq!(preflight["config_overrides"], display);
+
+    let mut launch = launch_export("frozen-display-policy");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["application_display_overrides"] = display.clone();
+    let mut wrong_token = launch.clone();
+    wrong_token["preflight_token"] = json!("wrong-token");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", wrong_token)["code"],
+        "preflight_mismatch"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "other-service", launch.clone())["code"],
+        "preflight_not_found"
+    );
+    harness.catalog_config_overrides = Some(json!({"dd_resolution_option":"disabled"}));
+    let mut mismatch = launch.clone();
+    mismatch["application_display_overrides"]["dd_resolution_option"] = json!("disabled");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", mismatch)["code"],
+        "application_display_policy_mismatch"
+    );
+    assert!(harness.processes.is_empty());
+    let mut malformed = launch.clone();
+    malformed["application_display_overrides"]["dd_hdr_option"] = json!("unknown");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+        "invalid_application_display_overrides"
+    );
+    assert!(harness.processes.is_empty());
+
+    let started = harness.request(&mut pipeline, "nvhttp", launch.clone());
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(started["launch"]["application_display_overrides"], display);
+    assert_eq!(started["launch"]["config_overrides"], display);
+    assert_eq!(started["launch"]["catalog_revision"], 1);
+    assert_eq!(harness.request(&mut pipeline, "nvhttp", launch), started);
+    let status = harness.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(status["launch"]["application_display_overrides"], display);
+    assert_eq!(status["launch"]["config_overrides"], display);
+}
+
+#[test]
+fn display_preflight_treats_absent_and_null_as_sparse_and_rejects_bad_catalog_values() {
+    for (case, overrides) in [
+        ("absent", None),
+        (
+            "null",
+            Some(json!({"dd_resolution_option":null,"dd_hdr_option":null})),
+        ),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = overrides;
+        let preflight = harness.request(
+            &mut pipeline(),
+            "nvhttp",
+            json!({
+                "action":"preflight_export","operation_id":format!("display-{case}"),
+                "app_id":"app-0000000000000001"
+            }),
+        );
+        assert_eq!(preflight["ok"], true, "{preflight}");
+        assert_eq!(preflight["application_display_overrides"], json!({}));
+    }
+    for invalid in [
+        json!(17),
+        json!("unknown"),
+        json!({"mixed":[{"requested_fps":22}]}),
+    ] {
+        let mut harness = Harness::new();
+        harness.catalog_config_overrides = Some(json!({"dd_mode_remapping":invalid}));
+        let rejected = harness.request(
+            &mut pipeline(),
+            "nvhttp",
+            json!({
+                "action":"preflight_export","operation_id":"bad-display",
+                "app_id":"app-0000000000000001"
+            }),
+        );
+        assert_eq!(rejected["code"], "invalid_catalog_response", "{rejected}");
+        assert!(harness.processes.is_empty());
+    }
+}
+
+#[test]
 fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();

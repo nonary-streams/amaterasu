@@ -103,7 +103,19 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_mode_remapping: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_resolution_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_refresh_rate_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_refresh_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_configuration_option: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_hdr_request_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +212,16 @@ impl ConfigOverrides {
         {
             return Err("dd_refresh_rate_option must be auto, disabled, manual, or prefer_highest");
         }
+        if !valid_display_overrides(
+            self.dd_mode_remapping.as_ref(),
+            self.dd_resolution_option.as_deref(),
+            self.dd_manual_resolution.as_deref(),
+            self.dd_manual_refresh_rate.as_deref(),
+            self.dd_hdr_option.as_deref(),
+            self.dd_configuration_option.as_deref(),
+        ) {
+            return Err("invalid application display override");
+        }
         if self
             .dd_hdr_request_override
             .as_deref()
@@ -280,7 +302,13 @@ impl ConfigOverrides {
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
+            && self.dd_mode_remapping.is_none()
+            && self.dd_resolution_option.is_none()
+            && self.dd_manual_resolution.is_none()
             && self.dd_refresh_rate_option.is_none()
+            && self.dd_manual_refresh_rate.is_none()
+            && self.dd_hdr_option.is_none()
+            && self.dd_configuration_option.is_none()
             && self.dd_hdr_request_override.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
@@ -303,6 +331,95 @@ impl ConfigOverrides {
             && self.ds4_back_as_touchpad_click.is_none()
             && self.native_pen_touch.is_none()
     }
+}
+
+fn valid_display_overrides(
+    remapping: Option<&serde_json::Value>,
+    resolution_option: Option<&str>,
+    manual_resolution: Option<&str>,
+    manual_refresh_rate: Option<&str>,
+    hdr_option: Option<&str>,
+    configuration_option: Option<&str>,
+) -> bool {
+    if resolution_option.is_some_and(|value| !matches!(value, "auto" | "disabled" | "manual"))
+        || hdr_option.is_some_and(|value| !matches!(value, "auto" | "disabled"))
+        || configuration_option.is_some_and(|value| {
+            !matches!(
+                value,
+                "disabled"
+                    | "verify_only"
+                    | "ensure_active"
+                    | "ensure_primary"
+                    | "ensure_only_display"
+            )
+        })
+        || manual_resolution.is_some_and(|value| {
+            if value.len() > 32 {
+                return true;
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return false;
+            }
+            value.split_once(['x', '×']).is_none_or(|(width, height)| {
+                width.parse::<u32>().is_err() || height.parse::<u32>().is_err()
+            })
+        })
+        || manual_refresh_rate.is_some_and(|value| {
+            value.len() > 64
+                || (!value.trim().is_empty() && {
+                    let value = value.trim();
+                    value.split_once('.').map_or_else(
+                        || !value.bytes().all(|byte| byte.is_ascii_digit()),
+                        |(whole, fraction)| {
+                            whole.is_empty()
+                                || fraction.is_empty()
+                                || !whole.bytes().all(|byte| byte.is_ascii_digit())
+                                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+                        },
+                    )
+                })
+        })
+    {
+        return false;
+    }
+    let Some(remapping) = remapping else {
+        return true;
+    };
+    let Some(groups) = remapping.as_object() else {
+        return false;
+    };
+    if groups.len() > 3
+        || groups.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "mixed" | "resolution_only" | "refresh_rate_only"
+            )
+        })
+    {
+        return false;
+    }
+    groups.values().all(|group| {
+        group.as_array().is_some_and(|entries| {
+            entries.len() <= 128
+                && entries.iter().all(|entry| {
+                    entry.as_object().is_some_and(|fields| {
+                        fields.len() <= 4
+                            && fields.iter().all(|(key, value)| {
+                                matches!(
+                                    key.as_str(),
+                                    "requested_resolution"
+                                        | "requested_fps"
+                                        | "final_resolution"
+                                        | "final_refresh_rate"
+                                ) && value.as_str().is_some_and(|text| {
+                                    text.len() <= 64 && !text.chars().any(char::is_control)
+                                })
+                            })
+                    })
+                })
+        })
+    })
 }
 
 fn valid_millihertz_value(value: f64) -> bool {

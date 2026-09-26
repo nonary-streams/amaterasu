@@ -47,6 +47,8 @@ pub enum Operation {
         frame_limiter_settings: Option<BTreeMap<String, Value>>,
         #[serde(default)]
         client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
+        #[serde(default)]
+        application_display_overrides: Option<BTreeMap<String, Value>>,
     },
     Lookup {
         operation_id: String,
@@ -911,6 +913,22 @@ pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_max_batch_size_kb: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_mode_remapping: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_resolution_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_refresh_rate_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_manual_refresh_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_configuration_option: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dd_hdr_request_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_sink: Option<String>,
@@ -982,6 +1000,9 @@ impl ApplicationConfigOverrides {
         if self.fec_percentage == Some(0) {
             return Err("invalid_catalog_response");
         }
+        if !valid_application_display_overrides(&self.display_overrides()) {
+            return Err("invalid_catalog_response");
+        }
         if self
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
@@ -1043,6 +1064,14 @@ impl ApplicationConfigOverrides {
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
             && self.video_max_batch_size_kb.is_none()
+            && self.dd_mode_remapping.is_none()
+            && self.dd_resolution_option.is_none()
+            && self.dd_manual_resolution.is_none()
+            && self.dd_refresh_rate_option.is_none()
+            && self.dd_manual_refresh_rate.is_none()
+            && self.dd_hdr_option.is_none()
+            && self.dd_configuration_option.is_none()
+            && self.dd_hdr_request_override.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.audio_sink_capture_only.is_none()
@@ -1062,6 +1091,140 @@ impl ApplicationConfigOverrides {
             && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
     }
+}
+
+impl ApplicationConfigOverrides {
+    pub fn display_overrides(&self) -> BTreeMap<String, Value> {
+        let value = serde_json::to_value(self).expect("serializable application overrides");
+        let object = value.as_object().expect("application overrides object");
+        object
+            .iter()
+            .filter(|(key, _)| is_display_override_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+}
+
+fn is_display_override_key(key: &str) -> bool {
+    matches!(
+        key,
+        "dd_mode_remapping"
+            | "dd_resolution_option"
+            | "dd_manual_resolution"
+            | "dd_refresh_rate_option"
+            | "dd_manual_refresh_rate"
+            | "dd_hdr_option"
+            | "dd_configuration_option"
+            | "dd_hdr_request_override"
+    )
+}
+
+pub fn valid_application_display_overrides(overrides: &BTreeMap<String, Value>) -> bool {
+    if overrides.keys().any(|key| !is_display_override_key(key))
+        || overrides.values().any(Value::is_null)
+    {
+        return false;
+    }
+    let value = serde_json::to_value(overrides).expect("serializable display map");
+    let Ok(fields) = serde_json::from_value::<ApplicationConfigOverrides>(value) else {
+        return false;
+    };
+    if fields
+        .dd_refresh_rate_option
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "auto" | "disabled" | "manual" | "prefer_highest"))
+        || fields
+            .dd_hdr_request_override
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "force_on" | "force_off"))
+        || fields
+            .dd_resolution_option
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "disabled" | "manual"))
+        || fields
+            .dd_hdr_option
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto" | "disabled"))
+        || fields
+            .dd_configuration_option
+            .as_deref()
+            .is_some_and(|value| {
+                !matches!(
+                    value,
+                    "disabled"
+                        | "verify_only"
+                        | "ensure_active"
+                        | "ensure_primary"
+                        | "ensure_only_display"
+                )
+            })
+    {
+        return false;
+    }
+    if fields.dd_manual_resolution.as_deref().is_some_and(|value| {
+        if value.len() > 32 {
+            return true;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        value.split_once(['x', '×']).is_none_or(|(width, height)| {
+            width.parse::<u32>().is_err() || height.parse::<u32>().is_err()
+        })
+    }) || fields
+        .dd_manual_refresh_rate
+        .as_deref()
+        .is_some_and(|value| {
+            if value.len() > 64 {
+                return true;
+            }
+            let value = value.trim();
+            !value.is_empty()
+                && value.split_once('.').map_or_else(
+                    || !value.bytes().all(|byte| byte.is_ascii_digit()),
+                    |(whole, fraction)| {
+                        whole.is_empty()
+                            || fraction.is_empty()
+                            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+                            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+                    },
+                )
+        })
+    {
+        return false;
+    }
+    let Some(remapping) = fields.dd_mode_remapping else {
+        return true;
+    };
+    let Some(groups) = remapping.as_object() else {
+        return false;
+    };
+    groups.len() <= 3
+        && groups.iter().all(|(key, group)| {
+            matches!(
+                key.as_str(),
+                "mixed" | "resolution_only" | "refresh_rate_only"
+            ) && group.as_array().is_some_and(|entries| {
+                entries.len() <= 128
+                    && entries.iter().all(|entry| {
+                        entry.as_object().is_some_and(|fields| {
+                            fields.len() <= 4
+                                && fields.iter().all(|(key, value)| {
+                                    matches!(
+                                        key.as_str(),
+                                        "requested_resolution"
+                                            | "requested_fps"
+                                            | "final_resolution"
+                                            | "final_refresh_rate"
+                                    ) && value.as_str().is_some_and(|text| {
+                                        text.len() <= 64 && !text.chars().any(char::is_control)
+                                    })
+                                })
+                        })
+                    })
+            })
+        })
 }
 
 fn valid_millihertz_value(value: f64) -> bool {
