@@ -63,9 +63,42 @@ const UI_DEV_DESTROY: libc::Ioctl = libc::_IO(b'U' as u32, 2);
 struct Device {
     file: File,
     created: bool,
+    #[cfg(test)]
+    fake: Option<(u8, std::rc::Rc<std::cell::RefCell<FakeInputAdapter>>)>,
 }
+
+#[cfg(test)]
+#[derive(Default)]
+struct FakeInputAdapter {
+    next_id: u8,
+    writes: Vec<u8>,
+    destroys: Vec<u8>,
+    fail_write: Option<u8>,
+    fail_destroy: Option<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAKE_INPUT_ADAPTER: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<FakeInputAdapter>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl Device {
     fn create(path: &str, keyboard: bool) -> InputResult<Self> {
+        #[cfg(test)]
+        if let Some(adapter) = FAKE_INPUT_ADAPTER.with(|slot| slot.borrow().clone()) {
+            let id = {
+                let mut state = adapter.borrow_mut();
+                state.next_id += 1;
+                state.next_id
+            };
+            assert_eq!(keyboard, id % 2 == 1);
+            return Ok(Self {
+                file: File::open("/dev/null").map_err(system_error)?,
+                created: true,
+                fake: Some((id, adapter)),
+            });
+        }
         let file = open_uinput(path)?;
         let fd = file.as_raw_fd();
         set_bit(fd, UI_SET_EVBIT, u32::from(EV_KEY))?;
@@ -179,6 +212,16 @@ impl Device {
         create_device(file, name.as_bytes())
     }
     fn emit(&self, values: &[(u16, u16, i32)]) -> InputResult<()> {
+        #[cfg(test)]
+        if let Some((id, adapter)) = &self.fake {
+            let mut state = adapter.borrow_mut();
+            state.writes.push(*id);
+            if state.fail_write == Some(*id) {
+                state.fail_write = None;
+                return Err(InputError::new("injection_failed", "fake partial frame"));
+            }
+            return Ok(());
+        }
         let mut frame: Vec<libc::input_event> = values
             .iter()
             .map(|(kind, code, value)| {
@@ -200,6 +243,17 @@ impl Device {
 
     fn destroy(&mut self) -> InputResult<()> {
         if self.created {
+            #[cfg(test)]
+            if let Some((id, adapter)) = &self.fake {
+                let mut state = adapter.borrow_mut();
+                state.destroys.push(*id);
+                if state.fail_destroy == Some(*id) {
+                    state.fail_destroy = None;
+                    return Err(InputError::new("release_failed", "fake destroy failure"));
+                }
+                self.created = false;
+                return Ok(());
+            }
             // SAFETY: this live uinput descriptor owns the virtual device created
             // by UI_DEV_CREATE; a successful ioctl destroys only that device.
             check(unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY) })?;
@@ -265,6 +319,8 @@ fn create_device(file: File, name: &[u8]) -> InputResult<Device> {
     Ok(Device {
         file,
         created: true,
+        #[cfg(test)]
+        fake: None,
     })
 }
 
@@ -880,6 +936,93 @@ fn scroll_unit_frame(
 mod tests {
     use super::*;
     use crate::model::PenTouchPhase;
+
+    struct FakeAdapterGuard;
+
+    impl FakeAdapterGuard {
+        fn install() -> std::rc::Rc<std::cell::RefCell<FakeInputAdapter>> {
+            let adapter = std::rc::Rc::new(std::cell::RefCell::new(FakeInputAdapter::default()));
+            FAKE_INPUT_ADAPTER.with(|slot| {
+                assert!(slot.borrow_mut().replace(adapter.clone()).is_none());
+            });
+            adapter
+        }
+    }
+
+    impl Drop for FakeAdapterGuard {
+        fn drop(&mut self) {
+            FAKE_INPUT_ADAPTER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[test]
+    fn failed_keyboard_frame_and_destroy_block_reacquisition_until_cleanup() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        assert_eq!(
+            backend.keyboard.as_ref().unwrap().fake.as_ref().unwrap().0,
+            1
+        );
+        assert_eq!(
+            backend.pointer.as_ref().unwrap().fake.as_ref().unwrap().0,
+            2
+        );
+
+        adapter.borrow_mut().fail_write = Some(1);
+        assert_eq!(
+            backend
+                .inject(&Event::Key {
+                    key: Key::MoonlightVk {
+                        code: 0x41,
+                        normalized: true,
+                        repeat_modifiers: 0,
+                        temporary_modifier: false,
+                    },
+                    state: KeyState::Down,
+                })
+                .unwrap_err()
+                .code,
+            "injection_failed"
+        );
+        assert!(backend.keyboard_recovery_required);
+        assert!(backend.held_virtual_keycodes.contains_key(&0x41));
+        backend.inject(&Event::Relative { dx: 4, dy: -2 }).unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 2]);
+
+        adapter.borrow_mut().fail_destroy = Some(1);
+        assert_eq!(backend.stop().unwrap_err().code, "release_failed");
+        assert!(backend.keyboard_recovery_required);
+        assert!(backend.held_virtual_keycodes.contains_key(&0x41));
+        assert!(backend.keyboard.is_some());
+        assert!(backend.pointer.is_none());
+        assert_eq!(backend.start().unwrap_err().code, "backend_busy");
+        assert_eq!(adapter.borrow().next_id, 2);
+
+        backend.stop().unwrap();
+        assert!(!backend.keyboard_recovery_required);
+        assert!(backend.held_virtual_keycodes.is_empty());
+        assert!(backend.keyboard.is_none());
+        backend.start().unwrap();
+        assert!(backend.held_virtual_keycodes.is_empty());
+        assert_eq!(
+            backend.keyboard.as_ref().unwrap().fake.as_ref().unwrap().0,
+            3
+        );
+        assert_eq!(
+            backend.pointer.as_ref().unwrap().fake.as_ref().unwrap().0,
+            4
+        );
+        backend.inject(&Event::Relative { dx: 1, dy: 1 }).unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 2, 4]);
+        backend.stop().unwrap();
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [1, 2, 1, 3, 4]);
+    }
 
     fn touch_event(phase: PenTouchPhase) -> Event {
         Event::PenTouch {
