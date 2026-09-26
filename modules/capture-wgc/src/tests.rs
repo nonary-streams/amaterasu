@@ -116,6 +116,7 @@ fn enumeration_pages_are_bounded_ordered_and_do_not_disturb_capture() {
     let mut offset = None;
     let mut ids = Vec::new();
     let mut page_count = 0;
+    let mut enumeration_id = None;
     loop {
         let reply = controller.handle(
             "owner",
@@ -127,6 +128,14 @@ fn enumeration_pages_are_bounded_ordered_and_do_not_disturb_capture() {
         );
         assert_eq!(reply["ok"], true);
         assert!(serde_json::to_vec(&reply).unwrap().len() <= 12_000);
+        let page_id = reply["enumeration_id"].as_str().unwrap();
+        assert_eq!(page_id.len(), 64);
+        assert!(page_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if let Some(expected) = &enumeration_id {
+            assert_eq!(page_id, expected);
+        } else {
+            enumeration_id = Some(page_id.to_owned());
+        }
         let page = reply["outputs"].as_array().unwrap();
         assert!(!page.is_empty());
         ids.extend(
@@ -183,6 +192,51 @@ fn no_argument_enumeration_pages_more_than_the_default_limit() {
     assert_eq!(first["next_offset"], page.len());
     assert!(serde_json::to_vec(&first).unwrap().len() <= 12_000);
     assert_eq!(page[0]["id"], "output-000");
+    assert_eq!(first["enumeration_id"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn enumeration_id_changes_with_full_output_metadata() {
+    let outputs = vec![test_output(1, "first"), test_output(2, "second")];
+    let enumerate = |outputs| {
+        Controller::new(paged_backend(outputs), true).handle(
+            "owner",
+            Operation::Enumerate {
+                offset: Some(0),
+                limit: Some(1),
+            },
+            &mut || Ok(()),
+        )["enumeration_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let original = enumerate(outputs.clone());
+    assert_eq!(original, enumerate(outputs.iter().cloned().rev().collect()));
+    assert_ne!(original, enumerate(vec![outputs[0].clone()]));
+    let mut changed = outputs;
+    changed[1].attached = false;
+    assert_ne!(original, enumerate(changed.clone()));
+    changed[1].attached = true;
+    changed[1].device_name = "renamed".into();
+    assert_ne!(original, enumerate(changed));
+}
+
+#[test]
+fn enumeration_rejects_duplicate_output_ids() {
+    let first = test_output(1, "first");
+    let mut duplicate = test_output(1, "second");
+    duplicate.device_name = "different-device".into();
+    let mut controller = Controller::new(paged_backend(vec![first, duplicate]), true);
+    let reply = controller.handle(
+        "owner",
+        Operation::Enumerate {
+            offset: None,
+            limit: None,
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(reply["error"]["code"], "backend_error");
 }
 
 #[test]
@@ -215,6 +269,7 @@ fn enumeration_validates_cursor_and_preserves_small_legacy_reply() {
         &mut || Ok(()),
     );
     assert_eq!(page["outputs"], legacy["outputs"]);
+    assert_eq!(page["enumeration_id"], legacy["enumeration_id"]);
     assert!(page.get("next_offset").is_none());
     let empty = Controller::new(paged_backend(Vec::new()), true);
     let mut empty = empty;

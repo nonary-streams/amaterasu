@@ -4,6 +4,7 @@ use crate::model::{
 };
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -443,6 +444,13 @@ fn enumeration_reply(
     const MAX_PAGE_OUTPUTS: usize = 256;
 
     outputs.sort_by(|a, b| a.id.cmp(&b.id).then(a.device_name.cmp(&b.device_name)));
+    if outputs.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(CaptureError::new(
+            "backend_error",
+            "capture backend enumerated duplicate output IDs",
+        ));
+    }
+    let enumeration_id = enumeration_id(&outputs)?;
     let requested_page = offset.is_some() || limit.is_some();
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(MAX_PAGE_OUTPUTS);
@@ -458,7 +466,7 @@ fn enumeration_reply(
     }
 
     if !requested_page && outputs.len() <= MAX_PAGE_OUTPUTS {
-        let reply = json!({"ok":true,"outputs":outputs});
+        let reply = json!({"ok":true,"outputs":outputs,"enumeration_id":enumeration_id});
         if serialized_size(&reply)? <= MAX_REPLY_BYTES {
             return Ok(reply);
         }
@@ -468,7 +476,11 @@ fn enumeration_reply(
     for output in outputs.iter().skip(offset).take(limit) {
         page.push(output);
         let next_offset = offset + page.len();
-        let reply = page_reply(&page, (next_offset < outputs.len()).then_some(next_offset));
+        let reply = page_reply(
+            &page,
+            (next_offset < outputs.len()).then_some(next_offset),
+            &enumeration_id,
+        );
         if serialized_size(&reply)? > MAX_REPLY_BYTES {
             page.pop();
             break;
@@ -484,11 +496,22 @@ fn enumeration_reply(
     Ok(page_reply(
         &page,
         (next_offset < outputs.len()).then_some(next_offset),
+        &enumeration_id,
     ))
 }
 
-fn page_reply(outputs: &[&crate::model::Output], next_offset: Option<usize>) -> Value {
-    let mut reply = json!({"ok":true,"outputs":outputs});
+fn enumeration_id(outputs: &[crate::model::Output]) -> CaptureResult<String> {
+    let encoded = serde_json::to_vec(outputs)
+        .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn page_reply(
+    outputs: &[&crate::model::Output],
+    next_offset: Option<usize>,
+    enumeration_id: &str,
+) -> Value {
+    let mut reply = json!({"ok":true,"outputs":outputs,"enumeration_id":enumeration_id});
     if let Some(offset) = next_offset {
         reply["next_offset"] = json!(offset);
     }
