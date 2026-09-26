@@ -101,6 +101,8 @@ impl ManagedModule for DiagnosticsModule {
             self.journal.set_ready(true);
         }
 
+        self.journal.recover_logging_if_due(now);
+
         match self.runtime.send(Command::Poll {})? {
             Response::Request {
                 id,
@@ -595,6 +597,11 @@ mod hydration_tests {
             2
         );
         assert_eq!(
+            journal.handle("capture", json!({"action":"status"}))["logging_sink"]["state"],
+            "failed"
+        );
+        journal.recover_logging_if_due(Instant::now() + std::time::Duration::from_secs(5));
+        assert_eq!(
             handle_request(
                 &mut journal,
                 &mut reader,
@@ -605,6 +612,29 @@ mod hydration_tests {
             ),
             json!({"ok":true,"applied_revision":2})
         );
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(3, "third.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":true,"applied_revision":3})
+        );
+        assert_eq!(
+            handle_request(
+                &mut journal,
+                &mut reader,
+                HOST_CONFIGURATION_CALLER,
+                apply(2, "first.log"),
+                now,
+                Some(&root)
+            ),
+            json!({"ok":false,"code":"stale_revision"})
+        );
+        assert_eq!(journal.logging_configuration_revision(), Some(3));
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }

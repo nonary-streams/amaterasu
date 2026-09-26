@@ -2,6 +2,7 @@ use crate::logging::{LoggingSettings, SessionLogger};
 use crate::protocol::{Action, Record, page_limit, valid_name};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
 
 const MAX_CALLERS: usize = 64;
 const MAX_RECORDS: usize = 128;
@@ -104,6 +105,10 @@ impl Journal {
 
     pub(crate) fn logging_delivery_available(&self) -> bool {
         self.logger.delivery_available()
+    }
+
+    pub(crate) fn recover_logging_if_due(&mut self, now: Instant) {
+        self.logger.recover_if_due(now);
     }
 
     #[cfg(test)]
@@ -441,13 +446,20 @@ mod hydration_tests {
             journal.handle("capture", record("written after recovery"))["sequence"],
             2
         );
+        assert_eq!(status(&mut journal)["logging_sink"]["state"], "failed");
+        journal
+            .recover_logging_if_due(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        assert_eq!(
+            journal.handle("capture", record("written after recovery on disk"))["sequence"],
+            3
+        );
         assert_eq!(
             status(&mut journal)["logging_sink"],
             json!({"state":"healthy","failure":null})
         );
         let log_path = journal.logger.active_path_for_test().to_path_buf();
         let contents = std::fs::read_to_string(log_path).unwrap();
-        assert!(contents.contains("written after recovery"));
+        assert!(contents.contains("written after recovery on disk"));
         assert!(!contents.contains("retained on disk failure"));
 
         drop(journal);
@@ -512,6 +524,8 @@ mod hydration_tests {
         );
 
         std::fs::remove_file(blocked).unwrap();
+        journal
+            .recover_logging_if_due(std::time::Instant::now() + std::time::Duration::from_secs(5));
         assert_eq!(
             journal.handle("capture", record("warn", "after recovery"))["sequence"],
             3
@@ -533,6 +547,55 @@ mod hydration_tests {
             3
         );
 
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_recovery_cannot_restore_a_superseded_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-superseded-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let settings = |path| {
+            LoggingSettings::from_value(json!({
+                "min_log_level":2,
+                "log_path":path,
+                "state_root":root,
+            }))
+            .unwrap()
+        };
+        let mut journal = Journal::unready();
+        journal
+            .apply_persisted_logging(settings("old.log"), 7)
+            .unwrap();
+        journal.close_sink_for_test();
+        journal.handle(
+            "capture",
+            json!({
+                "action":"record","level":"info","target":"capture","message":"failed old sink"
+            }),
+        );
+        assert!(!journal.logging_delivery_available());
+
+        journal
+            .apply_persisted_logging(settings("new.log"), 8)
+            .unwrap();
+        assert!(
+            journal
+                .apply_persisted_logging(settings("old.log"), 7)
+                .is_err()
+        );
+        let new_path = journal.logger.active_path_for_test().to_path_buf();
+        journal.recover_logging_if_due(Instant::now() + std::time::Duration::from_secs(30));
+        assert_eq!(journal.logger.active_path_for_test(), new_path);
+        assert_eq!(journal.logging_configuration_revision(), Some(8));
+        assert!(journal.logging_delivery_available());
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
     }

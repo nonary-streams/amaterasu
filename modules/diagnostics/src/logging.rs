@@ -6,13 +6,14 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_LIMIT: usize = 30;
 const ROLLOVER_SIZE: u64 = 2 * 1024 * 1024;
 const SESSION_SIZE: u64 = 10 * 1024 * 1024;
 const ROLLOVER_COUNT: usize = (SESSION_SIZE / ROLLOVER_SIZE) as usize - 1;
 const LOG_SUFFIX: &str = ".log";
+const SINK_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +130,7 @@ pub(crate) struct SessionLogger {
     settings: Option<LoggingSettings>,
     session: Option<SessionLog>,
     failure: Option<SinkFailure>,
+    retry_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -146,12 +148,14 @@ impl SessionLogger {
             settings: logging_enabled.then_some(settings),
             session: None,
             failure: None,
+            retry_at: None,
         };
         if let Some(session) = logger.open_configured_session() {
             match session {
                 Ok(session) => logger.session = Some(session),
                 Err(error) => {
                     logger.failure = Some(SinkFailure::Open);
+                    logger.retry_at = Some(Instant::now() + SINK_RETRY_INTERVAL);
                     return (logger, Some(error.to_string()));
                 }
             }
@@ -190,17 +194,6 @@ impl SessionLogger {
         if record.level.numeric() < self.minimum_level {
             return;
         }
-        if self.session.is_none()
-            && let Some(session) = self.open_configured_session()
-        {
-            match session {
-                Ok(session) => self.session = Some(session),
-                Err(_) => {
-                    self.failure = Some(SinkFailure::Open);
-                    return;
-                }
-            }
-        }
         if let Some(session) = &mut self.session {
             match session.write_record(caller, record) {
                 Ok(()) => self.failure = None,
@@ -208,8 +201,28 @@ impl SessionLogger {
                     // Preserve the in-memory caller journal if a disk sink stops working.
                     self.session = None;
                     self.failure = Some(SinkFailure::Write);
+                    self.retry_at = Some(Instant::now() + SINK_RETRY_INTERVAL);
                 }
             }
+        }
+    }
+
+    /// Retry the current policy on a timer, including when no records arrive.
+    pub(crate) fn recover_if_due(&mut self, now: Instant) {
+        if !self.retry_at.is_some_and(|retry_at| now >= retry_at) {
+            return;
+        }
+        match self.open_configured_session() {
+            Some(Ok(session)) => {
+                self.session = Some(session);
+                self.failure = None;
+                self.retry_at = None;
+            }
+            Some(Err(_)) => {
+                self.failure = Some(SinkFailure::Open);
+                self.retry_at = Some(now + SINK_RETRY_INTERVAL);
+            }
+            None => self.retry_at = None,
         }
     }
 
@@ -705,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_sink_reopens_for_the_next_qualifying_record() {
+    fn failed_sink_recovers_only_when_retry_is_due() {
         let state_root = temp_root();
         let settings = LoggingSettings::from_value(json!({
             "log_path":"capture.log",
@@ -722,19 +735,26 @@ mod tests {
         assert!(logger.session.is_none());
         assert_eq!(logger.health(), json!({"state":"failed","failure":"write"}));
 
+        logger.write_record("capture", &test_record("not retried by record"));
+        assert!(logger.session.is_none());
+        let retry_at = logger.retry_at.unwrap();
+        logger.recover_if_due(retry_at - Duration::from_nanos(1));
+        assert!(logger.session.is_none());
+        logger.recover_if_due(retry_at);
         logger.write_record("capture", &test_record("written after reopening"));
         let reopened = logger.session.as_ref().unwrap();
         assert_ne!(reopened.active_path, original_path);
         let contents = fs::read_to_string(&reopened.active_path).unwrap();
         assert!(contents.contains("written after reopening"));
         assert!(!contents.contains("lost to closed sink"));
+        assert!(!contents.contains("not retried by record"));
         assert_eq!(logger.health(), json!({"state":"healthy","failure":null}));
 
         fs::remove_dir_all(state_root).unwrap();
     }
 
     #[test]
-    fn initially_unavailable_sink_reopens_when_a_later_record_arrives() {
+    fn initially_unavailable_sink_uses_bounded_retry() {
         let state_root = temp_root();
         let blocking_path = state_root.join("delayed");
         fs::write(&blocking_path, b"block directory creation").unwrap();
@@ -751,7 +771,14 @@ mod tests {
         logger.write_record("capture", &test_record("still blocked"));
         assert_eq!(logger.health(), json!({"state":"failed","failure":"open"}));
 
+        let retry_at = logger.retry_at.unwrap();
+        logger.recover_if_due(retry_at);
+        assert_eq!(logger.retry_at, Some(retry_at + SINK_RETRY_INTERVAL));
+
         fs::remove_file(&blocking_path).unwrap();
+        logger.recover_if_due(retry_at + Duration::from_nanos(1));
+        assert!(logger.session.is_none());
+        logger.recover_if_due(retry_at + SINK_RETRY_INTERVAL);
         logger.write_record(
             "capture",
             &test_record("recovered after initial open failure"),
