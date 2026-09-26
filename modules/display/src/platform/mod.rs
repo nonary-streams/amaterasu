@@ -1,4 +1,4 @@
-use crate::model::{Configuration, DisplayResult, Snapshot};
+use crate::model::{AvailableMode, Configuration, DisplayResult, Snapshot};
 use serde_json::Value;
 
 pub trait Platform {
@@ -10,6 +10,7 @@ pub trait Platform {
         offset: usize,
         limit: usize,
     ) -> DisplayResult<Value>;
+    fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>>;
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn apply(
         &mut self,
@@ -39,6 +40,9 @@ impl Platform for NativePlatform {
         false
     }
     fn enumerate(&mut self, _: Option<&str>, _: usize, _: usize) -> DisplayResult<Value> {
+        unsupported()
+    }
+    fn available_modes(&mut self, _: &str) -> DisplayResult<Vec<AvailableMode>> {
         unsupported()
     }
     fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {

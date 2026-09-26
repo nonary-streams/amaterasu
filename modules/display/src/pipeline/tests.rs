@@ -66,6 +66,9 @@ struct FakePlatform {
     apply_failure: bool,
     restore_failure: bool,
     topology_changed: bool,
+    available_modes: Vec<crate::model::AvailableMode>,
+    mode_queries: usize,
+    inactive: bool,
 }
 impl Platform for FakePlatform {
     fn name(&self) -> &'static str {
@@ -76,6 +79,19 @@ impl Platform for FakePlatform {
     }
     fn enumerate(&mut self, _: Option<&str>, _: usize, _: usize) -> DisplayResult<Value> {
         Ok(json!({"ok":true,"entries":[]}))
+    }
+    fn available_modes(
+        &mut self,
+        display: &str,
+    ) -> DisplayResult<Vec<crate::model::AvailableMode>> {
+        self.mode_queries += 1;
+        if self.inactive || !display.eq_ignore_ascii_case("monitor.one") {
+            return Err(DisplayError::new(
+                "unsupported_display",
+                "display is inactive",
+            ));
+        }
+        Ok(self.available_modes.clone())
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let display = &configuration.displays[0];
@@ -365,12 +381,45 @@ fn explicit_client_mode_override_preserves_concrete_configuration() {
     ));
     assert_eq!(pipeline.platform.prepared_mode, mode);
     assert_eq!(pipeline.platform.applied_mode, mode);
+    assert_eq!(pipeline.platform.mode_queries, 0);
 }
 
 #[test]
-fn unsupported_highest_refresh_cannot_start_provider_or_journal() {
+fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    pipeline.platform.available_modes = vec![
+        crate::model::AvailableMode {
+            width: 1280,
+            height: 720,
+            bits_per_pixel: 32,
+            nominal_refresh_hz: 240,
+            refresh: Rational {
+                numerator: 240,
+                denominator: 1,
+            },
+        },
+        crate::model::AvailableMode {
+            width: 1920,
+            height: 1080,
+            bits_per_pixel: 32,
+            nominal_refresh_hz: 60,
+            refresh: Rational {
+                numerator: 60,
+                denominator: 1,
+            },
+        },
+        crate::model::AvailableMode {
+            width: 1920,
+            height: 1080,
+            bits_per_pixel: 32,
+            nominal_refresh_hz: 120,
+            refresh: Rational {
+                numerator: 120000,
+                denominator: 1001,
+            },
+        },
+    ];
     let result = state.run(
         &mut pipeline,
         "owner",
@@ -380,18 +429,103 @@ fn unsupported_highest_refresh_cannot_start_provider_or_journal() {
             "mode_policy":{
                 "display_id":"monitor.one",
                 "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":false,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":true
+                },
+                "remapping":{"resolution_only":[{
+                    "requested_resolution":"1280x720",
+                    "final_resolution":"1920x1080"
+                }]},
+                "refresh_rate_option":"prefer_highest"
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    let selected = Some((
+        1920,
+        1080,
+        Rational {
+            numerator: 120000,
+            denominator: 1001,
+        },
+    ));
+    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert_eq!(pipeline.platform.prepared_mode, selected);
+    assert_eq!(pipeline.platform.applied_mode, selected);
+    assert!(state.journal.is_some());
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":result["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["apply", "restore"]);
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn missing_highest_mode_rejects_before_prepare_and_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    pipeline.platform.available_modes = vec![crate::model::AvailableMode {
+        width: 1920,
+        height: 1080,
+        bits_per_pixel: 32,
+        nominal_refresh_hz: 240,
+        refresh: Rational {
+            numerator: 240,
+            denominator: 1,
+        },
+    }];
+    let request = json!({
+        "action":"apply", "configuration":configuration(),
+        "mode_policy":{
+            "display_id":"monitor.one",
+            "context":{
+                "resolution_is_automatic":false,
+                "refresh_rate_is_automatic":false,
+                "client_display_mode_override":false,
+                "optimize_game_settings":true
+            },
+            "remapping":{}, "refresh_rate_option":"prefer_highest"
+        }
+    });
+    let result = state.run(&mut pipeline, "owner", request);
+    assert_eq!(result["error"]["code"], "unsupported_display");
+    assert_eq!(pipeline.platform.mode_queries, 1);
+    assert!(pipeline.platform.prepared_mode.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn inactive_display_rejects_highest_before_prepare_and_journal() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    pipeline.platform.inactive = true;
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply", "configuration":configuration(),
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "context":{
                     "resolution_is_automatic":false,
                     "refresh_rate_is_automatic":false,
                     "client_display_mode_override":false,
                     "optimize_game_settings":true
                 },
-                "remapping":{},
-                "refresh_rate_option":"prefer_highest"
+                "remapping":{}, "refresh_rate_option":"prefer_highest"
             }
         }),
     );
-    assert_eq!(result["error"]["code"], "unsupported_policy");
+    assert_eq!(result["error"]["code"], "unsupported_display");
+    assert_eq!(pipeline.platform.mode_queries, 1);
     assert!(pipeline.platform.prepared_mode.is_none());
+    assert!(pipeline.platform.effects.is_empty());
     assert!(state.journal.is_none());
 }
 #[test]

@@ -1,5 +1,5 @@
 use super::conversion::{address, decode_path};
-use crate::model::{DisplayError, DisplayResult, Snapshot};
+use crate::model::{AvailableMode, DisplayError, DisplayResult, Rational, Snapshot};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use windows_sys::Win32::Devices::Display::*;
@@ -191,14 +191,23 @@ pub fn monitors() -> DisplayResult<Vec<Value>> {
 }
 
 pub fn modes(id: &str) -> DisplayResult<Vec<Value>> {
+    Ok(available_modes(id)?
+        .into_iter()
+        .map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_hz":mode.nominal_refresh_hz,"bits_per_pixel":mode.bits_per_pixel,"refresh":mode.refresh}))
+        .collect())
+}
+
+pub fn available_modes(id: &str) -> DisplayResult<Vec<AvailableMode>> {
     // GDI enumerates modes for an active source, not an arbitrary inactive CCD
     // route. Inactive targets can still be enabled through validated CCD apply.
     let buffers = query(QDC_ONLY_ACTIVE_PATHS)?;
     let mut source = None;
+    let mut current = None;
     for path in &buffers.paths {
         let device = names(path)?;
         if device.id.eq_ignore_ascii_case(id) {
             source = Some(device.source);
+            current = Some(decode_path(path, &buffers.modes, names(path)?)?);
             break;
         }
     }
@@ -223,7 +232,42 @@ pub fn modes(id: &str) -> DisplayResult<Vec<Value>> {
         if mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0 {
             continue;
         }
-        modes.insert((mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency, mode.dmBitsPerPel), json!({"width":mode.dmPelsWidth,"height":mode.dmPelsHeight,"refresh_hz":mode.dmDisplayFrequency,"bits_per_pixel":mode.dmBitsPerPel}));
+        if mode.dmDisplayFrequency == 0 {
+            continue;
+        }
+        let refresh = current
+            .as_ref()
+            .filter(|current| {
+                current.source.width == mode.dmPelsWidth
+                    && current.source.height == mode.dmPelsHeight
+                    && current.refresh.denominator != 0
+                    && (u64::from(current.refresh.numerator)
+                        + u64::from(current.refresh.denominator) / 2)
+                        / u64::from(current.refresh.denominator)
+                        == u64::from(mode.dmDisplayFrequency)
+            })
+            .map_or(
+                Rational {
+                    numerator: mode.dmDisplayFrequency,
+                    denominator: 1,
+                },
+                |current| current.refresh,
+            );
+        modes.insert(
+            (
+                mode.dmPelsWidth,
+                mode.dmPelsHeight,
+                mode.dmDisplayFrequency,
+                mode.dmBitsPerPel,
+            ),
+            AvailableMode {
+                width: mode.dmPelsWidth,
+                height: mode.dmPelsHeight,
+                refresh,
+                nominal_refresh_hz: mode.dmDisplayFrequency,
+                bits_per_pixel: mode.dmBitsPerPel,
+            },
+        );
     }
     Err(DisplayError::new(
         "resource_exhausted",

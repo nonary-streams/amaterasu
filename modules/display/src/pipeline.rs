@@ -285,10 +285,22 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
-                if let Some(policy) = mode_policy
-                    && let Err(error) = configuration.resolve_mode_policy(&policy)
-                {
-                    return complete(send, context.request, error.payload());
+                if let Some(policy) = mode_policy {
+                    let modes = if policy.refresh_rate_option
+                        == Some(crate::refresh_rate_option::RefreshRateOption::PreferHighest)
+                        && !policy.context.client_display_mode_override
+                    {
+                        match self.platform.available_modes(&policy.display_id) {
+                            Ok(modes) => Some(modes),
+                            Err(error) => return complete(send, context.request, error.payload()),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(error) = configuration.resolve_mode_policy(&policy, modes.as_deref())
+                    {
+                        return complete(send, context.request, error.payload());
+                    }
                 }
                 self.prepare(context, revision, configuration, send)
             }

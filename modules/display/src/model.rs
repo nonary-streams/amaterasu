@@ -76,6 +76,14 @@ pub struct Rational {
     pub numerator: u32,
     pub denominator: u32,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvailableMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh: Rational,
+    pub nominal_refresh_hz: u32,
+    pub bits_per_pixel: u32,
+}
 impl Rational {
     #[cfg(any(windows, test))]
     pub fn equivalent(self, other: Self) -> bool {
@@ -84,7 +92,11 @@ impl Rational {
     }
 }
 impl Configuration {
-    pub fn resolve_mode_policy(&mut self, policy: &ModePolicy) -> Result<(), DisplayError> {
+    pub fn resolve_mode_policy(
+        &mut self,
+        policy: &ModePolicy,
+        available_modes: Option<&[AvailableMode]>,
+    ) -> Result<(), DisplayError> {
         self.validate()?;
         let display = self
             .displays
@@ -148,16 +160,11 @@ impl Configuration {
                             })?,
                         );
                     }
-                    RefreshRateOption::PreferHighest => {
-                        return Err(DisplayError::new(
-                            "unsupported_policy",
-                            "highest refresh rate requires provider mode enumeration",
-                        ));
-                    }
+                    RefreshRateOption::PreferHighest => {}
                 }
             }
         }
-        let resolved = policy
+        let mut resolved = policy
             .remapping
             .resolve(context, selected)
             .map_err(|error| {
@@ -166,6 +173,35 @@ impl Configuration {
                     format!("invalid display mode remapping: {error}"),
                 )
             })?;
+        if !context.client_display_mode_override
+            && policy.refresh_rate_option == Some(RefreshRateOption::PreferHighest)
+        {
+            let resolution = resolved.resolution.ok_or_else(|| {
+                DisplayError::new("invalid_request", "mode policy has no selected resolution")
+            })?;
+            let modes = available_modes.ok_or_else(|| {
+                DisplayError::new("unsupported_display", "display modes are unavailable")
+            })?;
+            let highest = modes
+                .iter()
+                .filter(|mode| mode.width == resolution.width && mode.height == resolution.height)
+                .filter(|mode| mode.refresh.denominator != 0 && mode.refresh.numerator != 0)
+                .max_by(|left, right| {
+                    (u64::from(left.refresh.numerator) * u64::from(right.refresh.denominator)).cmp(
+                        &(u64::from(right.refresh.numerator) * u64::from(left.refresh.denominator)),
+                    )
+                })
+                .ok_or_else(|| {
+                    DisplayError::new(
+                        "unsupported_display",
+                        format!(
+                            "display has no available mode at {}x{}",
+                            resolution.width, resolution.height
+                        ),
+                    )
+                })?;
+            resolved.refresh_rate = Some(highest.refresh);
+        }
         if let Some(resolution) = resolved.resolution {
             display.width = resolution.width;
             display.height = resolution.height;

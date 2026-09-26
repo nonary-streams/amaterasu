@@ -3,7 +3,7 @@ mod conversion;
 mod query;
 
 use super::Platform;
-use crate::model::{Configuration, DisplayError, DisplayResult, Snapshot};
+use crate::model::{AvailableMode, Configuration, DisplayError, DisplayResult, Snapshot};
 use serde_json::{Value, json};
 #[derive(Default)]
 pub struct WindowsPlatform;
@@ -58,6 +58,9 @@ impl Platform for WindowsPlatform {
         let requested = apply::requested(configuration)?;
         apply::set(&requested, false)?;
         Ok(before)
+    }
+    fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>> {
+        query::available_modes(display)
     }
     fn apply(
         &mut self,
