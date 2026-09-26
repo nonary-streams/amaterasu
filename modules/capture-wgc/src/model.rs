@@ -49,7 +49,12 @@ pub struct Output {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Status,
-    Enumerate,
+    Enumerate {
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Open {
         output: String,
         operation_id: Option<String>,

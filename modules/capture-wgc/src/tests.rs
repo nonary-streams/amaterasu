@@ -41,6 +41,189 @@ impl Backend for FakeBackend {
     }
 }
 
+struct EnumeratingBackend {
+    capture: FakeBackend,
+    outputs: Vec<Output>,
+}
+
+impl Backend for EnumeratingBackend {
+    fn supported(&self) -> bool {
+        self.capture.supported()
+    }
+
+    fn enumerate(&self) -> CaptureResult<Vec<Output>> {
+        Ok(self.outputs.clone())
+    }
+
+    fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+        self.capture.open(output)
+    }
+}
+
+fn paged_backend(outputs: Vec<Output>) -> EnumeratingBackend {
+    EnumeratingBackend {
+        capture: FakeBackend {
+            events: Arc::new(Mutex::new(VecDeque::from([Ok(Some(frame(
+                7,
+                1,
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+            )))]))),
+            geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        outputs,
+    }
+}
+
+fn test_output(id: usize, description: &str) -> Output {
+    Output {
+        id: format!("output-{id:03}"),
+        adapter: "adapter".into(),
+        adapter_vendor_id: Some(1),
+        adapter_device_id: Some(2),
+        adapter_description: Some(description.into()),
+        device_name: format!("display-{id}"),
+        attached: true,
+        left: id as i32,
+        top: 0,
+        width: 1920,
+        height: 1080,
+        rotation: 0,
+    }
+}
+
+#[test]
+fn enumeration_pages_are_bounded_ordered_and_do_not_disturb_capture() {
+    let description = "x".repeat(300);
+    let outputs = (0..80)
+        .rev()
+        .map(|id| test_output(id, &description))
+        .collect();
+    let mut controller = Controller::new(paged_backend(outputs), true);
+    let opened = controller.handle(
+        "owner",
+        Operation::Open {
+            output: "output-000".into(),
+            operation_id: None,
+            constant_rate: true,
+        },
+        &mut || Ok(()),
+    );
+    let stream = opened["stream"].as_u64().unwrap();
+    assert_eq!(opened["constant_rate"], true);
+
+    let mut offset = None;
+    let mut ids = Vec::new();
+    let mut page_count = 0;
+    loop {
+        let reply = controller.handle(
+            "owner",
+            Operation::Enumerate {
+                offset,
+                limit: None,
+            },
+            &mut || Ok(()),
+        );
+        assert_eq!(reply["ok"], true);
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= 12_000);
+        let page = reply["outputs"].as_array().unwrap();
+        assert!(!page.is_empty());
+        ids.extend(
+            page.iter()
+                .map(|output| output["id"].as_str().unwrap().to_owned()),
+        );
+        page_count += 1;
+        offset = reply
+            .get("next_offset")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
+        if offset.is_none() {
+            break;
+        }
+    }
+    assert!(page_count > 1);
+    assert_eq!(
+        ids,
+        (0..80)
+            .map(|id| format!("output-{id:03}"))
+            .collect::<Vec<_>>()
+    );
+    let limited = controller.handle(
+        "owner",
+        Operation::Enumerate {
+            offset: Some(0),
+            limit: Some(7),
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(limited["outputs"].as_array().unwrap().len(), 7);
+    assert_eq!(limited["next_offset"], 7);
+    let delivered = controller.read("owner", stream, 0).unwrap().unwrap();
+    assert_eq!(delivered.bytes.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(delivered.capture_pacing_timestamp_us, 7);
+    assert!(controller.read("owner", stream, 0).unwrap().is_some());
+}
+
+#[test]
+fn enumeration_validates_cursor_and_preserves_small_legacy_reply() {
+    let mut controller = Controller::new(paged_backend(vec![test_output(1, "short")]), true);
+    let legacy = controller.handle(
+        "owner",
+        Operation::Enumerate {
+            offset: None,
+            limit: None,
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(legacy["outputs"].as_array().unwrap().len(), 1);
+    assert!(legacy.get("next_offset").is_none());
+    for (offset, limit) in [
+        (Some(1), None),
+        (Some(usize::MAX), None),
+        (None, Some(0)),
+        (None, Some(257)),
+    ] {
+        let reply = controller.handle("owner", Operation::Enumerate { offset, limit }, &mut || {
+            Ok(())
+        });
+        assert_eq!(reply["error"]["code"], "invalid_request");
+    }
+    let page = controller.handle(
+        "owner",
+        serde_json::from_value(json!({"action":"enumerate","offset":0,"limit":1})).unwrap(),
+        &mut || Ok(()),
+    );
+    assert_eq!(page["outputs"], legacy["outputs"]);
+    assert!(page.get("next_offset").is_none());
+    let empty = Controller::new(paged_backend(Vec::new()), true);
+    let mut empty = empty;
+    assert_eq!(
+        empty.handle(
+            "owner",
+            Operation::Enumerate {
+                offset: Some(0),
+                limit: Some(1)
+            },
+            &mut || Ok(())
+        )["outputs"],
+        json!([])
+    );
+    let mut oversized = Controller::new(
+        paged_backend(vec![test_output(1, &"x".repeat(12_000))]),
+        true,
+    );
+    let reply = oversized.handle(
+        "owner",
+        Operation::Enumerate {
+            offset: None,
+            limit: None,
+        },
+        &mut || Ok(()),
+    );
+    assert_eq!(reply["error"]["code"], "resource_exhausted");
+}
+
 impl CaptureSession for FakeSession {
     fn read(&mut self, _: u32) -> CaptureResult<Option<Frame>> {
         self.events.lock().unwrap().pop_front().unwrap_or(Ok(None))

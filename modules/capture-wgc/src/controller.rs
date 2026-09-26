@@ -76,7 +76,10 @@ impl<B: Backend> Controller<B> {
         self.opened_stream = None;
         let result = match operation {
             Operation::Status => Ok(self.status(caller)),
-            Operation::Enumerate => self.backend.enumerate().and_then(enumeration_reply),
+            Operation::Enumerate { offset, limit } => self
+                .backend
+                .enumerate()
+                .and_then(|outputs| enumeration_reply(outputs, offset, limit)),
             Operation::Open {
                 output,
                 operation_id,
@@ -431,17 +434,71 @@ fn validate_operation_id(operation_id: &str) -> CaptureResult<()> {
     Ok(())
 }
 
-fn enumeration_reply(outputs: Vec<crate::model::Output>) -> CaptureResult<Value> {
-    let reply = json!({"ok":true,"outputs":outputs});
-    let encoded = serde_json::to_vec(&reply)
-        .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
-    if encoded.len() > 12_000 {
+fn enumeration_reply(
+    mut outputs: Vec<crate::model::Output>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> CaptureResult<Value> {
+    const MAX_REPLY_BYTES: usize = 12_000;
+    const MAX_PAGE_OUTPUTS: usize = 256;
+
+    outputs.sort_by(|a, b| a.id.cmp(&b.id).then(a.device_name.cmp(&b.device_name)));
+    let requested_page = offset.is_some() || limit.is_some();
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(MAX_PAGE_OUTPUTS);
+    if limit == 0
+        || limit > MAX_PAGE_OUTPUTS
+        || offset > outputs.len()
+        || (offset == outputs.len() && !outputs.is_empty())
+    {
         return Err(CaptureError::new(
-            "resource_exhausted",
-            "output metadata exceeds the control reply limit",
+            "invalid_request",
+            "enumeration offset or limit is out of range",
         ));
     }
-    Ok(reply)
+
+    if !requested_page {
+        let reply = json!({"ok":true,"outputs":outputs});
+        if serialized_size(&reply)? <= MAX_REPLY_BYTES {
+            return Ok(reply);
+        }
+    }
+
+    let mut page = Vec::new();
+    for output in outputs.iter().skip(offset).take(limit) {
+        page.push(output);
+        let next_offset = offset + page.len();
+        let reply = page_reply(&page, (next_offset < outputs.len()).then_some(next_offset));
+        if serialized_size(&reply)? > MAX_REPLY_BYTES {
+            page.pop();
+            break;
+        }
+    }
+    if page.is_empty() && offset < outputs.len() {
+        return Err(CaptureError::new(
+            "resource_exhausted",
+            "one output exceeds the control reply limit",
+        ));
+    }
+    let next_offset = offset + page.len();
+    Ok(page_reply(
+        &page,
+        (next_offset < outputs.len()).then_some(next_offset),
+    ))
+}
+
+fn page_reply(outputs: &[&crate::model::Output], next_offset: Option<usize>) -> Value {
+    let mut reply = json!({"ok":true,"outputs":outputs});
+    if let Some(offset) = next_offset {
+        reply["next_offset"] = json!(offset);
+    }
+    reply
+}
+
+fn serialized_size(reply: &Value) -> CaptureResult<usize> {
+    serde_json::to_vec(reply)
+        .map(|encoded| encoded.len())
+        .map_err(|error| CaptureError::new("backend_error", error.to_string()))
 }
 
 fn open_reply(
