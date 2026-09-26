@@ -317,12 +317,16 @@ fn capture_geometry_error(error: GeometryError) -> CaptureError {
 impl FrameSource for Session {
     fn poll(&mut self) -> CaptureResult<Option<Frame>> {
         let closed = self.closed.clone();
-        while_item_open(&closed, || {
+        let result = while_item_open(&closed, || {
             if !self.readback.pending() && !self.acquire()? {
                 return Ok(None);
             }
             self.readback.poll()
-        })
+        });
+        if result.is_err() {
+            self.readback.invalidate();
+        }
+        result
     }
 }
 

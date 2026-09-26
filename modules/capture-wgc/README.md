@@ -119,7 +119,9 @@ capacity-one channels. At most one poll is outstanding. Reads use `try_send` and
 `try_recv` rather than waiting on the worker; the WinRT queue is polled with
 `TryGetNextFrame`, and GPU readback uses `Map(DO_NOT_WAIT)`. Pending staging
 textures survive until a later poll. Each captured frame is explicitly closed,
-and every successful map is paired with guarded `Unmap`.
+and every successful map is paired with guarded `Unmap`. One compatible staging
+texture is reused after its pixels are copied and unmapped. Pending readbacks
+cannot be overwritten; mode changes and terminal readback errors discard it.
 
 The worker owns even non-`Send` resources without transferring them across
 threads. Closing disconnects the request channel and joins the worker before the
@@ -165,7 +167,7 @@ capture cadence and is not atomic with the frame.
 
 ## Verification and remaining gates
 
-Sixteen unit tests cover caller-owned operations and native
+Unit tests cover staging reuse and invalidation, caller-owned operations and native
 bindings, replay/lookup, callback pixel lifetime, row pitch, cancellation, capacity,
 shutdown, incompatible ABI queries, non-`Send` worker ownership, bounded outstanding
 polling, joined destruction, and failed initialization cleanup. Windows x86_64 MSVC
@@ -180,8 +182,9 @@ the installed Windows API version and session permissions.
 
 HDR preservation/tone mapping, dirty regions, GPU texture sharing, presentation
 clock alignment, window capture, and automatic reconnect are not implemented.
-The BGRA8 path must not be advertised as preserving HDR. A new CPU staging texture
-and allocation are used per copied frame; performance is unqualified.
+The BGRA8 path must not be advertised as preserving HDR. CPU frame bytes are still
+allocated per copied frame; the compatible D3D staging texture is reused.
+Performance is unqualified.
 
 Behavioral references were the sibling Vibeshine WGC interface declarations in
 `src/platform/windows/display.h` and history (`5bb5331a4`, captured adapter identity;

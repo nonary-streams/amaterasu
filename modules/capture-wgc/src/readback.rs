@@ -1,4 +1,5 @@
 use crate::model::{CaptureError, CaptureResult, Frame, copy_bgra_rows, frame_layout};
+use crate::staging::{StagingKey, StagingLifecycle};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
@@ -13,12 +14,13 @@ use windows::core::Interface;
 pub struct Readback {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    pending: Option<PendingTexture>,
+    staging: StagingLifecycle<ID3D11Texture2D, PendingTexture>,
     sequence: u64,
 }
 
 struct PendingTexture {
     texture: ID3D11Texture2D,
+    key: StagingKey,
     width: u32,
     height: u32,
     timestamp_us: u64,
@@ -65,7 +67,7 @@ impl Readback {
             Self {
                 device,
                 context,
-                pending: None,
+                staging: StagingLifecycle::default(),
                 sequence: 0,
             },
             graphics_device,
@@ -73,7 +75,11 @@ impl Readback {
     }
 
     pub fn pending(&self) -> bool {
-        self.pending.is_some()
+        self.staging.pending().is_some()
+    }
+
+    pub fn invalidate(&mut self) {
+        self.staging.invalidate();
     }
 
     pub fn device_adapter(&self) -> Value {
@@ -99,12 +105,22 @@ impl Readback {
         height: u32,
         timestamp_us: u64,
     ) -> CaptureResult<()> {
-        frame_layout(width, height)?;
+        if self.pending() {
+            return Err(CaptureError::new(
+                "backend_error",
+                "WGC readback is still pending",
+            ));
+        }
+        if let Err(error) = frame_layout(width, height) {
+            self.staging.invalidate();
+            return Err(error);
+        }
         let mut description = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: source is retained by the captured frame during this call;
         // description is writable stack storage initialized by GetDesc.
         unsafe { source.GetDesc(&mut description) };
         if description.Width != width || description.Height != height {
+            self.staging.invalidate();
             return Err(CaptureError::new(
                 "access_lost",
                 "capture surface dimensions changed; reopen the output",
@@ -115,6 +131,7 @@ impl Readback {
             || description.ArraySize != 1
             || description.MipLevels != 1
         {
+            self.staging.invalidate();
             return Err(CaptureError::new(
                 "unsupported_format",
                 "WGC surface must be single-plane BGRA8",
@@ -124,24 +141,36 @@ impl Readback {
         description.BindFlags = 0;
         description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         description.MiscFlags = 0;
-        let mut texture = None;
+        let key = StagingKey {
+            width,
+            height,
+            format: description.Format.0 as u32,
+        };
+        let mut created = None;
         // SAFETY: initialized staging descriptor and writable local COM slot.
-        unsafe {
-            self.device
-                .CreateTexture2D(&description, None, Some(&mut texture))
-        }
-        .map_err(native_error)?;
-        let texture = texture.ok_or_else(|| {
-            CaptureError::new("backend_error", "D3D11 returned no staging texture")
-        })?;
+        let texture = if let Some(texture) = self.staging.take_idle(key) {
+            texture
+        } else {
+            if let Err(error) = unsafe {
+                self.device
+                    .CreateTexture2D(&description, None, Some(&mut created))
+            } {
+                self.staging.invalidate();
+                return Err(native_error(error));
+            }
+            created.ok_or_else(|| {
+                CaptureError::new("backend_error", "D3D11 returned no staging texture")
+            })?
+        };
         // SAFETY: source/destination match format and dimensions, are retained
         // through submission, and D3D11 tracks queued GPU resource dependencies.
         unsafe {
             self.context.CopyResource(&texture, source);
             self.context.Flush();
         }
-        self.pending = Some(PendingTexture {
+        self.staging.submit(PendingTexture {
             texture,
+            key,
             width,
             height,
             timestamp_us,
@@ -150,7 +179,7 @@ impl Readback {
     }
 
     pub fn poll(&mut self) -> CaptureResult<Option<Frame>> {
-        let pending = self.pending.as_ref().expect("pending WGC staging texture");
+        let pending = self.staging.pending().expect("pending WGC staging texture");
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: CPU-readable staging texture and writable map output slot.
         // DO_NOT_WAIT returns instead of waiting for GPU completion.
@@ -165,13 +194,23 @@ impl Readback {
         } {
             Ok(()) => (),
             Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => return Ok(None),
-            Err(error) => return Err(native_error(error)),
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(native_error(error));
+            }
         }
         let mapping = MappedTexture {
             context: &self.context,
             texture: &pending.texture,
         };
-        let (stride, _) = frame_layout(pending.width, pending.height)?;
+        let (stride, _) = match frame_layout(pending.width, pending.height) {
+            Ok(layout) => layout,
+            Err(error) => {
+                drop(mapping);
+                self.staging.invalidate();
+                return Err(error);
+            }
+        };
         // SAFETY: each mapped row contains initialized pixel bytes through
         // Unmap. The helper reads only pixels, never uninitialized row padding.
         let bytes = unsafe {
@@ -181,7 +220,15 @@ impl Readback {
                 mapped.RowPitch,
                 mapped.pData.cast::<u8>(),
             )
-        }?;
+        };
+        drop(mapping);
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.staging.invalidate();
+                return Err(error);
+            }
+        };
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
             width: pending.width,
@@ -192,8 +239,11 @@ impl Readback {
             capture_pacing_timestamp_us: pending.timestamp_us,
             sequence: self.sequence,
         };
-        drop(mapping);
-        self.pending = None;
+        let completed = self
+            .staging
+            .take_pending()
+            .expect("mapped WGC staging texture");
+        self.staging.store_idle(completed.key, completed.texture);
         Ok(Some(result))
     }
 }

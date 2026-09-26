@@ -3,6 +3,7 @@ mod backend;
 mod controller;
 mod model;
 mod native;
+mod staging;
 mod worker;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
