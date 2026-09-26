@@ -122,7 +122,11 @@ fn platform_registers_host_configuration_with_runtime_and_state_dependencies() {
 #[test]
 fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
     let host_configuration_service = "amaterasu.host-configuration/1";
-    assert_eq!(DIAGNOSTICS.calls, &[host_configuration_service]);
+    let state_service = "amaterasu.state/1";
+    assert_eq!(
+        DIAGNOSTICS.calls,
+        &[host_configuration_service, state_service]
+    );
     assert!(DIAGNOSTICS.dependencies.contains(&HOST_CONFIGURATION.id));
     assert!(MANAGEMENT.calls.contains(&host_configuration_service));
     assert!(MANAGEMENT.dependencies.contains(&HOST_CONFIGURATION.id));
@@ -140,8 +144,10 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
 
     for policy in [development, installer] {
         let diagnostics_calls = &policy.principals[DIAGNOSTICS.id].call;
-        assert_eq!(diagnostics_calls.len(), 1);
-        assert!(diagnostics_calls.contains(host_configuration_service));
+        assert_eq!(
+            diagnostics_calls,
+            &names(&[host_configuration_service, state_service])
+        );
         assert!(
             policy.principals[MANAGEMENT.id]
                 .call
@@ -156,7 +162,7 @@ fn diagnostics_and_management_receive_narrow_host_configuration_grants() {
                 .contains(host_configuration_service)
         );
         assert_eq!(host_configuration.call.len(), 1);
-        assert!(host_configuration.call.contains("amaterasu.state/1"));
+        assert!(host_configuration.call.contains(state_service));
         assert_eq!(policy.settings[PAIRING.id]["host_configuration"], true);
         assert_eq!(
             policy.principals[PAIRING.id].call.len(),

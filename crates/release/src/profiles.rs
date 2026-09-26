@@ -131,7 +131,8 @@ const DIAGNOSTICS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.diagnostics",
     library: "amaterasu_diagnostics",
     provides: &["amaterasu.diagnostics/1"],
-    calls: &["amaterasu.host-configuration/1"],
+    // Host configuration reads state under the original diagnostics caller.
+    calls: &["amaterasu.host-configuration/1", "amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
