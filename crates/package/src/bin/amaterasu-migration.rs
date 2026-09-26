@@ -118,9 +118,10 @@ fn run() -> Result<(), String> {
                 return Err("preflight accepts only --source and --program-files".into());
             }
             if !sources.is_empty() {
+                let validation = validate_sensitive_sources(&sources)?;
                 preflight_legacy_configuration_with_sensitive_sources(
                     &sources,
-                    &validate_sensitive_sources(&sources)?,
+                    &validation.approvals,
                 )?;
             } else if !discovered_only {
                 return Err("preflight requires at least one --source or --program-files".into());
@@ -155,8 +156,9 @@ fn run() -> Result<(), String> {
                 println!("migration completed: no predecessor configuration found");
                 return Ok(());
             }
-            let validated = validate_sensitive_sources(&sources)?;
-            if validated
+            let validation = validate_sensitive_sources(&sources)?;
+            if validation
+                .approvals
                 .iter()
                 .any(|source| source.pairing || source.authentication)
                 && runtime.is_none()
@@ -166,12 +168,12 @@ fn run() -> Result<(), String> {
             let receipt = import_legacy_configuration_with_sensitive_sources(
                 &destination,
                 &sources,
-                &validated,
+                &validation.approvals,
             )?;
             if let Some(runtime) = runtime {
                 let materialized = materialize_import_plan(&runtime, &receipt.plan)?;
                 let state = runtime_state_directory(&runtime)?;
-                seed_sensitive_sources(&destination, &sources, &validated, &state)?;
+                seed_sensitive_sources(&destination, &validation, &state)?;
                 write_import_validation(&runtime, &sources)?;
                 println!(
                     "migration runtime state materialized: {} application(s), {} setting(s)",
@@ -314,7 +316,7 @@ fn run() -> Result<(), String> {
 
 fn validate_sensitive_sources(
     sources: &[LegacyConfigSource],
-) -> Result<Vec<ValidatedSensitiveSource>, String> {
+) -> Result<SensitiveValidation, String> {
     let mut checks = Vec::new();
     for source in sources {
         let (needs_pairing, needs_authentication) = sensitive_needs(source)?;
@@ -338,7 +340,13 @@ fn validate_sensitive_sources(
                 )?,
         });
     }
-    Ok(aggregate_sensitive_approvals(&checks))
+    let approvals = aggregate_sensitive_approvals(&checks);
+    Ok(SensitiveValidation { checks, approvals })
+}
+
+struct SensitiveValidation {
+    checks: Vec<SourceValidation>,
+    approvals: Vec<ValidatedSensitiveSource>,
 }
 
 struct SourceValidation {
@@ -401,30 +409,40 @@ fn sensitive_needs(source: &LegacyConfigSource) -> Result<(bool, bool), String> 
 
 fn seed_sensitive_sources(
     destination: &std::path::Path,
-    sources: &[LegacyConfigSource],
-    validated: &[ValidatedSensitiveSource],
+    validation: &SensitiveValidation,
     state: &std::path::Path,
 ) -> Result<(), String> {
-    let pairing = helper_path("amaterasu-pairing-import")?;
-    let authentication = helper_path("amaterasu-authentication-import")?;
-    for source in sources {
-        let (needs_pairing, needs_authentication) = sensitive_needs(source)?;
-        let validated = validated
+    seed_sensitive_sources_with(destination, validation, state, |helper, source, state| {
+        helper_succeeds(&helper_path(helper)?, "seed", source, Some(state))
+    })
+}
+
+fn seed_sensitive_sources_with(
+    destination: &std::path::Path,
+    validation: &SensitiveValidation,
+    state: &std::path::Path,
+    mut seed: impl FnMut(&str, &std::path::Path, &std::path::Path) -> Result<bool, String>,
+) -> Result<(), String> {
+    // The live predecessor can change after the approved copy. Requirements
+    // belong to the validation decision, while helpers inspect the copied data.
+    for check in &validation.checks {
+        let validated = validation
+            .approvals
             .iter()
-            .find(|item| item.product == source.product)
+            .find(|item| item.product == check.product)
             .ok_or("migration approval is missing")?;
         let copied = destination
             .join(amaterasu_package::migration::LEGACY_IMPORT_DIRECTORY)
-            .join(source.product.directory_name());
-        if needs_pairing
+            .join(check.product.directory_name());
+        if check.pairing_needed
             && validated.pairing
-            && !helper_succeeds(&pairing, "seed", &copied, Some(state))?
+            && !seed("amaterasu-pairing-import", &copied, state)?
         {
             return Err("validated pairing migration could not be committed".into());
         }
-        if needs_authentication
+        if check.authentication_needed
             && validated.authentication
-            && !helper_succeeds(&authentication, "seed", &copied, Some(state))?
+            && !seed("amaterasu-authentication-import", &copied, state)?
         {
             return Err("validated authentication migration could not be committed".into());
         }
@@ -1342,6 +1360,63 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod handoff_cli_tests {
     use super::*;
+
+    #[test]
+    fn approved_credential_copy_still_requires_seeding_after_source_disappears() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-credential-copy-lifecycle-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("predecessor");
+        let destination = root.join("data");
+        let state = root.join("runtime/state");
+        fs::create_dir_all(source_root.join("credentials")).unwrap();
+        fs::write(
+            source_root.join("sunshine.conf"),
+            b"credentials_file = credentials/login.json\n",
+        )
+        .unwrap();
+        let credential = b"{\"username\":\"admin\",\"password\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"salt\":\"1234567890abcdef\"}";
+        fs::write(source_root.join("credentials/login.json"), credential).unwrap();
+        let source = LegacyConfigSource {
+            product: LegacyProduct::Sunshine,
+            root: source_root.clone(),
+        };
+        let check = SourceValidation {
+            product: LegacyProduct::Sunshine,
+            pairing_needed: false,
+            authentication_needed: true,
+            pairing_valid: true,
+            authentication_valid: true,
+        };
+        let validation = SensitiveValidation {
+            approvals: aggregate_sensitive_approvals(std::slice::from_ref(&check)),
+            checks: vec![check],
+        };
+        amaterasu_package::migration::import_legacy_configuration_with_sensitive_sources(
+            &destination,
+            &[source],
+            &validation.approvals,
+        )
+        .unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+
+        let mut seeded = false;
+        seed_sensitive_sources_with(&destination, &validation, &state, |helper, copied, root| {
+            assert_eq!(helper, "amaterasu-authentication-import");
+            assert_eq!(root, state);
+            assert_eq!(
+                fs::read(copied.join("credentials/login.json")).unwrap(),
+                credential
+            );
+            seeded = true;
+            Ok(true)
+        })
+        .unwrap();
+        assert!(seeded);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn one_approved_root_cannot_clear_another_roots_credential_gate() {
