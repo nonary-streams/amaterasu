@@ -84,6 +84,7 @@ pub struct Broker {
     pub limiter_restore_failures: usize,
     pub limiter_lease: Option<String>,
     pub limiter_session: Option<String>,
+    pub limiter_malformed_status: bool,
 }
 
 impl Broker {
@@ -478,6 +479,10 @@ impl Broker {
                 json!({"ok":true,"state":"applied","applied":true,"lease":lease})
             }
             "status" => {
+                if self.limiter_malformed_status {
+                    return json!({"ok":true,"version":1,"action":"status","state":"not_found",
+                        "applied":false,"session_id":payload["session_id"]});
+                }
                 let leases = if self.limiter_session.as_deref() == payload["session_id"].as_str() {
                     vec![
                         json!({"session_id":self.limiter_session,"lease":self.limiter_lease,
@@ -486,7 +491,8 @@ impl Broker {
                 } else {
                     Vec::new()
                 };
-                json!({"ok":true,"state":if leases.is_empty() {"not_found"} else {"applied"},"applied":false,"leases":leases})
+                json!({"ok":true,"version":1,"action":"status","session_id":payload["session_id"],
+                    "state":if leases.is_empty() {"not_found"} else {"applied"},"applied":false,"leases":leases})
             }
             "restore" => {
                 if self.limiter_restore_failures > 0 {

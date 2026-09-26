@@ -82,20 +82,24 @@ impl Pipeline {
             && let Some(mut pending) = job.pending.take()
             && let Some(record) = self.records.get_mut(&job.session)
         {
-            let mut resolved = false;
-            for turn in 0..8 {
-                match pending.poll(send, turn) {
-                    rpc::Progress::Result(response) => {
-                        limiter::accept_apply(record, &response);
-                        resolved = pending.release_result(send);
-                        break;
+            if !pending.was_sent() {
+                record.limiter_attempted = false;
+            } else {
+                let mut resolved = false;
+                for turn in 0..8 {
+                    match pending.poll(send, turn) {
+                        rpc::Progress::Result(response) => {
+                            limiter::accept_apply(record, &response);
+                            resolved = pending.release_result(send);
+                            break;
+                        }
+                        rpc::Progress::Waiting => {}
+                        rpc::Progress::Failed | rpc::Progress::Unresolved => break,
                     }
-                    rpc::Progress::Waiting => {}
-                    rpc::Progress::Failed | rpc::Progress::Unresolved => break,
                 }
-            }
-            if !resolved {
-                settled &= pending.shutdown(send);
+                if !resolved {
+                    settled &= pending.shutdown(send);
+                }
             }
         }
         for record in self.records.values_mut() {

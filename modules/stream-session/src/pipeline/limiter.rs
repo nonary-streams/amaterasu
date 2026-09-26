@@ -55,13 +55,14 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) {
     }
 }
 
-pub(super) fn status_confirms_no_lease(response: &Value) -> bool {
+pub(super) fn status_confirms_no_lease(record: &Record, response: &Value) -> bool {
     response["ok"] == true
-        && matches!(
-            response["state"].as_str(),
-            Some("not_found" | "not_needed" | "restored")
-        )
-        && response["leases"].as_array().is_none_or(Vec::is_empty)
+        && response["version"] == 1
+        && response["action"] == "status"
+        && response["state"] == "not_found"
+        && response["applied"] == false
+        && response["session_id"] == record.limiter_session()
+        && response["leases"].as_array().is_some_and(Vec::is_empty)
 }
 
 fn adopt_cleanup_lease(record: &mut Record, response: &Value) {
@@ -110,7 +111,7 @@ pub(super) fn shutdown(record: &mut Record, send: &mut Send<'_>) -> bool {
         };
         accept_status(record, &response);
         if record.limiter_lease.is_none() {
-            if status_confirms_no_lease(&response) {
+            if status_confirms_no_lease(record, &response) {
                 record.limiter_attempted = false;
                 return true;
             }

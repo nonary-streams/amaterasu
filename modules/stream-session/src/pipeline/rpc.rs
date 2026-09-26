@@ -145,7 +145,10 @@ impl Pending {
                     Progress::Waiting
                 }
                 Ok(Response::Error { .. }) => {
-                    self.admission_rejected = true;
+                    // An earlier lost admission may already have reached the
+                    // provider; only the first explicit rejection proves no
+                    // request was admitted.
+                    self.admission_rejected = self.attempts == 0;
                     Progress::Failed
                 }
                 _ => {
@@ -199,4 +202,34 @@ pub(super) fn complete(send: &mut Send<'_>, request: u64, payload: Value) -> boo
 
 pub(super) fn active(send: &mut Send<'_>, request: u64) -> bool {
     matches!(send(Command::CheckRequest { request }), Ok(Response::Ok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn later_admission_rejection_does_not_disprove_a_lost_first_send() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None);
+        let mut calls = 0;
+        let mut send = |_: Command| {
+            calls += 1;
+            if calls == 1 {
+                Err("lost admission".into())
+            } else {
+                Ok(Response::Error {
+                    code: "service_unavailable".into(),
+                    message: String::new(),
+                })
+            }
+        };
+        assert!(matches!(pending.poll(&mut send, 1), Progress::Waiting));
+        assert!(matches!(pending.poll(&mut send, 2), Progress::Failed));
+        assert!(!pending.admission_rejected());
+
+        let mut rejected = Pending::new("service", json!({}), "other".into(), None);
+        assert!(matches!(rejected.poll(&mut send, 1), Progress::Failed));
+        assert!(rejected.admission_rejected());
+    }
 }

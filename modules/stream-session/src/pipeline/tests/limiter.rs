@@ -201,3 +201,52 @@ fn provider_unavailable_is_nonfatal_and_does_not_claim_a_lease() {
         "stopped"
     );
 }
+
+#[test]
+fn malformed_status_does_not_clear_uncertain_apply_ownership() {
+    let mut host = Harness::new();
+    let (request, _) = limiter_prepare();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.fault = Some(("amaterasu.frame-limiter/1".into(), Fault::AfterMutation));
+    host.broker.limiter_malformed_status = true;
+    let started = host.response(2, start(id));
+    assert_eq!(started["state"], "active");
+    assert_eq!(started["frame_limiter_applied"], false);
+    let stopped = host.response(3, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "cleanup_failed");
+    assert!(host.broker.limiter_lease.is_some());
+}
+
+#[test]
+fn shutdown_does_not_dispatch_an_unsent_apply() {
+    let mut host = Harness::new();
+    let (request, _) = limiter_prepare();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.enqueue(2, "owner", start(id));
+    for _ in 0..100 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::ApplyLimiter
+                && job
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| !pending.was_sent())
+        }) {
+            break;
+        }
+    }
+    assert!(
+        host.pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step == Step::ApplyLimiter)
+    );
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(!host.broker.calls.iter().any(
+        |call| call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "apply"
+    ));
+    assert!(host.broker.limiter_lease.is_none());
+}

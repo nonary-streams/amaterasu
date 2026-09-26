@@ -15,7 +15,7 @@ impl Pipeline {
             Step::FindLimiter => {
                 super::limiter::accept_status(record, &payload);
                 if record.limiter_lease.is_none() {
-                    if super::limiter::status_confirms_no_lease(&payload) {
+                    if super::limiter::status_confirms_no_lease(record, &payload) {
                         record.limiter_attempted = false;
                     }
                     job.limiter_tried = true;
