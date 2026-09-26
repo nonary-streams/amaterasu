@@ -200,6 +200,19 @@ fn inactive_clone_cas_binds_route_and_retry_restores_from_persisted_baseline() {
         },
         true,
     );
+    let mut stale_revision = request.clone();
+    stale_revision["expected_topology_revision"] = "00000000000000000000000000000000".into();
+    let stale_result = state.run(&mut pipeline, "owner", stale_revision);
+    assert_eq!(stale_result["error"]["code"], "topology_changed");
+    let mut unrevisioned = request.clone();
+    unrevisioned
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_topology_revision");
+    let unrevisioned_result = state.run(&mut pipeline, "owner", unrevisioned);
+    assert_eq!(unrevisioned_result["error"]["code"], "invalid_request");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
     let applied = state.run(&mut pipeline, "owner", request.clone());
     assert_eq!(applied["applied"], true, "{applied}");
     assert_eq!(
