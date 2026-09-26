@@ -142,6 +142,59 @@ struct SnapshotWorker {
     processes: Vec<discovery::ProcessImage>,
 }
 
+type SunshineObservation = (Vec<discovery::ProcessImage>, bool, u64);
+
+struct PendingSunshineObservation {
+    desired: SunshineObservation,
+    acknowledgement: Receiver<()>,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct SunshineConnectionObservation {
+    confirmed: Option<SunshineObservation>,
+    pending: Option<PendingSunshineObservation>,
+}
+
+impl SunshineConnectionObservation {
+    fn confirmed_for(&self, desired: &SunshineObservation) -> bool {
+        self.confirmed.as_ref() == Some(desired)
+    }
+
+    fn advance(
+        &mut self,
+        desired: SunshineObservation,
+        submit: impl FnOnce(&SunshineObservation) -> Option<Receiver<()>>,
+    ) {
+        if let Some(pending) = self.pending.take()
+            && pending.desired == desired
+        {
+            match pending.acknowledgement.try_recv() {
+                Ok(()) => {
+                    self.confirmed = Some(desired);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < pending.deadline => {
+                    self.pending = Some(pending);
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        if self.confirmed_for(&desired) {
+            return;
+        }
+        self.confirmed = None;
+        if let Some(acknowledgement) = submit(&desired) {
+            self.pending = Some(PendingSunshineObservation {
+                desired,
+                acknowledgement,
+                deadline: Instant::now() + connector::OBSERVE_TIMEOUT,
+            });
+        }
+    }
+}
+
 impl SnapshotWorker {
     fn start(settings_epoch: u64, processes: Vec<discovery::ProcessImage>) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -187,7 +240,7 @@ struct PlayniteModule {
     catalog: catalog_sync::CatalogSync,
     snapshot_worker: SnapshotWorker,
     pending_unsolicited_snapshot: Option<connector::SnapshotEvent>,
-    sunshine_observed: Option<(Vec<discovery::ProcessImage>, bool, u64)>,
+    sunshine_observation: SunshineConnectionObservation,
     settings_epoch: u64,
     observed_settings_epoch: u64,
     observed_settings: Option<ProductSettings>,
@@ -215,7 +268,7 @@ impl ManagedModule for PlayniteModule {
             catalog: catalog_sync::CatalogSync::default(),
             snapshot_worker: SnapshotWorker::default(),
             pending_unsolicited_snapshot: None,
-            sunshine_observed: None,
+            sunshine_observation: SunshineConnectionObservation::default(),
             settings_epoch: 0,
             observed_settings_epoch: u64::MAX,
             observed_settings: None,
@@ -275,16 +328,14 @@ impl Drop for PlayniteModule {
 impl PlayniteModule {
     fn observe_sunshine_connection(&mut self) {
         let enabled = self.configuration.ready() && self.configuration.settings().enabled;
-        let observed = (
+        let desired = (
             self.last_discovery.processes.clone(),
             enabled,
             self.settings_epoch,
         );
-        if self.sunshine_observed.as_ref() == Some(&observed) {
-            return;
-        }
-        connector::observe_sunshine_processes(&observed.0, observed.1, observed.2);
-        self.sunshine_observed = Some(observed);
+        self.sunshine_observation.advance(desired, |desired| {
+            connector::observe_sunshine_processes(&desired.0, desired.1, desired.2)
+        });
     }
 
     fn observe_settings(&mut self) {
@@ -458,6 +509,11 @@ impl PlayniteModule {
             || !settings.auto_sync
             || self.snapshot_worker.busy()
             || self.catalog.busy()
+            || !self.sunshine_observation.confirmed_for(&(
+                self.last_discovery.processes.clone(),
+                true,
+                self.settings_epoch,
+            ))
         {
             return;
         }

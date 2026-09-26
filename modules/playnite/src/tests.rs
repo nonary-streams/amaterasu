@@ -237,6 +237,47 @@ fn disconnected_snapshot_worker_does_not_stick_in_busy_state() {
 }
 
 #[test]
+fn sunshine_observation_retries_reenable_and_ignores_old_process_acknowledgements() {
+    let old = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let restarted = process(73, old.path.as_str());
+    let disabled = (vec![old.clone()], false, 7);
+    let enabled = (vec![old.clone()], true, 8);
+    let after_restart = (vec![restarted], true, 8);
+    let mut observation = SunshineConnectionObservation::default();
+
+    let (disable_reply, disable_acknowledgement) = mpsc::channel();
+    observation.advance(disabled.clone(), |_| Some(disable_acknowledgement));
+    disable_reply.send(()).unwrap();
+    observation.advance(disabled.clone(), |_| {
+        panic!("disabled Observe was already sent")
+    });
+    assert_eq!(observation.confirmed, Some(disabled));
+
+    observation.advance(enabled.clone(), |_| None);
+    assert!(observation.confirmed.is_none());
+    assert!(observation.pending.is_none());
+    let (old_reply, old_acknowledgement) = mpsc::channel();
+    observation.advance(enabled.clone(), |_| Some(old_acknowledgement));
+    assert!(observation.confirmed.is_none());
+
+    observation.pending.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+    let (timed_out_reply, timed_out_acknowledgement) = mpsc::channel();
+    observation.advance(enabled.clone(), |_| Some(timed_out_acknowledgement));
+    old_reply.send(()).unwrap_err();
+    assert!(observation.confirmed.is_none());
+
+    let (restart_reply, restart_acknowledgement) = mpsc::channel();
+    observation.advance(after_restart.clone(), |_| Some(restart_acknowledgement));
+    timed_out_reply.send(()).unwrap_err();
+    assert!(observation.confirmed.is_none());
+    restart_reply.send(()).unwrap();
+    observation.advance(after_restart.clone(), |_| {
+        panic!("restart Observe was already sent")
+    });
+    assert_eq!(observation.confirmed, Some(after_restart));
+}
+
+#[test]
 fn process_restart_revokes_launch_eligibility_until_a_current_import_completes() {
     let old_process = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
     let new_process = process(73, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");

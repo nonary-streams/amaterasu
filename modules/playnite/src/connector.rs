@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const CONTROL_PIPE: &str = r"\\.\pipe\Sunshine.PlayniteExtension";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const OBSERVE_TIMEOUT: Duration = CONNECT_TIMEOUT;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -387,29 +388,28 @@ pub(crate) fn observe_sunshine_processes(
     processes: &[ProcessImage],
     enabled: bool,
     settings_epoch: u64,
-) {
+) -> Option<Receiver<()>> {
     #[cfg(windows)]
     {
-        let Some((commands, snapshots)) = sunshine_actor_channels() else {
-            return;
-        };
+        let (commands, _) = sunshine_actor_channels()?;
         let (reply, observed) = mpsc::channel();
-        if commands
+        commands
             .try_send(SunshineCommand::Observe {
                 processes: processes.to_vec(),
                 enabled,
                 settings_epoch,
                 reply,
             })
-            .is_ok()
-            && observed.recv_timeout(CONNECT_TIMEOUT).is_ok()
-            && let Ok(snapshots) = snapshots.lock()
-        {
-            while snapshots.try_recv().is_ok() {}
-        }
+            .ok()?;
+        Some(observed)
     }
     #[cfg(not(windows))]
-    let _ = (processes, enabled, settings_epoch);
+    {
+        let _ = (processes, enabled, settings_epoch);
+        let (reply, observed) = std::sync::mpsc::channel();
+        let _ = reply.send(());
+        Some(observed)
+    }
 }
 
 pub(crate) fn take_unsolicited_snapshot() -> Option<SnapshotEvent> {
