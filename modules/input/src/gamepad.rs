@@ -267,6 +267,7 @@ struct GamepadSlot<Device> {
     guide_until: Option<Instant>,
     suppress_back: bool,
     dirty: bool,
+    pending_removal: bool,
 }
 
 impl<Device: GamepadDevice> GamepadSlot<Device> {
@@ -279,6 +280,7 @@ impl<Device: GamepadDevice> GamepadSlot<Device> {
             guide_until: None,
             suppress_back: false,
             dirty: false,
+            pending_removal: false,
         }
     }
 
@@ -399,40 +401,66 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
             ));
         }
 
+        let mut first_error = None;
         for (slot, slot_device) in self.devices.iter_mut().enumerate() {
             if active_mask & (1 << slot) == 0
                 && let Some(device) = slot_device.as_mut()
             {
                 device.cancel_timeout();
-                device.device.release()?;
-                *slot_device = None;
+                device.pending_removal = true;
+                if let Err(error) = Self::release_slot(slot_device)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
         }
 
         let slot = usize::from(number);
         if active_mask & (1 << slot) == 0 {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
+        }
+        if self.devices[slot]
+            .as_ref()
+            .is_some_and(|device| device.pending_removal)
+        {
+            Self::release_slot(&mut self.devices[slot])?;
         }
         if self.devices[slot].is_none() {
             self.devices[slot] = Some(GamepadSlot::new(create(number as u8)?));
         }
-        self.devices[slot]
+        let update = self.devices[slot]
             .as_mut()
             .expect("active gamepad slot was created")
-            .update(state, back_button_timeout_ms, now)
+            .update(state, back_button_timeout_ms, now);
+        first_error.map_or(update, Err)
     }
 
     pub(crate) fn advance(&mut self, now: Instant) -> InputResult<()> {
         let mut first_error = None;
         for slot in &mut self.devices {
-            if let Some(slot) = slot.as_mut()
-                && let Err(error) = slot.advance(now)
+            let result = if slot.as_ref().is_some_and(|device| device.pending_removal) {
+                Self::release_slot(slot)
+            } else if let Some(device) = slot.as_mut() {
+                device.advance(now)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result
                 && first_error.is_none()
             {
                 first_error = Some(error);
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn release_slot(slot: &mut Option<GamepadSlot<Device>>) -> InputResult<()> {
+        if let Some(device) = slot.as_mut() {
+            device.device.release()?;
+            *slot = None;
+        }
+        Ok(())
     }
 
     pub(crate) fn disable_pending_back_timeouts(&mut self) {
@@ -1445,6 +1473,84 @@ mod tests {
         slots.stop().unwrap();
         assert!(slots.is_empty());
         assert_eq!(replacements.get(), 0);
+    }
+
+    #[test]
+    fn failed_slot_removal_retries_without_replaying_retired_state() {
+        struct Device {
+            number: u8,
+            trace: Rc<RefCell<Vec<(u8, &'static str)>>>,
+            remaining_release_failures: Rc<std::cell::Cell<u8>>,
+        }
+        impl GamepadDevice for Device {
+            fn update(&mut self, _: ControllerSnapshot) -> InputResult<()> {
+                self.trace.borrow_mut().push((self.number, "update"));
+                Ok(())
+            }
+
+            fn release(&mut self) -> InputResult<()> {
+                self.trace.borrow_mut().push((self.number, "release"));
+                if self.number == 0 && self.remaining_release_failures.get() > 0 {
+                    self.remaining_release_failures
+                        .set(self.remaining_release_failures.get() - 1);
+                    return Err(InputError::new("controller_unavailable", "detach failed"));
+                }
+                Ok(())
+            }
+        }
+
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let remaining_release_failures = Rc::new(std::cell::Cell::new(3));
+        let allocations = Rc::new(std::cell::Cell::new(0));
+        let mut slots = GamepadSlots::new();
+        let now = Instant::now();
+        let mut create = |number| {
+            allocations.set(allocations.get() + 1);
+            Ok(Device {
+                number,
+                trace: trace.clone(),
+                remaining_release_failures: remaining_release_failures.clone(),
+            })
+        };
+
+        slots
+            .apply(0, 1, ControllerSnapshot::default(), -1, now, &mut create)
+            .unwrap();
+        slots
+            .apply(1, 3, ControllerSnapshot::default(), -1, now, &mut create)
+            .unwrap();
+        assert_eq!(
+            slots
+                .apply(1, 2, ControllerSnapshot::default(), -1, now, &mut create)
+                .unwrap_err()
+                .code,
+            "controller_unavailable"
+        );
+        assert_eq!(
+            &*trace.borrow(),
+            &[(0, "update"), (1, "update"), (0, "release"), (1, "update")]
+        );
+
+        assert_eq!(
+            slots
+                .apply(0, 3, ControllerSnapshot::default(), -1, now, &mut create)
+                .unwrap_err()
+                .code,
+            "controller_unavailable"
+        );
+        assert_eq!(allocations.get(), 2);
+        assert_eq!(slots.stop().unwrap_err().code, "controller_unavailable");
+        assert!(!slots.is_empty());
+
+        slots.advance(now + Duration::from_millis(100)).unwrap();
+        assert_eq!(trace.borrow().last(), Some(&(0, "release")));
+        assert_eq!(allocations.get(), 2);
+        slots
+            .apply(0, 1, ControllerSnapshot::default(), -1, now, &mut create)
+            .unwrap();
+        assert_eq!(allocations.get(), 3);
+        slots.stop().unwrap();
+        assert!(slots.is_empty());
     }
 
     #[test]
