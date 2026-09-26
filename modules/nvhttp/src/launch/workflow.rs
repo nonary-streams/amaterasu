@@ -1677,7 +1677,7 @@ fn application_preflight_response(
         .get("executable_path")
         .is_some_and(|value| !value.is_null() && !value.is_string())
         || executable_path.as_deref().is_some_and(|path| {
-            path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+            path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
         })
     {
         return Err("invalid_application_preflight_response");

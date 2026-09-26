@@ -2976,6 +2976,24 @@ fn malformed_preflight_override_fails_before_application_launch() {
 }
 
 #[test]
+fn whitespace_executable_path_fails_preflight_before_launch_or_rtsp_open() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        application_executable_path: Some(" \t ".into()),
+        ..Broker::default()
+    };
+
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+
+    assert_ne!(reply.status, 200);
+    assert!(broker.actions().contains(&("amaterasu.launch/1", "preflight_export")));
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
 fn changed_application_policy_after_preflight_never_opens_rtsp() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
