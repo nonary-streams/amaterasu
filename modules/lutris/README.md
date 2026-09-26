@@ -154,8 +154,10 @@ artwork include an opaque Catalog Lutris reference; rows without artwork omit it
 Catalog acceptance requires the canonical decimal Lutris source ID artwork
 authorization contract. Client image delivery still needs the consuming integration.
 
-Other remaining gaps are trusted per-session discovery and launch for machine
-services, cross-user import, and launch admission for a
-retained row after its client disappears or Lutris is disabled.
+Launch rechecks authenticated Lutris `status` before admitting and spawning a
+retained catalog row. Disabled settings or an unavailable native/Flatpak source
+reject that launch; Flatpak availability verifies the current user's app install.
+Trusted per-session discovery and launch for machine services and cross-user
+import remain open.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.
