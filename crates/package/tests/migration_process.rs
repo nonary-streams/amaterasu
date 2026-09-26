@@ -217,6 +217,60 @@ fn failed_process_import_rolls_back_all_configured_files_and_retry_seeds_credent
         corrected_hash
     );
     assert!(runtime.join("installer-import-validated.json").is_file());
+
+    // The installer may restart after import succeeded but before predecessor
+    // handoff. Repeating the same snapshot must restore its approval without
+    // replacing the already seeded credential or published settings.
+    let published_configuration = runtime
+        .join("data/state/namespaces")
+        .join(
+            b"amaterasu.configuration"
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .join("state.json");
+    let configuration_bytes = fs::read(&published_configuration).unwrap();
+    let retry = import(&migration, &source, &destination, &runtime);
+    assert!(retry.status.success(), "{}", output_text(&retry));
+    assert_eq!(
+        fs::read(&published_configuration).unwrap(),
+        configuration_bytes
+    );
+    assert!(runtime.join("installer-import-validated.json").is_file());
+
+    // A predecessor changed after the approved copy is no longer that import.
+    // It must not regain permission to retire the predecessor on a retry.
+    fs::write(source.join("sunshine.conf"), "fps = 90\n").unwrap();
+    let changed = import(&migration, &source, &destination, &runtime);
+    assert!(!changed.status.success(), "changed source was accepted");
+    assert!(!runtime.join("installer-import-validated.json").exists());
+
+    fs::write(
+        source.join("sunshine.conf"),
+        "credentials_file = credentials/login.json\nfile_state = private/host.json\nvibeshine_file_state = private/auxiliary.json\nfps = 120\n",
+    )
+    .unwrap();
+    let edited_configuration = serde_json::json!({
+        "format_version": 1,
+        "revision": 2,
+        "values": {}
+    });
+    fs::write(
+        &published_configuration,
+        serde_json::to_vec(&edited_configuration).unwrap(),
+    )
+    .unwrap();
+    let edited_retry = import(&migration, &source, &destination, &runtime);
+    assert!(
+        !edited_retry.status.success(),
+        "edited runtime was accepted"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&published_configuration).unwrap()).unwrap(),
+        edited_configuration
+    );
+    assert!(!runtime.join("installer-import-validated.json").exists());
     fs::remove_dir_all(root).unwrap();
 }
 

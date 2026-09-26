@@ -144,3 +144,108 @@ fn catalog_failure_rolls_back_configuration_and_leaves_no_retry_marker() {
     assert!(!state.join(IMPORT_TRANSACTION_FILE).exists());
     materialize_import_plan(&runtime, &plan()).unwrap();
 }
+
+#[test]
+fn completed_import_retries_only_while_bootstrap_records_match() {
+    let fixture = TemporaryDirectory::new();
+    let runtime = runtime_root(&fixture);
+    let first = materialize_import_plan(&runtime, &plan()).unwrap();
+    assert_eq!(
+        materialize_import_plan(&runtime, &plan())
+            .unwrap()
+            .applications,
+        1
+    );
+
+    let configuration = namespace_path(&first.state_directory, CONFIGURATION_CALLER);
+    write_json_atomically(
+        &configuration,
+        &json!({"format_version":1,"revision":2,"values":{}}),
+    )
+    .unwrap();
+    assert!(materialize_import_plan(&runtime, &plan()).is_err());
+    let retained: Value = crate::read_json(&configuration).unwrap();
+    assert_eq!(retained["revision"], 2);
+}
+
+#[test]
+fn interrupted_import_preserves_user_edit_during_recovery() {
+    let fixture = TemporaryDirectory::new();
+    let runtime = runtime_root(&fixture);
+    let state = runtime_state_directory(&runtime).unwrap();
+    let configuration = namespace_path(&state, CONFIGURATION_CALLER);
+    create_private_directory(configuration.parent().unwrap()).unwrap();
+    write_json_atomically(
+        &configuration,
+        &json!({"format_version":1,"revision":2,"values":{}}),
+    )
+    .unwrap();
+    let journal = state.join(IMPORT_TRANSACTION_FILE);
+    write_json_atomically(
+        &journal,
+        &ImportTransaction {
+            schema: 1,
+            configuration_published: true,
+            catalog_published: false,
+        },
+    )
+    .unwrap();
+
+    let error = materialize_import_plan(&runtime, &plan()).unwrap_err();
+    assert!(error.contains("changed before recovery"));
+    let retained: Value = crate::read_json(&configuration).unwrap();
+    assert_eq!(retained["revision"], 2);
+    assert!(journal.exists());
+}
+
+#[test]
+fn interrupted_matching_import_recovers_and_retries() {
+    let fixture = TemporaryDirectory::new();
+    let runtime = runtime_root(&fixture);
+    let state = materialize_import_plan(&runtime, &plan())
+        .unwrap()
+        .state_directory;
+    let journal = state.join(IMPORT_TRANSACTION_FILE);
+    write_json_atomically(
+        &journal,
+        &ImportTransaction {
+            schema: 1,
+            configuration_published: true,
+            catalog_published: true,
+        },
+    )
+    .unwrap();
+
+    let receipt = materialize_import_plan(&runtime, &plan()).unwrap();
+    assert_eq!(receipt.applications, 1);
+    assert_eq!(receipt.settings, 5);
+    assert!(!journal.exists());
+}
+
+#[test]
+fn interrupted_catalog_recovery_preserves_changed_entries() {
+    let fixture = TemporaryDirectory::new();
+    let runtime = runtime_root(&fixture);
+    let state = materialize_import_plan(&runtime, &plan())
+        .unwrap()
+        .state_directory;
+    let catalog = collection_directory(&state, CATALOG_CALLER, CATALOG_COLLECTION);
+    let shard = catalog.join("shard-0000000000000001-00000000.json");
+    let edited = json!({"user-entry":{"name":"keep"}});
+    write_json_atomically(&shard, &edited).unwrap();
+    let journal = state.join(IMPORT_TRANSACTION_FILE);
+    write_json_atomically(
+        &journal,
+        &ImportTransaction {
+            schema: 1,
+            configuration_published: true,
+            catalog_published: true,
+        },
+    )
+    .unwrap();
+
+    let error = materialize_import_plan(&runtime, &plan()).unwrap_err();
+    assert!(error.contains("catalog changed before recovery"));
+    assert_eq!(crate::read_json::<Value>(&shard).unwrap(), edited);
+    assert!(journal.exists());
+}

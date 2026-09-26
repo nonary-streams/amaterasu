@@ -27,11 +27,12 @@ pub struct RuntimeImportReceipt {
 }
 
 /// Stores supported applications and settings from `plan` in a provisioned
-/// runtime root.
+/// runtime root. A completed import may be repeated only while its published
+/// bootstrap records still match the same plan exactly.
 ///
 /// The catalog and configuration records are installer-owned bootstrap records.
-/// This operation refuses to replace either one when it already exists, so it
-/// cannot overwrite a user's Amaterasu catalog or configuration. Catalog state
+/// This operation refuses to replace changed records, so it cannot overwrite
+/// a user's Amaterasu catalog or configuration. Catalog state
 /// is published through the same immutable-shard and atomic-manifest format
 /// used by the state module; configuration is the same caller-scoped document
 /// read by the configuration module.
@@ -57,7 +58,29 @@ fn materialize_import_plan_inner(
     let catalog_directory =
         collection_directory(&state_directory, CATALOG_CALLER, CATALOG_COLLECTION);
     let configuration_path = namespace_path(&state_directory, CONFIGURATION_CALLER);
-    recover_incomplete_import(&state_directory, &catalog_directory, &configuration_path)?;
+    recover_incomplete_import(
+        &state_directory,
+        &catalog_directory,
+        &configuration_path,
+        catalog.as_ref(),
+        configuration.as_ref(),
+    )?;
+    if existing_import_matches(
+        &catalog_directory,
+        &configuration_path,
+        catalog.as_ref(),
+        configuration.as_ref(),
+    )? {
+        return Ok(RuntimeImportReceipt {
+            state_directory,
+            applications: catalog
+                .as_ref()
+                .map_or(0, |document| document.entries.len()),
+            settings: configuration
+                .as_ref()
+                .map_or(0, |document| document.values.len()),
+        });
+    }
     preflight_empty_targets(
         &catalog_directory,
         &configuration_path,
@@ -126,6 +149,97 @@ fn materialize_import_plan_inner(
     })
 }
 
+/// Installer restart may repeat a completed import. Accept only the exact
+/// bootstrap records that this plan would have published; user edits and
+/// partially populated targets remain conflicts.
+fn existing_import_matches(
+    catalog_directory: &Path,
+    configuration_path: &Path,
+    catalog: Option<&CatalogDocument>,
+    configuration: Option<&ConfigurationDocument>,
+) -> PackageResult<bool> {
+    let expected_targets = catalog.is_some() || configuration.is_some();
+    if !expected_targets {
+        return Ok(false);
+    }
+    let configuration_matches = match configuration {
+        Some(document) => json_file_matches(configuration_path, &configuration_snapshot(document))?,
+        None => !configuration_path
+            .try_exists()
+            .map_err(|error| error.to_string())?,
+    };
+    let catalog_matches = match catalog {
+        Some(document) => {
+            let expected_names = ["manifest.json", "shard-0000000000000001-00000000.json"];
+            let exact_entries = match fs::read_dir(catalog_directory) {
+                Ok(entries) => {
+                    let names = entries
+                        .map(|entry| {
+                            entry
+                                .map(|entry| entry.file_name())
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<PackageResult<Vec<_>>>()?;
+                    names.len() == expected_names.len()
+                        && names
+                            .iter()
+                            .all(|name| expected_names.iter().any(|expected| name == expected))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
+            };
+            exact_entries
+                && json_file_matches(
+                    &catalog_directory.join("manifest.json"),
+                    &catalog_manifest_snapshot(document),
+                )?
+                && json_file_matches(
+                    &catalog_directory.join("shard-0000000000000001-00000000.json"),
+                    &json!(document.entries),
+                )?
+        }
+        None => !directory_has_entries(catalog_directory)?,
+    };
+    Ok(configuration_matches && catalog_matches)
+}
+
+fn configuration_snapshot(document: &ConfigurationDocument) -> Value {
+    let mut values = BTreeMap::new();
+    values.insert(CONFIGURATION_KEY, json!(document));
+    json!(Namespace {
+        format_version: 1,
+        revision: 1,
+        values,
+    })
+}
+
+fn catalog_manifest_snapshot(document: &CatalogDocument) -> Value {
+    let mut shards = BTreeMap::new();
+    shards.insert(
+        String::new(),
+        ShardReference {
+            revision: 1,
+            slot: 0,
+            count: document.entries.len(),
+        },
+    );
+    json!(CollectionManifest {
+        format_version: 1,
+        revision: 1,
+        metadata: json!({"revision": document.revision, "next_id": document.next_id}),
+        count: document.entries.len(),
+        shards,
+    })
+}
+
+fn json_file_matches(path: &Path, expected: &Value) -> PackageResult<bool> {
+    if !path.try_exists().map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
+    let actual: Value = read_json(path)?;
+    Ok(actual == *expected)
+}
+
 #[derive(Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportTransaction {
@@ -138,6 +252,8 @@ fn recover_incomplete_import(
     state_directory: &Path,
     catalog_directory: &Path,
     configuration_path: &Path,
+    catalog: Option<&CatalogDocument>,
+    configuration: Option<&ConfigurationDocument>,
 ) -> PackageResult<()> {
     let transaction_path = state_directory.join(IMPORT_TRANSACTION_FILE);
     if !transaction_path
@@ -149,6 +265,45 @@ fn recover_incomplete_import(
     let transaction: ImportTransaction = read_json(&transaction_path)?;
     if transaction.schema != 1 {
         return Err("legacy import transaction is invalid".into());
+    }
+    // The journal records intent before publication, but a crash can leave
+    // either target absent. Never delete a target whose content is no longer
+    // the exact bootstrap record for the plan being retried.
+    if transaction.configuration_published
+        && configuration_path
+            .try_exists()
+            .map_err(|error| error.to_string())?
+    {
+        let matches = match configuration {
+            Some(document) => {
+                json_file_matches(configuration_path, &configuration_snapshot(document))?
+            }
+            None => false,
+        };
+        if !matches {
+            return Err("interrupted import configuration changed before recovery".into());
+        }
+    }
+    if transaction.catalog_published && directory_has_entries(catalog_directory)? {
+        let Some(document) = catalog else {
+            return Err("interrupted import catalog changed before recovery".into());
+        };
+        let expected = ["manifest.json", "shard-0000000000000001-00000000.json"];
+        for entry in fs::read_dir(catalog_directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            if !expected.iter().any(|candidate| name == *candidate) {
+                return Err("interrupted import catalog changed before recovery".into());
+            }
+            let matches = if name == "manifest.json" {
+                json_file_matches(&entry.path(), &catalog_manifest_snapshot(document))?
+            } else {
+                json_file_matches(&entry.path(), &json!(document.entries))?
+            };
+            if !matches {
+                return Err("interrupted import catalog changed before recovery".into());
+            }
+        }
     }
     remove_import_transaction(
         &transaction_path,
