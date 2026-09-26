@@ -192,6 +192,20 @@ fn configured_windows_roots_override_install_defaults() {
 }
 
 #[test]
+fn linux_user_root_policy_rejects_machine_and_privileged_processes() {
+    let user_status = "Uid:\t1000\t1000\t1000\t1000\nCapEff:\t0000000000000000\n";
+    let root_status = "Uid:\t0\t0\t0\t0\nCapEff:\t0000000000000000\n";
+    let privileged_status = "Uid:\t1000\t1000\t1000\t1000\nCapEff:\t0000000000200000\n";
+
+    assert!(linux_status_allows_user_roots(user_status, false));
+    assert!(!linux_status_allows_user_roots(user_status, true));
+    assert!(!linux_status_allows_user_roots(root_status, false));
+    assert!(!linux_status_allows_user_roots(privileged_status, false));
+    assert!(!linux_status_allows_user_roots("Uid:\t1000\t1000\n", false));
+    assert!(!linux_status_allows_user_roots("CapEff:\t0\n", false));
+}
+
+#[test]
 fn linux_session_defaults_recover_and_explicit_roots_override_them() {
     let fixture = Libraries::new();
     let home = fixture.0.join("home");

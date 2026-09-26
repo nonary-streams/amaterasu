@@ -238,7 +238,8 @@ pub fn find_steam_executable(roots: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// An omitted root setting follows the current user's common Steam installs.
-/// Linux machine hosts never infer desktop-user paths from the host's HOME.
+/// Privileged Linux processes and explicitly marked machine hosts do not infer
+/// desktop-user paths from the host's HOME.
 pub fn default_library_roots() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -312,21 +313,26 @@ fn linux_user_session_allowed() -> bool {
     let machine_host = ["AMATERASU_MACHINE_HOST", "VIBESHINE_MACHINE_HOST"]
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    std::fs::read_to_string("/proc/self/status")
+        .is_ok_and(|status| linux_status_allows_user_roots(&status, machine_host))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_status_allows_user_roots(status: &str, machine_host: bool) -> bool {
     if machine_host {
         return false;
     }
-    let effective_uid = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("Uid:"))?
-                .split_whitespace()
-                .nth(1)?
-                .parse::<u32>()
-                .ok()
-        });
-    effective_uid.is_some_and(|uid| uid != 0)
+    let effective_uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().nth(1))
+        .and_then(|uid| uid.parse::<u32>().ok());
+    let effective_capabilities = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|capabilities| u64::from_str_radix(capabilities.trim(), 16).ok());
+    matches!((effective_uid, effective_capabilities), (Some(uid), Some(caps))
+        if uid != 0 && caps & (1_u64 << 21) == 0)
 }
 
 fn resolve_client_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {

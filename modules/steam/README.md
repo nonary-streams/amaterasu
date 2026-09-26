@@ -13,10 +13,13 @@ On Windows, an absent or empty roots setting discovers the current user's Steam
 installation from the registered Steam path, then Program Files and Local App
 Data defaults. Only existing roots with `steamapps` directories are scanned;
 each refresh rechecks these locations so an installation added later can be
-found. On Linux in a non-root user session, absent roots search the usual native,
-Flatpak, Snap, and `XDG_DATA_HOME/Steam` install locations. A machine host or
-root process does not infer desktop-user paths; it needs a session-owned
-discovery broker or explicit roots. Explicit roots override these defaults;
+found. On Linux, absent roots search the usual native, Flatpak, Snap, and
+`XDG_DATA_HOME/Steam` install locations only when the process has a non-root
+effective user ID and lacks effective `CAP_SYS_ADMIN`. A nonprivileged machine
+service must set `AMATERASU_MACHINE_HOST` (or legacy `VIBESHINE_MACHINE_HOST`)
+to suppress this fallback; the repository does not set either flag itself.
+Such a service needs a session-owned discovery broker or explicit roots.
+Explicit roots override these defaults;
 macOS still needs explicit roots. Up to 32 configured roots and 64 discovered
 libraries are supported. Paths must be native absolute paths. Root symlinks are
 canonicalized to support ordinary Linux Steam layouts; manifest symlinks are
