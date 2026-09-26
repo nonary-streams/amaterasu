@@ -287,15 +287,33 @@ fn install_existing_installer_root(
                 root,
                 package,
                 &current,
-                &upgraded,
+                Some(&upgraded),
                 &next_package.digest,
                 active,
                 &bootstrap_bytes,
                 &selection_bytes,
                 inject_failure_after_switch,
             )?;
-        } else if next_package.digest != active {
-            let _ = stage_package(package, root, &current, false)?;
+        } else if next_package.digest != active
+            && selection.pending.as_deref() != Some(next_package.digest.as_str())
+        {
+            transition_installer_policy(
+                root,
+                package,
+                &current,
+                None,
+                &next_package.digest,
+                active,
+                &bootstrap_bytes,
+                &selection_bytes,
+                inject_failure_after_switch,
+            )?;
+        } else if selection.pending.as_deref() == Some(next_package.digest.as_str()) {
+            verify_package(
+                &package_directory(root, &next_package.digest)?,
+                &current,
+                policy,
+            )?;
         }
         eprintln!("installer authorization policy: {authorization_result}");
         return Ok(());
@@ -305,7 +323,7 @@ fn install_existing_installer_root(
         root,
         package,
         &current,
-        &candidate,
+        Some(&candidate),
         &next_package.digest,
         active,
         &bootstrap_bytes,
@@ -400,7 +418,7 @@ fn transition_installer_policy(
     root: &Path,
     package: &Path,
     current: &BootstrapConfig,
-    replacement: &BootstrapConfig,
+    replacement: Option<&BootstrapConfig>,
     next_digest: &str,
     active: &str,
     bootstrap_bytes: &[u8],
@@ -415,8 +433,10 @@ fn transition_installer_policy(
             let _ = stage_package(package, root, current, false)?;
             transition.record_replacement(root, Path::new("selection.json"))?;
         }
-        write_json_atomically(&bootstrap_path, replacement)?;
-        transition.record_replacement(root, Path::new("bootstrap.json"))?;
+        if let Some(replacement) = replacement {
+            write_json_atomically(&bootstrap_path, replacement)?;
+            transition.record_replacement(root, Path::new("bootstrap.json"))?;
+        }
         if inject_failure_after_switch {
             return Err("injected installer policy switch failure".into());
         }
@@ -1093,6 +1113,64 @@ mod provision_tests {
             fs::read(runtime.join("bootstrap.json")).unwrap(),
             bootstrap_bytes
         );
+        assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_production_policy_stages_signed_update_with_installer_rollback() {
+        let root = fixture("production-custom-auth-rollback");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let signing_key = SigningKey::from_bytes(&[25; 32]);
+        let seed = prepare_seed(&root, &artifacts, &signing_key);
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut bootstrap: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap()["session_token_ttl_seconds"] = serde_json::json!(3600);
+        write_json_atomically(&runtime.join("bootstrap.json"), &bootstrap).unwrap();
+        let bootstrap_before = fs::read(runtime.join("bootstrap.json")).unwrap();
+        let selection_before = fs::read(runtime.join("selection.json")).unwrap();
+
+        let update_root = root.join("update");
+        let update_artifacts = update_root.join("artifacts");
+        write_artifacts(&update_artifacts);
+        fs::write(
+            update_artifacts.join(library_filename("amaterasu_runtime")),
+            b"updated-runtime-artifact",
+        )
+        .unwrap();
+        let update = prepare_seed(&update_root, &update_artifacts, &signing_key);
+        install_installer_root(
+            &update.join("bootstrap-template.json"),
+            &update.join("package"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_before
+        );
+        assert_ne!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            selection_before
+        );
+        assert_eq!(fs::read_dir(runtime.join("sets")).unwrap().count(), 2);
+        assert!(runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+
+        unprovision_if_created(&runtime).unwrap();
+        assert_eq!(
+            fs::read(runtime.join("bootstrap.json")).unwrap(),
+            bootstrap_before
+        );
+        assert_eq!(
+            fs::read(runtime.join("selection.json")).unwrap(),
+            selection_before
+        );
+        assert_eq!(fs::read_dir(runtime.join("sets")).unwrap().count(), 1);
         assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
         let _ = fs::remove_dir_all(root);
     }
