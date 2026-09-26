@@ -741,9 +741,10 @@ impl CatalogSync {
             let canceled_for_process_change = transaction.canceled_for_process_change;
             if let Call::Waiting { request } = transaction.call {
                 // An old provider call may sit in the broker until its full
-                // timeout. Revoke and release it so the new Playnite instance
-                // can reconcile immediately. Catalog generation/revision
-                // checks reject any old mutation already dispatched there.
+                // timeout. Cancel prevents queued delivery and releases its
+                // broker record so a current snapshot can be reconciled.
+                // A call already delivered to Catalog can still mutate there;
+                // the next sync must inventory and reconcile that state.
                 if !settle_canceled_request(runtime, request) {
                     transaction.call = Call::Waiting { request };
                     self.transaction = Some(transaction);
