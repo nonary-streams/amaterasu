@@ -2,9 +2,26 @@ use crate::model::{CaptureResult, Frame, Output};
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct TouchSurface {
+    pub width: u32,
+    pub height: u32,
+    pub logical_width: u32,
+    pub logical_height: u32,
+}
+
+impl TouchSurface {
+    pub fn valid(self) -> bool {
+        self.width != 0 && self.height != 0 && self.logical_width != 0 && self.logical_height != 0
+    }
+}
+
 pub trait CaptureSession: Send {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>>;
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {
+        Ok(None)
+    }
+    fn touch_surface(&mut self) -> CaptureResult<Option<TouchSurface>> {
         Ok(None)
     }
     fn device_adapter(&self) -> Value {

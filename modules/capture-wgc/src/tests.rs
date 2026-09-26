@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::{Backend, CaptureSession};
+use crate::backend::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureResult, Frame, Output};
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::*;
@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct FakeBackend {
     events: Arc<Mutex<VecDeque<CaptureResult<Option<Frame>>>>>,
     geometries: Arc<Mutex<VecDeque<CaptureResult<Option<CaptureGeometry>>>>>,
+    touch_surfaces: Arc<Mutex<VecDeque<CaptureResult<Option<TouchSurface>>>>>,
     drops: Arc<AtomicUsize>,
 }
 
 struct FakeSession {
     events: Arc<Mutex<VecDeque<CaptureResult<Option<Frame>>>>>,
     geometries: Arc<Mutex<VecDeque<CaptureResult<Option<CaptureGeometry>>>>>,
+    touch_surfaces: Arc<Mutex<VecDeque<CaptureResult<Option<TouchSurface>>>>>,
     drops: Arc<AtomicUsize>,
 }
 
@@ -33,6 +35,7 @@ impl Backend for FakeBackend {
         Ok(Box::new(FakeSession {
             events: self.events.clone(),
             geometries: self.geometries.clone(),
+            touch_surfaces: self.touch_surfaces.clone(),
             drops: self.drops.clone(),
         }))
     }
@@ -45,6 +48,14 @@ impl CaptureSession for FakeSession {
 
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {
         self.geometries
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(None))
+    }
+
+    fn touch_surface(&mut self) -> CaptureResult<Option<TouchSurface>> {
+        self.touch_surfaces
             .lock()
             .unwrap()
             .pop_front()
@@ -66,16 +77,97 @@ fn setup_with_geometry(
     enabled: bool,
     geometries: VecDeque<CaptureResult<Option<CaptureGeometry>>>,
 ) -> (Arc<Mutex<Controller<FakeBackend>>>, Arc<AtomicUsize>) {
+    setup_with_surfaces(enabled, geometries, VecDeque::new())
+}
+
+fn setup_with_surfaces(
+    enabled: bool,
+    geometries: VecDeque<CaptureResult<Option<CaptureGeometry>>>,
+    touch_surfaces: VecDeque<CaptureResult<Option<TouchSurface>>>,
+) -> (Arc<Mutex<Controller<FakeBackend>>>, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     let backend = FakeBackend {
         events: Arc::new(Mutex::new(VecDeque::new())),
         geometries: Arc::new(Mutex::new(geometries)),
+        touch_surfaces: Arc::new(Mutex::new(touch_surfaces)),
         drops: drops.clone(),
     };
     (
         Arc::new(Mutex::new(Controller::new(backend, enabled))),
         drops,
     )
+}
+
+#[test]
+fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
+    let valid = TouchSurface {
+        width: 1920,
+        height: 1080,
+        logical_width: 1920,
+        logical_height: 1080,
+    };
+    let cases = [
+        (Ok(Some(valid)), true, None),
+        (Ok(None), false, None),
+        (
+            Err(CaptureError::new(
+                "geometry_unavailable",
+                "topology unavailable",
+            )),
+            false,
+            None,
+        ),
+        (
+            Ok(Some(TouchSurface {
+                logical_width: 0,
+                ..valid
+            })),
+            false,
+            Some("geometry_unavailable"),
+        ),
+    ];
+    for (provider, present, error) in cases {
+        let (controller, _) =
+            setup_with_surfaces(true, VecDeque::new(), VecDeque::from([provider]));
+        let mut controller = controller.lock().unwrap();
+        let request = || Operation::Open {
+            output: "fake".into(),
+            operation_id: Some("touch".into()),
+            constant_rate: false,
+        };
+        let reply = controller.handle("owner", request(), &mut || Ok(()));
+        if let Some(error) = error {
+            assert_eq!(reply["error"]["code"], error);
+            assert_eq!(
+                controller.handle("owner", Operation::Status, &mut || Ok(()))["streams"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            continue;
+        }
+        assert_eq!(reply["touch_surface"].is_object(), present);
+        if present {
+            assert_eq!(reply["touch_surface"]["logical_width"], 1920);
+        }
+        assert_eq!(controller.handle("owner", request(), &mut || Ok(())), reply);
+        assert_eq!(
+            controller.handle(
+                "owner",
+                Operation::Lookup {
+                    operation_id: "touch".into()
+                },
+                &mut || Ok(())
+            ),
+            reply
+        );
+        let status = controller.handle("owner", Operation::Status, &mut || Ok(()));
+        assert_eq!(
+            status["streams"][0]["touch_surface"],
+            reply["touch_surface"]
+        );
+    }
 }
 
 fn open(controller: &mut Controller<FakeBackend>, owner: &str) -> u64 {
@@ -425,6 +517,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
         FakeBackend {
             events,
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: drops.clone(),
         },
         true,
@@ -682,6 +775,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
         FakeBackend {
             events,
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: drops.clone(),
         },
         true,
@@ -722,6 +816,7 @@ fn rejected_native_delivery_clears_the_constant_rate_cache() {
         FakeBackend {
             events,
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: Arc::new(AtomicUsize::new(0)),
         },
         true,
@@ -748,6 +843,7 @@ fn constant_rate_repeats_owned_pixels_with_monotonic_metadata_and_stops_after_er
     let backend = FakeBackend {
         events: Arc::new(Mutex::new(events)),
         geometries: Arc::new(Mutex::new(VecDeque::new())),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
         drops,
     };
     let mut controller = Controller::new(backend, true);
@@ -826,6 +922,7 @@ fn v1_3_capture_callback_preserves_acquisition_time_across_timestamp_rewrite_and
         FakeBackend {
             events: Arc::new(Mutex::new(events)),
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: Arc::new(AtomicUsize::new(0)),
         },
         true,
@@ -869,6 +966,7 @@ fn v1_2_prefix_callback_remains_usable_from_the_v1_3_table() {
         FakeBackend {
             events: Arc::new(Mutex::new(events)),
             geometries: Arc::new(Mutex::new(VecDeque::new())),
+            touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
             drops: Arc::new(AtomicUsize::new(0)),
         },
         true,
@@ -889,6 +987,7 @@ fn default_wgc_mode_does_not_repeat_the_last_frame() {
     let backend = FakeBackend {
         events: Arc::new(Mutex::new(events)),
         geometries: Arc::new(Mutex::new(VecDeque::new())),
+        touch_surfaces: Arc::new(Mutex::new(VecDeque::new())),
         drops: Arc::new(AtomicUsize::new(0)),
     };
     let mut controller = Controller::new(backend, true);

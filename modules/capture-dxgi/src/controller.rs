@@ -1,4 +1,4 @@
-use crate::backend::{Backend, CaptureSession};
+use crate::backend::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureError, CaptureResult, Frame, MAX_STREAMS, MAX_WAIT_MS, Operation};
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ struct Stream {
     output: String,
     session: Box<dyn CaptureSession>,
     geometry: Option<CaptureGeometry>,
+    touch_surface: Option<TouchSurface>,
     operation_id: Option<String>,
 }
 
@@ -80,7 +81,12 @@ impl<B: Backend> Controller<B> {
                         "operation ID already selected a different output",
                     ));
                 }
-                return Ok(open_reply(stream_id, &existing.output, existing.geometry));
+                return Ok(open_reply(
+                    stream_id,
+                    &existing.output,
+                    existing.geometry,
+                    existing.touch_surface,
+                ));
             }
         }
         if self.streams.len() >= MAX_STREAMS {
@@ -93,6 +99,7 @@ impl<B: Backend> Controller<B> {
         guard()?;
         let mut session = self.backend.open(output)?;
         let geometry = initial_geometry(&mut *session)?;
+        let touch_surface = initial_touch_surface(&mut *session)?;
         // Opening may block in a driver. Recheck before retaining resources.
         guard()?;
         self.streams.insert(
@@ -102,11 +109,12 @@ impl<B: Backend> Controller<B> {
                 output: output.into(),
                 session,
                 geometry,
+                touch_surface,
                 operation_id,
             },
         );
         self.opened_stream = Some(id);
-        Ok(open_reply(id, output, geometry))
+        Ok(open_reply(id, output, geometry, touch_surface))
     }
 
     fn status(&self, caller: &str) -> Value {
@@ -115,7 +123,8 @@ impl<B: Backend> Controller<B> {
             .iter()
             .filter(|(_, stream)| stream.owner == caller)
             .map(|(id, stream)| {
-                let mut reply = stream_reply(*id, &stream.output, stream.geometry);
+                let mut reply =
+                    stream_reply(*id, &stream.output, stream.geometry, stream.touch_surface);
                 reply["device_adapter"] = stream.session.device_adapter();
                 reply
             })
@@ -154,7 +163,9 @@ impl<B: Backend> Controller<B> {
     fn lookup(&self, caller: &str, operation_id: &str) -> CaptureResult<Value> {
         validate_operation_id(operation_id)?;
         self.find_operation(caller, operation_id)
-            .map(|(id, stream)| open_reply(id, &stream.output, stream.geometry))
+            .map(|(id, stream)| {
+                open_reply(id, &stream.output, stream.geometry, stream.touch_surface)
+            })
             .ok_or_else(|| {
                 CaptureError::new("not_found", "no capture stream owned by this operation")
             })
@@ -232,6 +243,18 @@ fn initial_geometry(session: &mut dyn CaptureSession) -> CaptureResult<Option<Ca
     }
 }
 
+fn initial_touch_surface(session: &mut dyn CaptureSession) -> CaptureResult<Option<TouchSurface>> {
+    match session.touch_surface() {
+        Err(error) if error.code == "geometry_unavailable" => Ok(None),
+        Err(error) => Err(error),
+        Ok(Some(surface)) if !surface.valid() => Err(CaptureError::new(
+            "geometry_unavailable",
+            "capture backend returned invalid touch surface",
+        )),
+        Ok(surface) => Ok(surface),
+    }
+}
+
 fn validate_operation_id(operation_id: &str) -> CaptureResult<()> {
     if operation_id.is_empty() || operation_id.len() > 128 {
         return Err(CaptureError::new(
@@ -255,16 +278,29 @@ fn enumeration_reply(outputs: Vec<crate::model::Output>) -> CaptureResult<Value>
     Ok(reply)
 }
 
-fn open_reply(stream_id: u64, output: &str, geometry: Option<CaptureGeometry>) -> Value {
-    let mut reply = stream_reply(stream_id, output, geometry);
+fn open_reply(
+    stream_id: u64,
+    output: &str,
+    geometry: Option<CaptureGeometry>,
+    touch_surface: Option<TouchSurface>,
+) -> Value {
+    let mut reply = stream_reply(stream_id, output, geometry, touch_surface);
     reply["ok"] = json!(true);
     reply
 }
 
-fn stream_reply(stream_id: u64, output: &str, geometry: Option<CaptureGeometry>) -> Value {
+fn stream_reply(
+    stream_id: u64,
+    output: &str,
+    geometry: Option<CaptureGeometry>,
+    touch_surface: Option<TouchSurface>,
+) -> Value {
     let mut reply = json!({ "stream": stream_id, "output": output });
     if let Some(geometry) = geometry {
         reply["desktop_geometry"] = json!(geometry);
+    }
+    if let Some(touch_surface) = touch_surface {
+        reply["touch_surface"] = json!(touch_surface);
     }
     reply
 }

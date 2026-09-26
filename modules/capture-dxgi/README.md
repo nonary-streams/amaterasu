@@ -17,7 +17,11 @@ Native modules are trusted code; these grants are not a native-code sandbox.
 - `{"action":"open","output":"<enumerated id>"}` returns
   `{"ok":true,"stream":123,"output":"..."}` plus `desktop_geometry` when
   Windows can prove the selected monitor's physical rectangle and the complete
-  virtual desktop. IDs are opaque JSON unsigned 64-bit integers; clients must
+  virtual desktop. A separate `touch_surface` object contains positive
+  `width`, `height`, `logical_width`, and `logical_height` when DXGI, GDI, and
+  CCD verify the same physical output. Its logical dimensions are physical
+  Windows pointer units; no stream letterboxing is claimed. The field is
+  omitted if that mapping cannot be verified. IDs are opaque JSON unsigned 64-bit integers; clients must
   preserve integer precision.
 - Open accepts optional `operation_id` (1..128 UTF-8 bytes). Repeating the same
   caller/output/operation ID returns the existing live stream; changing output

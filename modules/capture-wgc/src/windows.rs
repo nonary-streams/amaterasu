@@ -1,4 +1,4 @@
-use super::{Backend, CaptureSession};
+use super::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout};
 use crate::worker::{FrameSource, Worker};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
@@ -113,6 +113,23 @@ impl CaptureSession for WindowsSession {
             .map(|(selection, _)| Some(selection.geometry))
     }
 
+    fn touch_surface(&mut self) -> CaptureResult<Option<TouchSurface>> {
+        let Some(target_id) = &self.target_id else {
+            return Ok(None);
+        };
+        let (_, monitor) = resolve_monitor(&self.output_id, Some(target_id))?;
+        let width = monitor.metadata.width;
+        let height = monitor.metadata.height;
+        // The verified GDI/DXGI/CCD topology uses physical desktop pixels,
+        // matching Windows absolute pointer coordinates for this monitor.
+        Ok(Some(TouchSurface {
+            width,
+            height,
+            logical_width: width,
+            logical_height: height,
+        }))
+    }
+
     fn device_adapter(&self) -> Value {
         self.device_adapter.clone()
     }
@@ -149,6 +166,14 @@ impl Session {
             unsafe { interop.CreateForMonitor(monitor.handle) }.map_err(native_error)?;
         let size = item.Size().map_err(native_error)?;
         validate_size(size)?;
+        if u32::try_from(size.Width).ok() != Some(monitor.metadata.width)
+            || u32::try_from(size.Height).ok() != Some(monitor.metadata.height)
+        {
+            return Err(CaptureError::new(
+                "access_lost",
+                "WGC capture size differs from the selected physical monitor",
+            ));
+        }
         let (readback, graphics_device) = Readback::new()?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &graphics_device,

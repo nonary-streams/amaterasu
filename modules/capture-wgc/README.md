@@ -25,7 +25,11 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
 - `{"action":"open","output":"<enumerated id>"}` returns
   `{"ok":true,"stream":123,"output":"..."}` plus `desktop_geometry` when
   Windows can prove the selected monitor's physical rectangle and the complete
-  virtual desktop. The opaque unsigned 64-bit stream ID must retain integer
+  virtual desktop. A separate `touch_surface` object contains positive
+  `width`, `height`, `logical_width`, and `logical_height` when the physical
+  output topology is verified and the WGC item has that size. Its logical
+  dimensions are physical Windows pointer units; no stream letterboxing is
+  claimed. The field is omitted when the mapping cannot be verified. The opaque unsigned 64-bit stream ID must retain integer
   precision in clients.
 - Open also accepts optional `constant_rate`; when `true`, it enables cached
   image repeats as described below. Omission and `false` retain event-driven

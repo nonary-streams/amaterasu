@@ -1,4 +1,4 @@
-use super::{Backend, CaptureSession};
+use super::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureError, CaptureResult, Frame, Output, copy_bgra_rows, frame_layout};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_windows_capture_geometry::{
@@ -371,6 +371,34 @@ impl CaptureSession for Session {
         };
         resolve_output(&self.output_id, Some(target_id))
             .map(|(selection, _)| Some(selection.geometry))
+    }
+
+    fn touch_surface(&mut self) -> CaptureResult<Option<TouchSurface>> {
+        let Some(target_id) = &self.target_id else {
+            return Ok(None);
+        };
+        let (_, output) = resolve_output(&self.output_id, Some(target_id))?;
+        if output.metadata.rotation != DXGI_MODE_ROTATION_IDENTITY.0 as u32 {
+            return Ok(None);
+        }
+        if output.metadata.width != self.adapter.width
+            || output.metadata.height != self.adapter.height
+        {
+            return Err(CaptureError::new(
+                "access_lost",
+                "capture output dimensions changed; enumerate and reopen",
+            ));
+        }
+        // The verified topology runs in physical per-monitor DPI coordinates.
+        // Windows absolute pointer input uses those same physical desktop units.
+        let width = output.metadata.width;
+        let height = output.metadata.height;
+        Ok(Some(TouchSurface {
+            width,
+            height,
+            logical_width: width,
+            logical_height: height,
+        }))
     }
 
     fn device_adapter(&self) -> Value {
