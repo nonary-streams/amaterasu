@@ -95,6 +95,11 @@ fn launch_request_waits_for_authenticated_inventory_result_and_release() {
     });
     module.tick().unwrap();
     module.tick().unwrap();
+    assert_eq!(
+        module.discovery_call_count.get(),
+        1,
+        "throttled tick must not enumerate processes again"
+    );
     assert!(module.catalog.epoch_ready());
     let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
     module.eligible_launch_ids.insert(game_id.into());

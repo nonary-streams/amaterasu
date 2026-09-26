@@ -259,6 +259,8 @@ struct PlayniteModule {
     last_epoch_ready: bool,
     #[cfg(test)]
     discovery_override: Option<discovery::Discovery>,
+    #[cfg(test)]
+    discovery_call_count: std::cell::Cell<usize>,
 }
 
 struct PendingLaunch {
@@ -324,6 +326,8 @@ impl ManagedModule for PlayniteModule {
             last_epoch_ready: false,
             #[cfg(test)]
             discovery_override: None,
+            #[cfg(test)]
+            discovery_call_count: std::cell::Cell::new(0),
         })
     }
 
@@ -386,6 +390,9 @@ impl Drop for PlayniteModule {
 impl PlayniteModule {
     fn discover_processes(&self) -> discovery::Discovery {
         #[cfg(test)]
+        self.discovery_call_count
+            .set(self.discovery_call_count.get() + 1);
+        #[cfg(test)]
         if let Some(discovery) = &self.discovery_override {
             return discovery.clone();
         }
@@ -437,12 +444,16 @@ impl PlayniteModule {
     }
 
     fn refresh_discovery(&mut self) {
+        let now = Instant::now();
+        if now < self.next_discovery {
+            return;
+        }
         let previous_processes = self.last_discovery.processes.clone();
         let discovered = self.discover_processes();
         refresh_discovery_at(
             &mut self.last_discovery,
             &mut self.next_discovery,
-            Instant::now(),
+            now,
             false,
             || discovered,
         );
