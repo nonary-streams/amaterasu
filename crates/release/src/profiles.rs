@@ -832,13 +832,13 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.console", "amaterasu.management"],
-                "authorization_policy_generation": 1,
+                "authorization_policy_generation": 2,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
-                    "application.terminate", "steam.read", "steam.refresh", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
+                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
                 ]
             }),
         ),
@@ -908,13 +908,13 @@ pub fn installer_policy(
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.management"],
-                "authorization_policy_generation": 2,
+                "authorization_policy_generation": 3,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
-                    "application.terminate", "steam.read", "steam.refresh", "diagnostics.read",
+                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read",
                     "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
                 ],
             }),

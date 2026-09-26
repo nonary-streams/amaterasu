@@ -470,6 +470,20 @@ fn catalog_profiles_scope_lutris_steam_id_export_authorization() {
             catalog["export_principals"],
             json!({"amaterasu.nvhttp": "amaterasu.management"})
         );
+        assert!(
+            policy.settings[AUTHENTICATION.id]["allowed_scopes"]
+                .as_array()
+                .is_some_and(|scopes| scopes.contains(&json!("lutris.read")))
+        );
+        for (principal, grants) in &policy.principals {
+            if principal != "amaterasu.console" {
+                assert_eq!(
+                    grants.call.contains("amaterasu.lutris/1"),
+                    principal == MANAGEMENT.id,
+                    "unexpected Lutris call grant for {principal}"
+                );
+            }
+        }
     }
 }
 
@@ -536,13 +550,13 @@ fn authorization_policy_generations_are_distinct_nonzero_and_survive_reload() {
         installer.settings["amaterasu.authentication"]["authorization_policy_generation"]
             .as_u64()
             .unwrap();
-    assert_eq!(development_generation, 1);
-    assert_eq!(installer_generation, 2);
+    assert_eq!(development_generation, 2);
+    assert_eq!(installer_generation, 3);
     assert_ne!(development_generation, 0);
     assert_ne!(installer_generation, 0);
     assert_ne!(development_generation, installer_generation);
 
-    for (policy, expected_generation) in [(development, 1), (installer, 2)] {
+    for (policy, expected_generation) in [(development, 2), (installer, 3)] {
         let serialized = serde_json::to_value(&policy).unwrap();
         assert_eq!(
             serialized["settings"]["amaterasu.authentication"]["authorization_policy_generation"],
