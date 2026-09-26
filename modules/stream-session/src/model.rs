@@ -148,6 +148,7 @@ struct DisplayRefresh {
 #[serde(deny_unknown_fields)]
 struct DisplayModePolicy {
     display_id: String,
+    configuration_option: Option<String>,
     #[serde(rename = "remapping")]
     _remapping: DisplayRemapping,
     #[serde(rename = "context")]
@@ -261,6 +262,19 @@ impl DisplayRequest {
                 || targets
                     .iter()
                     .any(|id| id.eq_ignore_ascii_case(&policy.display_id))
+                || policy
+                    .configuration_option
+                    .as_deref()
+                    .is_some_and(|option| {
+                        !matches!(
+                            option,
+                            "disabled"
+                                | "verify_only"
+                                | "ensure_active"
+                                | "ensure_primary"
+                                | "ensure_only_display"
+                        )
+                    })
                 || policy
                     .resolution_option
                     .as_deref()

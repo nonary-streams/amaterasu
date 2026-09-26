@@ -12,6 +12,81 @@ fn display_request() -> Value {
 }
 
 #[test]
+fn selected_display_configuration_options_reach_apply_and_cleanup() {
+    let mut two_monitor = display_request();
+    two_monitor["mode_policies"][0]["configuration_option"] = json!("ensure_only_display");
+    two_monitor["mode_policies"][1]["configuration_option"] = json!("disabled");
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = two_monitor.clone();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["display_state"], "applied");
+    let applied = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply")
+        .unwrap();
+    assert_eq!(
+        applied.payload["mode_policies"],
+        two_monitor["mode_policies"]
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(host.broker.display_lease.is_none());
+
+    for option in ["ensure_active", "ensure_primary"] {
+        let mut sole_target = display_request();
+        sole_target["configuration"]["displays"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        sole_target.as_object_mut().unwrap().remove("mode_policies");
+        sole_target["mode_policy"] = json!({"display_id":"first",
+            "configuration_option":option,"remapping":{},"context":{
+                "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
+                "client_display_mode_override":false,"optimize_game_settings":false}});
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["display_request"] = sole_target.clone();
+        let id = host.response(1, request)["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["display_state"], "applied");
+        let applied = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply")
+            .unwrap();
+        assert_eq!(applied.payload["mode_policy"], sole_target["mode_policy"]);
+        assert!(applied.payload.get("mode_policies").is_none());
+        assert_eq!(
+            host.response(3, json!({"action":"stop","session":id}))["state"],
+            "stopped"
+        );
+    }
+}
+
+#[test]
+fn unknown_display_configuration_option_fails_before_provider_call() {
+    for option in ["ensure_only", "ENSURE_ACTIVE", ""] {
+        let mut request = prepare();
+        request["display_request"] = display_request();
+        request["display_request"]["mode_policies"][0]["configuration_option"] = json!(option);
+        let mut host = Harness::new();
+        assert_eq!(host.response(1, request)["code"], "invalid_display_request");
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == "amaterasu.display/1")
+        );
+    }
+}
+
+#[test]
 fn full_frozen_topology_applies_once_and_restores_on_stop() {
     let mut host = Harness::new();
     let mut request = prepare();
