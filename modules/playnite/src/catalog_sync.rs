@@ -1929,6 +1929,7 @@ mod tests {
             plugins: vec![],
         };
         let mut sync = CatalogSync::default();
+        sync.epoch_barrier.epoch = Some(0);
         sync.start(&snapshot(old_id), &settings, 7, 0).unwrap();
         sync.transaction.as_mut().unwrap().call = Call::Waiting { request: 42 };
         sync.cancel_after_process_change();
