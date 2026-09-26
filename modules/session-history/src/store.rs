@@ -6,7 +6,7 @@ use crate::model::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 2;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -16,6 +16,11 @@ const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 const MAX_DETAIL_RESPONSE_BYTES: usize = 16_384;
 const ACTIVITY_RESERVATION_SECONDS: i64 = 300;
 const MAX_ACTIVITY_IDS: usize = 4096;
+
+struct PendingActivity {
+    expires_at_unix: i64,
+    reserved_at: Instant,
+}
 
 #[derive(Debug)]
 pub enum HistoryError {
@@ -57,7 +62,7 @@ pub struct HistoryStore {
     configuration_ready: bool,
     effective_enabled: bool,
     active_streams: BTreeSet<String>,
-    pending_activities: BTreeMap<String, i64>,
+    pending_activities: BTreeMap<String, PendingActivity>,
     terminal_activities: BTreeSet<String>,
     terminal_order: VecDeque<String>,
     failed_operations: u64,
@@ -229,7 +234,10 @@ impl HistoryStore {
         }
         self.pending_activities.insert(
             session_id.to_owned(),
-            now_unix.saturating_add(ACTIVITY_RESERVATION_SECONDS),
+            PendingActivity {
+                expires_at_unix: now_unix.saturating_add(ACTIVITY_RESERVATION_SECONDS),
+                reserved_at: Instant::now(),
+            },
         );
         Ok(true)
     }
@@ -666,10 +674,15 @@ impl HistoryStore {
     }
 
     fn expire_stream_activities(&mut self, now_unix: i64) {
+        let now_monotonic = Instant::now();
         let expired: Vec<_> = self
             .pending_activities
             .iter()
-            .filter(|(_, deadline)| now_unix >= **deadline)
+            .filter(|(_, activity)| {
+                now_unix >= activity.expires_at_unix
+                    || now_monotonic.saturating_duration_since(activity.reserved_at)
+                        >= Duration::from_secs(ACTIVITY_RESERVATION_SECONDS as u64)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for session_id in expired {
@@ -1286,6 +1299,40 @@ mod tests {
         assert!(!store.begin_session_at(&metadata("new"), 403, 403).unwrap());
         assert!(!store.end_session("new", 404, 404).unwrap());
         assert_eq!(store.status().unwrap().sessions, 0);
+    }
+
+    #[test]
+    fn clock_rollback_cannot_extend_pending_toggle_deferral() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 1000).unwrap();
+        configure(&mut store, HistorySettings::default(), 1000);
+        assert!(store.begin_stream_activity("pending", 1000).unwrap());
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            1001,
+        );
+
+        // A wall-clock rollback alone must not expire a fresh reservation.
+        store.prune_if_due(-2600);
+        assert!(store.settings().1);
+        assert_eq!(store.status().unwrap().pending_activities, 1);
+
+        // Model five real minutes passing while Unix time remains rolled back.
+        store
+            .pending_activities
+            .get_mut("pending")
+            .unwrap()
+            .reserved_at = Instant::now()
+            .checked_sub(Duration::from_secs(ACTIVITY_RESERVATION_SECONDS as u64 + 1))
+            .unwrap();
+        store.prune_if_due(-2599);
+        assert!(!store.settings().1);
+        assert_eq!(store.status().unwrap().pending_activities, 0);
+        assert!(store.begin_stream_activity("pending", -2598).is_err());
     }
 
     #[test]
