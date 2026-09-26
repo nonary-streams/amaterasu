@@ -278,6 +278,8 @@ impl PlayniteModule {
         // focus or Fullscreen entry behavior changed while it was in flight.
         self.snapshot_worker
             .retain_for_settings_epoch(self.settings_epoch, same_catalog_policy);
+        self.catalog
+            .retain_for_settings_epoch(self.settings_epoch, same_catalog_policy);
         self.observed_settings = Some(settings.clone());
         self.fullscreen_entry_sync
             .set_desired(cfg!(windows) && settings.enabled && settings.fullscreen_entry_enabled);

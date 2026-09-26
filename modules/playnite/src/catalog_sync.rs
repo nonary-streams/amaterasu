@@ -691,6 +691,15 @@ impl CatalogSync {
         self.transaction.is_some()
     }
 
+    pub fn retain_for_settings_epoch(&mut self, settings_epoch: u64, same_catalog_policy: bool) {
+        if same_catalog_policy
+            && let Some(transaction) = self.transaction.as_mut()
+            && !transaction.canceled_for_process_change
+        {
+            transaction.settings_epoch = settings_epoch;
+        }
+    }
+
     pub fn cancel_after_process_change(&mut self) {
         self.completed_launchable_game_ids = None;
         let Some(mut transaction) = self.transaction.take() else {
@@ -917,6 +926,43 @@ fn new_sync_id(source_revision: u64) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::{Category, Plugin};
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
+    };
+    use std::ffi::c_void;
+
+    #[derive(Default)]
+    struct FakeCatalogHost {
+        commands: Vec<Command>,
+    }
+
+    unsafe extern "C" fn invoke_fake_catalog_host(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: the test keeps the boxed host alive through every synchronous
+        // runtime call, and the ABI buffers are borrowed only for this call.
+        let Ok(input) = (unsafe { input.read() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command) = serde_json::from_slice::<Command>(input) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let response = match command {
+            Command::Request { .. } => Response::Accepted { id: 42 },
+            Command::TakeResult { .. } => Response::Pending,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        // SAFETY: context points to the live test host for this callback.
+        unsafe { &mut *(context as *mut FakeCatalogHost) }
+            .commands
+            .push(command);
+        let output = serde_json::to_vec(&response).unwrap();
+        // SAFETY: the output vector remains alive until the callback copies it.
+        unsafe { reply.send(&output) };
+        STATUS_OK
+    }
 
     fn game(id: &str, name: &str, exe: &str) -> Game {
         Game {
@@ -1082,6 +1128,62 @@ mod tests {
         assert!(matches!(
             sync.transaction.as_ref().unwrap().call,
             Call::Waiting { request: 42 }
+        ));
+        assert!(sync.take_completed_launchable_game_ids().is_none());
+    }
+
+    #[test]
+    fn operational_settings_change_keeps_in_flight_import_but_process_change_cancels_it() {
+        let snapshot = Snapshot {
+            games: vec![game(
+                "a1b2c3d4-1234-5678-9abc-0123456789ab",
+                "Game",
+                r"C:\Games\game.exe",
+            )],
+            categories: vec![],
+            plugins: vec![],
+        };
+        let settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            ..ProductSettings::default()
+        };
+        let mut sync = CatalogSync::default();
+        sync.start(&snapshot, &settings, 7, 0).unwrap();
+        sync.retain_for_settings_epoch(8, true);
+
+        let mut host = Box::new(FakeCatalogHost::default());
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut *host as *mut FakeCatalogHost).cast(),
+            invoke: invoke_fake_catalog_host,
+        };
+        // SAFETY: host remains boxed and alive through every runtime call.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        sync.advance(&runtime, 8).unwrap();
+        assert!(matches!(
+            host.commands.as_slice(),
+            [Command::Request { .. }]
+        ));
+        assert!(matches!(
+            sync.transaction.as_ref().unwrap().call,
+            Call::Waiting { request: 42 }
+        ));
+        assert_eq!(sync.transaction.as_ref().unwrap().settings_epoch, 8);
+
+        sync.cancel_after_process_change();
+        sync.retain_for_settings_epoch(9, true);
+        assert_eq!(sync.transaction.as_ref().unwrap().settings_epoch, 8);
+        assert!(
+            sync.transaction
+                .as_ref()
+                .unwrap()
+                .canceled_for_process_change
+        );
+        sync.advance(&runtime, 9).unwrap();
+        assert!(matches!(
+            host.commands.last(),
+            Some(Command::TakeResult { request: 42 })
         ));
         assert!(sync.take_completed_launchable_game_ids().is_none());
     }

@@ -72,7 +72,9 @@ already accepted by the catalog is drained before the next snapshot starts.
 Manual refresh forces current process discovery, including during the normal
 discovery throttle. Focus and Fullscreen entry setting changes preserve launch
 eligibility from the current completed import, including when auto-sync is off;
-disabling the provider or changing automatic selection policy revokes it.
+disabling the provider revokes it. Automatic selection policy changes revoke it
+when auto-sync is on. An in-flight import continues across operational settings
+changes but is canceled on provider disable, policy change, or process restart.
 Vibeshine instead requests a sync when its configuration is applied and
 otherwise reconciles snapshots sent by the Playnite extension, which coalesces
 library changes with a three-second debounce. The 30-second polling interval
