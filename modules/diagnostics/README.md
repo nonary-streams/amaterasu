@@ -48,12 +48,20 @@ values never wrap, and overflow leaves the previous value intact. Errors are
 `record_too_large`, `invalid_name`, `invalid_limit`, `invalid_cursor`,
 `invalid_caller`, `caller_limit`, `counter_limit`, `counter_overflow`,
 `sequence_exhausted`, and `not_ready` while logging policy hydration is pending.
-The `status` action returns `{"ok":true,"ready":false,"logging_configuration_revision":null}`
+The `status` action returns `{"ok":true,"ready":false,"logging_configuration_revision":null,"logging_sink":{"state":"disabled","failure":null}}`
 until hydration completes. A successfully applied persisted logging policy sets
 `ready:true` and reports its positive `logging_configuration_revision`. A legacy
 bootstrap policy has `ready:true` and a null revision. Failed refreshes keep the
 previous effective policy and revision. Query and counter responses remain
 available during hydration and include `ready:false`.
+`logging_sink.state` is `disabled` when no disk path is configured, `healthy`
+after a session opens or a qualifying record writes successfully, and `failed`
+after a sink open or write error. In the failed state, `failure` is `open` or
+`write`; otherwise it is null. These bounded values reveal no paths or OS error
+details. The applied revision remains unchanged when a sink later fails. A
+successful qualifying write after recovery clears the failure. A restarted
+module reports the newly opened sink's state after it adopts its persisted
+settings; the in-memory journal and any prior failure are not restored.
 
 At most 64 callers can create state, with caller identities bounded to 128 bytes.
 Reads do not allocate caller slots. Caller slots and counters persist until module

@@ -128,6 +128,13 @@ pub(crate) struct SessionLogger {
     minimum_level: u8,
     settings: Option<LoggingSettings>,
     session: Option<SessionLog>,
+    failure: Option<SinkFailure>,
+}
+
+#[derive(Clone, Copy)]
+enum SinkFailure {
+    Open,
+    Write,
 }
 
 impl SessionLogger {
@@ -138,11 +145,15 @@ impl SessionLogger {
             minimum_level,
             settings: logging_enabled.then_some(settings),
             session: None,
+            failure: None,
         };
         if let Some(session) = logger.open_configured_session() {
             match session {
                 Ok(session) => logger.session = Some(session),
-                Err(error) => return (logger, Some(error.to_string())),
+                Err(error) => {
+                    logger.failure = Some(SinkFailure::Open);
+                    return (logger, Some(error.to_string()));
+                }
             }
         }
         (logger, None)
@@ -155,21 +166,57 @@ impl SessionLogger {
         Some(SessionLog::new(log_path, state_root))
     }
 
+    pub(crate) fn health(&self) -> Value {
+        let state = if self.settings.is_none() {
+            "disabled"
+        } else if self.failure.is_some() {
+            "failed"
+        } else {
+            "healthy"
+        };
+        let failure = match self.failure {
+            Some(SinkFailure::Open) => Some("open"),
+            Some(SinkFailure::Write) => Some("write"),
+            None => None,
+        };
+        json!({"state":state,"failure":failure})
+    }
+
     pub(crate) fn write_record(&mut self, caller: &str, record: &Record) {
         if record.level.numeric() < self.minimum_level {
             return;
         }
         if self.session.is_none()
-            && let Some(Ok(session)) = self.open_configured_session()
+            && let Some(session) = self.open_configured_session()
         {
-            self.session = Some(session);
+            match session {
+                Ok(session) => self.session = Some(session),
+                Err(_) => {
+                    self.failure = Some(SinkFailure::Open);
+                    return;
+                }
+            }
         }
-        if let Some(session) = &mut self.session
-            && session.write_record(caller, record).is_err()
-        {
-            // Preserve the in-memory caller journal if a disk sink stops working.
-            self.session = None;
+        if let Some(session) = &mut self.session {
+            match session.write_record(caller, record) {
+                Ok(()) => self.failure = None,
+                Err(_) => {
+                    // Preserve the in-memory caller journal if a disk sink stops working.
+                    self.session = None;
+                    self.failure = Some(SinkFailure::Write);
+                }
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_sink_for_test(&mut self) {
+        self.session.as_mut().unwrap().file.take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_path_for_test(&self) -> &Path {
+        &self.session.as_ref().unwrap().active_path
     }
 }
 
@@ -636,11 +683,13 @@ mod tests {
         .unwrap();
         let (mut logger, warning) = SessionLogger::open(settings);
         assert!(warning.is_none());
+        assert_eq!(logger.health(), json!({"state":"healthy","failure":null}));
         let original_path = logger.session.as_ref().unwrap().active_path.clone();
 
         drop(logger.session.as_mut().unwrap().file.take());
         logger.write_record("capture", &test_record("lost to closed sink"));
         assert!(logger.session.is_none());
+        assert_eq!(logger.health(), json!({"state":"failed","failure":"write"}));
 
         logger.write_record("capture", &test_record("written after reopening"));
         let reopened = logger.session.as_ref().unwrap();
@@ -648,6 +697,7 @@ mod tests {
         let contents = fs::read_to_string(&reopened.active_path).unwrap();
         assert!(contents.contains("written after reopening"));
         assert!(!contents.contains("lost to closed sink"));
+        assert_eq!(logger.health(), json!({"state":"healthy","failure":null}));
 
         fs::remove_dir_all(state_root).unwrap();
     }
@@ -665,6 +715,10 @@ mod tests {
         let (mut logger, warning) = SessionLogger::open(settings);
         assert!(warning.is_some());
         assert!(logger.session.is_none());
+        assert_eq!(logger.health(), json!({"state":"failed","failure":"open"}));
+
+        logger.write_record("capture", &test_record("still blocked"));
+        assert_eq!(logger.health(), json!({"state":"failed","failure":"open"}));
 
         fs::remove_file(&blocking_path).unwrap();
         logger.write_record(
@@ -675,6 +729,7 @@ mod tests {
         let session = logger.session.as_ref().unwrap();
         let contents = fs::read_to_string(&session.active_path).unwrap();
         assert!(contents.contains("recovered after initial open failure"));
+        assert_eq!(logger.health(), json!({"state":"healthy","failure":null}));
 
         fs::remove_dir_all(state_root).unwrap();
     }

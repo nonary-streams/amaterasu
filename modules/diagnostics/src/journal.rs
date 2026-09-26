@@ -152,6 +152,7 @@ impl Journal {
                 "ok":true,
                 "ready":self.ready,
                 "logging_configuration_revision":self.logging_configuration_revision,
+                "logging_sink":self.logger.health(),
             })),
         }
     }
@@ -264,7 +265,8 @@ mod hydration_tests {
         assert!(journal.callers.is_empty());
         assert_eq!(
             journal.handle("capture", json!({"action":"status"})),
-            json!({"ok":true,"ready":false,"logging_configuration_revision":null})
+            json!({"ok":true,"ready":false,"logging_configuration_revision":null,
+                "logging_sink":{"state":"disabled","failure":null}})
         );
     }
 
@@ -279,7 +281,8 @@ mod hydration_tests {
         assert!(journal.is_ready());
         assert_eq!(
             journal.handle("capture", json!({"action":"status"})),
-            json!({"ok":true,"ready":true,"logging_configuration_revision":null})
+            json!({"ok":true,"ready":true,"logging_configuration_revision":null,
+                "logging_sink":{"state":"disabled","failure":null}})
         );
         assert_eq!(
             journal.handle(
@@ -318,7 +321,8 @@ mod hydration_tests {
         assert_eq!(
             journal.handle("capture", json!({"action":"status"})),
             json!({
-                "ok":true,"ready":true,"logging_configuration_revision":3
+                "ok":true,"ready":true,"logging_configuration_revision":3,
+                "logging_sink":{"state":"healthy","failure":null}
             })
         );
         assert!(
@@ -369,6 +373,80 @@ mod hydration_tests {
             4
         );
         drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_sink_failure_is_visible_and_recovers_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-diagnostics-sink-health-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = || {
+            LoggingSettings::from_value(json!({
+                "min_log_level":2,
+                "log_path":"capture.log",
+                "state_root":root,
+            }))
+            .unwrap()
+        };
+        let record = |message| {
+            json!({
+                "action":"record","level":"info","target":"capture","message":message
+            })
+        };
+        let status = |journal: &mut Journal| journal.handle("capture", json!({"action":"status"}));
+
+        let mut journal = Journal::unready();
+        journal.apply_persisted_logging(settings(), 7).unwrap();
+        assert_eq!(status(&mut journal)["logging_sink"]["state"], "healthy");
+
+        journal.logger.close_sink_for_test();
+        assert_eq!(
+            journal.handle("capture", record("retained on disk failure"))["sequence"],
+            1
+        );
+        assert_eq!(status(&mut journal)["logging_configuration_revision"], 7);
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"failed","failure":"write"})
+        );
+        assert_eq!(
+            journal.handle("capture", json!({"action":"query"}))["records"][0]["message"],
+            "retained on disk failure"
+        );
+
+        assert_eq!(
+            journal.handle("capture", record("written after recovery"))["sequence"],
+            2
+        );
+        assert_eq!(
+            status(&mut journal)["logging_sink"],
+            json!({"state":"healthy","failure":null})
+        );
+        let log_path = journal.logger.active_path_for_test().to_path_buf();
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(contents.contains("written after recovery"));
+        assert!(!contents.contains("retained on disk failure"));
+
+        drop(journal);
+        let mut restarted = Journal::unready();
+        restarted.apply_persisted_logging(settings(), 7).unwrap();
+        assert_eq!(status(&mut restarted)["logging_configuration_revision"], 7);
+        assert_eq!(
+            status(&mut restarted)["logging_sink"],
+            json!({"state":"healthy","failure":null})
+        );
+        assert_eq!(
+            restarted.handle("capture", record("written after restart"))["sequence"],
+            1
+        );
+        assert_eq!(
+            restarted.handle("capture", json!({"action":"query"}))["records"][0]["message"],
+            "written after restart"
+        );
+        drop(restarted);
         std::fs::remove_dir_all(root).unwrap();
     }
 
