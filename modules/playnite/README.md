@@ -96,7 +96,8 @@ source checkout, copy `extension.yaml` and `AmaterasuPlaynite.psm1` from
 restart Playnite.
 The Amaterasu installer does not yet install or roll back this extension;
 that packaging work is tracked separately. Only the service-launched
-`worker-user-serve` process can claim the Sunshine role: the extension compares
+`worker-user-serve` process can claim Sunshine, launcher, or fullscreen roles:
+the extension compares
 the kernel control/data client PID, live SCM service parent, executable path,
 and worker command line. It also requires the SCM image to reside in an
 administrator-protected location. This contract requires a packaged Windows/Playnite
