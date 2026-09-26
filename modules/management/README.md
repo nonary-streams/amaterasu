@@ -46,9 +46,11 @@ fields do not provide authentication. Before each business request, the module
 calls auth `verify` with `bearer` and `required_scopes:[scope]`, requires an explicit
 successful result containing the exact scope, then dispatches the action.
 
-Frontend code keeps both secrets only in tab memory and renews access through the
-refresh endpoint. Reloading the page loses the tokens and requires login again;
-the remember-me setting controls refresh lifetime, not browser-storage persistence.
+The frontend keeps ordinary sessions in tab memory and renews access through the
+refresh endpoint. With `remember_me`, it also stores the bearer and refresh pair
+in browser local storage and can restore the session after reload. Remembered
+sessions require Web Locks to serialize refresh and logout across tabs. The
+stored secrets are readable by page JavaScript; they are not HTTP-only cookies.
 
 | Route prefix | Actions | Required scope |
 | --- | --- | --- |
@@ -65,7 +67,11 @@ the remember-me setting controls refresh lifetime, not browser-storage persisten
 | `/v1/application/` | terminate | `application.terminate` |
 | `/v1/steam/` | list, status | `steam.read` |
 | `/v1/steam/` | refresh, force_sync | `steam.refresh` |
-| `/v1/diagnostics/` | query, counters | `diagnostics.read` |
+| `/v1/history/` | settings_get | `configuration.read` |
+| `/v1/history/` | settings_update | `configuration.write` |
+| `/v1/history/` | list_sessions, session_detail, active_sessions, history_status | `session.read` |
+| `/v1/history/` | delete_session | `session.write` |
+| `/v1/diagnostics/` | query, counters, status | `diagnostics.read` |
 | `/v1/diagnostics/` | record, increment | `diagnostics.write` |
 | `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
 | `/v1/display/` | status, enumerate | `display.read` |
@@ -82,7 +88,9 @@ principal. The logging editor changes only `log_path` and `min_log_level`, sends
 the other fields verbatim from the signed `get` response, and confirms the new
 revision and values through another signed read. A caller with
 `configuration.write` can intentionally change the other host-configuration
-paths through this API.
+paths through this API. The editor separately reads signed diagnostics `status`
+to show the revision actually adopted by the logging worker. A saved revision
+can remain pending if the worker has not refreshed or cannot open its file sink.
 
 Example authenticated request body for `/v1/catalog/create`:
 
