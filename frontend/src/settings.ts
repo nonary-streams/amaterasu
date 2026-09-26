@@ -249,7 +249,11 @@ namespace Amaterasu {
     return saved;
   }
 
-  export function parseDiagnosticsLoggingStatus(value: unknown): DiagnosticsLoggingStatus {
+  type DiagnosticsSinkStatus = DiagnosticsLoggingStatus & {
+    logging_sink?: { state: "disabled" | "healthy" | "failed"; failure: "open" | "write" | null };
+  };
+
+  export function parseDiagnosticsLoggingStatus(value: unknown): DiagnosticsSinkStatus {
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("Diagnostics status is invalid.");
     const status = value as Record<string, unknown>;
@@ -257,19 +261,62 @@ namespace Amaterasu {
     if (status.ok !== true || typeof status.ready !== "boolean" ||
         (revision !== null && (!Number.isSafeInteger(revision) || (revision as number) < 1)))
       throw new Error("Diagnostics logging status is invalid.");
-    return status as unknown as DiagnosticsLoggingStatus;
+    if (Object.hasOwn(status, "logging_sink")) {
+      const sink = status.logging_sink;
+      if (!sink || typeof sink !== "object" || Array.isArray(sink))
+        throw new Error("Diagnostics logging sink status is invalid.");
+      const { state, failure } = sink as Record<string, unknown>;
+      if ((state !== "disabled" && state !== "healthy" && state !== "failed") ||
+          (state === "failed" ? failure !== "open" && failure !== "write" : failure !== null))
+        throw new Error("Diagnostics logging sink status is invalid.");
+    }
+    return status as unknown as DiagnosticsSinkStatus;
+  }
+
+  export async function readHostLoggingState(
+    api: Pick<Api, "post">,
+  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsSinkStatus | null }> {
+    const settings = parseHostConfigurationReply(await api.post<unknown>("host-configuration/get"));
+    return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
+  }
+
+  async function readDiagnosticsLoggingStatus(api: Pick<Api, "post">): Promise<DiagnosticsSinkStatus | null> {
+    try {
+      return parseDiagnosticsLoggingStatus(await api.post<unknown>("diagnostics/status"));
+    } catch {
+      return null;
+    }
+  }
+
+  export async function saveHostLoggingState(
+    api: Pick<Api, "post">,
+    current: HostConfiguration,
+    level: string,
+    path: string,
+  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsSinkStatus | null }> {
+    const settings = await saveHostLoggingSettings(api, current, level, path);
+    return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
   }
 
   export function diagnosticsLoggingDescription(
     savedRevision: number,
-    status: DiagnosticsLoggingStatus | null,
+    status: DiagnosticsSinkStatus | null,
   ): string {
     if (!status)
       return "Saved host logging policy; diagnostics status is unavailable. Refresh to check whether it applied.";
     if (!status.ready)
       return "Saved host logging policy; diagnostics is not ready. Refresh after it starts.";
-    if (status.logging_configuration_revision === savedRevision)
-      return `Diagnostics is using saved host logging revision ${savedRevision}.`;
+    if (status.logging_configuration_revision === savedRevision) {
+      if (!status.logging_sink)
+        return `Diagnostics is using saved host logging revision ${savedRevision}; disk delivery is unverified.`;
+      if (status.logging_sink.state === "disabled")
+        return `Diagnostics is using saved host logging revision ${savedRevision}; disk logging is disabled.`;
+      if (status.logging_sink.state === "failed")
+        return status.logging_sink.failure === "open"
+          ? `Diagnostics is using saved host logging revision ${savedRevision}, but opening the disk log failed. Disk delivery is not working.`
+          : `Diagnostics is using saved host logging revision ${savedRevision}, but writing the disk log failed. Disk delivery is not working.`;
+      return `Diagnostics is using saved host logging revision ${savedRevision}; disk logging is healthy.`;
+    }
     if (status.logging_configuration_revision === null || status.logging_configuration_revision < savedRevision)
       return `Saved host logging revision ${savedRevision} is pending in diagnostics. Refresh to check again.`;
     return `Diagnostics is using a newer host logging revision ${status.logging_configuration_revision}. Refresh the saved policy.`;
@@ -1008,12 +1055,7 @@ namespace Amaterasu {
     async function loadHostLogging(): Promise<void> {
       hostLoggingArea.replaceChildren(el("p", "muted", "Loading host logging policy…"));
       try {
-        const settings = parseHostConfigurationReply(
-          await context.api.post<unknown>("host-configuration/get"),
-        );
-        const diagnosticsStatus = await context.api.post<unknown>("diagnostics/status")
-          .then(parseDiagnosticsLoggingStatus, () => null)
-          .catch(() => null);
+        const { settings, diagnostics: diagnosticsStatus } = await readHostLoggingState(context.api);
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const level = el("select");
@@ -1054,7 +1096,8 @@ namespace Amaterasu {
           if (!form.reportValidity()) return;
           void runAction(save, status, async () => {
             try {
-              await saveHostLoggingSettings(context.api, settings, level.value, path.value);
+              const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
+              context.notify(diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics));
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
                 await loadHostLogging();
@@ -1064,7 +1107,6 @@ namespace Amaterasu {
               throw error;
             }
             await loadHostLogging();
-            context.notify("Host logging policy saved and confirmed. Check diagnostics status for application.");
           });
         });
         hostLoggingArea.replaceChildren(panel("Host logging", form));

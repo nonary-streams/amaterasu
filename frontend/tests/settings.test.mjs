@@ -230,6 +230,64 @@ test("diagnostics status distinguishes saved, pending, unavailable and newer log
     { ok: true, ready: true }]) assert.throws(() => parseStatus(value));
 });
 
+test("host logging save confirms signed readback and reports disk sink failure and recovery", async () => {
+  const describe = context.Amaterasu.diagnosticsLoggingDescription;
+  let stored = hostConfiguration();
+  let sink = { state: "failed", failure: "open" };
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push(route);
+    if (route === "host-configuration/update") {
+      assert.equal(body.expected_revision, stored.revision);
+      stored = hostConfiguration(stored.revision + 1);
+      stored.values = { ...stored.values, min_log_level: body.min_log_level, log_path: body.log_path };
+      return { ok: true };
+    }
+    if (route === "host-configuration/get") return stored;
+    return { ok: true, ready: true, logging_configuration_revision: stored.revision, logging_sink: sink };
+  } };
+  const loaded = await context.Amaterasu.readHostLoggingState(api);
+  assert.match(describe(loaded.settings.revision, loaded.diagnostics), /opening the disk log failed/);
+  const saved = await context.Amaterasu.saveHostLoggingState(api, loaded.settings, "info", "logs/new.log");
+  assert.equal(saved.settings.revision, 7);
+  assert.match(describe(saved.settings.revision, saved.diagnostics), /opening the disk log failed/);
+  assert.deepEqual(calls, ["host-configuration/get", "diagnostics/status", "host-configuration/update", "host-configuration/get", "diagnostics/status"]);
+  sink = { state: "failed", failure: "write" };
+  const writeFailure = await context.Amaterasu.readHostLoggingState(api);
+  assert.match(describe(writeFailure.settings.revision, writeFailure.diagnostics), /writing the disk log failed/);
+  sink = { state: "healthy", failure: null };
+  const recovered = await context.Amaterasu.readHostLoggingState(api);
+  assert.match(describe(recovered.settings.revision, recovered.diagnostics), /disk logging is healthy/);
+  sink = { state: "disabled", failure: null };
+  const disabled = await context.Amaterasu.readHostLoggingState(api);
+  assert.match(describe(disabled.settings.revision, disabled.diagnostics), /disk logging is disabled/);
+  assert.doesNotMatch([loaded, saved, writeFailure, recovered, disabled]
+    .map(({ settings, diagnostics }) => describe(settings.revision, diagnostics)).join(" "), /logs\/new\.log|secret|password/);
+});
+
+test("diagnostics sink parser rejects malformed health and preserves legacy or unavailable status", async () => {
+  const parse = context.Amaterasu.parseDiagnosticsLoggingStatus;
+  const describe = context.Amaterasu.diagnosticsLoggingDescription;
+  const base = { ok: true, ready: true, logging_configuration_revision: 7 };
+  assert.match(describe(7, parse(base)), /disk delivery is unverified/);
+  for (const logging_sink of [null, [], {}, { state: "failed", failure: null },
+    { state: "failed", failure: "secret/path" }, { state: "healthy", failure: "write" },
+    { state: "disabled", failure: "open" }, { state: "unknown", failure: null }]) {
+    assert.throws(() => parse({ ...base, logging_sink }));
+  }
+  const settings = hostConfiguration();
+  for (const status of [{ ...base, logging_sink: { state: "failed", failure: "secret/path" } }, null]) {
+    const state = await context.Amaterasu.readHostLoggingState({ async post(route) {
+      if (route === "host-configuration/get") return settings;
+      if (status === null) throw new Error("scope denied");
+      return status;
+    } });
+    assert.deepEqual(ordinary(state.settings), settings);
+    assert.equal(state.diagnostics, null);
+    assert.match(describe(settings.revision, state.diagnostics), /status is unavailable/);
+  }
+});
+
 test("history editor confirms exact signed revision and settings readback", async () => {
   const current = { ok: true, revision: 4, settings: { enabled: true, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: true };
   const calls = [];

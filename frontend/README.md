@@ -66,6 +66,10 @@ browser API calls.
 - Process inventory and termination with confirmation, plus explicit status refresh.
 - Steam provider refresh, discovery pages, partial-scan warnings, and scan status.
 - Diagnostic records, bounded journal pagination, retention warnings, and counters.
+- Host logging settings confirm the saved revision and separately read signed
+  diagnostics status. The editor distinguishes pending application from healthy,
+  disabled, and failed disk delivery; older status replies leave delivery unverified.
+  Sink failures report only the operation category, without exposing disk paths.
 
 All surfaces read the management principal's shared namespace; this is not a
 multi-tenant frontend. External changes can invalidate cursors and revisions;
