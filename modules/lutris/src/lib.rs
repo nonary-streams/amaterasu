@@ -174,7 +174,7 @@ impl CapturedScan {
         steam_app_ids: &BTreeSet<u32>,
         current_epoch: u64,
         enabled: bool,
-    ) -> Result<Option<(usize, SourceSignature, u64)>, String> {
+    ) -> Result<Option<(usize, SourceSignature, u64, Snapshot)>, String> {
         if !enabled || self.settings_epoch != current_epoch {
             return Ok(None);
         }
@@ -188,6 +188,7 @@ impl CapturedScan {
             count,
             SourceSignature::from(&self.snapshot),
             self.settings_epoch,
+            self.snapshot,
         )))
     }
 }
@@ -216,6 +217,7 @@ struct LutrisModule {
     last_reconciled_source: Option<SourceSignature>,
     last_reconciled_at: Option<Instant>,
     pending_source: Option<(SourceSignature, u64)>,
+    pending_artwork: Option<(Snapshot, u64)>,
 }
 
 impl ManagedModule for LutrisModule {
@@ -242,6 +244,7 @@ impl ManagedModule for LutrisModule {
             last_reconciled_source: None,
             last_reconciled_at: None,
             pending_source: None,
+            pending_artwork: None,
         })
     }
 
@@ -297,21 +300,9 @@ impl LutrisModule {
         }
         match result {
             Ok(mut snapshot) => {
-                retain_current_artwork(
-                    &mut snapshot,
-                    &mut self.last_artwork_revisions,
-                    settings_epoch,
-                    self.settings_epoch,
-                    self.configuration.settings().enabled,
-                );
+                preserve_unscanned_artwork(&mut snapshot, &self.last_artwork_revisions);
                 self.last_snapshot_games = snapshot.games.len();
                 self.last_artwork_scan_incomplete = snapshot.artwork_scan_incomplete;
-                self.artwork.update_if_current(
-                    &snapshot,
-                    settings_epoch,
-                    self.settings_epoch,
-                    self.configuration.settings().enabled,
-                );
                 let signature = SourceSignature::from(&snapshot);
                 if !should_reconcile(
                     &signature,
@@ -390,8 +381,9 @@ impl LutrisModule {
             self.settings_epoch,
             self.configuration.settings().enabled,
         ) {
-            Ok(Some((_, signature, settings_epoch))) => {
+            Ok(Some((_, signature, settings_epoch, snapshot))) => {
                 self.pending_source = Some((signature, settings_epoch));
+                self.pending_artwork = Some((snapshot, settings_epoch));
                 self.last_error = None;
             }
             Ok(None) => self.reschedule_stale_scan(captured_epoch),
@@ -415,6 +407,14 @@ impl LutrisModule {
         ) else {
             return;
         };
+        publish_reconciled_artwork(
+            &mut self.pending_artwork,
+            &self.catalog,
+            &mut self.artwork,
+            &mut self.last_artwork_revisions,
+            self.settings_epoch,
+            self.configuration.settings().enabled,
+        );
         self.schedule_next_auto_sync(settings_changed);
     }
 
@@ -625,6 +625,33 @@ fn retain_current_artwork(
     }
     preserve_unscanned_artwork(snapshot, previous);
     *previous = snapshot.artwork_revisions.clone();
+}
+
+fn publish_reconciled_artwork(
+    pending: &mut Option<(Snapshot, u64)>,
+    catalog: &catalog_sync::CatalogSync,
+    artwork: &mut artwork::ArtworkStore,
+    previous: &mut BTreeMap<i64, String>,
+    current_epoch: u64,
+    enabled: bool,
+) {
+    if catalog.busy() {
+        return;
+    }
+    let Some((snapshot, captured_epoch)) = pending.take() else {
+        return;
+    };
+    if enabled && captured_epoch == current_epoch && catalog.succeeded() {
+        artwork.update_if_current(&snapshot, captured_epoch, current_epoch, enabled);
+        let mut snapshot = snapshot;
+        retain_current_artwork(
+            &mut snapshot,
+            previous,
+            captured_epoch,
+            current_epoch,
+            enabled,
+        );
+    }
 }
 
 fn next_auto_sync_after_scan(
@@ -1161,7 +1188,7 @@ mod tests {
         assert!(catalog.succeeded());
 
         // The receipt is created only when the deduped scan starts a catalog transaction.
-        let (_, signature, epoch) = pending
+        let (_, signature, epoch, _) = pending
             .scan
             .start_catalog(&mut catalog, &BTreeSet::new(), 7, true)
             .unwrap()
@@ -1279,6 +1306,66 @@ mod tests {
     }
 
     #[test]
+    fn artwork_changes_publish_only_after_current_catalog_finish() {
+        let mut catalog = catalog_sync::CatalogSync::default();
+        let mut artwork = artwork::ArtworkStore::default();
+        artwork.update(&snapshot());
+        let mut previous = BTreeMap::from([(10, "old".to_owned())]);
+        let mut changed = snapshot();
+        changed.artwork_revisions.insert(10, "new".to_owned());
+        changed.games.retain(|game| game.id == 10);
+
+        // A discovery and Steam read may succeed while the Catalog still rejects
+        // the replacement. Keep the old readback authorization until Finish.
+        catalog
+            .start(&changed, &ProductSettings::default(), &BTreeSet::new(), 1)
+            .unwrap();
+        let mut pending = Some((changed.clone(), 3));
+        publish_reconciled_artwork(&mut pending, &catalog, &mut artwork, &mut previous, 3, true);
+        assert!(pending.is_some());
+        assert_eq!(previous.get(&10).map(String::as_str), Some("old"));
+        assert!(artwork.contains_game_for_test(7));
+
+        catalog.respond_for_test(
+            json!({"ok":false,"error":{"code":"catalog_error","message":"retry"}}),
+        );
+        assert!(!catalog.succeeded());
+        pending = Some((changed.clone(), 3));
+        publish_reconciled_artwork(&mut pending, &catalog, &mut artwork, &mut previous, 3, true);
+        assert_eq!(previous.get(&10).map(String::as_str), Some("old"));
+        assert!(artwork.contains_game_for_test(7));
+
+        catalog
+            .start(&changed, &ProductSettings::default(), &BTreeSet::new(), 2)
+            .unwrap();
+        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":2,"next_sequence":1}));
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":3,"generation":2,"complete":true,
+            "cleanup_pending":false,"remove_stale":true,"remove_selection":true
+        }));
+        assert!(catalog.succeeded());
+
+        // A completed old transaction cannot republish after disable or a new epoch.
+        pending = Some((changed.clone(), 3));
+        publish_reconciled_artwork(
+            &mut pending,
+            &catalog,
+            &mut artwork,
+            &mut previous,
+            4,
+            false,
+        );
+        assert_eq!(previous.get(&10).map(String::as_str), Some("old"));
+        assert!(artwork.contains_game_for_test(7));
+
+        pending = Some((changed, 4));
+        publish_reconciled_artwork(&mut pending, &catalog, &mut artwork, &mut previous, 4, true);
+        assert_eq!(previous.get(&10).map(String::as_str), Some("new"));
+        assert!(!artwork.contains_game_for_test(7));
+    }
+
+    #[test]
     fn stale_pre_disable_scan_cannot_publish_after_reenable() {
         let scan_start_settings = ProductSettings {
             enabled: true,
@@ -1372,7 +1459,7 @@ mod tests {
             source_revision: 2,
             settings_epoch: 5,
         };
-        let (count, _, _) = fresh
+        let (count, _, _, _) = fresh
             .start_catalog(&mut catalog, &[9001].into(), 5, true)
             .unwrap()
             .unwrap();

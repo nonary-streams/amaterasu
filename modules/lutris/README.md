@@ -115,6 +115,12 @@ fresh scan.
 The provider status keeps `refresh_pending` true through catalog completion and
 reports a catalog failure in `last_error`; a successful later reconciliation
 clears it.
+Artwork readback switches to the newly discovered game set only after the
+matching Catalog snapshot finishes successfully under the current enabled
+settings. A failed Steam read or Catalog transaction retains the previous
+artwork source and revisions, so retained imported rows remain readable until
+a later successful reconciliation. Disable clears artwork immediately, and a
+late transaction cannot republish it after disable or re-enable.
 Local artwork revisions are SHA-256 digests of the validated opened image bytes.
 An image-only change updates the opaque Catalog reference on the next scan.
 Artwork discovery limits accepted image bytes to 256 MiB and checks an
