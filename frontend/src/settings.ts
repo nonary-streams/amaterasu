@@ -1049,6 +1049,161 @@ namespace Amaterasu {
     return parsed as LutrisExclusion[];
   }
 
+  export function parseSteamSettingsReply(value: unknown): SteamSettings {
+    const reply = parseImportSettingsEnvelope(value, "Steam");
+    const values = reply.values as Record<string, unknown>;
+    const imported = parseSteamImportSettings(
+      values.include_tools as boolean,
+      values.sync_all_installed as boolean,
+      values.autosync_remove_uninstalled as boolean,
+      values.recent_games as number,
+      values.recent_max_age_days as number,
+    );
+    if (typeof values.enabled !== "boolean" || typeof values.auto_sync !== "boolean")
+      throw new Error("Steam settings reply contains invalid switches.");
+    const parsed = {
+      enabled: values.enabled,
+      auto_sync: values.auto_sync,
+      exclude_games: parseSteamExclusions(JSON.stringify(values.exclude_games)),
+      ...imported,
+    };
+    if (!sameConfigurationValue(values, parsed))
+      throw new Error("Steam settings reply contains unexpected values.");
+    return { ok: true, revision: reply.revision, values: parsed };
+  }
+
+  export function parseLutrisSettingsReply(value: unknown): LutrisSettings {
+    const reply = parseImportSettingsEnvelope(value, "Lutris");
+    const values = reply.values as Record<string, unknown>;
+    if (typeof values.enabled !== "boolean" || typeof values.auto_sync !== "boolean" ||
+        typeof values.autosync_remove_uninstalled !== "boolean" ||
+        typeof values.include_steam !== "boolean")
+      throw new Error("Lutris settings reply contains invalid switches.");
+    const parsed = {
+      enabled: values.enabled,
+      auto_sync: values.auto_sync,
+      autosync_remove_uninstalled: values.autosync_remove_uninstalled,
+      include_steam: values.include_steam,
+      exclude_games: parseLutrisExclusions(JSON.stringify(values.exclude_games)),
+    };
+    if (!sameConfigurationValue(values, parsed))
+      throw new Error("Lutris settings reply contains unexpected values.");
+    return { ok: true, revision: reply.revision, values: parsed };
+  }
+
+  function parseImportSettingsEnvelope(
+    value: unknown,
+    provider: string,
+  ): { revision: number; values: Record<string, unknown> } {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error(`${provider} settings reply is invalid.`);
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !Number.isSafeInteger(reply.revision) ||
+        (reply.revision as number) < 0 || !reply.values ||
+        typeof reply.values !== "object" || Array.isArray(reply.values))
+      throw new Error(`${provider} settings reply is invalid.`);
+    return { revision: reply.revision as number, values: reply.values as Record<string, unknown> };
+  }
+
+  async function readImportSettings<T extends SteamSettings | LutrisSettings>(
+    api: Pick<Api, "post">,
+    provider: "steam" | "lutris",
+    parse: (value: unknown) => T,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return parse(await api.post<unknown>(`${provider}/settings`));
+      } catch (error) {
+        if (!(error instanceof ApiError) ||
+            !["settings_loading", "settings_busy"].includes(error.code) || attempt >= 7)
+          throw error;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+  }
+
+  async function saveImportSettings<T extends SteamSettings | LutrisSettings>(
+    api: Pick<Api, "post">,
+    provider: "steam" | "lutris",
+    current: T,
+    values: T["values"],
+    parse: (value: unknown) => T,
+  ): Promise<T> {
+    if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+        current.revision >= Number.MAX_SAFE_INTEGER)
+      throw new Error(`${provider} settings revision is invalid.`);
+    const confirms = (reply: T): boolean =>
+      reply.revision === current.revision + 1 && sameConfigurationValue(reply.values, values);
+    let updated: T;
+    try {
+      updated = parse(await api.post<unknown>(`${provider}/settings_update`, {
+        ...values,
+        expected_revision: current.revision,
+      }));
+    } catch (error) {
+      if (!(error instanceof ApiError) ||
+          (provider === "steam" ? error.code !== "settings_outcome_unknown" : error.code !== "update_outcome_unknown"))
+        throw error;
+      const reconciled = await readImportSettings(api, provider, parse);
+      if (!confirms(reconciled))
+        throw new Error(`${provider} update outcome is uncertain. Refresh and check the current values.`);
+      return reconciled;
+    }
+    if (!confirms(updated))
+      throw new Error(`${provider} update could not be confirmed. Refresh and check the current values.`);
+    const saved = await readImportSettings(api, provider, parse);
+    if (!confirms(saved))
+      throw new Error(`${provider} settings could not be confirmed after saving. Refresh and check the current values.`);
+    return saved;
+  }
+
+  export function readSteamSettings(api: Pick<Api, "post">): Promise<SteamSettings> {
+    return readImportSettings(api, "steam", parseSteamSettingsReply);
+  }
+
+  export function readLutrisSettings(api: Pick<Api, "post">): Promise<LutrisSettings> {
+    return readImportSettings(api, "lutris", parseLutrisSettingsReply);
+  }
+
+  export function saveSteamSettings(
+    api: Pick<Api, "post">,
+    current: SteamSettings,
+    values: SteamSettings["values"],
+  ): Promise<SteamSettings> {
+    return saveImportSettings(api, "steam", current, values, parseSteamSettingsReply);
+  }
+
+  export function saveLutrisSettings(
+    api: Pick<Api, "post">,
+    current: LutrisSettings,
+    values: LutrisSettings["values"],
+  ): Promise<LutrisSettings> {
+    return saveImportSettings(api, "lutris", current, values, parseLutrisSettingsReply);
+  }
+
+  export class ImportSettingsLoadGate<T> {
+    private generation = 0;
+
+    invalidate(): void {
+      this.generation += 1;
+    }
+
+    isCurrent(generation: number): boolean {
+      return generation === this.generation;
+    }
+
+    async read(load: () => Promise<T>): Promise<{ value: T; generation: number } | null> {
+      const generation = ++this.generation;
+      try {
+        const value = await load();
+        return this.isCurrent(generation) ? { value, generation } : null;
+      } catch (error) {
+        if (!this.isCurrent(generation)) return null;
+        throw error;
+      }
+    }
+  }
+
   export function lutrisStatusDescription(status: LutrisStatus): string {
     if (!status.settings_ready)
       return "Lutris settings are still loading; discovery state is not confirmed.";
@@ -1312,7 +1467,9 @@ namespace Amaterasu {
     const hostArea = el("div");
     const hostLoads = new NvhttpSettingsLoadGate();
     const steamArea = el("div");
+    const steamLoads = new ImportSettingsLoadGate<SteamSettings>();
     const lutrisArea = el("div");
+    const lutrisLoads = new ImportSettingsLoadGate<{ settings: LutrisSettings; runtime: LutrisStatus }>();
     const playniteArea = el("div");
     const playniteLoads = new PlayniteSettingsLoadGate();
     const inputArea = el("div");
@@ -1488,7 +1645,9 @@ namespace Amaterasu {
     async function loadSteam(): Promise<void> {
       steamArea.replaceChildren(el("p", "muted", "Loading Steam settings…"));
       try {
-        const settings = await context.api.post<SteamSettings>("steam/settings");
+        const loaded = await steamLoads.read(() => readSteamSettings(context.api));
+        if (loaded === null) return;
+        const { value: settings, generation } = loaded;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const enabled = input("steam_enabled", "", "checkbox");
@@ -1546,7 +1705,7 @@ namespace Amaterasu {
           field(
             "Enable Steam library discovery",
             enabled,
-            "Controls whether the provider exposes discovered Steam games and accepts scans.",
+            "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled.",
           ),
           field(
             "Automatic synchronization",
@@ -1590,25 +1749,39 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
-            await context.api.post("steam/settings_update", {
-              enabled: enabled.checked,
-              auto_sync: autoSync.checked,
-              exclude_games: parseSteamExclusions(exclusions.value),
-              ...parseSteamImportSettings(
-                includeTools.checked,
-                syncAllInstalled.checked,
-                autosyncRemoveUninstalled.checked,
-                recentGames.valueAsNumber,
-                recentMaxAgeDays.valueAsNumber,
-              ),
-              expected_revision: settings.revision,
-            });
-            context.notify("Steam discovery setting saved.");
-            await loadSteam();
+            steamLoads.invalidate();
+            let saveStarted = false;
+            try {
+              const values = {
+                enabled: enabled.checked,
+                auto_sync: autoSync.checked,
+                exclude_games: parseSteamExclusions(exclusions.value),
+                ...parseSteamImportSettings(
+                  includeTools.checked,
+                  syncAllInstalled.checked,
+                  autosyncRemoveUninstalled.checked,
+                  recentGames.valueAsNumber,
+                  recentMaxAgeDays.valueAsNumber,
+                ),
+              };
+              saveStarted = true;
+              await saveSteamSettings(context.api, settings, values);
+              await loadSteam();
+              context.notify("Steam settings saved and confirmed. Scan status is shown below.");
+            } catch (error) {
+              if (saveStarted) {
+                await loadSteam();
+                context.notify(error instanceof ApiError && error.code === "revision_conflict"
+                  ? "Steam settings changed elsewhere. Review the latest values before saving again."
+                  : "Steam save could not be confirmed. Review the latest values before saving again.");
+                return;
+              }
+              throw error;
+            }
           });
         });
         steamArea.replaceChildren(panel("Steam", form));
-        void loadSteamRuntimeStatus(runtimeStatus, context);
+        void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
       } catch (error) {
         if (context.content.isConnected)
           steamArea.replaceChildren(errorPanel(error, loadSteam));
@@ -1617,10 +1790,13 @@ namespace Amaterasu {
     async function loadLutris(): Promise<void> {
       lutrisArea.replaceChildren(el("p", "muted", "Loading Lutris settings…"));
       try {
-        const [settings, runtime] = await Promise.all([
-          loadLutrisSettings(),
-          context.api.post<LutrisStatus>("lutris/status"),
-        ]);
+        const loaded = await lutrisLoads.read(async () => {
+          const settings = await readLutrisSettings(context.api);
+          const runtime = await context.api.post<LutrisStatus>("lutris/status");
+          return { settings, runtime };
+        });
+        if (loaded === null) return;
+        const { settings, runtime } = loaded.value;
         if (!context.content.isConnected) return;
         const form = el("form", "settings-form");
         const enabled = input("lutris_enabled", "", "checkbox");
@@ -1645,7 +1821,11 @@ namespace Amaterasu {
         const runtimeStatus = el(
           "p",
           runtime.last_error ? "error" : "muted",
-          lutrisStatusDescription(runtime),
+          runtime.settings_revision !== settings.revision ||
+          runtime.enabled !== settings.values.enabled ||
+          runtime.auto_sync !== settings.values.auto_sync
+            ? "Saved Lutris settings are not yet reflected in provider status. Refresh to check application."
+            : lutrisStatusDescription(runtime),
         );
         const saveStatus = el("div");
         const refreshStatus = el("div");
@@ -1656,6 +1836,7 @@ namespace Amaterasu {
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
             const updated = await context.api.post<LutrisStatus>("lutris/refresh");
+            if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation)) return;
             runtimeStatus.className = updated.last_error ? "error" : "muted";
             runtimeStatus.textContent = lutrisStatusDescription(updated);
             context.notify("Lutris refresh requested.");
@@ -1706,21 +1887,26 @@ namespace Amaterasu {
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, saveStatus, async () => {
+            lutrisLoads.invalidate();
+            let saveStarted = false;
             try {
-              await context.api.post("lutris/settings_update", {
+              const values = {
                 enabled: enabled.checked,
                 auto_sync: autoSync.checked,
                 autosync_remove_uninstalled: removeUninstalled.checked,
                 include_steam: includeSteam.checked,
                 exclude_games: parseLutrisExclusions(exclusions.value),
-                expected_revision: settings.revision,
-              });
-              context.notify("Lutris settings saved.");
+              };
+              saveStarted = true;
+              await saveLutrisSettings(context.api, settings, values);
               await loadLutris();
+              context.notify("Lutris settings saved and confirmed. Scan status is shown below.");
             } catch (error) {
-              if (error instanceof ApiError && error.code === "revision_conflict") {
-                context.notify("Lutris settings changed elsewhere. The latest values have been reloaded.");
+              if (saveStarted) {
                 await loadLutris();
+                context.notify(error instanceof ApiError && error.code === "revision_conflict"
+                  ? "Lutris settings changed elsewhere. Review the latest values before saving again."
+                  : "Lutris save could not be confirmed. Review the latest values before saving again.");
                 return;
               }
               throw error;
@@ -1738,24 +1924,6 @@ namespace Amaterasu {
       } catch (error) {
         if (context.content.isConnected)
           lutrisArea.replaceChildren(errorPanel(error, loadLutris));
-      }
-    }
-    async function loadLutrisSettings(): Promise<LutrisSettings> {
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          return await context.api.post<LutrisSettings>("lutris/settings");
-        } catch (error) {
-          if (
-            !(error instanceof ApiError) ||
-            !["settings_loading", "settings_busy"].includes(error.code) ||
-            attempt >= 7
-          ) {
-            throw error;
-          }
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, 50 * (attempt + 1));
-          });
-        }
       }
     }
     async function loadPlaynite(): Promise<void> {
@@ -2538,13 +2706,17 @@ namespace Amaterasu {
     async function loadSteamRuntimeStatus(
       target: HTMLElement,
       context: PageContext,
+      settings: SteamSettings,
+      generation: number,
     ): Promise<void> {
       try {
         const status = await context.api.post<SteamStatus>("steam/status");
-        if (!target.isConnected) return;
-        target.textContent = steamStatusDescription(status);
+        if (!target.isConnected || !steamLoads.isCurrent(generation)) return;
+        target.textContent = status.settings_ready && status.enabled !== settings.values.enabled
+          ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
+          : steamStatusDescription(status);
       } catch (error) {
-        if (!target.isConnected) return;
+        if (!target.isConnected || !steamLoads.isCurrent(generation)) return;
         target.textContent =
           error instanceof ApiError && error.code === "forbidden"
             ? "Runtime status requires steam.read; settings remain available with configuration access."

@@ -2983,6 +2983,131 @@ var Amaterasu;
         return parsed;
     }
     Amaterasu.parseLutrisExclusions = parseLutrisExclusions;
+    function parseSteamSettingsReply(value) {
+        const reply = parseImportSettingsEnvelope(value, "Steam");
+        const values = reply.values;
+        const imported = parseSteamImportSettings(values.include_tools, values.sync_all_installed, values.autosync_remove_uninstalled, values.recent_games, values.recent_max_age_days);
+        if (typeof values.enabled !== "boolean" || typeof values.auto_sync !== "boolean")
+            throw new Error("Steam settings reply contains invalid switches.");
+        const parsed = {
+            enabled: values.enabled,
+            auto_sync: values.auto_sync,
+            exclude_games: parseSteamExclusions(JSON.stringify(values.exclude_games)),
+            ...imported,
+        };
+        if (!sameConfigurationValue(values, parsed))
+            throw new Error("Steam settings reply contains unexpected values.");
+        return { ok: true, revision: reply.revision, values: parsed };
+    }
+    Amaterasu.parseSteamSettingsReply = parseSteamSettingsReply;
+    function parseLutrisSettingsReply(value) {
+        const reply = parseImportSettingsEnvelope(value, "Lutris");
+        const values = reply.values;
+        if (typeof values.enabled !== "boolean" || typeof values.auto_sync !== "boolean" ||
+            typeof values.autosync_remove_uninstalled !== "boolean" ||
+            typeof values.include_steam !== "boolean")
+            throw new Error("Lutris settings reply contains invalid switches.");
+        const parsed = {
+            enabled: values.enabled,
+            auto_sync: values.auto_sync,
+            autosync_remove_uninstalled: values.autosync_remove_uninstalled,
+            include_steam: values.include_steam,
+            exclude_games: parseLutrisExclusions(JSON.stringify(values.exclude_games)),
+        };
+        if (!sameConfigurationValue(values, parsed))
+            throw new Error("Lutris settings reply contains unexpected values.");
+        return { ok: true, revision: reply.revision, values: parsed };
+    }
+    Amaterasu.parseLutrisSettingsReply = parseLutrisSettingsReply;
+    function parseImportSettingsEnvelope(value, provider) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error(`${provider} settings reply is invalid.`);
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) ||
+            reply.revision < 0 || !reply.values ||
+            typeof reply.values !== "object" || Array.isArray(reply.values))
+            throw new Error(`${provider} settings reply is invalid.`);
+        return { revision: reply.revision, values: reply.values };
+    }
+    async function readImportSettings(api, provider, parse) {
+        for (let attempt = 0;; attempt += 1) {
+            try {
+                return parse(await api.post(`${provider}/settings`));
+            }
+            catch (error) {
+                if (!(error instanceof Amaterasu.ApiError) ||
+                    !["settings_loading", "settings_busy"].includes(error.code) || attempt >= 7)
+                    throw error;
+                await new Promise((resolve) => window.setTimeout(resolve, 50 * (attempt + 1)));
+            }
+        }
+    }
+    async function saveImportSettings(api, provider, current, values, parse) {
+        if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
+            current.revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error(`${provider} settings revision is invalid.`);
+        const confirms = (reply) => reply.revision === current.revision + 1 && sameConfigurationValue(reply.values, values);
+        let updated;
+        try {
+            updated = parse(await api.post(`${provider}/settings_update`, {
+                ...values,
+                expected_revision: current.revision,
+            }));
+        }
+        catch (error) {
+            if (!(error instanceof Amaterasu.ApiError) ||
+                (provider === "steam" ? error.code !== "settings_outcome_unknown" : error.code !== "update_outcome_unknown"))
+                throw error;
+            const reconciled = await readImportSettings(api, provider, parse);
+            if (!confirms(reconciled))
+                throw new Error(`${provider} update outcome is uncertain. Refresh and check the current values.`);
+            return reconciled;
+        }
+        if (!confirms(updated))
+            throw new Error(`${provider} update could not be confirmed. Refresh and check the current values.`);
+        const saved = await readImportSettings(api, provider, parse);
+        if (!confirms(saved))
+            throw new Error(`${provider} settings could not be confirmed after saving. Refresh and check the current values.`);
+        return saved;
+    }
+    function readSteamSettings(api) {
+        return readImportSettings(api, "steam", parseSteamSettingsReply);
+    }
+    Amaterasu.readSteamSettings = readSteamSettings;
+    function readLutrisSettings(api) {
+        return readImportSettings(api, "lutris", parseLutrisSettingsReply);
+    }
+    Amaterasu.readLutrisSettings = readLutrisSettings;
+    function saveSteamSettings(api, current, values) {
+        return saveImportSettings(api, "steam", current, values, parseSteamSettingsReply);
+    }
+    Amaterasu.saveSteamSettings = saveSteamSettings;
+    function saveLutrisSettings(api, current, values) {
+        return saveImportSettings(api, "lutris", current, values, parseLutrisSettingsReply);
+    }
+    Amaterasu.saveLutrisSettings = saveLutrisSettings;
+    class ImportSettingsLoadGate {
+        generation = 0;
+        invalidate() {
+            this.generation += 1;
+        }
+        isCurrent(generation) {
+            return generation === this.generation;
+        }
+        async read(load) {
+            const generation = ++this.generation;
+            try {
+                const value = await load();
+                return this.isCurrent(generation) ? { value, generation } : null;
+            }
+            catch (error) {
+                if (!this.isCurrent(generation))
+                    return null;
+                throw error;
+            }
+        }
+    }
+    Amaterasu.ImportSettingsLoadGate = ImportSettingsLoadGate;
     function lutrisStatusDescription(status) {
         if (!status.settings_ready)
             return "Lutris settings are still loading; discovery state is not confirmed.";
@@ -3217,7 +3342,9 @@ var Amaterasu;
         const hostArea = Amaterasu.el("div");
         const hostLoads = new NvhttpSettingsLoadGate();
         const steamArea = Amaterasu.el("div");
+        const steamLoads = new ImportSettingsLoadGate();
         const lutrisArea = Amaterasu.el("div");
+        const lutrisLoads = new ImportSettingsLoadGate();
         const playniteArea = Amaterasu.el("div");
         const playniteLoads = new PlayniteSettingsLoadGate();
         const inputArea = Amaterasu.el("div");
@@ -3351,7 +3478,10 @@ var Amaterasu;
         async function loadSteam() {
             steamArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Steam settings…"));
             try {
-                const settings = await context.api.post("steam/settings");
+                const loaded = await steamLoads.read(() => readSteamSettings(context.api));
+                if (loaded === null)
+                    return;
+                const { value: settings, generation } = loaded;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3386,23 +3516,38 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save Steam settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
-                        await context.api.post("steam/settings_update", {
-                            enabled: enabled.checked,
-                            auto_sync: autoSync.checked,
-                            exclude_games: parseSteamExclusions(exclusions.value),
-                            ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
-                            expected_revision: settings.revision,
-                        });
-                        context.notify("Steam discovery setting saved.");
-                        await loadSteam();
+                        steamLoads.invalidate();
+                        let saveStarted = false;
+                        try {
+                            const values = {
+                                enabled: enabled.checked,
+                                auto_sync: autoSync.checked,
+                                exclude_games: parseSteamExclusions(exclusions.value),
+                                ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
+                            };
+                            saveStarted = true;
+                            await saveSteamSettings(context.api, settings, values);
+                            await loadSteam();
+                            context.notify("Steam settings saved and confirmed. Scan status is shown below.");
+                        }
+                        catch (error) {
+                            if (saveStarted) {
+                                await loadSteam();
+                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
+                                    ? "Steam settings changed elsewhere. Review the latest values before saving again."
+                                    : "Steam save could not be confirmed. Review the latest values before saving again.");
+                                return;
+                            }
+                            throw error;
+                        }
                     });
                 });
                 steamArea.replaceChildren(Amaterasu.panel("Steam", form));
-                void loadSteamRuntimeStatus(runtimeStatus, context);
+                void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
             }
             catch (error) {
                 if (context.content.isConnected)
@@ -3412,10 +3557,14 @@ var Amaterasu;
         async function loadLutris() {
             lutrisArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Lutris settings…"));
             try {
-                const [settings, runtime] = await Promise.all([
-                    loadLutrisSettings(),
-                    context.api.post("lutris/status"),
-                ]);
+                const loaded = await lutrisLoads.read(async () => {
+                    const settings = await readLutrisSettings(context.api);
+                    const runtime = await context.api.post("lutris/status");
+                    return { settings, runtime };
+                });
+                if (loaded === null)
+                    return;
+                const { settings, runtime } = loaded.value;
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3434,7 +3583,11 @@ var Amaterasu;
                 exclusions.maxLength = 12_000;
                 exclusions.spellcheck = false;
                 exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
-                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", lutrisStatusDescription(runtime));
+                const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.settings_revision !== settings.revision ||
+                    runtime.enabled !== settings.values.enabled ||
+                    runtime.auto_sync !== settings.values.auto_sync
+                    ? "Saved Lutris settings are not yet reflected in provider status. Refresh to check application."
+                    : lutrisStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Lutris settings");
@@ -3442,6 +3595,8 @@ var Amaterasu;
                 save.disabled = !context.api.allows("configuration.write");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
                     const updated = await context.api.post("lutris/refresh");
+                    if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation))
+                        return;
                     runtimeStatus.className = updated.last_error ? "error" : "muted";
                     runtimeStatus.textContent = lutrisStatusDescription(updated);
                     context.notify("Lutris refresh requested.");
@@ -3462,22 +3617,27 @@ var Amaterasu;
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        lutrisLoads.invalidate();
+                        let saveStarted = false;
                         try {
-                            await context.api.post("lutris/settings_update", {
+                            const values = {
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
                                 autosync_remove_uninstalled: removeUninstalled.checked,
                                 include_steam: includeSteam.checked,
                                 exclude_games: parseLutrisExclusions(exclusions.value),
-                                expected_revision: settings.revision,
-                            });
-                            context.notify("Lutris settings saved.");
+                            };
+                            saveStarted = true;
+                            await saveLutrisSettings(context.api, settings, values);
                             await loadLutris();
+                            context.notify("Lutris settings saved and confirmed. Scan status is shown below.");
                         }
                         catch (error) {
-                            if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
-                                context.notify("Lutris settings changed elsewhere. The latest values have been reloaded.");
+                            if (saveStarted) {
                                 await loadLutris();
+                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
+                                    ? "Lutris settings changed elsewhere. Review the latest values before saving again."
+                                    : "Lutris save could not be confirmed. Review the latest values before saving again.");
                                 return;
                             }
                             throw error;
@@ -3490,23 +3650,6 @@ var Amaterasu;
             catch (error) {
                 if (context.content.isConnected)
                     lutrisArea.replaceChildren(Amaterasu.errorPanel(error, loadLutris));
-            }
-        }
-        async function loadLutrisSettings() {
-            for (let attempt = 0;; attempt += 1) {
-                try {
-                    return await context.api.post("lutris/settings");
-                }
-                catch (error) {
-                    if (!(error instanceof Amaterasu.ApiError) ||
-                        !["settings_loading", "settings_busy"].includes(error.code) ||
-                        attempt >= 7) {
-                        throw error;
-                    }
-                    await new Promise((resolve) => {
-                        window.setTimeout(resolve, 50 * (attempt + 1));
-                    });
-                }
             }
         }
         async function loadPlaynite() {
@@ -3942,15 +4085,17 @@ var Amaterasu;
                     inputArea.replaceChildren(Amaterasu.errorPanel(error, loadInput));
             }
         }
-        async function loadSteamRuntimeStatus(target, context) {
+        async function loadSteamRuntimeStatus(target, context, settings, generation) {
             try {
                 const status = await context.api.post("steam/status");
-                if (!target.isConnected)
+                if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
-                target.textContent = steamStatusDescription(status);
+                target.textContent = status.settings_ready && status.enabled !== settings.values.enabled
+                    ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
+                    : steamStatusDescription(status);
             }
             catch (error) {
-                if (!target.isConnected)
+                if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
                 target.textContent =
                     error instanceof Amaterasu.ApiError && error.code === "forbidden"

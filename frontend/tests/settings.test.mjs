@@ -1489,6 +1489,111 @@ test("Steam exclusions preserve valid ID and name objects without normalization"
   assert.deepEqual(ordinary(parse(JSON.stringify(exclusions))), exclusions);
 });
 
+const steamSettingsValues = () => ({
+  enabled: true, auto_sync: false,
+  exclude_games: [{ id: "730", name: "Counter-Strike 2" }, { name: "Portal 2" }],
+  include_tools: false, sync_all_installed: false, recent_games: 10,
+  recent_max_age_days: 30, autosync_remove_uninstalled: true,
+});
+
+const lutrisSettingsValues = () => ({
+  enabled: true, auto_sync: true, autosync_remove_uninstalled: true,
+  include_steam: false,
+  exclude_games: ["0007", { id: "42", name: "Old Title" }, { name: "Portal 2" }],
+});
+
+test("Steam and Lutris confirm full signed updates and durable readback", async () => {
+  for (const [provider, save, initial] of [
+    ["steam", context.Amaterasu.saveSteamSettings, steamSettingsValues()],
+    ["lutris", context.Amaterasu.saveLutrisSettings, lutrisSettingsValues()],
+  ]) {
+    const current = { ok: true, revision: 7, values: initial };
+    const requested = provider === "steam"
+      ? { ...initial, auto_sync: true, recent_games: 12 }
+      : { ...initial, include_steam: true };
+    const confirmed = { ok: true, revision: 8, values: requested };
+    const routes = [];
+    const api = { async post(route, body) {
+      routes.push(route);
+      if (route === `${provider}/settings_update`)
+        assert.deepEqual(ordinary(body), { ...requested, expected_revision: 7 });
+      else assert.equal(route, `${provider}/settings`);
+      return ordinary(confirmed);
+    } };
+    assert.deepEqual(ordinary(await save(api, current, requested)), confirmed);
+    assert.deepEqual(routes, [`${provider}/settings_update`, `${provider}/settings`]);
+  }
+});
+
+test("Steam and Lutris reject mismatched configured values and concurrent readback", async () => {
+  for (const [provider, save, values] of [
+    ["steam", context.Amaterasu.saveSteamSettings, steamSettingsValues()],
+    ["lutris", context.Amaterasu.saveLutrisSettings, lutrisSettingsValues()],
+  ]) {
+    const current = { ok: true, revision: 7, values };
+    const confirmed = { ok: true, revision: 8, values };
+    for (const update of [
+      { ...confirmed, revision: 9 },
+      { ...confirmed, ok: false },
+      { ...confirmed, values: { ...values, extra: true } },
+      { ...confirmed, values: { ...values, auto_sync: !values.auto_sync } },
+    ]) {
+      const routes = [];
+      await assert.rejects(save({ async post(route) {
+        routes.push(route);
+        return update;
+      } }, current, values));
+      assert.deepEqual(routes, [`${provider}/settings_update`]);
+    }
+    for (const readback of [
+      { ...confirmed, revision: 9 },
+      { ...confirmed, values: { ...values, auto_sync: !values.auto_sync } },
+      { ...confirmed, values: { ...values, exclude_games: [] } },
+    ]) {
+      await assert.rejects(save({ async post(route) {
+        return route === `${provider}/settings_update` ? confirmed : readback;
+      } }, current, values));
+    }
+  }
+});
+
+test("Steam and Lutris reconcile uncertain outcomes using their distinct provider codes", async () => {
+  class ApiError extends Error {
+    constructor(code) { super(code); this.code = code; }
+  }
+  context.ApiError = ApiError;
+  for (const [provider, code, save, values] of [
+    ["steam", "settings_outcome_unknown", context.Amaterasu.saveSteamSettings, steamSettingsValues()],
+    ["lutris", "update_outcome_unknown", context.Amaterasu.saveLutrisSettings, lutrisSettingsValues()],
+  ]) {
+    const current = { ok: true, revision: 7, values };
+    const committed = { ok: true, revision: 8, values };
+    const api = (readback) => ({ async post(route) {
+      if (route === `${provider}/settings_update`) throw new ApiError(code);
+      assert.equal(route, `${provider}/settings`);
+      return readback;
+    } });
+    assert.deepEqual(ordinary(await save(api(committed), current, values)), committed);
+    await assert.rejects(save(api({ ...committed, values: { ...values, auto_sync: !values.auto_sync } }),
+      current, values), /uncertain/);
+  }
+});
+
+test("Import settings load gate discards old settings and status after refresh or save", async () => {
+  const gate = new context.Amaterasu.ImportSettingsLoadGate();
+  let resolveOld;
+  const old = gate.read(() => new Promise((resolve) => { resolveOld = resolve; }));
+  const latest = gate.read(async () => ({ revision: 9 }));
+  resolveOld({ revision: 8 });
+  assert.equal(await old, null);
+  assert.equal((await latest).value.revision, 9);
+  let rejectOld;
+  const failing = gate.read(() => new Promise((_, reject) => { rejectOld = reject; }));
+  gate.invalidate();
+  rejectOld(new Error("stale status failed"));
+  assert.equal(await failing, null);
+});
+
 test("Lutris exclusion editor preserves ID precedence and bounds entries", () => {
   const parse = context.Amaterasu.parseLutrisExclusions;
   const exclusions = ["0007", { id: "42", name: "Old title" }, { name: "Portal 2" }];

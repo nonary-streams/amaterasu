@@ -147,6 +147,7 @@ namespace Amaterasu {
     rtsp_listener_error: string | null;
   }
   export interface SteamSettings {
+    ok: true;
     revision: number;
     values: {
       enabled: boolean;
@@ -170,6 +171,7 @@ namespace Amaterasu {
         name?: string;
       };
   export interface LutrisSettings {
+    ok: true;
     revision: number;
     values: {
       enabled: boolean;
