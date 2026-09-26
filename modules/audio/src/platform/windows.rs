@@ -1020,7 +1020,7 @@ pub struct Capture {
     follow_console_default: bool,
     route_virtual_sink: bool,
     next_endpoint_check: Instant,
-    buffer_error_since: Option<Instant>,
+    buffer_errors: BufferErrorStreak,
     format: Format,
     timeline: Timeline,
     recovery_config: RecoveryConfig,
@@ -1289,7 +1289,7 @@ impl Capture {
                 follow_console_default,
                 route_virtual_sink,
                 next_endpoint_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
-                buffer_error_since: None,
+                buffer_errors: BufferErrorStreak::default(),
                 format,
                 timeline: Timeline::new(),
                 recovery_config,
@@ -1332,7 +1332,7 @@ impl Capture {
             if matches!(
                 packet_size_after_query(
                     self.capture.GetNextPacketSize(),
-                    &mut self.buffer_error_since,
+                    &mut self.buffer_errors,
                     Instant::now(),
                 )?,
                 None | Some(0)
@@ -1350,7 +1350,7 @@ impl Capture {
                 &self.capture,
                 acquired,
                 frames,
-                &mut self.buffer_error_since,
+                &mut self.buffer_errors,
             )?
             else {
                 return Ok(None);
@@ -1477,17 +1477,17 @@ fn borrowed_packet_after_acquisition<'a, C: CaptureBufferRelease + ?Sized>(
     capture: &'a C,
     acquired: windows::core::Result<()>,
     frames: u32,
-    first_error: &mut Option<Instant>,
+    buffer_errors: &mut BufferErrorStreak,
 ) -> AudioResult<Option<BorrowedPacket<'a, C>>> {
     match acquired {
         Ok(()) => {
-            *first_error = None;
+            buffer_errors.clear();
             Ok(Some(BorrowedPacket::new(capture, frames)))
         }
         // WASAPI may briefly return no buffer even after reporting frames.
         // A failed GetBuffer owns no buffer, so there is nothing to release.
         Err(error) if transient_buffer_error(error.code()) => {
-            if buffer_error_requires_recovery(first_error, Instant::now()) {
+            if buffer_errors.record(Instant::now()) {
                 Err("device_lost")
             } else {
                 Ok(None)
@@ -1499,13 +1499,18 @@ fn borrowed_packet_after_acquisition<'a, C: CaptureBufferRelease + ?Sized>(
 
 fn packet_size_after_query(
     queried: windows::core::Result<u32>,
-    first_error: &mut Option<Instant>,
+    buffer_errors: &mut BufferErrorStreak,
     now: Instant,
 ) -> AudioResult<Option<u32>> {
     match queried {
-        Ok(size) => Ok(Some(size)),
+        Ok(size) => {
+            // Empty polls are normal, but a long healthy interval must not
+            // carry one old buffer error into an unrelated later failure.
+            buffer_errors.expire(now);
+            Ok(Some(size))
+        }
         Err(error) if transient_buffer_error(error.code()) => {
-            if buffer_error_requires_recovery(first_error, now) {
+            if buffer_errors.record(now) {
                 Err("device_lost")
             } else {
                 Ok(None)
@@ -1547,9 +1552,33 @@ fn transient_buffer_error(code: HRESULT) -> bool {
     code == AUDCLNT_E_BUFFER_ERROR
 }
 
-fn buffer_error_requires_recovery(first_error: &mut Option<Instant>, now: Instant) -> bool {
-    let first_error = first_error.get_or_insert(now);
-    now.saturating_duration_since(*first_error) >= BUFFER_ERROR_RECOVERY_DELAY
+#[derive(Default)]
+struct BufferErrorStreak {
+    first: Option<Instant>,
+    last: Option<Instant>,
+}
+
+impl BufferErrorStreak {
+    fn clear(&mut self) {
+        self.first = None;
+        self.last = None;
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) >= BUFFER_ERROR_RECOVERY_DELAY)
+        {
+            self.clear();
+        }
+    }
+
+    fn record(&mut self, now: Instant) -> bool {
+        self.expire(now);
+        let first = *self.first.get_or_insert(now);
+        self.last = Some(now);
+        now.saturating_duration_since(first) >= BUFFER_ERROR_RECOVERY_DELAY
+    }
 }
 
 #[cfg(test)]
@@ -1827,28 +1856,19 @@ mod tests {
         assert!(transient_buffer_error(AUDCLNT_E_BUFFER_ERROR));
         assert!(!transient_buffer_error(AUDCLNT_E_DEVICE_INVALIDATED));
         let started = Instant::now();
-        let mut first_error = None;
-        assert!(!buffer_error_requires_recovery(&mut first_error, started));
-        assert!(!buffer_error_requires_recovery(
-            &mut first_error,
-            started + BUFFER_ERROR_RECOVERY_DELAY - Duration::from_nanos(1)
-        ));
-        assert!(buffer_error_requires_recovery(
-            &mut first_error,
-            started + BUFFER_ERROR_RECOVERY_DELAY
-        ));
-        first_error = None; // A successful acquisition clears the failure streak.
-        assert!(!buffer_error_requires_recovery(
-            &mut first_error,
-            started + BUFFER_ERROR_RECOVERY_DELAY
-        ));
+        let mut errors = BufferErrorStreak::default();
+        assert!(!errors.record(started));
+        assert!(!errors.record(started + BUFFER_ERROR_RECOVERY_DELAY - Duration::from_nanos(1)));
+        assert!(errors.record(started + BUFFER_ERROR_RECOVERY_DELAY));
+        errors.clear(); // A successful acquisition clears the failure streak.
+        assert!(!errors.record(started + BUFFER_ERROR_RECOVERY_DELAY));
 
         let capture = FakeCaptureBuffer::default();
         let acquisition = borrowed_packet_after_acquisition(
             &capture,
             Err(windows::core::Error::from_hresult(AUDCLNT_E_BUFFER_ERROR)),
             8,
-            &mut None,
+            &mut BufferErrorStreak::default(),
         );
         assert!(matches!(acquisition, Ok(None)));
         assert!(capture.released.lock().unwrap().is_empty());
@@ -1857,46 +1877,68 @@ mod tests {
     #[test]
     fn empty_polls_do_not_hide_repeated_buffer_failures_from_recovery() {
         let started = Instant::now();
-        let mut first_error = Some(started);
+        let mut errors = BufferErrorStreak::default();
+        assert!(!errors.record(started));
         assert_eq!(
-            packet_size_after_query(Ok(0), &mut first_error, started + Duration::from_millis(1)),
+            packet_size_after_query(Ok(0), &mut errors, started + Duration::from_millis(1)),
             Ok(Some(0))
         );
-        assert_eq!(first_error, Some(started));
+        assert_eq!(errors.first, Some(started));
 
         let buffer_error = || windows::core::Error::from_hresult(AUDCLNT_E_BUFFER_ERROR);
         assert_eq!(
             packet_size_after_query(
                 Err(buffer_error()),
-                &mut first_error,
+                &mut errors,
                 started + BUFFER_ERROR_RECOVERY_DELAY - Duration::from_nanos(1),
             ),
             Ok(None)
         );
         assert_eq!(
-            packet_size_after_query(
-                Ok(0),
-                &mut first_error,
-                started + BUFFER_ERROR_RECOVERY_DELAY
-            ),
+            packet_size_after_query(Ok(0), &mut errors, started + BUFFER_ERROR_RECOVERY_DELAY),
             Ok(Some(0))
         );
         assert_eq!(
             packet_size_after_query(
                 Err(buffer_error()),
-                &mut first_error,
+                &mut errors,
                 started + BUFFER_ERROR_RECOVERY_DELAY,
             ),
             Err("device_lost")
         );
 
         let capture = FakeCaptureBuffer::default();
-        let acquired = borrowed_packet_after_acquisition(&capture, Ok(()), 4, &mut first_error)
+        let acquired = borrowed_packet_after_acquisition(&capture, Ok(()), 4, &mut errors)
             .unwrap()
             .unwrap();
         acquired.release().unwrap();
-        assert_eq!(first_error, None);
+        assert_eq!(errors.first, None);
         assert_eq!(*capture.released.lock().unwrap(), [4]);
+    }
+
+    #[test]
+    fn isolated_buffer_errors_after_a_quiet_interval_do_not_trigger_recovery() {
+        let started = Instant::now();
+        let mut errors = BufferErrorStreak::default();
+        let buffer_error = || windows::core::Error::from_hresult(AUDCLNT_E_BUFFER_ERROR);
+
+        assert_eq!(
+            packet_size_after_query(Err(buffer_error()), &mut errors, started),
+            Ok(None)
+        );
+        assert_eq!(
+            packet_size_after_query(Ok(0), &mut errors, started + BUFFER_ERROR_RECOVERY_DELAY,),
+            Ok(Some(0))
+        );
+        assert_eq!(errors.first, None);
+        assert_eq!(
+            packet_size_after_query(
+                Err(buffer_error()),
+                &mut errors,
+                started + BUFFER_ERROR_RECOVERY_DELAY + Duration::from_millis(1),
+            ),
+            Ok(None)
+        );
     }
 
     #[test]
