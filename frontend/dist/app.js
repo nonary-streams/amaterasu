@@ -2548,11 +2548,20 @@ var Amaterasu;
     }
     Amaterasu.HostLoggingLoadGate = HostLoggingLoadGate;
     async function readDiagnosticsLoggingStatus(api) {
+        if (api.allows && !api.allows("diagnostics.read"))
+            return { status: null, error: "permission" };
+        let reply;
         try {
-            return parseDiagnosticsLoggingStatus(await api.post("diagnostics/status"));
+            reply = await api.post("diagnostics/status");
         }
         catch {
-            return null;
+            return { status: null, error: "request" };
+        }
+        try {
+            return { status: parseDiagnosticsLoggingStatus(reply), error: null };
+        }
+        catch {
+            return { status: null, error: "invalid" };
         }
     }
     async function saveHostLoggingState(api, current, level, path) {
@@ -2560,7 +2569,14 @@ var Amaterasu;
         return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
     }
     Amaterasu.saveHostLoggingState = saveHostLoggingState;
-    function diagnosticsLoggingDescription(savedRevision, status) {
+    function diagnosticsLoggingDescription(savedRevision, result) {
+        if (result.error === "permission")
+            return "Saved host logging policy; diagnostics status requires diagnostics.read permission.";
+        if (result.error === "request")
+            return "Saved host logging policy; diagnostics status request failed. Refresh to retry.";
+        if (result.error === "invalid")
+            return "Saved host logging policy; diagnostics returned invalid status. Refresh to retry.";
+        const status = result.status;
         if (!status)
             return "Saved host logging policy; diagnostics status is unavailable. Refresh to check whether it applied.";
         if (!status.ready)
@@ -3709,7 +3725,7 @@ var Amaterasu;
                 save.disabled = !context.api.allows("configuration.write");
                 const refresh = Amaterasu.button("Refresh diagnostics status", () => {
                     void Amaterasu.runAction(refresh, status, async () => {
-                        const current = parseDiagnosticsLoggingStatus(await context.api.post("diagnostics/status"));
+                        const current = await readDiagnosticsLoggingStatus(context.api);
                         applicationStatus.textContent = diagnosticsLoggingDescription(settings.revision, current);
                     });
                 });

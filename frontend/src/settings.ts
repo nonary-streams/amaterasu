@@ -508,6 +508,11 @@ namespace Amaterasu {
     logging_sink?: { state: "disabled" | "healthy" | "failed"; failure: "open" | "write" | null };
   };
 
+  type DiagnosticsStatusRead = {
+    status: DiagnosticsSinkStatus | null;
+    error: "permission" | "request" | "invalid" | null;
+  };
+
   export function parseDiagnosticsLoggingStatus(value: unknown): DiagnosticsSinkStatus {
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("Diagnostics status is invalid.");
@@ -529,8 +534,8 @@ namespace Amaterasu {
   }
 
   export async function readHostLoggingState(
-    api: Pick<Api, "post">,
-  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsSinkStatus | null }> {
+    api: Pick<Api, "post"> & Partial<Pick<Api, "allows">>,
+  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsStatusRead }> {
     const settings = parseHostConfigurationReply(await api.post<unknown>("host-configuration/get"));
     return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
   }
@@ -542,9 +547,9 @@ namespace Amaterasu {
       this.generation += 1;
     }
 
-    async read(api: Pick<Api, "post">): Promise<{
+    async read(api: Pick<Api, "post"> & Partial<Pick<Api, "allows">>): Promise<{
       settings: HostConfiguration;
-      diagnostics: DiagnosticsSinkStatus | null;
+      diagnostics: DiagnosticsStatusRead;
     } | null> {
       const generation = ++this.generation;
       try {
@@ -557,28 +562,45 @@ namespace Amaterasu {
     }
   }
 
-  async function readDiagnosticsLoggingStatus(api: Pick<Api, "post">): Promise<DiagnosticsSinkStatus | null> {
+  async function readDiagnosticsLoggingStatus(
+    api: Pick<Api, "post"> & Partial<Pick<Api, "allows">>,
+  ): Promise<DiagnosticsStatusRead> {
+    if (api.allows && !api.allows("diagnostics.read"))
+      return { status: null, error: "permission" };
+    let reply: unknown;
     try {
-      return parseDiagnosticsLoggingStatus(await api.post<unknown>("diagnostics/status"));
+      reply = await api.post<unknown>("diagnostics/status");
     } catch {
-      return null;
+      return { status: null, error: "request" };
+    }
+    try {
+      return { status: parseDiagnosticsLoggingStatus(reply), error: null };
+    } catch {
+      return { status: null, error: "invalid" };
     }
   }
 
   export async function saveHostLoggingState(
-    api: Pick<Api, "post">,
+    api: Pick<Api, "post"> & Partial<Pick<Api, "allows">>,
     current: HostConfiguration,
     level: string,
     path: string,
-  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsSinkStatus | null }> {
+  ): Promise<{ settings: HostConfiguration; diagnostics: DiagnosticsStatusRead }> {
     const settings = await saveHostLoggingSettings(api, current, level, path);
     return { settings, diagnostics: await readDiagnosticsLoggingStatus(api) };
   }
 
   export function diagnosticsLoggingDescription(
     savedRevision: number,
-    status: DiagnosticsSinkStatus | null,
+    result: DiagnosticsStatusRead,
   ): string {
+    if (result.error === "permission")
+      return "Saved host logging policy; diagnostics status requires diagnostics.read permission.";
+    if (result.error === "request")
+      return "Saved host logging policy; diagnostics status request failed. Refresh to retry.";
+    if (result.error === "invalid")
+      return "Saved host logging policy; diagnostics returned invalid status. Refresh to retry.";
+    const status = result.status;
     if (!status)
       return "Saved host logging policy; diagnostics status is unavailable. Refresh to check whether it applied.";
     if (!status.ready)
@@ -1900,7 +1922,7 @@ namespace Amaterasu {
         save.disabled = !context.api.allows("configuration.write");
         const refresh = button("Refresh diagnostics status", () => {
           void runAction(refresh, status, async () => {
-            const current = parseDiagnosticsLoggingStatus(await context.api.post<unknown>("diagnostics/status"));
+            const current = await readDiagnosticsLoggingStatus(context.api);
             applicationStatus.textContent = diagnosticsLoggingDescription(settings.revision, current);
           });
         });
