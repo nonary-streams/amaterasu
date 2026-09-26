@@ -1056,6 +1056,12 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
     let started = harness.request(&mut pipeline, "nvhttp", launch);
     assert_eq!(started["launch"]["state"], "active", "{started}");
     harness.catalog_config_overrides = Some(json!({"dd_hdr_option":"auto"}));
+    let mut unversioned_global = prepare.clone();
+    unversioned_global["global_revision"] = Value::Null;
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", unversioned_global)["code"],
+        "display_admission_denied"
+    );
     assert_eq!(
         harness.request(&mut pipeline, "other-service", prepare.clone())["code"],
         "display_admission_denied"

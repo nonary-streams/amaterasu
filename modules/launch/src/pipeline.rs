@@ -591,7 +591,8 @@ impl Pipeline {
                 rtsp_operation_id,
                 request_sha256,
             } => {
-                if caller != "nvhttp" {
+                if caller != "nvhttp" || (global_revision.is_none() && !global_overrides.is_empty())
+                {
                     return complete(send, request, error("display_admission_denied"));
                 }
                 let Some(record) = self.records.values.values_mut().find(|record| {
