@@ -154,6 +154,7 @@ fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
 struct FakePlatform {
     current_snapshot: Option<Snapshot>,
     prepared_configuration: Option<Configuration>,
+    preserving_selected: Vec<String>,
     effects: Vec<&'static str>,
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
@@ -264,6 +265,14 @@ impl Platform for FakePlatform {
         self.current_snapshot = Some(before.clone());
         Ok(before)
     }
+    fn prepare_preserving(
+        &mut self,
+        configuration: &Configuration,
+        selected: &str,
+    ) -> DisplayResult<Snapshot> {
+        self.preserving_selected.push(format!("prepare:{selected}"));
+        self.prepare(configuration)
+    }
     fn apply(
         &mut self,
         configuration: &Configuration,
@@ -331,6 +340,16 @@ impl Platform for FakePlatform {
             .after_mutation());
         }
         Ok(())
+    }
+    fn apply_preserving(
+        &mut self,
+        configuration: &Configuration,
+        before: &Snapshot,
+        selected: &str,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        self.preserving_selected.push(format!("apply:{selected}"));
+        self.apply(configuration, before, guard)
     }
     fn restore(
         &mut self,
@@ -642,7 +661,7 @@ fn mutating_configuration_options_require_revision_without_effect() {
 }
 
 #[test]
-fn ensure_active_rejects_rebuilding_untouched_native_monitor() {
+fn ensure_active_uses_preserving_path_for_other_native_monitor() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(
         FakePlatform {
@@ -663,9 +682,104 @@ fn ensure_active_rejects_rebuilding_untouched_native_monitor() {
             &baseline["topology_revision"],
         ),
     );
-    assert_eq!(applied["error"]["code"], "unsupported_topology");
-    assert!(state.journal.is_none());
-    assert!(pipeline.platform.effects.is_empty());
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        ["prepare:monitor.one", "apply:monitor.one"]
+    );
+    let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    assert_eq!(prepared.displays.len(), 2);
+    assert_eq!(prepared.displays[1].width, 1920);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.applied_modes.len(), 2);
+}
+
+#[test]
+fn ensure_primary_translates_two_monitor_topology_through_preserving_path() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            reorder_readback: true,
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let baseline = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_primary",
+            "monitor.two",
+            two_display_configuration(),
+            &baseline["topology_revision"],
+        ),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(
+        pipeline.platform.preserving_selected,
+        ["prepare:monitor.two", "apply:monitor.two"]
+    );
+    let prepared = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    assert_eq!(prepared.displays[0].x, -1920);
+    assert_eq!(prepared.displays[1].x, 0);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+}
+
+#[test]
+fn preserving_primary_hotplug_and_partial_failure_keep_exact_recovery_rules() {
+    for (drift, expected_effects) in [(true, vec![]), (false, vec!["apply", "restore"])] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                reorder_readback: true,
+                hdr_supported: true,
+                drift_on_apply: drift,
+                apply_failure: !drift,
+                ..Default::default()
+            },
+            true,
+        );
+        let baseline = state.run(&mut pipeline, "owner", json!({"action":"snapshot"}));
+        let result = state.run(
+            &mut pipeline,
+            "owner",
+            mutating_option_request(
+                "ensure_primary",
+                "monitor.two",
+                two_display_configuration(),
+                &baseline["topology_revision"],
+            ),
+        );
+        assert_eq!(
+            result["error"]["code"],
+            if drift {
+                "topology_changed"
+            } else {
+                "platform_error"
+            }
+        );
+        assert_eq!(pipeline.platform.effects, expected_effects);
+        assert_eq!(
+            pipeline.platform.preserving_selected,
+            ["prepare:monitor.two", "apply:monitor.two"]
+        );
+        assert!(state.journal.is_none());
+        if !drift {
+            assert_eq!(pipeline.platform.applied_modes.len(), 2);
+        }
+    }
 }
 
 #[test]
@@ -2037,6 +2151,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         stage: Stage::Armed {
             journal,
             configuration: serde_json::from_value(configuration()).unwrap(),
+            preserve_target: None,
         },
     });
     let mut completed = false;

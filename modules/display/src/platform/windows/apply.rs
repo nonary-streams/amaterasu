@@ -88,7 +88,7 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
     let mut modes = Vec::new();
     let mut source_modes = BTreeMap::new();
     for saved in &snapshot.paths {
-        let mut matched = None;
+        let mut matched: Option<DISPLAYCONFIG_PATH_INFO> = None;
         for candidate in &available.paths {
             if candidate.targetInfo.targetAvailable == 0 {
                 continue;
@@ -97,8 +97,22 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
             // Monitor device-interface paths are durable identities. Adapter
             // LUIDs are session-local and must be rebound after an OS restart.
             if device.id == saved.id && device.source == saved.source_name {
-                matched = Some(*candidate);
-                break;
+                if let Some(previous) = matched {
+                    let old_target = address(previous.targetInfo.adapterId, previous.targetInfo.id);
+                    let new_target =
+                        address(candidate.targetInfo.adapterId, candidate.targetInfo.id);
+                    let old_source = address(previous.sourceInfo.adapterId, previous.sourceInfo.id);
+                    let new_source =
+                        address(candidate.sourceInfo.adapterId, candidate.sourceInfo.id);
+                    if old_target != new_target || old_source != new_source {
+                        return Err(DisplayError::new(
+                            "unsupported_topology",
+                            "saved monitor/source route is ambiguous",
+                        ));
+                    }
+                } else {
+                    matched = Some(*candidate);
+                }
             }
         }
         let mut path = matched.ok_or_else(|| {
@@ -107,6 +121,12 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
                 format!("saved monitor/source route is unavailable: {}", saved.id),
             )
         })?;
+        if path.targetInfo.outputTechnology != saved.output_technology {
+            return Err(DisplayError::new(
+                "recovery_blocked",
+                "saved display output technology changed",
+            ));
+        }
         let source_key = (
             path.sourceInfo.adapterId.LowPart,
             path.sourceInfo.adapterId.HighPart,
@@ -155,6 +175,177 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
         paths.push(path);
     }
     Ok(ConfigurationBuffers { paths, modes })
+}
+
+pub fn preserving(
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+) -> DisplayResult<ConfigurationBuffers> {
+    let bound = restoration(before)?;
+    preserve_bound(bound, configuration, before, selected)
+}
+
+pub(super) fn preserve_bound(
+    mut bound: ConfigurationBuffers,
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: &str,
+) -> DisplayResult<ConfigurationBuffers> {
+    configuration.validate()?;
+    before.configuration()?;
+    if bound.paths.len() != before.paths.len() || configuration.displays.len() != before.paths.len()
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "preserved request must contain every active path",
+        ));
+    }
+    let mut selected_found = false;
+    for (path, saved) in bound.paths.iter_mut().zip(&before.paths) {
+        let wanted = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&saved.id))
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_topology", "active display was omitted")
+            })?;
+        let mode = bound
+            .modes
+            .iter_mut()
+            .find(|mode| {
+                mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                    && address(mode.adapterId, mode.id)
+                        == address(path.sourceInfo.adapterId, path.sourceInfo.id)
+            })
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_topology", "bound source mode is missing")
+            })?;
+        let mut source = saved.source.clone();
+        source.x = wanted.x;
+        source.y = wanted.y;
+        if saved.id.eq_ignore_ascii_case(selected) {
+            selected_found = true;
+            source.width = wanted.width;
+            source.height = wanted.height;
+            source.pixel_format = DISPLAYCONFIG_PIXELFORMAT_32BPP;
+            path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            path.targetInfo.refreshRate = native_rational(wanted.refresh);
+            path.targetInfo.rotation = rotation(wanted.rotation);
+            path.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
+            path.flags = DISPLAYCONFIG_PATH_ACTIVE;
+        } else if saved.source.width != wanted.width
+            || saved.source.height != wanted.height
+            || !saved.refresh.equivalent(wanted.refresh)
+            || saved.rotation != rotation(wanted.rotation)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "untouched monitor mode changed in preserving request",
+            ));
+        }
+        mode.Anonymous = DISPLAYCONFIG_MODE_INFO_0 {
+            sourceMode: native_source(&source),
+        };
+    }
+    if !selected_found {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "selected monitor is not active",
+        ));
+    }
+    compact_modes(&mut bound)?;
+    Ok(bound)
+}
+
+fn compact_modes(bound: &mut ConfigurationBuffers) -> DisplayResult<()> {
+    let mut compact = Vec::new();
+    let mut indexes = BTreeMap::new();
+    for path in &mut bound.paths {
+        // SAFETY: restoration and preserving wrote the modeInfoIdx union variant
+        // for every supplied path; target INVALID is the documented sentinel.
+        let source_index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+        let source = remap_mode(
+            &bound.modes,
+            &mut compact,
+            &mut indexes,
+            source_index,
+            DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        )?;
+        path.sourceInfo.Anonymous.modeInfoIdx = source;
+        let target_index = unsafe { path.targetInfo.Anonymous.modeInfoIdx };
+        if target_index != DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
+            let target = remap_mode(
+                &bound.modes,
+                &mut compact,
+                &mut indexes,
+                target_index,
+                DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+            )?;
+            path.targetInfo.Anonymous.modeInfoIdx = target;
+        }
+    }
+    bound.modes = compact;
+    Ok(())
+}
+
+fn remap_mode(
+    old: &[DISPLAYCONFIG_MODE_INFO],
+    compact: &mut Vec<DISPLAYCONFIG_MODE_INFO>,
+    indexes: &mut BTreeMap<u32, u32>,
+    index: u32,
+    expected_type: DISPLAYCONFIG_MODE_INFO_TYPE,
+) -> DisplayResult<u32> {
+    let mode = old.get(index as usize).ok_or_else(|| {
+        DisplayError::new(
+            "unsupported_topology",
+            "CCD mode index exceeds bound snapshot",
+        )
+    })?;
+    if mode.infoType != expected_type {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "CCD mode index has wrong type",
+        ));
+    }
+    if let Some(mapped) = indexes.get(&index) {
+        return Ok(*mapped);
+    }
+    let mapped = compact.len() as u32;
+    compact.push(*mode);
+    indexes.insert(index, mapped);
+    Ok(mapped)
+}
+
+pub fn verifies_untouched(
+    configuration: &Configuration,
+    before: &Snapshot,
+    current: &Snapshot,
+    selected: &str,
+) -> bool {
+    let mut expected = before.clone();
+    expected
+        .paths
+        .retain(|path| !path.id.eq_ignore_ascii_case(selected));
+    if expected.paths.is_empty() {
+        return true;
+    }
+    for path in &mut expected.paths {
+        let Some(wanted) = configuration
+            .displays
+            .iter()
+            .find(|display| display.id.eq_ignore_ascii_case(&path.id))
+        else {
+            return false;
+        };
+        path.source.x = wanted.x;
+        path.source.y = wanted.y;
+    }
+    let mut observed = current.clone();
+    observed
+        .paths
+        .retain(|path| !path.id.eq_ignore_ascii_case(selected));
+    expected.equivalent(&observed)
 }
 
 pub fn set(buffers: &ConfigurationBuffers, apply: bool) -> DisplayResult<()> {

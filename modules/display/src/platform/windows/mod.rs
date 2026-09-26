@@ -54,30 +54,14 @@ impl Platform for WindowsPlatform {
         Ok(json!({"ok":true,"platform":self.name(),"entries":rows,"next_offset":next}))
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
-        let before = query::snapshot()?;
-        for display in &configuration.displays {
-            let active = before
-                .paths
-                .iter()
-                .find(|path| path.id.eq_ignore_ascii_case(&display.id));
-            if display.hdr_enabled == Some(true) && active.is_none() {
-                return Err(DisplayError::new(
-                    "unsupported_display",
-                    "HDR enablement requires an active target with a recoverable baseline",
-                ));
-            }
-            if display.hdr_enabled == Some(true)
-                && active.is_some_and(|path| path.hdr_enabled.is_none())
-            {
-                return Err(DisplayError::new(
-                    "unsupported_display",
-                    "HDR enablement requires a target with queryable HDR state",
-                ));
-            }
-        }
-        let requested = apply::requested(configuration)?;
-        apply::set(&requested, false)?;
-        Ok(before)
+        prepare_configuration(configuration, None)
+    }
+    fn prepare_preserving(
+        &mut self,
+        configuration: &Configuration,
+        selected: &str,
+    ) -> DisplayResult<Snapshot> {
+        prepare_configuration(configuration, Some(selected))
     }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
         let first = query::snapshot()?;
@@ -99,43 +83,16 @@ impl Platform for WindowsPlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
-        if before.revision()? != query::snapshot()?.revision()? {
-            return Err(DisplayError::new(
-                "topology_changed",
-                "display configuration changed before the durable apply boundary",
-            ));
-        }
-        let requested = apply::requested(configuration)?;
-        apply::set(&requested, false)?;
-        guard()?;
-        if before.revision()? != query::snapshot()?.revision()? {
-            return Err(DisplayError::new(
-                "topology_changed",
-                "display topology changed after native validation",
-            ));
-        }
-        apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
-        verify_applied_configuration(configuration, query::snapshot())?;
-        for display in &configuration.displays {
-            if let Some(enabled) = display.hdr_enabled {
-                if !enabled
-                    && !before
-                        .paths
-                        .iter()
-                        .any(|path| path.id.eq_ignore_ascii_case(&display.id))
-                {
-                    query::verify_newly_active_hdr_is_off(&display.id)
-                        .map_err(DisplayError::after_mutation)?;
-                } else {
-                    query::set_advanced_color(&display.id, enabled)
-                        .map_err(DisplayError::after_mutation)?;
-                }
-            }
-        }
-        // HDR changes can affect another target or renegotiate mode/topology.
-        // Verify the complete request again after the last HDR operation.
-        let final_state = verify_applied_configuration(configuration, query::snapshot())?;
-        verify_requested_hdr(configuration, &final_state)
+        apply_configuration(configuration, before, None, guard)
+    }
+    fn apply_preserving(
+        &mut self,
+        configuration: &Configuration,
+        before: &Snapshot,
+        selected: &str,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        apply_configuration(configuration, before, Some(selected), guard)
     }
     fn restore(
         &mut self,
@@ -162,6 +119,98 @@ impl Platform for WindowsPlatform {
         }
         Ok(())
     }
+}
+
+fn prepare_configuration(
+    configuration: &Configuration,
+    selected: Option<&str>,
+) -> DisplayResult<Snapshot> {
+    let before = query::snapshot()?;
+    for display in &configuration.displays {
+        let active = before
+            .paths
+            .iter()
+            .find(|path| path.id.eq_ignore_ascii_case(&display.id));
+        if display.hdr_enabled == Some(true) && active.is_none() {
+            return Err(DisplayError::new(
+                "unsupported_display",
+                "HDR enablement requires an active target with a recoverable baseline",
+            ));
+        }
+        if display.hdr_enabled == Some(true)
+            && active.is_some_and(|path| path.hdr_enabled.is_none())
+        {
+            return Err(DisplayError::new(
+                "unsupported_display",
+                "HDR enablement requires a target with queryable HDR state",
+            ));
+        }
+    }
+    let requested = match selected {
+        Some(selected) => apply::preserving(configuration, &before, selected)?,
+        None => apply::requested(configuration)?,
+    };
+    apply::set(&requested, false)?;
+    Ok(before)
+}
+
+fn apply_configuration(
+    configuration: &Configuration,
+    before: &Snapshot,
+    selected: Option<&str>,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    if before.revision()? != query::snapshot()?.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "display configuration changed before the durable apply boundary",
+        ));
+    }
+    let requested = match selected {
+        Some(selected) => apply::preserving(configuration, before, selected)?,
+        None => apply::requested(configuration)?,
+    };
+    apply::set(&requested, false)?;
+    guard()?;
+    if before.revision()? != query::snapshot()?.revision()? {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "display topology changed after native validation",
+        ));
+    }
+    apply::set(&requested, true).map_err(DisplayError::after_mutation)?;
+    verify_applied_configuration(configuration, query::snapshot())?;
+    for display in &configuration.displays {
+        if selected.is_some_and(|id| !display.id.eq_ignore_ascii_case(id)) {
+            continue;
+        }
+        if let Some(enabled) = display.hdr_enabled {
+            if !enabled
+                && !before
+                    .paths
+                    .iter()
+                    .any(|path| path.id.eq_ignore_ascii_case(&display.id))
+            {
+                query::verify_newly_active_hdr_is_off(&display.id)
+                    .map_err(DisplayError::after_mutation)?;
+            } else {
+                query::set_advanced_color(&display.id, enabled)
+                    .map_err(DisplayError::after_mutation)?;
+            }
+        }
+    }
+    let final_state = verify_applied_configuration(configuration, query::snapshot())?;
+    verify_requested_hdr(configuration, &final_state)?;
+    if let Some(selected) = selected
+        && !apply::verifies_untouched(configuration, before, &final_state, selected)
+    {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "untouched Windows display path changed during apply",
+        )
+        .after_mutation());
+    }
+    Ok(())
 }
 
 fn verify_applied_configuration(
@@ -206,10 +255,57 @@ fn verify_requested_hdr(configuration: &Configuration, readback: &Snapshot) -> D
 
 #[cfg(test)]
 mod tests {
+    use super::conversion::{native_signal, native_source};
     use super::*;
     use crate::model::{
         Address, DisplayPath, DisplaySetting, Rational, Rotation, Signal, SourceMode,
     };
+    use windows_sys::Win32::Devices::Display::*;
+    use windows_sys::Win32::Foundation::LUID;
+    use windows_sys::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+
+    fn synthetic_bound(snapshot: &Snapshot) -> query::ConfigurationBuffers {
+        let mut paths = Vec::new();
+        let mut modes = Vec::new();
+        for saved in &snapshot.paths {
+            let mut path = DISPLAYCONFIG_PATH_INFO::default();
+            path.sourceInfo.adapterId = LUID {
+                LowPart: saved.source_address.adapter_low,
+                HighPart: saved.source_address.adapter_high,
+            };
+            path.sourceInfo.id = saved.source_address.id;
+            path.targetInfo.adapterId = LUID {
+                LowPart: saved.target_address.adapter_low,
+                HighPart: saved.target_address.adapter_high,
+            };
+            path.targetInfo.id = saved.target_address.id;
+            path.sourceInfo.Anonymous.modeInfoIdx = modes.len() as u32;
+            modes.push(DISPLAYCONFIG_MODE_INFO {
+                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+                id: path.sourceInfo.id,
+                adapterId: path.sourceInfo.adapterId,
+                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                    sourceMode: native_source(&saved.source),
+                },
+            });
+            path.targetInfo.Anonymous.modeInfoIdx = modes.len() as u32;
+            modes.push(DISPLAYCONFIG_MODE_INFO {
+                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+                id: path.targetInfo.id,
+                adapterId: path.targetInfo.adapterId,
+                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                    targetMode: DISPLAYCONFIG_TARGET_MODE {
+                        targetVideoSignalInfo: native_signal(&saved.signal),
+                    },
+                },
+            });
+            path.targetInfo.scaling = saved.scaling;
+            path.targetInfo.rotation = saved.rotation;
+            path.flags = saved.path_flags;
+            paths.push(path);
+        }
+        query::ConfigurationBuffers { paths, modes }
+    }
 
     fn readback_path(id: &str, x: i32, hdr_enabled: Option<bool>) -> DisplayPath {
         let refresh = Rational {
@@ -267,6 +363,105 @@ mod tests {
         second.hdr_enabled = second_hdr;
         configuration.displays.push(second);
         configuration
+    }
+
+    #[test]
+    fn preserving_builder_keeps_untouched_native_modes_and_reindexes_selected() {
+        let mut unchanged = readback_path("monitor.one", 0, Some(false));
+        unchanged.source.pixel_format = 7;
+        unchanged.scaling = 3;
+        unchanged.signal.pixel_rate = 123_456_789;
+        unchanged.path_flags = 5;
+        let selected = readback_path("monitor.two", 1920, Some(false));
+        let before = Snapshot {
+            format_version: 1,
+            paths: vec![unchanged.clone(), selected],
+        };
+        let mut configuration = before.configuration().unwrap();
+        configuration.displays[0].x = -1920;
+        configuration.displays[1].x = 0;
+        configuration.displays[1].width = 1280;
+        let bound = apply::preserve_bound(
+            synthetic_bound(&before),
+            &configuration,
+            &before,
+            "monitor.two",
+        )
+        .unwrap();
+        assert_eq!(bound.modes.len(), 3);
+        assert_eq!(bound.paths[0].targetInfo.scaling, 3);
+        assert_eq!(bound.paths[0].flags, 5);
+        // SAFETY: preserve_bound remapped these indexes to their validated
+        // SOURCE and TARGET variants in the returned mode array.
+        let source_index = unsafe { bound.paths[0].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let target_index = unsafe { bound.paths[0].targetInfo.Anonymous.modeInfoIdx } as usize;
+        let source = unsafe { bound.modes[source_index].Anonymous.sourceMode };
+        let target = unsafe { bound.modes[target_index].Anonymous.targetMode };
+        assert_eq!(
+            bound.modes[source_index].infoType,
+            DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+        );
+        assert_eq!(
+            bound.modes[target_index].infoType,
+            DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
+        );
+        assert_eq!(
+            bound.modes[source_index].adapterId.LowPart,
+            unchanged.source_address.adapter_low
+        );
+        assert_eq!(
+            bound.modes[target_index].adapterId.LowPart,
+            unchanged.target_address.adapter_low
+        );
+        assert_eq!(bound.modes[source_index].id, unchanged.source_address.id);
+        assert_eq!(bound.modes[target_index].id, unchanged.target_address.id);
+        assert_eq!(source.pixelFormat, 7);
+        assert_eq!(source.position.x, -1920);
+        assert_eq!(target.targetVideoSignalInfo.pixelRate, 123_456_789);
+        assert_eq!(
+            unsafe { bound.paths[1].targetInfo.Anonymous.modeInfoIdx },
+            DISPLAYCONFIG_PATH_MODE_IDX_INVALID
+        );
+        let selected_source_index =
+            unsafe { bound.paths[1].sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let selected_source = unsafe { bound.modes[selected_source_index].Anonymous.sourceMode };
+        assert_eq!(selected_source.width, 1280);
+        assert_eq!(selected_source.position.x, 0);
+        let mut changed = configuration.clone();
+        changed.displays[0].width = 1600;
+        assert_eq!(
+            apply::preserve_bound(synthetic_bound(&before), &changed, &before, "monitor.two")
+                .err()
+                .unwrap()
+                .code,
+            "unsupported_topology"
+        );
+        let mut wrong_type = synthetic_bound(&before);
+        wrong_type.paths[0].targetInfo.Anonymous.modeInfoIdx = 0;
+        assert_eq!(
+            apply::preserve_bound(wrong_type, &configuration, &before, "monitor.two")
+                .err()
+                .unwrap()
+                .code,
+            "unsupported_topology"
+        );
+        let mut after = before.clone();
+        after.paths[0].source.x = -1920;
+        after.paths[1].source.x = 0;
+        after.paths[1].source.width = 1280;
+        assert!(apply::verifies_untouched(
+            &configuration,
+            &before,
+            &after,
+            "monitor.two"
+        ));
+        after.paths[0].scaling = 1;
+        assert!(!apply::verifies_untouched(
+            &configuration,
+            &before,
+            &after,
+            "monitor.two"
+        ));
     }
 
     fn requested() -> Configuration {

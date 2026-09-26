@@ -22,6 +22,7 @@ struct PrepareIntent {
     expected_topology_revision: Option<String>,
     operation_id: Option<String>,
     topology_change: bool,
+    preserve_target: Option<String>,
 }
 struct Pending {
     context: Context,
@@ -33,6 +34,7 @@ enum Stage {
     Armed {
         journal: Journal,
         configuration: Configuration,
+        preserve_target: Option<String>,
     },
     Clearing(Value),
 }
@@ -274,7 +276,15 @@ impl<P: Platform> Pipeline<P> {
                     Stage::Armed {
                         journal,
                         configuration,
-                    } => self.apply(pending.context, revision, journal, configuration, send),
+                        preserve_target,
+                    } => self.apply(
+                        pending.context,
+                        revision,
+                        journal,
+                        configuration,
+                        preserve_target,
+                        send,
+                    ),
                     Stage::Clearing(reply) => {
                         self.active_lease = None;
                         complete(send, pending.context.request, reply)
@@ -421,6 +431,7 @@ impl<P: Platform> Pipeline<P> {
                             | DisplayConfigurationOption::EnsureOnlyDisplay
                     )
                 );
+                let mut preserve_target = None;
                 if topology_change {
                     let Some(expected) = expected_topology_revision.as_deref() else {
                         return complete(
@@ -445,6 +456,17 @@ impl<P: Platform> Pipeline<P> {
                                 "active display topology changed before configuration option",
                             ),
                         );
+                    }
+                    if matches!(
+                        topology_option,
+                        Some(
+                            DisplayConfigurationOption::EnsureActive
+                                | DisplayConfigurationOption::EnsurePrimary
+                        )
+                    ) && snapshot.paths.len() > 1
+                    {
+                        preserve_target =
+                            mode_policy.as_ref().map(|policy| policy.display_id.clone());
                     }
                     configuration = match compose_configuration(
                         &configuration,
@@ -490,6 +512,7 @@ impl<P: Platform> Pipeline<P> {
                         expected_topology_revision,
                         operation_id,
                         topology_change,
+                        preserve_target,
                     },
                     send,
                 )
@@ -544,11 +567,16 @@ impl<P: Platform> Pipeline<P> {
             expected_topology_revision,
             operation_id,
             topology_change,
+            preserve_target,
         } = intent;
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
         }
-        let snapshot = match self.platform.prepare(&configuration) {
+        let prepared = match preserve_target.as_deref() {
+            Some(selected) => self.platform.prepare_preserving(&configuration, selected),
+            None => self.platform.prepare(&configuration),
+        };
+        let snapshot = match prepared {
             Ok(snapshot) => snapshot,
             Err(error) => return complete(send, context.request, error.payload()),
         };
@@ -622,6 +650,7 @@ impl<P: Platform> Pipeline<P> {
             Stage::Armed {
                 journal,
                 configuration,
+                preserve_target,
             },
             send,
         )
@@ -632,13 +661,20 @@ impl<P: Platform> Pipeline<P> {
         revision: u64,
         journal: Journal,
         configuration: Configuration,
+        preserve_target: Option<String>,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let result = self
-            .platform
-            .apply(&configuration, &journal.snapshot, &mut || {
-                check_request(send, &context)
-            });
+        let result = if let Some(selected) = preserve_target.as_deref() {
+            self.platform
+                .apply_preserving(&configuration, &journal.snapshot, selected, &mut || {
+                    check_request(send, &context)
+                })
+        } else {
+            self.platform
+                .apply(&configuration, &journal.snapshot, &mut || {
+                    check_request(send, &context)
+                })
+        };
         match result {
             Ok(()) => {
                 self.active_lease = Some(journal.lease.clone());
@@ -738,18 +774,36 @@ fn compose_configuration(
         .displays
         .iter()
         .position(|display| display.id.eq_ignore_ascii_case(&selected.id));
-    // The classic CCD request builder recreates every supplied native path.
-    // Only a single selected path or an intentionally selected-only topology
-    // can currently be changed without rewriting untouched paths.
+    // Inactive targets need route identity bound across the journal boundary.
+    // Active targets can use the saved CCD route for every untouched monitor.
     let configuration = match policy.configuration_option {
         Some(
             DisplayConfigurationOption::EnsureActive | DisplayConfigurationOption::EnsurePrimary,
-        ) if existing.is_some() && active.displays.len() == 1 => {
-            selected.x = 0;
-            selected.y = 0;
-            Configuration {
-                displays: vec![selected],
+        ) if existing.is_some() => {
+            let index = existing.expect("checked active selected target");
+            let mut configuration = active;
+            let origin_x = configuration.displays[index].x;
+            let origin_y = configuration.displays[index].y;
+            selected.x = origin_x;
+            selected.y = origin_y;
+            configuration.displays[index] = selected;
+            if policy.configuration_option == Some(DisplayConfigurationOption::EnsurePrimary) {
+                for display in &mut configuration.displays {
+                    display.x = display.x.checked_sub(origin_x).ok_or_else(|| {
+                        DisplayError::new(
+                            "invalid_request",
+                            "primary translation overflows desktop",
+                        )
+                    })?;
+                    display.y = display.y.checked_sub(origin_y).ok_or_else(|| {
+                        DisplayError::new(
+                            "invalid_request",
+                            "primary translation overflows desktop",
+                        )
+                    })?;
+                }
             }
+            configuration
         }
         Some(DisplayConfigurationOption::EnsureOnlyDisplay) if existing.is_some() => {
             selected.x = 0;
@@ -765,7 +819,7 @@ fn compose_configuration(
         ) => {
             return Err(DisplayError::new(
                 "unsupported_topology",
-                "preserving untouched native routes or binding an inactive target requires a dedicated transition builder",
+                "inactive display route cannot be bound across the journal boundary",
             ));
         }
         _ => {

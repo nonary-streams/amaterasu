@@ -131,11 +131,15 @@ neither option resolves mode/HDR policy, creates a lease, or requires mutation
 startup permission. Mutating options require `expected_topology_revision` and
 use the durable Apply/restore journal. `ensure_only_display` accepts an active
 selected target, applies it at the origin, and disables all other active paths.
-`ensure_active` and `ensure_primary` currently accept only an already active
-sole target. Inactive targets and multi-monitor preservation for those options
-return `unsupported_topology` before journaling. The selected path uses the
-existing CCD Apply contract, including its requested 32bpp mode and preferred
-scaling; unchanged native path preservation remains unimplemented.
+`ensure_active` and `ensure_primary` accept an already active selected target.
+On a multi-monitor desktop they rebuild only that target's requested mode and
+translate untouched source positions for a primary change, while retaining the
+saved source/target modes, timing, scaling, pixel format, and route flags of
+other targets. Full native readback verifies those untouched paths after HDR.
+Inactive selected targets return `unsupported_topology` before journaling until
+their available route can be bound across the journal and native boundaries.
+The selected path uses the existing CCD Apply contract, including its requested
+32bpp mode and preferred scaling.
 
 `status` returns native support, startup mutation policy, `state` (`idle`, `leased`
 or `recovery_required`), `owned_by_caller`, and the lease and operation ID only to its owner. After a

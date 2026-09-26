@@ -13,10 +13,22 @@ pub trait Platform {
     fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>>;
     fn snapshot(&mut self) -> DisplayResult<Snapshot>;
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
+    fn prepare_preserving(
+        &mut self,
+        configuration: &Configuration,
+        selected: &str,
+    ) -> DisplayResult<Snapshot>;
     fn apply(
         &mut self,
         configuration: &Configuration,
         before: &Snapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()>;
+    fn apply_preserving(
+        &mut self,
+        configuration: &Configuration,
+        before: &Snapshot,
+        selected: &str,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()>;
     fn restore(
@@ -52,10 +64,22 @@ impl Platform for NativePlatform {
     fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {
         unsupported()
     }
+    fn prepare_preserving(&mut self, _: &Configuration, _: &str) -> DisplayResult<Snapshot> {
+        unsupported()
+    }
     fn apply(
         &mut self,
         _: &Configuration,
         _: &Snapshot,
+        _: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        unsupported()
+    }
+    fn apply_preserving(
+        &mut self,
+        _: &Configuration,
+        _: &Snapshot,
+        _: &str,
         _: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         unsupported()
