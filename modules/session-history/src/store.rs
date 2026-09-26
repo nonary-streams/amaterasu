@@ -210,6 +210,9 @@ impl HistoryStore {
     ) -> Result<bool, HistoryError> {
         validate_activity_id(session_id)?;
         self.expire_stream_activities(now_unix);
+        // Expiry can drain the previous cohort. Apply a saved toggle before
+        // admitting this launch, or it would inherit the prior cohort's policy.
+        self.transition_drained_writer(now_unix)?;
         if self.terminal_activities.contains(session_id) {
             return Err(HistoryError::Invalid("stream activity has already ended"));
         }
@@ -266,6 +269,9 @@ impl HistoryStore {
     ) -> Result<bool, HistoryError> {
         metadata.validate().map_err(HistoryError::Invalid)?;
         self.expire_stream_activities(now_unix);
+        // A direct session begin can also be the first call after a pending
+        // launch expires, so it must start under the newly effective policy.
+        self.transition_drained_writer(now_unix)?;
         if self.terminal_activities.contains(&metadata.session_id) {
             return Err(HistoryError::Invalid("stream activity has already ended"));
         }
@@ -684,13 +690,20 @@ impl HistoryStore {
     }
 
     fn finish_drained_transition(&mut self, now_unix: i64) {
-        if self.activity_cohort_drained()
-            && (self.writer_open != self.settings.enabled
-                || self.effective_enabled != self.settings.enabled)
-            && self.transition_writer(now_unix).is_err()
-        {
+        if self.transition_drained_writer(now_unix).is_err() {
             self.record_failure();
         }
+    }
+
+    fn transition_drained_writer(&mut self, now_unix: i64) -> Result<(), HistoryError> {
+        if self.configuration_ready
+            && self.activity_cohort_drained()
+            && (self.writer_open != self.settings.enabled
+                || self.effective_enabled != self.settings.enabled)
+        {
+            self.transition_writer(now_unix)?;
+        }
+        Ok(())
     }
 
     fn prune_best_effort(&mut self, now_unix: i64) {
@@ -1247,6 +1260,55 @@ mod tests {
         );
         assert!(!store.end_stream_activity("expired", 404).unwrap());
         assert_eq!(store.status().unwrap().sessions, 0);
+    }
+
+    #[test]
+    fn new_launch_after_expiry_uses_saved_disabled_policy() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        assert!(store.begin_stream_activity("expired", 101).unwrap());
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            102,
+        );
+        assert!(store.settings().1);
+
+        // There is no status/prune poll between expiry and the next admission.
+        assert!(store.begin_stream_activity("new", 401).unwrap());
+        assert!(!store.settings().1);
+        assert_eq!(store.status().unwrap().pending_activities, 1);
+        assert!(store.begin_stream_activity("expired", 402).is_err());
+        assert!(!store.begin_session_at(&metadata("new"), 403, 403).unwrap());
+        assert!(!store.end_session("new", 404, 404).unwrap());
+        assert_eq!(store.status().unwrap().sessions, 0);
+    }
+
+    #[test]
+    fn direct_session_after_expiry_uses_saved_enabled_policy() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            100,
+        );
+        assert!(store.begin_stream_activity("expired", 101).unwrap());
+        configure(&mut store, HistorySettings::default(), 102);
+        assert!(!store.settings().1);
+
+        assert!(store.begin_session_at(&metadata("new"), 403, 401).unwrap());
+        assert!(store.settings().1);
+        assert!(store.begin_stream_activity("expired", 402).is_err());
+        assert!(store.end_session("new", 404, 404).unwrap());
+        assert_eq!(store.status().unwrap().sessions, 1);
     }
 
     #[test]
