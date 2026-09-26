@@ -248,6 +248,7 @@ pub struct PruneReport {
 pub struct HistoryStatus {
     pub available: bool,
     pub configuration_ready: bool,
+    pub applied_revision: Option<u64>,
     pub enabled: bool,
     pub effective_enabled: bool,
     pub degraded: bool,

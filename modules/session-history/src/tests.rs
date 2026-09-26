@@ -78,6 +78,7 @@ fn status_reports_storage_unavailability_without_failing_the_module() {
     let response = unavailable_status();
     assert_eq!(response["ok"], true);
     assert_eq!(response["status"]["available"], false);
+    assert!(response["status"]["applied_revision"].is_null());
     assert_eq!(response["status"]["degraded"], true);
     assert_eq!(response["status"]["pending_activities"], 0);
 }
@@ -91,15 +92,16 @@ fn status_rpc_expires_launches_before_reporting_effective_recording() {
     ));
     let mut store = HistoryStore::open(&directory.join("history.db"), 100).unwrap();
     store
-        .apply_configuration(HistorySettings::default(), 100)
+        .apply_configuration_with_revision(HistorySettings::default(), 1, 100)
         .unwrap();
     assert!(store.begin_stream_activity("pending", 101).unwrap());
     store
-        .apply_configuration(
+        .apply_configuration_with_revision(
             HistorySettings {
                 enabled: false,
                 ..HistorySettings::default()
             },
+            2,
             102,
         )
         .unwrap();
@@ -107,9 +109,11 @@ fn status_rpc_expires_launches_before_reporting_effective_recording() {
     assert_eq!(waiting["status"]["pending_activities"], 1);
     assert_eq!(waiting["status"]["active_streams"], 0);
     assert_eq!(waiting["status"]["effective_enabled"], true);
+    assert_eq!(waiting["status"]["applied_revision"], 1);
     let status = execute(&mut store, operation("history_status"), 401).unwrap();
     assert_eq!(status["status"]["pending_activities"], 0);
     assert_eq!(status["status"]["effective_enabled"], false);
+    assert_eq!(status["status"]["applied_revision"], 2);
     drop(store);
     fs::remove_dir_all(directory).unwrap();
 }

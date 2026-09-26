@@ -28,7 +28,7 @@ struct SessionHistoryModule {
     runtime: RuntimeClient,
     store: Option<HistoryStore>,
     product_settings: ProductSettings,
-    applied_revision: Option<u64>,
+    loaded_revision: Option<u64>,
     legacy_cleanup_pending: bool,
     legacy_cleanup_retry_ticks: u8,
     deferred_settings: VecDeque<(u64, Operation)>,
@@ -66,7 +66,7 @@ impl ManagedModule for SessionHistoryModule {
             runtime,
             store,
             product_settings: ProductSettings::new(migration_candidate),
-            applied_revision: None,
+            loaded_revision: None,
             legacy_cleanup_pending: false,
             legacy_cleanup_retry_ticks: 0,
             deferred_settings: VecDeque::new(),
@@ -202,24 +202,26 @@ impl SessionHistoryModule {
             return;
         }
         let (settings, revision) = self.product_settings.settings();
-        if self.applied_revision == Some(revision) {
+        if self.loaded_revision == Some(revision) {
             return;
         }
         if let Some(store) = self.store.as_mut() {
-            match store.apply_configuration(settings.clone(), unix_time_seconds()) {
+            match store.apply_configuration_with_revision(
+                settings.clone(),
+                revision,
+                unix_time_seconds(),
+            ) {
                 Ok(()) => {
-                    self.applied_revision = Some(revision);
+                    self.loaded_revision = Some(revision);
                     self.legacy_cleanup_pending = true;
                 }
                 Err(_) => store.record_failure(),
             }
-        } else {
-            self.applied_revision = Some(revision);
         }
     }
 
     fn cleanup_legacy_settings(&mut self) {
-        if !self.legacy_cleanup_pending || self.applied_revision.is_none() {
+        if !self.legacy_cleanup_pending || self.loaded_revision.is_none() {
             return;
         }
         if self.legacy_cleanup_retry_ticks > 0 {
@@ -397,6 +399,7 @@ fn unavailable_status() -> Value {
         "status": {
             "available": false,
             "configuration_ready": false,
+            "applied_revision": null,
             "enabled": HistorySettings::default().enabled,
             "effective_enabled": false,
             "degraded": true,

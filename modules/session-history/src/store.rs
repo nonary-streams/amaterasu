@@ -60,6 +60,8 @@ pub struct HistoryStore {
     fail_next_read_only_open: bool,
     settings: HistorySettings,
     configuration_ready: bool,
+    desired_revision: Option<u64>,
+    applied_revision: Option<u64>,
     effective_enabled: bool,
     active_streams: BTreeSet<String>,
     pending_activities: BTreeMap<String, PendingActivity>,
@@ -92,6 +94,8 @@ impl HistoryStore {
             path: path.to_path_buf(),
             settings: HistorySettings::default(),
             configuration_ready: false,
+            desired_revision: None,
+            applied_revision: None,
             effective_enabled: false,
             connection,
             writer_open: true,
@@ -142,14 +146,34 @@ impl HistoryStore {
 
     /// Marks the policy loaded from `amaterasu.configuration/1` as active.
     /// The revision is owned by the configuration service, not SQLite.
+    #[cfg(test)]
     pub fn apply_configuration(
         &mut self,
         settings: HistorySettings,
         now_unix: i64,
     ) -> Result<(), HistoryError> {
+        self.apply_configuration_inner(settings, None, now_unix)
+    }
+
+    pub fn apply_configuration_with_revision(
+        &mut self,
+        settings: HistorySettings,
+        revision: u64,
+        now_unix: i64,
+    ) -> Result<(), HistoryError> {
+        self.apply_configuration_inner(settings, Some(revision), now_unix)
+    }
+
+    fn apply_configuration_inner(
+        &mut self,
+        settings: HistorySettings,
+        revision: Option<u64>,
+        now_unix: i64,
+    ) -> Result<(), HistoryError> {
         settings.validate().map_err(HistoryError::Invalid)?;
         self.settings = settings;
         self.configuration_ready = true;
+        self.desired_revision = revision;
         // Keep the recording decision stable for every stream in the current
         // cohort. Retention reads the new settings immediately below.
         self.expire_stream_activities(now_unix);
@@ -169,7 +193,8 @@ impl HistoryStore {
         self.expire_stream_activities(now_unix);
         if self.configuration_ready
             && (self.writer_open != self.settings.enabled
-                || self.effective_enabled != self.settings.enabled)
+                || self.effective_enabled != self.settings.enabled
+                || self.applied_revision != self.desired_revision)
         {
             // A failed connection transition is retried without changing the
             // policy or dropping admitted writes.
@@ -380,11 +405,7 @@ impl HistoryStore {
         if self.effective_enabled && (self.settings.enabled || ended) {
             self.prune_best_effort(retention_now_unix);
         }
-        if self.activity_cohort_drained()
-            && (self.writer_open != self.settings.enabled
-                || self.effective_enabled != self.settings.enabled)
-            && self.transition_writer(retention_now_unix).is_err()
-        {
+        if self.transition_drained_writer(retention_now_unix).is_err() {
             self.record_failure();
         }
         Ok(ended)
@@ -649,6 +670,7 @@ impl HistoryStore {
         Ok(HistoryStatus {
             available: true,
             configuration_ready: self.configuration_ready,
+            applied_revision: self.applied_revision,
             enabled: self.settings.enabled,
             effective_enabled: self.effective_enabled,
             degraded: !self.configuration_ready
@@ -712,7 +734,8 @@ impl HistoryStore {
         if self.configuration_ready
             && self.activity_cohort_drained()
             && (self.writer_open != self.settings.enabled
-                || self.effective_enabled != self.settings.enabled)
+                || self.effective_enabled != self.settings.enabled
+                || self.applied_revision != self.desired_revision)
         {
             self.transition_writer(now_unix)?;
         }
@@ -736,6 +759,7 @@ impl HistoryStore {
                 self.recovered = true;
             }
             self.effective_enabled = self.settings.enabled;
+            self.applied_revision = self.desired_revision;
             return Ok(());
         }
         let flags = if self.settings.enabled {
@@ -772,6 +796,7 @@ impl HistoryStore {
         // transaction has committed, so SQLite can checkpoint its WAL safely.
         self.writer_open = self.settings.enabled;
         self.effective_enabled = self.settings.enabled;
+        self.applied_revision = self.desired_revision;
         Ok(())
     }
 }
@@ -2639,5 +2664,126 @@ mod tests {
             Err(HistoryError::NotFound)
         ));
         assert_eq!(store.session_detail("recorded").unwrap().event_count, 2);
+    }
+
+    #[test]
+    fn status_confirms_revision_only_after_active_and_pending_activity_drains() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, None);
+        store
+            .apply_configuration_with_revision(HistorySettings::default(), 1, 100)
+            .unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, Some(1));
+
+        store.begin_stream_activity("pending", 101).unwrap();
+        store
+            .apply_configuration_with_revision(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                2,
+                102,
+            )
+            .unwrap();
+        let pending = store.status().unwrap();
+        assert!(!pending.enabled);
+        assert!(pending.effective_enabled);
+        assert_eq!(pending.applied_revision, Some(1));
+        store
+            .begin_session_at(&metadata("pending"), 103, 103)
+            .unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, Some(1));
+        store.end_session("pending", 104, 104).unwrap();
+        let disabled = store.status().unwrap();
+        assert!(!disabled.effective_enabled);
+        assert_eq!(disabled.applied_revision, Some(2));
+        assert_eq!(store.session_detail("pending").unwrap().event_count, 2);
+    }
+
+    #[test]
+    fn status_waits_for_drain_on_retention_only_revision_and_restart_load() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let mut store = HistoryStore::open(&path, 100).unwrap();
+        store
+            .apply_configuration_with_revision(HistorySettings::default(), 5, 100)
+            .unwrap();
+        store.begin_session(&metadata("active"), 101).unwrap();
+        store
+            .apply_configuration_with_revision(
+                HistorySettings {
+                    ttl_days: 3,
+                    ..HistorySettings::default()
+                },
+                6,
+                102,
+            )
+            .unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, Some(5));
+        store.end_session("active", 103, 103).unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, Some(6));
+        store
+            .apply_configuration_with_revision(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                7,
+                104,
+            )
+            .unwrap();
+        assert_eq!(store.status().unwrap().applied_revision, Some(7));
+        assert_eq!(store.session_detail("active").unwrap().event_count, 2);
+        drop(store);
+
+        let mut reopened = HistoryStore::open(&path, 200).unwrap();
+        let unready = reopened.status().unwrap();
+        assert!(!unready.configuration_ready);
+        assert_eq!(unready.applied_revision, None);
+        reopened
+            .apply_configuration_with_revision(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                8,
+                200,
+            )
+            .unwrap();
+        assert_eq!(reopened.status().unwrap().applied_revision, Some(8));
+        assert_eq!(reopened.session_detail("active").unwrap().event_count, 2);
+        reopened
+            .apply_configuration_with_revision(HistorySettings::default(), 9, 201)
+            .unwrap();
+        assert_eq!(reopened.status().unwrap().applied_revision, Some(9));
+        assert_eq!(reopened.session_detail("active").unwrap().event_count, 2);
+    }
+
+    #[test]
+    fn failed_writer_adoption_cannot_confirm_saved_revision() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        store
+            .apply_configuration_with_revision(HistorySettings::default(), 1, 100)
+            .unwrap();
+        store.fail_next_read_only_open = true;
+        assert!(matches!(
+            store.apply_configuration_with_revision(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                2,
+                101,
+            ),
+            Err(HistoryError::Database)
+        ));
+        assert_eq!(store.status().unwrap().applied_revision, Some(1));
+        assert!(!store.status().unwrap().effective_enabled);
+        store.prune_if_due(102);
+        assert_eq!(store.status().unwrap().applied_revision, Some(2));
+        assert!(!store.writer_open);
     }
 }
