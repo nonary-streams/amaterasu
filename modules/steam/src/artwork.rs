@@ -975,9 +975,9 @@ fn from_hashed_library_cache(
             ("library_600x900.jpg", 3),
             ("library_600x900.png", 3),
             ("library_600x900.webp", 3),
-            ("library_capsule.jpg", 2),
-            ("library_capsule.png", 2),
-            ("library_capsule.webp", 2),
+            ("library_capsule.jpg", 3),
+            ("library_capsule.png", 3),
+            ("library_capsule.webp", 3),
             ("library_header.jpg", 2),
             ("library_header.png", 2),
             ("library_header.webp", 2),
@@ -1454,6 +1454,25 @@ mod tests {
 
         let artwork = discover(42, &root.0, &[]);
         assert_eq!(artwork.source_path.as_deref(), portrait.to_str());
+        assert!(!artwork.needs_remote_upgrade);
+    }
+
+    #[test]
+    fn full_hashed_capsule_portrait_beats_a_low_resolution_local_portrait() {
+        let root = TemporaryRoot::new();
+        let cache = root.0.join("appcache/librarycache");
+        let hashed = cache.join("42/hash");
+        fs::create_dir_all(&hashed).unwrap();
+        fs::write(
+            cache.join("42_library_600x900.png"),
+            synthetic_png(300, 450),
+        )
+        .unwrap();
+        let capsule = hashed.join("library_capsule.png");
+        fs::write(&capsule, synthetic_png(600, 900)).unwrap();
+
+        let artwork = discover(42, &root.0, &[]);
+        assert_eq!(artwork.source_path.as_deref(), capsule.to_str());
         assert!(!artwork.needs_remote_upgrade);
     }
 
