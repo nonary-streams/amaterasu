@@ -345,21 +345,32 @@ pub fn default_database_path() -> Option<PathBuf> {
 }
 
 fn resolve_database_path(xdg_data_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
-    let xdg_candidate = xdg_data_home
+    let xdg_root = xdg_data_home
         .filter(|path| path.is_absolute())
-        .map(|path| path.join("lutris").join("pga.db"));
-    if let Some(path) = xdg_candidate.filter(|path| is_regular_file(path)) {
-        return path.canonicalize().ok();
+        .map(|path| path.join("lutris"));
+    if let Some(database) = xdg_root.and_then(|root| native_database_in(&root)) {
+        return Some(database);
     }
-    let home_candidate = home.filter(|path| path.is_absolute()).map(|path| {
-        path.join(".local")
-            .join("share")
-            .join("lutris")
-            .join("pga.db")
-    });
-    home_candidate
-        .filter(|path| is_regular_file(path))
-        .and_then(|path| path.canonicalize().ok())
+    let home_root = home
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join(".local/share/lutris"));
+    home_root.and_then(|root| native_database_in(&root))
+}
+
+fn native_database_in(root: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let database = root.join("pga.db").canonicalize().ok()?;
+    if !database.starts_with(&root) || !is_regular_file(&database) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&database).ok()?.uid() != effective_uid()? {
+            return None;
+        }
+    }
+    Some(database)
 }
 
 pub fn scan_database(path: &Path) -> Result<Vec<Game>, String> {
@@ -661,6 +672,57 @@ mod tests {
         );
         std::fs::remove_dir_all(home).unwrap();
         std::fs::remove_dir_all(xdg).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_discovery_rejects_escaped_database_and_recovers_from_valid_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-lutris-native-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        let home_database = home.join(".local/share/lutris/pga.db");
+        let xdg_database = xdg.join("lutris/pga.db");
+        let outside = root.join("outside.db");
+        std::fs::create_dir_all(home_database.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(xdg_database.parent().unwrap()).unwrap();
+        let connection = create_database(&home_database);
+        connection
+            .execute(
+                "INSERT INTO games (id,name,slug,runner,platform,directory,configpath,service,service_id,installed) \
+                 VALUES (7,'Home game','home','wine','linux','','game.yml','','',1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::write(&outside, []).unwrap();
+        std::os::unix::fs::symlink(&outside, &xdg_database).unwrap();
+
+        let selected = resolve_database_path(Some(&xdg), Some(&home)).unwrap();
+        assert_eq!(selected, home_database.canonicalize().unwrap());
+        assert_eq!(scan_database(&selected).unwrap()[0].name, "Home game");
+        assert_eq!(resolve_database_path(Some(&xdg), None), None);
+
+        std::fs::remove_file(&xdg_database).unwrap();
+        let connection = create_database(&xdg_database);
+        connection
+            .execute(
+                "INSERT INTO games (id,name,slug,runner,platform,directory,configpath,service,service_id,installed) \
+                 VALUES (8,'XDG game','xdg','wine','linux','','game.yml','','',1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let selected = resolve_database_path(Some(&xdg), Some(&home)).unwrap();
+        assert_eq!(selected, xdg_database.canonicalize().unwrap());
+        assert_eq!(scan_database(&selected).unwrap()[0].name, "XDG game");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

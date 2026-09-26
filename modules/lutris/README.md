@@ -8,9 +8,11 @@ and client pair, it can use the current user's
 `$HOME/.var/app/net.lutris.Lutris/data/lutris/pga.db` with a verified per-user
 Flatpak installation. It opens SQLite read-only and selects only
 installed rows with a nonempty game configuration path. It does not inspect
-other users' home directories. A machine service running as root cannot infer
-the active desktop user's identity, so it refuses discovery until a trusted
-session scanner exists.
+other users' home directories. Native database lookup rejects files that resolve
+outside the selected Lutris data directory or are not owned by the current
+user. An invalid XDG database can fall back to a valid home database. A machine
+service running as root cannot infer the active desktop user's identity, so it
+refuses discovery until a trusted session scanner exists.
 
 The database is limited to 256 MiB, 10,000 games, 24 MiB of selected row text,
 and an eight-second scan. Names and fields are validated against catalog
