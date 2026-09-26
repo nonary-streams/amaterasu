@@ -911,7 +911,7 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
     }
     let policies: Vec<&serde_json::Value> =
         match (fields.get("mode_policy"), fields.get("mode_policies")) {
-            (Some(policy), None) if targets.len() == 1 => vec![policy],
+            (Some(policy), None) => vec![policy],
             (None, Some(serde_json::Value::Array(policies))) if policies.len() == targets.len() => {
                 policies.iter().collect()
             }
@@ -925,6 +925,10 @@ fn valid_display_request(request: &serde_json::Value) -> bool {
         let id = policy.display_id.to_ascii_lowercase();
         if !targets.contains(&id)
             || !policy_targets.insert(id)
+            || (fields.get("mode_policies").is_some() && policy.configuration_option.is_some())
+            || (targets.len() > 1
+                && fields.get("mode_policy").is_some()
+                && policy.configuration_option.as_deref() != Some("ensure_only_display"))
             || policy
                 .resolution_option
                 .as_deref()
@@ -1266,8 +1270,8 @@ mod tests {
                 {"id":"two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
             ]},
             "mode_policies":[
-                {"display_id":"one","configuration_option":"ensure_primary","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},
-                {"display_id":"two","configuration_option":"ensure_active","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}
+                {"display_id":"one","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}},
+                {"display_id":"two","remapping":{},"context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}
             ]
         });
         input["display_request"] = request.clone();
@@ -1286,20 +1290,6 @@ mod tests {
         );
         let original_digest = selected.display_request_sha256().unwrap();
         assert_eq!(original_digest.len(), 64);
-        let mut changed_option = input.clone();
-        changed_option["display_request"]["mode_policies"][0]["configuration_option"] =
-            json!("verify_only");
-        let changed_option: Open = serde_json::from_value(changed_option).unwrap();
-        changed_option.validate(false).unwrap();
-        assert_ne!(
-            changed_option.display_request_sha256().unwrap(),
-            original_digest
-        );
-        assert_eq!(
-            changed_option.prepare("prepare", None)["display_request"]["mode_policies"][0]["configuration_option"],
-            "verify_only"
-        );
-
         for option in [
             "disabled",
             "verify_only",
@@ -1307,12 +1297,14 @@ mod tests {
             "ensure_primary",
             "ensure_only_display",
         ] {
-            let mut allowed = input.clone();
-            allowed["display_request"]["mode_policies"][0]["configuration_option"] = json!(option);
-            serde_json::from_value::<Open>(allowed)
-                .unwrap()
-                .validate(false)
-                .unwrap();
+            let mut rejected = input.clone();
+            rejected["display_request"]["mode_policies"][0]["configuration_option"] = json!(option);
+            assert_eq!(
+                serde_json::from_value::<Open>(rejected)
+                    .unwrap()
+                    .validate(false),
+                Err("display_request_unattested")
+            );
         }
         for invalid in [json!("ensure_everything"), json!("Ensure_Active"), json!(7)] {
             let mut malformed = input.clone();
@@ -1367,6 +1359,69 @@ mod tests {
         input["display_request"]["configuration"]["displays"][0]["unexpected"] = json!(true);
         let malformed: Open = serde_json::from_value(input).unwrap();
         assert_eq!(malformed.validate(false), Err("display_request_unattested"));
+    }
+
+    #[test]
+    fn singular_selected_only_policy_keeps_full_multimonitor_topology() {
+        let mut input = open_json();
+        let full_request = json!({
+            "expected_topology_revision":"aa".repeat(16),
+            "configuration":{"displays":[
+                {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
+                {"id":"two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
+            ]},
+            "mode_policy":{"display_id":"two","configuration_option":"ensure_only_display",
+                "remapping":{},"context":{"resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,"client_display_mode_override":false,
+                    "optimize_game_settings":false}}
+        });
+        input["display_request"] = full_request.clone();
+        input["display_admission_token"] = json!("ab".repeat(32));
+        input["application_operation_id"] = json!("launch-one");
+        input["display_policy_snapshot"] = json!({
+            "global_revision":1,"global_overrides":{},"catalog_revision":0,
+            "certificate_id":"cd".repeat(32),"application_overrides":{},
+            "client_overrides":{},"effective_overrides":{}
+        });
+        let accepted: Open = serde_json::from_value(input.clone()).unwrap();
+        accepted.validate(false).unwrap();
+        assert_eq!(
+            accepted.prepare("prepare", None)["display_request"],
+            full_request
+        );
+        let selected_digest = accepted.display_request_sha256().unwrap();
+
+        for (field, replacement) in [
+            ("configuration_option", json!("ensure_active")),
+            ("display_id", json!("missing")),
+        ] {
+            let mut invalid = input.clone();
+            invalid["display_request"]["mode_policy"][field] = replacement;
+            let invalid: Open = serde_json::from_value(invalid).unwrap();
+            assert_eq!(invalid.validate(false), Err("display_request_unattested"));
+        }
+        let mut changed = input.clone();
+        changed["display_request"]["mode_policy"]["display_id"] = json!("one");
+        let changed: Open = serde_json::from_value(changed).unwrap();
+        changed.validate(false).unwrap();
+        assert_ne!(changed.display_request_sha256().unwrap(), selected_digest);
+
+        let mut single_target = input;
+        single_target["display_request"]["configuration"]["displays"] =
+            json!([single_target["display_request"]["configuration"]["displays"][1].clone()]);
+        for option in [
+            "disabled",
+            "verify_only",
+            "ensure_active",
+            "ensure_primary",
+            "ensure_only_display",
+        ] {
+            single_target["display_request"]["mode_policy"]["configuration_option"] = json!(option);
+            serde_json::from_value::<Open>(single_target.clone())
+                .unwrap()
+                .validate(false)
+                .unwrap();
+        }
     }
 
     #[test]
