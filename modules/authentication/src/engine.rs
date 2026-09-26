@@ -287,6 +287,9 @@ impl Engine {
         if !valid_password || !valid_username {
             return Err("unauthorized");
         }
+        // Legacy usernames can be matched without regard to ASCII case, but
+        // the authenticated identity must remain the saved administrator name.
+        let subject = credential.username.clone();
         if self.sessions.len() >= MAX_SESSIONS {
             return Err("session_limit");
         }
@@ -304,7 +307,7 @@ impl Engine {
             .ok_or("clock_failure")?
             .min(refresh_expires_at);
         let scopes = self.settings.allowed_scopes.clone();
-        let response = json!({"ok":true,"bearer":bearer,"refresh_token":refresh_token,"kind":"administrator_session","subject":username,"scopes":scopes,"expires_at":expires_at,"refresh_expires_at":refresh_expires_at,"remember_me":remember_me});
+        let response = json!({"ok":true,"bearer":bearer,"refresh_token":refresh_token,"kind":"administrator_session","subject":subject,"scopes":scopes,"expires_at":expires_at,"refresh_expires_at":refresh_expires_at,"remember_me":remember_me});
         let upgraded = credential.legacy_salt.is_some();
         if upgraded {
             let credential = document
@@ -328,7 +331,7 @@ impl Engine {
             Session {
                 credential_digest,
                 policy_generation: self.settings.authorization_policy_generation,
-                subject: username,
+                subject,
                 scopes,
                 expires_at,
                 refresh_expires_at,

@@ -984,6 +984,7 @@ fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_a
         102,
     );
     assert_eq!(login["ok"], true);
+    assert_eq!(login["subject"], "ImportedAdmin");
     assert!(
         state.stored.as_ref().unwrap()["credential"]
             .get("legacy_salt")
@@ -991,15 +992,14 @@ fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_a
     );
 
     let mut restarted = Pipeline::new(settings());
-    assert_eq!(
-        state.request(
-            &mut restarted,
-            "frontend",
-            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
-            103,
-        )["ok"],
-        true
+    let verified = state.request(
+        &mut restarted,
+        "frontend",
+        json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
+        103,
     );
+    assert_eq!(verified["ok"], true);
+    assert_eq!(verified["subject"], "ImportedAdmin");
     let refreshed = state.request(
         &mut restarted,
         "frontend",
@@ -1007,6 +1007,7 @@ fn imported_credential_replaces_stale_session_only_namespace_and_authenticates_a
         104,
     );
     assert_eq!(refreshed["ok"], true);
+    assert_eq!(refreshed["subject"], "ImportedAdmin");
     let mut after_refresh = Pipeline::new(settings());
     assert_eq!(
         state.request(
