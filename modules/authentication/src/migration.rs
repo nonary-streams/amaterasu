@@ -1,6 +1,6 @@
 //! Strict, one-way migration of a legacy web-login verifier.
 
-use crate::protocol::{Credential, Document};
+use crate::protocol::{Credential, Document, SessionDocument};
 use amaterasu_storage::{RootLock, create_private_directory, read_bounded, write_json_atomically};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +16,7 @@ const STATE_FILES: &[&str] = &[
 const PRIMARY_STATE_FILES: &[&str] = &["apollo_state.json", "sunshine_state.json"];
 const PRINCIPAL: &str = "amaterasu.authentication";
 const STATE_KEY: &str = "authentication/v1";
+const SESSION_STATE_KEY: &str = "authentication/sessions/v1";
 
 /// A validated predecessor verifier. It intentionally has no `Debug` impl so
 /// callers cannot accidentally log the retained password verifier.
@@ -90,7 +91,9 @@ pub fn seed_authentication_state(
     let _lock = RootLock::acquire(state_root).map_err(|_| "legacy_authentication_state_busy")?;
     let path = namespace_path(state_root);
     let mut namespace = read_namespace(&path)?;
-    if namespace.values.contains_key(STATE_KEY) {
+    validate_existing_session_sidecar(&namespace)?;
+    if let Some(value) = namespace.values.get(STATE_KEY) {
+        validate_existing_authentication(value, namespace.revision)?;
         return Ok(AuthenticationSeedOutcome::ExistingAmaterasuState);
     }
     namespace.revision = namespace
@@ -109,6 +112,35 @@ pub fn seed_authentication_state(
     write_json_atomically(&path, &namespace)
         .map_err(|_| "legacy_authentication_state_unavailable")?;
     Ok(AuthenticationSeedOutcome::Seeded)
+}
+
+fn validate_existing_authentication(value: &Value, revision: u64) -> Result<(), &'static str> {
+    if revision == 0 {
+        return Err("legacy_authentication_existing_state_invalid");
+    }
+    let document: Document = serde_json::from_value(value.clone())
+        .map_err(|_| "legacy_authentication_existing_state_invalid")?;
+    document
+        .validate()
+        .map_err(|_| "legacy_authentication_existing_state_invalid")?;
+    if document.credential.is_none() {
+        return Err("legacy_authentication_existing_state_invalid");
+    }
+    Ok(())
+}
+
+fn validate_existing_session_sidecar(namespace: &Namespace) -> Result<(), &'static str> {
+    let Some(value) = namespace.values.get(SESSION_STATE_KEY) else {
+        return Ok(());
+    };
+    if namespace.revision == 0 {
+        return Err("legacy_authentication_existing_state_invalid");
+    }
+    let document: SessionDocument = serde_json::from_value(value.clone())
+        .map_err(|_| "legacy_authentication_existing_state_invalid")?;
+    document
+        .validate()
+        .map_err(|_| "legacy_authentication_existing_state_invalid")
 }
 
 #[derive(Deserialize)]
@@ -550,6 +582,115 @@ mod tests {
             seed_authentication_state(&state, &imported).unwrap(),
             AuthenticationSeedOutcome::ExistingAmaterasuState
         );
+        let _ = std::fs::remove_dir_all(source);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn existing_state_requires_a_usable_credential_and_positive_revision() {
+        let source = temporary_directory("existing-state-source");
+        let state = temporary_directory("existing-state-target");
+        std::fs::write(
+            source.join("sunshine_state.json"),
+            credential_record("Imported", "imported password", "ImportedSalt1234"),
+        )
+        .unwrap();
+        let imported = import_legacy_authentication(&source).unwrap();
+        let path = namespace_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for (name, revision, existing) in [
+            ("null", 1, Value::Null),
+            (
+                "uninitialized",
+                1,
+                serde_json::json!({"credential":null,"tokens":[]}),
+            ),
+            (
+                "invalid-verifier",
+                1,
+                serde_json::json!({
+                    "credential":{"username":"Admin","password_hash":"invalid","legacy_salt":null,"case_insensitive_username":true},
+                    "tokens":[]
+                }),
+            ),
+            (
+                "zero-revision",
+                0,
+                serde_json::to_value(&imported.document).unwrap(),
+            ),
+        ] {
+            let namespace = Namespace {
+                format_version: 1,
+                revision,
+                values: BTreeMap::from([(STATE_KEY.into(), existing)]),
+            };
+            std::fs::write(&path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                matches!(
+                    seed_authentication_state(&state, &imported),
+                    Err("legacy_authentication_existing_state_invalid")
+                ),
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+        }
+
+        for has_existing_credential in [false, true] {
+            let mut values = BTreeMap::from([(
+                SESSION_STATE_KEY.into(),
+                serde_json::json!({"version":999,"sessions":[]}),
+            )]);
+            if has_existing_credential {
+                values.insert(
+                    STATE_KEY.into(),
+                    serde_json::to_value(&imported.document).unwrap(),
+                );
+            }
+            let namespace = Namespace {
+                format_version: 1,
+                revision: 1,
+                values,
+            };
+            std::fs::write(&path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                seed_authentication_state(&state, &imported),
+                Err("legacy_authentication_existing_state_invalid")
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+
+        let namespace = Namespace {
+            format_version: 1,
+            revision: 1,
+            values: BTreeMap::from([(
+                SESSION_STATE_KEY.into(),
+                serde_json::to_value(SessionDocument::default()).unwrap(),
+            )]),
+        };
+        std::fs::write(&path, serde_json::to_vec(&namespace).unwrap()).unwrap();
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::ExistingAmaterasuState
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::Seeded
+        );
+        let valid_existing = std::fs::read(&path).unwrap();
+        assert_eq!(
+            seed_authentication_state(&state, &imported).unwrap(),
+            AuthenticationSeedOutcome::ExistingAmaterasuState
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), valid_existing);
         let _ = std::fs::remove_dir_all(source);
         let _ = std::fs::remove_dir_all(state);
     }
