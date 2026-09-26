@@ -1,5 +1,5 @@
 use super::Backend;
-use super::owned_devices::release_input_pair;
+use super::owned_devices::{acquire_input_pair, release_input_pair};
 use crate::gamepad::{
     ControllerSnapshot, GAMEPAD_ABSOLUTE_AXES, GamepadDevice, GamepadSlots, NativeGamepadEvent,
     controller_state_events, gamepad_key_codes, possible_controller_state_after_write_failure,
@@ -491,13 +491,12 @@ impl Backend for LinuxBackend {
                 "uinput devices are already active",
             ));
         }
-        let keyboard = Device::create(&self.path, true)?;
-        let pointer = Device::create(&self.path, false)?;
+        acquire_input_pair(&mut self.keyboard, &mut self.pointer, |keyboard| {
+            Device::create(&self.path, keyboard)
+        })?;
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.held_virtual_keycodes.clear();
-        self.keyboard = Some(keyboard);
-        self.pointer = Some(pointer);
         self.controller_input_supported = false;
         self.effective_profile = None;
         self.controller_unavailable_reason = None;
