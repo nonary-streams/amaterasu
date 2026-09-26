@@ -74,6 +74,10 @@ struct ActiveVirtualFormat {
 
 #[cfg(any(windows, test))]
 impl VirtualFormatPolicy {
+    pub fn has_active(&self, endpoint: &str) -> bool {
+        self.active.contains_key(endpoint)
+    }
+
     pub fn acquire(
         &mut self,
         endpoint: &str,
@@ -241,6 +245,7 @@ mod tests {
             channel_mask: 0x0003,
         };
         let mut selections = 0;
+        assert!(!policy.has_active("render.virtual"));
         assert_eq!(
             policy.acquire("render.virtual", 2, || {
                 selections += 1;
@@ -248,6 +253,7 @@ mod tests {
             }),
             Ok(stereo)
         );
+        assert!(policy.has_active("render.virtual"));
         assert_eq!(
             policy.acquire("render.virtual", 2, || {
                 panic!("a shared capture must not change an active engine format")
@@ -262,16 +268,19 @@ mod tests {
         // The first capture closes during device recovery. The other capture
         // still owns the layout, so reopening must share it.
         policy.release("render.virtual");
+        assert!(policy.has_active("render.virtual"));
         assert_eq!(
             policy.acquire("render.virtual", 2, || panic!("recovery must share")),
             Ok(stereo)
         );
         policy.release("render.virtual");
+        assert!(policy.has_active("render.virtual"));
         assert_eq!(
             policy.acquire("render.virtual", 6, || panic!("last owner is still live")),
             Err("virtual_sink_format_conflict")
         );
         policy.release("render.virtual");
+        assert!(!policy.has_active("render.virtual"));
 
         let surround = VirtualFormatCandidate {
             sample_format: VirtualSampleFormat::Float32,
@@ -297,6 +306,7 @@ mod tests {
             )),
             Err("virtual_sink_format_unavailable")
         );
+        assert!(!policy.has_active("render.virtual"));
         let candidate = VirtualFormatCandidate {
             sample_format: VirtualSampleFormat::Float32,
             channel_mask: 0x003f,

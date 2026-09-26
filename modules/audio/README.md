@@ -91,9 +91,12 @@ layout, while the selected endpoint's engine format change persists after
 capture closes. Concurrent captures of one virtual endpoint share its selected
 engine format. A request for a different channel layout fails with
 `virtual_sink_format_conflict` until the final capture releases that endpoint;
-recovery of a shared capture keeps the existing format. Capture-only routing is
-invalid for virtual selection; virtual
-opens use the normal shared default-role lease and cleanup.
+recovery of a shared capture keeps the existing format. If the device mix
+changes while another capture owns that format, recovery waits and retries
+without rewriting it; close cancels the wait. Once the final owner releases
+the endpoint, recovery can select its format again. Capture-only routing is
+invalid for virtual selection; virtual opens use the normal shared default-role
+lease and cleanup.
 
 Set `capture_sink_without_routing:true` on an open to capture the selected
 endpoint without changing any render default role. On Windows, when the regular

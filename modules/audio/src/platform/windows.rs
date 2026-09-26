@@ -848,6 +848,7 @@ fn set_virtual_device_layout(
 
 struct VirtualFormatLease {
     endpoint: String,
+    shared: bool,
 }
 
 impl VirtualFormatLease {
@@ -858,15 +859,17 @@ impl VirtualFormatLease {
     ) -> AudioResult<(Self, VirtualFormatCandidate)> {
         let policy =
             VIRTUAL_FORMAT_POLICY.get_or_init(|| Mutex::new(VirtualFormatPolicy::default()));
-        let candidate = policy
+        let mut policy = policy
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .acquire(endpoint, layout.channels, || {
-                set_virtual_device_layout(endpoint, layout, preferred_valid_bits)
-            })?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shared = policy.has_active(endpoint);
+        let candidate = policy.acquire(endpoint, layout.channels, || {
+            set_virtual_device_layout(endpoint, layout, preferred_valid_bits)
+        })?;
         Ok((
             Self {
                 endpoint: endpoint.to_owned(),
+                shared,
             },
             candidate,
         ))
@@ -896,12 +899,21 @@ fn validate_virtual_mix(
     Ok(())
 }
 
+fn virtual_mix_error(error: &'static str, recovering: bool, shared: bool) -> &'static str {
+    if recovering && shared {
+        "virtual_sink_format_changed"
+    } else {
+        error
+    }
+}
+
 struct OpenSelectedOptions {
     desired_layout: Option<ChannelLayout>,
     preferred_valid_bits: Option<u16>,
     capture_sink_without_routing: bool,
     follow_console_default: bool,
     explicit_route: bool,
+    recovering: bool,
 }
 
 pub struct Capture {
@@ -1023,6 +1035,7 @@ impl Capture {
                     capture_sink_without_routing: effective_capture_only,
                     follow_console_default,
                     explicit_route,
+                    recovering: false,
                 },
             )
         }
@@ -1058,6 +1071,7 @@ impl Capture {
                     capture_sink_without_routing: config.capture_sink_without_routing,
                     follow_console_default: config.follow_console_default,
                     explicit_route: config.explicit_route,
+                    recovering: true,
                 },
             )
         }
@@ -1080,6 +1094,7 @@ impl Capture {
             capture_sink_without_routing,
             follow_console_default,
             explicit_route,
+            recovering,
         } = options;
         let route_virtual_sink = desired_layout.is_some();
         // SAFETY: the caller created this device and enumerator in the live
@@ -1108,7 +1123,19 @@ impl Capture {
             let mix = MixFormat(client.GetMixFormat().map_err(|_| "unsupported_format")?);
             let mut capture_format = match (desired_layout, selected_virtual_format) {
                 (Some(layout), Some(candidate)) => {
-                    validate_virtual_mix(&mix, layout, candidate)?;
+                    if let Err(error) = validate_virtual_mix(&mix, layout, candidate) {
+                        // A second capture still owns this selected format. A
+                        // reset or external format change must not be
+                        // overwritten while it is live. Retry recovery after
+                        // the other owner closes or the mix returns.
+                        return Err(virtual_mix_error(
+                            error,
+                            recovering,
+                            virtual_format_lease
+                                .as_ref()
+                                .is_some_and(|lease| lease.shared),
+                        ));
+                    }
                     let mut format = Format::new(48_000, layout.channels, PCM_F32)?;
                     format.channel_mask = candidate.channel_mask;
                     let waveformat = virtual_waveformat(
@@ -1337,6 +1364,18 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_shared_recovery_treats_a_changed_virtual_mix_as_transient() {
+        let error = "unsupported_channel_layout";
+        assert_eq!(virtual_mix_error(error, false, false), error);
+        assert_eq!(virtual_mix_error(error, false, true), error);
+        assert_eq!(virtual_mix_error(error, true, false), error);
+        assert_eq!(
+            virtual_mix_error(error, true, true),
+            "virtual_sink_format_changed"
+        );
+    }
 
     #[test]
     fn automatic_virtual_selection_does_not_abandon_an_older_route() {
