@@ -3,9 +3,9 @@ use crate::model::{
     MAX_SESSION_LIMIT, MAX_STORED_EVENTS, MAX_STORED_SAMPLES, PruneReport, SessionDetail,
     SessionEvent, SessionMetadata, SessionSample, SessionSummary, validate_text,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 2;
@@ -21,6 +21,7 @@ pub enum HistoryError {
     Database,
     NotFound,
     ActiveSession,
+    RecordingDisabled,
 }
 
 pub struct SessionPage {
@@ -44,7 +45,12 @@ impl From<rusqlite::Error> for HistoryError {
 /// Module request dispatch is single-threaded, so SQLite writes have one owner
 /// and preserve admission order without a separate writer queue.
 pub struct HistoryStore {
+    path: PathBuf,
     connection: Connection,
+    writer_open: bool,
+    recovered: bool,
+    #[cfg(test)]
+    fail_next_read_only_open: bool,
     settings: HistorySettings,
     configuration_ready: bool,
     effective_enabled: bool,
@@ -55,7 +61,7 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
-    pub fn open(path: &Path, now_unix: i64) -> Result<Self, HistoryError> {
+    pub fn open(path: &Path, _now_unix: i64) -> Result<Self, HistoryError> {
         if !path.is_absolute() {
             return Err(HistoryError::Invalid("database path must be absolute"));
         }
@@ -72,19 +78,21 @@ impl HistoryStore {
              PRAGMA foreign_keys = ON;",
         )?;
         apply_schema(&connection)?;
-        let mut store = Self {
+        let store = Self {
+            path: path.to_path_buf(),
             settings: HistorySettings::default(),
             configuration_ready: false,
             effective_enabled: false,
             connection,
+            writer_open: true,
+            recovered: false,
+            #[cfg(test)]
+            fail_next_read_only_open: false,
             active_streams: BTreeSet::new(),
             failed_operations: 0,
             last_prune: empty_prune_report(),
             next_prune_at_unix: None,
         };
-        store.close_interrupted_sessions(now_unix)?;
-        store.trim_existing_rows()?;
-        store.prune_best_effort(now_unix);
         Ok(store)
     }
 
@@ -132,9 +140,11 @@ impl HistoryStore {
         // Keep the recording decision stable for every stream in the current
         // cohort. Retention reads the new settings immediately below.
         if self.active_streams.is_empty() {
-            self.effective_enabled = self.settings.enabled;
+            self.transition_writer(now_unix)?;
         }
-        self.prune_best_effort(now_unix);
+        if self.effective_enabled {
+            self.prune_best_effort(now_unix);
+        }
         self.next_prune_at_unix = Some(now_unix.saturating_add(PRUNE_INTERVAL_SECONDS));
         Ok(())
     }
@@ -142,6 +152,16 @@ impl HistoryStore {
     /// Periodic retention also runs when no further sessions end. Failed
     /// attempts count as degraded operations and retry at the next interval.
     pub fn prune_if_due(&mut self, now_unix: i64) {
+        if self.configuration_ready
+            && (self.writer_open != self.settings.enabled
+                || self.effective_enabled != self.settings.enabled)
+        {
+            // A failed connection transition is retried without changing the
+            // policy or dropping admitted writes.
+            if self.active_streams.is_empty() && self.transition_writer(now_unix).is_err() {
+                self.record_failure();
+            }
+        }
         let Some(next_prune_at_unix) = self.next_prune_at_unix else {
             return;
         };
@@ -149,19 +169,26 @@ impl HistoryStore {
             return;
         }
         self.next_prune_at_unix = Some(now_unix.saturating_add(PRUNE_INTERVAL_SECONDS));
-        if self.settings.ttl_days > 0 || self.settings.db_size_limit_mb > 0 {
+        if self.effective_enabled
+            && (self.settings.ttl_days > 0 || self.settings.db_size_limit_mb > 0)
+        {
             self.prune_best_effort(now_unix);
         }
     }
 
     /// Removes the v1 local policy only after the central document is known
     /// durable. Keeping this separate makes failed imports restart-safe.
-    pub fn discard_legacy_settings(&mut self) -> Result<(), HistoryError> {
+    /// Returns false when cleanup must wait for an enabled writer. A saved
+    /// policy must never depend on this obsolete-table maintenance succeeding.
+    pub fn discard_legacy_settings(&mut self) -> Result<bool, HistoryError> {
+        if !self.writer_open {
+            return Ok(!table_exists(&self.connection, "history_settings")?);
+        }
         if table_exists(&self.connection, "history_settings")? {
             self.connection
                 .execute_batch("DROP TABLE history_settings")?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn begin_session(
@@ -258,10 +285,16 @@ impl HistoryStore {
         if was_active {
             self.active_streams.remove(session_id);
         }
-        if self.active_streams.is_empty() {
-            self.effective_enabled = self.settings.enabled;
+        if self.effective_enabled && (self.settings.enabled || ended) {
+            self.prune_best_effort(retention_now_unix);
         }
-        self.prune_best_effort(retention_now_unix);
+        if self.active_streams.is_empty()
+            && (self.writer_open != self.settings.enabled
+                || self.effective_enabled != self.settings.enabled)
+            && self.transition_writer(retention_now_unix).is_err()
+        {
+            self.record_failure();
+        }
         Ok(ended)
     }
 
@@ -343,7 +376,7 @@ impl HistoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<SessionPage, HistoryError> {
-        self.session_page(limit, offset, false)
+        self.session_page(limit, offset)
     }
 
     pub fn session_detail(&self, session_id: &str) -> Result<SessionDetail, HistoryError> {
@@ -375,38 +408,55 @@ impl HistoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<SessionPage, HistoryError> {
-        self.session_page(limit, offset, true)
-    }
-
-    fn session_page(
-        &self,
-        limit: usize,
-        offset: usize,
-        active_only: bool,
-    ) -> Result<SessionPage, HistoryError> {
-        let maximum = if active_only {
-            MAX_ACTIVE_LIMIT
-        } else {
-            MAX_SESSION_LIMIT
-        };
-        if !(1..=maximum).contains(&limit) {
+        if !(1..=MAX_ACTIVE_LIMIT).contains(&limit) {
             return Err(HistoryError::Invalid("session page limit is out of range"));
         }
-        let offset_sql = i64::try_from(offset)
-            .map_err(|_| HistoryError::Invalid("offset exceeds SQLite integer range"))?;
-        let sql = if active_only {
+        if i64::try_from(offset).is_err() {
+            return Err(HistoryError::Invalid("offset exceeds SQLite integer range"));
+        }
+        if self.active_streams.is_empty() {
+            return bound_session_page(Vec::new(), offset, false);
+        }
+        // Persisted rows with no end time may belong to a process that died
+        // while recording was enabled. Recovery is deliberately deferred while
+        // disabled, so only sessions admitted in this process are live.
+        let mut statement = self.connection.prepare(
             "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
                     target_fps, target_bitrate_kbps, codec, started_at_unix, ended_at_unix,
                     duration_seconds
              FROM sessions WHERE ended_at_unix IS NULL
-             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1 OFFSET ?2"
-        } else {
-            "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
+             ORDER BY started_at_unix DESC, session_id DESC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut matched = 0usize;
+        let mut sessions = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            let session = summary_from_row(row)?;
+            if !self.active_streams.contains(&session.session_id) {
+                continue;
+            }
+            if matched >= offset {
+                if sessions.len() == limit {
+                    return bound_session_page(sessions, offset, true);
+                }
+                sessions.push(session);
+            }
+            matched = matched.saturating_add(1);
+        }
+        bound_session_page(sessions, offset, false)
+    }
+
+    fn session_page(&self, limit: usize, offset: usize) -> Result<SessionPage, HistoryError> {
+        if !(1..=MAX_SESSION_LIMIT).contains(&limit) {
+            return Err(HistoryError::Invalid("session page limit is out of range"));
+        }
+        let offset_sql = i64::try_from(offset)
+            .map_err(|_| HistoryError::Invalid("offset exceeds SQLite integer range"))?;
+        let sql = "SELECT session_id, protocol, client_name, device_name, app_name, width, height,
                     target_fps, target_bitrate_kbps, codec, started_at_unix, ended_at_unix,
                     duration_seconds
              FROM sessions
-             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1 OFFSET ?2"
-        };
+             ORDER BY started_at_unix DESC, session_id DESC LIMIT ?1 OFFSET ?2";
         let mut statement = self.connection.prepare(sql)?;
         let rows =
             statement.query_map(params![(limit + 1) as i64, offset_sql], summary_from_row)?;
@@ -417,6 +467,9 @@ impl HistoryStore {
     }
 
     pub fn delete_session(&mut self, session_id: &str) -> Result<(), HistoryError> {
+        if !self.effective_enabled {
+            return Err(HistoryError::RecordingDisabled);
+        }
         validate_text(
             session_id,
             1,
@@ -447,7 +500,7 @@ impl HistoryStore {
     }
 
     pub fn prune(&mut self, now_unix: i64) -> Result<PruneReport, HistoryError> {
-        if !self.configuration_ready {
+        if !self.configuration_ready || !self.effective_enabled {
             return Ok(self.last_prune.clone());
         }
         let transaction = self
@@ -524,57 +577,111 @@ impl HistoryStore {
     }
 
     fn prune_best_effort(&mut self, now_unix: i64) {
-        if self.configuration_ready && self.prune(now_unix).is_err() {
+        if self.configuration_ready && self.effective_enabled && self.prune(now_unix).is_err() {
             self.record_failure();
         }
     }
 
-    fn close_interrupted_sessions(&mut self, now_unix: i64) -> Result<(), HistoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut statement =
-            transaction.prepare("SELECT session_id FROM sessions WHERE ended_at_unix IS NULL")?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for session_id in ids {
-            transaction.execute(
-                "UPDATE sessions SET ended_at_unix = ?1,
+    /// The single-threaded service has already committed every admitted write
+    /// when this runs. Replace the write connection with a read-only connection
+    /// only after the last active stream has ended. If opening the replacement
+    /// fails, retain the current connection and retry on a later tick.
+    fn transition_writer(&mut self, now_unix: i64) -> Result<(), HistoryError> {
+        if self.settings.enabled == self.writer_open {
+            if self.settings.enabled && !self.recovered {
+                recover_existing_rows(&mut self.connection, now_unix)?;
+                self.recovered = true;
+            }
+            self.effective_enabled = self.settings.enabled;
+            return Ok(());
+        }
+        let flags = if self.settings.enabled {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if !self.settings.enabled {
+            // The last admitted recording has drained. Reject all new writes
+            // even if replacing the connection fails and the RW handle must
+            // stay alive for a retry.
+            self.effective_enabled = false;
+            // Readable history must not present a prior process's unfinished
+            // rows as live. This bounded recovery writes only end markers;
+            // cap trimming and retention remain paused until re-enable.
+            close_interrupted_sessions(&mut self.connection, now_unix)?;
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_read_only_open) {
+                return Err(HistoryError::Database);
+            }
+        }
+        let replacement = Connection::open_with_flags(&self.path, flags)?;
+        replacement.busy_timeout(Duration::from_secs(5))?;
+        replacement.pragma_update(None, "foreign_keys", "ON")?;
+        if self.settings.enabled {
+            let mut replacement = replacement;
+            recover_existing_rows(&mut replacement, now_unix)?;
+            self.connection = replacement;
+            self.recovered = true;
+        } else {
+            self.connection = replacement;
+        }
+        // The old connection is dropped after replacement succeeds. Each write
+        // transaction has committed, so SQLite can checkpoint its WAL safely.
+        self.writer_open = self.settings.enabled;
+        self.effective_enabled = self.settings.enabled;
+        Ok(())
+    }
+}
+
+fn recover_existing_rows(connection: &mut Connection, now_unix: i64) -> Result<(), HistoryError> {
+    close_interrupted_sessions(connection, now_unix)?;
+    trim_existing_rows(connection)
+}
+
+fn close_interrupted_sessions(
+    connection: &mut Connection,
+    now_unix: i64,
+) -> Result<(), HistoryError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut statement =
+        transaction.prepare("SELECT session_id FROM sessions WHERE ended_at_unix IS NULL")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for session_id in ids {
+        transaction.execute(
+            "UPDATE sessions SET ended_at_unix = ?1,
                  duration_seconds = max(?1 - started_at_unix, 0)
                  WHERE session_id = ?2 AND ended_at_unix IS NULL",
-                params![now_unix, session_id],
-            )?;
-            transaction.execute(
-                "INSERT INTO events (session_id, recorded_at_unix, event_type, payload)
+            params![now_unix, session_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO events (session_id, recorded_at_unix, event_type, payload)
                  VALUES (?1, ?2, 'stream_interrupted', NULL)",
-                params![session_id, now_unix],
-            )?;
-            trim_events(&transaction, &session_id)?;
-        }
-        transaction.commit()?;
-        Ok(())
+            params![session_id, now_unix],
+        )?;
+        trim_events(&transaction, &session_id)?;
     }
+    transaction.commit()?;
+    Ok(())
+}
 
-    /// Upgraded databases can contain rows written before per-session caps
-    /// existed. Trim them before the first management read, even when the
-    /// product policy has not loaded or recording is disabled.
-    fn trim_existing_rows(&mut self) -> Result<(), HistoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let overfull_samples = overfull_sessions(&transaction, "samples", MAX_STORED_SAMPLES)?;
-        for session_id in overfull_samples {
-            trim_samples(&transaction, &session_id)?;
-        }
-        let overfull_events = overfull_sessions(&transaction, "events", MAX_STORED_EVENTS)?;
-        for session_id in overfull_events {
-            trim_events(&transaction, &session_id)?;
-        }
-        transaction.commit()?;
-        Ok(())
+/// Upgraded databases can contain rows written before per-session caps
+/// existed. Trim them before the first management read, even when the
+/// product policy has not loaded or recording is disabled.
+fn trim_existing_rows(connection: &mut Connection) -> Result<(), HistoryError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let overfull_samples = overfull_sessions(&transaction, "samples", MAX_STORED_SAMPLES)?;
+    for session_id in overfull_samples {
+        trim_samples(&transaction, &session_id)?;
     }
+    let overfull_events = overfull_sessions(&transaction, "events", MAX_STORED_EVENTS)?;
+    for session_id in overfull_events {
+        trim_events(&transaction, &session_id)?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn bound_detail_response(detail: &mut SessionDetail) -> Result<(), HistoryError> {
@@ -1078,7 +1185,12 @@ mod tests {
             db_size_limit_mb: 17,
         };
         store.apply_configuration(central, 200).unwrap();
-        store.discard_legacy_settings().unwrap();
+        assert!(!store.discard_legacy_settings().unwrap());
+        assert!(table_exists(&store.connection, "history_settings").unwrap());
+        store
+            .apply_configuration(HistorySettings::default(), 201)
+            .unwrap();
+        assert!(store.discard_legacy_settings().unwrap());
         assert!(!table_exists(&store.connection, "history_settings").unwrap());
         assert!(store.status().unwrap().configuration_ready);
     }
@@ -1331,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_recording_still_applies_retention_after_restart() {
+    fn disabled_recording_keeps_readable_history_after_restart() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         {
@@ -1354,25 +1466,26 @@ mod tests {
             200_000,
         );
         assert!(!store.settings().1);
-        assert!(matches!(
-            store.session_detail("expired"),
-            Err(HistoryError::NotFound)
-        ));
+        assert!(!store.writer_open);
+        assert_eq!(
+            store.session_detail("expired").unwrap().session.session_id,
+            "expired"
+        );
         assert_eq!(
             store.session_detail("recent").unwrap().session.session_id,
             "recent"
         );
-        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 0);
         assert!(
             !store
                 .begin_session(&metadata("unrecorded"), 200_001)
                 .unwrap()
         );
-        assert_eq!(store.status().unwrap().sessions, 1);
+        assert_eq!(store.status().unwrap().sessions, 2);
     }
 
     #[test]
-    fn periodic_prune_expires_ended_records_without_new_streams() {
+    fn disabled_writer_does_not_run_periodic_retention() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
         configure(&mut store, HistorySettings::default(), 100);
@@ -1395,13 +1508,46 @@ mod tests {
 
         // The process stays open and no session ends while wall time advances.
         store.prune_if_due(86_502);
-        assert_eq!(store.status().unwrap().sessions, 0);
-        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+        assert_eq!(store.status().unwrap().sessions, 1);
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 0);
         assert!(!store.settings().1);
+        assert!(!store.writer_open);
     }
 
     #[test]
-    fn disabled_recording_still_applies_size_limit_to_ended_records() {
+    fn final_recorded_end_prunes_before_writer_closes_then_idle_prune_stops() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store.begin_session(&metadata("old"), 100).unwrap();
+        store.end_session("old", 101, 101).unwrap();
+        store.begin_session(&metadata("last"), 200).unwrap();
+        configure(
+            &mut store,
+            HistorySettings {
+                enabled: false,
+                ttl_days: 1,
+                db_size_limit_mb: 0,
+            },
+            201,
+        );
+        assert!(store.writer_open);
+        assert_eq!(store.status().unwrap().sessions, 2);
+
+        store.end_session("last", 86_500, 86_502).unwrap();
+        assert!(!store.writer_open);
+        assert!(matches!(
+            store.session_detail("old"),
+            Err(HistoryError::NotFound)
+        ));
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+        store.prune_if_due(200_000);
+        assert_eq!(store.status().unwrap().sessions, 1);
+        assert_eq!(store.status().unwrap().last_prune.sessions_deleted, 1);
+    }
+
+    #[test]
+    fn disabled_recording_does_not_apply_size_limit_to_ended_records() {
         let database = TemporaryDatabase::new();
         let mut store = HistoryStore::open(&database.path(), 100).unwrap();
         configure(&mut store, HistorySettings::default(), 100);
@@ -1423,12 +1569,12 @@ mod tests {
             600,
         );
         assert!(!store.settings().1);
-        assert!(matches!(
-            store.session_detail("large"),
-            Err(HistoryError::NotFound)
-        ));
+        assert_eq!(
+            store.session_detail("large").unwrap().session.session_id,
+            "large"
+        );
         let status = store.status().unwrap();
-        assert_eq!(status.last_prune.sessions_deleted, 1);
+        assert_eq!(status.last_prune.sessions_deleted, 0);
         assert!(!status.last_prune.size_limit_unmet);
     }
 
@@ -1702,7 +1848,15 @@ mod tests {
         assert_eq!(active_ids, expected);
         drop(store);
 
-        let reopened = HistoryStore::open(&path, 200).unwrap();
+        let mut reopened = HistoryStore::open(&path, 200).unwrap();
+        configure(
+            &mut reopened,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            200,
+        );
         let mut offset = 0;
         let mut saved_ids = Vec::new();
         let mut saw_short_page = false;
@@ -1738,6 +1892,11 @@ mod tests {
                 .unwrap()
                 .sessions
                 .is_empty()
+        );
+        assert!(
+            reopened.list_sessions_page(1, 0).unwrap().sessions[0]
+                .ended_at_unix
+                .is_some()
         );
     }
 
@@ -1847,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_an_overfull_ended_history_trims_it_before_policy_load() {
+    fn disabled_restart_defers_overfull_trim_until_writer_reenabled() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         {
@@ -1891,11 +2050,11 @@ mod tests {
                 .session_detail("legacy-large")
                 .unwrap()
                 .sample_count,
-            MAX_STORED_SAMPLES
+            MAX_STORED_SAMPLES + 3
         );
         assert_eq!(
             reopened.session_detail("legacy-large").unwrap().event_count,
-            MAX_STORED_EVENTS
+            MAX_STORED_EVENTS + 5
         );
         let oldest_sample: i64 = reopened
             .connection
@@ -1905,7 +2064,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(oldest_sample, 4);
+        assert_eq!(oldest_sample, 1);
         let oldest_event: i64 = reopened
             .connection
             .query_row(
@@ -1914,7 +2073,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(oldest_event, 1003);
+        assert_eq!(oldest_event, 100);
         assert_eq!(reopened.session_detail("small").unwrap().event_count, 2);
 
         configure(
@@ -1927,7 +2086,163 @@ mod tests {
             500,
         );
         assert!(!reopened.settings().1);
-        assert_eq!(reopened.status().unwrap().samples, MAX_STORED_SAMPLES);
-        assert_eq!(reopened.status().unwrap().events, MAX_STORED_EVENTS + 2);
+        assert_eq!(reopened.status().unwrap().samples, MAX_STORED_SAMPLES + 3);
+        assert_eq!(reopened.status().unwrap().events, MAX_STORED_EVENTS + 7);
+        assert!(matches!(
+            reopened.delete_session("small"),
+            Err(HistoryError::RecordingDisabled)
+        ));
+        configure(&mut reopened, HistorySettings::default(), 501);
+        assert!(reopened.writer_open);
+        assert_eq!(
+            reopened
+                .session_detail("legacy-large")
+                .unwrap()
+                .sample_count,
+            MAX_STORED_SAMPLES
+        );
+        assert_eq!(
+            reopened.session_detail("legacy-large").unwrap().event_count,
+            MAX_STORED_EVENTS
+        );
+        reopened.delete_session("small").unwrap();
+    }
+
+    #[test]
+    fn failed_reenable_trim_keeps_history_readable_and_retries() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        {
+            let mut store = HistoryStore::open(&path, 100).unwrap();
+            configure(&mut store, HistorySettings::default(), 100);
+            store.begin_session(&metadata("interrupted"), 100).unwrap();
+            store.end_session("interrupted", 101, 101).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "WITH RECURSIVE numbers(n) AS (
+                        SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 7201
+                     ) INSERT INTO samples (session_id, recorded_at_unix, frames_sent,
+                        bytes_sent, dropped_frames, actual_fps, actual_bitrate_kbps,
+                        encode_latency_ms)
+                     SELECT 'interrupted', n, 0, 0, 0, 0, 0, 0 FROM numbers;
+                     CREATE TRIGGER reject_trim BEFORE DELETE ON samples
+                     BEGIN SELECT RAISE(ABORT, 'retry trim'); END;",
+                )
+                .unwrap();
+        }
+
+        let mut reopened = HistoryStore::open(&path, 110).unwrap();
+        configure(
+            &mut reopened,
+            HistorySettings {
+                enabled: false,
+                ..HistorySettings::default()
+            },
+            110,
+        );
+        assert!(!reopened.writer_open);
+        assert_eq!(
+            reopened.session_detail("interrupted").unwrap().sample_count,
+            7201
+        );
+        assert!(matches!(
+            reopened.apply_configuration(HistorySettings::default(), 120),
+            Err(HistoryError::Database)
+        ));
+        assert!(!reopened.settings().1);
+        assert!(!reopened.writer_open);
+        assert_eq!(reopened.status().unwrap().sessions, 1);
+
+        let maintenance = Connection::open(&path).unwrap();
+        maintenance
+            .execute_batch("DROP TRIGGER reject_trim")
+            .unwrap();
+        drop(maintenance);
+        reopened.prune_if_due(121);
+        assert!(reopened.settings().1);
+        assert!(reopened.writer_open);
+        assert_eq!(
+            reopened.session_detail("interrupted").unwrap().sample_count,
+            MAX_STORED_SAMPLES
+        );
+        assert!(reopened.begin_session(&metadata("fresh"), 122).unwrap());
+    }
+
+    #[test]
+    fn failed_legacy_cleanup_does_not_block_saved_disable() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE history_settings (singleton INTEGER PRIMARY KEY, enabled INTEGER,
+             ttl_days INTEGER, db_size_limit_mb INTEGER);",
+            )
+            .unwrap();
+        store.begin_session(&metadata("admitted"), 101).unwrap();
+        store
+            .connection
+            .pragma_update(None, "query_only", "ON")
+            .unwrap();
+
+        store
+            .apply_configuration(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                102,
+            )
+            .unwrap();
+        assert!(!store.settings().0.enabled);
+        assert!(store.settings().1);
+        assert!(matches!(
+            store.discard_legacy_settings(),
+            Err(HistoryError::Database)
+        ));
+
+        store
+            .connection
+            .pragma_update(None, "query_only", "OFF")
+            .unwrap();
+        assert!(store.end_session("admitted", 103, 103).unwrap());
+        assert!(!store.settings().1);
+        assert!(!store.discard_legacy_settings().unwrap());
+        assert!(table_exists(&store.connection, "history_settings").unwrap());
+        store
+            .apply_configuration(HistorySettings::default(), 104)
+            .unwrap();
+        assert!(store.discard_legacy_settings().unwrap());
+    }
+
+    #[test]
+    fn failed_read_only_swap_closes_admission_and_retries_after_unrecorded_session() {
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 100).unwrap();
+        configure(&mut store, HistorySettings::default(), 100);
+        store.begin_session(&metadata("recorded"), 101).unwrap();
+        store
+            .apply_configuration(
+                HistorySettings {
+                    enabled: false,
+                    ..HistorySettings::default()
+                },
+                102,
+            )
+            .unwrap();
+        store.fail_next_read_only_open = true;
+        assert!(store.end_session("recorded", 103, 103).unwrap());
+        assert!(store.writer_open);
+        assert!(!store.settings().1);
+        assert!(!store.begin_session(&metadata("unrecorded"), 104).unwrap());
+        assert!(!store.end_session("unrecorded", 105, 105).unwrap());
+        assert!(!store.writer_open);
+        assert!(matches!(
+            store.session_detail("unrecorded"),
+            Err(HistoryError::NotFound)
+        ));
+        assert_eq!(store.session_detail("recorded").unwrap().event_count, 2);
     }
 }

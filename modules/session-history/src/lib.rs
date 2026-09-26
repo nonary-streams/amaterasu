@@ -231,7 +231,8 @@ impl SessionHistoryModule {
             return;
         };
         match store.discard_legacy_settings() {
-            Ok(()) => self.legacy_cleanup_pending = false,
+            Ok(true) => self.legacy_cleanup_pending = false,
+            Ok(false) => self.legacy_cleanup_retry_ticks = 30,
             Err(_) => {
                 store.record_failure();
                 self.legacy_cleanup_retry_ticks = 30;
@@ -366,6 +367,10 @@ fn error_response(error: HistoryError) -> Value {
         HistoryError::ActiveSession => {
             failure("active_session", "active history records cannot be deleted")
         }
+        HistoryError::RecordingDisabled => failure(
+            "recording_disabled",
+            "history records cannot be deleted while recording is disabled",
+        ),
     }
 }
 

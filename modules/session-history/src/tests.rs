@@ -219,7 +219,7 @@ fn saved_recording_toggle_waits_for_stream_drain_but_retention_survives_restart(
     reopened.prune_if_due(86_510);
     assert_eq!(
         call(&mut reopened, json!({"action":"history_status"}), 86_510)["status"]["sessions"],
-        0
+        2
     );
     drop(reopened);
     fs::remove_dir_all(directory).unwrap();
@@ -293,6 +293,17 @@ fn restart_during_pending_recording_toggles_adopts_saved_policy_without_phantom_
     let mut store = HistoryStore::open(&database, 110).unwrap();
     store.apply_configuration(policy(false), 111).unwrap();
     assert_policy(&mut store, false, false, 0, 1);
+    assert!(
+        call(
+            &mut store,
+            MANAGEMENT_CALLER,
+            json!({"action":"active_sessions","limit":16}),
+            111,
+        )["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let detail = call(
         &mut store,
         MANAGEMENT_CALLER,
@@ -301,7 +312,7 @@ fn restart_during_pending_recording_toggles_adopts_saved_policy_without_phantom_
         }),
         111,
     );
-    assert_eq!(detail["detail"]["session"]["ended_at_unix"], 110);
+    assert_eq!(detail["detail"]["session"]["ended_at_unix"], 111);
     assert_eq!(
         detail["detail"]["events"][0]["event_type"],
         "stream_started"

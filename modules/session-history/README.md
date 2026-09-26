@@ -48,18 +48,36 @@ do not fail the history module tick or the stream session.
 When `enabled` changes during active streams, the saved value is reported
 immediately, but the effective recording decision remains in place until the
 last active stream ends. New streams admitted during that interval use the
-existing decision. Retention limits apply immediately to ended records even
-while the recording change waits or recording is disabled.
+existing decision. The final recorded end and its retention pass commit before
+the write connection closes. While disabled, a read-only connection serves
+list, detail, active, and status requests. New sessions are not recorded,
+explicit delete returns `recording_disabled`, and settings changes or idle
+ticks do not run TTL or size retention. Re-enabling opens the writer and runs
+interrupted-session recovery, per-session row trimming, and retention before
+accepting new recorded sessions. A failed writer transition leaves history
+readable and is retried on later ticks. If closing the disabled writer fails,
+new recording admission closes after the admitted streams drain. Legacy SQLite
+settings cleanup is deferred while read-only and resumes after re-enable;
+cleanup failures do not block a saved recording policy. On restart the database schema is
+opened before the central policy loads. Once that policy is known, unfinished
+rows from a previous process receive an interrupted end marker before a
+disabled writer closes. Per-session cap trimming and retention wait for an
+enabled policy. The active list reflects only live sessions admitted by this
+process.
 
 History detail responses cap samples to the latest 32 and events to the latest
 8. Session listing is capped at 25 items per page and active listing at 16.
 Storage keeps the latest 7,200 samples and 2,000 events per session; inserts
 and trimming commit together so failed trimming cannot leave an unbounded row.
-Retention is applied by age and approximate live SQLite page bytes. Both
-policies delete ended sessions only; active records are retained even if the
-configured size limit cannot yet be met. Retention still applies to ended
-records while new recording is disabled, with an hourly sweep when no sessions
-end. A size of zero disables its policy.
+Retention is applied by age and approximate live SQLite page bytes while the
+writer is active. Both policies delete ended sessions only; active records are
+retained even if the configured size limit cannot yet be met. An hourly sweep
+runs when enabled and no sessions end. A size of zero disables its policy.
+
+The pinned Vibeshine writer joins its draining queue and closes its write
+database on disable. Its history reads and explicit deletion are unavailable
+while disabled. Amaterasu keeps a separate read-only connection for history
+inspection, while retaining the same paused retention and delete behavior.
 
 ## Integration status
 
