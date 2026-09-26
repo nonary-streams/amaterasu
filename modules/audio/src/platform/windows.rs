@@ -1086,13 +1086,11 @@ impl Capture {
             self.capture
                 .GetBuffer(&mut pointer, &mut frames, &mut flags, None, Some(&mut qpc))
                 .map_err(capture_error)?;
+            let buffer = BorrowedPacket::new(&self.capture, frames);
             if frames == 0 {
+                buffer.release()?;
                 return Ok(None);
             }
-            let buffer = BorrowedPacket {
-                capture: &self.capture,
-                frames,
-            };
             let flags = packet_flags(flags);
             let bytes = copy_samples(self.format, frames, flags, pointer);
             buffer.release()?;
@@ -1125,26 +1123,41 @@ impl Drop for Capture {
     }
 }
 
-struct BorrowedPacket<'a> {
-    capture: &'a IAudioCaptureClient,
-    frames: u32,
+trait CaptureBufferRelease {
+    fn release_buffer(&self, frames: u32) -> AudioResult<()>;
 }
 
-impl BorrowedPacket<'_> {
-    fn release(mut self) -> AudioResult<()> {
-        let frames = std::mem::take(&mut self.frames);
-        // SAFETY: releases exactly the count returned by GetBuffer, once.
-        unsafe { self.capture.ReleaseBuffer(frames).map_err(capture_error) }
+impl CaptureBufferRelease for IAudioCaptureClient {
+    fn release_buffer(&self, frames: u32) -> AudioResult<()> {
+        // SAFETY: the capture client owns the buffer returned by GetBuffer on
+        // this apartment thread; callers release it exactly once.
+        unsafe { self.ReleaseBuffer(frames).map_err(capture_error) }
     }
 }
 
-impl Drop for BorrowedPacket<'_> {
+struct BorrowedPacket<'a, C: CaptureBufferRelease + ?Sized> {
+    capture: &'a C,
+    frames: Option<u32>,
+}
+
+impl<'a, C: CaptureBufferRelease + ?Sized> BorrowedPacket<'a, C> {
+    fn new(capture: &'a C, frames: u32) -> Self {
+        Self {
+            capture,
+            frames: Some(frames),
+        }
+    }
+
+    fn release(mut self) -> AudioResult<()> {
+        let frames = self.frames.take().expect("capture buffer is still owned");
+        self.capture.release_buffer(frames)
+    }
+}
+
+impl<C: CaptureBufferRelease + ?Sized> Drop for BorrowedPacket<'_, C> {
     fn drop(&mut self) {
-        if self.frames != 0 {
-            // SAFETY: fallback during unwinding/error before explicit release.
-            unsafe {
-                let _ = self.capture.ReleaseBuffer(self.frames);
-            }
+        if let Some(frames) = self.frames.take() {
+            let _ = self.capture.release_buffer(frames);
         }
     }
 }
@@ -1180,6 +1193,29 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeCaptureBuffer {
+        released: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl CaptureBufferRelease for FakeCaptureBuffer {
+        fn release_buffer(&self, frames: u32) -> AudioResult<()> {
+            self.released.lock().unwrap().push(frames);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn zero_frame_and_error_paths_release_acquired_buffers_once() {
+        let capture = FakeCaptureBuffer::default();
+        BorrowedPacket::new(&capture, 0).release().unwrap();
+        BorrowedPacket::new(&capture, 12).release().unwrap();
+        {
+            let _buffer = BorrowedPacket::new(&capture, 4);
+        }
+        assert_eq!(*capture.released.lock().unwrap(), [0, 12, 4]);
+    }
 
     #[test]
     fn suspended_or_reset_capture_enters_device_recovery() {
