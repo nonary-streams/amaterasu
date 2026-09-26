@@ -731,13 +731,14 @@ fn read_samples(
     connection: &Connection,
     session_id: &str,
 ) -> Result<Vec<SessionSample>, HistoryError> {
+    // Row IDs preserve admission order when producer timestamps arrive late.
     let mut statement = connection.prepare(
         "SELECT session_id, recorded_at_unix, frames_sent, bytes_sent, dropped_frames,
                 actual_fps, actual_bitrate_kbps, encode_latency_ms
          FROM (
             SELECT * FROM samples WHERE session_id = ?1
-            ORDER BY recorded_at_unix DESC, id DESC LIMIT ?2
-         ) ORDER BY recorded_at_unix ASC, id ASC",
+            ORDER BY id DESC LIMIT ?2
+         ) ORDER BY id ASC",
     )?;
     let rows = statement.query_map(params![session_id, MAX_DETAIL_SAMPLES as i64], |row| {
         Ok(SessionSample {
@@ -762,8 +763,8 @@ fn read_events(
         "SELECT session_id, recorded_at_unix, event_type, payload
          FROM (
             SELECT * FROM events WHERE session_id = ?1
-            ORDER BY recorded_at_unix DESC, id DESC LIMIT ?2
-         ) ORDER BY recorded_at_unix ASC, id ASC",
+            ORDER BY id DESC LIMIT ?2
+         ) ORDER BY id ASC",
     )?;
     let rows = statement.query_map(params![session_id, MAX_DETAIL_EVENTS as i64], |row| {
         let payload = row
@@ -816,7 +817,7 @@ fn trim_samples(connection: &Connection, session_id: &str) -> Result<(), History
     connection.execute(
         "DELETE FROM samples WHERE id IN (
             SELECT id FROM samples WHERE session_id = ?1
-            ORDER BY recorded_at_unix DESC, id DESC LIMIT -1 OFFSET ?2
+            ORDER BY id DESC LIMIT -1 OFFSET ?2
         )",
         params![session_id, MAX_STORED_SAMPLES as i64],
     )?;
@@ -827,7 +828,7 @@ fn trim_events(connection: &Connection, session_id: &str) -> Result<(), HistoryE
     connection.execute(
         "DELETE FROM events WHERE id IN (
             SELECT id FROM events WHERE session_id = ?1
-            ORDER BY recorded_at_unix DESC, id DESC LIMIT -1 OFFSET ?2
+            ORDER BY id DESC LIMIT -1 OFFSET ?2
         )",
         params![session_id, MAX_STORED_EVENTS as i64],
     )?;
@@ -1175,6 +1176,85 @@ mod tests {
             .unwrap();
         assert!(store.end_session("retry-end", 110).unwrap());
         assert_eq!(store.status().unwrap().active_streams, 0);
+    }
+
+    #[test]
+    fn failed_sample_and_event_writes_retry_in_admission_order_after_reopen() {
+        let database = TemporaryDatabase::new();
+        let path = database.path();
+        let sample = |recorded_at_unix| SessionSample {
+            session_id: "retry-record".into(),
+            recorded_at_unix,
+            frames_sent: recorded_at_unix as u64,
+            bytes_sent: 100,
+            dropped_frames: 0,
+            actual_fps: 60.0,
+            actual_bitrate_kbps: 1_000.0,
+            encode_latency_ms: 1.0,
+        };
+        {
+            let mut store = HistoryStore::open(&path, 100).unwrap();
+            configure(&mut store, HistorySettings::default(), 100);
+            store.begin_session(&metadata("retry-record"), 100).unwrap();
+            store.record_sample(&sample(110)).unwrap();
+            store
+                .record_event(&event("retry-record", 110, json!("first")))
+                .unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_sample BEFORE INSERT ON samples
+                     BEGIN SELECT RAISE(ABORT, 'test failure'); END;
+                     CREATE TRIGGER reject_event BEFORE INSERT ON events
+                     WHEN NEW.event_type = 'marker'
+                     BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+                )
+                .unwrap();
+            assert!(matches!(
+                store.record_sample(&sample(105)),
+                Err(HistoryError::Database)
+            ));
+            assert!(matches!(
+                store.record_event(&event("retry-record", 105, json!("retried"))),
+                Err(HistoryError::Database)
+            ));
+            let detail = store.session_detail("retry-record").unwrap();
+            assert_eq!(detail.sample_count, 1);
+            assert_eq!(detail.event_count, 2);
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_sample; DROP TRIGGER reject_event;")
+                .unwrap();
+            assert!(store.record_sample(&sample(105)).unwrap());
+            assert!(
+                store
+                    .record_event(&event("retry-record", 105, json!("retried")))
+                    .unwrap()
+            );
+            store.end_session("retry-record", 120).unwrap();
+        }
+
+        let store = HistoryStore::open(&path, 130).unwrap();
+        let detail = store.session_detail("retry-record").unwrap();
+        assert_eq!(detail.sample_count, 2);
+        assert_eq!(detail.event_count, 4);
+        assert_eq!(
+            detail
+                .samples
+                .iter()
+                .map(|sample| sample.recorded_at_unix)
+                .collect::<Vec<_>>(),
+            [110, 105]
+        );
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["stream_started", "marker", "marker", "stream_ended"]
+        );
+        assert_eq!(detail.events[2].payload, Some(json!("retried")));
     }
 
     #[test]
@@ -1650,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_and_event_storage_keeps_the_newest_per_session_after_restart() {
+    fn sample_and_event_storage_keeps_the_latest_admitted_per_session_after_restart() {
         let database = TemporaryDatabase::new();
         let path = database.path();
         let mut store = HistoryStore::open(&path, 100).unwrap();
@@ -1693,7 +1773,7 @@ mod tests {
             store
                 .record_sample(&SessionSample {
                     session_id: "bounded-storage".into(),
-                    recorded_at_unix: 10_000,
+                    recorded_at_unix: 50,
                     frames_sent: 1,
                     bytes_sent: 2,
                     dropped_frames: 0,
@@ -1705,7 +1785,7 @@ mod tests {
         );
         assert!(
             store
-                .record_event(&event("bounded-storage", 10_001, json!(null)))
+                .record_event(&event("bounded-storage", 50, json!(null)))
                 .unwrap()
         );
         assert!(store.end_session("bounded-storage", 10_002).unwrap());
@@ -1719,7 +1799,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(oldest_sample, 102);
+        assert_eq!(oldest_sample, 50);
 
         drop(store);
         let mut reopened = HistoryStore::open(&path, 20_000).unwrap();
@@ -1727,7 +1807,8 @@ mod tests {
         let detail = reopened.session_detail("bounded-storage").unwrap();
         assert_eq!(detail.sample_count, MAX_STORED_SAMPLES);
         assert_eq!(detail.event_count, MAX_STORED_EVENTS);
-        assert_eq!(detail.samples.last().unwrap().recorded_at_unix, 10_000);
+        assert_eq!(detail.samples.last().unwrap().recorded_at_unix, 50);
+        assert_eq!(detail.events[detail.events.len() - 2].recorded_at_unix, 50);
         assert_eq!(detail.events.last().unwrap().event_type, "stream_ended");
     }
 
