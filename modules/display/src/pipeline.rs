@@ -1,3 +1,4 @@
+use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{Configuration, DisplayError, DisplayResult, Journal, Operation, Snapshot};
 use crate::platform::Platform;
 use crate::{JOURNAL_KEY, SERVICE, STATE_SERVICE};
@@ -105,6 +106,53 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if let Operation::Apply {
+            configuration,
+            expected_topology_revision,
+            mode_policy: Some(policy),
+            mode_policies: None,
+            ..
+        } = &incoming.operation
+            && matches!(
+                policy.configuration_option,
+                Some(DisplayConfigurationOption::Disabled | DisplayConfigurationOption::VerifyOnly)
+            )
+        {
+            let result = read_only_apply(
+                &mut self.platform,
+                configuration,
+                policy,
+                expected_topology_revision.as_deref(),
+            );
+            return complete(
+                send,
+                incoming.context.request,
+                result.unwrap_or_else(DisplayError::payload),
+            );
+        }
+        if let Operation::Apply {
+            mode_policy,
+            mode_policies,
+            ..
+        } = &incoming.operation
+            && (mode_policy
+                .as_ref()
+                .is_some_and(|policy| policy.configuration_option.is_some())
+                || mode_policies.as_ref().is_some_and(|policies| {
+                    policies
+                        .iter()
+                        .any(|policy| policy.configuration_option.is_some())
+                }))
+        {
+            return complete(
+                send,
+                incoming.context.request,
+                failure(
+                    "unsupported_configuration_option",
+                    "topology-changing configuration options require provider runtime support",
+                ),
+            );
+        }
         if let Operation::Snapshot = incoming.operation {
             let result = self.platform.snapshot().and_then(|snapshot| {
                 Ok(json!({"ok":true,"configuration":snapshot.configuration()?,"topology_revision":snapshot.revision()?}))
@@ -567,6 +615,48 @@ impl<P: Platform> Pipeline<P> {
         let payload = json!({"action":"delete","key":JOURNAL_KEY,"expected_revision":revision});
         self.submit(context, payload, Stage::Clearing(reply), send)
     }
+}
+fn read_only_apply<P: Platform>(
+    platform: &mut P,
+    configuration: &Configuration,
+    policy: &crate::model::ModePolicy,
+    expected_revision: Option<&str>,
+) -> DisplayResult<Value> {
+    configuration.validate()?;
+    if !configuration
+        .displays
+        .iter()
+        .any(|display| display.id.eq_ignore_ascii_case(&policy.display_id))
+    {
+        return Err(DisplayError::new(
+            "invalid_request",
+            "mode policy display is not in the configuration",
+        ));
+    }
+    if policy.configuration_option == Some(DisplayConfigurationOption::Disabled) {
+        return Ok(json!({"ok":true,"applied":false,"configuration_option":"disabled"}));
+    }
+    let snapshot = platform.snapshot()?;
+    snapshot.configuration()?;
+    if let Some(expected) = expected_revision
+        && snapshot.revision()? != expected
+    {
+        return Err(DisplayError::new(
+            "topology_changed",
+            "active display topology changed before verification",
+        ));
+    }
+    if !snapshot
+        .paths
+        .iter()
+        .any(|path| path.id.eq_ignore_ascii_case(&policy.display_id))
+    {
+        return Err(DisplayError::new(
+            "unsupported_display",
+            "verify_only requires an active display",
+        ));
+    }
+    Ok(json!({"ok":true,"applied":false,"verified":true,"configuration_option":"verify_only"}))
 }
 fn validate_active_ids(configuration: &Configuration, snapshot: &Snapshot) -> DisplayResult<()> {
     let requested: BTreeSet<_> = configuration

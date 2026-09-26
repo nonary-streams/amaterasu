@@ -1,3 +1,4 @@
+use crate::configuration_option::DisplayConfigurationOption;
 use crate::hdr_option::{DisplayHdrOption, resolve_hdr_configuration};
 use crate::mode_remapping::{DisplayMode, ModeRemapping, Resolution, ResolverContext};
 use crate::refresh_rate_option::{RefreshRateOption, parse_manual_refresh_rate};
@@ -41,6 +42,8 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct ModePolicy {
     pub display_id: String,
+    #[serde(default)]
+    pub configuration_option: Option<DisplayConfigurationOption>,
     pub remapping: ModeRemapping,
     pub context: ResolverContext,
     #[serde(default)]

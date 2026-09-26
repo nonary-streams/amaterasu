@@ -93,6 +93,16 @@ fn policy(display_id: &str, resolution: &str, refresh: &str) -> Value {
         }]}
     })
 }
+fn configuration_option_request(option: &str, display_id: &str, configuration: Value) -> Value {
+    json!({"action":"apply","configuration":configuration,"mode_policy":{
+        "display_id":display_id,
+        "configuration_option":option,
+        "remapping":{},
+        "context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":true},
+        "resolution_option":"manual",
+        "manual_resolution":"invalid ignored value"
+    }})
+}
 
 #[test]
 fn public_single_policy_resolution_validates_resulting_configuration() {
@@ -534,6 +544,66 @@ fn snapshot_returns_complete_multi_monitor_configuration_and_stable_revision() {
     assert_eq!(before, reordered.revision().unwrap());
     reordered.paths[0].source.width += 1;
     assert_ne!(before, reordered.revision().unwrap());
+}
+
+#[test]
+fn disabled_configuration_option_has_no_state_or_native_effect_even_when_mutation_disabled() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), false);
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        configuration_option_request("disabled", "monitor.one", configuration()),
+    );
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["applied"], false);
+    assert!(reply["lease"].is_null());
+    assert_eq!(state.revision, 0);
+    assert!(pipeline.platform.prepared_modes.is_empty());
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn verify_only_requires_active_target_without_journal_or_mode_resolution() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), false);
+    let reply = state.run(
+        &mut pipeline,
+        "owner",
+        configuration_option_request("verify_only", "monitor.one", configuration()),
+    );
+    assert_eq!(reply["verified"], true);
+    assert_eq!(reply["applied"], false);
+    assert!(reply["lease"].is_null());
+    assert_eq!(state.revision, 0);
+    assert!(pipeline.platform.prepared_modes.is_empty());
+    let mut inactive = snapshot();
+    inactive.paths[0].id = "monitor.other".into();
+    pipeline.platform.current_snapshot = Some(inactive);
+    let rejected = state.run(
+        &mut pipeline,
+        "owner",
+        configuration_option_request("verify_only", "monitor.one", configuration()),
+    );
+    assert_eq!(rejected["error"]["code"], "unsupported_display");
+    assert_eq!(state.revision, 0);
+}
+
+#[test]
+fn unfinished_mutating_configuration_options_cannot_silently_use_legacy_apply() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    for option in ["ensure_active", "ensure_primary", "ensure_only_display"] {
+        let reply = state.run(
+            &mut pipeline,
+            "owner",
+            configuration_option_request(option, "monitor.one", configuration()),
+        );
+        assert_eq!(reply["error"]["code"], "unsupported_configuration_option");
+    }
+    assert_eq!(state.revision, 0);
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
 }
 
 #[test]
