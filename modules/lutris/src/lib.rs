@@ -163,6 +163,7 @@ impl SnapshotWorker {
 struct CapturedScan {
     snapshot: Snapshot,
     settings: ProductSettings,
+    manual: bool,
     source_revision: u64,
     settings_epoch: u64,
 }
@@ -291,7 +292,7 @@ impl LutrisModule {
             return;
         };
         if settings_epoch != self.settings_epoch || !self.configuration.settings().enabled {
-            self.schedule_next_auto_sync(settings_epoch != self.settings_epoch);
+            self.reschedule_stale_scan(manual, settings_epoch);
             return;
         }
         match result {
@@ -331,6 +332,7 @@ impl LutrisModule {
                 let scan = CapturedScan {
                     snapshot,
                     settings,
+                    manual,
                     source_revision,
                     settings_epoch,
                 };
@@ -354,15 +356,24 @@ impl LutrisModule {
         let Some(mut pending) = self.steam_read.take() else {
             return Ok(());
         };
-        match pending.reader.advance(&self.runtime)? {
+        let progress = pending.reader.advance(&self.runtime)?;
+        match progress {
             SteamProgress::Pending => self.steam_read = Some(pending),
             SteamProgress::Failed(error) => {
-                let settings_changed = pending.scan.settings_epoch != self.settings_epoch;
-                self.last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
-                self.pending_source = None;
-                self.last_reconciled_source = None;
-                self.last_reconciled_at = None;
-                self.schedule_next_auto_sync(settings_changed);
+                if record_steam_failure_if_current(
+                    pending.scan.settings_epoch,
+                    self.settings_epoch,
+                    self.configuration.settings().enabled,
+                    &error,
+                    &mut self.last_error,
+                    &mut self.last_reconciled_source,
+                    &mut self.last_reconciled_at,
+                ) {
+                    self.pending_source = None;
+                    self.schedule_next_auto_sync(false);
+                } else {
+                    self.reschedule_stale_scan(pending.scan.manual, pending.scan.settings_epoch);
+                }
             }
             SteamProgress::Complete(steam_ids) => {
                 self.start_catalog_scan(pending.scan, &steam_ids);
@@ -373,6 +384,8 @@ impl LutrisModule {
 
     fn start_catalog_scan(&mut self, scan: CapturedScan, steam_app_ids: &BTreeSet<u32>) {
         let settings_changed = scan.settings_epoch != self.settings_epoch;
+        let manual = scan.manual;
+        let captured_epoch = scan.settings_epoch;
         match scan.start_catalog(
             &mut self.catalog,
             steam_app_ids,
@@ -383,7 +396,7 @@ impl LutrisModule {
                 self.pending_source = Some((signature, settings_epoch));
                 self.last_error = None;
             }
-            Ok(None) => self.schedule_next_auto_sync(settings_changed),
+            Ok(None) => self.reschedule_stale_scan(manual, captured_epoch),
             Err(error) => {
                 self.last_error = Some(error);
                 self.last_reconciled_source = None;
@@ -411,6 +424,17 @@ impl LutrisModule {
         self.next_auto_sync = next_auto_sync_after_scan(
             self.configuration.settings(),
             settings_changed,
+            Instant::now(),
+        );
+    }
+
+    fn reschedule_stale_scan(&mut self, manual: bool, captured_epoch: u64) {
+        reschedule_stale_scan(
+            self.configuration.settings(),
+            manual,
+            captured_epoch != self.settings_epoch,
+            &mut self.manual_refresh_pending,
+            &mut self.next_auto_sync,
             Instant::now(),
         );
     }
@@ -618,6 +642,38 @@ fn next_auto_sync_after_scan(
             AUTO_SYNC_INTERVAL
         }
     })
+}
+
+fn reschedule_stale_scan(
+    settings: &ProductSettings,
+    manual: bool,
+    settings_changed: bool,
+    manual_refresh_pending: &mut bool,
+    next_auto_sync: &mut Option<Instant>,
+    now: Instant,
+) {
+    if settings.enabled && manual {
+        *manual_refresh_pending = true;
+    }
+    *next_auto_sync = next_auto_sync_after_scan(settings, settings_changed, now);
+}
+
+fn record_steam_failure_if_current(
+    captured_epoch: u64,
+    current_epoch: u64,
+    enabled: bool,
+    error: &str,
+    last_error: &mut Option<String>,
+    last_reconciled_source: &mut Option<SourceSignature>,
+    last_reconciled_at: &mut Option<Instant>,
+) -> bool {
+    if !enabled || captured_epoch != current_epoch {
+        return false;
+    }
+    *last_error = Some(format!("Steam dedupe snapshot unavailable: {error}"));
+    *last_reconciled_source = None;
+    *last_reconciled_at = None;
+    true
 }
 
 fn finish_reconciliation(
@@ -942,6 +998,79 @@ mod tests {
     }
 
     #[test]
+    fn stale_manual_scan_requeues_a_fresh_scan_when_auto_sync_is_off() {
+        let settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            ..ProductSettings::default()
+        };
+        let now = Instant::now();
+        let mut manual_pending = false;
+        let mut next_auto_sync = None;
+        reschedule_stale_scan(
+            &settings,
+            true,
+            true,
+            &mut manual_pending,
+            &mut next_auto_sync,
+            now,
+        );
+        assert!(manual_pending);
+        assert_eq!(next_auto_sync, None);
+        assert!(scan_is_due(&settings, manual_pending, next_auto_sync, now));
+
+        manual_pending = false;
+        let disabled = ProductSettings {
+            enabled: false,
+            ..settings.clone()
+        };
+        reschedule_stale_scan(
+            &disabled,
+            true,
+            true,
+            &mut manual_pending,
+            &mut next_auto_sync,
+            now,
+        );
+        assert!(!manual_pending);
+        assert!(!scan_is_due(&disabled, manual_pending, next_auto_sync, now));
+    }
+
+    #[test]
+    fn stale_steam_failure_preserves_current_reconciliation_state() {
+        let signature = SourceSignature::from(&snapshot());
+        let now = Instant::now();
+        let mut last_error = Some("current scan error".to_owned());
+        let mut last_source = Some(signature.clone());
+        let mut last_at = Some(now);
+        assert!(!record_steam_failure_if_current(
+            3,
+            5,
+            true,
+            "old catalog failure",
+            &mut last_error,
+            &mut last_source,
+            &mut last_at,
+        ));
+        assert_eq!(last_error.as_deref(), Some("current scan error"));
+        assert_eq!(last_source, Some(signature.clone()));
+        assert_eq!(last_at, Some(now));
+
+        assert!(record_steam_failure_if_current(
+            5,
+            5,
+            true,
+            "current catalog failure",
+            &mut last_error,
+            &mut last_source,
+            &mut last_at,
+        ));
+        assert!(last_error.unwrap().contains("current catalog failure"));
+        assert_eq!(last_source, None);
+        assert_eq!(last_at, None);
+    }
+
+    #[test]
     fn unchanged_automatic_source_skips_catalog_until_retry_but_manual_refresh_runs() {
         let snapshot = snapshot();
         let signature = SourceSignature::from(&snapshot);
@@ -1013,6 +1142,7 @@ mod tests {
             scan: CapturedScan {
                 snapshot: source.clone(),
                 settings,
+                manual: true,
                 source_revision: 1,
                 settings_epoch: 7,
             },
@@ -1046,6 +1176,7 @@ mod tests {
                 include_steam: true,
                 ..ProductSettings::default()
             },
+            manual: true,
             source_revision: 2,
             settings_epoch: 7,
         };
@@ -1175,6 +1306,7 @@ mod tests {
         let scan = CapturedScan {
             snapshot: result.unwrap(),
             settings: captured_settings,
+            manual,
             source_revision: 1,
             settings_epoch,
         };
@@ -1201,6 +1333,7 @@ mod tests {
                 autosync_remove_uninstalled: false,
                 exclude_games: vec![Exclusion::Id("10".into())],
             },
+            manual: true,
             source_revision: 2,
             settings_epoch: 5,
         };
