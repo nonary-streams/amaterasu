@@ -99,7 +99,7 @@ impl<B: Backend> Controller<B> {
         guard()?;
         let mut session = self.backend.open(output)?;
         let geometry = initial_geometry(&mut *session)?;
-        let touch_surface = initial_touch_surface(&mut *session)?;
+        let touch_surface = initial_touch_surface(&mut *session, geometry)?;
         // Opening may block in a driver. Recheck before retaining resources.
         guard()?;
         self.streams.insert(
@@ -243,7 +243,13 @@ fn initial_geometry(session: &mut dyn CaptureSession) -> CaptureResult<Option<Ca
     }
 }
 
-fn initial_touch_surface(session: &mut dyn CaptureSession) -> CaptureResult<Option<TouchSurface>> {
+fn initial_touch_surface(
+    session: &mut dyn CaptureSession,
+    geometry: Option<CaptureGeometry>,
+) -> CaptureResult<Option<TouchSurface>> {
+    let Some(geometry) = geometry else {
+        return Ok(None);
+    };
     match session.touch_surface() {
         Err(error) if error.code == "geometry_unavailable" => Ok(None),
         Err(error) => Err(error),
@@ -251,7 +257,20 @@ fn initial_touch_surface(session: &mut dyn CaptureSession) -> CaptureResult<Opti
             "geometry_unavailable",
             "capture backend returned invalid touch surface",
         )),
-        Ok(surface) => Ok(surface),
+        Ok(Some(surface)) => {
+            if surface.width != geometry.output.width || surface.height != geometry.output.height {
+                return Ok(None);
+            }
+            // Providers may query topology independently for each value. A
+            // moved output can retain its dimensions, so verify the complete
+            // rectangle after obtaining the touch surface.
+            if initial_geometry(session)? == Some(geometry) {
+                Ok(Some(surface))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(None) => Ok(None),
     }
 }
 

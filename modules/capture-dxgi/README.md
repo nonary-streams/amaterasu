@@ -19,10 +19,12 @@ Native modules are trusted code; these grants are not a native-code sandbox.
   Windows can prove the selected monitor's physical rectangle and the complete
   virtual desktop. A separate `touch_surface` object contains positive
   `width`, `height`, `logical_width`, and `logical_height` when DXGI, GDI, and
-  CCD verify the same physical output. Its logical dimensions are physical
-  Windows pointer units; no stream letterboxing is claimed. The field is
-  omitted if that mapping cannot be verified. IDs are opaque JSON unsigned 64-bit integers; clients must
-  preserve integer precision.
+  CCD verify the same physical output, its dimensions agree with the advertised
+  output rectangle, and a second geometry check confirms that the output did
+  not move during open. Its logical dimensions are physical Windows pointer
+  units; no stream letterboxing is claimed. The field is omitted if geometry
+  or that mapping cannot be verified. IDs are opaque JSON unsigned 64-bit
+  integers; clients must preserve integer precision.
 - Open accepts optional `operation_id` (1..128 UTF-8 bytes). Repeating the same
   caller/output/operation ID returns the existing live stream; changing output
   returns `operation_conflict`. `{"action":"lookup","operation_id":"start-1"}`
