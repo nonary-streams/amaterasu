@@ -1,6 +1,7 @@
 use super::*;
 use model::HistorySettings;
 use serde_json::json;
+use std::fs;
 
 fn operation(action: &str) -> Operation {
     let mut payload = json!({"action": action});
@@ -86,4 +87,140 @@ fn configured_database_path_is_parsed_and_must_be_absolute() {
         configured_path
     );
     assert!(validate_database_path("relative/history.db".into()).is_err());
+}
+
+#[test]
+fn producer_updates_remain_ordered_and_readable_after_restart() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-history-rpc-{}-{}",
+        std::process::id(),
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let database = directory.join("history.db");
+    let producer_call = |store: &mut HistoryStore, payload| {
+        let operation: Operation = serde_json::from_value(payload).unwrap();
+        assert!(is_authorized(STREAM_SESSION_CALLER, &operation));
+        execute(store, operation, 200).unwrap()
+    };
+
+    {
+        let mut store = HistoryStore::open(&database, 100).unwrap();
+        store
+            .apply_configuration(HistorySettings::default(), 100)
+            .unwrap();
+        assert_eq!(
+            producer_call(
+                &mut store,
+                json!({
+                    "action":"session_begin",
+                    "metadata":{
+                        "session_id":"stream-session-000000000000002a",
+                        "protocol":"sunshine-modern",
+                        "client_name":"viewer",
+                        "device_name":"display",
+                        "app_name":"",
+                        "width":1920,
+                        "height":1080,
+                        "target_fps":60,
+                        "target_bitrate_kbps":20000,
+                        "codec":""
+                    },
+                    "started_at_unix":100
+                }),
+            )["recorded"],
+            true
+        );
+        for (timestamp, frames) in [(110, 60), (109, 120)] {
+            assert_eq!(
+                producer_call(
+                    &mut store,
+                    json!({
+                        "action":"record_sample",
+                        "sample":{
+                            "session_id":"stream-session-000000000000002a",
+                            "recorded_at_unix":timestamp,
+                            "frames_sent":frames,
+                            "bytes_sent":frames * 1000,
+                            "dropped_frames":0,
+                            "actual_fps":60.0,
+                            "actual_bitrate_kbps":480.0,
+                            "encode_latency_ms":0.0
+                        }
+                    }),
+                )["recorded"],
+                true
+            );
+        }
+        assert_eq!(
+            producer_call(
+                &mut store,
+                json!({
+                    "action":"record_event",
+                    "event":{
+                        "session_id":"stream-session-000000000000002a",
+                        "recorded_at_unix":111,
+                        "event_type":"stream_stopped",
+                        "payload":{"state":"stopped"}
+                    }
+                }),
+            )["recorded"],
+            true
+        );
+        assert_eq!(
+            producer_call(
+                &mut store,
+                json!({
+                    "action":"session_end",
+                    "session_id":"stream-session-000000000000002a",
+                    "ended_at_unix":112
+                }),
+            )["recorded"],
+            true
+        );
+        assert_eq!(
+            producer_call(
+                &mut store,
+                json!({
+                    "action":"session_end",
+                    "session_id":"stream-session-000000000000002a",
+                    "ended_at_unix":112
+                }),
+            )["recorded"],
+            false
+        );
+    }
+
+    let mut reopened = HistoryStore::open(&database, 120).unwrap();
+    reopened
+        .apply_configuration(HistorySettings::default(), 120)
+        .unwrap();
+    let list = execute(
+        &mut reopened,
+        serde_json::from_value(json!({"action":"list_sessions","limit":1,"offset":0})).unwrap(),
+        120,
+    )
+    .unwrap();
+    assert_eq!(
+        list["sessions"][0]["session_id"],
+        "stream-session-000000000000002a"
+    );
+    assert_eq!(list["next_offset"], serde_json::Value::Null);
+    let detail = execute(
+        &mut reopened,
+        serde_json::from_value(json!({
+            "action":"session_detail",
+            "session_id":"stream-session-000000000000002a"
+        }))
+        .unwrap(),
+        120,
+    )
+    .unwrap();
+    assert_eq!(detail["detail"]["sample_count"], 2);
+    assert_eq!(detail["detail"]["event_count"], 3);
+    assert_eq!(detail["detail"]["samples"][0]["recorded_at_unix"], 110);
+    assert_eq!(detail["detail"]["samples"][1]["recorded_at_unix"], 109);
+    assert_eq!(detail["detail"]["events"][1]["payload"]["state"], "stopped");
+    assert_eq!(detail["detail"]["events"][2]["event_type"], "stream_ended");
+    drop(reopened);
+    fs::remove_dir_all(directory).unwrap();
 }
