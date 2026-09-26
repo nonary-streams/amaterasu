@@ -771,7 +771,9 @@ var Amaterasu;
                     }
                 }
                 catch (error) {
-                    await this.clear();
+                    if (generation === this.authGeneration &&
+                        (this.remembered ? this.sessionId : null) === previousSessionId)
+                        await this.clear();
                     if (shouldRemember)
                         void this.revokeSession({ refresh_token: validated.refresh_token });
                     throw error;
