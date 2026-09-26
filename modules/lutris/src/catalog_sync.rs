@@ -516,6 +516,10 @@ impl CatalogSync {
         self.transaction.is_none() && self.last_error.is_none()
     }
 
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn respond_for_test(&mut self, payload: Value) {
         let transaction = self

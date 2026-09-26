@@ -340,22 +340,16 @@ impl LutrisModule {
     }
 
     fn finish_catalog_if_ready(&mut self) {
-        if self.pending_source.is_none() || self.catalog.busy() {
+        let Some(settings_changed) = finish_reconciliation(
+            &mut self.pending_source,
+            &self.catalog,
+            self.settings_epoch,
+            &mut self.last_reconciled_source,
+            &mut self.last_reconciled_at,
+            &mut self.last_error,
+        ) else {
             return;
-        }
-        let settings_changed = self
-            .pending_source
-            .as_ref()
-            .is_some_and(|(_, epoch)| *epoch != self.settings_epoch);
-        if let Some((signature, settings_epoch)) = self.pending_source.take() {
-            if self.catalog.succeeded() && settings_epoch == self.settings_epoch {
-                self.last_reconciled_source = Some(signature);
-                self.last_reconciled_at = Some(Instant::now());
-            } else {
-                self.last_reconciled_source = None;
-                self.last_reconciled_at = None;
-            }
-        }
+        };
         self.schedule_next_auto_sync();
         if settings_changed && self.next_auto_sync.is_some() {
             self.next_auto_sync = Some(Instant::now());
@@ -469,7 +463,7 @@ impl LutrisModule {
             "executable_available":available.executable_available,
             "settings_revision":self.configuration.revision(),
             "game_count":self.last_snapshot_games,
-            "refresh_pending":self.manual_refresh_pending || self.snapshot_worker.busy() || self.steam_read.is_some(),
+            "refresh_pending":self.manual_refresh_pending || self.snapshot_worker.busy() || self.steam_read.is_some() || self.catalog.busy(),
             "last_error":self.last_error,
             "catalog_sync":self.catalog.status(),
         })
@@ -484,6 +478,33 @@ impl LutrisModule {
             response => Err(format!("Lutris request completion failed: {response:?}")),
         }
     }
+}
+
+fn finish_reconciliation(
+    pending_source: &mut Option<(SourceSignature, u64)>,
+    catalog: &catalog_sync::CatalogSync,
+    settings_epoch: u64,
+    last_reconciled_source: &mut Option<SourceSignature>,
+    last_reconciled_at: &mut Option<Instant>,
+    last_error: &mut Option<String>,
+) -> Option<bool> {
+    if catalog.busy() {
+        return None;
+    }
+    let (signature, captured_settings_epoch) = pending_source.take()?;
+    let settings_changed = captured_settings_epoch != settings_epoch;
+    if catalog.succeeded() && !settings_changed {
+        *last_reconciled_source = Some(signature);
+        *last_reconciled_at = Some(Instant::now());
+        *last_error = None;
+    } else {
+        *last_reconciled_source = None;
+        *last_reconciled_at = None;
+        if let Some(error) = catalog.last_error() {
+            *last_error = Some(format!("Lutris catalog reconciliation failed: {error}"));
+        }
+    }
+    Some(settings_changed)
 }
 
 fn scan_is_due(
@@ -697,6 +718,84 @@ mod tests {
         }));
         assert!(!catalog.busy());
         assert!(!catalog.succeeded());
+    }
+
+    #[test]
+    fn failed_reconciliation_is_visible_and_a_later_scan_recovers() {
+        let mut source = snapshot();
+        source.games.clear();
+        let settings = ProductSettings::default();
+        let signature = SourceSignature::from(&source);
+        let mut catalog = catalog_sync::CatalogSync::default();
+        let mut reconciled_source = None;
+        let mut reconciled_at = None;
+        let mut last_error = None;
+
+        catalog
+            .start(&source, &settings, &BTreeSet::new(), 1)
+            .unwrap();
+        let mut pending = Some((signature.clone(), 3));
+        assert_eq!(
+            finish_reconciliation(
+                &mut pending,
+                &catalog,
+                3,
+                &mut reconciled_source,
+                &mut reconciled_at,
+                &mut last_error,
+            ),
+            None
+        );
+        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":1,"generation":2,"complete":false,
+            "cleanup_pending":false,"remove_stale":true,"remove_selection":true
+        }));
+        assert_eq!(
+            finish_reconciliation(
+                &mut pending,
+                &catalog,
+                3,
+                &mut reconciled_source,
+                &mut reconciled_at,
+                &mut last_error,
+            ),
+            Some(false)
+        );
+        assert!(reconciled_source.is_none());
+        assert!(reconciled_at.is_none());
+        assert!(last_error.as_deref().unwrap().contains("catalog finish"));
+        assert!(should_reconcile(
+            &signature,
+            reconciled_source.as_ref(),
+            reconciled_at,
+            false,
+            Instant::now()
+        ));
+
+        catalog
+            .start(&source, &settings, &BTreeSet::new(), 2)
+            .unwrap();
+        pending = Some((signature.clone(), 3));
+        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":3,"next_sequence":0}));
+        catalog.respond_for_test(json!({
+            "ok":true,"revision":2,"generation":3,"complete":true,
+            "cleanup_pending":false,"remove_stale":true,"remove_selection":true
+        }));
+        assert_eq!(
+            finish_reconciliation(
+                &mut pending,
+                &catalog,
+                3,
+                &mut reconciled_source,
+                &mut reconciled_at,
+                &mut last_error,
+            ),
+            Some(false)
+        );
+        assert_eq!(reconciled_source, Some(signature));
+        assert!(reconciled_at.is_some());
+        assert_eq!(last_error, None);
     }
 
     #[test]
