@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_root() -> PathBuf {
@@ -611,5 +612,172 @@ fn settings_that_exceed_the_runtime_response_bound_are_rejected() {
     assert!(document_fits(&document));
     let response = build_read_response(&document, &root).unwrap_err();
     assert_eq!(response["error"]["code"], "resource_exhausted");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A tiny service transport with state backed by a file survives reconstruction
+/// of both the provider pipeline and the transport after an update.
+struct LifecycleTransport {
+    state_file: PathBuf,
+    incoming: Option<Response>,
+    child_results: BTreeMap<u64, Value>,
+    next_child_id: u64,
+    completed: Option<Value>,
+    applied_revision: Option<u64>,
+    events: Vec<&'static str>,
+}
+
+impl LifecycleTransport {
+    fn new(state_file: PathBuf) -> Self {
+        Self {
+            state_file,
+            incoming: None,
+            child_results: BTreeMap::new(),
+            next_child_id: 20,
+            completed: None,
+            applied_revision: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn stored(&self) -> (u64, Option<Document>) {
+        match std::fs::read(&self.state_file) {
+            Ok(bytes) => {
+                let state: Value = serde_json::from_slice(&bytes).unwrap();
+                (
+                    state["revision"].as_u64().unwrap(),
+                    Some(serde_json::from_value(state["value"].clone()).unwrap()),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
+            Err(error) => panic!("could not read test state: {error}"),
+        }
+    }
+
+    fn send(&mut self, command: Command) -> TransportResult {
+        match command {
+            Command::Poll {} => Ok(self.incoming.take().unwrap_or(Response::Pending)),
+            Command::Request {
+                service, payload, ..
+            } => {
+                let result = if service == crate::STATE_SERVICE {
+                    match payload["action"].as_str().unwrap() {
+                        "get" => {
+                            self.events.push("read");
+                            let (revision, document) = self.stored();
+                            json!({
+                                "ok":true,"revision":revision,
+                                "found":document.is_some(),"value":document
+                            })
+                        }
+                        "set" => {
+                            self.events.push("save");
+                            let (revision, _) = self.stored();
+                            assert_eq!(payload["expected_revision"], revision);
+                            let document: Document =
+                                serde_json::from_value(payload["value"].clone()).unwrap();
+                            let next_revision = revision + 1;
+                            std::fs::write(
+                                &self.state_file,
+                                serde_json::to_vec(&json!({
+                                    "revision":next_revision,"value":document
+                                }))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            json!({"ok":true,"revision":next_revision})
+                        }
+                        action => panic!("unexpected state action: {action}"),
+                    }
+                } else if service == DIAGNOSTICS_SERVICE {
+                    match payload["action"].as_str().unwrap() {
+                        "status" => {
+                            self.events.push("preflight");
+                            json!({"ok":true,"ready":true,"applied_revision":self.applied_revision})
+                        }
+                        "apply_host_logging" => {
+                            self.events.push("apply");
+                            let configuration = &payload["configuration"];
+                            let (_, saved) = self.stored();
+                            let saved = saved.expect("logging apply follows durable save");
+                            assert_eq!(configuration["revision"], saved.revision);
+                            assert_eq!(configuration["values"]["log_path"], saved.log_path);
+                            assert_eq!(
+                                configuration["values"]["min_log_level"],
+                                json!(saved.min_log_level)
+                            );
+                            self.applied_revision = Some(saved.revision);
+                            json!({"ok":true,"applied_revision":saved.revision})
+                        }
+                        action => panic!("unexpected diagnostics action: {action}"),
+                    }
+                } else {
+                    panic!("unexpected service: {service}")
+                };
+                self.next_child_id += 1;
+                self.child_results.insert(self.next_child_id, result);
+                Ok(Response::Accepted {
+                    id: self.next_child_id,
+                })
+            }
+            Command::TakeResult { request } => Ok(Response::Result {
+                payload: self.child_results.get(&request).unwrap().clone(),
+            }),
+            Command::ReleaseResult { request } => {
+                assert!(self.child_results.remove(&request).is_some());
+                Ok(Response::Ok)
+            }
+            Command::Complete { payload, .. } => {
+                self.completed = Some(payload);
+                Ok(Response::Ok)
+            }
+            command => panic!("unexpected lifecycle command: {command:?}"),
+        }
+    }
+
+    fn complete(&mut self, pipeline: &mut Pipeline) -> Value {
+        for _ in 0..12 {
+            pipeline.tick(|command| self.send(command)).unwrap();
+            if let Some(completed) = self.completed.take() {
+                return completed;
+            }
+        }
+        panic!("provider did not finish lifecycle request")
+    }
+}
+
+#[test]
+fn durable_update_applies_logging_and_reloads_after_provider_restart() {
+    let root = test_root();
+    let state_file = root.join("host-configuration-test-state.json");
+    let mut transport = LifecycleTransport::new(state_file.clone());
+    transport.incoming = Some(request(
+        "amaterasu.management",
+        json!({
+            "action":"update","expected_revision":0,
+            "file_state":"state.json","vibeshine_file_state":"legacy.json",
+            "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+            "log_path":"logs/live.log","min_log_level":"warning"
+        }),
+    ));
+    let updated = transport.complete(&mut Pipeline::new(Ok(root.clone())));
+    assert_eq!(updated["ok"], true);
+    assert_eq!(updated["revision"], 1);
+    assert_eq!(updated["logging"]["applied_revision"], 1);
+    assert_eq!(transport.applied_revision, Some(1));
+    assert_eq!(transport.events, ["read", "preflight", "save", "apply"]);
+
+    let mut restarted_transport = LifecycleTransport::new(state_file);
+    restarted_transport.incoming = Some(request("consumer.module", json!({"action":"get"})));
+    let reloaded = restarted_transport.complete(&mut Pipeline::new(Ok(root.clone())));
+    assert_eq!(reloaded["ok"], true);
+    assert_eq!(reloaded["revision"], 1);
+    assert_eq!(reloaded["values"]["log_path"], "logs/live.log");
+    assert_eq!(reloaded["values"]["min_log_level"], "warning");
+    assert_eq!(
+        reloaded["effective"]["log_path"],
+        root.join("logs/live.log").to_string_lossy().as_ref()
+    );
+    assert_eq!(restarted_transport.events, ["read"]);
     std::fs::remove_dir_all(root).unwrap();
 }
