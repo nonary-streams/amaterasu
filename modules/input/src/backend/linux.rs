@@ -75,6 +75,7 @@ struct FakeInputAdapter {
     destroys: Vec<u8>,
     fail_write: Option<u8>,
     fail_destroy: Option<u8>,
+    fail_create: bool,
 }
 
 #[cfg(test)]
@@ -89,10 +90,12 @@ impl Device {
         if let Some(adapter) = FAKE_INPUT_ADAPTER.with(|slot| slot.borrow().clone()) {
             let id = {
                 let mut state = adapter.borrow_mut();
+                if std::mem::take(&mut state.fail_create) {
+                    return Err(InputError::new("acquire_failed", "fake create failure"));
+                }
                 state.next_id += 1;
                 state.next_id
             };
-            assert_eq!(keyboard, id % 2 == 1);
             return Ok(Self {
                 file: File::open("/dev/null").map_err(system_error)?,
                 created: true,
@@ -419,6 +422,8 @@ pub struct LinuxBackend {
     pointer_recovery_required: bool,
     key_rightalt_to_key_win: bool,
     held_virtual_keycodes: HashMap<u8, u16>,
+    keyboard_retired: bool,
+    pointer_retired: bool,
     vertical_scroll_remainder: i32,
     horizontal_scroll_remainder: i32,
     gamepads: GamepadSlots<UinputGamepad>,
@@ -440,6 +445,8 @@ impl LinuxBackend {
             pointer_recovery_required: false,
             key_rightalt_to_key_win: false,
             held_virtual_keycodes: HashMap::new(),
+            keyboard_retired: false,
+            pointer_retired: false,
             vertical_scroll_remainder: 0,
             horizontal_scroll_remainder: 0,
             gamepads: GamepadSlots::new(),
@@ -546,6 +553,8 @@ impl Backend for LinuxBackend {
             || !self.gamepads.is_empty()
             || self.gamepad_probe.is_some()
             || !self.pen_touch.is_idle()
+            || self.keyboard_retired
+            || self.pointer_retired
         {
             return Err(InputError::new(
                 "backend_busy",
@@ -558,6 +567,8 @@ impl Backend for LinuxBackend {
         self.vertical_scroll_remainder = 0;
         self.horizontal_scroll_remainder = 0;
         self.held_virtual_keycodes.clear();
+        self.keyboard_retired = false;
+        self.pointer_retired = false;
         self.keyboard_recovery_required = false;
         self.pointer_recovery_required = false;
         self.controller_input_supported = false;
@@ -631,6 +642,22 @@ impl Backend for LinuxBackend {
                 .map_err(|error| InputError::new("controller_unavailable", error.message));
         }
         if let Event::Key { key, state } = event {
+            if self.keyboard_retired {
+                return if *state == KeyState::Up {
+                    Ok(())
+                } else {
+                    Err(not_started())
+                };
+            }
+            if self.keyboard_recovery_required && *state == KeyState::Up {
+                retire_uncertain_input_device(
+                    &mut self.keyboard,
+                    &mut self.keyboard_recovery_required,
+                    &mut self.keyboard_retired,
+                )?;
+                self.held_virtual_keycodes.clear();
+                return Ok(());
+            }
             if self.keyboard_recovery_required {
                 recover_input_device(
                     &mut self.keyboard,
@@ -692,6 +719,23 @@ impl Backend for LinuxBackend {
             if let (Some(identity), KeyState::Up) = (identity, state) {
                 self.held_virtual_keycodes.remove(&identity);
             }
+            return Ok(());
+        }
+        if self.pointer_retired {
+            return if matches!(event, Event::Button { pressed: false, .. }) {
+                Ok(())
+            } else {
+                Err(not_started())
+            };
+        }
+        if self.pointer_recovery_required && matches!(event, Event::Button { pressed: false, .. }) {
+            retire_uncertain_input_device(
+                &mut self.pointer,
+                &mut self.pointer_recovery_required,
+                &mut self.pointer_retired,
+            )?;
+            self.vertical_scroll_remainder = 0;
+            self.horizontal_scroll_remainder = 0;
             return Ok(());
         }
         if self.pointer_recovery_required {
@@ -756,9 +800,11 @@ impl Backend for LinuxBackend {
         if self.keyboard.is_none() {
             self.held_virtual_keycodes.clear();
             self.keyboard_recovery_required = false;
+            self.keyboard_retired = false;
         }
         if self.pointer.is_none() {
             self.pointer_recovery_required = false;
+            self.pointer_retired = false;
             self.vertical_scroll_remainder = 0;
             self.horizontal_scroll_remainder = 0;
         }
@@ -797,6 +843,20 @@ impl Backend for LinuxBackend {
     fn disable_controller_input(&mut self) -> InputResult<()> {
         self.gamepads.stop()
     }
+}
+
+fn retire_uncertain_input_device(
+    device: &mut Option<Device>,
+    recovery_required: &mut bool,
+    retired: &mut bool,
+) -> InputResult<()> {
+    if let Some(owned) = device.as_mut() {
+        owned.destroy()?;
+        *device = None;
+    }
+    *recovery_required = false;
+    *retired = true;
+    Ok(())
 }
 
 fn profile_uses_uinput_backend(profile: GamepadProfile) -> bool {
@@ -935,7 +995,8 @@ fn scroll_unit_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PenTouchPhase;
+    use crate::controller::Controller;
+    use crate::model::{Operation, PenTouchPhase};
 
     struct FakeAdapterGuard;
 
@@ -955,6 +1016,271 @@ mod tests {
                 slot.borrow_mut().take();
             });
         }
+    }
+
+    fn moonlight_key(code: u8, state: KeyState) -> Event {
+        Event::Key {
+            key: Key::MoonlightVk {
+                code,
+                normalized: true,
+                repeat_modifiers: 0,
+                temporary_modifier: false,
+            },
+            state,
+        }
+    }
+
+    fn pointer_button(button: Button, pressed: bool) -> Event {
+        Event::Button { button, pressed }
+    }
+
+    fn acquire_fake_lease(controller: &mut Controller<LinuxBackend>) -> String {
+        let response = controller.handle(
+            "owner",
+            Operation::Acquire {
+                operation_id: None,
+                ttl_ms: Some(5000),
+                back_button_timeout: None,
+                controller: None,
+                gamepad: Some(GamepadProfile::Ds4),
+                ds4_back_as_touchpad_click: None,
+                native_pen_touch: None,
+                keyboard: None,
+                mouse: None,
+                high_resolution_scrolling: None,
+                always_send_scancodes: None,
+                key_rightalt_to_key_win: None,
+                key_repeat_delay: None,
+                key_repeat_frequency: None,
+            },
+            std::time::Instant::now(),
+            &mut || Ok(()),
+        );
+        assert_eq!(response["ok"], true);
+        response["lease"].as_str().unwrap().to_owned()
+    }
+
+    fn fake_batch(
+        controller: &mut Controller<LinuxBackend>,
+        lease: &str,
+        events: Vec<Event>,
+    ) -> serde_json::Value {
+        controller.handle(
+            "owner",
+            Operation::Batch {
+                lease: lease.into(),
+                events,
+            },
+            std::time::Instant::now(),
+            &mut || Ok(()),
+        )
+    }
+
+    #[test]
+    fn controller_cleanup_releases_all_keys_after_uncertain_keyboard_destroy_retry() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut controller = Controller::new(LinuxBackend::new("/missing/uinput".into()), true);
+        let lease = acquire_fake_lease(&mut controller);
+        assert_eq!(
+            fake_batch(
+                &mut controller,
+                &lease,
+                vec![
+                    moonlight_key(0x41, KeyState::Down),
+                    moonlight_key(0x42, KeyState::Down),
+                    pointer_button(Button::Left, true),
+                ],
+            )["ok"],
+            true
+        );
+        {
+            let mut fake = adapter.borrow_mut();
+            fake.fail_write = Some(1);
+            fake.fail_destroy = Some(1);
+            fake.fail_create = true;
+        }
+        let failure = fake_batch(
+            &mut controller,
+            &lease,
+            vec![moonlight_key(0x43, KeyState::Down)],
+        );
+        assert_eq!(failure["error"]["code"], "injection_failed");
+        assert_eq!(failure["cleanup_required"], true);
+        assert_eq!(adapter.borrow().next_id, 2);
+        assert!(adapter.borrow().fail_create);
+        let released = controller.handle(
+            "owner",
+            Operation::Release { lease },
+            std::time::Instant::now(),
+            &mut || Ok(()),
+        );
+        assert_eq!(released["ok"], true);
+        assert_eq!(released["released"], true);
+        assert!(!controller.cleanup_required());
+        assert_eq!(adapter.borrow().destroys, [1, 1, 2]);
+        assert_eq!(adapter.borrow().next_id, 2);
+        assert!(adapter.borrow().fail_create);
+        adapter.borrow_mut().fail_create = false;
+        let next_lease = acquire_fake_lease(&mut controller);
+        assert_eq!(adapter.borrow().next_id, 4);
+        assert_eq!(
+            controller.handle(
+                "owner",
+                Operation::Release { lease: next_lease },
+                std::time::Instant::now(),
+                &mut || Ok(()),
+            )["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn uncertain_keyboard_cleanup_retires_without_reopening_and_keeps_pointer_live() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        backend
+            .inject(&moonlight_key(0x41, KeyState::Down))
+            .unwrap();
+        backend
+            .inject(&moonlight_key(0x42, KeyState::Down))
+            .unwrap();
+        backend.inject(&pointer_button(Button::Left, true)).unwrap();
+
+        adapter.borrow_mut().fail_write = Some(1);
+        assert_eq!(
+            backend
+                .inject(&moonlight_key(0x43, KeyState::Down))
+                .unwrap_err()
+                .code,
+            "injection_failed"
+        );
+        adapter.borrow_mut().fail_destroy = Some(1);
+        assert_eq!(
+            backend
+                .inject(&moonlight_key(0x43, KeyState::Up))
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        assert!(backend.keyboard_recovery_required);
+        assert_eq!(adapter.borrow().next_id, 2);
+
+        adapter.borrow_mut().fail_create = true;
+        backend.inject(&moonlight_key(0x43, KeyState::Up)).unwrap();
+        backend.inject(&moonlight_key(0x42, KeyState::Up)).unwrap();
+        backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+        assert!(backend.keyboard_retired);
+        assert!(backend.keyboard.is_none());
+        assert!(backend.held_virtual_keycodes.is_empty());
+        assert_eq!(
+            backend
+                .inject(&moonlight_key(0x44, KeyState::Down))
+                .unwrap_err()
+                .code,
+            "backend_inactive"
+        );
+        assert_eq!(adapter.borrow().next_id, 2);
+        assert!(adapter.borrow().fail_create);
+
+        backend
+            .inject(&pointer_button(Button::Left, false))
+            .unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 1, 2, 1, 2]);
+        assert_eq!(adapter.borrow().destroys, [1, 1]);
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [1, 1, 2]);
+        assert_eq!(backend.start().unwrap_err().code, "acquire_failed");
+        backend.start().unwrap();
+        assert_eq!(adapter.borrow().next_id, 4);
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn uncertain_pointer_cleanup_retires_without_reopening_and_keeps_keyboard_live() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        backend
+            .inject(&moonlight_key(0x41, KeyState::Down))
+            .unwrap();
+        backend.inject(&pointer_button(Button::Left, true)).unwrap();
+        backend
+            .inject(&pointer_button(Button::Right, true))
+            .unwrap();
+
+        adapter.borrow_mut().fail_write = Some(2);
+        assert_eq!(
+            backend
+                .inject(&Event::Relative { dx: 1, dy: 2 })
+                .unwrap_err()
+                .code,
+            "injection_failed"
+        );
+        adapter.borrow_mut().fail_destroy = Some(2);
+        assert_eq!(
+            backend
+                .inject(&pointer_button(Button::Right, false))
+                .unwrap_err()
+                .code,
+            "release_failed"
+        );
+        adapter.borrow_mut().fail_create = true;
+        backend
+            .inject(&pointer_button(Button::Right, false))
+            .unwrap();
+        backend
+            .inject(&pointer_button(Button::Left, false))
+            .unwrap();
+        assert!(backend.pointer_retired);
+        assert!(backend.pointer.is_none());
+        assert_eq!(
+            backend
+                .inject(&Event::Relative { dx: 1, dy: 2 })
+                .unwrap_err()
+                .code,
+            "backend_inactive"
+        );
+        assert!(adapter.borrow().fail_create);
+        backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+        assert_eq!(adapter.borrow().writes, [1, 2, 2, 2, 1]);
+        assert_eq!(adapter.borrow().destroys, [2, 2]);
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [2, 2, 1]);
+    }
+
+    #[test]
+    fn terminal_key_release_completes_after_a_failed_keyboard_recreation() {
+        let adapter = FakeAdapterGuard::install();
+        let _guard = FakeAdapterGuard;
+        let mut backend = LinuxBackend::new("/missing/uinput".into());
+        backend.set_gamepad_profile(GamepadProfile::Ds4);
+        backend.start().unwrap();
+        adapter.borrow_mut().fail_write = Some(1);
+        assert!(
+            backend
+                .inject(&moonlight_key(0x41, KeyState::Down))
+                .is_err()
+        );
+        adapter.borrow_mut().fail_create = true;
+        assert_eq!(
+            backend
+                .inject(&moonlight_key(0x42, KeyState::Down))
+                .unwrap_err()
+                .code,
+            "acquire_failed"
+        );
+        assert!(backend.keyboard.is_none());
+        assert!(backend.keyboard_recovery_required);
+        backend.inject(&moonlight_key(0x41, KeyState::Up)).unwrap();
+        assert!(backend.keyboard_retired);
+        backend.stop().unwrap();
+        assert_eq!(adapter.borrow().destroys, [1, 2]);
     }
 
     #[test]
