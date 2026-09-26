@@ -1,5 +1,6 @@
 //! Linux Lutris discovery, product settings, and catalog import provider.
 
+mod artwork;
 mod catalog_sync;
 mod configuration;
 mod discovery;
@@ -54,6 +55,14 @@ fn should_reconcile(
 enum Action {
     Status {},
     Refresh {},
+    ArtworkGet {
+        game_id: i64,
+    },
+    ArtworkRead {
+        game_id: i64,
+        revision: String,
+        offset: u64,
+    },
     SettingsGet {},
     SettingsUpdate {
         enabled: bool,
@@ -181,6 +190,7 @@ struct LutrisModule {
     runtime: RuntimeClient,
     configuration: configuration::ProductConfiguration,
     catalog: catalog_sync::CatalogSync,
+    artwork: artwork::ArtworkStore,
     snapshot_worker: SnapshotWorker,
     steam_read: Option<PendingSteamRead>,
     settings_epoch: u64,
@@ -204,6 +214,7 @@ impl ManagedModule for LutrisModule {
             runtime,
             configuration: configuration::ProductConfiguration::new(),
             catalog: catalog_sync::CatalogSync::default(),
+            artwork: artwork::ArtworkStore::default(),
             snapshot_worker: SnapshotWorker::default(),
             steam_read: None,
             settings_epoch: 0,
@@ -265,6 +276,7 @@ impl LutrisModule {
         match result {
             Ok(snapshot) => {
                 self.last_snapshot_games = snapshot.games.len();
+                self.artwork.update(&snapshot);
                 let signature = SourceSignature::from(&snapshot);
                 if !should_reconcile(
                     &signature,
@@ -412,6 +424,30 @@ impl LutrisModule {
         }
         match action {
             Action::Status {} => self.complete(request, self.status()),
+            Action::ArtworkGet { game_id } => self.complete(
+                request,
+                artwork_response(
+                    &self.artwork,
+                    self.configuration.settings().enabled,
+                    caller,
+                    game_id,
+                    None,
+                ),
+            ),
+            Action::ArtworkRead {
+                game_id,
+                revision,
+                offset,
+            } => self.complete(
+                request,
+                artwork_response(
+                    &self.artwork,
+                    self.configuration.settings().enabled,
+                    caller,
+                    game_id,
+                    Some((&revision, offset)),
+                ),
+            ),
             Action::Refresh {} => {
                 if !self.configuration.settings().enabled {
                     return self.complete(request, json!({"ok":false,"code":"lutris_disabled"}));
@@ -481,6 +517,26 @@ impl LutrisModule {
     }
 }
 
+fn artwork_response(
+    store: &artwork::ArtworkStore,
+    enabled: bool,
+    caller: &str,
+    game_id: i64,
+    read: Option<(&str, u64)>,
+) -> Value {
+    if !is_management_caller(caller) {
+        return json!({"ok":false,"code":"forbidden"});
+    }
+    if !enabled {
+        return json!({"ok":false,"code":"lutris_disabled"});
+    }
+    let result = match read {
+        Some((revision, offset)) => store.read(game_id, revision, offset),
+        None => store.metadata(game_id),
+    };
+    result.unwrap_or_else(|code| json!({"ok":false,"code":code}))
+}
+
 fn next_auto_sync_after_scan(
     settings: &ProductSettings,
     settings_changed: bool,
@@ -538,7 +594,9 @@ mod tests {
     use super::*;
     use crate::discovery::{Game, Snapshot};
     use crate::settings::Exclusion;
+    use std::fs::File;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn game(id: i64, runner: &str, service: &str, service_id: &str) -> Game {
         Game {
@@ -568,6 +626,82 @@ mod tests {
                 game(10, "wine", "", ""),
             ],
         }
+    }
+
+    #[test]
+    fn artwork_actions_read_bounded_current_images_without_exposing_paths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("amaterasu-lutris-artwork-{nonce}"));
+        let lutris_data = root.join("lutris");
+        let cover = lutris_data.join("coverart/lutris-game-10.png");
+        std::fs::create_dir_all(cover.parent().unwrap()).unwrap();
+        let first = [b"\x89PNG\r\n\x1a\n".as_slice(), b"first"].concat();
+        std::fs::write(&cover, &first).unwrap();
+        let mut source = snapshot();
+        source.database_path = lutris_data.join("pga.db");
+        let mut store = artwork::ArtworkStore::default();
+        store.update(&source);
+
+        let metadata = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        let revision = metadata["revision"].as_str().unwrap().to_owned();
+        assert_eq!(metadata["mime_type"], "image/png");
+        assert_eq!(metadata["total_bytes"], first.len());
+        assert!(metadata.get("path").is_none());
+        let chunk = artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 0)));
+        assert_eq!(chunk["ok"], true);
+        assert_eq!(chunk["next_offset"], Value::Null);
+        assert!(chunk.get("path").is_none());
+        assert_eq!(
+            artwork_response(&store, true, "amaterasu.other", 10, None)["code"],
+            "forbidden"
+        );
+        assert_eq!(
+            artwork_response(&store, false, MANAGEMENT_CALLER, 10, None)["code"],
+            "lutris_disabled"
+        );
+        assert_eq!(
+            artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 1)))["code"],
+            "invalid_cursor"
+        );
+
+        std::fs::write(
+            &cover,
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"replacement"].concat(),
+        )
+        .unwrap();
+        let changed = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        assert_ne!(changed["revision"], revision);
+        assert_eq!(
+            artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 0)))["code"],
+            "artwork_changed"
+        );
+        File::create(&cover)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        let icon = root.join("icons/hicolor/256x256/apps/lutris_lutris-game-10.png");
+        std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        std::fs::write(&icon, &first).unwrap();
+        assert_eq!(
+            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["mime_type"],
+            "image/png"
+        );
+        std::fs::remove_file(icon).unwrap();
+        assert_eq!(
+            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["code"],
+            "artwork_unavailable"
+        );
+
+        source.games[2].slug = "../outside".into();
+        store.update(&source);
+        assert_eq!(
+            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["code"],
+            "artwork_unavailable"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn completed_snapshot_worker(settings: ProductSettings, snapshot: Snapshot) -> SnapshotWorker {

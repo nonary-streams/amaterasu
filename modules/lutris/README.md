@@ -89,6 +89,17 @@ clears it.
 Artwork revisions are not represented by the current Lutris snapshot, so this
 periodic retry does not refresh artwork.
 
+The provider can discover local cover art by safe game slug in Lutris `coverart`
+(`png`, `jpg`, `jpeg`, `webp` in that order), falling back to installed hicolor
+icons from 256 through 48 pixels. Only regular images within the discovered
+user's data tree, up to 16 MiB, are accepted. The signed management principal
+can call `artwork_get` with a numeric `game_id` to obtain an opaque revision,
+MIME type, and byte count, then `artwork_read` with that ID, revision, and an
+8 KiB aligned offset for base64 chunks. Changed images reject stale revisions;
+paths are never accepted or returned. Disabling Lutris also disables these
+reads. Catalog artwork references and image delivery still require the Catalog
+consumer contract, so imported rows currently contain no artwork.
+
 Other remaining gaps are trusted per-session discovery for machine services,
 cross-user import, and launch handling for games whose Lutris client cannot be
 resolved.
