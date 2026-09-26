@@ -1525,6 +1525,139 @@ test("Steam and Lutris confirm full signed updates and durable readback", async 
   }
 });
 
+test("Steam accepts only Linux forced-enabled normalization and returns durable values", async () => {
+  const current = { ok: true, revision: 7, values: steamSettingsValues() };
+  const requested = { ...current.values, enabled: false, recent_games: 12 };
+  const normalized = { ok: true, revision: 8, values: { ...requested, enabled: true } };
+  const routes = [];
+  const api = { async post(route, body) {
+    routes.push(route);
+    if (route === "steam/settings_update") {
+      assert.deepEqual(ordinary(body), { ...requested, expected_revision: 7 });
+      return normalized;
+    }
+    assert.equal(route, "steam/settings");
+    return normalized;
+  } };
+  assert.deepEqual(ordinary(await context.Amaterasu.saveSteamSettings(api, current, requested)), normalized);
+  assert.deepEqual(routes, ["steam/settings_update", "steam/settings"]);
+  for (const update of [
+    { ...normalized, values: { ...normalized.values, recent_games: 13 } },
+    { ...normalized, revision: 9 },
+  ]) {
+    await assert.rejects(context.Amaterasu.saveSteamSettings({ async post() { return update; } },
+      current, requested));
+  }
+  await assert.rejects(context.Amaterasu.saveSteamSettings({ async post(route) {
+    return route === "steam/settings_update" ? normalized : { ...normalized, values: requested };
+  } }, current, requested));
+  await assert.rejects(context.Amaterasu.saveLutrisSettings({ async post() {
+    return { ok: true, revision: 8, values: { ...lutrisSettingsValues(), enabled: true } };
+  } }, { ok: true, revision: 7, values: lutrisSettingsValues() },
+  { ...lutrisSettingsValues(), enabled: false }));
+});
+
+test("Steam form reloads normalized Linux settings and explains the enabled policy", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+    }
+    setConnected(value) {
+      this.isConnected = value;
+      for (const child of this.children) child?.setConnected?.(value);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    setCustomValidity() {}
+    get options() { return this.children.filter((child) => child?.tagName === "option"); }
+    get valueAsNumber() { return Number(this.value); }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({
+    TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) },
+  });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  dom.ApiError = class ApiError extends Error {};
+  const content = new Element("main");
+  content.setConnected(true);
+  const notices = [];
+  let stored = { ok: true, revision: 7, values: steamSettingsValues() };
+  const routes = [];
+  dom.Amaterasu.renderSettings({
+    content,
+    notify: (message) => notices.push(message),
+    api: {
+      allows: (scope) => scope === "configuration.write",
+      async post(route, body) {
+        routes.push(route);
+        if (route === "steam/settings") return stored;
+        if (route === "steam/status") return {
+          settings_ready: true, enabled: true, scanning: false, complete: false,
+          game_count: 0, warning_count: 0,
+        };
+        if (route === "steam/settings_update") {
+          assert.equal(body.expected_revision, 7);
+          assert.equal(body.enabled, false);
+          stored = { ok: true, revision: 8, values: { ...body, enabled: true } };
+          delete stored.values.expected_revision;
+          return stored;
+        }
+        throw new Error(`unavailable: ${route}`);
+      },
+    },
+  });
+  await new Promise(setImmediate);
+  const steamArea = content.children[5];
+  const oldForm = find(steamArea, (node) => node.tagName === "form");
+  assert.ok(oldForm);
+  find(oldForm, (node) => node.name === "steam_enabled").checked = false;
+  oldForm.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(oldForm.isConnected, false);
+  assert.match(steamArea.textContent, /Revision 8/);
+  assert.equal(find(steamArea, (node) => node.name === "steam_enabled").checked, true);
+  assert.match(notices.at(-1), /remains enabled by Linux host policy/);
+  assert.deepEqual(routes.filter((route) => route.startsWith("steam/")), [
+    "steam/settings", "steam/status", "steam/settings_update", "steam/settings", "steam/settings", "steam/status",
+  ]);
+});
+
 test("Steam and Lutris reject mismatched configured values and concurrent readback", async () => {
   for (const [provider, save, values] of [
     ["steam", context.Amaterasu.saveSteamSettings, steamSettingsValues()],

@@ -3046,7 +3046,14 @@ var Amaterasu;
         if (!Number.isSafeInteger(current.revision) || current.revision < 0 ||
             current.revision >= Number.MAX_SAFE_INTEGER)
             throw new Error(`${provider} settings revision is invalid.`);
-        const confirms = (reply) => reply.revision === current.revision + 1 && sameConfigurationValue(reply.values, values);
+        const confirms = (reply) => {
+            if (reply.revision !== current.revision + 1)
+                return false;
+            if (sameConfigurationValue(reply.values, values))
+                return true;
+            return provider === "steam" && values.enabled === false && reply.values.enabled === true &&
+                sameConfigurationValue({ ...reply.values, enabled: false }, values);
+        };
         let updated;
         try {
             updated = parse(await api.post(`${provider}/settings_update`, {
@@ -3066,7 +3073,7 @@ var Amaterasu;
         if (!confirms(updated))
             throw new Error(`${provider} update could not be confirmed. Refresh and check the current values.`);
         const saved = await readImportSettings(api, provider, parse);
-        if (!confirms(saved))
+        if (!confirms(saved) || !sameConfigurationValue(saved.values, updated.values))
             throw new Error(`${provider} settings could not be confirmed after saving. Refresh and check the current values.`);
         return saved;
     }
@@ -3530,9 +3537,11 @@ var Amaterasu;
                                 ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
                             };
                             saveStarted = true;
-                            await saveSteamSettings(context.api, settings, values);
+                            const saved = await saveSteamSettings(context.api, settings, values);
                             await loadSteam();
-                            context.notify("Steam settings saved and confirmed. Scan status is shown below.");
+                            context.notify(!values.enabled && saved.values.enabled
+                                ? "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below."
+                                : "Steam settings saved and confirmed. Scan status is shown below.");
                         }
                         catch (error) {
                             if (saveStarted) {
