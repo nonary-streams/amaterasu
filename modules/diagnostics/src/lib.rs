@@ -7,12 +7,21 @@ pub use journal::Journal;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use host_logging::HostLoggingConfigurationReader;
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 pub const SERVICE: &str = "amaterasu.diagnostics/1";
+const MANAGEMENT_CALLER: &str = "amaterasu.management";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshLoggingRequest {
+    action: String,
+    minimum_revision: u64,
+}
 
 pub struct DiagnosticsModule {
     runtime: RuntimeClient,
@@ -91,7 +100,13 @@ impl ManagedModule for DiagnosticsModule {
                 payload,
                 ..
             } => {
-                let payload = self.journal.handle(&caller, payload);
+                let payload = handle_request(
+                    &mut self.journal,
+                    &mut self.host_logging,
+                    &caller,
+                    payload,
+                    now,
+                );
                 // A cancellation after dispatch does not undo an accepted record/counter.
                 match self.runtime.send(Command::Complete {
                     request: id,
@@ -110,6 +125,35 @@ impl ManagedModule for DiagnosticsModule {
             response => Err(format!("unexpected diagnostics poll: {response:?}")),
         }
     }
+}
+
+fn handle_request(
+    journal: &mut Journal,
+    host_logging: &mut HostLoggingConfigurationReader,
+    caller: &str,
+    payload: Value,
+    now: Instant,
+) -> Value {
+    if payload.get("action").and_then(Value::as_str) != Some("refresh_logging") {
+        return journal.handle(caller, payload);
+    }
+    if caller != MANAGEMENT_CALLER {
+        return json!({"ok":false,"code":"permission_denied"});
+    }
+    let Ok(request) = serde_json::from_value::<RefreshLoggingRequest>(payload) else {
+        return json!({"ok":false,"code":"invalid_request"});
+    };
+    if request.action != "refresh_logging" || request.minimum_revision == 0 {
+        return json!({"ok":false,"code":"invalid_request"});
+    }
+
+    host_logging.request_refresh(now, request.minimum_revision);
+    json!({
+        "ok":true,
+        "requested_revision":request.minimum_revision,
+        "logging_configuration_revision":journal.logging_configuration_revision(),
+        "ready":journal.is_ready(),
+    })
 }
 
 fn persisted_logging_settings(
@@ -185,6 +229,43 @@ mod hydration_tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn refresh_logging_requires_management_and_reports_pending_application() {
+        let now = Instant::now();
+        let mut journal = Journal::unready();
+        let mut reader = HostLoggingConfigurationReader::default();
+        let refresh = json!({"action":"refresh_logging","minimum_revision":7});
+
+        assert_eq!(
+            handle_request(&mut journal, &mut reader, "untrusted", refresh.clone(), now),
+            json!({"ok":false,"code":"permission_denied"})
+        );
+        for invalid in [
+            json!({"action":"refresh_logging","minimum_revision":0}),
+            json!({"action":"refresh_logging","minimum_revision":7,"caller":"amaterasu.management"}),
+        ] {
+            assert_eq!(
+                handle_request(&mut journal, &mut reader, MANAGEMENT_CALLER, invalid, now),
+                json!({"ok":false,"code":"invalid_request"})
+            );
+        }
+        assert_eq!(
+            handle_request(&mut journal, &mut reader, MANAGEMENT_CALLER, refresh, now),
+            json!({"ok":true,"requested_revision":7,"logging_configuration_revision":null,"ready":false})
+        );
+        assert!(
+            reader
+                .tick(now, |command| match command {
+                    Command::Request { payload, .. } => {
+                        assert_eq!(payload, json!({"action":"get"}));
+                        Ok(Response::Accepted { id: 1 })
+                    }
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+    }
 
     #[test]
     fn valid_provider_configuration_enables_readiness_after_path_validation() {

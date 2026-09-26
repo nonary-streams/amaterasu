@@ -141,6 +141,19 @@ highest revision successfully adopted by this worker. Invalid refresh results
 leave the current policy active. The module polls every 30 seconds after a
 successful read.
 
+After a signed host logging update completes, `amaterasu.management` may call
+`{"action":"refresh_logging","minimum_revision":N}` with a positive saved
+revision. The broker-supplied caller identity is required; a caller field in the
+payload is rejected. The response is
+`{"ok":true,"requested_revision":N,"logging_configuration_revision":R,"ready":B}`,
+where `R` is the revision already applied (or null) and `B` is current readiness.
+This acknowledges scheduling, not application. Diagnostics coalesces requests
+with an in-flight GET, reads only the authoritative host configuration provider,
+and retries promptly while its result is below the requested revision. Repeated
+requests cannot install an older policy. Callers confirm application with a
+separate `status` read of the exact revision and sink health. A rollback is a new
+host configuration update with a newer revision.
+
 The diagnostics reader uses the caller-scoped operation ID
 `diagnostics.host-configuration.logging.read` for each serialized GET cycle.
 If the diagnostics module restarts while its broker request is still retained,

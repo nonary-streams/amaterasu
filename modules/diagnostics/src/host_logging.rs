@@ -33,6 +33,7 @@ pub(crate) struct HostLoggingConfigurationReader {
     provider_granted: bool,
     legacy_bootstrap_authorized: bool,
     highest_adopted_revision: Option<u64>,
+    requested_revision: Option<u64>,
 }
 
 impl Default for HostLoggingConfigurationReader {
@@ -44,6 +45,7 @@ impl Default for HostLoggingConfigurationReader {
             provider_granted: false,
             legacy_bootstrap_authorized: false,
             highest_adopted_revision: None,
+            requested_revision: None,
         }
     }
 }
@@ -206,7 +208,16 @@ impl HostLoggingConfigurationReader {
             return None;
         }
 
-        self.next_attempt = Some(now + REFRESH_INTERVAL);
+        self.next_attempt = Some(
+            now + if self
+                .requested_revision
+                .is_some_and(|requested| revision < requested)
+            {
+                RETRY_DELAY
+            } else {
+                REFRESH_INTERVAL
+            },
+        );
         if self
             .highest_adopted_revision
             .is_some_and(|highest_adopted_revision| revision <= highest_adopted_revision)
@@ -223,6 +234,26 @@ impl HostLoggingConfigurationReader {
 
     pub(crate) fn adopt_configuration(&mut self, revision: u64) {
         self.highest_adopted_revision = Some(revision);
+        if self
+            .requested_revision
+            .is_some_and(|requested| revision >= requested)
+        {
+            self.requested_revision = None;
+        }
+    }
+
+    /// Request a prompt authoritative read without interrupting an in-flight GET.
+    pub(crate) fn request_refresh(&mut self, now: Instant, minimum_revision: u64) {
+        if self
+            .highest_adopted_revision
+            .is_some_and(|applied| applied >= minimum_revision)
+        {
+            return;
+        }
+        self.requested_revision = Some(self.requested_revision.unwrap_or(0).max(minimum_revision));
+        if self.pending.is_none() {
+            self.next_attempt = Some(now);
+        }
     }
 
     pub(crate) fn reject_configuration(&mut self, now: Instant) {
@@ -768,6 +799,66 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    #[test]
+    fn refresh_coalesces_with_pending_read_and_retries_until_requested_revision() {
+        let started = Instant::now();
+        let mut reader = HostLoggingConfigurationReader::default();
+        assert_eq!(
+            complete_configuration_read(&mut reader, started, 1, 1),
+            None
+        );
+        assert_eq!(
+            complete_configuration_read(
+                &mut reader,
+                started + RETRY_DELAY + Duration::from_secs(1),
+                2,
+                1
+            ),
+            Some(ready_configuration(1))
+        );
+
+        let requested_at = started + Duration::from_secs(10);
+        reader.request_refresh(requested_at, 3);
+        assert!(
+            reader
+                .tick(requested_at, |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 3 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        reader.request_refresh(requested_at, 4);
+        assert_eq!(reader.requested_revision, Some(4));
+        assert!(reader.pending.is_some());
+        assert_eq!(
+            reader.tick(
+                requested_at + Duration::from_secs(1),
+                |command| match command {
+                    Command::TakeResult { request: 3 } => Ok(Response::Result {
+                        payload: ready_configuration(2)
+                    }),
+                    Command::ReleaseResult { request: 3 } => Ok(Response::Ok),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                }
+            ),
+            Some(ready_configuration(2))
+        );
+        reader.adopt_configuration(2);
+        assert_eq!(reader.requested_revision, Some(4));
+        assert!(
+            reader
+                .tick(requested_at + Duration::from_secs(5), |_| panic!(
+                    "retry too early"
+                ))
+                .is_none()
+        );
+        assert_eq!(
+            complete_configuration_read(&mut reader, requested_at + Duration::from_secs(6), 4, 4),
+            Some(ready_configuration(4))
+        );
+        assert_eq!(reader.requested_revision, None);
     }
 
     #[test]

@@ -91,6 +91,10 @@ impl Journal {
         self.ready
     }
 
+    pub(crate) fn logging_configuration_revision(&self) -> Option<u64> {
+        self.logging_configuration_revision
+    }
+
     pub fn handle(&mut self, caller: &str, payload: Value) -> Value {
         let result = serde_json::from_value(payload)
             .map_err(|_| "invalid_request")
