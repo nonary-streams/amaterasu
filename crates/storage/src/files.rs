@@ -62,6 +62,37 @@ pub fn create_machine_private_directory(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// Protects an existing regular file containing machine-owned secrets.
+/// On Windows, only LocalSystem applies the installed SY/BA ACL, matching
+/// `create_machine_private_directory`; non-SYSTEM development runs retain
+/// their caller-owned ACL. Callers must protect the parent separately.
+pub fn protect_machine_private_file(path: &Path) -> StorageResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(format!(
+                "reparse point is not a regular file: {}",
+                path.display()
+            ));
+        }
+        if running_as_local_system()? {
+            set_machine_private_dacl(path)?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn running_as_local_system() -> StorageResult<bool> {
     #[link(name = "advapi32")]
@@ -229,5 +260,43 @@ impl RootLock {
         file.try_lock()
             .map_err(|error| format!("host root is busy: {error}"))?;
         Ok(Self { _file: file })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_secret_protection_requires_a_regular_file() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-machine-secret-{}-{}",
+            std::process::id(),
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("key.pem");
+        fs::write(&file, b"private key fixture").unwrap();
+        protect_machine_private_file(&file).unwrap();
+        #[cfg(windows)]
+        if !running_as_local_system().unwrap() {
+            assert_eq!(fs::read(&file).unwrap(), b"private key fixture");
+        }
+        #[cfg(unix)]
+        assert_eq!(fs::read(&file).unwrap(), b"private key fixture");
+        assert!(protect_machine_private_file(&root).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let link = root.join("key-link.pem");
+            symlink(&file, &link).unwrap();
+            assert!(protect_machine_private_file(&link).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

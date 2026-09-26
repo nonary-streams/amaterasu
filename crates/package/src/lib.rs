@@ -20,8 +20,8 @@ pub use digest::{decode_hex, encode_hex, random_identifier, sha256, sha256_reade
 pub use manifest::*;
 pub use staging::{package_directory, stage_package};
 pub use storage::{
-    RootLock, create_machine_private_directory, create_private_directory, read_bounded, read_json,
-    write_json_atomically,
+    RootLock, create_machine_private_directory, create_private_directory,
+    protect_machine_private_file, read_bounded, read_json, write_json_atomically,
 };
 pub use verification::{
     VerificationPolicy, verify_detached_signature, verify_package, verify_package_with_progress,

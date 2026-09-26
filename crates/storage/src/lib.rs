@@ -3,8 +3,9 @@
 mod files;
 
 pub use files::{
-    RootLock, create_machine_private_directory, create_private_directory, read_bounded, read_json,
-    sync_directory, write_atomically, write_json_atomically,
+    RootLock, create_machine_private_directory, create_private_directory,
+    protect_machine_private_file, read_bounded, read_json, sync_directory, write_atomically,
+    write_json_atomically,
 };
 
 pub type StorageResult<T> = Result<T, String>;
