@@ -876,7 +876,7 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
     let mut pipeline = pipeline();
     let operation_id = "frozen-frame-policy";
     let preflight_request = json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"});
-    let preflight = harness.request(&mut pipeline, "nvhttp", preflight_request.clone());
+    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
     assert_eq!(preflight["catalog_revision"], 1);
     assert_eq!(
         preflight["config_overrides"],
@@ -887,7 +887,7 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", preflight_request),
+        harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request),
         preflight
     );
 
@@ -896,7 +896,7 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
     request["frame_limiter_settings"] = frame_limiter_snapshot();
     request["client_frame_limiter_overrides"] = json!({});
     harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
-    let started = harness.request(&mut pipeline, "nvhttp", request.clone());
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", request.clone());
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(
         started["launch"]["config_overrides"],
@@ -910,14 +910,17 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
         started["launch"]["frame_limiter_settings"],
         frame_limiter_snapshot()
     );
-    assert_eq!(harness.request(&mut pipeline, "nvhttp", request), started);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", request),
+        started
+    );
     let mut changed_retry = launch_export(operation_id);
     changed_retry["preflight_token"] = preflight["preflight_token"].clone();
     changed_retry["frame_limiter_settings"] = frame_limiter_snapshot();
     changed_retry["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
     changed_retry["client_frame_limiter_overrides"] = json!({});
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", changed_retry)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", changed_retry)["code"],
         "operation_conflict"
     );
     let launch_id = started["launch"]["launch_id"].clone();
@@ -925,7 +928,7 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
         json!({"action":"status","launch_id":launch_id}),
         json!({"action":"lookup","operation_id":operation_id}),
     ] {
-        let readback = harness.request(&mut pipeline, "nvhttp", query);
+        let readback = harness.request(&mut pipeline, "amaterasu.nvhttp", query);
         assert_eq!(
             readback["launch"]["frame_limiter_settings"],
             frame_limiter_snapshot()
@@ -962,7 +965,7 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     let mut pipeline = pipeline();
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({
             "action":"preflight_export","operation_id":"frozen-display-policy",
             "app_id":"app-0000000000000001"
@@ -979,7 +982,7 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     let mut wrong_token = launch.clone();
     wrong_token["preflight_token"] = json!("wrong-token");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", wrong_token)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", wrong_token)["code"],
         "preflight_mismatch"
     );
     assert_eq!(
@@ -990,27 +993,30 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
     let mut mismatch = launch.clone();
     mismatch["application_display_overrides"]["dd_resolution_option"] = json!("disabled");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", mismatch)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", mismatch)["code"],
         "application_display_policy_mismatch"
     );
     assert!(harness.processes.is_empty());
     let mut malformed = launch.clone();
     malformed["application_display_overrides"]["dd_hdr_option"] = json!("unknown");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
         "invalid_application_display_overrides"
     );
     assert!(harness.processes.is_empty());
 
-    let started = harness.request(&mut pipeline, "nvhttp", launch.clone());
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(started["launch"]["application_display_overrides"], display);
     assert_eq!(started["launch"]["config_overrides"], display);
     assert_eq!(started["launch"]["catalog_revision"], 1);
-    assert_eq!(harness.request(&mut pipeline, "nvhttp", launch), started);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch),
+        started
+    );
     let status = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(status["launch"]["application_display_overrides"], display);
@@ -1018,14 +1024,14 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
 }
 
 #[test]
-fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() {
+fn signed_principals_attest_frozen_display_policy_and_reject_changed_or_revoked_use() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
     let application = json!({"dd_resolution_option":"manual","dd_manual_resolution":"2560x1440"});
     harness.catalog_config_overrides = Some(application.clone());
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({
             "action":"preflight_export","operation_id":"admitted-application",
             "app_id":"app-0000000000000001"
@@ -1045,8 +1051,12 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
         "rtsp_operation_id":"admitted-rtsp",
         "request_sha256":request_sha256,
     });
-    let admission = harness.request(&mut pipeline, "nvhttp", prepare.clone());
+    let admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone());
     assert_eq!(admission["ok"], true, "{admission}");
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", prepare.clone())["code"],
+        "display_admission_denied"
+    );
     let token = admission["display_admission_token"].as_str().unwrap();
     let verify = json!({
         "action":"verify_display_admission",
@@ -1059,7 +1069,11 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
         "catalog_revision":preflight["catalog_revision"],
     });
     assert_eq!(
-        harness.request(&mut pipeline, "rtsp", verify.clone())["verified"],
+        harness.request(&mut pipeline, "rtsp", verify.clone())["code"],
+        "display_admission_denied"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["verified"],
         true
     );
     let mut launch = launch_export("admitted-application");
@@ -1067,7 +1081,7 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
     launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["application_display_overrides"] = application.clone();
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "display_admission_denied"
     );
     assert!(harness.sessions.is_empty());
@@ -1075,26 +1089,26 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
     let mut forged = launch.clone();
     forged["display_admission_token"] = json!("00".repeat(32));
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", forged)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", forged)["code"],
         "display_admission_denied"
     );
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
     launch["display_admission_token"] = json!(token);
-    let started = harness.request(&mut pipeline, "nvhttp", launch);
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
     assert_eq!(started["launch"]["state"], "active", "{started}");
     harness.catalog_config_overrides = Some(json!({"dd_hdr_option":"auto"}));
     let mut unversioned_global = prepare.clone();
     unversioned_global["global_revision"] = Value::Null;
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", unversioned_global)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", unversioned_global)["code"],
         "display_admission_denied"
     );
     assert_eq!(
         harness.request(&mut pipeline, "other-service", prepare.clone())["code"],
         "display_admission_denied"
     );
-    let retried_admission = harness.request(&mut pipeline, "nvhttp", prepare.clone());
+    let retried_admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone());
     assert_eq!(retried_admission, admission);
     assert_eq!(token.len(), 64);
     assert_eq!(
@@ -1117,18 +1131,18 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
         let mut changed = prepare.clone();
         changed[field] = value;
         assert_eq!(
-            harness.request(&mut pipeline, "nvhttp", changed)["code"],
+            harness.request(&mut pipeline, "amaterasu.nvhttp", changed)["code"],
             "display_admission_denied"
         );
     }
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", verify.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", verify.clone())["code"],
         "display_admission_denied"
     );
-    let verified = harness.request(&mut pipeline, "rtsp", verify.clone());
+    let verified = harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone());
     assert_eq!(verified["verified"], true, "{verified}");
     assert_eq!(
-        harness.request(&mut pipeline, "rtsp", verify.clone()),
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone()),
         verified
     );
     for (field, value) in [
@@ -1142,7 +1156,7 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
         let mut changed = verify.clone();
         changed[field] = value;
         assert_eq!(
-            harness.request(&mut pipeline, "rtsp", changed)["code"],
+            harness.request(&mut pipeline, "amaterasu.rtsp", changed)["code"],
             "display_admission_denied"
         );
     }
@@ -1150,28 +1164,28 @@ fn display_admission_attests_frozen_policy_and_rejects_changed_or_revoked_use() 
     changed_snapshot["display_policy_snapshot"]["effective_overrides"]["dd_hdr_option"] =
         json!("auto");
     assert_eq!(
-        harness.request(&mut pipeline, "rtsp", changed_snapshot)["code"],
+        harness.request(&mut pipeline, "amaterasu.rtsp", changed_snapshot)["code"],
         "display_admission_denied"
     );
     let status = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
     assert!(!status.to_string().contains(token));
     let lookup = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"lookup","operation_id":"admitted-application"}),
     );
     assert!(!lookup.to_string().contains(token));
     let _stopped = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(
-        harness.request(&mut pipeline, "rtsp", verify)["code"],
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify)["code"],
         "display_admission_denied"
     );
 }
@@ -1182,7 +1196,7 @@ fn staged_display_admission_expires_or_stops_before_launch() {
     let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"expiring-app",
             "app_id":"app-0000000000000001"}),
     );
@@ -1199,7 +1213,7 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         "rtsp_operation_id":"expiring-rtsp",
         "request_sha256":"ab".repeat(32),
     });
-    let admission = harness.request(&mut pipeline, "nvhttp", prepare.clone());
+    let admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone());
     assert_eq!(admission["ok"], true);
     let verify = json!({
         "action":"verify_display_admission",
@@ -1211,7 +1225,7 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         "certificate_id":"cd".repeat(32),
         "catalog_revision":preflight["catalog_revision"],
     });
-    let verified = harness.request(&mut pipeline, "rtsp", verify.clone());
+    let verified = harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone());
     assert_eq!(verified["verified"], true);
     assert!(
         verified["preflight_remaining_ms"]
@@ -1227,18 +1241,21 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         .unwrap();
     record.preflight_deadline = Some(Instant::now() - Duration::from_secs(1));
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", prepare.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone())["code"],
         "display_admission_denied"
     );
     assert_eq!(
-        harness.request(&mut pipeline, "rtsp", verify.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
         "display_admission_denied"
     );
     let mut launch = launch_export("expiring-app");
     launch["preflight_token"] = preflight["preflight_token"].clone();
     launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["display_admission_token"] = admission["display_admission_token"].clone();
-    assert_ne!(harness.request(&mut pipeline, "nvhttp", launch)["ok"], true);
+    assert_ne!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["ok"],
+        true
+    );
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
 
@@ -1246,14 +1263,14 @@ fn staged_display_admission_expires_or_stops_before_launch() {
     let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"stopped-app",
             "app_id":"app-0000000000000001"}),
     );
     let mut stopped_prepare = prepare;
     stopped_prepare["application_operation_id"] = json!("stopped-app");
     stopped_prepare["catalog_revision"] = preflight["catalog_revision"].clone();
-    let staged = harness.request(&mut pipeline, "nvhttp", stopped_prepare.clone());
+    let staged = harness.request(&mut pipeline, "amaterasu.nvhttp", stopped_prepare.clone());
     assert_eq!(staged["ok"], true);
     let launch_id = pipeline
         .records
@@ -1264,7 +1281,7 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         .launch_id;
     let stopped = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"stop","launch_id":launch_id}),
     );
     assert_eq!(stopped["code"], "preflight_unavailable");
@@ -1274,7 +1291,7 @@ fn staged_display_admission_expires_or_stops_before_launch() {
             .is_none()
     );
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", stopped_prepare)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", stopped_prepare)["code"],
         "display_admission_denied"
     );
     assert!(harness.sessions.is_empty());
@@ -1287,14 +1304,14 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
     let mut pipeline = pipeline();
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"legacy-display-app",
             "app_id":"app-0000000000000001"}),
     );
     let mut launch = launch_export("legacy-display-app");
     launch["preflight_token"] = preflight["preflight_token"].clone();
     launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    let started = harness.request(&mut pipeline, "nvhttp", launch.clone());
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
     assert_eq!(started["launch"]["state"], "active");
     let prepare = json!({
         "action":"prepare_display_admission",
@@ -1308,11 +1325,11 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
         "rtsp_operation_id":"legacy-display-rtsp",
         "request_sha256":"ab".repeat(32),
     });
-    let admission = harness.request(&mut pipeline, "nvhttp", prepare);
+    let admission = harness.request(&mut pipeline, "amaterasu.nvhttp", prepare);
     assert_eq!(admission["ok"], true);
     let verified = harness.request(
         &mut pipeline,
-        "rtsp",
+        "amaterasu.rtsp",
         json!({
             "action":"verify_display_admission",
             "token":admission["display_admission_token"],
@@ -1326,7 +1343,10 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
     );
     assert_eq!(verified["verified"], true);
     assert!(verified.get("preflight_remaining_ms").is_none());
-    assert_eq!(harness.request(&mut pipeline, "nvhttp", launch), started);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch),
+        started
+    );
     assert_eq!(harness.processes.len(), 1);
 }
 
@@ -1334,7 +1354,11 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
 fn display_admission_is_unavailable_to_legacy_launches() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
-    let started = harness.request(&mut pipeline, "nvhttp", launch_export("legacy-admission"));
+    let started = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        launch_export("legacy-admission"),
+    );
     assert_eq!(started["launch"]["state"], "active", "{started}");
     let prepare = json!({
         "action":"prepare_display_admission",
@@ -1349,7 +1373,7 @@ fn display_admission_is_unavailable_to_legacy_launches() {
         "request_sha256":"ab".repeat(32),
     });
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", prepare)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", prepare)["code"],
         "display_admission_denied"
     );
 
@@ -1358,7 +1382,7 @@ fn display_admission_is_unavailable_to_legacy_launches() {
     let mut failed_pipeline = Pipeline::new(BTreeMap::new()).unwrap();
     let failed = failed_harness.request(
         &mut failed_pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({
             "action":"preflight_export", "operation_id":"failed-admission",
             "app_id":"app-0000000000000001"
@@ -1379,12 +1403,16 @@ fn display_admission_is_unavailable_to_legacy_launches() {
         "request_sha256":"ab".repeat(32),
     });
     assert_eq!(
-        failed_harness.request(&mut failed_pipeline, "nvhttp", failed_prepare.clone())["code"],
+        failed_harness.request(
+            &mut failed_pipeline,
+            "amaterasu.nvhttp",
+            failed_prepare.clone()
+        )["code"],
         "display_admission_denied"
     );
     failed_prepare["application_operation_id"] = json!("missing-admission");
     assert_eq!(
-        failed_harness.request(&mut failed_pipeline, "nvhttp", failed_prepare)["code"],
+        failed_harness.request(&mut failed_pipeline, "amaterasu.nvhttp", failed_prepare)["code"],
         "display_admission_denied"
     );
 }
@@ -1402,7 +1430,7 @@ fn display_preflight_treats_absent_and_null_as_sparse_and_rejects_bad_catalog_va
         harness.catalog_config_overrides = overrides;
         let preflight = harness.request(
             &mut pipeline(),
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({
                 "action":"preflight_export","operation_id":format!("display-{case}"),
                 "app_id":"app-0000000000000001"
@@ -1422,7 +1450,7 @@ fn display_preflight_treats_absent_and_null_as_sparse_and_rejects_bad_catalog_va
         harness.catalog_config_overrides = Some(json!({"dd_mode_remapping":invalid}));
         let rejected = harness.request(
             &mut pipeline(),
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({
                 "action":"preflight_export","operation_id":"bad-display",
                 "app_id":"app-0000000000000001"
@@ -1439,7 +1467,7 @@ fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
     let mut pipeline = pipeline();
     let preflight = harness.request_as(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         "paired-client",
         json!({"action":"preflight_export","operation_id":"bound-token","app_id":"app-0000000000000001"}),
     );
@@ -1449,7 +1477,7 @@ fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
 
     for (caller, initiator, expected) in [
         ("other-service", "paired-client", "preflight_not_found"),
-        ("nvhttp", "other-client", "operation_conflict"),
+        ("amaterasu.nvhttp", "other-client", "operation_conflict"),
     ] {
         let rejected = harness.request_as(&mut pipeline, caller, initiator, launch.clone());
         assert_eq!(rejected["code"], expected, "{rejected}");
@@ -1457,25 +1485,40 @@ fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
     let mut wrong_operation = launch.clone();
     wrong_operation["operation_id"] = json!("other-operation");
     assert_eq!(
-        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_operation)["code"],
+        harness.request_as(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            "paired-client",
+            wrong_operation
+        )["code"],
         "preflight_not_found"
     );
     let mut wrong_application = launch.clone();
     wrong_application["app_id"] = json!("app-0000000000000002");
     assert_eq!(
-        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_application)["code"],
+        harness.request_as(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            "paired-client",
+            wrong_application
+        )["code"],
         "operation_conflict"
     );
     let mut wrong_token = launch.clone();
     wrong_token["preflight_token"] = json!("wrong-token");
     assert_eq!(
-        harness.request_as(&mut pipeline, "nvhttp", "paired-client", wrong_token)["code"],
+        harness.request_as(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            "paired-client",
+            wrong_token
+        )["code"],
         "preflight_mismatch"
     );
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
     assert_eq!(
-        harness.request_as(&mut pipeline, "nvhttp", "paired-client", launch)["launch"]["state"],
+        harness.request_as(&mut pipeline, "amaterasu.nvhttp", "paired-client", launch)["launch"]["state"],
         "active"
     );
 }
@@ -1487,7 +1530,7 @@ fn preflight_rejects_invalid_catalog_policy_and_export_rejects_snapshot_mismatch
     harness.catalog_config_overrides = Some(json!({"rtss_frame_limit_type":17}));
     let rejected = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"invalid-catalog","app_id":"app-0000000000000001"}),
     );
     assert_eq!(rejected["code"], "invalid_catalog_response");
@@ -1496,42 +1539,42 @@ fn preflight_rejects_invalid_catalog_policy_and_export_rejects_snapshot_mismatch
     harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"validate-snapshot","app_id":"app-0000000000000001"}),
     );
     let mut launch = launch_export("validate-snapshot");
     launch["preflight_token"] = preflight["preflight_token"].clone();
     launch["frame_limiter_settings"] = frame_limiter_snapshot();
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "frame_limiter_policy_mismatch"
     );
     launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
     launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!("60hz");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "invalid_frame_limiter_snapshot"
     );
     launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(60000);
     launch["client_frame_limiter_overrides"] = json!({"unrecognized":null});
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "invalid_client_frame_limiter_overrides"
     );
     launch["client_frame_limiter_overrides"] = json!({"frame_limiter_fps_limit":"120"});
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "invalid_client_frame_limiter_overrides"
     );
     launch["client_frame_limiter_overrides"] = json!({});
     launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!("async");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "invalid_frame_limiter_snapshot"
     );
     launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = Value::Null;
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch)["launch"]["state"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["launch"]["state"],
         "active"
     );
 }
@@ -1557,7 +1600,7 @@ fn rtss_limit_type_stays_sparse_across_preflight_launch_and_status() {
         let operation_id = format!("rtss-preflight-{index}");
         let preflight = harness.request(
             &mut pipeline,
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"}),
         );
         assert_eq!(
@@ -1576,7 +1619,7 @@ fn rtss_limit_type_stays_sparse_across_preflight_launch_and_status() {
             launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] =
                 json!(true);
         }
-        let started = harness.request(&mut pipeline, "nvhttp", launch);
+        let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
         assert_eq!(started["launch"]["state"], "active", "{case}: {started}");
         assert_eq!(
             started["launch"]["config_overrides"]
@@ -1586,7 +1629,7 @@ fn rtss_limit_type_stays_sparse_across_preflight_launch_and_status() {
         );
         let status = harness.request(
             &mut pipeline,
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
         );
         assert_eq!(
@@ -1603,7 +1646,7 @@ fn expired_preflight_token_cannot_launch_or_resurrect_after_catalog_change() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
     let preflight_request = json!({"action":"preflight_export","operation_id":"expired-token","app_id":"app-0000000000000001"});
-    let preflight = harness.request(&mut pipeline, "nvhttp", preflight_request.clone());
+    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
     pipeline
         .records
         .values
@@ -1615,15 +1658,15 @@ fn expired_preflight_token_cannot_launch_or_resurrect_after_catalog_change() {
     launch["preflight_token"] = preflight["preflight_token"].clone();
     launch["frame_limiter_settings"] = frame_limiter_snapshot();
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch.clone())["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "preflight_not_found"
     );
     assert!(harness.sessions.is_empty());
     harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
-    let replacement = harness.request(&mut pipeline, "nvhttp", preflight_request);
+    let replacement = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request);
     assert_ne!(replacement["preflight_token"], preflight["preflight_token"]);
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["code"],
         "preflight_mismatch"
     );
     assert!(harness.sessions.is_empty());
@@ -1636,7 +1679,7 @@ fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
     let mut pipeline = pipeline();
     let preflight = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"preflight_export","operation_id":"invalid-runtime-context","app_id":"app-0000000000000001"}),
     );
     let mut launch = launch_export("invalid-runtime-context");
@@ -1645,13 +1688,13 @@ fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
     let mut malformed = launch.clone();
     malformed["frame_limiter_settings"]["game_frame_generation_mode"] = json!("game_provided");
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
         "invalid_frame_limiter_snapshot"
     );
     let mut malformed = launch.clone();
     malformed["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!(true);
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
         "frame_limiter_policy_mismatch"
     );
     for (field, value) in [
@@ -1664,7 +1707,7 @@ fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
         let mut malformed = launch.clone();
         malformed["frame_limiter_settings"]["settings"][field] = value;
         assert_eq!(
-            harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+            harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
             "invalid_frame_limiter_snapshot"
         );
     }
@@ -1672,7 +1715,7 @@ fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
         let mut malformed = launch.clone();
         malformed["frame_limiter_settings"]["settings"]["rtss_install_path"] = json!("/opt/rtss");
         assert_eq!(
-            harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+            harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
             "invalid_frame_limiter_snapshot"
         );
     } else {
@@ -1680,7 +1723,7 @@ fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
             let mut malformed = launch.clone();
             malformed["frame_limiter_settings"]["settings"]["rtss_install_path"] = json!(path);
             assert_eq!(
-                harness.request(&mut pipeline, "nvhttp", malformed)["code"],
+                harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
                 "invalid_frame_limiter_snapshot"
             );
         }
@@ -1987,7 +2030,11 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     let mut pipeline = pipeline();
 
     let operation_id = "fec-snapshot";
-    let started = harness.request(&mut pipeline, "nvhttp", launch_export(operation_id));
+    let started = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        launch_export(operation_id),
+    );
     assert_eq!(started["launch"]["state"], "active", "{started}");
     let original_launch_id = started["launch"]["launch_id"].clone();
     let original_config_overrides = started["launch"]["config_overrides"].clone();
@@ -2045,7 +2092,11 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
         "keyboard":true,
         "mouse":false,
     }));
-    let replayed = harness.request(&mut pipeline, "nvhttp", launch_export(operation_id));
+    let replayed = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        launch_export(operation_id),
+    );
     assert_eq!(replayed["launch"]["launch_id"], original_launch_id);
     assert_eq!(
         replayed["launch"]["config_overrides"],
@@ -2053,7 +2104,7 @@ fn launch_result_retains_policy_from_the_catalog_revision_used_to_start_the_app(
     );
     let status = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(status["launch"]["config_overrides"]["fec_percentage"], 37);
@@ -2235,7 +2286,11 @@ fn native_pen_touch_is_retained_across_launch_response_retry_and_status() {
         let mut pipeline = pipeline();
         let operation_id = format!("native-pen-touch-{case}");
 
-        let started = harness.request(&mut pipeline, "nvhttp", launch_export(&operation_id));
+        let started = harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            launch_export(&operation_id),
+        );
         assert_eq!(started["launch"]["state"], "active", "{case}: {started}");
         assert_eq!(
             started["launch"]
@@ -2249,7 +2304,11 @@ fn native_pen_touch_is_retained_across_launch_response_retry_and_status() {
 
         // Catalog edits do not replace the configuration captured by this launch.
         harness.catalog_config_overrides = changed_config_overrides;
-        let retry = harness.request(&mut pipeline, "nvhttp", launch_export(&operation_id));
+        let retry = harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            launch_export(&operation_id),
+        );
         assert_eq!(
             retry["launch"]
                 .get("config_overrides")
@@ -2261,7 +2320,7 @@ fn native_pen_touch_is_retained_across_launch_response_retry_and_status() {
 
         let status = harness.request(
             &mut pipeline,
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({"action":"status","launch_id":launch_id}),
         );
         assert_eq!(
@@ -2287,7 +2346,7 @@ fn invalid_native_pen_touch_fails_before_session_creation() {
 
         let failed = harness.request(
             &mut pipeline,
-            "nvhttp",
+            "amaterasu.nvhttp",
             launch_export(&format!("invalid-native-pen-touch-{index}")),
         );
         assert_eq!(failed["launch"]["state"], "failed", "{failed}");
@@ -2691,7 +2750,11 @@ fn real_process_launch_retry_owner_isolation_and_ordered_stop() {
 fn exported_launch_uses_canonical_owner_lease_and_supports_owned_lookup() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
-    let exported = harness.request(&mut pipeline, "nvhttp", launch_export("public-one"));
+    let exported = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        launch_export("public-one"),
+    );
     assert_eq!(exported["launch"]["state"], "active", "{exported}");
     assert!(!exported.to_string().contains("management"));
     assert_eq!(
@@ -2706,7 +2769,7 @@ fn exported_launch_uses_canonical_owner_lease_and_supports_owned_lookup() {
     assert_eq!(
         harness.request(
             &mut pipeline,
-            "nvhttp",
+            "amaterasu.nvhttp",
             json!({"action":"lookup","operation_id":"public-one"})
         ),
         exported
@@ -2741,7 +2804,7 @@ fn exported_launch_uses_canonical_owner_lease_and_supports_owned_lookup() {
         .is_err()
     );
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch("public-one"))["code"],
+        harness.request(&mut pipeline, "amaterasu.nvhttp", launch("public-one"))["code"],
         "operation_conflict"
     );
 }
@@ -2773,7 +2836,11 @@ fn exported_launch_cancellation_reconciles_without_respawn() {
     let mut harness = Harness::new();
     harness.cancel_after_spawn = true;
     let mut pipeline = pipeline();
-    let result = harness.request(&mut pipeline, "nvhttp", launch_export("cancelled-export"));
+    let result = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        launch_export("cancelled-export"),
+    );
     assert_eq!(result["launch"]["state"], "cancelled", "{result}");
     assert_eq!(harness.processes.len(), 1);
     assert!(harness.processes[0].child.is_none());
@@ -2790,7 +2857,11 @@ fn exported_launch_natural_exit_is_visible_through_lookup() {
     harness.catalog_exit = true;
     let mut pipeline = pipeline();
     assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", launch_export("export-exit"))["launch"]["state"],
+        harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            launch_export("export-exit")
+        )["launch"]["state"],
         "active"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2801,7 +2872,7 @@ fn exported_launch_natural_exit_is_visible_through_lookup() {
     }
     let stopped = harness.request(
         &mut pipeline,
-        "nvhttp",
+        "amaterasu.nvhttp",
         json!({"action":"lookup","operation_id":"export-exit"}),
     );
     assert_eq!(stopped["launch"]["state"], "stopped");

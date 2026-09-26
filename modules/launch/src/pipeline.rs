@@ -615,7 +615,8 @@ impl Pipeline {
                 rtsp_operation_id,
                 request_sha256,
             } => {
-                if caller != "nvhttp" || (global_revision.is_none() && !global_overrides.is_empty())
+                if caller != "amaterasu.nvhttp"
+                    || (global_revision.is_none() && !global_overrides.is_empty())
                 {
                     return complete(send, request, error("display_admission_denied"));
                 }
@@ -696,12 +697,12 @@ impl Pipeline {
                 certificate_id,
                 catalog_revision,
             } => {
-                if caller != "rtsp" {
+                if caller != "amaterasu.rtsp" {
                     return complete(send, request, error("display_admission_denied"));
                 }
                 let now = Instant::now();
                 let remaining_ms = self.records.values.values().find_map(|record| {
-                    let verified = record.owner == "nvhttp"
+                    let verified = record.owner == "amaterasu.nvhttp"
                         && record.operation_id == application_operation_id
                         && display_admission_eligible(record, now)
                         && record.catalog_revision == Some(catalog_revision)
