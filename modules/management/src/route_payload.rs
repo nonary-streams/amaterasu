@@ -26,7 +26,22 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.playnite/1" => playnite(route.action, object),
         "amaterasu.input/1" => input(route.action, object),
         "amaterasu.session-history/1" => history(route.action, object),
-        "amaterasu.diagnostics/1" if route.action == "status" => fields(object, &[], &[]),
+        "amaterasu.diagnostics/1" if route.action == "status" || route.action == "counters" => {
+            fields(object, &[], &[])
+        }
+        "amaterasu.diagnostics/1" if route.action == "query" => {
+            fields(object, &[], &["after", "limit"])?;
+            if object
+                .get("after")
+                .is_some_and(|value| value.as_u64().is_none())
+                || object.get("limit").is_some_and(|value| {
+                    !value.as_u64().is_some_and(|limit| (1..=4).contains(&limit))
+                })
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "amaterasu.diagnostics/1" if route.action == "refresh_logging" => {
             fields(object, &["minimum_revision"], &[])?;
             if object

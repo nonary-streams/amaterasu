@@ -5784,26 +5784,81 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderSteam = renderSteam;
+    function parseDiagnosticQueryReply(value, after) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Diagnostics query reply is invalid.");
+        const reply = value;
+        const nonnegative = (number) => typeof number === "number" && Number.isSafeInteger(number) && number >= 0;
+        const validName = (name) => typeof name === "string" && /^[A-Za-z0-9._\-/]{1,64}$/.test(name);
+        if (reply.ok !== true || !Array.isArray(reply.records) || reply.records.length > 4 ||
+            typeof reply.has_more !== "boolean" || typeof reply.resync_required !== "boolean" ||
+            !nonnegative(reply.next_cursor) || !nonnegative(reply.latest_sequence) ||
+            !nonnegative(reply.dropped_total) ||
+            (reply.oldest_sequence !== null && !nonnegative(reply.oldest_sequence)) ||
+            reply.next_cursor < after || reply.next_cursor > reply.latest_sequence)
+            throw new Error("Diagnostics query reply is invalid or exceeds exact browser integer range.");
+        let sequence = after;
+        for (const entry of reply.records) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry))
+                throw new Error("Diagnostics record is invalid.");
+            const record = entry;
+            if (!nonnegative(record.sequence) || record.sequence <= sequence ||
+                !["trace", "debug", "info", "warn", "error"].includes(record.level) ||
+                !validName(record.target) || typeof record.message !== "string" ||
+                new TextEncoder().encode(record.message).length > 512 ||
+                !record.fields || typeof record.fields !== "object" || Array.isArray(record.fields) ||
+                Object.keys(record.fields).length > 8 ||
+                Object.entries(record.fields).some(([name, field]) => !validName(name) ||
+                    typeof field !== "string" || new TextEncoder().encode(field).length > 256))
+                throw new Error("Diagnostics record is invalid.");
+            sequence = record.sequence;
+        }
+        if (reply.next_cursor !== sequence || reply.has_more !== (sequence < reply.latest_sequence))
+            throw new Error("Diagnostics query cursor is inconsistent.");
+        return reply;
+    }
+    Amaterasu.parseDiagnosticQueryReply = parseDiagnosticQueryReply;
+    function parseDiagnosticCountersReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Diagnostics counters reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !reply.counters || typeof reply.counters !== "object" ||
+            Array.isArray(reply.counters))
+            throw new Error("Diagnostics counters reply is invalid.");
+        const counters = reply.counters;
+        if (Object.entries(counters).some(([name, count]) => !/^[A-Za-z0-9._\-/]{1,64}$/.test(name) ||
+            typeof count !== "number" || !Number.isSafeInteger(count) || count < 0))
+            throw new Error("Diagnostics counter value is invalid or exceeds exact browser integer range.");
+        return counters;
+    }
+    Amaterasu.parseDiagnosticCountersReply = parseDiagnosticCountersReply;
     function renderDiagnostics(context) {
         const area = Amaterasu.el("div");
         let after = 0;
         const history = [0];
+        let loadRequest = 0;
         context.content.append(Amaterasu.sectionHeading("Diagnostics", "Records and counters for this management console.", Amaterasu.button("Refresh", () => {
             after = 0;
             history.splice(0, history.length, 0);
             return load();
         })), area);
         async function load() {
+            const request = ++loadRequest;
+            const cursor = after;
             try {
-                const [reply, counters] = await Promise.all([
+                const [queryValue, counterValue] = await Promise.all([
                     context.api.post("diagnostics/query", {
-                        after,
+                        after: cursor,
                         limit: 4,
                     }),
                     context.api.post("diagnostics/counters"),
                 ]);
-                if (!context.content.isConnected)
+                if (!context.content.isConnected || request !== loadRequest)
                     return;
+                const reply = parseDiagnosticQueryReply(queryValue, cursor);
+                const counters = parseDiagnosticCountersReply(counterValue);
+                if (reply.resync_required)
+                    history.splice(0, history.length, cursor);
                 const records = Amaterasu.el("div", "records", ...reply.records.map((record) => Amaterasu.el("article", "record", Amaterasu.el("div", "section-meta", Amaterasu.badge(record.level, record.level === "error" ? "bad" : ""), Amaterasu.el("small", "muted", `#${record.sequence} · ${record.target}`)), Amaterasu.el("p", "", record.message), ...Object.entries(record.fields).map(([key, value]) => Amaterasu.el("p", "record-field", Amaterasu.el("strong", "", `${key}: `), value)))));
                 area.replaceChildren(reply.resync_required
                     ? Amaterasu.el("p", "notice", "Older records were removed from the bounded journal. Showing the records still available.")
@@ -5821,15 +5876,15 @@ var Amaterasu;
                         history.push(after);
                         void load();
                     }
-                    : null, `Page ${history.length}`), Amaterasu.panel("Counters", Object.keys(counters.counters).length
-                    ? Amaterasu.table(["Counter", "Value"], Object.entries(counters.counters).map(([name, value]) => [
+                    : null, `Page ${history.length}`), Amaterasu.panel("Counters", Object.keys(counters).length
+                    ? Amaterasu.table(["Counter", "Value"], Object.entries(counters).map(([name, value]) => [
                         name,
                         String(value),
                     ]))
                     : Amaterasu.el("p", "muted", "No counters have been recorded.")));
             }
             catch (error) {
-                if (context.content.isConnected)
+                if (context.content.isConnected && request === loadRequest)
                     area.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }

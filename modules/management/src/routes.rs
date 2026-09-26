@@ -395,6 +395,31 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_query_and_counters_accept_only_bounded_read_payloads() {
+        let query = resolve("/v1/diagnostics/query").unwrap();
+        let counters = resolve("/v1/diagnostics/counters").unwrap();
+        assert_eq!(query.scope, Some("diagnostics.read"));
+        assert_eq!(counters.scope, Some("diagnostics.read"));
+        assert_eq!(
+            payload(query, br#"{"after":7,"limit":4}"#).unwrap()["after"],
+            7
+        );
+        assert!(payload(query, b"{}").is_ok());
+        assert!(payload(counters, b"{}").is_ok());
+        for body in [
+            br#"{"after":-1}"#.as_slice(),
+            br#"{"after":"7"}"#,
+            br#"{"limit":0}"#,
+            br#"{"limit":5}"#,
+            br#"{"limit":1.5}"#,
+            br#"{"scope":"diagnostics.write"}"#,
+        ] {
+            assert!(payload(query, body).is_err());
+            assert!(payload(counters, body).is_err());
+        }
+    }
+
+    #[test]
     fn diagnostics_logging_refresh_requires_configuration_write_and_a_positive_revision() {
         let route = resolve("/v1/diagnostics/refresh_logging").unwrap();
         assert_eq!(route.service, "amaterasu.diagnostics/1");

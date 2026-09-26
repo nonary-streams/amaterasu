@@ -1020,10 +1020,62 @@ namespace Amaterasu {
     void load();
   }
 
+  export function parseDiagnosticQueryReply(value: unknown, after: number): DiagnosticReply {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Diagnostics query reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    const nonnegative = (number: unknown): number is number =>
+      typeof number === "number" && Number.isSafeInteger(number) && number >= 0;
+    const validName = (name: unknown): name is string =>
+      typeof name === "string" && /^[A-Za-z0-9._\-/]{1,64}$/.test(name);
+    if (reply.ok !== true || !Array.isArray(reply.records) || reply.records.length > 4 ||
+        typeof reply.has_more !== "boolean" || typeof reply.resync_required !== "boolean" ||
+        !nonnegative(reply.next_cursor) || !nonnegative(reply.latest_sequence) ||
+        !nonnegative(reply.dropped_total) ||
+        (reply.oldest_sequence !== null && !nonnegative(reply.oldest_sequence)) ||
+        reply.next_cursor < after || reply.next_cursor > reply.latest_sequence)
+      throw new Error("Diagnostics query reply is invalid or exceeds exact browser integer range.");
+    let sequence = after;
+    for (const entry of reply.records) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        throw new Error("Diagnostics record is invalid.");
+      const record = entry as Record<string, unknown>;
+      if (!nonnegative(record.sequence) || record.sequence <= sequence ||
+          !["trace", "debug", "info", "warn", "error"].includes(record.level as string) ||
+          !validName(record.target) || typeof record.message !== "string" ||
+          new TextEncoder().encode(record.message).length > 512 ||
+          !record.fields || typeof record.fields !== "object" || Array.isArray(record.fields) ||
+          Object.keys(record.fields).length > 8 ||
+          Object.entries(record.fields).some(([name, field]) => !validName(name) ||
+            typeof field !== "string" || new TextEncoder().encode(field).length > 256))
+        throw new Error("Diagnostics record is invalid.");
+      sequence = record.sequence;
+    }
+    if (reply.next_cursor !== sequence || reply.has_more !== (sequence < reply.latest_sequence))
+      throw new Error("Diagnostics query cursor is inconsistent.");
+    return reply as unknown as DiagnosticReply;
+  }
+
+  export function parseDiagnosticCountersReply(value: unknown): Record<string, number> {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("Diagnostics counters reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !reply.counters || typeof reply.counters !== "object" ||
+        Array.isArray(reply.counters))
+      throw new Error("Diagnostics counters reply is invalid.");
+    const counters = reply.counters as Record<string, unknown>;
+    if (Object.entries(counters).some(([name, count]) =>
+      !/^[A-Za-z0-9._\-/]{1,64}$/.test(name) ||
+      typeof count !== "number" || !Number.isSafeInteger(count) || count < 0))
+      throw new Error("Diagnostics counter value is invalid or exceeds exact browser integer range.");
+    return counters as Record<string, number>;
+  }
+
   export function renderDiagnostics(context: PageContext): void {
     const area = el("div");
     let after = 0;
     const history = [0];
+    let loadRequest = 0;
     context.content.append(
       sectionHeading(
         "Diagnostics",
@@ -1037,17 +1089,22 @@ namespace Amaterasu {
       area,
     );
     async function load(): Promise<void> {
+      const request = ++loadRequest;
+      const cursor = after;
       try {
-        const [reply, counters] = await Promise.all([
-          context.api.post<DiagnosticReply>("diagnostics/query", {
-            after,
+        const [queryValue, counterValue] = await Promise.all([
+          context.api.post<unknown>("diagnostics/query", {
+            after: cursor,
             limit: 4,
           }),
-          context.api.post<{ counters: Record<string, number> }>(
+          context.api.post<unknown>(
             "diagnostics/counters",
           ),
         ]);
-        if (!context.content.isConnected) return;
+        if (!context.content.isConnected || request !== loadRequest) return;
+        const reply = parseDiagnosticQueryReply(queryValue, cursor);
+        const counters = parseDiagnosticCountersReply(counterValue);
+        if (reply.resync_required) history.splice(0, history.length, cursor);
         const records = el(
           "div",
           "records",
@@ -1104,10 +1161,10 @@ namespace Amaterasu {
           ),
           panel(
             "Counters",
-            Object.keys(counters.counters).length
+            Object.keys(counters).length
               ? table(
                   ["Counter", "Value"],
-                  Object.entries(counters.counters).map(([name, value]) => [
+                  Object.entries(counters).map(([name, value]) => [
                     name,
                     String(value),
                   ]),
@@ -1116,7 +1173,7 @@ namespace Amaterasu {
           ),
         );
       } catch (error) {
-        if (context.content.isConnected)
+        if (context.content.isConnected && request === loadRequest)
           area.replaceChildren(errorPanel(error, load));
       }
     }

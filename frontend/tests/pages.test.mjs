@@ -71,7 +71,10 @@ function createPageContext() {
   const timers = new Map();
   let nextTimer = 0;
   return vm.createContext({
-    document: { createElement: (tagName) => new FakeElement(tagName) },
+    document: {
+      createElement: (tagName) => new FakeElement(tagName),
+      createTextNode: (text) => text,
+    },
     window: {
       setTimeout(callback, delay) {
         const id = ++nextTimer;
@@ -914,4 +917,103 @@ test("recorded detail keeps the latest selection after older success or failure 
   await waitFor(() => reopened.textContent.includes("History for first"), "reopened detail");
   assert.match(reopened.textContent, /1 samples.*1 events/);
   assert.match(reopened.textContent, /stream_started/);
+});
+
+function diagnosticReply(after, message, overrides = {}) {
+  const sequence = after + 1;
+  return {
+    ok: true,
+    records: [{ sequence, level: "info", target: "capture", message, fields: { source: "host" } }],
+    next_cursor: sequence,
+    has_more: false,
+    latest_sequence: sequence,
+    oldest_sequence: sequence,
+    dropped_total: 0,
+    resync_required: false,
+    ...overrides,
+  };
+}
+
+test("diagnostics rejects malformed signed records, cursors and unsafe counters", () => {
+  const parse = pages.parseDiagnosticQueryReply;
+  assert.equal(parse(diagnosticReply(0, "ready"), 0).records[0].message, "ready");
+  for (const reply of [
+    diagnosticReply(0, "bad", { next_cursor: 0 }),
+    diagnosticReply(0, "bad", { has_more: true }),
+    diagnosticReply(0, "bad", { records: [{ ...diagnosticReply(0, "bad").records[0], fields: { source: 7 } }] }),
+    diagnosticReply(0, "bad", { records: [{ ...diagnosticReply(0, "bad").records[0], sequence: Number.MAX_SAFE_INTEGER + 1 }] }),
+    diagnosticReply(0, "bad", { records: null }),
+  ]) assert.throws(() => parse(reply, 0));
+  assert.equal(pages.parseDiagnosticCountersReply({ ok: true, counters: { dropped: 2 } }).dropped, 2);
+  for (const counters of [
+    { ok: true, counters: { dropped: Number.MAX_SAFE_INTEGER + 1 } },
+    { ok: true, counters: { dropped: -1 } },
+    { ok: true, counters: [] },
+  ]) assert.throws(() => pages.parseDiagnosticCountersReply(counters));
+});
+
+test("diagnostics ignores older page replies and errors after refresh", async () => {
+  const pending = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    async post(route, payload) {
+      if (route === "diagnostics/counters") return { ok: true, counters: { reads: 1 } };
+      if (route === "diagnostics/query")
+        return new Promise((resolve, reject) => pending.push({ after: payload.after, resolve, reject }));
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  pending[0].resolve(diagnosticReply(0, "first", { has_more: true, latest_sequence: 2 }));
+  await waitFor(() => findButton(content, "Next →"), "next diagnostics page");
+  findButton(content, "Next →").click();
+  await waitFor(() => pending.length === 2, "pending second page");
+  findButton(content, "Refresh").click();
+  await waitFor(() => pending.length === 3, "pending refresh");
+  pending[2].resolve(diagnosticReply(0, "fresh"));
+  await waitFor(() => content.textContent.includes("fresh"), "refreshed diagnostics");
+  pending[1].resolve(diagnosticReply(1, "stale"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(content.textContent, /fresh/);
+  assert.doesNotMatch(content.textContent, /stale/);
+  assert.match(content.textContent, /Page 1/);
+  findButton(content, "Refresh").click();
+  findButton(content, "Refresh").click();
+  await waitFor(() => pending.length === 5, "overlapping refreshes");
+  pending[4].resolve(diagnosticReply(0, "latest"));
+  await waitFor(() => content.textContent.includes("latest"), "latest diagnostics");
+  pending[3].reject(new Error("old request failed"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(content.textContent, /latest/);
+  assert.doesNotMatch(content.textContent, /old request failed/);
+});
+
+test("diagnostics resync clears back navigation into evicted records", async () => {
+  const pending = [];
+  const content = new FakeElement("main");
+  content.setConnected(true);
+  pages.renderDiagnostics({ content, notify() {}, navigate() {}, api: {
+    async post(route, payload) {
+      if (route === "diagnostics/counters") return { ok: true, counters: {} };
+      if (route === "diagnostics/query")
+        return new Promise((resolve) => pending.push({ after: payload.after, resolve }));
+      throw new Error(`Unexpected route ${route}`);
+    },
+  } });
+  pending[0].resolve(diagnosticReply(0, "old", { has_more: true, latest_sequence: 5 }));
+  await waitFor(() => findButton(content, "Next →"), "next diagnostics page");
+  findButton(content, "Next →").click();
+  await waitFor(() => pending.length === 2, "next query");
+  pending[1].resolve(diagnosticReply(1, "retained", {
+    records: [{ sequence: 5, level: "info", target: "capture", message: "retained", fields: {} }],
+    next_cursor: 5,
+    latest_sequence: 5,
+    oldest_sequence: 5,
+    dropped_total: 4,
+    resync_required: true,
+  }));
+  await waitFor(() => content.textContent.includes("retained"), "resynced records");
+  assert.match(content.textContent, /Page 1/);
+  assert.match(content.textContent, /Older records were removed/);
+  assert.equal(findButton(content, "← Previous").disabled, true);
 });
