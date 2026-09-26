@@ -149,6 +149,9 @@ impl HostLoggingConfigurationReader {
             Err(_) => {
                 // The request may have been accepted before the transport failed.
                 // Reuse the stable operation ID so the broker returns that same request.
+                // A later denial cannot prove the provider grant was absent once
+                // an earlier submission may have reached the broker.
+                self.provider_granted = true;
                 self.schedule_retry(now);
                 None
             }
@@ -765,6 +768,42 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_denial_after_a_lost_acknowledgement_cannot_enable_legacy_bootstrap() {
+        let started = Instant::now();
+        let mut reader = HostLoggingConfigurationReader::default();
+
+        assert!(
+            reader
+                .tick(started, |command| match command {
+                    Command::Request { .. } => Err("request acknowledgement was lost".into()),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(
+            reader
+                .tick(started + RETRY_DELAY, |command| match command {
+                    Command::Request { .. } => Ok(Response::error(
+                        "permission_denied",
+                        "later grant check denied",
+                    )),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(!reader.legacy_bootstrap_authorized());
+        assert!(
+            reader
+                .tick(started + RETRY_DELAY * 2, |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 41 }),
+                    unexpected => panic!("unexpected runtime command: {unexpected:?}"),
+                })
+                .is_none()
+        );
+        assert!(!reader.legacy_bootstrap_authorized());
     }
 
     // Restart simulations are sequential; simultaneous readers would share this caller-scoped key.
