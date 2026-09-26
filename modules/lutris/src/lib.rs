@@ -20,6 +20,7 @@ use steam_catalog::{Progress as SteamProgress, SteamCatalogRead};
 
 pub const SERVICE: &str = "amaterasu.lutris/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -477,7 +478,7 @@ impl LutrisModule {
             Ok(action) => action,
             Err(_) => return self.complete(request, json!({"ok":false,"code":"invalid_request"})),
         };
-        if !is_management_caller(caller) {
+        if !caller_can_access(caller, &action) {
             return self.complete(request, json!({"ok":false,"code":"forbidden"}));
         }
         if action.is_settings() && self.configuration.busy() {
@@ -555,7 +556,10 @@ impl LutrisModule {
     }
 
     fn status(&self) -> Value {
-        let available = discovery::availability();
+        self.status_with_availability(discovery::availability())
+    }
+
+    fn status_with_availability(&self, available: discovery::Availability) -> Value {
         json!({
             "ok":true,
             "settings_ready":self.configuration.ready(),
@@ -1507,6 +1511,158 @@ mod tests {
 
 fn is_management_caller(caller: &str) -> bool {
     caller == MANAGEMENT_CALLER
+}
+
+fn caller_can_access(caller: &str, action: &Action) -> bool {
+    is_management_caller(caller) || (caller == LAUNCH_CALLER && matches!(action, Action::Status {}))
+}
+
+#[cfg(test)]
+mod launch_status_access_tests {
+    use super::*;
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
+    };
+    use std::collections::VecDeque;
+    use std::ffi::c_void;
+
+    struct Host {
+        completed: Vec<Value>,
+        requests: VecDeque<(u64, String, Value)>,
+        load_ready: bool,
+    }
+
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        output: ReplySink,
+    ) -> Status {
+        // SAFETY: the test keeps Host alive for every synchronous runtime call.
+        let host = unsafe { &mut *context.cast::<Host>() };
+        // SAFETY: the borrowed command remains valid for this invocation.
+        let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+        let response = match command {
+            Command::Register { .. } => Response::Ok,
+            Command::Request { .. } => Response::Accepted { id: 99 },
+            Command::TakeResult { request: 99 } if !host.load_ready => Response::Pending,
+            Command::TakeResult { request: 99 } => Response::Result {
+                payload: json!({
+                    "ok":true,
+                    "found":true,
+                    "version":1,
+                    "revision":4,
+                    "values":{
+                        "enabled":false,
+                        "auto_sync":false,
+                        "autosync_remove_uninstalled":true,
+                        "include_steam":false,
+                        "exclude_games":[]
+                    }
+                }),
+            },
+            Command::ReleaseResult { request: 99 } => Response::Ok,
+            Command::Poll {} => {
+                host.requests
+                    .pop_front()
+                    .map_or(Response::Pending, |(id, caller, payload)| {
+                        Response::Request {
+                            id,
+                            caller,
+                            initiator: "trusted-runtime".into(),
+                            service: SERVICE.into(),
+                            remaining_ms: 1000,
+                            payload,
+                        }
+                    })
+            }
+            Command::Complete { payload, .. } => {
+                host.completed.push(payload);
+                Response::Ok
+            }
+            other => panic!("unexpected runtime command: {other:?}"),
+        };
+        // SAFETY: the response buffer remains live until ReplySink copies it.
+        unsafe { output.send(&serde_json::to_vec(&response).unwrap()) };
+        STATUS_OK
+    }
+
+    #[test]
+    fn launch_can_read_disabled_provider_status_but_no_management_actions() {
+        let mut host = Host {
+            completed: Vec::new(),
+            requests: VecDeque::new(),
+            load_ready: false,
+        };
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut host as *mut Host).cast(),
+            invoke,
+        };
+        // SAFETY: Host outlives the module and every synchronous call below.
+        let mut module =
+            LutrisModule::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
+        host.requests
+            .push_back((0, LAUNCH_CALLER.into(), json!({"action":"status"})));
+        module.tick().unwrap();
+        let loading = host.completed.pop().unwrap();
+        assert_eq!(loading["ok"], true);
+        assert_eq!(loading["settings_ready"], false);
+        assert_eq!(
+            loading["available"],
+            discovery::availability().paired_source_available
+        );
+        host.load_ready = true;
+        module.tick().unwrap();
+        module.last_snapshot_games = 3; // Previously imported catalog rows remain on disable.
+
+        let available = discovery::Availability {
+            supported_platform: true,
+            database_available: true,
+            executable_available: true,
+            paired_source_available: true,
+        };
+        let status = module.status_with_availability(available);
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["settings_ready"], true);
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["available"], true);
+        assert_eq!(status["game_count"], 3);
+        let unavailable = module.status_with_availability(discovery::Availability {
+            paired_source_available: false,
+            ..available
+        });
+        assert_eq!(unavailable["enabled"], false);
+        assert_eq!(unavailable["available"], false);
+
+        host.requests
+            .push_back((1, LAUNCH_CALLER.into(), json!({"action":"status"})));
+        module.tick().unwrap();
+        let launch_status = host.completed.pop().unwrap();
+        assert_eq!(launch_status["ok"], true);
+        assert_eq!(launch_status["settings_ready"], true);
+        assert_eq!(launch_status["enabled"], false);
+        assert_eq!(launch_status["game_count"], 3);
+
+        for action in [
+            json!({"action":"refresh"}),
+            json!({"action":"settings_get"}),
+            json!({"action":"settings_update","enabled":true,"expected_revision":4}),
+            json!({"action":"artwork_get","game_id":7}),
+            json!({"action":"artwork_read","game_id":7,"revision":"a","offset":0}),
+        ] {
+            host.requests.push_back((2, LAUNCH_CALLER.into(), action));
+            module.tick().unwrap();
+            assert_eq!(host.completed.pop().unwrap()["code"], "forbidden");
+        }
+        host.requests
+            .push_back((3, "amaterasu.steam".into(), json!({"action":"status"})));
+        module.tick().unwrap();
+        assert_eq!(host.completed.pop().unwrap()["code"], "forbidden");
+        host.requests
+            .push_back((4, MANAGEMENT_CALLER.into(), json!({"action":"status"})));
+        module.tick().unwrap();
+        assert_eq!(host.completed.pop().unwrap()["ok"], true);
+    }
 }
 
 amaterasu_module_sdk::export_module!(LutrisModule);
