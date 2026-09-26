@@ -15,6 +15,9 @@ const MAX_USER_DIRECTORIES: usize = 32;
 const MAX_HASH_DIRECTORIES: usize = 32;
 const MAX_DIMENSION_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
+// Bound the pixel buffer an image decoder would allocate after the compressed
+// transfer has passed its byte limit (four bytes per pixel).
+const MAX_DECODED_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
 const REMOTE_CACHE_DIRECTORY: &str = "amaterasu-steam-artwork-v1";
 const MAX_TEMP_NAME_ATTEMPTS: u64 = 8;
@@ -666,7 +669,10 @@ fn validate_remote_artwork(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_ARTWORK_BYTES as usize
         && image_mime_from_header(bytes.get(..12).unwrap_or(bytes)) == Some("image/jpeg")
         && jpeg_dimensions(bytes).is_some_and(|(width, height)| {
-            width >= 600 && height >= 900 && u64::from(width) * 3 == u64::from(height) * 2
+            width >= 600
+                && height >= 900
+                && u64::from(width) * 3 == u64::from(height) * 2
+                && u64::from(width) * u64::from(height) * 4 <= MAX_DECODED_ARTWORK_BYTES
         })
 }
 
@@ -969,9 +975,9 @@ fn from_hashed_library_cache(
             ("library_600x900.jpg", 3),
             ("library_600x900.png", 3),
             ("library_600x900.webp", 3),
-            ("library_capsule.jpg", 3),
-            ("library_capsule.png", 3),
-            ("library_capsule.webp", 3),
+            ("library_capsule.jpg", 2),
+            ("library_capsule.png", 2),
+            ("library_capsule.webp", 2),
             ("library_header.jpg", 2),
             ("library_header.png", 2),
             ("library_header.webp", 2),
@@ -1050,6 +1056,13 @@ fn inspect_candidate(
     }
     image_mime(&canonical_path)?;
     let (width, height) = image_dimensions(&canonical_path).unwrap_or_default();
+    // A mislabeled wide library image is a header even when its filename says
+    // 600x900. It must not displace a real portrait in another Steam root.
+    let role_priority = if role_priority == 3 && width > height {
+        2
+    } else {
+        role_priority
+    };
     let modified_nanos = metadata
         .modified()
         .ok()
@@ -1399,6 +1412,48 @@ mod tests {
             artwork.source_path.as_deref(),
             high_resolution_portrait.to_str()
         );
+        assert!(!artwork.needs_remote_upgrade);
+    }
+
+    #[test]
+    fn wide_library_assets_do_not_displace_a_low_resolution_portrait() {
+        let root = TemporaryRoot::new();
+        let cache = root.0.join("appcache/librarycache");
+        let hashed = cache.join("42/hash");
+        fs::create_dir_all(&hashed).unwrap();
+        let portrait = cache.join("42_library_600x900.png");
+        fs::write(&portrait, synthetic_png(300, 450)).unwrap();
+        fs::write(
+            cache.join("42_library_600x900_2x.png"),
+            synthetic_png(1920, 1080),
+        )
+        .unwrap();
+        fs::write(
+            hashed.join("library_capsule.png"),
+            synthetic_png(2048, 1024),
+        )
+        .unwrap();
+
+        let artwork = discover(42, &root.0, &[]);
+        assert_eq!(artwork.source_path.as_deref(), portrait.to_str());
+        assert!(artwork.needs_remote_upgrade);
+    }
+
+    #[test]
+    fn full_local_portrait_stays_selected_over_wide_library_assets() {
+        let root = TemporaryRoot::new();
+        let cache = root.0.join("appcache/librarycache");
+        fs::create_dir_all(&cache).unwrap();
+        let portrait = cache.join("42_library_600x900.png");
+        fs::write(&portrait, synthetic_png(600, 900)).unwrap();
+        fs::write(
+            cache.join("42_library_600x900_2x.png"),
+            synthetic_png(1920, 1080),
+        )
+        .unwrap();
+
+        let artwork = discover(42, &root.0, &[]);
+        assert_eq!(artwork.source_path.as_deref(), portrait.to_str());
         assert!(!artwork.needs_remote_upgrade);
     }
 
@@ -1877,6 +1932,7 @@ mod tests {
             900,
             MAX_ARTWORK_BYTES as usize + 1
         )));
+        assert!(!validate_remote_artwork(&synthetic_jpeg(6000, 9000, 64)));
     }
 
     #[test]

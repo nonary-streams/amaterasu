@@ -262,7 +262,7 @@ filesystem call can still block on unavailable storage.
 Behavior reference: sibling Vibeshine `src/steam_integration.h` and
 `src/steam_artwork.cpp`; source was not copied or translated. Other missing
 parity includes machine-host session-broker discovery,
-persistent artwork caching and conversion, uninstalled owned games,
+PNG artwork conversion for consumers that require it, uninstalled owned games,
 app type filtering, play-history selection, launch options/Proton resolution,
 launch/process tracking, watchers, and Steam broker environment handling. This
 provider neither modifies Steam files.
