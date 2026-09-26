@@ -1,7 +1,8 @@
 use super::*;
 
 fn display_request() -> Value {
-    json!({"configuration":{"displays":[
+    json!({"expected_topology_revision":"0123456789abcdef0123456789abcdef",
+        "configuration":{"displays":[
         {"id":"first","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
         {"id":"second","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
     ]},"mode_policies":[
@@ -34,6 +35,14 @@ fn full_frozen_topology_applies_once_and_restores_on_stop() {
     assert_eq!(
         applies[0].payload["mode_policies"],
         display_request()["mode_policies"]
+    );
+    assert_eq!(
+        applies[0].payload["expected_topology_revision"],
+        display_request()["expected_topology_revision"]
+    );
+    assert_eq!(
+        applies[0].payload["operation_id"],
+        host.pipeline.records[&id].display_operation()
     );
     assert!(applies[0].payload.get("mode_policy").is_none());
     assert_eq!(
@@ -131,7 +140,7 @@ fn rejected_apply_keeps_stream_alive_without_lease() {
 }
 
 #[test]
-fn lost_apply_result_does_not_adopt_unbound_status_lease() {
+fn lost_apply_result_adopts_only_its_operation_and_restores() {
     let mut host = Harness::new();
     let mut request = prepare();
     request["display_request"] = display_request();
@@ -139,8 +148,11 @@ fn lost_apply_result_does_not_adopt_unbound_status_lease() {
     host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
     let response = host.response(2, start(id));
     assert_eq!(response["state"], "active");
-    assert!(host.pipeline.records[&id].display_lease.is_none());
-    assert_eq!(response["display_state"], "status_unverified");
+    assert_eq!(
+        host.pipeline.records[&id].display_lease.as_deref(),
+        Some("display-0000000000000001")
+    );
+    assert_eq!(response["display_state"], "leased");
     assert_eq!(
         host.broker
             .calls
@@ -153,16 +165,63 @@ fn lost_apply_result_does_not_adopt_unbound_status_lease() {
     );
     assert_eq!(
         host.response(3, json!({"action":"stop","session":id}))["state"],
-        "cleanup_failed"
+        "stopped"
     );
-    assert!(host.broker.display_lease.is_some());
+    assert!(host.broker.display_lease.is_none());
+}
+
+#[test]
+fn recovered_provider_journal_keeps_operation_identity_through_stop() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    host.broker.display_restart_on_lost_apply = true;
+    host.broker.fault = Some(("amaterasu.display/1:apply".into(), Fault::AfterMutation));
+    assert_eq!(
+        host.response(2, start(id))["display_state"],
+        "recovery_required"
+    );
+    assert_eq!(
+        host.pipeline.records[&id].display_lease.as_deref(),
+        Some("display-0000000000000001")
+    );
+    assert_eq!(
+        host.broker.display_operation.as_deref(),
+        Some(host.pipeline.records[&id].display_operation().as_str())
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
     assert!(
-        !host
-            .broker
-            .calls
-            .iter()
-            .any(|call| call.service == "amaterasu.display/1"
-                && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+        host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
+        )
+    );
+}
+
+#[test]
+fn same_operation_recovery_reply_retains_lease_for_recover() {
+    let mut host = Harness::new();
+    host.broker.display_apply_recovery_reply = true;
+    host.broker.display_recovery_required = false;
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    assert_eq!(
+        host.response(2, start(id))["display_state"],
+        "recovery_required"
+    );
+    host.broker.display_recovery_required = true;
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert!(
+        host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "recover"
+        )
     );
 }
 
@@ -195,6 +254,54 @@ fn concurrent_owner_lease_after_preflight_is_never_restored_by_this_session() {
             .iter()
             .any(|call| call.service == "amaterasu.display/1"
                 && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+    );
+}
+
+#[test]
+fn wrong_display_operation_cannot_be_adopted_or_restored() {
+    let mut host = Harness::new();
+    host.broker.display_wrong_apply_operation = true;
+    host.broker.display_wrong_status_operation = true;
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    assert!(host.pipeline.records[&id].display_lease.is_none());
+    assert_eq!(
+        host.pipeline.records[&id].display_state,
+        "status_unverified"
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "cleanup_failed"
+    );
+    assert!(host.broker.display_lease.is_some());
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.display/1"
+                && matches!(call.payload["action"].as_str(), Some("restore" | "recover")))
+    );
+}
+
+#[test]
+fn display_revision_is_required_and_caller_cannot_supply_operation_identity() {
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    request["display_request"]["expected_topology_revision"] = json!("bad");
+    assert_eq!(
+        Harness::new().response(1, request)["code"],
+        "invalid_display_request"
+    );
+
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    request["display_request"]["operation_id"] = json!("forged");
+    assert_eq!(
+        Harness::new().response(1, request)["code"],
+        "invalid_request"
     );
 }
 

@@ -128,7 +128,7 @@ impl Job {
             self.limiter_tried = true;
         }
         if !self.display_tried {
-            if record.display_attempted && record.display_lease.is_none() {
+            if record.display_attempted && !record.display_status_verified {
                 return Some(Step::FindDisplay);
             }
             if record.display_lease.is_some() {

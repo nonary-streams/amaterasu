@@ -111,6 +111,7 @@ pub(super) struct Record {
     pub limiter_state: String,
     pub display_attempted: bool,
     pub display_lease: Option<String>,
+    pub display_status_verified: bool,
     pub display_state: String,
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
@@ -173,6 +174,7 @@ impl Record {
             limiter_state: "not_requested".into(),
             display_attempted: false,
             display_lease: None,
+            display_status_verified: false,
             display_state: "not_requested".into(),
             input_request_started_at: 0,
             input_expires_at: 0,
@@ -195,6 +197,10 @@ impl Record {
 
     pub fn input_operation(&self) -> String {
         format!("ss-{:x}-input", self.id)
+    }
+
+    pub fn display_operation(&self) -> String {
+        format!("ss-{:x}-display", self.id)
     }
 
     pub fn limiter_session(&self) -> String {
@@ -256,7 +262,8 @@ impl Record {
             "frame_limiter_state": self.limiter_state,
             "frame_limiter_applied": self.limiter_lease.is_some() && self.limiter_state == "applied",
             "display_request": self.config.display_request.as_ref().map(|request| {
-                let mut value = json!({"configuration": request.configuration});
+                let mut value = json!({"configuration": request.configuration,
+                    "expected_topology_revision":request.expected_topology_revision});
                 if let Some(policy) = &request.mode_policy { value["mode_policy"] = policy.clone(); }
                 if let Some(policies) = &request.mode_policies { value["mode_policies"] = json!(policies); }
                 value

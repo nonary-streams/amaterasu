@@ -91,11 +91,16 @@ pub struct Broker {
     pub limiter_session: Option<String>,
     pub limiter_malformed_status: bool,
     pub display_lease: Option<String>,
+    pub display_operation: Option<String>,
     pub display_recovery_required: bool,
     pub display_apply_failure: bool,
+    pub display_wrong_apply_operation: bool,
+    pub display_apply_recovery_reply: bool,
+    pub display_wrong_status_operation: bool,
     pub display_restore_failures: usize,
     pub display_unavailable: bool,
     pub display_race_on_lost_apply: bool,
+    pub display_restart_on_lost_apply: bool,
 }
 
 impl Broker {
@@ -250,6 +255,7 @@ impl Broker {
                         && pending.call.payload["action"] == "apply"
                     {
                         self.display_lease = Some("display-0000000000000002".into());
+                        self.display_operation = Some("another-session-display".into());
                     }
                     self.requests.insert(request, pending);
                     return Err("lost result before provider dispatch".into());
@@ -260,6 +266,12 @@ impl Broker {
                     .unwrap_or_else(|| self.execute(&pending.call));
                 if matches!(fault, Some(Fault::AfterMutation)) {
                     self.fault = None;
+                    if self.display_restart_on_lost_apply
+                        && pending.call.service == "amaterasu.display/1"
+                        && pending.call.payload["action"] == "apply"
+                    {
+                        self.display_recovery_required = true;
+                    }
                     pending.result = Some(result);
                     self.requests.insert(request, pending);
                     return Err("lost result after commit".into());
@@ -504,15 +516,37 @@ impl Broker {
         }
         match action {
             "status" => json!({"ok":true,"native_supported":true,"mutation_enabled":true,
-                "state":if self.display_recovery_required {"recovery_required"} else if self.display_lease.is_some() {"leased"} else {"idle"},
-                "owned_by_caller":self.display_lease.is_some(),"lease":self.display_lease}),
+            "state":if self.display_recovery_required {"recovery_required"} else if self.display_lease.is_some() {"leased"} else {"idle"},
+            "owned_by_caller":self.display_lease.is_some(),"lease":self.display_lease,
+            "operation_id":if self.display_wrong_status_operation && self.display_lease.is_some() {
+                Some("another-session-display")
+            } else {
+                self.display_operation.as_deref()
+            }}),
             "apply" => {
                 if self.display_apply_failure {
                     return error("invalid_configuration");
                 }
+                assert_eq!(
+                    payload["expected_topology_revision"],
+                    "0123456789abcdef0123456789abcdef"
+                );
+                let operation = payload["operation_id"]
+                    .as_str()
+                    .expect("session operation ID");
                 assert!(self.display_lease.is_none(), "duplicate display Apply");
                 self.display_lease = Some("display-0000000000000001".into());
-                json!({"ok":true,"applied":true,"lease":self.display_lease})
+                self.display_operation = Some(operation.into());
+                if self.display_apply_recovery_reply {
+                    return json!({"ok":true,"applied":false,"state":"recovery_required",
+                        "lease":self.display_lease,"operation_id":self.display_operation});
+                }
+                json!({"ok":true,"applied":true,"lease":self.display_lease,
+                "operation_id":if self.display_wrong_apply_operation {
+                    Some("another-session-display")
+                } else {
+                    self.display_operation.as_deref()
+                }})
             }
             "restore" | "recover" => {
                 if self.display_restore_failures > 0 {
@@ -523,6 +557,7 @@ impl Broker {
                 assert_eq!(payload["lease"].as_str(), self.display_lease.as_deref());
                 let lease = self.display_lease.take();
                 self.display_recovery_required = false;
+                self.display_operation = None;
                 json!({"ok":true,"restored":true,"lease":lease})
             }
             _ => panic!("unexpected display action"),

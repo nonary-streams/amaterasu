@@ -8,7 +8,12 @@ pub(super) fn apply(record: &Record) -> Value {
         .display_request
         .as_ref()
         .expect("validated display request");
-    let mut payload = json!({"action":"apply","configuration":request.configuration});
+    let mut payload = json!({
+        "action":"apply",
+        "configuration":request.configuration,
+        "expected_topology_revision":request.expected_topology_revision,
+        "operation_id":record.display_operation(),
+    });
     if let Some(policy) = &request.mode_policy {
         payload["mode_policy"] = policy.clone();
     }
@@ -21,6 +26,7 @@ pub(super) fn apply(record: &Record) -> Value {
 pub(super) fn accept_apply(record: &mut Record, response: &Value) {
     if response["ok"] == true
         && response["applied"] == true
+        && response["operation_id"] == record.display_operation()
         && let Some(lease) = response["lease"]
             .as_str()
             .filter(|lease| valid_lease(lease))
@@ -29,7 +35,8 @@ pub(super) fn accept_apply(record: &mut Record, response: &Value) {
         record.display_state = "applied".into();
         return;
     }
-    if response["recovery_required"] == true
+    if (response["recovery_required"] == true || response["state"] == "recovery_required")
+        && response["operation_id"] == record.display_operation()
         && let Some(lease) = response["lease"]
             .as_str()
             .filter(|lease| valid_lease(lease))
@@ -45,23 +52,29 @@ pub(super) fn accept_apply(record: &mut Record, response: &Value) {
 }
 
 pub(super) fn accept_status(record: &mut Record, response: &Value) -> bool {
+    record.display_status_verified = false;
     if response["ok"] != true {
         return false;
     }
+    if response["operation_id"] != record.display_operation() && response["state"] != "idle" {
+        return false;
+    }
     match response["state"].as_str() {
-        Some("idle") if response["lease"].is_null() => {
+        Some("idle") if response["lease"].is_null() && response["operation_id"].is_null() => {
             record.display_lease = None;
             record.display_attempted = false;
+            record.display_status_verified = false;
             true
         }
         Some("leased" | "recovery_required") if response["owned_by_caller"] == true => {
-            // Status is scoped to the module caller, not to this stream session.
-            // An unknown lease may belong to another module instance that won
-            // the race after our preflight. Never adopt or restore that lease.
-            if record.display_lease.as_deref().is_some_and(valid_lease)
-                && response["lease"].as_str() == record.display_lease.as_deref()
+            if record.display_attempted
+                && response["lease"].as_str().is_some_and(valid_lease)
+                && (record.display_lease.is_none()
+                    || response["lease"].as_str() == record.display_lease.as_deref())
             {
+                record.display_lease = response["lease"].as_str().map(str::to_owned);
                 record.display_state = response["state"].as_str().unwrap().into();
+                record.display_status_verified = true;
                 return true;
             }
             false
@@ -71,12 +84,14 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> bool {
 }
 
 pub(super) fn accept_restore(record: &mut Record, response: &Value) -> bool {
-    if response["ok"] == true
+    if record.display_status_verified
+        && response["ok"] == true
         && response["restored"] == true
         && response["lease"].as_str() == record.display_lease.as_deref()
     {
         record.display_lease = None;
         record.display_attempted = false;
+        record.display_status_verified = false;
         record.display_state = "restored".into();
         return true;
     }
@@ -98,7 +113,7 @@ pub(super) fn shutdown(record: &mut Record, send: &mut Send<'_>) -> bool {
     if !record.display_attempted && record.display_lease.is_none() {
         return true;
     }
-    if record.display_lease.is_none() {
+    if !record.display_status_verified {
         let Some(response) = exchange(record, "status", json!({"action":"status"}), send) else {
             record.display_state = "cleanup_pending".into();
             return false;

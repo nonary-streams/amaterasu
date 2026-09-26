@@ -108,6 +108,7 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct DisplayRequest {
     pub configuration: Value,
+    pub expected_topology_revision: String,
     #[serde(default)]
     pub mode_policy: Option<Value>,
     #[serde(default)]
@@ -208,6 +209,14 @@ struct DisplayModeContext {
 
 impl DisplayRequest {
     fn validate(&self) -> Result<(), &'static str> {
+        if self.expected_topology_revision.len() != 32
+            || !self
+                .expected_topology_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("invalid_display_request");
+        }
         let topology: DisplayTopology = serde_json::from_value(self.configuration.clone())
             .map_err(|_| "invalid_display_request")?;
         if topology.displays.is_empty() || topology.displays.len() > 16 {
