@@ -1079,6 +1079,8 @@ struct Broker {
     reject_rtsp_display_apply: bool,
     missing_rtsp_display_readback: bool,
     reject_launch_export: bool,
+    hold_launch_export_result: bool,
+    held_launch_export_request: Option<u64>,
     wrong_application_display_overrides: bool,
     display_entries: Vec<Value>,
     display_snapshot_ids: Vec<String>,
@@ -1134,6 +1136,8 @@ impl Default for Broker {
             reject_rtsp_display_apply: false,
             missing_rtsp_display_readback: false,
             reject_launch_export: false,
+            hold_launch_export_result: false,
+            held_launch_export_request: None,
             wrong_application_display_overrides: false,
             display_entries: Vec::new(),
             display_snapshot_ids: Vec::new(),
@@ -1164,6 +1168,12 @@ impl Broker {
                 }
                 self.next += 1;
                 let request = self.next;
+                if self.hold_launch_export_result
+                    && service == "amaterasu.launch/1"
+                    && payload["action"] == "launch_export"
+                {
+                    self.held_launch_export_request = Some(request);
+                }
                 if service == "amaterasu.rtsp/1" && payload["action"] == "close" {
                     self.rtsp_closed = true;
                     self.unsettled_rtsp.insert(request);
@@ -1175,6 +1185,12 @@ impl Broker {
                 let result = self.response(&service, &payload);
                 self.results.insert(request, result);
                 Ok(Response::Accepted { id: request })
+            }
+            Command::TakeResult { request }
+                if self.hold_launch_export_result
+                    && self.held_launch_export_request == Some(request) =>
+            {
+                Ok(Response::Pending)
             }
             Command::TakeResult { request }
                 if (self.fail_rtsp_settlement && self.unsettled_rtsp.contains(&request))

@@ -379,3 +379,64 @@ fn failed_display_stage_never_starts_application_and_failed_export_restores_rtsp
             *service == "amaterasu.display/1" && *action == "apply"));
     }
 }
+
+#[test]
+fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_application() {
+    let now = Instant::now();
+    let (mut controller, mut broker) = mutating_display_fixture("ensure_only_display", true);
+    broker.hold_launch_export_result = true;
+    let stream = request(45);
+    let paired = peer(45);
+    assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+
+    for _ in 0..32 {
+        if broker.held_launch_export_request.is_some() {
+            break;
+        }
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+    }
+    let held_request = broker.held_launch_export_request.expect("export was accepted");
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, State::Starting);
+    assert!(record.rtsp_ticket.is_some(), "display lease was applied before export");
+    assert!(record.application_launch.is_none());
+    let deadline = record.deadline;
+    assert_eq!(deadline, now + INITIAL_DEADLINE);
+
+    let near_deadline = deadline - Duration::from_millis(1);
+    assert!(controller.poll(near_deadline, &mut |command| broker.send(command)).is_empty());
+    assert_eq!(
+        controller
+            .launch(11, stream.clone(), paired.clone(), near_deadline)
+            .unwrap()
+            .status,
+        409,
+        "an in-flight exact retry cannot replay LaunchExport"
+    );
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, deadline);
+    assert_eq!(connection, 10);
+    assert_ne!(reply.status, 200, "deadline must not produce a launch success");
+    assert!(broker.rtsp_closed, "RTSP Close restores the staged display lease");
+    assert!(broker.application_stopped, "owned Launch lookup found and stopped the app");
+    let actions = broker.actions();
+    let position = |service: &str, action: &str| {
+        actions
+            .iter()
+            .position(|(seen_service, seen_action)| *seen_service == service && *seen_action == action)
+            .expect("required cleanup action")
+    };
+    assert!(position("amaterasu.rtsp/1", "open") < position("amaterasu.launch/1", "launch_export"));
+    assert!(position("amaterasu.launch/1", "launch_export") < position("amaterasu.rtsp/1", "close"));
+    assert!(position("amaterasu.launch/1", "lookup") < position("amaterasu.launch/1", "stop"));
+    assert!(broker.commands.iter().any(|command| matches!(
+        command,
+        Command::Cancel { request } if *request == held_request
+    )));
+    assert_eq!(
+        actions.iter().filter(|(service, action)|
+            *service == "amaterasu.launch/1" && *action == "launch_export").count(),
+        1
+    );
+    assert_eq!(controller.records.values().next().unwrap().state, State::Failed);
+    assert_eq!(controller.launch(12, stream, paired, deadline).unwrap().status, 409);
+}
