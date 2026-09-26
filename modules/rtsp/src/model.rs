@@ -867,9 +867,21 @@ struct DisplayModeContext {
 }
 
 fn valid_display_request(request: &serde_json::Value) -> bool {
-    let Some(fields) = request.as_object().filter(|fields| fields.len() == 2) else {
+    let Some(fields) = request.as_object().filter(|fields| fields.len() == 3) else {
         return false;
     };
+    if !fields
+        .get("expected_topology_revision")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|revision| {
+            revision.len() == 32
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return false;
+    }
     let Ok(topology) = serde_json::from_value::<DisplayTopology>(request["configuration"].clone())
     else {
         return false;
@@ -1198,6 +1210,7 @@ mod tests {
     fn complete_display_request_is_rejected_even_with_a_policy_snapshot() {
         let mut input = open_json();
         let display_request = json!({
+            "expected_topology_revision":"aa".repeat(16),
             "configuration":{"displays":[
                 {"id":"monitor.one","width":1920,"height":1080,
                  "refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
@@ -1233,6 +1246,7 @@ mod tests {
     fn attested_display_request_keeps_exact_modes_and_rejects_incomplete_policy() {
         let mut input = open_json();
         let request = json!({
+            "expected_topology_revision":"aa".repeat(16),
             "configuration":{"displays":[
                 {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0},
                 {"id":"two","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0}
@@ -1256,7 +1270,41 @@ mod tests {
             selected.prepare("prepare", None)["display_request"],
             request
         );
-        assert_eq!(selected.display_request_sha256().unwrap().len(), 64);
+        let original_digest = selected.display_request_sha256().unwrap();
+        assert_eq!(original_digest.len(), 64);
+
+        for invalid in [
+            json!(null),
+            json!("AA".repeat(16)),
+            json!("aa".repeat(15)),
+            json!("gg".repeat(16)),
+        ] {
+            let mut malformed = input.clone();
+            malformed["display_request"]["expected_topology_revision"] = invalid;
+            let malformed: Open = serde_json::from_value(malformed).unwrap();
+            assert_eq!(malformed.validate(false), Err("display_request_unattested"));
+        }
+        let mut missing = input.clone();
+        missing["display_request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_topology_revision");
+        let missing: Open = serde_json::from_value(missing).unwrap();
+        assert_eq!(missing.validate(false), Err("display_request_unattested"));
+
+        let mut changed = input.clone();
+        changed["display_request"]["expected_topology_revision"] = json!("bb".repeat(16));
+        let changed: Open = serde_json::from_value(changed).unwrap();
+        changed.validate(false).unwrap();
+        assert_ne!(changed.display_request_sha256().unwrap(), original_digest);
+        assert_eq!(
+            changed.prepare("prepare", None)["display_request"]["expected_topology_revision"],
+            "bb".repeat(16)
+        );
+        let mut extra = input.clone();
+        extra["display_request"]["unexpected"] = json!(true);
+        let extra: Open = serde_json::from_value(extra).unwrap();
+        assert_eq!(extra.validate(false), Err("display_request_unattested"));
 
         input["display_request"]["mode_policies"]
             .as_array_mut()

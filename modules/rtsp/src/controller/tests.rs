@@ -135,7 +135,7 @@ fn attested_open() -> Open {
         "display_policy_snapshot":{"global_revision":1,"global_overrides":{},
             "catalog_revision":0,"certificate_id":"cd".repeat(32),
             "application_overrides":{},"client_overrides":{},"effective_overrides":{}},
-        "display_request":{"configuration":{"displays":[
+        "display_request":{"expected_topology_revision":"aa".repeat(16),"configuration":{"displays":[
             {"id":"one","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0}
         ]},"mode_policy":{"display_id":"one","remapping":{},"context":{
             "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
@@ -155,6 +155,7 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
     .unwrap();
     let mut controller = Controller::new(settings).unwrap();
     let config = attested_open();
+    let retry_config = config.clone();
     let digest = config.display_request_sha256().unwrap();
     let snapshot = config.display_policy_snapshot.clone().unwrap();
     let mut endpoint = Endpoint {
@@ -230,19 +231,118 @@ fn display_verifier_runs_before_ticket_or_stream_prepare() {
         controller.job.is_some(),
         "stream Prepare starts only after verification"
     );
+    let frozen = controller.records.values().next().unwrap().response();
+    controller.open(
+        OpenRequest {
+            request: 20,
+            caller: "amaterasu.nvhttp".into(),
+            config: retry_config.clone(),
+            deadline: 5_000,
+        },
+        4,
+        &runtime,
+        false,
+    );
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(request, response)| *request == 20 && *response == frozen)
+    );
+    let mut changed = retry_config;
+    changed.display_request.as_mut().unwrap()["expected_topology_revision"] =
+        json!("bb".repeat(16));
+    controller.open(
+        OpenRequest {
+            request: 21,
+            caller: "amaterasu.nvhttp".into(),
+            config: changed,
+            deadline: 5_000,
+        },
+        4,
+        &runtime,
+        false,
+    );
+    assert!(
+        endpoint
+            .completions
+            .iter()
+            .any(|(request, response)| *request == 21 && response["code"] == "operation_conflict")
+    );
+    assert_eq!(controller.records.len(), 1);
+}
+
+#[test]
+fn malformed_topology_revision_never_reaches_verifier_or_stream_prepare() {
+    for malformed in [
+        serde_json::Value::Null,
+        json!("AA".repeat(16)),
+        json!("aa".repeat(15)),
+    ] {
+        let settings: Settings = serde_json::from_value(json!({
+            "enabled":true,"bind":"127.0.0.1:0",
+            "allowed_principals":["amaterasu.nvhttp"]
+        }))
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let mut config = attested_open();
+        config.display_request.as_mut().unwrap()["expected_topology_revision"] = malformed;
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.open(
+            OpenRequest {
+                request: 19,
+                caller: "amaterasu.nvhttp".into(),
+                config,
+                deadline: 5_000,
+            },
+            0,
+            &runtime,
+            false,
+        );
+        assert!(controller.records.is_empty());
+        assert!(controller.job.is_none());
+        assert!(controller.display_admission.is_none());
+        assert!(
+            !endpoint
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Request { .. }))
+        );
+        assert!(
+            endpoint
+                .completions
+                .iter()
+                .any(|(_, response)| response["code"] == "display_request_unattested")
+        );
+    }
 }
 
 #[test]
 fn forged_or_unavailable_display_admission_never_creates_a_ticket() {
-    for failure in ["wrong_caller", "wrong_hash", "rejected", "missing_grant"] {
+    for failure in [
+        "wrong_caller",
+        "wrong_hash",
+        "wrong_revision_digest",
+        "rejected",
+        "missing_grant",
+    ] {
         let settings: Settings = serde_json::from_value(json!({
             "enabled":true,"bind":"127.0.0.1:0",
             "allowed_principals":["amaterasu.nvhttp","other"]
         }))
         .unwrap();
         let mut controller = Controller::new(settings).unwrap();
-        let config = attested_open();
+        let mut config = attested_open();
         let digest = config.display_request_sha256().unwrap();
+        if failure == "wrong_revision_digest" {
+            config.display_request.as_mut().unwrap()["expected_topology_revision"] =
+                json!("bb".repeat(16));
+            assert_ne!(config.display_request_sha256().unwrap(), digest);
+        }
         let mut endpoint = Endpoint {
             active_request: true,
             verifier_reply: Some(json!({"ok":true,"verified":true,
@@ -275,6 +375,11 @@ fn forged_or_unavailable_display_admission_never_creates_a_ticket() {
         }
         assert!(controller.records.is_empty(), "{failure}");
         assert!(controller.job.is_none(), "{failure}");
+        assert!(
+            !endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, .. } if service == "amaterasu.stream-session/1")),
+            "{failure}"
+        );
         assert!(
             endpoint
                 .completions
