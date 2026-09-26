@@ -367,6 +367,17 @@ pub struct Snapshot {
     pub paths: Vec<DisplayPath>,
 }
 impl Snapshot {
+    /// Old journals were created only from SDR paths and have no HDR field.
+    /// Refuse to overwrite a path whose HDR state changed after that snapshot.
+    #[cfg(any(windows, test))]
+    pub fn legacy_hdr_target_conflicts(&self, display_id: &str, current: Option<bool>) -> bool {
+        current == Some(true)
+            && self
+                .paths
+                .iter()
+                .any(|path| path.hdr_enabled.is_none() && path.id.eq_ignore_ascii_case(display_id))
+    }
+
     pub fn validate(&self) -> Result<(), DisplayError> {
         if self.format_version != 1 || self.paths.is_empty() || self.paths.len() > MAX_DISPLAYS {
             return Err(DisplayError::new(

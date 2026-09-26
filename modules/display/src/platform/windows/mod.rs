@@ -56,14 +56,22 @@ impl Platform for WindowsPlatform {
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let before = query::snapshot()?;
         for display in &configuration.displays {
-            if display.hdr_enabled.is_some()
-                && !before.paths.iter().any(|path| {
-                    path.id.eq_ignore_ascii_case(&display.id) && path.hdr_enabled.is_some()
-                })
+            let active = before
+                .paths
+                .iter()
+                .find(|path| path.id.eq_ignore_ascii_case(&display.id));
+            if display.hdr_enabled.is_some() && active.is_none() {
+                return Err(DisplayError::new(
+                    "unsupported_display",
+                    "HDR changes require an active target",
+                ));
+            }
+            if display.hdr_enabled == Some(true)
+                && active.is_some_and(|path| path.hdr_enabled.is_none())
             {
                 return Err(DisplayError::new(
                     "unsupported_display",
-                    "HDR changes require an active target with queryable HDR state",
+                    "HDR enablement requires a target with queryable HDR state",
                 ));
             }
         }
@@ -113,6 +121,7 @@ impl Platform for WindowsPlatform {
         snapshot: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
+        query::check_legacy_hdr_recovery(snapshot)?;
         let requested = apply::restoration(snapshot)?;
         apply::set(&requested, false)?;
         guard()?;

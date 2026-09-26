@@ -90,6 +90,7 @@ struct FakePlatform {
     inactive: bool,
     hdr_supported: bool,
     hdr_state: bool,
+    hdr_mutations: usize,
     prepared_hdr: Option<Option<bool>>,
 }
 impl Platform for FakePlatform {
@@ -117,8 +118,14 @@ impl Platform for FakePlatform {
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
         let display = &configuration.displays[0];
-        if display.hdr_enabled.is_some() && !self.hdr_supported {
+        if display.hdr_enabled == Some(true) && !self.hdr_supported {
             return Err(DisplayError::new("unsupported_display", "HDR unavailable"));
+        }
+        if display.hdr_enabled.is_some() && self.inactive {
+            return Err(DisplayError::new(
+                "unsupported_display",
+                "HDR target inactive",
+            ));
         }
         self.prepared_hdr = Some(display.hdr_enabled);
         self.prepared_mode = Some((display.width, display.height, display.refresh));
@@ -139,8 +146,9 @@ impl Platform for FakePlatform {
         guard()?;
         let display = &configuration.displays[0];
         self.applied_mode = Some((display.width, display.height, display.refresh));
-        if let Some(enabled) = display.hdr_enabled {
+        if let Some(enabled) = display.hdr_enabled.filter(|_| self.hdr_supported) {
             self.hdr_state = enabled;
+            self.hdr_mutations += 1;
         }
         self.effects.push("apply");
         if self.apply_failure {
@@ -155,6 +163,15 @@ impl Platform for FakePlatform {
         before: &Snapshot,
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
+        if before.legacy_hdr_target_conflicts(
+            "monitor.one",
+            self.hdr_supported.then_some(self.hdr_state),
+        ) {
+            return Err(DisplayError::new(
+                "recovery_blocked",
+                "external HDR state changed",
+            ));
+        }
         guard()?;
         self.effects.push("restore");
         if self.restore_failure {
@@ -349,6 +366,68 @@ fn unsupported_hdr_and_missing_client_request_cannot_claim_success() {
     let missing = state.run(&mut pipeline, "owner", hdr_apply("auto", None));
     assert_eq!(missing["error"]["code"], "invalid_request");
     assert!(state.journal.is_none());
+}
+
+#[test]
+fn hdr_auto_sdr_request_is_a_noop_on_unsupported_active_target() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let applied = state.run(&mut pipeline, "owner", hdr_apply("auto", Some(false)));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(pipeline.platform.prepared_hdr, Some(Some(false)));
+    assert!(!pipeline.platform.hdr_state);
+    assert_eq!(pipeline.platform.hdr_mutations, 0);
+    assert_eq!(pipeline.platform.effects, ["apply"]);
+    assert!(state.journal.is_some());
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(!pipeline.platform.hdr_state);
+}
+
+#[test]
+fn old_sdr_journal_refuses_external_hdr_before_restore_mutation() {
+    let mut state = State {
+        revision: 1,
+        journal: Some(json!({
+            "owner":"owner",
+            "lease":"legacy-lease",
+            "snapshot":snapshot()
+        })),
+        ..Default::default()
+    };
+    state.journal.as_mut().unwrap()["snapshot"]["paths"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("hdr_enabled");
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            hdr_state: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let blocked = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":"legacy-lease"}),
+    );
+    assert_eq!(blocked["error"]["code"], "recovery_blocked");
+    assert_eq!(blocked["recovery_required"], true);
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_some());
+    pipeline.platform.hdr_state = false;
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":"legacy-lease"}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert_eq!(pipeline.platform.effects, ["restore"]);
 }
 
 #[test]

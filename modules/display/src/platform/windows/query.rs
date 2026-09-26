@@ -131,14 +131,47 @@ pub fn advanced_color_enabled(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<O
     }
     check(result, "DisplayConfigGetDeviceInfo(advanced color)")?;
     // SAFETY: value is the documented raw bitfield view of this initialized union.
-    let flags = unsafe { packet.Anonymous.value };
+    decode_advanced_color_flags(unsafe { packet.Anonymous.value })
+}
+
+fn decode_advanced_color_flags(flags: u32) -> DisplayResult<Option<bool>> {
     if flags & 4 != 0 {
         return Err(DisplayError::new(
             "unsupported_display",
             "wide-color-gamut state cannot be restored by the HDR recovery journal",
         ));
     }
+    if flags & 2 != 0 && flags & 1 == 0 {
+        return Err(DisplayError::new(
+            "platform_error",
+            "advanced color is enabled without reported target support",
+        ));
+    }
     Ok((flags & 1 != 0).then_some(flags & 2 != 0))
+}
+
+pub fn check_legacy_hdr_recovery(snapshot: &Snapshot) -> DisplayResult<()> {
+    if !snapshot.paths.iter().any(|path| path.hdr_enabled.is_none()) {
+        return Ok(());
+    }
+    let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+    for path in &active.paths {
+        let id = names(path)?.id;
+        if !snapshot
+            .paths
+            .iter()
+            .any(|saved| saved.hdr_enabled.is_none() && saved.id.eq_ignore_ascii_case(&id))
+        {
+            continue;
+        }
+        if snapshot.legacy_hdr_target_conflicts(&id, advanced_color_enabled(path)?) {
+            return Err(DisplayError::new(
+                "recovery_blocked",
+                "HDR was enabled outside the old SDR recovery journal",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
@@ -151,6 +184,7 @@ pub fn set_advanced_color(id: &str, enabled: bool) -> DisplayResult<()> {
     match advanced_color_enabled(path)? {
         Some(current) if current == enabled => return Ok(()),
         Some(_) => {}
+        None if !enabled => return Ok(()),
         None => {
             return Err(DisplayError::new(
                 "unsupported_display",
@@ -372,5 +406,19 @@ pub fn check(code: i32, operation: &str) -> DisplayResult<()> {
             "platform_error",
             format!("{operation} failed with Windows error {code}"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_advanced_color_flags;
+
+    #[test]
+    fn advanced_color_support_and_enablement_bits_are_distinct() {
+        assert_eq!(decode_advanced_color_flags(0).unwrap(), None);
+        assert_eq!(decode_advanced_color_flags(1).unwrap(), Some(false));
+        assert_eq!(decode_advanced_color_flags(3).unwrap(), Some(true));
+        assert!(decode_advanced_color_flags(2).is_err());
+        assert!(decode_advanced_color_flags(5).is_err());
     }
 }
