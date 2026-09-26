@@ -22,6 +22,12 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
 - `{"action":"enumerate"}` returns `{"ok":true,"outputs":[...]}`. Each entry
   has `id`, `adapter`, `device_name`, `attached`, `left`, `top`, `width`, `height`,
   and `rotation`. Enumeration is read-only and works while capture is disabled.
+  Entries are ordered by output ID. Optional `offset` (default `0`) and `limit`
+  (default `256`, valid range `1..=256`) select a page, for example
+  `{"action":"enumerate","offset":0,"limit":16}`. A reply with more outputs
+  includes numeric `next_offset`; send it as the next request's `offset` until
+  the field is absent. A no-argument request retains the original reply shape
+  when the complete output list fits in one reply.
 - `{"action":"open","output":"<enumerated id>"}` returns
   `{"ok":true,"stream":123,"output":"..."}` plus `desktop_geometry` when
   Windows can prove the selected monitor's physical rectangle and the complete
@@ -57,8 +63,12 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
 
 Errors use `{"ok":false,"error":{"code":"...","message":"..."}}`.
 There are at most four streams per module, 64 enumerated monitors, and 12,000
-encoded bytes per enumeration reply. Oversized enumeration returns
-`resource_exhausted`; pagination is not implemented.
+encoded bytes per enumeration reply. A page may contain fewer than `limit`
+outputs to stay within that byte bound. A no-argument request returns the first
+page when the complete reply exceeds the bound. An offset at or beyond the end
+of a nonempty list, or a limit outside `1..=256`, returns `invalid_request`;
+offset `0` is valid for an empty list. If one output cannot fit, enumeration
+returns `resource_exhausted`.
 
 Monitor IDs are current GDI device names, not stable monitor serial numbers.
 `adapter` is `system-selected`: WGC uses a system-selected D3D11 GPU, while the
