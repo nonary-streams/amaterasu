@@ -228,8 +228,9 @@ impl RouteLease {
         let endpoint_policy = PolicyConfig::new()?;
         for assignment in assignments {
             if role_endpoint(enumerator, assignment.role)?.as_deref() != Some(&self.endpoint) {
-                endpoint_policy.set_default(&self.endpoint, assignment.role)?;
-                policy.record_assignment(&self.endpoint, assignment.role)?;
+                policy.attempt_assignment(&self.endpoint, assignment.role, || {
+                    endpoint_policy.set_default(&self.endpoint, assignment.role)
+                })?;
             }
         }
         Ok(())
@@ -288,8 +289,9 @@ fn assign_defaults(
             // Another actor changed this role after our snapshot. Preserve it.
             continue;
         }
-        policy.set_default(endpoint, assignment.role)?;
-        route_policy.record_assignment(endpoint, assignment.role)?;
+        route_policy.attempt_assignment(endpoint, assignment.role, || {
+            policy.set_default(endpoint, assignment.role)
+        })?;
     }
 
     let current = default_endpoints(enumerator)?;

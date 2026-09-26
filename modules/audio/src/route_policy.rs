@@ -155,6 +155,18 @@ impl RoutePolicy {
         Ok(())
     }
 
+    /// A failed platform call can still have changed the role. Record the
+    /// attempt first so final cleanup checks whether the target was reached.
+    pub fn attempt_assignment(
+        &mut self,
+        endpoint: &str,
+        role: DefaultRole,
+        assign: impl FnOnce() -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        self.record_assignment(endpoint, role)?;
+        assign()
+    }
+
     pub fn release(
         &mut self,
         endpoint: &str,
@@ -673,6 +685,36 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn failed_assignment_that_reached_target_remains_owned_for_restore() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        policy.acquire("render.selected", &original).unwrap();
+
+        let mut platform_called = false;
+        assert_eq!(
+            policy.attempt_assignment("render.selected", DefaultRole::Console, || {
+                platform_called = true;
+                Err("audio_route_change_failed")
+            }),
+            Err("audio_route_change_failed")
+        );
+        assert!(platform_called);
+        policy.abort_acquire("render.selected").unwrap();
+
+        let changed = endpoints("render.selected", "render.multimedia", "render.comms");
+        assert_eq!(
+            policy.pending_restore_assignments(&changed),
+            Some(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.console".into(),
+            }])
+        );
+        // If the platform returned an error before changing the role, cleanup
+        // has nothing to restore and must leave the user's endpoint untouched.
+        assert_eq!(policy.pending_restore_assignments(&original), Some(vec![]));
     }
 
     #[test]
