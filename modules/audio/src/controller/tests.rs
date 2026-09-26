@@ -833,6 +833,77 @@ unsafe extern "C" fn write(context: *mut c_void, frame: *const AudioFrame) -> St
     STATUS_OK
 }
 
+struct FailingSource;
+
+impl Source for FailingSource {
+    fn read(&mut self) -> AudioResult<Option<Packet>> {
+        Err("audio_source_failed")
+    }
+
+    fn health(&self) -> Health {
+        Health {
+            recovering: true,
+            ..Health::default()
+        }
+    }
+}
+
+#[test]
+fn read_failure_overrides_recovery_status_until_close_and_reacquire() {
+    let (mut controller, observed) = controller(true);
+    let opened = controller.handle("alice", open()).unwrap();
+    let stream_id = opened.created.unwrap();
+    controller.streams.get_mut(&stream_id).unwrap().source = Box::new(FailingSource);
+    assert_eq!(
+        controller.status("alice", Some(stream_id))["streams"][0]["state"],
+        "recovering"
+    );
+
+    let mut sink = Sink {
+        reject: false,
+        packets: Vec::new(),
+    };
+    let callback = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+    // SAFETY: callback context remains live through the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BACKEND_ERROR
+    );
+    let status = controller.status("alice", Some(stream_id));
+    assert_eq!(status["streams"][0]["state"], "failed");
+    assert_eq!(status["streams"][0]["failure"], "audio_source_failed");
+    // SAFETY: callback context remains live through the synchronous read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BACKEND_ERROR
+    );
+
+    controller.close("alice", stream_id).unwrap();
+    assert_eq!(controller.status("alice", None)["streams"], json!([]));
+    let reopened = controller
+        .handle(
+            "alice",
+            Operation::Open {
+                endpoint: "render.explicit".into(),
+                virtual_sink: None,
+                channels: None,
+                host_audio_enabled: true,
+                operation_id: Some("reacquired".into()),
+                capture_sink_without_routing: false,
+            },
+        )
+        .unwrap();
+    assert_ne!(reopened.created, Some(stream_id));
+    assert_eq!(
+        controller.status("alice", reopened.created)["streams"][0]["state"],
+        "capturing"
+    );
+    assert_eq!(observed.opens.lock().unwrap().len(), 2);
+}
+
 unsafe fn bind(factory: &Factory, owner: &str) -> *const AudioCaptureApi {
     let query = NativeInterfaceQuery {
         header: AbiHeader::of::<NativeInterfaceQuery>(),
