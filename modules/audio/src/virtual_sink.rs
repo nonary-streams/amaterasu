@@ -1,6 +1,8 @@
 use crate::model::AudioResult;
 #[cfg(any(windows, test))]
 use crate::model::Endpoint;
+#[cfg(any(windows, test))]
+use std::collections::BTreeMap;
 
 #[cfg(any(windows, test))]
 pub const DEFAULT_VIRTUAL_SINK_ADAPTER: &str = "Steam Streaming Speakers";
@@ -53,6 +55,61 @@ impl VirtualSampleFormat {
 pub struct VirtualFormatCandidate {
     pub sample_format: VirtualSampleFormat,
     pub channel_mask: u32,
+}
+
+/// Keeps one selected engine layout stable while captures share an endpoint.
+/// The device format itself intentionally persists after the final release.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub struct VirtualFormatPolicy {
+    active: BTreeMap<String, ActiveVirtualFormat>,
+}
+
+#[cfg(any(windows, test))]
+struct ActiveVirtualFormat {
+    channels: u32,
+    candidate: VirtualFormatCandidate,
+    references: usize,
+}
+
+#[cfg(any(windows, test))]
+impl VirtualFormatPolicy {
+    pub fn acquire(
+        &mut self,
+        endpoint: &str,
+        channels: u32,
+        select: impl FnOnce() -> AudioResult<VirtualFormatCandidate>,
+    ) -> AudioResult<VirtualFormatCandidate> {
+        if let Some(active) = self.active.get_mut(endpoint) {
+            if active.channels != channels {
+                return Err("virtual_sink_format_conflict");
+            }
+            active.references = active
+                .references
+                .checked_add(1)
+                .ok_or("virtual_sink_format_conflict")?;
+            return Ok(active.candidate);
+        }
+        let candidate = select()?;
+        self.active.insert(
+            endpoint.to_owned(),
+            ActiveVirtualFormat {
+                channels,
+                candidate,
+                references: 1,
+            },
+        );
+        Ok(candidate)
+    }
+
+    pub fn release(&mut self, endpoint: &str) {
+        if let Some(active) = self.active.get_mut(endpoint) {
+            active.references -= 1;
+            if active.references == 0 {
+                self.active.remove(endpoint);
+            }
+        }
+    }
 }
 
 const STEREO_MASKS: &[u32] = &[0x0003];
@@ -175,6 +232,81 @@ enum MatchField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_virtual_format_survives_failed_open_and_recovery_until_final_release() {
+        let mut policy = VirtualFormatPolicy::default();
+        let stereo = VirtualFormatCandidate {
+            sample_format: VirtualSampleFormat::Float32,
+            channel_mask: 0x0003,
+        };
+        let mut selections = 0;
+        assert_eq!(
+            policy.acquire("render.virtual", 2, || {
+                selections += 1;
+                Ok(stereo)
+            }),
+            Ok(stereo)
+        );
+        assert_eq!(
+            policy.acquire("render.virtual", 2, || {
+                panic!("a shared capture must not change an active engine format")
+            }),
+            Ok(stereo)
+        );
+        assert_eq!(
+            policy.acquire("render.virtual", 6, || panic!("conflict must not select")),
+            Err("virtual_sink_format_conflict")
+        );
+
+        // The first capture closes during device recovery. The other capture
+        // still owns the layout, so reopening must share it.
+        policy.release("render.virtual");
+        assert_eq!(
+            policy.acquire("render.virtual", 2, || panic!("recovery must share")),
+            Ok(stereo)
+        );
+        policy.release("render.virtual");
+        assert_eq!(
+            policy.acquire("render.virtual", 6, || panic!("last owner is still live")),
+            Err("virtual_sink_format_conflict")
+        );
+        policy.release("render.virtual");
+
+        let surround = VirtualFormatCandidate {
+            sample_format: VirtualSampleFormat::Float32,
+            channel_mask: 0x003f,
+        };
+        assert_eq!(
+            policy.acquire("render.virtual", 6, || {
+                selections += 1;
+                Ok(surround)
+            }),
+            Ok(surround)
+        );
+        assert_eq!(selections, 2);
+        policy.release("render.virtual");
+    }
+
+    #[test]
+    fn failed_virtual_format_selection_does_not_reserve_endpoint() {
+        let mut policy = VirtualFormatPolicy::default();
+        assert_eq!(
+            policy.acquire("render.virtual", 2, || Err(
+                "virtual_sink_format_unavailable"
+            )),
+            Err("virtual_sink_format_unavailable")
+        );
+        let candidate = VirtualFormatCandidate {
+            sample_format: VirtualSampleFormat::Float32,
+            channel_mask: 0x003f,
+        };
+        assert_eq!(
+            policy.acquire("render.virtual", 6, || Ok(candidate)),
+            Ok(candidate)
+        );
+        policy.release("render.virtual");
+    }
 
     fn endpoint(id: &str, name: &str, description: &str, adapter: &str) -> Endpoint {
         Endpoint {

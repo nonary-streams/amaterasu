@@ -8,8 +8,8 @@ use crate::{
         assignments_reached_target,
     },
     virtual_sink::{
-        ChannelLayout, VirtualFormatCandidate, VirtualSampleFormat, channel_layout,
-        preferred_format_candidates, select_endpoint, select_policy_virtual_sink,
+        ChannelLayout, VirtualFormatCandidate, VirtualFormatPolicy, VirtualSampleFormat,
+        channel_layout, preferred_format_candidates, select_endpoint, select_policy_virtual_sink,
     },
 };
 use amaterasu_media::{
@@ -45,6 +45,7 @@ const DEFAULT_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTE_RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 static ROUTE_POLICY: OnceLock<Mutex<RoutePolicy>> = OnceLock::new();
+static VIRTUAL_FORMAT_POLICY: OnceLock<Mutex<VirtualFormatPolicy>> = OnceLock::new();
 static ROUTE_RESTORE_WORKER: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 static ROUTE_RESTORE_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
@@ -845,6 +846,44 @@ fn set_virtual_device_layout(
     Err("virtual_sink_format_unavailable")
 }
 
+struct VirtualFormatLease {
+    endpoint: String,
+}
+
+impl VirtualFormatLease {
+    fn acquire(
+        endpoint: &str,
+        layout: ChannelLayout,
+        preferred_valid_bits: u16,
+    ) -> AudioResult<(Self, VirtualFormatCandidate)> {
+        let policy =
+            VIRTUAL_FORMAT_POLICY.get_or_init(|| Mutex::new(VirtualFormatPolicy::default()));
+        let candidate = policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .acquire(endpoint, layout.channels, || {
+                set_virtual_device_layout(endpoint, layout, preferred_valid_bits)
+            })?;
+        Ok((
+            Self {
+                endpoint: endpoint.to_owned(),
+            },
+            candidate,
+        ))
+    }
+}
+
+impl Drop for VirtualFormatLease {
+    fn drop(&mut self) {
+        if let Some(policy) = VIRTUAL_FORMAT_POLICY.get() {
+            policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release(&self.endpoint);
+        }
+    }
+}
+
 fn validate_virtual_mix(
     mix: &MixFormat,
     layout: ChannelLayout,
@@ -875,6 +914,7 @@ pub struct Capture {
     format: Format,
     timeline: Timeline,
     recovery_config: RecoveryConfig,
+    _virtual_format_lease: Option<VirtualFormatLease>,
     _route_lease: RouteLease,
     _apartment: Apartment,
 }
@@ -1052,13 +1092,16 @@ impl Capture {
                 route_virtual_sink,
                 explicit_route,
             )?;
-            let selected_virtual_format = match (desired_layout, preferred_valid_bits) {
-                (Some(layout), Some(valid_bits)) => {
-                    Some(set_virtual_device_layout(&endpoint, layout, valid_bits)?)
-                }
-                (None, None) => None,
-                _ => return Err("virtual_sink_format_unavailable"),
-            };
+            let (virtual_format_lease, selected_virtual_format) =
+                match (desired_layout, preferred_valid_bits) {
+                    (Some(layout), Some(valid_bits)) => {
+                        let (lease, candidate) =
+                            VirtualFormatLease::acquire(&endpoint, layout, valid_bits)?;
+                        (Some(lease), Some(candidate))
+                    }
+                    (None, None) => (None, None),
+                    _ => return Err("virtual_sink_format_unavailable"),
+                };
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|_| "audio_activation_failed")?;
@@ -1124,6 +1167,7 @@ impl Capture {
                 format,
                 timeline: Timeline::new(),
                 recovery_config,
+                _virtual_format_lease: virtual_format_lease,
                 _route_lease: route_lease,
                 _apartment: apartment,
             })
