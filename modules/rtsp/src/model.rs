@@ -1763,9 +1763,19 @@ mod tests {
 
     #[test]
     fn dual_family_udp_preflight_checks_the_ipv6_addresses_too() {
+        assert_dual_family_udp_preflight_checks_the_ipv6_addresses(false);
+    }
+
+    #[test]
+    #[ignore = "opens wildcard UDP sockets; run explicitly when testing remote binding"]
+    fn remote_dual_family_udp_preflight_checks_the_ipv6_addresses_too() {
+        assert_dual_family_udp_preflight_checks_the_ipv6_addresses(true);
+    }
+
+    fn assert_dual_family_udp_preflight_checks_the_ipv6_addresses(allow_remote: bool) {
         let settings: Settings = serde_json::from_value(json!({
             "enabled": true,
-            "allow_remote": true,
+            "allow_remote": allow_remote,
             "address_family": "both",
             "bind_address": "",
             "bind": "127.0.0.1:48010"
@@ -1778,8 +1788,14 @@ mod tests {
             .probe_media_binds(base_port)
             .expect("all six family-specific UDP sockets bind together");
 
-        let occupied_address =
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), base_port + VIDEO_OFFSET);
+        let occupied_address = SocketAddr::new(
+            IpAddr::V6(if allow_remote {
+                Ipv6Addr::UNSPECIFIED
+            } else {
+                Ipv6Addr::LOCALHOST
+            }),
+            base_port + VIDEO_OFFSET,
+        );
         let blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         blocker.set_only_v6(true).unwrap();
         blocker.bind(&SockAddr::from(occupied_address)).unwrap();

@@ -14,6 +14,18 @@
 - Keep dependencies small and justified; use vetted cryptographic implementations.
 - Native modules are trusted code. Never describe API grants as a native-code sandbox.
 
+## Network tests
+
+- Default tests that open sockets must bind only loopback addresses (`127.0.0.1`
+  or `::1`). Prefer ephemeral ports where the test does not require a fixed port.
+- Test wildcard and remote address selection without opening a listener when
+  possible. Keep tests that must bind `0.0.0.0`, `[::]`, or another non-loopback
+  address as separate, clearly named opt-in tests marked `#[ignore]` with a reason.
+  Run a specific case with `cargo test -p <package> <test-name> -- --ignored`
+  when remote binding needs validation.
+- Do not disable Windows firewall notifications or add persistent firewall rules
+  for generated test executables as a test workaround.
+
 ## Configuration parity execution
 
 - For the active parity task, follow `docs/configuration-execution-plan.md`.

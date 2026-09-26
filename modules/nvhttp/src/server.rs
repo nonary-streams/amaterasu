@@ -818,137 +818,152 @@ mod tests {
 
     #[test]
     fn omitted_bind_address_uses_explicit_ipv4_family_for_live_listeners() {
-        for allow_remote in [false, true] {
-            let settings = Settings {
-                enabled: true,
-                address_family: Some(crate::settings::AddressFamily::Ipv4),
-                allow_remote,
-                http_bind: "127.0.0.1:0".parse().unwrap(),
-                https_bind: "127.0.0.1:0".parse().unwrap(),
-                ..Settings::default()
-            };
-            let server = Server::bind(&settings).expect("bind explicit IPv4 family");
-            let expected_ip = if allow_remote {
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V4(Ipv4Addr::LOCALHOST)
-            };
-            let bound_addresses = server
-                .http_addresses()
-                .into_iter()
-                .chain(server.https_addresses())
-                .collect::<Vec<_>>();
+        assert_explicit_ipv4_family_for_live_listeners(false);
+    }
 
-            for address in bound_addresses {
-                assert_eq!(address.ip(), expected_ip);
-                assert!(
-                    TcpStream::connect(SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::LOCALHOST),
-                        address.port(),
-                    ))
-                    .is_ok()
-                );
-            }
+    #[test]
+    #[ignore = "opens wildcard listeners; run explicitly when testing remote binding"]
+    fn omitted_bind_address_uses_explicit_ipv4_family_for_remote_listeners() {
+        assert_explicit_ipv4_family_for_live_listeners(true);
+    }
+
+    fn assert_explicit_ipv4_family_for_live_listeners(allow_remote: bool) {
+        let settings = Settings {
+            enabled: true,
+            address_family: Some(crate::settings::AddressFamily::Ipv4),
+            allow_remote,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let server = Server::bind(&settings).expect("bind explicit IPv4 family");
+        let expected_ip = if allow_remote {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        let bound_addresses = server
+            .http_addresses()
+            .into_iter()
+            .chain(server.https_addresses())
+            .collect::<Vec<_>>();
+
+        for address in bound_addresses {
+            assert_eq!(address.ip(), expected_ip);
+            assert!(
+                TcpStream::connect(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    address.port(),
+                ))
+                .is_ok()
+            );
         }
     }
 
     #[test]
-    fn both_family_accepts_ipv4_and_ipv6_with_or_without_remote_access() {
-        for allow_remote in [false, true] {
-            let settings: Settings = serde_json::from_value(serde_json::json!({
-                "enabled": true,
-                "allow_remote": allow_remote,
-                "address_family": "both",
-                "bind_address": "",
-                "http_bind": "127.0.0.1:0",
-                "https_bind": "127.0.0.1:0"
-            }))
-            .unwrap();
-            let mut server = Server::bind(&settings).expect("bind both address families");
-            let http_addresses = server.http_addresses();
-            let https_addresses = server.https_addresses();
-            assert_eq!(http_addresses.len(), 2);
-            assert_eq!(https_addresses.len(), 2);
-            let (expected_v4, expected_v6) = if allow_remote {
-                (
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                )
+    fn both_loopback_families_accept_ipv4_and_ipv6() {
+        assert_both_families_accept_ipv4_and_ipv6(false);
+    }
+
+    #[test]
+    #[ignore = "opens wildcard listeners; run explicitly when testing remote binding"]
+    fn both_remote_families_accept_ipv4_and_ipv6() {
+        assert_both_families_accept_ipv4_and_ipv6(true);
+    }
+
+    fn assert_both_families_accept_ipv4_and_ipv6(allow_remote: bool) {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "allow_remote": allow_remote,
+            "address_family": "both",
+            "bind_address": "",
+            "http_bind": "127.0.0.1:0",
+            "https_bind": "127.0.0.1:0"
+        }))
+        .unwrap();
+        let mut server = Server::bind(&settings).expect("bind both address families");
+        let http_addresses = server.http_addresses();
+        let https_addresses = server.https_addresses();
+        assert_eq!(http_addresses.len(), 2);
+        assert_eq!(https_addresses.len(), 2);
+        let (expected_v4, expected_v6) = if allow_remote {
+            (
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            )
+        } else {
+            (
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            )
+        };
+        assert_eq!(http_addresses[0].ip(), expected_v4);
+        assert_eq!(http_addresses[1].ip(), expected_v6);
+        assert_eq!(http_addresses[0].port(), http_addresses[1].port());
+        assert_eq!(https_addresses[0].port(), https_addresses[1].port());
+        assert!(https_addresses.iter().all(|address| {
+            if allow_remote {
+                address.ip().is_unspecified()
             } else {
-                (
-                    IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    IpAddr::V6(Ipv6Addr::LOCALHOST),
-                )
-            };
-            assert_eq!(http_addresses[0].ip(), expected_v4);
-            assert_eq!(http_addresses[1].ip(), expected_v6);
-            assert_eq!(http_addresses[0].port(), http_addresses[1].port());
-            assert_eq!(https_addresses[0].port(), https_addresses[1].port());
-            assert!(https_addresses.iter().all(|address| {
-                if allow_remote {
-                    address.ip().is_unspecified()
+                address.ip().is_loopback()
+            }
+        }));
+
+        let tls_configuration =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        server.replace_tls(Arc::new(tls_configuration));
+
+        let mut clients = Vec::new();
+        for address in &http_addresses {
+            let destination = SocketAddr::new(
+                if address.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
                 } else {
-                    address.ip().is_loopback()
-                }
-            }));
-
-            let tls_configuration = ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
-            server.replace_tls(Arc::new(tls_configuration));
-
-            let mut clients = Vec::new();
-            for address in &http_addresses {
-                let destination = SocketAddr::new(
-                    if address.is_ipv4() {
-                        IpAddr::V4(Ipv4Addr::LOCALHOST)
-                    } else {
-                        IpAddr::V6(Ipv6Addr::LOCALHOST)
-                    },
-                    address.port(),
-                );
-                let mut client = TcpStream::connect(destination).unwrap();
-                client
-                    .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
-                    .unwrap();
-                clients.push(client);
-            }
-            let mut tls_clients = Vec::new();
-            for address in https_addresses {
-                let destination = SocketAddr::new(
-                    if address.is_ipv4() {
-                        IpAddr::V4(Ipv4Addr::LOCALHOST)
-                    } else {
-                        IpAddr::V6(Ipv6Addr::LOCALHOST)
-                    },
-                    address.port(),
-                );
-                tls_clients.push(TcpStream::connect(destination).unwrap());
-            }
-
-            let requests = server.tick().requests;
-            assert_eq!(requests.len(), 2);
-            assert_eq!(server.connections(), 4, "both HTTPS families were accepted");
-            let peers = requests
-                .into_iter()
-                .map(|request| request.remote)
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(
-                peers,
-                [
-                    IpAddr::V4(Ipv4Addr::LOCALHOST),
                     IpAddr::V6(Ipv6Addr::LOCALHOST)
-                ]
-                .into_iter()
-                .collect()
+                },
+                address.port(),
             );
-            drop(clients);
-            drop(tls_clients);
+            let mut client = TcpStream::connect(destination).unwrap();
+            client
+                .write_all(b"GET /serverinfo HTTP/1.1\r\nHost: test\r\n\r\n")
+                .unwrap();
+            clients.push(client);
         }
+        let mut tls_clients = Vec::new();
+        for address in https_addresses {
+            let destination = SocketAddr::new(
+                if address.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                },
+                address.port(),
+            );
+            tls_clients.push(TcpStream::connect(destination).unwrap());
+        }
+
+        let requests = server.tick().requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(server.connections(), 4, "both HTTPS families were accepted");
+        let peers = requests
+            .into_iter()
+            .map(|request| request.remote)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            peers,
+            [
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            ]
+            .into_iter()
+            .collect()
+        );
+        drop(clients);
+        drop(tls_clients);
     }
 
     #[test]
@@ -1112,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opens wildcard listeners; run explicitly when testing remote binding"]
     fn same_port_wildcard_expansion_rebinds_all_families_before_reporting_active() {
         let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let base_port = available_port_pair();
@@ -1164,12 +1180,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_overlapping_loopback_expansion_restores_both_listener_sets() {
+        assert_failed_overlapping_expansion_restores_both_listener_sets(false);
+    }
+
+    #[test]
+    #[ignore = "opens a wildcard listener; run explicitly when testing remote binding"]
     fn failed_overlapping_wildcard_expansion_restores_both_listener_sets() {
+        assert_failed_overlapping_expansion_restores_both_listener_sets(true);
+    }
+
+    fn assert_failed_overlapping_expansion_restores_both_listener_sets(allow_remote: bool) {
         let _lock = FIXED_PORT_LOCK.lock().unwrap();
         let (_occupied_ipv6, startup, mut server) = (0..100)
             .find_map(|_| {
                 let occupied_ipv6 = bind_listener(
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+                    SocketAddr::new(
+                        IpAddr::V6(if allow_remote {
+                            Ipv6Addr::UNSPECIFIED
+                        } else {
+                            Ipv6Addr::LOCALHOST
+                        }),
+                        0,
+                    ),
                     "IPv6 rollback blocker",
                 )
                 .ok()?;
@@ -1194,7 +1227,7 @@ mod tests {
         let old_http = server.http_addresses();
         let old_https = server.https_addresses();
         let mut target = startup;
-        target.allow_remote = true;
+        target.allow_remote = allow_remote;
         target.address_family = Some(crate::settings::AddressFamily::Both);
         target.bind_address = Some(String::new());
 
