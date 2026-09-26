@@ -374,6 +374,11 @@ fn native_database_in(root: &Path) -> Option<PathBuf> {
 }
 
 pub fn scan_database(path: &Path) -> Result<Vec<Game>, String> {
+    scan_database_with_timeout(path, MAX_SCAN_TIME)
+}
+
+fn scan_database_with_timeout(path: &Path, timeout: Duration) -> Result<Vec<Game>, String> {
+    let started = Instant::now();
     let metadata = std::fs::metadata(path).map_err(|_| "lutris_database_unavailable".to_owned())?;
     if !metadata.is_file() || metadata.len() > MAX_DATABASE_BYTES {
         return Err("lutris_database_exceeds_bounds".into());
@@ -389,31 +394,33 @@ pub fn scan_database(path: &Path) -> Result<Vec<Game>, String> {
     connection
         .execute_batch("PRAGMA query_only = ON;")
         .map_err(|_| "lutris_database_unreadable".to_owned())?;
+    // SQLite may sort the entire games table before yielding its first row.
+    // Interrupt that work too, so a stalled scan cannot delay recovery forever.
+    install_scan_deadline(&connection, started, timeout);
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(|_| "lutris_database_unreadable".to_owned())?;
+        .map_err(|error| scan_query_error(error, "lutris_database_unreadable"))?;
     let mut statement = transaction
         .prepare(
             "SELECT id, name, slug, runner, platform, directory, configpath, service, service_id \
              FROM games WHERE installed = 1 AND configpath IS NOT NULL AND configpath <> '' \
              ORDER BY id",
         )
-        .map_err(|_| "lutris_database_schema_unsupported".to_owned())?;
-    let started = Instant::now();
+        .map_err(|error| scan_query_error(error, "lutris_database_schema_unsupported"))?;
     let mut rows = statement
         .query(params![])
-        .map_err(|_| "lutris_database_query_failed".to_owned())?;
+        .map_err(|error| scan_query_error(error, "lutris_database_query_failed"))?;
     let mut games = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut total_bytes = 0_usize;
     loop {
         let row = rows
             .next()
-            .map_err(|_| "lutris_database_query_failed".to_owned())?;
+            .map_err(|error| scan_query_error(error, "lutris_database_query_failed"))?;
         let Some(row) = row else {
             break;
         };
-        if started.elapsed() > MAX_SCAN_TIME || games.len() >= MAX_GAMES {
+        if started.elapsed() >= timeout || games.len() >= MAX_GAMES {
             return Err("lutris_scan_exceeds_bounds".into());
         }
         let game = Game {
@@ -474,10 +481,28 @@ pub fn scan_database(path: &Path) -> Result<Vec<Game>, String> {
     }
     drop(rows);
     drop(statement);
+    if started.elapsed() >= timeout {
+        return Err("lutris_scan_exceeds_bounds".into());
+    }
     transaction
         .commit()
-        .map_err(|_| "lutris_database_query_failed".to_owned())?;
+        .map_err(|error| scan_query_error(error, "lutris_database_query_failed"))?;
     Ok(games)
+}
+
+fn install_scan_deadline(connection: &Connection, started: Instant, timeout: Duration) {
+    connection.progress_handler(1_000, Some(move || started.elapsed() >= timeout));
+}
+
+fn scan_query_error(error: rusqlite::Error, fallback: &str) -> String {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            "lutris_scan_exceeds_bounds".into()
+        }
+        _ => fallback.into(),
+    }
 }
 
 fn validate_game(game: &Game) -> Result<(), String> {
@@ -910,6 +935,44 @@ mod tests {
         assert_eq!(games.len(), 1);
         assert_eq!(games[0].id, 7);
         assert_eq!(games[0].name, "Example");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn query_timeout_before_first_row_preserves_retryable_discovery() {
+        let path = temp_database_path();
+        let connection = create_database(&path);
+        connection
+            .execute_batch(
+                "WITH RECURSIVE ids(id) AS (SELECT 500 UNION ALL SELECT id - 1 FROM ids WHERE id > 1)
+                 INSERT INTO games (id,name,slug,runner,platform,directory,configpath,service,service_id,installed)
+                 SELECT id,'Game','game','wine','linux','','game.yml','','',1 FROM ids;",
+            )
+            .unwrap();
+        drop(connection);
+
+        // ORDER BY needs SQLite work before the first row is returned. The
+        // expired query must fail as an incomplete scan, not publish an empty
+        // snapshot or leave a worker running indefinitely.
+        let probe = Connection::open(&path).unwrap();
+        install_scan_deadline(&probe, Instant::now(), Duration::ZERO);
+        let mut statement = probe.prepare("SELECT id FROM games ORDER BY id").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(matches!(
+            rows.next(),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+        drop(rows);
+        drop(statement);
+        drop(probe);
+        assert_eq!(
+            scan_database_with_timeout(&path, Duration::ZERO),
+            Err("lutris_scan_exceeds_bounds".into())
+        );
+        let recovered = scan_database(&path).unwrap();
+        assert_eq!(recovered.len(), 500);
+        assert_eq!(recovered.first().unwrap().id, 1);
         std::fs::remove_file(path).unwrap();
     }
 
