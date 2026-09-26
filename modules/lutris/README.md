@@ -13,9 +13,16 @@ The database is limited to 256 MiB, 10,000 games, 24 MiB of selected row text,
 and an eight-second scan. Names and fields are validated against catalog
 bounds before any snapshot is started. A missing database, unsupported schema,
 malformed row, missing Lutris executable, or incomplete Steam list leaves the
-catalog unchanged. Lutris is resolved from safe absolute `PATH` directories;
-entries launch the client with `lutris:rungameid/<id>` and use detached process
-semantics. The URI form preserves Lutris runner-specific launch behavior.
+catalog unchanged. Lutris is resolved from safe absolute `PATH` directories.
+When `PATH` has no usable client, current-user discovery tries `/usr/bin/lutris`
+and `/usr/local/bin/lutris`. A fallback must be root-owned, executable by the
+current user, and located beneath root-owned directories that cannot be written
+by a group or other users. Two distinct valid fallback clients are ambiguous
+and leave the catalog unchanged. Entries launch the canonical client with
+`lutris:rungameid/<id>` and use detached process semantics. The URI form
+preserves Lutris runner-specific launch behavior. A later scan re-resolves the
+client; a client removed after import cannot be revalidated by this provider at
+launch time until the shared Launch admission contract supports that check.
 
 Version 1 product settings are owned by Lutris and stored through
 `amaterasu.configuration/1` with revision compare-and-swap. Only the management
@@ -113,8 +120,8 @@ artwork include an opaque Catalog Lutris reference; rows without artwork omit it
 Catalog acceptance requires the canonical decimal Lutris source ID artwork
 authorization contract. Client image delivery still needs the consuming integration.
 
-Other remaining gaps are trusted per-session discovery for machine services,
-cross-user import, and launch handling for games whose Lutris client cannot be
-resolved.
+Other remaining gaps are trusted per-session discovery and launch for machine
+services, cross-user import, Flatpak-only clients, and launch admission for a
+retained row after its client disappears or Lutris is disabled.
 Behavior was checked against the pinned Vibeshine Lutris policy and database
 contract; source code was not copied or translated.

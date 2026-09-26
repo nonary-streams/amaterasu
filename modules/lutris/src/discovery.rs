@@ -245,34 +245,91 @@ fn is_regular_file(path: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn find_lutris_executable() -> Option<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
     let effective_uid = effective_uid()?;
     // A machine service has no trusted logged-in desktop identity. The session
     // scanner/launcher that Vibeshine uses is not part of this service yet.
     if effective_uid == 0 {
         return None;
     }
-    for directory in std::env::split_paths(&std::env::var_os("PATH")?) {
-        if !directory.is_absolute() {
-            continue;
-        }
-        let candidate = directory.join("lutris");
-        let Ok(path) = candidate.canonicalize() else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if metadata.is_file()
-            && metadata.permissions().mode() & 0o111 != 0
-            && metadata.permissions().mode() & 0o022 == 0
-            && (metadata.uid() == effective_uid || metadata.uid() == 0)
-        {
-            return Some(path);
+    let path_directories = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let system_candidates = [
+        PathBuf::from("/usr/bin/lutris"),
+        PathBuf::from("/usr/local/bin/lutris"),
+    ];
+    select_lutris_executable(
+        &path_directories,
+        &system_candidates,
+        &|path| verified_user_executable(path, effective_uid),
+        &verified_system_executable,
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn select_lutris_executable(
+    path_directories: &[PathBuf],
+    system_candidates: &[PathBuf],
+    verify_path: &dyn Fn(&Path) -> Option<PathBuf>,
+    verify_system: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    for directory in path_directories.iter().filter(|path| path.is_absolute()) {
+        if let Some(executable) = verify_path(&directory.join("lutris")) {
+            return Some(executable);
         }
     }
-    None
+    let mut fallback = None;
+    for candidate in system_candidates {
+        if let Some(executable) = verify_system(candidate) {
+            match &fallback {
+                Some(previous) if previous != &executable => return None,
+                None => fallback = Some(executable),
+                _ => {}
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(target_os = "linux")]
+fn verified_user_executable(candidate: &Path, effective_uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = candidate.canonicalize().ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    let mode = metadata.permissions().mode();
+    (metadata.is_file()
+        && mode & 0o022 == 0
+        && (metadata.uid() == effective_uid || metadata.uid() == 0)
+        && ((metadata.uid() == effective_uid && mode & 0o100 != 0) || mode & 0o001 != 0))
+        .then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_system_executable(candidate: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = candidate.canonicalize().ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o001 == 0
+    {
+        return None;
+    }
+    for parent in [candidate.parent()?, path.parent()?] {
+        for ancestor in parent.ancestors() {
+            let metadata = std::fs::metadata(ancestor).ok()?;
+            if !metadata.is_dir()
+                || metadata.uid() != 0
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return None;
+            }
+        }
+    }
+    Some(path)
 }
 
 #[cfg(target_os = "linux")]

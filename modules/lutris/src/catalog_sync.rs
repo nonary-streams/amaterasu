@@ -1084,6 +1084,69 @@ mod tests {
     }
 
     #[test]
+    fn fallback_client_reconciles_a_stable_game_only_when_unambiguous() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("amaterasu-lutris-client-{nonce}"));
+        let normal = root.join("normal");
+        let system = root.join("system");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let fallback = system.join("lutris");
+        let second = system.join("other-lutris");
+        std::fs::write(&fallback, b"client").unwrap();
+        std::fs::write(&second, b"different client").unwrap();
+        let verify = |candidate: &Path| {
+            candidate
+                .is_file()
+                .then(|| candidate.canonicalize().unwrap())
+        };
+        let choose = |candidates: &[PathBuf]| {
+            crate::discovery::select_lutris_executable(
+                std::slice::from_ref(&normal),
+                candidates,
+                &verify,
+                &verify,
+            )
+        };
+
+        let selected = choose(std::slice::from_ref(&fallback)).unwrap();
+        let mut source = snapshot(vec![game(7, "Example Game", "wine", "", "")]);
+        source.lutris_executable = selected.clone();
+        let entry = prepare_entries(&source, &ProductSettings::default(), &BTreeSet::new())
+            .unwrap()
+            .remove(0);
+        assert_eq!(entry["source_id"], "7");
+        assert_eq!(
+            entry["entry"]["launch"]["program"],
+            selected.to_str().unwrap()
+        );
+        assert_eq!(
+            entry["entry"]["launch"]["arguments"],
+            json!(["lutris:rungameid/7"])
+        );
+        assert_eq!(
+            choose(std::slice::from_ref(&fallback)),
+            Some(selected.clone())
+        );
+        assert_eq!(choose(&[fallback.clone(), second]), None);
+        std::fs::remove_file(&fallback).unwrap();
+        assert_eq!(choose(std::slice::from_ref(&fallback)), None);
+
+        let disabled = ProductSettings {
+            enabled: false,
+            ..ProductSettings::default()
+        };
+        let now = Instant::now();
+        assert!(!crate::scan_is_due(&disabled, true, Some(now), now));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn include_steam_keeps_only_records_missing_from_direct_steam_provider() {
         let settings = ProductSettings {
             include_steam: true,
