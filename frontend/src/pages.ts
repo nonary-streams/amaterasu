@@ -171,6 +171,39 @@ namespace Amaterasu {
     return lines;
   }
 
+  export function parseHistoryDetailReply(value: unknown, sessionId: string): HistoryDetailReply {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("History detail reply is invalid.");
+    const reply = value as Record<string, unknown>;
+    if (reply.ok !== true || !reply.detail || typeof reply.detail !== "object" || Array.isArray(reply.detail))
+      throw new Error("History detail reply is invalid.");
+    const detail = reply.detail as Record<string, unknown>;
+    const session = detail.session;
+    if (!session || typeof session !== "object" || Array.isArray(session) ||
+      (session as Record<string, unknown>).session_id !== sessionId)
+      throw new Error("History detail belongs to a different session.");
+    for (const key of ["sample_count", "event_count"])
+      if (!Number.isSafeInteger(detail[key]) || (detail[key] as number) < 0)
+        throw new Error(`History ${key} is invalid.`);
+    for (const key of ["samples_truncated", "events_truncated"])
+      if (typeof detail[key] !== "boolean") throw new Error(`History ${key} is invalid.`);
+    for (const [key, countKey] of [["samples", "sample_count"], ["events", "event_count"]] as const) {
+      const rows = detail[key];
+      if (!Array.isArray(rows) || rows.length > (detail[countKey] as number) || rows.some((row) =>
+        !row || typeof row !== "object" || Array.isArray(row) || row.session_id !== sessionId ||
+        !Number.isSafeInteger(row.recorded_at_unix)))
+        throw new Error(`History ${key} are invalid.`);
+    }
+    for (const sample of detail.samples as Record<string, unknown>[]) {
+      for (const key of ["frames_sent", "bytes_sent", "dropped_frames", "actual_fps", "actual_bitrate_kbps"])
+        if (typeof sample[key] !== "number" || !Number.isFinite(sample[key]) || sample[key] < 0)
+          throw new Error(`History sample ${key} is invalid.`);
+    }
+    if ((detail.events as Record<string, unknown>[]).some((event) => typeof event.event_type !== "string"))
+      throw new Error("History event type is invalid.");
+    return reply as unknown as HistoryDetailReply;
+  }
+
   export function renderSessions(context: PageContext): void {
     const area = el("div");
     const status = el("div");
@@ -182,6 +215,9 @@ namespace Amaterasu {
     const history = [0];
     let savedOffset = 0;
     const savedHistory = [0];
+    let savedListRequest = 0;
+    let savedDetailRequest = 0;
+    let selectedSavedSession: string | null = null;
     context.content.append(
       sectionHeading(
         "Sessions",
@@ -287,13 +323,17 @@ namespace Amaterasu {
       }
     }
     async function loadSaved(): Promise<void> {
+      const request = ++savedListRequest;
       savedArea.replaceChildren(el("p", "muted", "Loading recorded sessions…"));
       try {
         const reply = await context.api.post<HistoryListReply>(
           "history/list_sessions",
           { limit: 25, offset: savedOffset },
         );
-        if (!context.content.isConnected) return;
+        if (!context.content.isConnected || request !== savedListRequest) return;
+        if (reply.ok !== true || !Array.isArray(reply.sessions) ||
+          (reply.next_offset != null && (!Number.isSafeInteger(reply.next_offset) || reply.next_offset <= savedOffset)))
+          throw new Error("History session page is invalid.");
         const rows = reply.sessions.map((session) => {
           const details = button("Details", () => loadSavedDetail(session.session_id));
           const remove = button(
@@ -311,7 +351,11 @@ namespace Amaterasu {
                 await context.api.post("history/delete_session", {
                   session_id: session.session_id,
                 });
-                savedDetail.replaceChildren();
+                if (selectedSavedSession === session.session_id) {
+                  ++savedDetailRequest;
+                  selectedSavedSession = null;
+                  savedDetail.replaceChildren();
+                }
                 context.notify("Recorded session deleted.");
                 await loadSaved();
               });
@@ -352,24 +396,23 @@ namespace Amaterasu {
           ),
         );
       } catch (error) {
-        if (context.content.isConnected)
+        if (context.content.isConnected && request === savedListRequest)
           savedArea.replaceChildren(errorPanel(error, loadSaved));
       }
     }
 
     async function loadSavedDetail(sessionId: string): Promise<void> {
+      selectedSavedSession = sessionId;
+      const request = ++savedDetailRequest;
       savedDetail.replaceChildren(el("p", "muted", "Loading session details…"));
       try {
-        const reply = await context.api.post<HistoryDetailReply>(
+        const reply = parseHistoryDetailReply(await context.api.post<unknown>(
           "history/session_detail",
           { session_id: sessionId },
-        );
-        if (!context.content.isConnected) return;
+        ), sessionId);
+        if (!context.content.isConnected || request !== savedDetailRequest) return;
         const detail = reply.detail;
-        if (!detail) {
-          savedDetail.replaceChildren(empty("Session unavailable", "The recorded session was removed."));
-          return;
-        }
+        if (!detail) return;
         savedDetail.replaceChildren(
           panel(
             `History for ${detail.session.app_name || detail.session.session_id}`,
@@ -400,7 +443,7 @@ namespace Amaterasu {
           ),
         );
       } catch (error) {
-        if (context.content.isConnected)
+        if (context.content.isConnected && request === savedDetailRequest)
           savedDetail.replaceChildren(errorPanel(error, () => loadSavedDetail(sessionId)));
       }
     }

@@ -4237,6 +4237,39 @@ var Amaterasu;
         return lines;
     }
     Amaterasu.historyRuntimeDescription = historyRuntimeDescription;
+    function parseHistoryDetailReply(value, sessionId) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("History detail reply is invalid.");
+        const reply = value;
+        if (reply.ok !== true || !reply.detail || typeof reply.detail !== "object" || Array.isArray(reply.detail))
+            throw new Error("History detail reply is invalid.");
+        const detail = reply.detail;
+        const session = detail.session;
+        if (!session || typeof session !== "object" || Array.isArray(session) ||
+            session.session_id !== sessionId)
+            throw new Error("History detail belongs to a different session.");
+        for (const key of ["sample_count", "event_count"])
+            if (!Number.isSafeInteger(detail[key]) || detail[key] < 0)
+                throw new Error(`History ${key} is invalid.`);
+        for (const key of ["samples_truncated", "events_truncated"])
+            if (typeof detail[key] !== "boolean")
+                throw new Error(`History ${key} is invalid.`);
+        for (const [key, countKey] of [["samples", "sample_count"], ["events", "event_count"]]) {
+            const rows = detail[key];
+            if (!Array.isArray(rows) || rows.length > detail[countKey] || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row) || row.session_id !== sessionId ||
+                !Number.isSafeInteger(row.recorded_at_unix)))
+                throw new Error(`History ${key} are invalid.`);
+        }
+        for (const sample of detail.samples) {
+            for (const key of ["frames_sent", "bytes_sent", "dropped_frames", "actual_fps", "actual_bitrate_kbps"])
+                if (typeof sample[key] !== "number" || !Number.isFinite(sample[key]) || sample[key] < 0)
+                    throw new Error(`History sample ${key} is invalid.`);
+        }
+        if (detail.events.some((event) => typeof event.event_type !== "string"))
+            throw new Error("History event type is invalid.");
+        return reply;
+    }
+    Amaterasu.parseHistoryDetailReply = parseHistoryDetailReply;
     function renderSessions(context) {
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
@@ -4248,6 +4281,9 @@ var Amaterasu;
         const history = [0];
         let savedOffset = 0;
         const savedHistory = [0];
+        let savedListRequest = 0;
+        let savedDetailRequest = 0;
+        let selectedSavedSession = null;
         context.content.append(Amaterasu.sectionHeading("Sessions", "Inspect and stop sessions owned by this management console.", Amaterasu.button("Refresh", () => {
             void load();
             void loadSaved();
@@ -4315,11 +4351,15 @@ var Amaterasu;
             }
         }
         async function loadSaved() {
+            const request = ++savedListRequest;
             savedArea.replaceChildren(Amaterasu.el("p", "muted", "Loading recorded sessions…"));
             try {
                 const reply = await context.api.post("history/list_sessions", { limit: 25, offset: savedOffset });
-                if (!context.content.isConnected)
+                if (!context.content.isConnected || request !== savedListRequest)
                     return;
+                if (reply.ok !== true || !Array.isArray(reply.sessions) ||
+                    (reply.next_offset != null && (!Number.isSafeInteger(reply.next_offset) || reply.next_offset <= savedOffset)))
+                    throw new Error("History session page is invalid.");
                 const rows = reply.sessions.map((session) => {
                     const details = Amaterasu.button("Details", () => loadSavedDetail(session.session_id));
                     const remove = Amaterasu.button("Delete", async () => {
@@ -4329,7 +4369,11 @@ var Amaterasu;
                             await context.api.post("history/delete_session", {
                                 session_id: session.session_id,
                             });
-                            savedDetail.replaceChildren();
+                            if (selectedSavedSession === session.session_id) {
+                                ++savedDetailRequest;
+                                selectedSavedSession = null;
+                                savedDetail.replaceChildren();
+                            }
                             context.notify("Recorded session deleted.");
                             await loadSaved();
                         });
@@ -4361,21 +4405,21 @@ var Amaterasu;
                     : null, `Showing from ${savedOffset + 1}`));
             }
             catch (error) {
-                if (context.content.isConnected)
+                if (context.content.isConnected && request === savedListRequest)
                     savedArea.replaceChildren(Amaterasu.errorPanel(error, loadSaved));
             }
         }
         async function loadSavedDetail(sessionId) {
+            selectedSavedSession = sessionId;
+            const request = ++savedDetailRequest;
             savedDetail.replaceChildren(Amaterasu.el("p", "muted", "Loading session details…"));
             try {
-                const reply = await context.api.post("history/session_detail", { session_id: sessionId });
-                if (!context.content.isConnected)
+                const reply = parseHistoryDetailReply(await context.api.post("history/session_detail", { session_id: sessionId }), sessionId);
+                if (!context.content.isConnected || request !== savedDetailRequest)
                     return;
                 const detail = reply.detail;
-                if (!detail) {
-                    savedDetail.replaceChildren(Amaterasu.empty("Session unavailable", "The recorded session was removed."));
+                if (!detail)
                     return;
-                }
                 savedDetail.replaceChildren(Amaterasu.panel(`History for ${detail.session.app_name || detail.session.session_id}`, Amaterasu.el("p", "muted", `${detail.session.protocol} · ${detail.session.width}×${detail.session.height} · ${detail.session.target_fps} FPS · ${detail.session.codec || "codec unavailable"}`), Amaterasu.el("p", "muted", `${detail.sample_count} samples${detail.samples_truncated ? " (recent samples shown)" : ""} · ${detail.event_count} events${detail.events_truncated ? " (recent events shown)" : ""}`), detail.samples.length
                     ? Amaterasu.table(["Sample time", "Frames", "Bytes", "Dropped", "FPS", "Bitrate (kbps)"], detail.samples.map((sample) => [
                         new Date(sample.recorded_at_unix * 1000).toLocaleString(),
@@ -4393,7 +4437,7 @@ var Amaterasu;
                     : Amaterasu.el("p", "muted", "No events recorded.")));
             }
             catch (error) {
-                if (context.content.isConnected)
+                if (context.content.isConnected && request === savedDetailRequest)
                     savedDetail.replaceChildren(Amaterasu.errorPanel(error, () => loadSavedDetail(sessionId)));
             }
         }

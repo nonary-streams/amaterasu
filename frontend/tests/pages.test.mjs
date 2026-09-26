@@ -543,8 +543,100 @@ function historySummary(sessionId) {
     client_name: "Client",
     device_name: "Device",
     app_name: sessionId,
+    width: 1920,
+    height: 1080,
+    target_fps: 60,
+    target_bitrate_kbps: 10000,
+    codec: "h264",
     started_at_unix: 100,
     ended_at_unix: 120,
     duration_seconds: 20,
   };
 }
+
+function historyDetail(sessionId) {
+  return {
+    ok: true,
+    detail: {
+      session: historySummary(sessionId),
+      sample_count: 1,
+      event_count: 1,
+      samples_truncated: false,
+      events_truncated: false,
+      samples: [{ session_id: sessionId, recorded_at_unix: 101, frames_sent: 60,
+        bytes_sent: 4096, dropped_frames: 0, actual_fps: 60, actual_bitrate_kbps: 8000 }],
+      events: [{ session_id: sessionId, recorded_at_unix: 102, event_type: "stream_started", payload: null }],
+    },
+  };
+}
+
+test("recorded detail readback rejects mismatched and malformed signed replies", () => {
+  assert.equal(pages.parseHistoryDetailReply(historyDetail("first"), "first").detail.sample_count, 1);
+  for (const reply of [
+    { ...historyDetail("first"), ok: false },
+    historyDetail("other"),
+    { ...historyDetail("first"), detail: { ...historyDetail("first").detail, sample_count: -1 } },
+    { ...historyDetail("first"), detail: { ...historyDetail("first").detail,
+      samples: [{ ...historyDetail("first").detail.samples[0], actual_fps: Number.NaN }] } },
+    { ...historyDetail("first"), detail: { ...historyDetail("first").detail,
+      events: [{ ...historyDetail("first").detail.events[0], session_id: "other" }] } },
+  ]) assert.throws(() => pages.parseHistoryDetailReply(reply, "first"));
+});
+
+test("recorded detail keeps the latest selection after older success or failure and reads again after remount", async () => {
+  const pending = [];
+  const api = {
+    allows: () => false,
+    async post(route) {
+      if (route === "session/list") return { sessions: [], next_offset: null };
+      if (route === "history/history_status") return historyStatus();
+      if (route === "history/list_sessions")
+        return { ok: true, sessions: [historySummary("first"), historySummary("second")], next_offset: null };
+      if (route === "history/session_detail")
+        return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+      throw new Error(`Unexpected route ${route}`);
+    },
+  };
+  const mount = () => {
+    const content = new FakeElement("main");
+    content.setConnected(true);
+    pages.renderSessions({ content, api, notify() {}, navigate() {} });
+    return content;
+  };
+  const content = mount();
+  await waitFor(() => findAll(content, (node) => node.tagName === "button" && node.textContent === "Details").length === 2, "history list");
+  let details = findAll(content, (node) => node.tagName === "button" && node.textContent === "Details");
+  details[0].click();
+  details[1].click();
+  pending[1].resolve(historyDetail("second"));
+  await waitFor(() => content.textContent.includes("History for second"), "newer detail");
+  pending[0].resolve(historyDetail("first"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(content.textContent, /History for second/);
+  assert.doesNotMatch(content.textContent, /History for first/);
+
+  details[0].click();
+  details[1].click();
+  pending[3].resolve(historyDetail("second"));
+  await waitFor(() => content.textContent.includes("History for second"), "newer detail again");
+  pending[2].reject(new Error("old storage failure"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.doesNotMatch(content.textContent, /old storage failure/);
+
+  details[0].click();
+  pending[4].reject(new Error("current storage failure"));
+  await waitFor(() => content.textContent.includes("current storage failure"), "current detail failure");
+  findButton(content, "Try again").click();
+  pending[5].resolve(historyDetail("first"));
+  await waitFor(() => content.textContent.includes("History for first"), "retried detail readback");
+
+  content.setConnected(false);
+  const reopened = mount();
+  await waitFor(() => findAll(reopened, (node) => node.tagName === "button" && node.textContent === "Details").length === 2, "reopened history list");
+  details = findAll(reopened, (node) => node.tagName === "button" && node.textContent === "Details");
+  details[0].click();
+  pending[6].resolve(historyDetail("first"));
+  await waitFor(() => reopened.textContent.includes("History for first"), "reopened detail");
+  assert.match(reopened.textContent, /1 samples.*1 events/);
+  assert.match(reopened.textContent, /stream_started/);
+});
