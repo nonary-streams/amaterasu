@@ -922,7 +922,7 @@ pub struct Capture {
     endpoint: String,
     follow_console_default: bool,
     route_virtual_sink: bool,
-    next_console_default_check: Instant,
+    next_endpoint_check: Instant,
     format: Format,
     timeline: Timeline,
     recovery_config: RecoveryConfig,
@@ -1190,7 +1190,7 @@ impl Capture {
                 endpoint,
                 follow_console_default,
                 route_virtual_sink,
-                next_console_default_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
+                next_endpoint_check: Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL,
                 format,
                 timeline: Timeline::new(),
                 recovery_config,
@@ -1210,12 +1210,13 @@ impl Capture {
     }
 
     pub fn read(&mut self) -> AudioResult<Option<Packet>> {
-        if (self.follow_console_default || self.route_virtual_sink)
-            && Instant::now() >= self.next_console_default_check
-        {
-            self.next_console_default_check = Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL;
+        if Instant::now() >= self.next_endpoint_check {
+            self.next_endpoint_check = Instant::now() + DEFAULT_ENDPOINT_POLL_INTERVAL;
             if self.follow_console_default && !self.is_current_console_default() {
                 return Err("default_endpoint_changed");
+            }
+            if !self.is_active_endpoint() {
+                return Err("device_lost");
             }
             if self.route_virtual_sink
                 && let Ok(enumerator) = enumerator()
@@ -1262,6 +1263,31 @@ impl Capture {
             role_endpoint(&enumerator, DefaultRole::Console),
             &self.endpoint,
         )
+    }
+
+    fn is_active_endpoint(&self) -> bool {
+        let Ok(enumerator) = enumerator() else {
+            return true;
+        };
+        let wide: Vec<u16> = self.endpoint.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the endpoint query and device state read stay on this
+        // capture thread's COM apartment. A missing endpoint is lost; other
+        // query failures are retried at the next poll.
+        unsafe {
+            let state = enumerator
+                .GetDevice(PCWSTR(wide.as_ptr()))
+                .and_then(|device| device.GetState())
+                .map_err(|error| error.code());
+            endpoint_state_is_active(state)
+        }
+    }
+}
+
+fn endpoint_state_is_active(state: Result<DEVICE_STATE, HRESULT>) -> bool {
+    match state {
+        Ok(state) => state.0 & DEVICE_STATE_ACTIVE.0 != 0,
+        Err(HRESULT_NOT_FOUND) => false,
+        Err(_) => true,
     }
 }
 
@@ -1364,6 +1390,14 @@ fn capture_error(error: windows::core::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_endpoint_requires_recovery_but_query_failures_are_retried() {
+        assert!(endpoint_state_is_active(Ok(DEVICE_STATE_ACTIVE)));
+        assert!(!endpoint_state_is_active(Ok(DEVICE_STATE(0))));
+        assert!(!endpoint_state_is_active(Err(HRESULT_NOT_FOUND)));
+        assert!(endpoint_state_is_active(Err(HRESULT(0x80004005u32 as i32))));
+    }
 
     #[test]
     fn only_shared_recovery_treats_a_changed_virtual_mix_as_transient() {

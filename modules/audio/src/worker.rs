@@ -616,7 +616,9 @@ mod tests {
     #[test]
     fn device_loss_retries_open_and_preserves_packet_clock() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
-        let initial = FakeCapture::new(format, [Ok(Some(packet(1_000, 0))), Err("device_lost")]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial = FakeCapture::new(format, [Ok(Some(packet(1_000, 0))), Err("device_lost")])
+            .with_drop_counter(drops.clone());
         let (sender, packets) = mpsc::sync_channel(4);
         let health = Arc::new(Mutex::new(Health::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -629,6 +631,7 @@ mod tests {
             let stop = stop.clone();
             let attempts = attempts.clone();
             let recovering_during_retry = recovering_during_retry.clone();
+            let drops = drops.clone();
             move || {
                 let mut recovery_attempt = 0;
                 run_capture_loop(
@@ -643,8 +646,10 @@ mod tests {
                             );
                             return Err("endpoint_not_found");
                         }
-                        Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
-                            as Box<dyn CaptureDevice>)
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                                .with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
                     },
                     &sender,
                     &health,
@@ -670,6 +675,7 @@ mod tests {
         assert!(recovered.timestamp_us > first.timestamp_us);
         assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert!(recovering_during_retry.load(Ordering::Acquire));
         let health = health.lock().unwrap();
         assert!(!health.recovering);
