@@ -7,13 +7,22 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use windows_sys::Win32::Devices::Display::*;
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_SUPPORTED, LUID};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, LUID,
+};
 use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, EnumDisplaySettingsExW};
+use windows_sys::Win32::Graphics::Gdi::{
+    DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID, DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID,
+    DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID, DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE,
+    DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID,
+};
 
 pub struct ConfigurationBuffers {
     pub paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     pub modes: Vec<DISPLAYCONFIG_MODE_INFO>,
 }
+// windows-sys 0.61 does not expose the Windows 11 dynamic refresh path bit.
+const DISPLAYCONFIG_PATH_BOOST_REFRESH_RATE: u32 = 0x10;
 pub struct DeviceNames {
     pub id: String,
     pub friendly: String,
@@ -380,6 +389,7 @@ fn unique_active_target<'a>(
 
 pub fn snapshot() -> DisplayResult<Snapshot> {
     let buffers = query(QDC_ONLY_ACTIVE_PATHS)?;
+    check_virtual_layout(&buffers)?;
     let mut paths = Vec::new();
     for path in &buffers.paths {
         if matches!(
@@ -403,6 +413,134 @@ pub fn snapshot() -> DisplayResult<Snapshot> {
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+/// The recovery journal stores legacy source and target modes, but no desktop
+/// image or virtual clone-group record. Query the aware view independently so
+/// a modern driver cannot hide an un-restorable layout behind legacy indexes.
+fn check_virtual_layout(legacy: &ConfigurationBuffers) -> DisplayResult<()> {
+    if legacy
+        .paths
+        .iter()
+        .any(|path| path.flags & DISPLAYCONFIG_PATH_BOOST_REFRESH_RATE != 0)
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "dynamic refresh rate needs virtual and physical rate recovery",
+        ));
+    }
+    let flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+    let mut path_count = 0;
+    let mut mode_count = 0;
+    // SAFETY: the two output counters are valid exclusive stack references.
+    let result = unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
+    if result == ERROR_INVALID_PARAMETER || result == ERROR_NOT_SUPPORTED {
+        // Older systems do not support aware queries. The legacy CCD query is
+        // their sole supported representation.
+        return Ok(());
+    }
+    check(result as i32, "GetDisplayConfigBufferSizes(virtual mode)")?;
+    let refresh_flags = flags | QDC_VIRTUAL_REFRESH_RATE_AWARE;
+    let refresh_result =
+        unsafe { GetDisplayConfigBufferSizes(refresh_flags, &mut path_count, &mut mode_count) };
+    let aware =
+        if refresh_result == ERROR_INVALID_PARAMETER || refresh_result == ERROR_NOT_SUPPORTED {
+            query(flags)?
+        } else {
+            check(
+                refresh_result as i32,
+                "GetDisplayConfigBufferSizes(virtual refresh)",
+            )?;
+            query(refresh_flags)?
+        };
+    validate_virtual_layout(legacy, &aware)
+}
+
+fn validate_virtual_layout(
+    legacy: &ConfigurationBuffers,
+    aware: &ConfigurationBuffers,
+) -> DisplayResult<()> {
+    if legacy.paths.len() != aware.paths.len() {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "virtual-aware CCD query changed active path count",
+        ));
+    }
+    for old in &legacy.paths {
+        let mut candidates = aware.paths.iter().filter(|path| {
+            address(path.sourceInfo.adapterId, path.sourceInfo.id)
+                == address(old.sourceInfo.adapterId, old.sourceInfo.id)
+                && address(path.targetInfo.adapterId, path.targetInfo.id)
+                    == address(old.targetInfo.adapterId, old.targetInfo.id)
+        });
+        let virtual_path = candidates.next().ok_or_else(|| {
+            DisplayError::new("unsupported_topology", "virtual-aware CCD route differs")
+        })?;
+        if virtual_path.flags & DISPLAYCONFIG_PATH_BOOST_REFRESH_RATE != 0 {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "dynamic refresh rate needs virtual and physical rate recovery",
+            ));
+        }
+        if candidates.next().is_some() {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "virtual-aware CCD route is ambiguous",
+            ));
+        }
+        // SAFETY: QDC_VIRTUAL_MODE_AWARE uses packed 16-bit fields only when
+        // PATH_SUPPORT_VIRTUAL_MODE is set. windows-sys exposes the raw union.
+        let source = unsafe { virtual_path.sourceInfo.Anonymous.modeInfoIdx };
+        let target = unsafe { virtual_path.targetInfo.Anonymous.modeInfoIdx };
+        let (source_index, target_index) =
+            if virtual_path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
+                let clone_group = source & 0xffff;
+                let source_index = source >> 16;
+                let desktop_index = target & 0xffff;
+                let target_index = target >> 16;
+                if source_index == DISPLAYCONFIG_PATH_SOURCE_MODE_IDX_INVALID
+                    || target_index == DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID
+                    || clone_group != DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID
+                    || desktop_index != DISPLAYCONFIG_PATH_DESKTOP_IMAGE_IDX_INVALID
+                {
+                    return Err(DisplayError::new(
+                        "unsupported_topology",
+                        "virtual CCD layout needs desktop-image or clone-group recovery",
+                    ));
+                }
+                (source_index, target_index)
+            } else {
+                (source, target)
+            };
+        let mut normalized = *virtual_path;
+        normalized.sourceInfo.Anonymous.modeInfoIdx = source_index;
+        normalized.targetInfo.Anonymous.modeInfoIdx = target_index;
+        let empty_names = || DeviceNames {
+            id: String::new(),
+            friendly: String::new(),
+            source: String::new(),
+        };
+        let legacy_mode = decode_path(old, &legacy.modes, empty_names())?;
+        let aware_mode = decode_path(&normalized, &aware.modes, empty_names())?;
+        if legacy_mode.source != aware_mode.source
+            || legacy_mode.signal != aware_mode.signal
+            || legacy_mode.refresh != aware_mode.refresh
+            || legacy_mode.rotation != aware_mode.rotation
+            || legacy_mode.scaling != aware_mode.scaling
+            || legacy_mode.scan_line_ordering != aware_mode.scan_line_ordering
+            || legacy_mode.output_technology != aware_mode.output_technology
+            || legacy_mode.source_flags != aware_mode.source_flags
+            || legacy_mode.target_flags != aware_mode.target_flags
+            || (legacy_mode.path_flags & !DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+                != (aware_mode.path_flags & !DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "virtual-aware CCD mode differs from restorable legacy mode",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn monitors() -> DisplayResult<Vec<Value>> {
@@ -570,6 +708,121 @@ mod tests {
         settle_advanced_color, verify_advanced_color_route,
     };
     use crate::model::{Address, DisplayError};
+
+    fn compatible_virtual_buffers() -> (super::ConfigurationBuffers, super::ConfigurationBuffers) {
+        use windows_sys::Win32::Devices::Display::*;
+        use windows_sys::Win32::Foundation::LUID;
+
+        let adapter = LUID {
+            LowPart: 4,
+            HighPart: 0,
+        };
+        let mut path = DISPLAYCONFIG_PATH_INFO::default();
+        path.sourceInfo.adapterId = adapter;
+        path.sourceInfo.id = 1;
+        path.targetInfo.adapterId = adapter;
+        path.targetInfo.id = 2;
+        path.sourceInfo.Anonymous.modeInfoIdx = 0;
+        path.targetInfo.Anonymous.modeInfoIdx = 1;
+        let modes = vec![
+            DISPLAYCONFIG_MODE_INFO {
+                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+                id: 1,
+                adapterId: adapter,
+                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                    sourceMode: DISPLAYCONFIG_SOURCE_MODE::default(),
+                },
+            },
+            DISPLAYCONFIG_MODE_INFO {
+                infoType: DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+                id: 2,
+                adapterId: adapter,
+                Anonymous: DISPLAYCONFIG_MODE_INFO_0 {
+                    targetMode: DISPLAYCONFIG_TARGET_MODE::default(),
+                },
+            },
+        ];
+        let legacy = super::ConfigurationBuffers {
+            paths: vec![path],
+            modes: modes.clone(),
+        };
+        path.flags = windows_sys::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE;
+        path.sourceInfo.Anonymous.modeInfoIdx = 0x0000_ffff;
+        path.targetInfo.Anonymous.modeInfoIdx = 0x0001_ffff;
+        let aware = super::ConfigurationBuffers {
+            paths: vec![path],
+            modes,
+        };
+        (legacy, aware)
+    }
+
+    #[test]
+    fn compatible_virtual_indexes_preserve_legacy_mode_and_route() {
+        let (legacy, aware) = compatible_virtual_buffers();
+        super::validate_virtual_layout(&legacy, &aware).unwrap();
+    }
+
+    #[test]
+    fn aware_query_without_virtual_flag_uses_full_width_indexes() {
+        let (mut legacy, mut aware) = compatible_virtual_buffers();
+        legacy.paths[0].flags = 0;
+        aware.paths[0].flags = 0;
+        aware.paths[0].sourceInfo.Anonymous.modeInfoIdx = 0;
+        aware.paths[0].targetInfo.Anonymous.modeInfoIdx = 1;
+        super::validate_virtual_layout(&legacy, &aware).unwrap();
+    }
+
+    #[test]
+    fn desktop_image_and_clone_group_require_a_richer_recovery_journal() {
+        let (legacy, mut aware) = compatible_virtual_buffers();
+        aware.paths[0].targetInfo.Anonymous.modeInfoIdx = 0x0001_0002;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+        aware.paths[0].targetInfo.Anonymous.modeInfoIdx = 0x0001_ffff;
+        aware.paths[0].sourceInfo.Anonymous.modeInfoIdx = 0x0000_0002;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+    }
+
+    #[test]
+    fn dynamic_refresh_is_rejected_even_when_indexes_are_compatible() {
+        let (legacy, mut aware) = compatible_virtual_buffers();
+        aware.paths[0].flags |= super::DISPLAYCONFIG_PATH_BOOST_REFRESH_RATE;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+    }
+
+    #[test]
+    fn virtual_query_must_match_legacy_route_and_mode() {
+        let (legacy, mut aware) = compatible_virtual_buffers();
+        aware.paths[0].targetInfo.id = 3;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+        aware.paths[0].targetInfo.id = 2;
+        aware.modes[0].Anonymous.sourceMode.width = 2560;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
+    }
 
     fn saved_target() -> Address {
         Address {

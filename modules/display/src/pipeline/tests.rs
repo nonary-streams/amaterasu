@@ -579,6 +579,7 @@ struct FakePlatform {
     inactive_route_ambiguous: bool,
     inactive_route_changed: bool,
     restoration_unavailable: bool,
+    virtual_layout_unsupported: bool,
     effects: Vec<&'static str>,
     prepared_mode: Option<(u32, u32, Rational)>,
     applied_mode: Option<(u32, u32, Rational)>,
@@ -725,6 +726,12 @@ impl Platform for FakePlatform {
         }
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot> {
+        if self.virtual_layout_unsupported {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "virtual CCD layout needs desktop-image recovery",
+            ));
+        }
         self.prepared_configuration = Some(configuration.clone());
         let display = &configuration.displays[0];
         self.prepared_modes = configuration
@@ -2730,6 +2737,32 @@ fn remapped_mode_reaches_prepare_and_durable_apply() {
     assert_eq!(pipeline.platform.prepared_mode, mode);
     assert_eq!(pipeline.platform.applied_mode, mode);
     assert!(state.journal.is_some());
+}
+
+#[test]
+fn unsupported_virtual_layout_rejects_mode_and_hdr_policy_before_journal_or_native_effect() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            virtual_layout_unsupported: true,
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut request = json!({
+        "action":"apply",
+        "configuration":configuration(),
+        "mode_policy":policy("monitor.one", "1920x1080", "120")
+    });
+    request["mode_policy"]["hdr_option"] = json!("auto");
+    request["mode_policy"]["effective_client_hdr_request"] = json!(true);
+    let rejected = state.run(&mut pipeline, "owner", request);
+    assert_eq!(rejected["error"]["code"], "unsupported_topology");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.prepared_configuration.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert_eq!(pipeline.platform.hdr_mutations, 0);
 }
 
 #[test]
