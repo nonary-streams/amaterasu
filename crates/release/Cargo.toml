@@ -14,5 +14,8 @@ serde.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 
+[dev-dependencies]
+amaterasu-runtime = { path = "../runtime" }
+
 [lints]
 workspace = true

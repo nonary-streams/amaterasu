@@ -1,4 +1,6 @@
 use super::*;
+use amaterasu_contracts::{Command, Response};
+use amaterasu_runtime::Broker;
 
 #[test]
 fn every_profile_contains_unique_providers_and_all_dependencies() {
@@ -161,6 +163,195 @@ fn signed_platform_call_intersections_cover_active_and_cleanup_display_paths() {
             .remove("amaterasu.display/1");
         assert!(!delegates(&narrowed, NVHTTP.id, &active_display));
     }
+}
+
+#[test]
+fn installer_policy_authorizes_real_parented_display_and_launch_requests() {
+    fn accepted(response: Response) -> u64 {
+        match response {
+            Response::Accepted { id } => id,
+            other => panic!("broker rejected expected call: {other:?}"),
+        }
+    }
+
+    fn send(
+        broker: &mut Broker,
+        caller: &str,
+        service: &str,
+        operation_id: &str,
+        parent: Option<u64>,
+        action: &str,
+    ) -> u64 {
+        accepted(broker.dispatch(
+            caller,
+            Command::Request {
+                service: service.into(),
+                payload: json!({"action": action}),
+                timeout_ms: 30_000,
+                operation_id: operation_id.into(),
+                parent,
+            },
+        ))
+    }
+
+    fn delivered(broker: &mut Broker, provider: &str, id: u64, initiator: &str) {
+        assert!(
+            matches!(broker.dispatch(provider, Command::Poll {}),
+                Response::Request { id: delivered, initiator: actual, .. }
+                    if delivered == id && actual == initiator),
+            "{provider} did not receive parented request {id}"
+        );
+    }
+
+    let mut broker = Broker::new(installer_policy("__WEB__", BTreeMap::new())).unwrap();
+    for component in [RTSP, STREAM_SESSION, DISPLAY, STATE, LAUNCH] {
+        assert!(matches!(
+            broker.dispatch(
+                component.id,
+                Command::Register {
+                    service: component.provides[0].into(),
+                },
+            ),
+            Response::Ok
+        ));
+    }
+
+    let rtsp = send(
+        &mut broker,
+        NVHTTP.id,
+        "amaterasu.rtsp/1",
+        "rtsp-active",
+        None,
+        "open",
+    );
+    delivered(&mut broker, RTSP.id, rtsp, NVHTTP.id);
+    let session = send(
+        &mut broker,
+        RTSP.id,
+        "amaterasu.stream-session/1",
+        "session-active",
+        Some(rtsp),
+        "start",
+    );
+    delivered(&mut broker, STREAM_SESSION.id, session, NVHTTP.id);
+    for (operation, action) in [("display-apply", "apply"), ("display-status", "status")] {
+        let display = send(
+            &mut broker,
+            STREAM_SESSION.id,
+            "amaterasu.display/1",
+            operation,
+            Some(session),
+            action,
+        );
+        delivered(&mut broker, DISPLAY.id, display, NVHTTP.id);
+        let state = send(
+            &mut broker,
+            DISPLAY.id,
+            "amaterasu.state/1",
+            &format!("{operation}-journal"),
+            Some(display),
+            "get",
+        );
+        delivered(&mut broker, STATE.id, state, NVHTTP.id);
+    }
+
+    for (operation, action) in [("cleanup-status", "status"), ("cleanup-restore", "restore")] {
+        let display = send(
+            &mut broker,
+            STREAM_SESSION.id,
+            "amaterasu.display/1",
+            operation,
+            None,
+            action,
+        );
+        delivered(&mut broker, DISPLAY.id, display, STREAM_SESSION.id);
+        let state = send(
+            &mut broker,
+            DISPLAY.id,
+            "amaterasu.state/1",
+            &format!("{operation}-journal"),
+            Some(display),
+            "get",
+        );
+        delivered(&mut broker, STATE.id, state, STREAM_SESSION.id);
+    }
+
+    let launch = send(
+        &mut broker,
+        RTSP.id,
+        "amaterasu.launch/1",
+        "launch-verify",
+        Some(rtsp),
+        "verify",
+    );
+    delivered(&mut broker, LAUNCH.id, launch, NVHTTP.id);
+
+    for outsider in [PLAYNITE.id, LUTRIS.id, AUTHENTICATION.id, INPUT.id] {
+        assert!(matches!(
+            broker.dispatch(
+                outsider,
+                Command::Request {
+                    service: "amaterasu.display/1".into(),
+                    payload: json!({"action":"apply"}),
+                    timeout_ms: 30_000,
+                    operation_id: "unauthorized-display".into(),
+                    parent: None,
+                },
+            ),
+            Response::Error { code, .. } if code == "permission_denied"
+        ));
+    }
+
+    let mut narrowed_policy = installer_policy("__WEB__", BTreeMap::new());
+    narrowed_policy
+        .principals
+        .get_mut(NVHTTP.id)
+        .unwrap()
+        .call
+        .remove("amaterasu.display/1");
+    let mut narrowed = Broker::new(narrowed_policy).unwrap();
+    for component in [RTSP, STREAM_SESSION, DISPLAY] {
+        assert!(matches!(
+            narrowed.dispatch(
+                component.id,
+                Command::Register {
+                    service: component.provides[0].into(),
+                },
+            ),
+            Response::Ok
+        ));
+    }
+    let rtsp = send(
+        &mut narrowed,
+        NVHTTP.id,
+        "amaterasu.rtsp/1",
+        "rtsp-narrow",
+        None,
+        "open",
+    );
+    delivered(&mut narrowed, RTSP.id, rtsp, NVHTTP.id);
+    let session = send(
+        &mut narrowed,
+        RTSP.id,
+        "amaterasu.stream-session/1",
+        "session-narrow",
+        Some(rtsp),
+        "start",
+    );
+    delivered(&mut narrowed, STREAM_SESSION.id, session, NVHTTP.id);
+    assert!(matches!(
+        narrowed.dispatch(
+            STREAM_SESSION.id,
+            Command::Request {
+                service: "amaterasu.display/1".into(),
+                payload: json!({"action":"apply"}),
+                timeout_ms: 30_000,
+                operation_id: "display-narrow".into(),
+                parent: Some(session),
+            },
+        ),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
 }
 
 #[test]

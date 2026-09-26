@@ -396,6 +396,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-package",
+ "amaterasu-runtime",
  "amaterasu-storage",
  "ed25519-dalek",
  "getrandom 0.3.4",
