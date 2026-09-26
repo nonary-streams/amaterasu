@@ -265,9 +265,9 @@ impl ContainedChild {
     // Ask every top-level window in the job to close, matching the sibling's
     // GUI shutdown behavior; callers force the owned job if none accepts it.
     pub fn request_stop(&mut self) -> io::Result<bool> {
-        let Ok(process_ids) = process_ids_in_job(self.job.as_raw_handle()) else {
-            return Ok(false);
-        };
+        // A failed job query cannot establish that there are no windows. Keep
+        // the job owned and let the caller retry instead of forcing it to stop.
+        let process_ids = process_ids_in_job(self.job.as_raw_handle())?;
         if process_ids.is_empty() {
             return Ok(false);
         }
