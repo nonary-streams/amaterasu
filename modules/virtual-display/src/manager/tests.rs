@@ -422,6 +422,13 @@ fn readiness_and_feeding_track_exact_owned_lease() {
     tick(&mut manager);
     assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
     assert_eq!(calls.borrow().feeds, vec![calls.borrow().creates[0].0]);
+    tick(&mut manager);
+    assert_eq!(calls.borrow().feeds.len(), 1);
+    assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
+    manager.monitors.values_mut().next().unwrap().next_feed = Instant::now();
+    tick(&mut manager);
+    assert_eq!(calls.borrow().feeds, vec![calls.borrow().creates[0].0; 2]);
+    assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
 }
 #[test]
 fn ambiguous_create_is_not_replayed_and_cleanup_waits_for_departure() {
@@ -539,13 +546,13 @@ fn departing_lease_revokes_readiness_and_stops_feeding_until_departure() {
     assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
 
     calls.borrow_mut().pending = true;
+    manager.monitors.values_mut().next().unwrap().next_feed = Instant::now();
     tick(&mut manager);
     let departing = manager.handle("alice", Operation::Status { identity: None });
     assert_eq!(departing["monitors"][0]["state"], "removing");
     assert_eq!(departing["monitors"][0]["error"], "lease_departing");
     assert!(departing["monitors"][0]["ready"].is_null());
 
-    manager.monitors.values_mut().next().unwrap().next_feed = Instant::now();
     tick(&mut manager);
     assert_eq!(calls.borrow().removes, vec![owned]);
     assert!(calls.borrow().feeds.is_empty());

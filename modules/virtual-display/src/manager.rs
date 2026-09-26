@@ -284,13 +284,6 @@ impl<D: Driver> Drop for Manager<D> {
 }
 
 fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
-    if now >= monitor.next_feed {
-        if let Err(code) = driver.feed(monitor.lease) {
-            monitor.begin_cleanup(Some(code));
-            return;
-        }
-        monitor.next_feed = now + FEED_INTERVAL;
-    }
     match driver.inspect(monitor.lease, monitor.display_id, monitor.binding) {
         Ok(observation) if observation.pending_departure => {
             monitor.begin_cleanup(Some("lease_departing"));
@@ -311,6 +304,16 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
             }
         }
         Err(code) => monitor.begin_cleanup(Some(code)),
+    }
+    if monitor.state == "removing" {
+        return;
+    }
+    if now >= monitor.next_feed {
+        if let Err(code) = driver.feed(monitor.lease) {
+            monitor.begin_cleanup(Some(code));
+            return;
+        }
+        monitor.next_feed = now + FEED_INTERVAL;
     }
 }
 
