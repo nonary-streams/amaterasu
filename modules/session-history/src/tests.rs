@@ -224,3 +224,128 @@ fn producer_updates_remain_ordered_and_readable_after_restart() {
     drop(reopened);
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn delayed_end_uses_processing_time_for_ttl_without_changing_saved_end_time() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-history-retention-{}-{}",
+        std::process::id(),
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let database = directory.join("history.db");
+    let mut store = HistoryStore::open(&database, 190_000).unwrap();
+    store
+        .apply_configuration(HistorySettings::default(), 190_000)
+        .unwrap();
+    for (id, started_at) in [("saved", 190_000), ("delayed", 195_000)] {
+        let begin: Operation = serde_json::from_value(json!({
+            "action":"session_begin",
+            "metadata":{"session_id":id,"protocol":"sunshine-modern"},
+            "started_at_unix":started_at
+        }))
+        .unwrap();
+        assert_eq!(
+            execute(&mut store, begin, started_at).unwrap()["recorded"],
+            true
+        );
+    }
+    let saved_end: Operation = serde_json::from_value(json!({
+        "action":"session_end","session_id":"saved","ended_at_unix":190_010
+    }))
+    .unwrap();
+    assert_eq!(
+        execute(&mut store, saved_end, 190_010).unwrap()["recorded"],
+        true
+    );
+
+    let policy = HistorySettings {
+        enabled: true,
+        ttl_days: 1,
+        db_size_limit_mb: 0,
+    };
+    store.apply_configuration(policy.clone(), 200_000).unwrap();
+    let delayed_end: Operation = serde_json::from_value(json!({
+        "action":"session_end","session_id":"delayed","ended_at_unix":400_000
+    }))
+    .unwrap();
+    assert_eq!(
+        execute(&mut store, delayed_end, 200_000).unwrap()["recorded"],
+        true
+    );
+    assert_eq!(
+        store.session_detail("saved").unwrap().session.ended_at_unix,
+        Some(190_010)
+    );
+    assert_eq!(
+        store
+            .session_detail("delayed")
+            .unwrap()
+            .session
+            .ended_at_unix,
+        Some(400_000)
+    );
+
+    drop(store);
+    let mut reopened = HistoryStore::open(&database, 200_010).unwrap();
+    reopened.apply_configuration(policy, 200_010).unwrap();
+    let list: Operation =
+        serde_json::from_value(json!({"action":"list_sessions","limit":2})).unwrap();
+    let response = execute(&mut reopened, list, 200_010).unwrap();
+    assert_eq!(response["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(response["next_offset"], serde_json::Value::Null);
+
+    let stale_begin: Operation = serde_json::from_value(json!({
+        "action":"session_begin",
+        "metadata":{"session_id":"stale","protocol":"sunshine-modern"},
+        "started_at_unix":100
+    }))
+    .unwrap();
+    assert_eq!(
+        execute(&mut reopened, stale_begin, 200_010).unwrap()["recorded"],
+        true
+    );
+    let stale_end: Operation = serde_json::from_value(json!({
+        "action":"session_end","session_id":"stale","ended_at_unix":101
+    }))
+    .unwrap();
+    assert_eq!(
+        execute(&mut reopened, stale_end, 200_010).unwrap()["recorded"],
+        true
+    );
+    assert!(matches!(
+        reopened.session_detail("stale"),
+        Err(store::HistoryError::NotFound)
+    ));
+    drop(reopened);
+
+    let mut reopened = HistoryStore::open(&database, 200_020).unwrap();
+    reopened
+        .apply_configuration(
+            HistorySettings {
+                enabled: true,
+                ttl_days: 1,
+                db_size_limit_mb: 0,
+            },
+            200_020,
+        )
+        .unwrap();
+    assert_eq!(reopened.status().unwrap().sessions, 2);
+    assert_eq!(
+        reopened
+            .session_detail("saved")
+            .unwrap()
+            .session
+            .ended_at_unix,
+        Some(190_010)
+    );
+    assert_eq!(
+        reopened
+            .session_detail("delayed")
+            .unwrap()
+            .session
+            .ended_at_unix,
+        Some(400_000)
+    );
+    drop(reopened);
+    fs::remove_dir_all(directory).unwrap();
+}

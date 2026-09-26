@@ -214,10 +214,13 @@ impl HistoryStore {
         Ok(true)
     }
 
+    /// Preserve the producer's end time in the record, but evaluate retention
+    /// against the module's processing time so delayed updates cannot shift TTL.
     pub fn end_session(
         &mut self,
         session_id: &str,
         ended_at_unix: i64,
+        retention_now_unix: i64,
     ) -> Result<bool, HistoryError> {
         validate_text(
             session_id,
@@ -256,7 +259,7 @@ impl HistoryStore {
         if self.active_streams.is_empty() {
             self.effective_enabled = self.settings.enabled;
         }
-        self.prune_best_effort(ended_at_unix);
+        self.prune_best_effort(retention_now_unix);
         Ok(ended)
     }
 
@@ -1005,7 +1008,7 @@ mod tests {
                     .record_event(&event("session-1", 106, json!({"marker":"test"})))
                     .unwrap()
             );
-            assert!(store.end_session("session-1", 110).unwrap());
+            assert!(store.end_session("session-1", 110, 110).unwrap());
         }
 
         let mut store = HistoryStore::open(&path, 120).unwrap();
@@ -1098,7 +1101,7 @@ mod tests {
             .apply_configuration(HistorySettings::default(), 101)
             .unwrap();
         assert!(!store.status().unwrap().effective_enabled);
-        assert!(!store.end_session("config-pending", 110).unwrap());
+        assert!(!store.end_session("config-pending", 110, 110).unwrap());
         assert!(store.status().unwrap().effective_enabled);
         assert_eq!(store.list_sessions(25, 0).unwrap().len(), 0);
     }
@@ -1165,7 +1168,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.end_session("retry-end", 110),
+            store.end_session("retry-end", 110, 110),
             Err(HistoryError::Database)
         ));
         assert_eq!(store.status().unwrap().active_streams, 1);
@@ -1174,7 +1177,7 @@ mod tests {
             .connection
             .execute_batch("DROP TRIGGER reject_stream_ended")
             .unwrap();
-        assert!(store.end_session("retry-end", 110).unwrap());
+        assert!(store.end_session("retry-end", 110, 110).unwrap());
         assert_eq!(store.status().unwrap().active_streams, 0);
     }
 
@@ -1231,7 +1234,7 @@ mod tests {
                     .record_event(&event("retry-record", 105, json!("retried")))
                     .unwrap()
             );
-            store.end_session("retry-record", 120).unwrap();
+            store.end_session("retry-record", 120, 120).unwrap();
         }
 
         let store = HistoryStore::open(&path, 130).unwrap();
@@ -1272,7 +1275,7 @@ mod tests {
         assert!(!store.begin_session(&metadata("unrecorded"), 110).unwrap());
         configure(&mut store, HistorySettings::default(), 120);
         assert!(!store.settings().1);
-        assert!(!store.end_session("unrecorded", 130).unwrap());
+        assert!(!store.end_session("unrecorded", 130, 130).unwrap());
         assert!(store.settings().1);
         assert!(store.list_sessions(25, 0).unwrap().is_empty());
     }
@@ -1293,8 +1296,8 @@ mod tests {
         store.begin_session(&metadata("expired"), 100).unwrap();
         store.begin_session(&metadata("recent"), 190_000).unwrap();
         store.begin_session(&metadata("active"), 100).unwrap();
-        store.end_session("expired", 101).unwrap();
-        store.end_session("recent", 190_100).unwrap();
+        store.end_session("expired", 101, 101).unwrap();
+        store.end_session("recent", 190_100, 190_100).unwrap();
 
         let sessions = store.list_sessions(25, 0).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -1320,9 +1323,9 @@ mod tests {
             let mut store = HistoryStore::open(&path, 100).unwrap();
             configure(&mut store, HistorySettings::default(), 100);
             store.begin_session(&metadata("expired"), 100).unwrap();
-            store.end_session("expired", 110).unwrap();
+            store.end_session("expired", 110, 110).unwrap();
             store.begin_session(&metadata("recent"), 170_000).unwrap();
-            store.end_session("recent", 170_010).unwrap();
+            store.end_session("recent", 170_010, 170_010).unwrap();
         }
 
         let mut store = HistoryStore::open(&path, 200_000).unwrap();
@@ -1361,7 +1364,7 @@ mod tests {
         store
             .begin_session(&metadata("expires-later"), 100)
             .unwrap();
-        store.end_session("expires-later", 101).unwrap();
+        store.end_session("expires-later", 101, 101).unwrap();
         configure(
             &mut store,
             HistorySettings {
@@ -1393,7 +1396,7 @@ mod tests {
                 .record_event(&event("large", 101 + index, json!("x".repeat(4000))))
                 .unwrap();
         }
-        store.end_session("large", 500).unwrap();
+        store.end_session("large", 500, 500).unwrap();
 
         configure(
             &mut store,
@@ -1433,12 +1436,12 @@ mod tests {
         );
         assert!(store.settings().1);
         assert!(store.begin_session(&metadata("second"), 102).unwrap());
-        assert!(store.end_session("first", 103).unwrap());
+        assert!(store.end_session("first", 103, 103).unwrap());
         assert!(store.settings().1);
-        assert!(store.end_session("second", 104).unwrap());
+        assert!(store.end_session("second", 104, 104).unwrap());
         assert!(!store.settings().1);
         assert!(!store.begin_session(&metadata("third"), 105).unwrap());
-        assert!(!store.end_session("third", 106).unwrap());
+        assert!(!store.end_session("third", 106, 106).unwrap());
         assert_eq!(store.status().unwrap().sessions, 2);
 
         drop(store);
@@ -1475,14 +1478,14 @@ mod tests {
                 .record_event(&event("oldest", 11 + index, json!("x".repeat(4000))))
                 .unwrap();
         }
-        store.end_session("oldest", 200).unwrap();
+        store.end_session("oldest", 200, 200).unwrap();
         store.begin_session(&metadata("newer"), 300).unwrap();
         for index in 0..150 {
             store
                 .record_event(&event("newer", 301 + index, json!("y".repeat(4000))))
                 .unwrap();
         }
-        store.end_session("newer", 500).unwrap();
+        store.end_session("newer", 500, 500).unwrap();
         store.begin_session(&metadata("still-active"), 600).unwrap();
 
         let report = store.status().unwrap().last_prune;
@@ -1521,7 +1524,7 @@ mod tests {
         store
             .record_event(&event("active", 11, json!({"persist":true})))
             .unwrap();
-        store.end_session("active", 12).unwrap();
+        store.end_session("active", 12, 12).unwrap();
         store.delete_session("active").unwrap();
         assert!(matches!(
             store.session_detail("active"),
@@ -1554,7 +1557,7 @@ mod tests {
                 .record_event(&event("bounded", 60 + index, json!({"index":index})))
                 .unwrap();
         }
-        store.end_session("bounded", 80).unwrap();
+        store.end_session("bounded", 80, 80).unwrap();
 
         let detail = store.session_detail("bounded").unwrap();
         assert_eq!(detail.sample_count, 40);
@@ -1602,7 +1605,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        store.end_session("large-detail", 80).unwrap();
+        store.end_session("large-detail", 80, 80).unwrap();
 
         let detail = store.session_detail("large-detail").unwrap();
         let response = json!({"ok":true,"detail":detail});
@@ -1788,7 +1791,11 @@ mod tests {
                 .record_event(&event("bounded-storage", 50, json!(null)))
                 .unwrap()
         );
-        assert!(store.end_session("bounded-storage", 10_002).unwrap());
+        assert!(
+            store
+                .end_session("bounded-storage", 10_002, 10_002)
+                .unwrap()
+        );
         assert_eq!(store.status().unwrap().samples, MAX_STORED_SAMPLES);
         assert_eq!(store.status().unwrap().events, MAX_STORED_EVENTS);
         let oldest_sample: i64 = store
@@ -1820,9 +1827,9 @@ mod tests {
             let mut store = HistoryStore::open(&path, 100).unwrap();
             configure(&mut store, HistorySettings::default(), 100);
             store.begin_session(&metadata("legacy-large"), 100).unwrap();
-            store.end_session("legacy-large", 200).unwrap();
+            store.end_session("legacy-large", 200, 200).unwrap();
             store.begin_session(&metadata("small"), 100).unwrap();
-            store.end_session("small", 200).unwrap();
+            store.end_session("small", 200, 200).unwrap();
             let transaction = store.connection.transaction().unwrap();
             {
                 let mut insert = transaction

@@ -325,7 +325,7 @@ fn execute(
             ended_at_unix,
         } => Ok(json!({
             "ok": true,
-            "recorded": store.end_session(&session_id, ended_at_unix.unwrap_or(now_unix))?,
+            "recorded": store.end_session(&session_id, ended_at_unix.unwrap_or(now_unix), now_unix)?,
         })),
         Operation::RecordSample { sample } => Ok(json!({
             "ok": true,
