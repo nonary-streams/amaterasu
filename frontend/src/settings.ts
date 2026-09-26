@@ -170,7 +170,7 @@ namespace Amaterasu {
     if (!runtime.configuration_ready)
       return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
     if (runtime.enabled !== settings.settings.enabled)
-      return "Saved history settings confirmed. Runtime has not yet reported the saved recording policy.";
+      return "Saved history settings confirmed. Runtime reports a different recording policy from this saved readback; refresh to check the current settings.";
     const policy = runtime.effective_enabled !== runtime.enabled
       ? runtime.enabled
         ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."

@@ -652,8 +652,12 @@ test("history editor confirms deferred toggles, immediate retention and durable 
     ["history/settings_update", { settings: { enabled: false, ttl_days: 3, db_size_limit_mb: 5 }, expected_revision: 6 }],
   ]);
   runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
-  const pending = await context.Amaterasu.readHistorySettingsState(api);
-  assert.match(context.Amaterasu.historySettingsRuntimeDescription(pending.settings, pending.runtime), /has not yet reported/);
+  const mismatch = await context.Amaterasu.readHistorySettingsState(api);
+  const mismatchDescription = context.Amaterasu.historySettingsRuntimeDescription(mismatch.settings, mismatch.runtime);
+  assert.match(mismatchDescription, /different recording policy from this saved readback; refresh to check the current settings/);
+  assert.doesNotMatch(mismatchDescription, /not yet|pending|deferred/);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, disabled.runtime),
+    /different recording policy from this saved readback/);
   runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
   const notReady = context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, {
     ...reloaded.runtime, configuration_ready: false,
