@@ -168,9 +168,14 @@ returns to the local revision and asks the reader to retry. An expired client
 read does not change the catalog reference. Missing local art still uses the
 fixed CDN reference and the UI's existing icon fallback on fetch failure.
 An existing `steam_artwork_cache_root` in trusted startup settings enables a
-four-image disk cache across module restarts. Cache entries are bounded and
-validated before serving, and corrupt entries fall back to the CDN. The host
-must overwrite any package-supplied value with its own dedicated cache root;
+four-image disk cache across module restarts. The provider creates and uses
+only an `amaterasu-steam-artwork-v1` child of that root; it never enumerates or
+removes files in the parent. Cache entries are bounded and validated before
+serving, and corrupt entries fall back to the CDN. The host must overwrite any
+package-supplied value with its own dedicated, access-controlled private root.
+Path checks reject links and reparse points, but filesystem checks cannot
+eliminate races if another process can mutate that root. Without host-enforced
+ownership and access controls, the disk cache must remain disabled;
 until that host injection exists, remote images remain memory cached only.
 Remote images are not converted to PNG.
 Manual mode needs another `force_sync` to reconcile a later promotion; ordinary

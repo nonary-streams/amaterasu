@@ -16,6 +16,7 @@ const MAX_HASH_DIRECTORIES: usize = 32;
 const MAX_DIMENSION_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REMOTE_CACHE_IMAGES: usize = 4;
+const REMOTE_CACHE_DIRECTORY: &str = "amaterasu-steam-artwork-v1";
 const MAX_REMOTE_FAILURES: usize = 64;
 const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
 const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
@@ -127,11 +128,28 @@ fn remote_portrait_url(app_id: u32) -> Option<String> {
 impl RemoteArtworkCache {
     fn with_disk_root(root: Option<PathBuf>) -> Self {
         Self {
-            disk_root: root
-                .and_then(|root| root.canonicalize().ok())
-                .filter(|root| root.is_dir()),
+            disk_root: root.and_then(|root| {
+                if !regular_directory(&root) {
+                    return None;
+                }
+                let parent = root.canonicalize().ok()?;
+                let child = parent.join(REMOTE_CACHE_DIRECTORY);
+                if !child.exists() && fs::create_dir(&child).is_err() {
+                    return None;
+                }
+                (regular_directory(&child) && child.canonicalize().ok().as_ref() == Some(&child))
+                    .then_some(child)
+            }),
             ..Self::default()
         }
+    }
+
+    fn disk_directory_valid(&self) -> bool {
+        self.disk_root.as_ref().is_some_and(|root| {
+            regular_directory(root)
+                && root.canonicalize().ok().as_ref() == Some(root)
+                && root.parent().is_some_and(regular_directory)
+        })
     }
 
     fn read_chunk_with(
@@ -218,7 +236,8 @@ impl RemoteArtworkCache {
     }
 
     fn disk_path(&self, app_id: u32, revision: &str) -> Option<PathBuf> {
-        if app_id == 0
+        if !self.disk_directory_valid()
+            || app_id == 0
             || revision.is_empty()
             || revision.len() > 20
             || !revision.bytes().all(|byte| byte.is_ascii_digit())
@@ -239,18 +258,28 @@ impl RemoteArtworkCache {
         }
         let metadata = fs::symlink_metadata(&path).ok()?;
         if !metadata.is_file()
-            || metadata.file_type().is_symlink()
+            || is_link_or_reparse(&metadata)
             || metadata.len() > MAX_ARTWORK_BYTES
         {
             return None;
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)
-            .ok()?
-            .take(MAX_ARTWORK_BYTES + 1)
+        let file = File::open(&path).ok()?;
+        let opened = file.metadata().ok()?;
+        if !opened.is_file()
+            || opened.len() != metadata.len()
+            || opened.modified().ok() != metadata.modified().ok()
+        {
+            return None;
+        }
+        file.take(MAX_ARTWORK_BYTES + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        (bytes.len() as u64 == metadata.len() && validate_remote_artwork(&bytes)).then_some(bytes)
+        (bytes.len() as u64 == opened.len()
+            && path.canonicalize().ok().as_ref() == Some(&path)
+            && self.disk_directory_valid()
+            && validate_remote_artwork(&bytes))
+        .then_some(bytes)
     }
 
     fn write_disk(&self, app_id: u32, revision: &str, bytes: &[u8]) {
@@ -260,14 +289,9 @@ impl RemoteArtworkCache {
         if !validate_remote_artwork(bytes) || bytes.len() as u64 > MAX_ARTWORK_BYTES {
             return;
         }
-        // A host-owned cache directory is required. Never create a directory at
-        // an untrusted path or follow a preexisting cache entry's symlink.
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && (!metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || path.canonicalize().ok().as_deref() != Some(path.as_path())
-                || fs::remove_file(&path).is_err())
-        {
+        // Existing entries are never removed here. A corrupt file falls back
+        // to the network and cannot authorize deletion of a swapped target.
+        if fs::symlink_metadata(&path).is_ok() {
             return;
         }
         if !self.make_disk_room() {
@@ -324,12 +348,18 @@ impl RemoteArtworkCache {
             let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
                 return false;
             };
-            if metadata.is_file() && !metadata.file_type().is_symlink() {
+            if metadata.is_file()
+                && !is_link_or_reparse(&metadata)
+                && entry.path().canonicalize().ok().as_ref() == Some(&entry.path())
+            {
                 images.push((metadata.modified().unwrap_or(UNIX_EPOCH), entry.path()));
             }
         }
         images.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         while images.len() >= MAX_REMOTE_CACHE_IMAGES {
+            if !self.disk_directory_valid() {
+                return false;
+            }
             if fs::remove_file(images.remove(0).1).is_err() {
                 return false;
             }
@@ -345,6 +375,26 @@ impl RemoteArtworkCache {
         }
         self.failed_until
             .insert(app_id, now + REMOTE_FAILURE_COOLDOWN);
+    }
+}
+
+fn regular_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !is_link_or_reparse(&metadata))
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -1388,7 +1438,10 @@ mod tests {
         first
             .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
             .unwrap();
-        let path = root.0.join(format!("42-{revision}.jpg"));
+        let path = root
+            .0
+            .join(REMOTE_CACHE_DIRECTORY)
+            .join(format!("42-{revision}.jpg"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut restarted = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
@@ -1404,13 +1457,17 @@ mod tests {
         recovered
             .read_chunk_with(42, 123, &revision, 0, now, |_| Ok(bytes.clone()))
             .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt");
         assert_eq!(recovered.images.len(), 1);
     }
 
     #[test]
     fn disk_cache_evicts_old_portraits_and_requires_an_existing_root() {
         let root = TemporaryRoot::new();
+        let unrelated = root
+            .0
+            .join(format!("1-{}.jpg", remote_revision(1, 123).unwrap()));
+        fs::write(&unrelated, b"unrelated parent file").unwrap();
         let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         for app_id in 1..=6 {
             let revision = remote_revision(app_id, 123).unwrap();
@@ -1421,14 +1478,59 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            fs::read_dir(&root.0).unwrap().count(),
+            fs::read_dir(root.0.join(REMOTE_CACHE_DIRECTORY))
+                .unwrap()
+                .count(),
             MAX_REMOTE_CACHE_IMAGES
         );
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated parent file");
         assert!(
             RemoteArtworkCache::with_disk_root(Some(root.0.join("missing")))
                 .disk_root
                 .is_none()
         );
+    }
+
+    #[test]
+    fn disk_cache_rejects_linked_cache_directory_and_entry() {
+        let root = TemporaryRoot::new();
+        let other = TemporaryRoot::new();
+        let child = root.0.join(REMOTE_CACHE_DIRECTORY);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&other.0, &child);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&other.0, &child);
+        if linked.is_err() {
+            return;
+        } // Windows may deny symlink creation to this test user.
+        assert!(
+            RemoteArtworkCache::with_disk_root(Some(root.0.clone()))
+                .disk_root
+                .is_none()
+        );
+        fs::remove_dir(&child).unwrap();
+
+        let mut cache = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
+        let revision = remote_revision(42, 123).unwrap();
+        let target = other.0.join("portrait.jpg");
+        fs::write(&target, synthetic_jpeg(600, 900, 64)).unwrap();
+        let entry = child.join(format!("42-{revision}.jpg"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &entry).unwrap();
+        cache
+            .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| {
+                Ok(synthetic_jpeg(600, 900, 64))
+            })
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(&entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target).unwrap(), synthetic_jpeg(600, 900, 64));
     }
 
     #[test]
