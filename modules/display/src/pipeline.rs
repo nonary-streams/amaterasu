@@ -286,6 +286,7 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
+                let singular_policy = mode_policies.is_none();
                 let policies =
                     match collect_mode_policies(&configuration, mode_policy, mode_policies) {
                         Ok(policies) => policies,
@@ -303,8 +304,12 @@ impl<P: Platform> Pipeline<P> {
                     } else {
                         None
                     };
-                    if let Err(error) = configuration.resolve_mode_policy(&policy, modes.as_deref())
-                    {
+                    let resolution = if singular_policy {
+                        configuration.resolve_mode_policy(&policy, modes.as_deref())
+                    } else {
+                        configuration.resolve_mode_policy_in_batch(&policy, modes.as_deref())
+                    };
+                    if let Err(error) = resolution {
                         return complete(send, context.request, error.payload());
                     }
                 }

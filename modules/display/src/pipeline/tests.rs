@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{Address, DisplayPath, Rational, Signal, Snapshot, SourceMode};
+use crate::model::{Address, DisplayPath, ModePolicy, Rational, Signal, Snapshot, SourceMode};
 
 fn snapshot() -> Snapshot {
     Snapshot {
@@ -92,6 +92,22 @@ fn policy(display_id: &str, resolution: &str, refresh: &str) -> Value {
             "final_refresh_rate": refresh
         }]}
     })
+}
+
+#[test]
+fn public_single_policy_resolution_validates_resulting_configuration() {
+    let mut concrete: Configuration = serde_json::from_value(configuration()).unwrap();
+    let undersized: ModePolicy =
+        serde_json::from_value(policy("monitor.one", "200x100", "120")).unwrap();
+    let error = concrete.resolve_mode_policy(&undersized, None).unwrap_err();
+    assert_eq!(error.code, "invalid_request");
+
+    let mut invalid_input: Configuration = serde_json::from_value(configuration()).unwrap();
+    invalid_input.displays[0].refresh.denominator = 0;
+    let error = invalid_input
+        .resolve_mode_policy(&undersized, None)
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_request");
 }
 fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
     json!({

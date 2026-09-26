@@ -108,6 +108,17 @@ impl Configuration {
         policy: &ModePolicy,
         available_modes: Option<&[AvailableMode]>,
     ) -> Result<(), DisplayError> {
+        self.validate()?;
+        self.resolve_mode_policy_in_batch(policy, available_modes)?;
+        self.validate()
+    }
+
+    /// Resolve one target while the caller owns validation of the complete batch.
+    pub(crate) fn resolve_mode_policy_in_batch(
+        &mut self,
+        policy: &ModePolicy,
+        available_modes: Option<&[AvailableMode]>,
+    ) -> Result<(), DisplayError> {
         let display = self
             .displays
             .iter_mut()
