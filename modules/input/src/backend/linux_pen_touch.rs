@@ -71,6 +71,32 @@ struct ContactTracker {
 }
 
 impl ContactTracker {
+    fn validate_touch_lifecycle(
+        &self,
+        pointer_id: u32,
+        phase: PenTouchPhase,
+        event: &Event,
+    ) -> InputResult<()> {
+        match phase {
+            PenTouchPhase::Down => match self.touches.get(&pointer_id) {
+                Some(touch) if touch.contact.initial_down != *event => {
+                    Err(duplicate_down_mismatch())
+                }
+                Some(_) => Ok(()),
+                None if self.touches.len() >= usize::from(MAX_TOUCH_SLOTS) => Err(InputError::new(
+                    "contact_capacity",
+                    "Linux touchscreen uinput supports at most 10 simultaneous contacts",
+                )),
+                None => Ok(()),
+            },
+            PenTouchPhase::Move | PenTouchPhase::Up | PenTouchPhase::Cancel => self
+                .touches
+                .contains_key(&pointer_id)
+                .then_some(())
+                .ok_or_else(pointer_not_active),
+        }
+    }
+
     fn inject(
         &mut self,
         event: &Event,
@@ -215,22 +241,14 @@ impl ContactTracker {
         event: &Event,
         emit: &mut impl FnMut(Target, &[(u16, u16, i32)], &mut bool) -> InputResult<()>,
     ) -> InputResult<()> {
+        self.validate_touch_lifecycle(pointer_id, phase, event)?;
         match phase {
             PenTouchPhase::Down => {
                 if let Some(touch) = self.touches.get(&pointer_id) {
-                    if touch.contact.initial_down != *event {
-                        return Err(duplicate_down_mismatch());
-                    }
                     if touch.contact.down_written {
                         return Ok(());
                     }
                 } else {
-                    if self.touches.len() >= usize::from(MAX_TOUCH_SLOTS) {
-                        return Err(InputError::new(
-                            "contact_capacity",
-                            "Linux touchscreen uinput supports at most 10 simultaneous contacts",
-                        ));
-                    }
                     let slot = self.allocate_touch_slot()?;
                     // Reserve the exact client identity before writing: a partial
                     // uinput frame can reach the kernel before write reports failure.
@@ -531,14 +549,15 @@ impl LinuxPenTouch {
             }
         }
         if self.touch_write_failed
-            && matches!(
-                event,
-                Event::PenTouch {
-                    device: PenTouchDevice::Touch,
-                    ..
-                }
-            )
+            && let Event::PenTouch {
+                device: PenTouchDevice::Touch,
+                pointer_id,
+                phase,
+                ..
+            } = event
         {
+            self.tracker
+                .validate_touch_lifecycle(*pointer_id, *phase, event)?;
             // A partial frame can corrupt any slot on this shared device.
             // Detach it before replaying every still-active pointer.
             let terminal_pointer = match event {
@@ -967,6 +986,62 @@ mod tests {
             file: std::fs::OpenOptions::new().write(true).open(path).unwrap(),
             created: false,
         }
+    }
+
+    #[test]
+    fn invalid_touch_lifecycle_does_not_drain_pending_device_recovery() {
+        let mut pen_touch = LinuxPenTouch::new();
+        pen_touch.touch_device = Some(fake_device("/dev/full"));
+        let down = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 10, 20);
+        assert!(pen_touch.inject("\0", &down).is_err());
+        let original_contact = pen_touch.tracker.touches.get(&11).unwrap().clone();
+        pen_touch.touch_device.as_mut().unwrap().created = true;
+
+        let mismatched_down = event(11, PenTouchDevice::Touch, PenTouchPhase::Down, 50, 60);
+        for invalid in [
+            event(22, PenTouchDevice::Touch, PenTouchPhase::Move, 10, 20),
+            event(22, PenTouchDevice::Touch, PenTouchPhase::Up, 10, 20),
+            event(22, PenTouchDevice::Touch, PenTouchPhase::Cancel, 10, 20),
+            mismatched_down,
+        ] {
+            assert_eq!(
+                pen_touch.inject("\0", &invalid).unwrap_err().code,
+                "invalid_sequence"
+            );
+            assert!(pen_touch.touch_write_failed);
+            assert!(pen_touch.touch_device.as_ref().unwrap().created);
+            assert_eq!(pen_touch.tracker.touches.len(), 1);
+            let contact = pen_touch.tracker.touches.get(&11).unwrap();
+            assert_eq!(contact.slot, original_contact.slot);
+            assert_eq!(
+                contact.contact.last_event,
+                original_contact.contact.last_event
+            );
+            assert_eq!(
+                contact.contact.down_written,
+                original_contact.contact.down_written
+            );
+            assert_eq!(
+                contact.contact.native_write_attempted,
+                original_contact.contact.native_write_attempted
+            );
+        }
+
+        assert!(
+            pen_touch
+                .tracker
+                .validate_touch_lifecycle(11, PenTouchPhase::Down, &down)
+                .is_ok()
+        );
+        let new_down = event(22, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        assert!(
+            pen_touch
+                .tracker
+                .validate_touch_lifecycle(22, PenTouchPhase::Down, &new_down)
+                .is_ok()
+        );
+        pen_touch.touch_device.as_mut().unwrap().created = false;
+        pen_touch.stop().unwrap();
     }
 
     #[test]
