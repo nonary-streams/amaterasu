@@ -401,6 +401,117 @@ fn continuous_packetizer_pads_partial_pcm_only_when_idle_and_preserves_it() {
 }
 
 #[test]
+fn continuous_packetizer_keeps_device_recovery_pcm_out_of_the_previous_frame() {
+    let format = Format::new(48_000, 2, PCM_F32).unwrap();
+    let mut packetizer = ContinuousPacketizer::new(format, 240).unwrap();
+    let before_loss = [0, 0, 128, 63, 0, 0, 0, 64];
+    let after_recovery = [0, 0, 64, 64, 0, 0, 128, 64];
+    assert!(
+        packetizer
+            .push(Packet {
+                frames: 1,
+                flags: 0,
+                bytes: before_loss.to_vec(),
+                timestamp_us: 1_000,
+                sequence: 0,
+            })
+            .unwrap()
+            .is_empty()
+    );
+
+    let previous = packetizer
+        .push(Packet {
+            frames: 1,
+            flags: AUDIO_DISCONTINUITY,
+            bytes: after_recovery.to_vec(),
+            timestamp_us: 2_000,
+            sequence: 1,
+        })
+        .unwrap();
+    assert_eq!(previous.len(), 1);
+    assert_eq!(&previous[0].bytes[..before_loss.len()], &before_loss);
+    assert!(
+        previous[0].bytes[before_loss.len()..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert_eq!(previous[0].flags & AUDIO_DISCONTINUITY, 0);
+    assert_eq!(previous[0].flags & AUDIO_TIMESTAMP_ESTIMATED, 0);
+
+    let recovered = packetizer.idle(10_000).unwrap();
+    assert_eq!(&recovered.bytes[..after_recovery.len()], &after_recovery);
+    assert!(
+        recovered.bytes[after_recovery.len()..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert_ne!(recovered.flags & AUDIO_DISCONTINUITY, 0);
+    assert_eq!(recovered.flags & AUDIO_TIMESTAMP_ESTIMATED, 0);
+    assert_eq!((previous[0].sequence, recovered.sequence), (0, 1));
+    assert!(recovered.timestamp_us > previous[0].timestamp_us);
+}
+
+#[test]
+fn continuous_partial_pcm_survives_terminal_failure_and_sink_retry_until_close() {
+    let (mut controller, observed) = controller(true);
+    let stream_id = controller
+        .handle("alice", continuous_open(5, "partial-failure"))
+        .unwrap()
+        .created
+        .unwrap();
+    let mut sink = Sink {
+        reject: true,
+        packets: Vec::new(),
+    };
+    let callback = AudioSink {
+        context: (&mut sink as *mut Sink).cast(),
+        write,
+    };
+
+    // The first captured frame is smaller than the configured 240-frame packet.
+    // SAFETY: the sink callback context remains live through every read.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_PENDING
+    );
+    observed.health.lock().unwrap().failure = Some("audio_capture_failed");
+    assert_eq!(
+        controller.status("alice", Some(stream_id))["streams"][0]["state"],
+        "failed"
+    );
+    // SAFETY: the callback may reject this packet and the controller retains it.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BUSY
+    );
+    assert!(sink.packets.is_empty());
+    sink.reject = false;
+    // SAFETY: the retained packet remains owned by the controller during callback.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        STATUS_OK
+    );
+    assert_eq!(sink.packets.len(), 1);
+    assert_eq!(sink.packets[0].1, 240);
+    assert_eq!((sink.packets[0].2, sink.packets[0].3), (100, 0));
+    assert_ne!(sink.packets[0].0 & AUDIO_DISCONTINUITY, 0);
+    assert_eq!(sink.packets[0].0 & AUDIO_TIMESTAMP_ESTIMATED, 0);
+    assert_eq!(sink.packets[0].4, vec![0; 240 * 2 * 4]);
+    // SAFETY: the terminal source failure becomes visible after retained PCM.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_BACKEND_ERROR
+    );
+    controller.close("alice", stream_id).unwrap();
+    assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    // SAFETY: a closed stream owns no pending packet or source.
+    assert_eq!(
+        unsafe { controller.read("alice", stream_id, callback) },
+        MEDIA_CLOSED
+    );
+}
+
+#[test]
 fn continuous_packet_frame_count_truncates_fractional_samples() {
     let format = Format::new(44_100, 2, PCM_F32).unwrap();
     let continuous = ContinuousStream::new(format, ContinuousAudio { packet_ms: 5 }).unwrap();

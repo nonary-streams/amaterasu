@@ -68,6 +68,7 @@ struct StreamOpen {
 struct ContinuousStream {
     packetizer: ContinuousPacketizer,
     ready: VecDeque<Packet>,
+    terminal_failure: Option<&'static str>,
     packet_duration: Duration,
     deadline: Instant,
     started_at: Instant,
@@ -100,6 +101,7 @@ impl ContinuousStream {
         Ok(Self {
             packetizer,
             ready: VecDeque::new(),
+            terminal_failure: None,
             packet_duration,
             deadline: started_at + packet_duration,
             started_at,
@@ -112,8 +114,20 @@ impl ContinuousStream {
             return Ok(Some(packet));
         }
 
-        if let Some(captured) = source.read()? {
-            self.ready.extend(self.packetizer.push(captured)?);
+        if let Some(error) = self.terminal_failure {
+            return Err(error);
+        }
+        match source.read() {
+            Ok(Some(captured)) => self.ready.extend(self.packetizer.push(captured)?),
+            Ok(None) => {}
+            Err(error) => {
+                self.terminal_failure = Some(error);
+                if let Some(packet) = self.packetizer.flush_partial()? {
+                    self.deadline = Instant::now() + self.packet_duration;
+                    return Ok(Some(packet));
+                }
+                return Err(error);
+            }
         }
 
         if let Some(packet) = self.ready.pop_front() {
@@ -164,9 +178,16 @@ impl ContinuousPacketizer {
             return Err("invalid_audio_buffer");
         }
 
+        // Device recovery starts a new capture timeline. Finish the old
+        // partial frame before accepting samples from the recovered device.
+        let mut ready = Vec::new();
+        if packet.flags & amaterasu_media::AUDIO_DISCONTINUITY != 0
+            && let Some(partial) = self.flush_partial()?
+        {
+            ready.push(partial);
+        }
         let mut input_flags = packet.flags & !AUDIO_SILENT;
         let mut offset = 0;
-        let mut ready = Vec::new();
         while offset < packet.bytes.len() {
             if self.pending_bytes.is_empty() {
                 let input_frame_offset = offset / self.block_align;
@@ -201,6 +222,14 @@ impl ContinuousPacketizer {
             }
         }
         Ok(ready)
+    }
+
+    fn flush_partial(&mut self) -> AudioResult<Option<Packet>> {
+        if self.pending_bytes.is_empty() {
+            Ok(None)
+        } else {
+            self.idle(0).map(Some)
+        }
     }
 
     fn idle(&mut self, elapsed_us: u64) -> AudioResult<Packet> {

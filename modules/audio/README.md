@@ -148,6 +148,10 @@ sample in the complete output frame is zero. Full synthetic idle frames use
 elapsed monotonic timestamps and set `AUDIO_TIMESTAMP_ESTIMATED`; partial frames
 retain captured timestamp flags and QPC timing. Output sequence and timestamps
 advance per frame, and capture discontinuity flags are retained.
+When a recovered capture marks a discontinuity, a partial frame from before the
+loss is padded and emitted first; the recovered samples start a new frame.
+Terminal capture failure likewise emits any partial PCM once before reporting
+`MEDIA_BACKEND_ERROR`, including after a sink rejects and retries that packet.
 The packet duration participates in operation retry identity. After close, retry returns
 `stream_closed` and lookup returns `stream_not_found`. Up to 128 operation
 records remain in memory per module instance. There are at most four live
