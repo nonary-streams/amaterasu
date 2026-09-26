@@ -10,6 +10,11 @@ pub(super) enum Step {
     Authenticate,
     MediaReady,
     ApplyLimiter,
+    CheckDisplay,
+    ApplyDisplay,
+    FindDisplay,
+    RestoreDisplay,
+    RecoverDisplay,
     FindLimiter,
     RestoreLimiter,
     AcquireOutput,
@@ -45,6 +50,7 @@ pub(super) struct Job {
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
     pub limiter_tried: bool,
+    pub display_tried: bool,
 }
 
 impl Job {
@@ -61,6 +67,7 @@ impl Job {
             tried: Default::default(),
             input_tried: false,
             limiter_tried: false,
+            display_tried: false,
         }
     }
 
@@ -120,6 +127,19 @@ impl Job {
             }
             self.limiter_tried = true;
         }
+        if !self.display_tried {
+            if record.display_attempted && record.display_lease.is_none() {
+                return Some(Step::FindDisplay);
+            }
+            if record.display_lease.is_some() {
+                return Some(if record.display_state == "recovery_required" {
+                    Step::RecoverDisplay
+                } else {
+                    Step::RestoreDisplay
+                });
+            }
+            self.display_tried = true;
+        }
         if record.resources.contains_key(&Resource::Session) {
             if record
                 .attempted
@@ -159,6 +179,14 @@ impl Job {
             Step::RestoreLimiter => (
                 "amaterasu.frame-limiter/1".into(),
                 json!({"action":"restore","version":1,"lease":record.limiter_lease}),
+            ),
+            Step::CheckDisplay | Step::FindDisplay => {
+                ("amaterasu.display/1".into(), json!({"action":"status"}))
+            }
+            Step::ApplyDisplay => ("amaterasu.display/1".into(), super::display::apply(record)),
+            Step::RestoreDisplay | Step::RecoverDisplay => (
+                "amaterasu.display/1".into(),
+                json!({"action":if self.step == Step::RecoverDisplay {"recover"} else {"restore"},"lease":record.display_lease}),
             ),
             Step::AcquireOutput | Step::AcquireAudio => (
                 Resource::Session.service(),

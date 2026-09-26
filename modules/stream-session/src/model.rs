@@ -106,8 +106,118 @@ pub struct VideoEncryptionPolicySnapshot {
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct DisplayRequest {
+    pub configuration: Value,
+    #[serde(default)]
+    pub mode_policy: Option<Value>,
+    #[serde(default)]
+    pub mode_policies: Option<Vec<Value>>,
+}
+
+impl DisplayRequest {
+    fn validate(&self) -> Result<(), &'static str> {
+        let displays = self
+            .configuration
+            .get("displays")
+            .and_then(Value::as_array)
+            .filter(|displays| !displays.is_empty() && displays.len() <= 16)
+            .ok_or("invalid_display_request")?;
+        if !self.configuration.is_object()
+            || self.mode_policy.is_some() && self.mode_policies.is_some()
+        {
+            return Err("invalid_display_request");
+        }
+        if self
+            .configuration
+            .as_object()
+            .is_none_or(|object| object.len() != 1)
+        {
+            return Err("invalid_display_request");
+        }
+        let identities: Vec<&str> = displays
+            .iter()
+            .map(|display| {
+                let mode = display.get("refresh").ok_or("invalid_display_request")?;
+                if display
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|value| value == 0 || value > u32::MAX as u64)
+                    || display
+                        .get("height")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
+                    || mode
+                        .get("numerator")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
+                    || mode
+                        .get("denominator")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|value| value == 0 || value > u32::MAX as u64)
+                    || display
+                        .get("x")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|value| i32::try_from(value).is_err())
+                    || display
+                        .get("y")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|value| i32::try_from(value).is_err())
+                {
+                    return Err("invalid_display_request");
+                }
+                display
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 4096)
+                    .ok_or("invalid_display_request")
+            })
+            .collect::<Result<_, _>>()?;
+        if identities.iter().enumerate().any(|(index, id)| {
+            identities[..index]
+                .iter()
+                .any(|prior| prior.eq_ignore_ascii_case(id))
+        }) {
+            return Err("invalid_display_request");
+        }
+        let policies: Vec<&Value> = self
+            .mode_policy
+            .iter()
+            .chain(self.mode_policies.iter().flatten())
+            .collect();
+        if policies.iter().any(|policy| {
+            policy
+                .get("display_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| {
+                    !identities
+                        .iter()
+                        .any(|target| target.eq_ignore_ascii_case(id))
+                })
+                || !policy.get("remapping").is_some_and(Value::is_object)
+                || !policy.get("context").is_some_and(|context| {
+                    [
+                        "resolution_is_automatic",
+                        "refresh_rate_is_automatic",
+                        "client_display_mode_override",
+                        "optimize_game_settings",
+                    ]
+                    .iter()
+                    .all(|key| context.get(key).is_some_and(Value::is_boolean))
+                })
+        }) {
+            return Err("invalid_display_request");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareConfig {
     pub peer_ip: IpAddr,
+    /// Complete, frozen display Apply request from the authenticated launch.
+    #[serde(default)]
+    pub display_request: Option<Box<DisplayRequest>>,
     /// Frozen launch policy; retained with the prepared operation for retries.
     #[serde(default)]
     pub frame_limiter_settings: Option<Value>,
@@ -149,6 +259,9 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if let Some(request) = &self.display_request {
+            request.validate()?;
+        }
         self.validate_frame_limiter_snapshot()?;
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");

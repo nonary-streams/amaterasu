@@ -90,6 +90,11 @@ pub struct Broker {
     pub limiter_lease: Option<String>,
     pub limiter_session: Option<String>,
     pub limiter_malformed_status: bool,
+    pub display_lease: Option<String>,
+    pub display_recovery_required: bool,
+    pub display_apply_failure: bool,
+    pub display_restore_failures: usize,
+    pub display_unavailable: bool,
 }
 
 impl Broker {
@@ -227,7 +232,15 @@ impl Broker {
                 let fault = self
                     .fault
                     .as_ref()
-                    .filter(|(service, _)| service == &pending.call.service)
+                    .filter(|(service, _)| {
+                        service == &pending.call.service
+                            || service
+                                == &format!(
+                                    "{}:{}",
+                                    pending.call.service,
+                                    pending.call.payload["action"].as_str().unwrap_or("")
+                                )
+                    })
                     .map(|(_, mode)| *mode);
                 if matches!(fault, Some(Fault::BeforeMutation)) {
                     self.fault = None;
@@ -324,6 +337,9 @@ impl Broker {
         }
         if service == "amaterasu.frame-limiter/1" {
             return self.frame_limiter(action, &call.payload);
+        }
+        if service == "amaterasu.display/1" {
+            return self.display(action, &call.payload);
         }
         if matches!(action, "open" | "create") {
             if self.fail_open.as_deref() == Some(service) {
@@ -449,11 +465,13 @@ impl Broker {
                     "failed"
                 } else if !ready {
                     "discovering"
-                } else if self
-                    .allocations
-                    .keys()
-                    .any(|(provider, _)| provider == "amaterasu.video/1")
-                {
+                } else if self.allocations.keys().any(|(provider, video_key)| {
+                    provider == "amaterasu.video/1"
+                        && key
+                            .1
+                            .strip_suffix("-media-transport")
+                            .is_some_and(|prefix| video_key == &format!("{prefix}-video"))
+                }) {
                     "drained"
                 } else {
                     "sending"
@@ -471,6 +489,37 @@ impl Broker {
             return json!({"ok":true,"streams":[metadata]});
         }
         json!({"ok":true,"stream":id})
+    }
+
+    fn display(&mut self, action: &str, payload: &Value) -> Value {
+        if self.display_unavailable {
+            return error("permission_denied");
+        }
+        match action {
+            "status" => json!({"ok":true,"native_supported":true,"mutation_enabled":true,
+                "state":if self.display_recovery_required {"recovery_required"} else if self.display_lease.is_some() {"leased"} else {"idle"},
+                "owned_by_caller":self.display_lease.is_some(),"lease":self.display_lease}),
+            "apply" => {
+                if self.display_apply_failure {
+                    return error("invalid_configuration");
+                }
+                assert!(self.display_lease.is_none(), "duplicate display Apply");
+                self.display_lease = Some("display-0000000000000001".into());
+                json!({"ok":true,"applied":true,"lease":self.display_lease})
+            }
+            "restore" | "recover" => {
+                if self.display_restore_failures > 0 {
+                    self.display_restore_failures -= 1;
+                    self.display_recovery_required = true;
+                    return json!({"ok":false,"recovery_required":true,"lease":self.display_lease});
+                }
+                assert_eq!(payload["lease"].as_str(), self.display_lease.as_deref());
+                let lease = self.display_lease.take();
+                self.display_recovery_required = false;
+                json!({"ok":true,"restored":true,"lease":lease})
+            }
+            _ => panic!("unexpected display action"),
+        }
     }
 
     fn frame_limiter(&mut self, action: &str, payload: &Value) -> Value {

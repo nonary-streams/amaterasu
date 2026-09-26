@@ -51,6 +51,15 @@ impl Pipeline {
                         job.fail(record, "frame_limiter_apply_uncertain", now);
                         return true;
                     }
+                    if job.step == Step::ApplyDisplay {
+                        let settled = pending.shutdown(send);
+                        if !settled {
+                            record.uncertain = Some(pending);
+                        }
+                        record.display_state = "apply_uncertain".into();
+                        job.fail(record, "display_apply_uncertain", now);
+                        return true;
+                    }
                     record.uncertain = Some(pending);
                     record.plane = None;
                     record.audio_recovery_needed = false;
@@ -79,6 +88,9 @@ impl Pipeline {
                                 | Step::ReleaseInput
                                 | Step::FindLimiter
                                 | Step::RestoreLimiter
+                                | Step::FindDisplay
+                                | Step::RestoreDisplay
+                                | Step::RecoverDisplay
                         ) {
                             self.cleanup_rejected(record, job, send)
                         } else {
@@ -94,6 +106,33 @@ impl Pipeline {
                         }
                         job.step = if job.step == Step::ApplyLimiter {
                             Step::FindLimiter
+                        } else {
+                            Step::AcquireOutput
+                        };
+                        return true;
+                    }
+                    if matches!(job.step, Step::CheckDisplay | Step::ApplyDisplay) {
+                        record.display_state = "runtime_unavailable".into();
+                        if job.step == Step::ApplyDisplay && !pending.admission_rejected() {
+                            job.step = Step::FindDisplay;
+                        } else {
+                            record.display_attempted = false;
+                            job.step = if record.config.frame_limiter_settings.is_some()
+                                && !record.limiter_attempted
+                            {
+                                Step::ApplyLimiter
+                            } else {
+                                Step::AcquireOutput
+                            };
+                        }
+                        return true;
+                    }
+                    if job.step == Step::FindDisplay {
+                        record.display_state = "status_unavailable".into();
+                        job.step = if record.config.frame_limiter_settings.is_some()
+                            && !record.limiter_attempted
+                        {
+                            Step::ApplyLimiter
                         } else {
                             Step::AcquireOutput
                         };
@@ -125,6 +164,9 @@ impl Pipeline {
         }
         if job.step == Step::ApplyLimiter {
             record.limiter_attempted = true;
+        }
+        if job.step == Step::ApplyDisplay {
+            record.display_attempted = true;
         }
         if job.step == Step::AcquireInput {
             record.input_attempted = true;
@@ -201,6 +243,71 @@ impl Pipeline {
             job.step = Step::AcquireOutput;
             return true;
         }
+        if job.step == Step::CheckDisplay {
+            job.step = if payload["ok"] == true
+                && payload["state"] == "idle"
+                && payload["lease"].is_null()
+                && payload["native_supported"] == true
+                && payload["mutation_enabled"] == true
+                && !self
+                    .records
+                    .values()
+                    .any(|other| other.display_attempted || other.display_lease.is_some())
+            {
+                Step::ApplyDisplay
+            } else {
+                record.display_state = if payload["state"] == "idle" {
+                    "unavailable".into()
+                } else {
+                    "busy".into()
+                };
+                if record.config.frame_limiter_settings.is_some() && !record.limiter_attempted {
+                    Step::ApplyLimiter
+                } else {
+                    Step::AcquireOutput
+                }
+            };
+            return true;
+        }
+        if job.step == Step::ApplyDisplay {
+            super::display::accept_apply(record, &payload);
+            if record.display_lease.is_none() {
+                if payload["ok"] == false && payload["recovery_required"] != true {
+                    record.display_attempted = false;
+                    job.step = if record.config.frame_limiter_settings.is_some()
+                        && !record.limiter_attempted
+                    {
+                        Step::ApplyLimiter
+                    } else {
+                        Step::AcquireOutput
+                    };
+                } else {
+                    job.step = Step::FindDisplay;
+                }
+            } else {
+                job.step = if record.config.frame_limiter_settings.is_some()
+                    && !record.limiter_attempted
+                {
+                    Step::ApplyLimiter
+                } else {
+                    Step::AcquireOutput
+                };
+            }
+            return true;
+        }
+        if job.step == Step::FindDisplay {
+            let known = super::display::accept_status(record, &payload);
+            if !known {
+                record.display_state = "status_unverified".into();
+            }
+            job.step =
+                if record.config.frame_limiter_settings.is_some() && !record.limiter_attempted {
+                    Step::ApplyLimiter
+                } else {
+                    Step::AcquireOutput
+                };
+            return true;
+        }
         if payload["ok"] != true {
             if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
             {
@@ -261,13 +368,16 @@ impl Pipeline {
                         record.state = State::Starting;
                         job.deadline = now.saturating_add(15000);
                     }
-                    job.step = if record.config.frame_limiter_settings.is_some()
-                        && !record.limiter_attempted
-                    {
-                        Step::ApplyLimiter
-                    } else {
-                        Step::AcquireOutput
-                    };
+                    job.step =
+                        if record.config.display_request.is_some() && !record.display_attempted {
+                            Step::CheckDisplay
+                        } else if record.config.frame_limiter_settings.is_some()
+                            && !record.limiter_attempted
+                        {
+                            Step::ApplyLimiter
+                        } else {
+                            Step::AcquireOutput
+                        };
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {

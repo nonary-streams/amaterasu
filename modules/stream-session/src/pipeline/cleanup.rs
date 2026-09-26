@@ -12,6 +12,24 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::FindDisplay => {
+                if super::display::accept_status(record, &payload) {
+                    if record.display_lease.is_none() {
+                        job.display_tried = true;
+                    }
+                } else {
+                    record.cleanup_error = Some("display_status_unavailable");
+                    job.display_tried = true;
+                }
+            }
+            Step::RestoreDisplay | Step::RecoverDisplay => {
+                if super::display::accept_restore(record, &payload) {
+                    job.display_tried = true;
+                } else {
+                    record.cleanup_error = Some("display_restore_failed");
+                    job.display_tried = true;
+                }
+            }
             Step::FindLimiter => {
                 super::limiter::accept_status(record, &payload);
                 if record.limiter_lease.is_none() {
@@ -138,6 +156,11 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("component_cleanup_failed");
         match job.step {
+            Step::FindDisplay | Step::RestoreDisplay | Step::RecoverDisplay => {
+                record.cleanup_error = Some("display_cleanup_unavailable");
+                job.display_tried = true;
+                true
+            }
             Step::FindLimiter => {
                 record.cleanup_error = Some("frame_limiter_status_unavailable");
                 job.limiter_tried = true;
@@ -184,6 +207,8 @@ impl Pipeline {
             && record.input_lease.is_none()
             && record.limiter_lease.is_none()
             && !record.limiter_attempted
+            && !record.display_attempted
+            && record.display_lease.is_none()
         {
             record.cleanup_error = None;
             record.outcome

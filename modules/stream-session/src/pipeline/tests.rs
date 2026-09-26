@@ -1,4 +1,5 @@
 mod armed;
+mod display;
 mod harness;
 mod history;
 mod input;

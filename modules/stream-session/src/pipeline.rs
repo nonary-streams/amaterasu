@@ -1,5 +1,6 @@
 mod actions;
 mod cleanup;
+mod display;
 mod history;
 mod input;
 mod lifecycle;
@@ -106,6 +107,31 @@ impl Pipeline {
                 }
             }
         }
+        if let Some(job) = self.job.as_mut()
+            && job.step == Step::ApplyDisplay
+            && let Some(mut pending) = job.pending.take()
+            && let Some(record) = self.records.get_mut(&job.session)
+        {
+            if !pending.was_sent() {
+                record.display_attempted = false;
+            } else {
+                let mut resolved = false;
+                for turn in 0..8 {
+                    match pending.poll(send, turn) {
+                        rpc::Progress::Result(response) => {
+                            display::accept_apply(record, &response);
+                            resolved = pending.release_result(send);
+                            break;
+                        }
+                        rpc::Progress::Waiting => {}
+                        rpc::Progress::Failed | rpc::Progress::Unresolved => break,
+                    }
+                }
+                if !resolved {
+                    settled &= pending.shutdown(send);
+                }
+            }
+        }
         for record in self.records.values_mut() {
             record.plane = None;
             settled &= record.history.shutdown(send);
@@ -113,6 +139,7 @@ impl Pipeline {
                 settled &= pending.shutdown(send);
             }
             settled &= limiter::shutdown(record, send);
+            settled &= display::shutdown(record, send);
         }
         if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
             settled &= pending.shutdown(send);

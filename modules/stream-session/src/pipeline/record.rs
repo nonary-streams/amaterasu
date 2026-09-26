@@ -109,6 +109,9 @@ pub(super) struct Record {
     pub limiter_attempted: bool,
     pub limiter_lease: Option<String>,
     pub limiter_state: String,
+    pub display_attempted: bool,
+    pub display_lease: Option<String>,
+    pub display_state: String,
     pub input_request_started_at: u64,
     pub input_expires_at: u64,
     pub input_renew_at: u64,
@@ -168,6 +171,9 @@ impl Record {
             limiter_attempted: false,
             limiter_lease: None,
             limiter_state: "not_requested".into(),
+            display_attempted: false,
+            display_lease: None,
+            display_state: "not_requested".into(),
             input_request_started_at: 0,
             input_expires_at: 0,
             input_renew_at: 0,
@@ -249,6 +255,14 @@ impl Record {
             "frame_limiter_executable_path": self.config.frame_limiter_executable_path,
             "frame_limiter_state": self.limiter_state,
             "frame_limiter_applied": self.limiter_lease.is_some() && self.limiter_state == "applied",
+            "display_request": self.config.display_request.as_ref().map(|request| {
+                let mut value = json!({"configuration": request.configuration});
+                if let Some(policy) = &request.mode_policy { value["mode_policy"] = policy.clone(); }
+                if let Some(policies) = &request.mode_policies { value["mode_policies"] = json!(policies); }
+                value
+            }),
+            "display_state": self.display_state,
+            "display_applied": self.display_lease.is_some() && self.display_state == "applied",
             "packet_bytes": self.packet_bytes,
             "wire_audio_bytes": self.wire_audio_bytes,
             "control_local": self.control_local,
