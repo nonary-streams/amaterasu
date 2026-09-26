@@ -1140,8 +1140,10 @@ fn crypto_certificate_der(pem: &str) -> Vec<u8> {
 
 struct HostConfigurationHarness {
     actions: Vec<String>,
+    operations: Vec<String>,
     missing_provider: bool,
     ready: bool,
+    revision: u64,
     effective: Value,
     incoming: Option<Response>,
     output: Option<Value>,
@@ -1156,8 +1158,10 @@ impl HostConfigurationHarness {
     fn new(effective: Value) -> Self {
         Self {
             actions: Vec::new(),
+            operations: Vec::new(),
             missing_provider: false,
             ready: true,
+            revision: 4,
             effective,
             incoming: None,
             output: None,
@@ -1207,10 +1211,14 @@ impl HostConfigurationHarness {
     fn send(&mut self, command: Command) -> Transport {
         Ok(match command {
             Command::Request {
-                service, payload, ..
+                service,
+                payload,
+                operation_id,
+                ..
             } if service == "amaterasu.host-configuration/1" => {
                 let action = payload["action"].as_str().unwrap();
                 self.actions.push(action.into());
+                self.operations.push(operation_id);
                 if action == "readiness" && self.missing_provider {
                     Response::error("service_unavailable", "host configuration is missing")
                 } else if action == "readiness" {
@@ -1228,7 +1236,7 @@ impl HostConfigurationHarness {
             },
             Command::TakeResult { request: 71 } => Response::Result {
                 payload: json!({
-                    "ok":true,"ready":true,"revision":4,"effective":self.effective
+                    "ok":true,"ready":true,"revision":self.revision,"effective":self.effective
                 }),
             },
             Command::Request {
@@ -1429,6 +1437,155 @@ fn configured_provider_missing_effective_key_or_certificate_fails_closed() {
         assert_eq!(harness.actions, ["readiness", "get"]);
         assert_eq!(harness.state_requests, 0);
     }
+}
+
+#[test]
+fn missing_first_boot_files_recover_after_revision_change_and_matching_import() {
+    let (directory, effective, configured) = generated_configured_files();
+    std::fs::remove_file(effective["cert"].as_str().unwrap()).unwrap();
+    std::fs::remove_file(effective["pkey"].as_str().unwrap()).unwrap();
+    let mut harness = HostConfigurationHarness::new(effective.clone());
+    harness.revision = 0;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let unavailable = harness.request(&mut pipeline, "console", json!({"action":"identity"}), time);
+    assert_eq!(unavailable["code"], "host_configuration_unavailable");
+    assert!(pipeline.identity.get(time).is_err());
+    assert_eq!(harness.actions, ["readiness", "get"]);
+
+    harness.revision = 1;
+    std::fs::write(
+        effective["cert"].as_str().unwrap(),
+        &configured.certificate_pem,
+    )
+    .unwrap();
+    std::fs::write(
+        effective["pkey"].as_str().unwrap(),
+        &configured.private_key_pem,
+    )
+    .unwrap();
+    harness.enqueue(
+        "console",
+        json!({
+            "action":"import_identity",
+            "certificate_pem":configured.certificate_pem,
+            "private_key_pem":configured.private_key_pem
+        }),
+    );
+    pipeline
+        .tick_at(time, |command| harness.send(command))
+        .unwrap();
+    assert!(
+        harness.output.is_none(),
+        "import waits for the next configuration retry"
+    );
+    for _ in 0..6 {
+        pipeline
+            .tick_at(time + 1, |command| harness.send(command))
+            .unwrap();
+        if harness.output.is_some() {
+            break;
+        }
+    }
+    let imported = harness
+        .output
+        .take()
+        .expect("deferred import must finish after recovery");
+    assert_eq!(imported["ok"], true, "{imported}");
+    assert_eq!(harness.state_writes, 1);
+    assert_eq!(harness.actions, ["readiness", "get", "readiness", "get"]);
+    assert_eq!(harness.operations.len(), 4);
+    assert_ne!(harness.operations[0], harness.operations[2]);
+    assert_ne!(harness.operations[1], harness.operations[3]);
+    assert_eq!(
+        pipeline.identity.get(time + 1).unwrap().certificate(),
+        crypto_certificate_der(&configured.certificate_pem)
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unavailable_configuration_does_not_defer_unauthorized_identity_import() {
+    let mut harness = HostConfigurationHarness::new(json!({}));
+    harness.missing_provider = true;
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let response = harness.request(
+        &mut pipeline,
+        "untrusted",
+        json!({
+            "action":"import_identity",
+            "certificate_pem":HOST_CERT,
+            "private_key_pem":HOST_KEY
+        }),
+        now(),
+    );
+    assert_eq!(response["code"], "host_configuration_unavailable");
+    assert!(pipeline.deferred_import.is_none());
+}
+
+#[test]
+fn refreshed_configuration_revokes_old_tls_identity_when_new_files_are_invalid() {
+    let (directory, effective, configured) = generated_configured_files();
+    let mut harness = HostConfigurationHarness::new(effective);
+    let mut pipeline =
+        Pipeline::with_host_configuration(settings(), Arc::new(Shared::default()), true);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let imported = harness.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"import_identity",
+            "certificate_pem":configured.certificate_pem,
+            "private_key_pem":configured.private_key_pem
+        }),
+        time,
+    );
+    assert_eq!(imported["ok"], true, "{imported}");
+    assert!(pipeline.identity.get(time).is_ok());
+
+    harness.revision = 5;
+    harness.effective["cert"] = "/missing/host-cert.pem".into();
+    pipeline
+        .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+            harness.send(command)
+        })
+        .unwrap();
+    assert!(
+        pipeline
+            .identity
+            .get(time + HOST_CONFIGURATION_REFRESH_SECONDS)
+            .is_err()
+    );
+    pipeline
+        .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+            harness.send(command)
+        })
+        .unwrap();
+    pipeline
+        .tick_at(time + HOST_CONFIGURATION_REFRESH_SECONDS, |command| {
+            harness.send(command)
+        })
+        .unwrap();
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::Failed { .. }
+    ));
+    assert!(
+        pipeline
+            .identity
+            .get(time + HOST_CONFIGURATION_REFRESH_SECONDS)
+            .is_err()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

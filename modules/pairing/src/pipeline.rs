@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const STATE_KEY: &str = "pairing/v1";
 const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
 const HOST_CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
+const HOST_CONFIGURATION_REFRESH_SECONDS: u64 = 2;
+const HOST_CONFIGURATION_MAX_RETRY_SECONDS: u64 = 8;
 
 type Transport = ModuleResult<Response>;
 
@@ -23,6 +25,10 @@ struct Pending {
     state_request: u64,
     stage: Stage,
 }
+struct DeferredImport {
+    response: Response,
+    deadline: Instant,
+}
 enum Stage {
     Loading(Box<Operation>),
     Saving {
@@ -34,8 +40,10 @@ enum Stage {
 pub struct Pipeline {
     engine: Engine,
     pending: Option<Pending>,
+    deferred_import: Option<DeferredImport>,
     identity: Arc<Shared>,
     host_configuration: HostConfigurationState,
+    host_configuration_retry_seconds: u64,
 }
 
 enum HostConfigurationState {
@@ -43,8 +51,13 @@ enum HostConfigurationState {
     Start,
     WaitingReadiness(u64),
     WaitingGet(u64),
-    Ready(Arc<ConfiguredIdentity>),
-    Failed,
+    Ready {
+        identity: Arc<ConfiguredIdentity>,
+        refresh_at: u64,
+    },
+    Failed {
+        retry_at: u64,
+    },
 }
 
 impl Pipeline {
@@ -71,8 +84,10 @@ impl Pipeline {
         Self {
             engine: Engine::new(settings),
             pending: None,
+            deferred_import: None,
             identity,
             host_configuration,
+            host_configuration_retry_seconds: 1,
         }
     }
 
@@ -95,7 +110,12 @@ impl Pipeline {
     ) -> ModuleResult<()> {
         let result = match self.advance_host_configuration(now, &mut send) {
             Ok(true) => self.drive(now, &mut send),
-            Ok(false) if matches!(&self.host_configuration, HostConfigurationState::Failed) => {
+            Ok(false)
+                if matches!(
+                    &self.host_configuration,
+                    HostConfigurationState::Failed { .. }
+                ) =>
+            {
                 self.reject_unconfigured(&mut send)
             }
             Ok(false) => Ok(()),
@@ -113,17 +133,28 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
         match &self.host_configuration {
-            HostConfigurationState::Disabled | HostConfigurationState::Ready(_) => return Ok(true),
-            HostConfigurationState::Failed
-            | HostConfigurationState::WaitingReadiness(_)
-            | HostConfigurationState::WaitingGet(_) => {}
-            HostConfigurationState::Start => {
-                self.host_configuration = match request_host_configuration("readiness", send) {
-                    Ok(Some(request)) => HostConfigurationState::WaitingReadiness(request),
-                    _ => HostConfigurationState::Failed,
-                };
-                return Ok(false);
+            HostConfigurationState::Disabled => return Ok(true),
+            HostConfigurationState::Ready { refresh_at, .. } if now < *refresh_at => {
+                return Ok(true);
             }
+            HostConfigurationState::Failed { retry_at } if now < *retry_at => return Ok(false),
+            HostConfigurationState::Ready { .. } | HostConfigurationState::Failed { .. } => {
+                self.identity.invalidate();
+                self.host_configuration = HostConfigurationState::Start;
+            }
+            HostConfigurationState::WaitingReadiness(_) | HostConfigurationState::WaitingGet(_) => {
+            }
+            HostConfigurationState::Start => {}
+        }
+        if matches!(&self.host_configuration, HostConfigurationState::Start) {
+            self.host_configuration = match self.request_host_configuration("readiness", send) {
+                Ok(Some(request)) => HostConfigurationState::WaitingReadiness(request),
+                _ => {
+                    self.fail_host_configuration(now);
+                    return Ok(false);
+                }
+            };
+            return Ok(false);
         }
 
         let request = match &self.host_configuration {
@@ -139,61 +170,112 @@ impl Pipeline {
             Ok(Response::Pending) => Ok(false),
             Ok(Response::Result { payload }) if waiting_for_readiness => {
                 if payload["ok"] != true || payload["ready"] != true {
-                    self.fail_host_configuration();
+                    self.fail_host_configuration(now);
                     return Ok(false);
                 }
-                self.host_configuration = match request_host_configuration("get", send) {
+                self.host_configuration = match self.request_host_configuration("get", send) {
                     Ok(Some(request)) => HostConfigurationState::WaitingGet(request),
-                    _ => HostConfigurationState::Failed,
+                    _ => {
+                        self.fail_host_configuration(now);
+                        return Ok(false);
+                    }
                 };
                 Ok(false)
             }
             Ok(Response::Result { payload }) => {
                 let Some(revision) = payload["revision"].as_u64() else {
-                    self.fail_host_configuration();
+                    self.fail_host_configuration(now);
                     return Ok(false);
                 };
                 if payload["ok"] != true || payload["ready"] != true {
-                    self.fail_host_configuration();
+                    self.fail_host_configuration(now);
                     return Ok(false);
                 }
                 let Some(certificate_path) = payload["effective"]["cert"].as_str() else {
-                    self.fail_host_configuration();
+                    self.fail_host_configuration(now);
                     return Ok(false);
                 };
                 let Some(private_key_path) = payload["effective"]["pkey"].as_str() else {
-                    self.fail_host_configuration();
+                    self.fail_host_configuration(now);
                     return Ok(false);
                 };
                 match ConfiguredIdentity::load(certificate_path, private_key_path, revision, now) {
                     Ok(identity) => {
-                        self.host_configuration = HostConfigurationState::Ready(Arc::new(identity));
+                        self.host_configuration = HostConfigurationState::Ready {
+                            identity: Arc::new(identity),
+                            refresh_at: now.saturating_add(HOST_CONFIGURATION_REFRESH_SECONDS),
+                        };
+                        self.host_configuration_retry_seconds = 1;
                         Ok(true)
                     }
                     Err(_) => {
-                        self.fail_host_configuration();
+                        self.fail_host_configuration(now);
                         Ok(false)
                     }
                 }
             }
             _ => {
-                self.fail_host_configuration();
+                self.fail_host_configuration(now);
                 Ok(false)
             }
         }
     }
 
-    fn fail_host_configuration(&mut self) {
-        self.host_configuration = HostConfigurationState::Failed;
+    fn fail_host_configuration(&mut self, now: u64) {
+        self.host_configuration = HostConfigurationState::Failed {
+            retry_at: now.saturating_add(self.host_configuration_retry_seconds),
+        };
+        self.host_configuration_retry_seconds =
+            (self.host_configuration_retry_seconds * 2).min(HOST_CONFIGURATION_MAX_RETRY_SECONDS);
         self.identity.invalidate();
+    }
+
+    fn request_host_configuration(
+        &mut self,
+        action: &str,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<Option<u64>> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "host configuration entropy unavailable")?;
+        match send(Command::Request {
+            service: HOST_CONFIGURATION_SERVICE.into(),
+            payload: json!({"action": action}),
+            timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
+            operation_id: format!(
+                "pairing.host-configuration.{action}.{}",
+                u128::from_le_bytes(nonce)
+            ),
+            parent: None,
+        })? {
+            Response::Accepted { id } => Ok(Some(id)),
+            _ => Ok(None),
+        }
     }
 
     fn reject_unconfigured(
         &mut self,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if let Some(deferred) = &self.deferred_import {
+            if Instant::now() < deferred.deadline {
+                return Ok(());
+            }
+            let deferred = self.deferred_import.take().unwrap();
+            let Response::Request { id, .. } = deferred.response else {
+                unreachable!()
+            };
+            return complete(send, id, error("host_configuration_unavailable"));
+        }
         match send(Command::Poll {})? {
             Response::Pending => Ok(()),
+            response if self.authorized_import_for_retry(&response) => {
+                let Response::Request { remaining_ms, .. } = &response else {
+                    unreachable!()
+                };
+                let deadline = Instant::now() + Duration::from_millis((*remaining_ms).min(30_000));
+                self.deferred_import = Some(DeferredImport { response, deadline });
+                Ok(())
+            }
             Response::Request { id, service, .. } if service == SERVICE => {
                 complete(send, id, error("host_configuration_unavailable"))
             }
@@ -202,13 +284,53 @@ impl Pipeline {
         }
     }
 
+    fn authorized_import_for_retry(&self, response: &Response) -> bool {
+        let Response::Request {
+            caller,
+            service,
+            payload,
+            ..
+        } = response
+        else {
+            return false;
+        };
+        if service != SERVICE || payload["action"] != "import_identity" {
+            return false;
+        }
+        if serde_json::to_vec(payload).map_or(true, |bytes| bytes.len() > 12_000) {
+            return false;
+        }
+        let Ok(operation) = serde_json::from_value::<Operation>(payload.clone()) else {
+            return false;
+        };
+        self.engine.admit(caller, &operation).is_ok()
+    }
+
     fn drive(&mut self, now: u64, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(pending) = self.pending.take() {
             return self.advance(pending, now, &mut send);
         }
         // One request at a time: state CAS operations cannot race internally and
         // identity writes and pairing commits are serialized without stale caches.
-        match send(Command::Poll {})? {
+        let incoming = match self.deferred_import.take() {
+            Some(deferred) if Instant::now() < deferred.deadline => {
+                let Response::Request { id, .. } = &deferred.response else {
+                    unreachable!()
+                };
+                if !matches!(send(Command::CheckRequest { request: *id })?, Response::Ok) {
+                    return Ok(());
+                }
+                deferred.response
+            }
+            Some(deferred) => {
+                let Response::Request { id, .. } = deferred.response else {
+                    unreachable!()
+                };
+                return complete(&mut send, id, error("host_configuration_unavailable"));
+            }
+            None => send(Command::Poll {})?,
+        };
+        match incoming {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
@@ -230,8 +352,16 @@ impl Pipeline {
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
                 }
-                if self.configured_identity().is_some()
-                    && matches!(&operation, Operation::ImportIdentity { .. })
+                if let (
+                    Some(configured_identity),
+                    Operation::ImportIdentity {
+                        certificate_pem,
+                        private_key_pem,
+                        ..
+                    },
+                ) = (self.configured_identity(), &operation)
+                    && (certificate_pem != &configured_identity.certificate_pem
+                        || private_key_pem != &configured_identity.private_key_pem)
                 {
                     return complete(
                         &mut send,
@@ -393,7 +523,10 @@ impl Pipeline {
         };
         if self.configured_identity().is_some()
             && document.identity.is_none()
-            && !matches!(&operation, Operation::Initialize {})
+            && !matches!(
+                &operation,
+                Operation::Initialize {} | Operation::ImportIdentity { .. }
+            )
         {
             self.publish_identity(revision, loaded)?;
             return complete(send, request.id, error("not_initialized"));
@@ -508,10 +641,11 @@ impl Pipeline {
         now: u64,
     ) -> Result<Option<Arc<Snapshot>>, &'static str> {
         match &self.host_configuration {
-            HostConfigurationState::Ready(configured_identity) => {
-                Snapshot::prepare_with_configured_identity(document, now, configured_identity)
-                    .map(Some)
-            }
+            HostConfigurationState::Ready {
+                identity: configured_identity,
+                ..
+            } => Snapshot::prepare_with_configured_identity(document, now, configured_identity)
+                .map(Some),
             HostConfigurationState::Disabled => Snapshot::prepare(document, now),
             _ => Err("host_configuration_unavailable"),
         }
@@ -519,7 +653,10 @@ impl Pipeline {
 
     fn configured_identity(&self) -> Option<&ConfiguredIdentity> {
         match &self.host_configuration {
-            HostConfigurationState::Ready(configured_identity) => Some(configured_identity),
+            HostConfigurationState::Ready {
+                identity: configured_identity,
+                ..
+            } => Some(configured_identity),
             _ => None,
         }
     }
@@ -530,9 +667,10 @@ impl Pipeline {
         snapshot: Option<Arc<Snapshot>>,
     ) -> Result<(), &'static str> {
         let configuration_revision = match &self.host_configuration {
-            HostConfigurationState::Ready(configured_identity) => {
-                configured_identity.provider_revision
-            }
+            HostConfigurationState::Ready {
+                identity: configured_identity,
+                ..
+            } => configured_identity.provider_revision,
             HostConfigurationState::Disabled => 0,
             _ => return Err("host_configuration_unavailable"),
         };
@@ -541,22 +679,6 @@ impl Pipeline {
             configuration_revision,
             snapshot,
         )
-    }
-}
-
-fn request_host_configuration(
-    action: &str,
-    send: &mut impl FnMut(Command) -> Transport,
-) -> ModuleResult<Option<u64>> {
-    match send(Command::Request {
-        service: HOST_CONFIGURATION_SERVICE.into(),
-        payload: json!({"action": action}),
-        timeout_ms: HOST_CONFIGURATION_TIMEOUT_MS,
-        operation_id: format!("pairing.host-configuration.{action}"),
-        parent: None,
-    })? {
-        Response::Accepted { id } => Ok(Some(id)),
-        _ => Ok(None),
     }
 }
 
