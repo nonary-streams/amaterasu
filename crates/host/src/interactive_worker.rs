@@ -313,7 +313,7 @@ struct Worker {
 impl Worker {
     fn start(root: &Path, digest: &str, session_id: u32) -> PackageResult<Self> {
         let user_token = UserToken::for_session(session_id)?;
-        let prepared = crate::state_root::prepare(root, user_token.handle)?;
+        let prepared = crate::state_root::prepare(root, digest, user_token.handle)?;
         let primary_token = user_token.duplicate_primary()?;
         let environment = UserEnvironment::for_token(primary_token.handle)?;
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;

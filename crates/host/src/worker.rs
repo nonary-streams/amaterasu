@@ -163,7 +163,14 @@ fn development_state_root(root: &Path) -> PackageResult<std::path::PathBuf> {
     }
     let state_root = root.join("data").join("state");
     amaterasu_package::create_private_directory(&state_root)?;
-    state_root.canonicalize().map_err(|error| error.to_string())
+    let state_root = state_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    if let Some(active) = crate::loading::management_tls::active_file_names(&bootstrap.policy)? {
+        crate::state_root::protect_development_files(root, &state_root, &active)?;
+    }
+    Ok(state_root)
 }
 
 enum StartupProgress {
@@ -227,6 +234,8 @@ pub fn serve_interactive(
     // Its stdout is a single inherited, write-only pipe to the Session 0
     // supervisor. It carries the exact bounded startup proof and is not a
     // console or a capability channel.
+    #[cfg(windows)]
+    crate::state_root::apply_staged_tls(root, state_root)?;
     #[cfg(windows)]
     if let Some(seed) = seed {
         crate::state_root::apply_pending_seed(seed, state_root)?;

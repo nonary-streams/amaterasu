@@ -12,7 +12,10 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+mod management_tls;
 mod seed;
+pub(crate) use management_tls::apply_staged_tls;
+pub(crate) use management_tls::protect_development_files;
 pub(crate) use seed::apply_pending_seed;
 
 const TOKEN_USER: u32 = 1;
@@ -194,8 +197,166 @@ fn validate_owner(path: &Path, allowed_sids: &[&str]) -> PackageResult<()> {
     Ok(())
 }
 
+/// Check provisioned browser TLS material without changing its security descriptor.
+/// Every ancestor is checked by the loading boundary before this call.
+pub(crate) fn validate_management_tls_acl(path: &Path) -> PackageResult<()> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the process pseudo-handle is valid; the returned token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) } == 0 {
+        return Err("management TLS worker token is unavailable".into());
+    }
+    let sid = sid_string(token);
+    // SAFETY: OpenProcessToken returned this owned token handle.
+    unsafe { CloseHandle(token) };
+    let sid = sid?;
+    validate_tls_acl(
+        path,
+        &[&sid, "S-1-5-18"],
+        &[
+            (&sid, FILE_ALL_ACCESS),
+            ("S-1-5-18", FILE_ALL_ACCESS),
+            ("S-1-5-32-544", FILE_ALL_ACCESS),
+        ],
+        false,
+    )
+}
+
+fn set_tls_stage_dacl(path: &Path, sid: &str) -> PackageResult<()> {
+    let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;{sid})");
+    apply_dacl(path, &sddl)?;
+    validate_tls_stage_acl(path, sid)
+}
+
+fn validate_tls_stage_acl(path: &Path, sid: &str) -> PackageResult<()> {
+    validate_tls_acl(
+        path,
+        &["S-1-5-18"],
+        &[
+            (sid, 0x8000_0000),
+            ("S-1-5-18", FILE_ALL_ACCESS),
+            ("S-1-5-32-544", FILE_ALL_ACCESS),
+        ],
+        false,
+    )
+}
+
+fn validate_machine_tls_acl(path: &Path) -> PackageResult<()> {
+    validate_tls_acl(
+        path,
+        &["S-1-5-18", "S-1-5-32-544"],
+        &[
+            ("S-1-5-18", FILE_ALL_ACCESS),
+            ("S-1-5-32-544", FILE_ALL_ACCESS),
+        ],
+        false,
+    )
+}
+
+fn validate_inherited_machine_tls_file_acl(path: &Path) -> PackageResult<()> {
+    validate_tls_acl(
+        path,
+        &["S-1-5-18", "S-1-5-32-544"],
+        &[
+            ("S-1-5-18", FILE_ALL_ACCESS),
+            ("S-1-5-32-544", FILE_ALL_ACCESS),
+        ],
+        true,
+    )
+}
+
+fn validate_tls_acl(
+    path: &Path,
+    owners: &[&str],
+    expected: &[(&str, u32)],
+    inherited: bool,
+) -> PackageResult<()> {
+    validate_owner(path, owners)?;
+    let path_wide = wide(path.as_os_str())?;
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: path is NUL-terminated. The descriptor owns dacl until LocalFree.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || dacl.is_null() {
+        return Err("management TLS ACL is unavailable".into());
+    }
+    let result = validate_management_tls_descriptor(descriptor, dacl, expected, inherited);
+    // SAFETY: GetNamedSecurityInfoW allocated this descriptor.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
+fn validate_management_tls_descriptor(
+    descriptor: *const c_void,
+    dacl: *const c_void,
+    expected: &[(&str, u32)],
+    inherited: bool,
+) -> PackageResult<()> {
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: descriptor remains live through this function.
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+        || (control & SE_DACL_PROTECTED != 0) == inherited
+    {
+        return Err("management TLS ACL is not protected".into());
+    }
+    let mut information = AclSizeInformation {
+        ace_count: 0,
+        acl_bytes_in_use: 0,
+        acl_bytes_free: 0,
+    };
+    // SAFETY: dacl belongs to the live descriptor; information is writable.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut information as *mut AclSizeInformation).cast(),
+            std::mem::size_of::<AclSizeInformation>() as u32,
+            2,
+        )
+    } == 0
+        || information.ace_count as usize != expected.len()
+    {
+        return Err("management TLS ACL has unexpected entries".into());
+    }
+    for (expected_sid, expected_mask) in expected {
+        let expected_sid = sid_from_string(expected_sid)?;
+        let found = (0..information.ace_count).any(|index| {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: index is below the ACL-reported count.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return false;
+            }
+            // SAFETY: GetAce returned a complete ACE with a fixed header.
+            let allowed = unsafe { &*(ace.cast::<AccessAllowedAce>()) };
+            allowed.header.ace_type == ACCESS_ALLOWED_ACE_TYPE
+                && (allowed.header.ace_flags & 0x10 != 0) == inherited
+                && allowed.access_mask == *expected_mask
+                // SAFETY: the SID begins at sid_start in AccessAllowedAce.
+                && unsafe { EqualSid((&allowed.sid_start as *const u32).cast(), expected_sid.0) } != 0
+        });
+        if !found {
+            return Err("management TLS ACL grants an unexpected principal".into());
+        }
+    }
+    Ok(())
+}
+
 /// Prepares a user root and a separate SID-readable migration snapshot.
-pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PreparedUserState> {
+pub(crate) fn prepare(
+    root: &Path,
+    digest: &str,
+    token: *mut c_void,
+) -> PackageResult<PreparedUserState> {
     let root = canonical_real_directory(root, "runtime root")?;
     ensure_machine_private(&root)?;
     let sid = sid_string(token)?;
@@ -220,6 +381,23 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<Prepared
     if !existing {
         destination = materialize_empty(&container, &destination, &sid)?;
     }
+
+    let bootstrap: amaterasu_package::BootstrapConfig =
+        amaterasu_package::read_json(&root.join("bootstrap.json"))?;
+    let package = amaterasu_package::verify_package(
+        &amaterasu_package::package_directory(&root, digest)?,
+        &bootstrap,
+        amaterasu_package::VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now: amaterasu_package::unix_timestamp(),
+        },
+    )?;
+    if package.digest != digest || !package.signed {
+        return Err("selected management TLS package is not authenticated".into());
+    }
+    let active_tls = crate::loading::management_tls::active_file_names(&package.runtime_config)?;
+    management_tls::stage_for_user(&root, &container, &sid, active_tls.as_ref())?;
 
     // The service never writes through an existing SID-controlled tree.
     // It stages under a SYSTEM-only parent; the worker applies the snapshot.
@@ -528,6 +706,11 @@ fn sid_string(token: *mut c_void) -> PackageResult<String> {
 }
 
 fn set_dacl(path: &Path, sddl: &str) -> PackageResult<()> {
+    apply_dacl(path, sddl)?;
+    validate_dacl(path, sddl)
+}
+
+fn apply_dacl(path: &Path, sddl: &str) -> PackageResult<()> {
     let sddl_wide = wide(OsStr::new(sddl))?;
     let path_wide = wide(path.as_os_str())?;
     let mut descriptor = std::ptr::null_mut();
@@ -553,7 +736,7 @@ fn set_dacl(path: &Path, sddl: &str) -> PackageResult<()> {
     if applied == 0 {
         return Err("state root ACL could not be applied".into());
     }
-    validate_dacl(path, sddl)
+    Ok(())
 }
 
 /// Reads the effective descriptor back from the filesystem and accepts only

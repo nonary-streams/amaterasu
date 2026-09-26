@@ -10,6 +10,8 @@ use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
 
+pub(crate) mod management_tls;
+
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 const STEAM_COMPONENT: &str = "amaterasu.steam";
 
@@ -58,6 +60,14 @@ impl LoadedComponents {
             .any(|component| component.id == HOST_CONFIGURATION_COMPONENT)
         {
             inject_host_configuration_root(&mut runtime_config, &state_root_string)?;
+        }
+        if package
+            .manifest
+            .components
+            .iter()
+            .any(|component| component.id == "amaterasu.management")
+        {
+            management_tls::validate(&mut runtime_config, &state_root)?;
         }
         if package
             .manifest
