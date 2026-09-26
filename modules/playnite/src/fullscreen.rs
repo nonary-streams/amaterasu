@@ -99,6 +99,11 @@ pub struct FullscreenSessions {
     by_ticket: BTreeMap<String, Session>,
 }
 
+struct StartOptions {
+    focus_policy: FocusPolicy,
+    now: Instant,
+}
+
 impl FullscreenSessions {
     pub fn active_count(&self) -> usize {
         self.by_ticket
@@ -182,8 +187,21 @@ impl FullscreenSessions {
             poll_watch_events(session, now, processes);
             match session.state {
                 State::Starting => {
-                    if let Some(fullscreen_process) = new_fullscreen_candidate(session, processes) {
-                        track_fullscreen_process(session, fullscreen_process, now);
+                    if let Some(fullscreen_processes) = exact_fullscreen_processes_if_due(
+                        session,
+                        now,
+                        &mut scan_fullscreen_processes,
+                    ) {
+                        if let Some(fullscreen_process) =
+                            new_fullscreen_candidate(session, &fullscreen_processes)
+                        {
+                            track_fullscreen_process(session, fullscreen_process, now);
+                        } else if !fullscreen_processes.is_empty() {
+                            session.transition(State::CleanupFailed, now);
+                        } else if now.saturating_duration_since(session.started_at) >= START_TIMEOUT
+                        {
+                            session.transition(State::LaunchFailed, now);
+                        }
                     } else if now.saturating_duration_since(session.started_at) >= START_TIMEOUT {
                         session.transition(State::LaunchFailed, now);
                     }
@@ -209,6 +227,7 @@ impl FullscreenSessions {
                             &validate_installation,
                             &mut launch,
                             processes,
+                            &mut scan_fullscreen_processes,
                         );
                     } else if !tracked_fullscreen_process_is_running(session, processes) {
                         // Without an authenticated game handoff, disappearance
@@ -218,13 +237,22 @@ impl FullscreenSessions {
                 }
                 State::Playing => {
                     if session.fullscreen_process.is_none()
-                        && let Some(fullscreen_process) =
-                            new_fullscreen_candidate(session, processes)
+                        && let Some(fullscreen_processes) = exact_fullscreen_processes_if_due(
+                            session,
+                            now,
+                            &mut scan_fullscreen_processes,
+                        )
                     {
-                        // A handoff may precede discovery. Track the ticket's
-                        // post-baseline process for later stop, without focusing
-                        // the UI over the active game.
-                        session.fullscreen_process = Some(fullscreen_process);
+                        if let Some(fullscreen_process) =
+                            new_fullscreen_candidate(session, &fullscreen_processes)
+                        {
+                            // A handoff may precede discovery. Claim a unique
+                            // post-baseline process from the complete scan, but
+                            // do not focus the UI over the active game.
+                            session.fullscreen_process = Some(fullscreen_process);
+                        } else if !fullscreen_processes.is_empty() {
+                            session.transition(State::CleanupFailed, now);
+                        }
                     }
                     if session.playnite_exiting {
                         if playnite_exit_is_confirmed(session, now, &mut scan_fullscreen_processes)
@@ -239,12 +267,23 @@ impl FullscreenSessions {
                             &validate_installation,
                             &mut launch,
                             processes,
+                            &mut scan_fullscreen_processes,
                         );
                     }
                 }
                 State::LaunchFailed => {
-                    if let Some(fullscreen_process) = new_fullscreen_candidate(session, processes) {
-                        track_fullscreen_process(session, fullscreen_process, now);
+                    if let Some(fullscreen_processes) = exact_fullscreen_processes_if_due(
+                        session,
+                        now,
+                        &mut scan_fullscreen_processes,
+                    ) {
+                        if let Some(fullscreen_process) =
+                            new_fullscreen_candidate(session, &fullscreen_processes)
+                        {
+                            track_fullscreen_process(session, fullscreen_process, now);
+                        } else if !fullscreen_processes.is_empty() {
+                            session.transition(State::CleanupFailed, now);
+                        }
                     }
                 }
                 State::CleanupFailed => {
@@ -274,26 +313,20 @@ impl FullscreenSessions {
                         None
                     };
                     if session.fullscreen_process.is_none()
-                        && let Some(fullscreen_process) =
-                            new_fullscreen_candidate(session, processes).or_else(|| {
-                                exact_process_scan
-                                    .as_ref()
-                                    .and_then(Option::as_deref)
-                                    .and_then(|scan| new_fullscreen_candidate(session, scan))
-                            })
+                        && let Some(Some(scan)) = &exact_process_scan
                     {
-                        session.fullscreen_process = Some(fullscreen_process);
+                        session.fullscreen_process = new_fullscreen_candidate(session, scan);
                     }
                     let tracked_processes = session
                         .fullscreen_process
                         .as_ref()
-                        .filter(|expected| match &exact_process_scan {
-                            Some(Some(scan)) => {
-                                scan.iter().any(|process| process.same_identity(expected))
-                            }
-                            Some(None) | None => processes
-                                .iter()
-                                .any(|process| process.same_identity(expected)),
+                        .filter(|expected| {
+                            exact_process_scan
+                                .as_ref()
+                                .and_then(Option::as_ref)
+                                .is_some_and(|scan| {
+                                    scan.iter().any(|process| process.same_identity(expected))
+                                })
                         })
                         .cloned()
                         .into_iter()
@@ -362,16 +395,34 @@ impl FullscreenSessions {
         processes: &[ProcessImage],
         focus_policy: FocusPolicy,
     ) -> Value {
-        self.start_with(
-            operation_id,
-            installation,
-            processes,
-            focus_policy,
-            Instant::now(),
-            Installation::launch_fullscreen,
-        )
+        #[cfg(test)]
+        {
+            self.start_with(
+                operation_id,
+                installation,
+                processes,
+                focus_policy,
+                Instant::now(),
+                Installation::launch_fullscreen,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            self.start_with_scanner(
+                operation_id,
+                installation,
+                processes,
+                StartOptions {
+                    focus_policy,
+                    now: Instant::now(),
+                },
+                Installation::processes_with_fullscreen_image,
+                Installation::launch_fullscreen,
+            )
+        }
     }
 
+    #[cfg(test)]
     fn start_with(
         &mut self,
         operation_id: &str,
@@ -381,6 +432,34 @@ impl FullscreenSessions {
         now: Instant,
         launch: impl FnOnce(&Installation) -> Result<ProcessImage, &'static str>,
     ) -> Value {
+        self.start_with_scanner(
+            operation_id,
+            installation,
+            processes,
+            StartOptions { focus_policy, now },
+            |installation| {
+                Some(
+                    installation
+                        .fullscreen_processes(processes)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                )
+            },
+            launch,
+        )
+    }
+
+    fn start_with_scanner(
+        &mut self,
+        operation_id: &str,
+        installation: Option<Installation>,
+        processes: &[ProcessImage],
+        options: StartOptions,
+        scan_fullscreen_processes: impl FnOnce(&Installation) -> Option<Vec<ProcessImage>>,
+        launch: impl FnOnce(&Installation) -> Result<ProcessImage, &'static str>,
+    ) -> Value {
+        let StartOptions { focus_policy, now } = options;
         self.prune(now);
         if !valid_operation_id(operation_id) {
             return crate::launch::not_started_error("invalid_request");
@@ -401,6 +480,9 @@ impl FullscreenSessions {
         if !installation.matches_running_processes(processes) {
             return crate::launch::not_started_error("playnite_installation_mismatch");
         }
+        let Some(launch_baseline) = scan_fullscreen_processes(&installation) else {
+            return crate::launch::not_started_error("fullscreen_process_scan_failed");
+        };
         let ticket = match new_ticket() {
             Ok(ticket) => ticket,
             Err(code) => return crate::launch::not_started_error(code),
@@ -410,11 +492,6 @@ impl FullscreenSessions {
             Ok(_) => return crate::launch::not_started_error("fullscreen_launch_failed"),
             Err(code) => return crate::launch::not_started_error(code),
         };
-        let launch_baseline = installation
-            .fullscreen_processes(processes)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
         let watch_processes = installation
             .processes_for_installation(processes)
             .into_iter()
@@ -499,40 +576,16 @@ impl FullscreenSessions {
         &mut self,
         ticket: &str,
         exit_timeout_seconds: u64,
-        processes: &[ProcessImage],
+        _processes: &[ProcessImage],
     ) -> Value {
-        self.stop_with(
-            ticket,
-            exit_timeout_seconds,
-            processes,
-            Installation::request_fullscreen_close,
-        )
+        self.stop_with(ticket, exit_timeout_seconds)
     }
 
-    fn stop_with(
-        &mut self,
-        ticket: &str,
-        exit_timeout_seconds: u64,
-        processes: &[ProcessImage],
-        request_close: impl FnOnce(&Installation, &[ProcessImage]) -> Result<usize, &'static str>,
-    ) -> Value {
-        self.stop_with_at(
-            ticket,
-            exit_timeout_seconds,
-            processes,
-            Instant::now(),
-            request_close,
-        )
+    fn stop_with(&mut self, ticket: &str, exit_timeout_seconds: u64) -> Value {
+        self.stop_with_at(ticket, exit_timeout_seconds, Instant::now())
     }
 
-    fn stop_with_at(
-        &mut self,
-        ticket: &str,
-        exit_timeout_seconds: u64,
-        processes: &[ProcessImage],
-        now: Instant,
-        request_close: impl FnOnce(&Installation, &[ProcessImage]) -> Result<usize, &'static str>,
-    ) -> Value {
+    fn stop_with_at(&mut self, ticket: &str, exit_timeout_seconds: u64, now: Instant) -> Value {
         self.prune(Instant::now());
         if !valid_ticket(ticket) || exit_timeout_seconds > MAX_EXIT_TIMEOUT_SECONDS {
             return error("invalid_request");
@@ -541,11 +594,6 @@ impl FullscreenSessions {
             return error("launch_not_found");
         };
         if !session.state.terminal() && session.state != State::Stopping {
-            if session.fullscreen_process.is_none()
-                && let Some(fullscreen_process) = new_fullscreen_candidate(session, processes)
-            {
-                session.fullscreen_process = Some(fullscreen_process);
-            }
             session.transition(State::Stopping, now);
             session.return_allowed = false;
             session.active_game = None;
@@ -561,20 +609,6 @@ impl FullscreenSessions {
                 Duration::from_secs(exit_timeout_seconds)
             };
             session.stop_deadline = now.checked_add(timeout);
-        }
-        if session.state == State::Stopping {
-            let tracked_processes = session
-                .fullscreen_process
-                .as_ref()
-                .filter(|expected| processes.iter().any(|process| process == *expected))
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if request_close(&session.installation, &tracked_processes).is_err() {
-                session.transition(State::CleanupFailed, now);
-            } else {
-                session.last_close_request_at = Some(now);
-            }
         }
         session.response()
     }
@@ -756,6 +790,9 @@ fn normalize_status_path(path: &str) -> String {
 }
 
 fn new_fullscreen_candidate(session: &Session, processes: &[ProcessImage]) -> Option<ProcessImage> {
+    if baseline_pid_was_reused(session, processes) {
+        return None;
+    }
     let mut candidates = session
         .installation
         .fullscreen_processes(processes)
@@ -764,12 +801,20 @@ fn new_fullscreen_candidate(session: &Session, processes: &[ProcessImage]) -> Op
             !session
                 .launch_baseline
                 .iter()
-                .any(|previous| previous.same_identity(process))
+                .any(|previous| previous.process_id == process.process_id)
                 && process.creation_time >= session.launched_process.creation_time
         })
         .cloned();
     let candidate = candidates.next()?;
     candidates.next().is_none().then_some(candidate)
+}
+
+fn baseline_pid_was_reused(session: &Session, processes: &[ProcessImage]) -> bool {
+    session.launch_baseline.iter().any(|baseline| {
+        processes.iter().any(|process| {
+            process.process_id == baseline.process_id && !process.same_identity(baseline)
+        })
+    })
 }
 
 fn track_fullscreen_process(session: &mut Session, process: ProcessImage, now: Instant) {
@@ -799,14 +844,23 @@ fn playnite_exit_is_confirmed(
     now: Instant,
     scan_fullscreen_processes: &mut impl FnMut(&Installation) -> Option<Vec<ProcessImage>>,
 ) -> bool {
+    exact_fullscreen_processes_if_due(session, now, scan_fullscreen_processes)
+        .is_some_and(|processes| processes.is_empty())
+}
+
+fn exact_fullscreen_processes_if_due(
+    session: &mut Session,
+    now: Instant,
+    scan_fullscreen_processes: &mut impl FnMut(&Installation) -> Option<Vec<ProcessImage>>,
+) -> Option<Vec<ProcessImage>> {
     if session
         .next_fullscreen_process_scan
         .is_some_and(|deadline| now < deadline)
     {
-        return false;
+        return None;
     }
     session.next_fullscreen_process_scan = now.checked_add(CLOSE_RETRY_INTERVAL);
-    scan_fullscreen_processes(&session.installation).is_some_and(|processes| processes.is_empty())
+    scan_fullscreen_processes(&session.installation)
 }
 
 fn advance_active_game(
@@ -816,6 +870,7 @@ fn advance_active_game(
     validate_installation: &impl Fn(&Installation) -> bool,
     launch: &mut impl FnMut(&Installation) -> Result<ProcessImage, &'static str>,
     processes: &[ProcessImage],
+    scan_fullscreen_processes: &mut impl FnMut(&Installation) -> Option<Vec<ProcessImage>>,
 ) {
     let Some(active_game) = session.active_game.as_mut() else {
         session.transition(State::CleanupFailed, now);
@@ -856,7 +911,14 @@ fn advance_active_game(
     if now.saturating_duration_since(absent_since) < GAME_EXIT_GRACE {
         return;
     }
-    return_to_fullscreen(session, now, validate_installation, launch, processes);
+    return_to_fullscreen(
+        session,
+        now,
+        validate_installation,
+        launch,
+        processes,
+        scan_fullscreen_processes,
+    );
 }
 
 fn return_to_fullscreen(
@@ -865,6 +927,7 @@ fn return_to_fullscreen(
     validate_installation: &impl Fn(&Installation) -> bool,
     launch: &mut impl FnMut(&Installation) -> Result<ProcessImage, &'static str>,
     processes: &[ProcessImage],
+    scan_fullscreen_processes: &mut impl FnMut(&Installation) -> Option<Vec<ProcessImage>>,
 ) {
     if !session.return_allowed
         || session.stop_requested_at.is_some()
@@ -872,17 +935,38 @@ fn return_to_fullscreen(
     {
         return;
     }
-    if let Some(expected) = &session.fullscreen_process {
-        if processes
+    let Some(fullscreen_processes) =
+        exact_fullscreen_processes_if_due(session, now, scan_fullscreen_processes)
+    else {
+        return;
+    };
+    if !validate_installation(&session.installation) {
+        session.transition(State::CleanupFailed, now);
+        return;
+    }
+    if baseline_pid_was_reused(session, &fullscreen_processes) {
+        session.transition(State::CleanupFailed, now);
+        return;
+    }
+    if processes.iter().any(|observed| {
+        fullscreen_processes
             .iter()
-            .any(|process| process.same_identity(expected))
+            .any(|exact| observed.process_id == exact.process_id && !observed.same_identity(exact))
+    }) {
+        session.transition(State::CleanupFailed, now);
+        return;
+    }
+    if let Some(expected) = &session.fullscreen_process {
+        if let Some(verified) = fullscreen_processes
+            .iter()
+            .find(|process| process.same_identity(expected))
         {
             session.focus_retry.start(
                 session.focus_policy,
                 crate::focus::FocusTarget::for_process(
-                    &expected.path,
-                    expected.process_id,
-                    expected.creation_time,
+                    &verified.path,
+                    verified.process_id,
+                    verified.creation_time,
                 ),
                 now,
             );
@@ -891,42 +975,36 @@ fn return_to_fullscreen(
             session.transition(State::Running, now);
             return;
         }
-        if processes
+        if fullscreen_processes
             .iter()
             .any(|process| process.process_id == expected.process_id)
-            || !session
-                .installation
-                .fullscreen_processes(processes)
-                .is_empty()
+            || processes.iter().any(|process| {
+                process.process_id == expected.process_id && !process.same_identity(expected)
+            })
         {
             session.transition(State::CleanupFailed, now);
             return;
         }
-    } else if let Some(candidate) = new_fullscreen_candidate(session, processes) {
+    }
+    if let Some(candidate) = new_fullscreen_candidate(session, &fullscreen_processes) {
         // Status may beat process discovery. Adopt only one exact-install
         // process created after this ticket's launch baseline.
         track_fullscreen_process(session, candidate, now);
         session.active_game = None;
+        session.next_game_process_scan = None;
         return;
-    } else if !session
-        .installation
-        .fullscreen_processes(processes)
-        .is_empty()
+    }
+    if !fullscreen_processes.is_empty()
+        || !session
+            .installation
+            .fullscreen_processes(processes)
+            .is_empty()
     {
         // A baseline or ambiguous process cannot be claimed by this ticket.
         session.transition(State::CleanupFailed, now);
         return;
     }
-    if !validate_installation(&session.installation) {
-        session.transition(State::CleanupFailed, now);
-        return;
-    }
-    let baseline = session
-        .installation
-        .fullscreen_processes(processes)
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let baseline = fullscreen_processes;
     match launch(&session.installation) {
         Ok(launched_process)
             if session
@@ -1070,6 +1148,49 @@ mod tests {
         }
     }
 
+    fn advance_to_observed_game_exit_grace(
+        sessions: &mut FullscreenSessions,
+        ticket: &str,
+        now: Instant,
+        extension: &ProcessImage,
+    ) {
+        let game_id = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+        queue_status(
+            sessions,
+            ticket,
+            status(FullscreenStatusKind::GameStarted, Some(game_id)),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(2),
+            std::slice::from_ref(extension),
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("game start must not relaunch"),
+        );
+        queue_status(
+            sessions,
+            ticket,
+            status(FullscreenStatusKind::GameStopped, Some(game_id)),
+            extension.clone(),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(3),
+            std::slice::from_ref(extension),
+            Some(&[game_process(44)]),
+            |_| true,
+            |_| panic!("running game must not relaunch"),
+        );
+        sessions.advance_with(
+            now + Duration::from_secs(4),
+            std::slice::from_ref(extension),
+            Some(&[]),
+            |_| true,
+            |_| panic!("exit grace must elapse before return"),
+        );
+        assert_eq!(sessions.status(ticket)["state"], "playing");
+    }
+
     #[test]
     fn start_is_ticketed_idempotent_and_respects_installation_identity() {
         let now = Instant::now();
@@ -1159,10 +1280,7 @@ mod tests {
         let running = [fullscreen_process(80)];
         sessions.advance(now + Duration::from_secs(1), &running);
         assert_eq!(sessions.status(&ticket)["state"], "running");
-        assert_eq!(
-            sessions.stop_with(&ticket, 10, &running, |_, _| Ok(1))["state"],
-            "stopping"
-        );
+        assert_eq!(sessions.stop_with(&ticket, 10)["state"], "stopping");
         sessions.advance(now + Duration::from_secs(3), &[]);
         assert_eq!(sessions.status(&ticket)["state"], "stopped");
     }
@@ -1201,7 +1319,7 @@ mod tests {
 
         sessions.advance(now + Duration::from_secs(3), &running);
         assert_eq!(sessions.status(&ticket)["state"], "running");
-        sessions.stop_with(&ticket, 10, &running, |_, _| Ok(1));
+        sessions.stop_with(&ticket, 10);
         sessions.advance(now + Duration::from_secs(6), &[]);
         assert_eq!(sessions.status(&ticket)["state"], "stopped");
         assert_eq!(sessions.active_count(), 0);
@@ -1240,14 +1358,14 @@ mod tests {
             "fullscreen_session_limit"
         );
 
-        sessions.stop_with_at(&ticket, 0, &launcher, now + START_TIMEOUT, |_, _| Ok(0));
+        sessions.stop_with_at(&ticket, 0, now + START_TIMEOUT);
         sessions.advance(now + START_TIMEOUT + Duration::from_secs(2), &launcher);
         assert_eq!(sessions.status(&ticket)["state"], "stopping");
         sessions.advance(now + START_TIMEOUT + Duration::from_secs(21), &launcher);
         assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
         assert_eq!(sessions.active_count(), 1);
 
-        sessions.stop_with(&ticket, 10, &[], |_, _| Ok(0));
+        sessions.stop_with(&ticket, 10);
         sessions.advance(now + START_TIMEOUT + Duration::from_secs(5), &[]);
         assert_eq!(sessions.status(&ticket)["state"], "stopped");
         assert_eq!(sessions.active_count(), 0);
@@ -1268,7 +1386,7 @@ mod tests {
         let ticket = started["ticket"].as_str().unwrap().to_owned();
         let running = [fullscreen_process(80)];
         sessions.advance(now + Duration::from_secs(1), &running);
-        sessions.stop_with(&ticket, 1, &running, |_, _| Ok(1));
+        sessions.stop_with(&ticket, 1);
         sessions.advance(now + Duration::from_secs(2), &running);
         assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
 
@@ -1366,6 +1484,14 @@ mod tests {
             |_| true,
             |_| panic!("adopt the one new exact-install process"),
         );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        sessions.advance_with(
+            now + Duration::from_secs(6),
+            &[fullscreen_process(95)],
+            Some(&[]),
+            |_| true,
+            |_| panic!("the adopted fullscreen process must not relaunch"),
+        );
         assert_eq!(sessions.status(&ticket)["state"], "running");
         assert_eq!(
             sessions.by_ticket[&ticket].fullscreen_process,
@@ -1409,28 +1535,28 @@ mod tests {
         assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
 
         let discovered_fullscreen = fullscreen_process(95);
-        let discovered_processes = [discovered_fullscreen.clone(), extension.clone()];
         assert_eq!(
-            sessions.stop_with_at(
-                &ticket,
-                10,
-                &discovered_processes,
-                now + Duration::from_secs(2),
-                |_, owned| {
-                    assert_eq!(owned, std::slice::from_ref(&discovered_fullscreen));
-                    Ok(1)
-                }
-            )["state"],
+            sessions.stop_with_at(&ticket, 10, now + Duration::from_secs(2))["state"],
             "stopping"
+        );
+        assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(vec![discovered_fullscreen.clone()]),
+            |_| true,
+            |_| panic!("stopping must not relaunch"),
         );
         assert_eq!(
             sessions.by_ticket[&ticket].fullscreen_process,
-            Some(discovered_fullscreen)
+            Some(discovered_fullscreen.clone())
         );
-        sessions.advance_with(
-            now + Duration::from_secs(4),
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(5),
             &[extension],
             Some(&[]),
+            |_| Some(Vec::new()),
             |_| true,
             |_| panic!("stopped tickets cannot relaunch"),
         );
@@ -1453,16 +1579,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let ambiguous_fullscreen = [fullscreen_process(90), fullscreen_process(91)];
-        sessions.stop_with_at(
-            &ticket,
-            1,
-            &ambiguous_fullscreen,
-            now + Duration::from_secs(1),
-            |_, owned| {
-                assert!(owned.is_empty());
-                Ok(0)
-            },
-        );
+        sessions.stop_with_at(&ticket, 1, now + Duration::from_secs(1));
         sessions.advance_with(
             now + Duration::from_secs(3),
             &ambiguous_fullscreen,
@@ -1473,6 +1590,40 @@ mod tests {
         assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
         assert_eq!(sessions.active_count(), 1);
         assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
+    }
+
+    #[test]
+    fn stop_does_not_close_coarse_unique_candidate_when_exact_scan_is_ambiguous() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = sessions.start_with(
+            "coarse-unique-stop-ambiguous",
+            Some(installation()),
+            &[],
+            FocusPolicy::disabled(),
+            now,
+            |_| Ok(launch_process(77)),
+        )["ticket"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        sessions.stop_with_at(&ticket, 1, now + Duration::from_secs(1));
+        let coarse_candidate = fullscreen_process(90);
+        let exact_candidates = [coarse_candidate.clone(), fullscreen_process(91)];
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(3),
+            std::slice::from_ref(&coarse_candidate),
+            Some(&[]),
+            |_| Some(exact_candidates.to_vec()),
+            |_| true,
+            |_| panic!("stop must never relaunch"),
+        );
+
+        let session = &sessions.by_ticket[&ticket];
+        assert_eq!(session.state, State::CleanupFailed);
+        assert!(session.fullscreen_process.is_none());
+        assert!(session.last_close_request_at.is_none());
     }
 
     #[test]
@@ -1490,10 +1641,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        sessions.stop_with_at(&ticket, 1, &[], now + Duration::from_secs(1), |_, owned| {
-            assert!(owned.is_empty());
-            Ok(0)
-        });
+        sessions.stop_with_at(&ticket, 1, now + Duration::from_secs(1));
         sessions.advance_with_scanner(
             now + Duration::from_secs(3),
             &[],
@@ -1710,16 +1858,7 @@ mod tests {
             |_| panic!("game start must not relaunch"),
         );
         assert_eq!(
-            sessions.stop_with_at(
-                &ticket,
-                10,
-                &fullscreen,
-                now + Duration::from_secs(2),
-                |_, owned| {
-                    assert_eq!(owned, &[fullscreen_process(80)]);
-                    Ok(1)
-                }
-            )["state"],
+            sessions.stop_with_at(&ticket, 10, now + Duration::from_secs(2))["state"],
             "stopping"
         );
         queue_status(
@@ -2151,6 +2290,236 @@ mod tests {
             |_| panic!("a reused PID must never focus or relaunch"),
         );
         assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+    }
+
+    #[test]
+    fn unknown_auto_return_scan_retains_playing_ticket_without_relaunch() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        advance_to_observed_game_exit_grace(&mut sessions, &ticket, now, &extension);
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(7),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| None,
+            |_| true,
+            |_| panic!("unknown exact scan must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert_eq!(sessions.active_count(), 1);
+    }
+
+    #[test]
+    fn exact_auto_return_scan_finds_ticket_ui_omitted_by_coarse_discovery() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        advance_to_observed_game_exit_grace(&mut sessions, &ticket, now, &extension);
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(7),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(vec![fullscreen_process(80)]),
+            |_| true,
+            |_| panic!("verified ticket UI must be reused"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "running");
+        assert_eq!(
+            sessions.by_ticket[&ticket].fullscreen_process,
+            Some(fullscreen_process(80))
+        );
+    }
+
+    #[test]
+    fn exact_auto_return_scan_adopts_only_a_unique_postbaseline_process() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = begin_running_session(&mut sessions, now);
+        let extension = extension_process(31, 310);
+        advance_to_observed_game_exit_grace(&mut sessions, &ticket, now, &extension);
+        sessions
+            .by_ticket
+            .get_mut(&ticket)
+            .unwrap()
+            .fullscreen_process = None;
+        let candidate = fullscreen_process(90);
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(7),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(vec![candidate.clone()]),
+            |_| true,
+            |_| panic!("unique exact candidate must be reused"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "playing");
+        assert_eq!(
+            sessions.by_ticket[&ticket].fullscreen_process,
+            Some(candidate.clone())
+        );
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(8),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(vec![candidate.clone()]),
+            |_| true,
+            |_| panic!("adopted ticket process must not be relaunched"),
+        );
+        assert_eq!(sessions.status(&ticket)["state"], "running");
+    }
+
+    #[test]
+    fn exact_auto_return_scan_fails_closed_on_ambiguous_or_reused_pid_candidates() {
+        let now = Instant::now();
+        let extension = extension_process(31, 310);
+        let mut ambiguous = FullscreenSessions::default();
+        let ambiguous_ticket = begin_running_session(&mut ambiguous, now);
+        advance_to_observed_game_exit_grace(&mut ambiguous, &ambiguous_ticket, now, &extension);
+        ambiguous
+            .by_ticket
+            .get_mut(&ambiguous_ticket)
+            .unwrap()
+            .fullscreen_process = None;
+        let candidates = [fullscreen_process(90), fullscreen_process(91)];
+        ambiguous.advance_with_scanner(
+            now + Duration::from_secs(7),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(candidates.to_vec()),
+            |_| true,
+            |_| panic!("ambiguous exact candidates must not relaunch"),
+        );
+        assert_eq!(
+            ambiguous.status(&ambiguous_ticket)["state"],
+            "cleanup_failed"
+        );
+        assert!(
+            ambiguous.by_ticket[&ambiguous_ticket]
+                .fullscreen_process
+                .is_none()
+        );
+
+        let mut reused_pid = FullscreenSessions::default();
+        let reused_ticket = begin_running_session(&mut reused_pid, now);
+        advance_to_observed_game_exit_grace(&mut reused_pid, &reused_ticket, now, &extension);
+        let session = reused_pid.by_ticket.get_mut(&reused_ticket).unwrap();
+        session.fullscreen_process = None;
+        session.launch_baseline = vec![ProcessImage {
+            process_id: 95,
+            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            creation_time: 95,
+        }];
+        let reused_candidate = ProcessImage {
+            process_id: 95,
+            path: r"C:\Playnite\Playnite.FullscreenApp.exe".into(),
+            creation_time: 950,
+        };
+        reused_pid.advance_with_scanner(
+            now + Duration::from_secs(7),
+            std::slice::from_ref(&extension),
+            Some(&[]),
+            |_| Some(vec![reused_candidate.clone()]),
+            |_| true,
+            |_| panic!("baseline PID reuse must not relaunch"),
+        );
+        assert_eq!(reused_pid.status(&reused_ticket)["state"], "cleanup_failed");
+        assert!(
+            reused_pid.by_ticket[&reused_ticket]
+                .fullscreen_process
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn starting_does_not_claim_coarse_unique_process_when_exact_scan_is_ambiguous() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let ticket = sessions.start_with(
+            "coarse-unique-exact-ambiguous",
+            Some(installation()),
+            &[],
+            FocusPolicy::disabled(),
+            now,
+            |_| Ok(launch_process(77)),
+        )["ticket"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let coarse_candidate = fullscreen_process(90);
+        let exact_candidates = [coarse_candidate.clone(), fullscreen_process(91)];
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(1),
+            std::slice::from_ref(&coarse_candidate),
+            Some(&[]),
+            |_| Some(exact_candidates.to_vec()),
+            |_| true,
+            |_| panic!("ambiguous exact scan must not relaunch"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+        assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
+    }
+
+    #[test]
+    fn startup_baseline_includes_preexisting_ui_omitted_by_coarse_discovery() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let preexisting = fullscreen_process(90);
+        let ticket = sessions.start_with_scanner(
+            "omitted-preexisting-ui",
+            Some(installation()),
+            &[],
+            StartOptions {
+                focus_policy: FocusPolicy::disabled(),
+                now,
+            },
+            |_| Some(vec![preexisting.clone()]),
+            |_| Ok(launch_process(77)),
+        )["ticket"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        sessions.advance_with_scanner(
+            now + Duration::from_secs(1),
+            &[],
+            Some(&[]),
+            |_| Some(vec![preexisting.clone()]),
+            |_| true,
+            |_| panic!("preexisting UI must not be relaunched"),
+        );
+
+        assert_eq!(sessions.status(&ticket)["state"], "cleanup_failed");
+        assert!(sessions.by_ticket[&ticket].fullscreen_process.is_none());
+    }
+
+    #[test]
+    fn startup_does_not_launch_without_a_complete_baseline_scan() {
+        let now = Instant::now();
+        let mut sessions = FullscreenSessions::default();
+        let result = sessions.start_with_scanner(
+            "unknown-startup-scan",
+            Some(installation()),
+            &[],
+            StartOptions {
+                focus_policy: FocusPolicy::disabled(),
+                now,
+            },
+            |_| None,
+            |_| panic!("incomplete baseline must not launch"),
+        );
+
+        assert_eq!(result["code"], "fullscreen_process_scan_failed");
+        assert_eq!(sessions.active_count(), 0);
     }
 
     #[test]

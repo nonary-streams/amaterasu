@@ -127,8 +127,13 @@ restart retires the previous creation-time identity and discards its queued
 events.
 Return focuses only the ticket's verified FullscreenApp process, or relaunches
 from the still-validated canonical install when no uncorrelated FullscreenApp
-is present. Exact image/PID/creation-time checks, ambiguous process lists, and
-unknown scans fail closed. Native Windows pipe, process enumeration, focus, and
+is present. Startup requires a complete exact-image scan before launch to
+establish its baseline. Handoff adoption, automatic return, and stop cleanup
+claim an untracked process only from a complete exact-image scan and only when
+it is uniquely post-baseline. Coarse discovery cannot authorize focus or close. Scan
+errors, ambiguous candidates, and baseline PID reuse fail closed without
+focusing, closing, or relaunching. Exact PID/path/creation-time checks still
+guard stored identities. Native Windows pipe, process enumeration, focus, and
 restart behavior still requires runtime qualification.
 
 Manual `playnite_fullscreen` entries use only a typed launch kind and bounded
