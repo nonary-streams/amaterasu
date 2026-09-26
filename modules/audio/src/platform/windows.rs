@@ -945,7 +945,6 @@ fn set_virtual_device_layout(
 
 struct VirtualFormatLease {
     endpoint: String,
-    shared: bool,
 }
 
 impl VirtualFormatLease {
@@ -959,14 +958,12 @@ impl VirtualFormatLease {
         let mut policy = policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shared = policy.has_active(endpoint);
         let candidate = policy.acquire(endpoint, layout.channels, || {
             set_virtual_device_layout(endpoint, layout, preferred_valid_bits)
         })?;
         Ok((
             Self {
                 endpoint: endpoint.to_owned(),
-                shared,
             },
             candidate,
         ))
@@ -996,8 +993,8 @@ fn validate_virtual_mix(
     Ok(())
 }
 
-fn virtual_mix_error(error: &'static str, recovering: bool, shared: bool) -> &'static str {
-    if recovering && shared {
+fn virtual_mix_error(error: &'static str, recovering: bool) -> &'static str {
+    if recovering {
         "virtual_sink_format_changed"
     } else {
         error
@@ -1222,17 +1219,12 @@ impl Capture {
             let mut capture_format = match (desired_layout, selected_virtual_format) {
                 (Some(layout), Some(candidate)) => {
                     if let Err(error) = validate_virtual_mix(&mix, layout, candidate) {
-                        // A second capture still owns this selected format. A
-                        // reset or external format change must not be
-                        // overwritten while it is live. Retry recovery after
-                        // the other owner closes or the mix returns.
-                        return Err(virtual_mix_error(
-                            error,
-                            recovering,
-                            virtual_format_lease
-                                .as_ref()
-                                .is_some_and(|lease| lease.shared),
-                        ));
+                        // Windows can still publish the old mix immediately
+                        // after SetDeviceFormat succeeds. A shared capture
+                        // also cannot overwrite its peer's selected format.
+                        // Retry either recovery until the requested mix is
+                        // visible, while initial opens still fail promptly.
+                        return Err(virtual_mix_error(error, recovering));
                     }
                     let mut format = Format::new(48_000, layout.channels, PCM_F32)?;
                     format.channel_mask = candidate.channel_mask;
@@ -1772,13 +1764,11 @@ mod tests {
     }
 
     #[test]
-    fn only_shared_recovery_treats_a_changed_virtual_mix_as_transient() {
+    fn virtual_mix_change_is_transient_during_solo_or_shared_recovery() {
         let error = "unsupported_channel_layout";
-        assert_eq!(virtual_mix_error(error, false, false), error);
-        assert_eq!(virtual_mix_error(error, false, true), error);
-        assert_eq!(virtual_mix_error(error, true, false), error);
+        assert_eq!(virtual_mix_error(error, false), error);
         assert_eq!(
-            virtual_mix_error(error, true, true),
+            virtual_mix_error(error, true),
             "virtual_sink_format_changed"
         );
     }

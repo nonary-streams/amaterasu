@@ -74,6 +74,7 @@ struct ActiveVirtualFormat {
 
 #[cfg(any(windows, test))]
 impl VirtualFormatPolicy {
+    #[cfg(test)]
     pub fn has_active(&self, endpoint: &str) -> bool {
         self.active.contains_key(endpoint)
     }

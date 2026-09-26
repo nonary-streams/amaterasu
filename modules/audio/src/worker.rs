@@ -781,9 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_virtual_format_change_retries_recovery_without_failing_stream() {
+    fn virtual_format_change_retries_recovery_and_releases_the_solo_capture() {
         let format = Format::new(48_000, 1, amaterasu_media::PCM_F32).unwrap();
-        let initial = FakeCapture::new(format, [Err("device_lost")]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let initial =
+            FakeCapture::new(format, [Err("device_lost")]).with_drop_counter(drops.clone());
         let (sender, packets) = mpsc::sync_channel(1);
         let health = Arc::new(Mutex::new(Health::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -792,6 +794,7 @@ mod tests {
             let health = health.clone();
             let stop = stop.clone();
             let attempts = attempts.clone();
+            let drops = drops.clone();
             move || {
                 run_capture_loop(
                     Box::new(initial),
@@ -799,8 +802,10 @@ mod tests {
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             return Err("virtual_sink_format_changed");
                         }
-                        Ok(Box::new(FakeCapture::new(format, [Ok(Some(packet(0, 0)))]))
-                            as Box<dyn CaptureDevice>)
+                        Ok(Box::new(
+                            FakeCapture::new(format, [Ok(Some(packet(0, 0)))])
+                                .with_drop_counter(drops.clone()),
+                        ) as Box<dyn CaptureDevice>)
                     },
                     &sender,
                     &health,
@@ -825,6 +830,7 @@ mod tests {
         let health = health.lock().unwrap();
         assert_eq!(health.failure, None);
         assert!(!health.recovering);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
