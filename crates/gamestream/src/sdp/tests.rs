@@ -55,6 +55,52 @@ fn primary_client_shape_negotiates_exact_h264_sdr_requirements() {
 }
 
 #[test]
+fn surround_audio_requires_exact_channel_mask_and_enable_pair() {
+    for (channels, mask) in [(6, 63), (8, 1599)] {
+        let announce = changed("x-nv-audio.surround.numChannels", &channels.to_string());
+        let announce = announce.replace(
+            "a=x-nv-audio.surround.channelMask:3 ",
+            &format!("a=x-nv-audio.surround.channelMask:{mask} "),
+        );
+        let announce = announce.replace(
+            "a=x-nv-audio.surround.enable:0 ",
+            "a=x-nv-audio.surround.enable:1 ",
+        );
+        let parsed = parse_announce(announce.as_bytes()).unwrap();
+        assert_eq!(
+            (parsed.audio.channels, parsed.audio.channel_mask),
+            (channels, mask)
+        );
+        for (name, value) in [
+            ("x-nv-audio.surround.channelMask", "3"),
+            ("x-nv-audio.surround.enable", "0"),
+            ("x-nv-audio.surround.AudioQuality", "1"),
+            ("x-nv-aqos.packetDuration", "20"),
+        ] {
+            let changed = announce.replace(
+                &format!(
+                    "a={name}:{} ",
+                    if name == "x-nv-audio.surround.channelMask" {
+                        mask.to_string()
+                    } else if name == "x-nv-audio.surround.enable" {
+                        "1".into()
+                    } else if name == "x-nv-audio.surround.AudioQuality" {
+                        "0".into()
+                    } else {
+                        "5".into()
+                    }
+                ),
+                &format!("a={name}:{value} "),
+            );
+            assert!(
+                parse_announce(changed.as_bytes()).is_err(),
+                "accepted {name}={value}"
+            );
+        }
+    }
+}
+
+#[test]
 fn encryption_requirements_are_preserved_and_cannot_silently_downgrade() {
     let result = parse_announce(changed("x-ss-general.encryptionEnabled", "7").as_bytes()).unwrap();
     assert!(result.encryption.control_v2 && result.encryption.video && result.encryption.audio);
@@ -92,7 +138,7 @@ fn unsupported_media_modes_and_invalid_numeric_boundaries_fail() {
         ("x-nv-video[0].videoEncoderSlicesPerFrame", "2"),
         ("x-nv-video[0].maxNumReferenceFrames", "2"),
         ("x-nv-video[0].encoderCscMode", "4"),
-        ("x-nv-audio.surround.numChannels", "6"),
+        ("x-nv-audio.surround.numChannels", "4"),
         ("x-nv-audio.surround.channelMask", "63"),
         ("x-nv-audio.surround.AudioQuality", "1"),
         ("x-nv-aqos.packetDuration", "20"),

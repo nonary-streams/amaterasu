@@ -266,7 +266,7 @@ impl Controller {
                             record.request.continuous_audio && record.effective_stream_audio,
                         "capture_sink_without_routing": record.capture_sink_without_routing,
                         "virtual_sink": record.resolved_virtual_sink,
-                        "channels": record.resolved_virtual_sink.as_ref().map(|_| 2),
+                        "channels": record.resolved_virtual_sink.as_ref().map(|_| record.request.audio_channels),
                         "back_button_timeout": record.scoped_back_button_timeout,
                         "controller": record.scoped_controller,
                         "gamepad": record.scoped_gamepad,
@@ -554,6 +554,14 @@ impl Controller {
                                     &record.audio_endpoint,
                                     record.resolved_virtual_sink.as_deref(),
                                 );
+                                if record.request.audio_channels != 2
+                                    && (record.resolved_virtual_sink.is_none()
+                                        || !record.effective_stream_audio)
+                                {
+                                    fail_record(record, "surround_audio_requires_stream_sink", now);
+                                    self.finish_or_retain(job.record, now, replies);
+                                    return;
+                                }
                                 record.scoped_back_button_timeout = record
                                     .peer
                                     .client_back_button_timeout

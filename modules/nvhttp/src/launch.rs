@@ -53,6 +53,8 @@ pub struct LaunchRequest {
     pub host_audio_enabled: bool,
     /// Moonlight's optional continuousAudio request for silence-padded capture.
     pub continuous_audio: bool,
+    /// Authenticated Moonlight surroundAudioInfo selection (2, 6, or 8 channels).
+    pub audio_channels: u32,
     /// Moonlight's optional per-launch device-name override (`clientName`).
     pub device_name: Option<String>,
     pub remote_input_key: [u8; 16],
@@ -657,6 +659,9 @@ impl Controller {
         if request.app_id == 0
             || request.app_id > i32::MAX as u32
             || !config.profile.accepts(&request)
+            || !matches!(request.audio_channels, 2 | 6 | 8)
+            || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+            || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
             || request
                 .device_name
                 .as_deref()

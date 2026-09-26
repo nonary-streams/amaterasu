@@ -39,6 +39,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         .map_err(|_| "remote input key must contain 16 bytes")?;
     let key_id = key_id(query.required("rikeyid")?)?;
     let host_audio_enabled = query.get("localAudioPlayMode") == Some("1");
+    let audio_channels = surround_audio_channels(query.get("surroundAudioInfo"))?;
     let device_name = query.get("clientName").unwrap_or_default();
     if !device_name.is_empty()
         && (device_name.len() > 128 || device_name.chars().any(char::is_control))
@@ -52,6 +53,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         fps,
         host_audio_enabled,
         continuous_audio: query.get("continuousAudio") == Some("1"),
+        audio_channels,
         device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
         remote_input_key,
         key_id,
@@ -100,16 +102,19 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     )?;
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
-    require_optional_value(
-        query,
-        "surroundAudioInfo",
-        "196610",
-        "surround audio is unsupported",
-    )?;
     for field in ["remoteControllersBitmap", "gcmap", "gcpersist"] {
         require_optional_value(query, field, "0", "controller forwarding is unsupported")?;
     }
     require_optional_value(query, "corever", "1", "unsupported Moonlight core version")
+}
+
+fn surround_audio_channels(value: Option<&str>) -> Result<u32, &'static str> {
+    match value {
+        None | Some("196610") => Ok(2),
+        Some("393222") => Ok(6),
+        Some("524296") => Ok(8),
+        Some(_) => Err("unsupported surround audio configuration"),
+    }
 }
 
 fn optional_boolean(query: &Query, name: &str) -> Result<(), &'static str> {
@@ -286,7 +291,7 @@ mod tests {
         for field in [
             "hdrMode=1",
             "sops=1",
-            "surroundAudioInfo=393222",
+            "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
             "remoteControllersBitmap=1",
             "gcmap=1",
@@ -312,6 +317,26 @@ mod tests {
         for value in ["2", "-1", "", "true"] {
             assert!(
                 parse(&format!("{base}&localAudioPlayMode={value}")).is_err(),
+                "accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surround_audio_info_accepts_only_exact_supported_client_layouts() {
+        let base = "appid=1&mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        assert_eq!(parse(base).unwrap().audio_channels, 2);
+        for (value, channels) in [("196610", 2), ("393222", 6), ("524296", 8)] {
+            assert_eq!(
+                parse(&format!("{base}&surroundAudioInfo={value}"))
+                    .unwrap()
+                    .audio_channels,
+                channels
+            );
+        }
+        for value in ["", "0", "6", "393223", "524294", "+393222", "393222 "] {
+            assert!(
+                parse(&format!("{base}&surroundAudioInfo={value}")).is_err(),
                 "accepted {value:?}"
             );
         }

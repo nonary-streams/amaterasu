@@ -123,17 +123,23 @@ fn bitrate(attributes: &mut Attributes<'_>) -> Result<(u32, Option<u32>), Error>
 }
 
 fn audio(attributes: &mut Attributes<'_>) -> Result<Audio, Error> {
-    attributes.require_value("x-nv-audio.surround.numChannels", 2)?;
-    attributes.require_value("x-nv-audio.surround.channelMask", 3)?;
-    attributes.require_value("x-nv-audio.surround.enable", 0)?;
+    let channels = attributes.required("x-nv-audio.surround.numChannels")?;
+    let channel_mask = attributes.required("x-nv-audio.surround.channelMask")?;
+    let enabled = attributes.required("x-nv-audio.surround.enable")?;
+    if !matches!(
+        (channels, channel_mask, enabled),
+        (2, 3, 0) | (6, 63, 1) | (8, 1599, 1)
+    ) {
+        return Err(Error::Unsupported("audio channel layout"));
+    }
     attributes.require_value("x-nv-audio.surround.AudioQuality", 0)?;
     let packet_duration_ms = attributes.required("x-nv-aqos.packetDuration")?;
     if !matches!(packet_duration_ms, 5 | 10) {
         return Err(Error::Unsupported("audio packet duration"));
     }
     Ok(Audio {
-        channels: 2,
-        channel_mask: 3,
+        channels,
+        channel_mask,
         packet_duration_ms,
     })
 }

@@ -48,7 +48,7 @@ impl Record {
         &mut self,
         announce: &amaterasu_gamestream::sdp::Announce,
     ) -> bool {
-        let accepted = self.config.effective_profile().matches(announce);
+        let accepted = self.config.matches_announce(announce);
         self.negotiated_encryption = accepted.then_some(crate::model::EncryptionSnapshot {
             video: announce.encryption.video,
             audio: announce.encryption.audio,

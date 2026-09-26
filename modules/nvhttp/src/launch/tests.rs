@@ -227,6 +227,7 @@ fn request(key: u8) -> LaunchRequest {
         fps: 60,
         host_audio_enabled: false,
         continuous_audio: false,
+        audio_channels: 2,
         device_name: None,
         remote_input_key: [key; 16],
         key_id: 17,
@@ -922,6 +923,57 @@ fn virtual_sink_overrides_follow_client_app_global_precedence_and_empty_clears_i
     // Explicit empty in the app scope clears the global selector while the
     // regular application endpoint keeps its capture-only policy.
     launch_payload(None, Some(""), None, "endpoint.application", true);
+}
+
+#[test]
+fn authenticated_surround_request_reaches_rtsp_and_binds_retry_identity() {
+    for (channels, bitrate) in [(6, 256_000), (8, 512_000)] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.profile.audio_bitrate = bitrate;
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut broker = Broker::default();
+        let mut stream = request(channels as u8);
+        stream.audio_channels = channels;
+        let paired = peer_with_virtual_sink(channels as u8, Some("virtual.surround"));
+        assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        let open = opened_rtsp_payload(&broker);
+        assert_eq!(open["channels"], channels);
+        assert_eq!(open["virtual_sink"], "virtual.surround");
+        assert_eq!(open["profile"]["audio_bitrate"], bitrate);
+        controller.reply_delivered(10, now);
+        assert_eq!(
+            controller.launch(11, stream.clone(), paired.clone(), now).unwrap().body,
+            reply.body
+        );
+        stream.audio_channels = if channels == 6 { 2 } else { 6 };
+        assert_eq!(controller.launch(12, stream, paired, now).unwrap().status, 409);
+    }
+}
+
+#[test]
+fn surround_without_virtual_sink_or_supported_bitrate_stops_before_launch() {
+    for (sink, bitrate) in [(None, 256_000), (Some("virtual.surround"), 128_000)] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.profile.audio_bitrate = bitrate;
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        let mut broker = Broker::default();
+        let mut stream = request(6);
+        stream.audio_channels = 6;
+        let result = controller.launch(10, stream, peer_with_virtual_sink(6, sink), now);
+        if bitrate == 128_000 {
+            assert_eq!(result.unwrap().status, 400);
+        } else {
+            assert!(result.is_none());
+            let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+            assert_ne!(reply.status, 200);
+        }
+        assert!(!broker.actions().iter().any(|(service, action)|
+            *service == "amaterasu.rtsp/1" && *action == "open"));
+    }
 }
 
 #[test]

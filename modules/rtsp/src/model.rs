@@ -341,6 +341,15 @@ impl Default for Profile {
         }
     }
 }
+fn audio_channel_mask(channels: u32) -> u32 {
+    match channels {
+        2 => 3,
+        6 => 63,
+        8 => 1599,
+        _ => 0,
+    }
+}
+
 impl Profile {
     pub fn effective_video_max_batch_size_kb(&self) -> u8 {
         match self.video_max_batch_size_kb {
@@ -393,7 +402,7 @@ impl Profile {
             || self.max_reference_frames > 1
             || self.video_max_batch_size_kb > 64
             || !matches!(self.packet_ms, 5 | 10)
-            || !(6000..=256000).contains(&self.audio_bitrate)
+            || !(6000..=512000).contains(&self.audio_bitrate)
         {
             return Err("invalid_profile");
         }
@@ -590,6 +599,20 @@ impl Open {
         profile
     }
 
+    pub(crate) fn matches_announce(&self, announce: &Announce) -> bool {
+        let channels = self.channels.unwrap_or(2);
+        let profile = self.effective_profile();
+        if channels == 2 {
+            return profile.matches(announce);
+        }
+        profile.matches_video(announce)
+            && profile.matches_transport(announce)
+            && announce.audio.packet_duration_ms == profile.packet_ms
+            && announce.encryption.audio == profile.encrypt_audio
+            && announce.audio.channels == channels
+            && announce.audio.channel_mask == audio_channel_mask(channels)
+    }
+
     fn validate_operation_id(&self) -> Result<(), &'static str> {
         if !valid_name(&self.operation_id) {
             return Err("invalid_operation_id");
@@ -652,8 +675,24 @@ impl Open {
                     && !self.capture_sink_without_routing => {}
             (Some(_), _) => return Err("invalid_virtual_sink_channels"),
         }
-        if self.stream_audio && self.channels.is_some_and(|channels| channels != 2) {
-            return Err("unsupported_audio_channels");
+        if self.channels.is_some_and(|channels| channels != 2) {
+            if !self.stream_audio {
+                return Err("surround_requires_stream_audio");
+            }
+            let minimum = if self.channels == Some(6) {
+                256000
+            } else {
+                512000
+            };
+            if self.profile.audio_bitrate < minimum {
+                return Err("unsupported_surround_bitrate");
+            }
+            let packet_bytes = (u64::from(self.profile.audio_bitrate)
+                * u64::from(self.profile.packet_ms))
+            .div_ceil(8000);
+            if packet_bytes > 1275 {
+                return Err("unsupported_audio_packet");
+            }
         }
         Ok(())
     }
@@ -693,6 +732,12 @@ impl Open {
             "encrypt_audio": self.profile.encrypt_audio,
             "permit_legacy_audio_iv_wrap": self.profile.permit_legacy_audio_iv_wrap,
         });
+        if let Some(channels @ (6 | 8)) = self.channels {
+            payload["audio"]["channels"] = serde_json::json!(channels);
+            payload["audio"]["channel_mask"] = serde_json::json!(audio_channel_mask(channels));
+            payload["audio"]["layout"] =
+                serde_json::json!(if channels == 6 { "5.1" } else { "7.1" });
+        }
         if let Some(discovery) = discovery {
             payload["discovery"] = serde_json::json!({
                 "audio_ping_payload": discovery.audio_ping_payload,
@@ -2252,7 +2297,7 @@ mod tests {
             ("max_reference_frames", json!(2)),
             ("packet_ms", json!(20)),
             ("audio_bitrate", json!(5999)),
-            ("audio_bitrate", json!(256001)),
+            ("audio_bitrate", json!(512001)),
             ("packet_size", json!(0)),
             ("fec_percentage", json!(0)),
             ("max_fec_blocks", json!(0)),
@@ -2413,10 +2458,50 @@ mod tests {
             let expected = if channels == 4 {
                 "invalid_virtual_sink_channels"
             } else {
-                // RTSP/media packetization is currently stereo-only.
-                "unsupported_audio_channels"
+                "unsupported_surround_bitrate"
             };
             assert_eq!(request.validate(false), Err(expected));
+        }
+    }
+
+    #[test]
+    fn surround_open_preserves_exact_prepared_layout_and_announce_authority() {
+        for (channels, mask, layout, bitrate) in [(6, 63, "5.1", 256000), (8, 1599, "7.1", 512000)]
+        {
+            let mut value = open_json();
+            value["capture"]["audio_endpoint"] = json!("");
+            value["virtual_sink"] = json!("Steam Streaming Speakers");
+            value["channels"] = json!(channels);
+            value["profile"]["audio_bitrate"] = json!(bitrate);
+            let mut request: Open = serde_json::from_value(value).unwrap();
+            request.profile = matching_profile();
+            request.profile.audio_bitrate = bitrate;
+            assert!(request.validate(false).is_ok());
+            let prepare = request.prepare("prepare-surround", None);
+            assert_eq!(prepare["audio"]["channels"], channels);
+            assert_eq!(prepare["audio"]["channel_mask"], mask);
+            assert_eq!(prepare["audio"]["layout"], layout);
+            assert_eq!(request.arm(41)["configuration"]["channels"], channels);
+
+            let announce =
+                changed_announce("x-nv-audio.surround.numChannels", &channels.to_string())
+                    .replace(
+                        "a=x-nv-audio.surround.channelMask:3 ",
+                        &format!("a=x-nv-audio.surround.channelMask:{mask} "),
+                    )
+                    .replace(
+                        "a=x-nv-audio.surround.enable:0 ",
+                        "a=x-nv-audio.surround.enable:1 ",
+                    )
+                    .replace(
+                        "a=x-ss-general.encryptionEnabled:0 ",
+                        "a=x-ss-general.encryptionEnabled:7 ",
+                    );
+            let announce = parse_announce(announce.as_bytes()).unwrap();
+            assert!(request.matches_announce(&announce));
+            let mut mismatched = request.clone();
+            mismatched.channels = Some(if channels == 6 { 8 } else { 6 });
+            assert!(!mismatched.matches_announce(&announce));
         }
     }
 
