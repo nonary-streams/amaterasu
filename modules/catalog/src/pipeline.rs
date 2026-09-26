@@ -1511,7 +1511,7 @@ impl Pipeline {
                     session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
                 }
                 Some(ArtworkReference::Lutris { game_id, .. }) => {
-                    session.caller != LUTRIS_IMPORTER || source_id != format!("lutris:{game_id}")
+                    session.caller != LUTRIS_IMPORTER || source_id != game_id.to_string()
                 }
                 None => false,
             };

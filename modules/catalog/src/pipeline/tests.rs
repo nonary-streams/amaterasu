@@ -4155,12 +4155,13 @@ fn steam_artwork_is_limited_to_the_authenticated_importer_and_matching_source_id
 fn lutris_artwork_requires_authenticated_matching_importer_and_source() {
     let mut backend = Backend::default();
     let mut pipeline = lutris_artwork_importer();
-    let digest = "a".repeat(64);
+    let revision = "17";
     for (caller, source_id) in [
-        ("other.provider", "lutris:42"),
-        ("amaterasu.steam", "lutris:42"),
-        ("amaterasu.lutris", "lutris:43"),
-        ("amaterasu.lutris", "lutris:042"),
+        ("other.provider", "42"),
+        ("amaterasu.steam", "42"),
+        ("amaterasu.lutris", "43"),
+        ("amaterasu.lutris", "042"),
+        ("amaterasu.lutris", "lutris:42"),
     ] {
         let sync_id = format!("forged-{caller}-{source_id}");
         let begin = backend.run_for(
@@ -4179,7 +4180,7 @@ fn lutris_artwork_requires_authenticated_matching_importer_and_source() {
                 1,
                 0,
                 begin["revision"].as_u64().unwrap(),
-                vec![(source_id, lutris_artwork_entry("Forged", 42, &digest))],
+                vec![(source_id, lutris_artwork_entry("Forged", 42, revision))],
             ),
             caller,
             "amaterasu.management",
@@ -4194,8 +4195,8 @@ fn lutris_artwork_requires_authenticated_matching_importer_and_source() {
 fn lutris_artwork_revision_persists_without_changing_other_rows() {
     let mut backend = Backend::default();
     let mut pipeline = lutris_artwork_importer();
-    let revision_a = "a".repeat(64);
-    let revision_b = "b".repeat(64);
+    let revision_a = "17";
+    let revision_b = "18";
     let manual = backend.run_for(
         &mut pipeline,
         json!({"action":"create","expected_revision":0,"entry":entry("Manual game")}),
@@ -4236,7 +4237,7 @@ fn lutris_artwork_revision_persists_without_changing_other_rows() {
                 source_revision,
                 0,
                 begin["revision"].as_u64().unwrap(),
-                vec![("lutris:42", lutris_artwork_entry("Lutris game", 42, digest))],
+                vec![("42", lutris_artwork_entry("Lutris game", 42, digest))],
             ),
             "amaterasu.lutris",
             "amaterasu.management",
