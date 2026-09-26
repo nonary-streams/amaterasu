@@ -533,6 +533,27 @@ fn detached_environment_retries_reuse_resolution_and_reject_changed_launch_field
 }
 
 #[test]
+fn detached_retry_rejects_changed_override_even_when_effective_environment_matches() {
+    let mut manager = ProcessManager::default();
+    let mut request = launch("detached-redundant-override", "sleep");
+    request["environment"]["SAME_VALUE"] = json!("same");
+    request["detached"] = json!([{
+        "command":"amaterasu-missing-detached-command",
+        "environment":{"SAME_VALUE":"same"}
+    }]);
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["process"]["state"], "running", "{started}");
+    assert_eq!(manager.handle("alice", request.clone()), started);
+
+    request["detached"][0]["environment"] = json!({});
+    assert_eq!(
+        manager.handle("alice", request)["code"],
+        "operation_conflict"
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn auto_detach_retains_a_quick_successful_launcher_until_explicit_stop() {
     let directory = test_directory("auto-detach");
     let marker = directory.join("launcher-exited");

@@ -850,7 +850,7 @@ impl ProcessManager {
             .values_mut()
             .find(|record| record.owner == caller && record.operation_id == operation_id)
         {
-            if record.spec != spec {
+            if record.spec != spec || record.detached_requests != detached_requests {
                 return Err("operation_conflict");
             }
             record.advance()?;
