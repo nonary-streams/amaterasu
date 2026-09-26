@@ -218,6 +218,85 @@ fn low_resolution_art_promotes_only_after_successful_current_remote_fetch() {
 }
 
 #[test]
+fn restarted_cache_promotes_each_queued_portrait_and_repairs_corrupt_entry() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "amaterasu-steam-upgrade-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let first_revision = artwork::remote_revision(42, 123).unwrap();
+    let second_revision = artwork::remote_revision(43, 123).unwrap();
+    let cache_directory = root.join("amaterasu-steam-artwork-v1");
+    let first_path = cache_directory.join(format!("42-{first_revision}.png"));
+    let second_path = cache_directory.join(format!("43-{second_revision}.png"));
+
+    let mut initial = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    initial.games.insert(42, upgrade_game(42, true));
+    initial.remote_artwork.set_cache_root(Some(root.clone()));
+    initial
+        .remote_artwork
+        .start_with_fetcher(|_| Ok(remote_test_jpeg()))
+        .unwrap();
+    initial.upgrade_queue.push_back(42);
+    initial.enqueue_next_upgrade();
+    drain_artwork_until(&mut initial, Instant::now() + Duration::from_secs(5));
+    assert!(first_path.exists());
+    drop(initial);
+
+    std::fs::write(&second_path, b"corrupt cached portrait").unwrap();
+    let fetch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fetch_count_in_worker = std::sync::Arc::clone(&fetch_count);
+    let mut restarted = Provider {
+        enabled: true,
+        snapshot_complete: true,
+        ..Provider::default()
+    };
+    restarted.games.insert(42, upgrade_game(42, true));
+    restarted.games.insert(43, upgrade_game(43, true));
+    restarted.remote_artwork.set_cache_root(Some(root.clone()));
+    restarted
+        .remote_artwork
+        .start_with_fetcher(move |app_id| {
+            assert_eq!(app_id, 43, "the first portrait should come from disk");
+            fetch_count_in_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(remote_test_jpeg())
+        })
+        .unwrap();
+    restarted.upgrade_queue.extend([42, 43]);
+    restarted.enqueue_next_upgrade();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while restarted.upgrade_pending.is_some() || !restarted.upgrade_queue.is_empty() {
+        restarted.drain_remote_artwork();
+        assert!(Instant::now() < deadline, "queued upgrades did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fetch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        restarted.games[&42].artwork_revision.as_deref(),
+        Some(first_revision.as_str())
+    );
+    assert_eq!(
+        restarted.games[&43].artwork_revision.as_deref(),
+        Some(second_revision.as_str())
+    );
+    assert!(restarted.games.values().all(|game| game.artwork_is_remote));
+    assert_ne!(
+        std::fs::read(&second_path).unwrap(),
+        b"corrupt cached portrait"
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn high_resolution_local_art_stays_local_and_failed_upgrade_keeps_fallback() {
     let mut high = Provider {
         enabled: true,

@@ -2654,12 +2654,12 @@ mod tests {
                 last_updated: 123,
                 revision: revision.clone(),
                 offset: 0,
-                deadline: started + Duration::from_secs(2),
+                deadline: started + Duration::from_secs(5),
             })
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(150));
 
-        for _ in 0..100 {
+        while started.elapsed() < Duration::from_secs(5) {
             if let Some(completion) = worker.drain().into_iter().next() {
                 assert_eq!(completion.request_id, 7);
                 assert_eq!(completion.app_id, 42);

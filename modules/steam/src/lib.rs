@@ -626,6 +626,7 @@ impl Provider {
                     game.artwork_revision = Some(completion.revision);
                     self.revision += 1;
                 }
+                self.enqueue_next_upgrade();
                 continue;
             }
             let still_current = self.games.get(&completion.app_id).is_some_and(|game| {
