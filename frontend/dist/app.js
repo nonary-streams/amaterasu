@@ -2086,6 +2086,46 @@ var Amaterasu;
         return saved;
     }
     Amaterasu.saveHistorySettings = saveHistorySettings;
+    async function readHistorySettingsState(api) {
+        const settings = parseHistorySettingsReply(await api.post("history/settings_get"));
+        return { settings, runtime: await readHistoryRuntime(api) };
+    }
+    Amaterasu.readHistorySettingsState = readHistorySettingsState;
+    async function readHistoryRuntime(api) {
+        try {
+            return Amaterasu.parseHistoryRuntimeStatus(await api.post("history/history_status"));
+        }
+        catch {
+            return null;
+        }
+    }
+    async function saveHistorySettingsState(api, current, enabled, ttlDays, sizeLimitMb) {
+        const settings = await saveHistorySettings(api, current, enabled, ttlDays, sizeLimitMb);
+        return { settings, runtime: await readHistoryRuntime(api) };
+    }
+    Amaterasu.saveHistorySettingsState = saveHistorySettingsState;
+    function historySettingsRuntimeDescription(settings, runtime) {
+        if (runtime === null)
+            return "Saved history settings confirmed. Runtime status is unavailable; recording is not confirmed.";
+        if (!runtime.available)
+            return "Saved history settings confirmed. History storage is unavailable; recording is not active.";
+        if (!runtime.configuration_ready)
+            return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
+        if (runtime.enabled !== settings.settings.enabled)
+            return "Saved history settings confirmed. Runtime has not yet reported the saved recording policy.";
+        if (runtime.degraded)
+            return runtime.effective_enabled !== runtime.enabled
+                ? "Saved history settings confirmed. History runtime is degraded and the recording change is deferred until active streams end."
+                : "Saved history settings confirmed. History runtime is degraded; recording health is not confirmed.";
+        if (runtime.effective_enabled !== runtime.enabled)
+            return runtime.enabled
+                ? "Saved history settings confirmed. Recording enable change is deferred until active streams end."
+                : "Saved history settings confirmed. Recording disable change is deferred until active streams end.";
+        return runtime.effective_enabled
+            ? "Saved history settings confirmed. History recording is active."
+            : "Saved history settings confirmed. History recording is disabled.";
+    }
+    Amaterasu.historySettingsRuntimeDescription = historySettingsRuntimeDescription;
     async function saveAuthTokenLifetimes(api, revision, sessionTokenTtlSeconds, rememberMeRefreshTokenTtlSeconds) {
         if (!Number.isSafeInteger(revision) || revision < 0)
             throw new Error("Authentication settings revision is invalid.");
@@ -3331,7 +3371,7 @@ var Amaterasu;
         async function loadHistorySettings() {
             historyArea.replaceChildren(Amaterasu.el("p", "muted", "Loading session history settings…"));
             try {
-                const reply = parseHistorySettingsReply(await context.api.post("history/settings_get"));
+                const { settings: reply, runtime } = await readHistorySettingsState(context.api);
                 if (!context.content.isConnected)
                     return;
                 const form = Amaterasu.el("form", "settings-form");
@@ -3353,9 +3393,7 @@ var Amaterasu;
                 };
                 enabled.addEventListener("change", updateVisibility);
                 updateVisibility();
-                const status = Amaterasu.el("p", "muted", reply.effective_enabled === reply.settings.enabled
-                    ? "The saved history policy is active."
-                    : "The enable change will apply after active streams end.");
+                const status = Amaterasu.el("p", "muted", historySettingsRuntimeDescription(reply, runtime));
                 const save = Amaterasu.el("button", "button primary", "Save history settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
@@ -3363,10 +3401,8 @@ var Amaterasu;
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
-                        const updated = await saveHistorySettings(context.api, reply, enabled.checked, ttl.valueAsNumber, size.valueAsNumber);
-                        context.notify(updated.effective_enabled === updated.settings.enabled
-                            ? "Session history settings saved."
-                            : "Session history settings saved; the recording change is deferred.");
+                        const updated = await saveHistorySettingsState(context.api, reply, enabled.checked, ttl.valueAsNumber, size.valueAsNumber);
+                        context.notify(historySettingsRuntimeDescription(updated.settings, updated.runtime));
                         await loadHistorySettings();
                     });
                 });

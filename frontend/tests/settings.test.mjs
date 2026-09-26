@@ -11,6 +11,12 @@ vm.runInContext(
   }),
   context,
 );
+vm.runInContext(
+  ts.transpile(readFileSync("src/pages.ts", "utf8"), {
+    target: ts.ScriptTarget.ES2022,
+  }),
+  context,
+);
 const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 
@@ -241,6 +247,69 @@ test("history editor confirms exact signed revision and settings readback", asyn
     const staleApi = { async post(route) { return route === "history/settings_get" ? stale : { ok: true }; } };
     await assert.rejects(context.Amaterasu.saveHistorySettings(staleApi, current, false, 14, 20), /could not be confirmed/);
   }
+});
+
+test("history editor confirms durable save and separately reads signed runtime on save and reload", async () => {
+  let stored = { ok: true, revision: 4, settings: { enabled: false, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: false };
+  let runtime = {
+    ok: true,
+    status: {
+      available: true, configuration_ready: true, enabled: false, effective_enabled: false,
+      degraded: false, failed_operations: 0, active_streams: 1, sessions: 0, samples: 0,
+      events: 0, live_bytes: 0,
+      last_prune: { sessions_deleted: 0, live_bytes: 0, size_limit_bytes: 0, size_limit_unmet: false },
+    },
+  };
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push([route, ordinary(body ?? {})]);
+    if (route === "history/settings_update") {
+      assert.equal(body.expected_revision, stored.revision);
+      stored = { ...stored, revision: stored.revision + 1, settings: body.settings, effective_enabled: false };
+      runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
+      return { ok: true };
+    }
+    return route === "history/settings_get" ? stored : runtime;
+  } };
+  assert.equal(context.Amaterasu.parseHistoryRuntimeStatus(runtime).available, true);
+  const initial = await context.Amaterasu.readHistorySettingsState(api);
+  assert.deepEqual(calls, [["history/settings_get", {}], ["history/history_status", {}]]);
+  assert.equal(initial.runtime?.available, true);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(initial.settings, initial.runtime), /recording is disabled/);
+  const saved = await context.Amaterasu.saveHistorySettingsState(api, initial.settings, true, 14, 20);
+  assert.equal(saved.settings.revision, 5);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime), /deferred until active streams end/);
+  assert.deepEqual(calls.map(([route]) => route), [
+    "history/settings_get", "history/history_status", "history/settings_update",
+    "history/settings_get", "history/history_status",
+  ]);
+  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: true, active_streams: 0 } };
+  const reloaded = await context.Amaterasu.readHistorySettingsState(api);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /recording is active/);
+  runtime = { ...runtime, status: { ...runtime.status, enabled: false } };
+  const pending = await context.Amaterasu.readHistorySettingsState(api);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(pending.settings, pending.runtime), /has not yet reported/);
+  runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
+  const notReady = context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, {
+    ...reloaded.runtime, configuration_ready: false,
+  });
+  assert.match(notReady, /configuration is not ready/);
+  runtime = { ...runtime, status: { ...runtime.status, available: false, effective_enabled: false } };
+  const unavailable = await context.Amaterasu.readHistorySettingsState(api);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(unavailable.settings, unavailable.runtime), /storage is unavailable/);
+  assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(unavailable.settings, unavailable.runtime), /recording is active/);
+  runtime = { ...runtime, status: { ...runtime.status, available: true, degraded: true } };
+  const degraded = await context.Amaterasu.readHistorySettingsState(api);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(degraded.settings, degraded.runtime), /degraded/);
+  runtime = { ...runtime, status: { ...runtime.status, available: "true" } };
+  const malformed = await context.Amaterasu.readHistorySettingsState(api);
+  assert.equal(malformed.runtime, null);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(malformed.settings, malformed.runtime), /status is unavailable/);
+  const rejected = await context.Amaterasu.readHistorySettingsState({ async post(route) {
+    if (route === "history/history_status") throw new Error("service unavailable");
+    return stored;
+  } });
+  assert.equal(rejected.runtime, null);
 });
 
 test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
