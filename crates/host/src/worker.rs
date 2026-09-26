@@ -218,10 +218,23 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
 /// Interactive-session worker lifetime. The SCM supervisor owns process
 /// creation and termination; this user-token process never accepts console
 /// commands or receives a privileged service handle.
-pub fn serve_interactive(root: &Path, digest: &str, state_root: &Path) -> PackageResult<()> {
+pub fn serve_interactive(
+    root: &Path,
+    digest: &str,
+    state_root: &Path,
+    seed: Option<&Path>,
+) -> PackageResult<()> {
     // Its stdout is a single inherited, write-only pipe to the Session 0
     // supervisor. It carries the exact bounded startup proof and is not a
     // console or a capability channel.
+    #[cfg(windows)]
+    if let Some(seed) = seed {
+        crate::state_root::apply_pending_seed(seed, state_root)?;
+    }
+    #[cfg(not(windows))]
+    if seed.is_some() {
+        return Err("interactive migration seed requires Windows".into());
+    }
     let mut startup_progress = |_| Ok(());
     let mut components = load_components(root, digest, state_root, &mut startup_progress)?;
     components.tick()?;

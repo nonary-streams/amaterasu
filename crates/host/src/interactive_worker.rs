@@ -276,20 +276,24 @@ struct Worker {
 impl Worker {
     fn start(root: &Path, digest: &str, session_id: u32) -> PackageResult<Self> {
         let user_token = UserToken::for_session(session_id)?;
-        let state_root = crate::state_root::prepare(root, user_token.handle)?;
+        let prepared = crate::state_root::prepare(root, user_token.handle)?;
         let primary_token = user_token.duplicate_primary()?;
         let environment = UserEnvironment::for_token(primary_token.handle)?;
         let null_device = InheritableNull::open()?;
         let mut readiness = ReadinessPipe::open()?;
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let application_name = wide_os(executable.as_os_str())?;
-        let mut command_line = command_line(&[
+        let mut arguments = vec![
             executable.as_os_str(),
             OsStr::new("worker-user-serve"),
             root.as_os_str(),
             OsStr::new(digest),
-            state_root.as_os_str(),
-        ])?;
+            prepared.root.as_os_str(),
+        ];
+        if let Some(seed) = &prepared.seed {
+            arguments.push(seed.as_os_str());
+        }
+        let mut command_line = command_line(&arguments)?;
         let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(Some(0)).collect();
         let allowed_handles = [null_device.handle, readiness.write_handle()];
         let attributes = StartupAttributeList::only_handles(&allowed_handles)?;

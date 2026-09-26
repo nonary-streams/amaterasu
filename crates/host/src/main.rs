@@ -38,7 +38,15 @@ fn run() -> PackageResult<()> {
             worker::serve(Path::new(root), digest)?;
         }
         [command, root, digest, state_root] if command == "worker-user-serve" => {
-            worker::serve_interactive(Path::new(root), digest, Path::new(state_root))?;
+            worker::serve_interactive(Path::new(root), digest, Path::new(state_root), None)?;
+        }
+        [command, root, digest, state_root, seed] if command == "worker-user-serve" => {
+            worker::serve_interactive(
+                Path::new(root),
+                digest,
+                Path::new(state_root),
+                Some(Path::new(seed)),
+            )?;
         }
         [command, root] if command == "probe" => {
             supervisor::probe(Path::new(root), None)?;

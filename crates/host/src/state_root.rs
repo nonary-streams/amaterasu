@@ -3,14 +3,17 @@
 //! The service runs as LocalSystem and derives the directory name from the
 //! active WTS token. A signed package is verified before this code is reached;
 //! the package never chooses this path. The machine migration seed remains
-//! SYSTEM/Admin-only and is copied once into a SID-specific directory before
-//! the user-token process starts.
+//! SYSTEM/Admin-only and is staged under the protected parent before the
+//! user-token process merges it into that user's durable state.
 
 use amaterasu_package::{PackageResult, random_identifier};
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+
+mod seed;
+pub(crate) use seed::apply_pending_seed;
 
 const TOKEN_USER: u32 = 1;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
@@ -109,10 +112,22 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn GetFileAttributesW(path: *const u16) -> u32;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
-/// Prepares the root visible to exactly one active interactive user.
-pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PathBuf> {
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+}
+
+pub(crate) struct PreparedUserState {
+    pub(crate) root: PathBuf,
+    pub(crate) seed: Option<PathBuf>,
+}
+
+/// Prepares a user root and a separate SID-readable migration snapshot.
+pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PreparedUserState> {
     let root = canonical_real_directory(root, "runtime root")?;
     ensure_machine_private(&root)?;
     let sid = sid_string(token)?;
@@ -122,39 +137,53 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PathBuf>
 
     let container = root.join("user-state");
     ensure_directory(&container, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
-    let destination = container.join(&sid);
-    if destination
+    let mut destination = container.join(&sid);
+    let existing = destination
         .try_exists()
-        .map_err(|error| error.to_string())?
-    {
-        let destination = canonical_real_directory(&destination, "user state root")?;
+        .map_err(|error| error.to_string())?;
+    if existing {
+        destination = canonical_real_directory(&destination, "user state root")?;
         set_dacl(
             &destination,
             &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"),
         )?;
-        return Ok(destination);
     }
 
-    // The migration helpers seed this machine-private directory. It is copied
-    // only during first materialization; later service starts preserve the
-    // user's durable state rather than replaying an import.
+    if !existing {
+        destination = materialize_empty(&container, &destination, &sid)?;
+    }
+
+    // The service never writes through an existing SID-controlled tree.
+    // It stages under a SYSTEM-only parent; the worker applies the snapshot.
     let data = root.join("data");
     ensure_machine_private(&data)?;
     let seed = data.join("state");
     if !seed.try_exists().map_err(|error| error.to_string())? {
-        return materialize_empty(&container, &destination, &sid);
+        return Ok(PreparedUserState {
+            root: destination,
+            seed: None,
+        });
     }
     let seed = canonical_real_directory(&seed, "pending migration seed")?;
     ensure_machine_private(&seed)?;
     if !claim_pending_seed(&data, &sid)? {
-        return materialize_empty(&container, &destination, &sid);
+        return Ok(PreparedUserState {
+            root: destination,
+            seed: None,
+        });
+    }
+    let staged = container.join(format!(".seed-{sid}"));
+    if staged.try_exists().map_err(|error| error.to_string())? {
+        return Ok(PreparedUserState {
+            root: destination,
+            seed: Some(staged),
+        });
     }
     let pending = container.join(format!(".pending-{}", random_identifier()?));
     create_real_directory(&pending)?;
     let result = copy_real_tree(&seed, &pending);
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&pending);
-        let _ = fs::remove_file(data.join("state-seed-claim"));
         return Err(error);
     }
     let result = (|| {
@@ -162,12 +191,15 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PathBuf>
             &pending,
             &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"),
         )?;
-        fs::rename(&pending, &destination).map_err(|error| error.to_string())?;
-        canonical_real_directory(&destination, "new user state root")
+        secure_user_directories(&pending, &sid)?;
+        fs::rename(&pending, &staged).map_err(|error| error.to_string())?;
+        Ok(PreparedUserState {
+            root: destination,
+            seed: Some(staged),
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&pending);
-        let _ = fs::remove_file(data.join("state-seed-claim"));
     }
     result
 }
@@ -180,34 +212,50 @@ pub(crate) fn prepare(root: &Path, token: *mut c_void) -> PackageResult<PathBuf>
 fn claim_pending_seed(data: &Path, sid: &str) -> PackageResult<bool> {
     let claim = data.join("state-seed-claim");
     if claim.try_exists().map_err(|error| error.to_string())? {
-        let metadata = fs::symlink_metadata(&claim).map_err(|error| error.to_string())?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err("migration seed claim is invalid".into());
-        }
-        reject_reparse(&claim)?;
-        if metadata.len() == 0 || metadata.len() > MAX_SID_LENGTH as u64 {
-            return Err("migration seed claim is invalid".into());
-        }
-        let owner = fs::read_to_string(&claim).map_err(|error| error.to_string())?;
-        if !valid_sid(&owner) || owner.len() as u64 != metadata.len() {
-            return Err("migration seed claim is invalid".into());
-        }
+        let owner = read_seed_owner(&claim)?;
         // A crash after claiming but before publishing the per-user root must
         // not permanently strand imported credentials. The caller holds the
-        // runtime root lock, and an existing destination was handled above.
+        // runtime root lock; an existing destination can still need a merge.
         return Ok(owner == sid);
     }
-    use std::io::Write;
-    let mut claim_file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&claim)
-        .map_err(|error| error.to_string())?;
-    claim_file
-        .write_all(sid.as_bytes())
-        .and_then(|()| claim_file.sync_all())
-        .map_err(|error| error.to_string())?;
+    write_seed_owner(&claim, sid)?;
     Ok(true)
+}
+
+fn write_seed_owner(path: &Path, sid: &str) -> PackageResult<()> {
+    use std::io::Write;
+    let temporary = path.with_file_name(format!(".seed-marker-{}", random_identifier()?));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(sid.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_seed_owner(path: &Path) -> PackageResult<String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("migration seed marker is invalid".into());
+    }
+    reject_reparse(path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_SID_LENGTH as u64 {
+        return Err("migration seed marker is invalid".into());
+    }
+    let owner = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if !valid_sid(&owner) || owner.len() as u64 != metadata.len() {
+        return Err("migration seed marker is invalid".into());
+    }
+    Ok(owner)
 }
 
 fn materialize_empty(container: &Path, destination: &Path, sid: &str) -> PackageResult<PathBuf> {
@@ -238,6 +286,31 @@ fn copy_real_tree(source: &Path, destination: &Path) -> PackageResult<()> {
         }
     }
     Ok(())
+}
+
+fn secure_user_directories(root: &Path, sid: &str) -> PackageResult<()> {
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        reject_reparse(&path)?;
+        if metadata.is_dir() {
+            set_user_dacl(&path, sid)?;
+            secure_user_directories(&path, sid)?;
+        } else if metadata.is_file() {
+            set_user_dacl(&path, sid)?;
+        } else {
+            return Err("migration seed contains a non-regular entry".into());
+        }
+    }
+    Ok(())
+}
+
+fn set_user_dacl(path: &Path, sid: &str) -> PackageResult<()> {
+    set_dacl(
+        path,
+        &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})"),
+    )
 }
 
 fn ensure_directory(path: &Path, sddl: &str) -> PackageResult<()> {
@@ -506,13 +579,54 @@ fn valid_sid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::seed::{SeedNamespace, read_seed_namespace};
     use super::{
-        AccessAllowedAce, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetSecurityDescriptorDacl, LocalFree, canonical_real_directory, claim_pending_seed,
-        copy_real_tree, expected_sids, same_windows_path, valid_sid, validate_descriptor, wide,
+        AccessAllowedAce, CloseHandle, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetCurrentProcess, GetSecurityDescriptorDacl, LocalFree, OpenProcessToken,
+        SetFileSecurityW, canonical_real_directory, claim_pending_seed, copy_real_tree,
+        expected_sids, same_windows_path, sid_string, valid_sid, validate_dacl,
+        validate_descriptor, wide,
     };
+    use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::ffi::{OsStr, c_void};
     use std::fs;
+
+    fn current_sid() -> String {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: the pseudo process handle is valid and OpenProcessToken writes one handle.
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) },
+            0
+        );
+        let sid = sid_string(token).unwrap();
+        // SAFETY: OpenProcessToken returned this owned handle.
+        unsafe { CloseHandle(token) };
+        sid
+    }
+
+    fn make_permissive(path: &std::path::Path) {
+        let sddl = wide(OsStr::new("D:P(A;OICI;FA;;;WD)")).unwrap();
+        let path = wide(path.as_os_str()).unwrap();
+        let mut descriptor = std::ptr::null_mut();
+        let mut length = 0;
+        // SAFETY: SDDL is NUL-terminated; Windows allocates descriptor on success.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    &mut length,
+                )
+            },
+            0
+        );
+        // SAFETY: buffers remain valid for this synchronous security update.
+        assert_ne!(unsafe { SetFileSecurityW(path.as_ptr(), 4, descriptor) }, 0);
+        // SAFETY: conversion API allocated this descriptor.
+        unsafe { LocalFree(descriptor) };
+    }
 
     #[test]
     fn accepts_only_string_sids_safe_for_a_directory_component() {
@@ -537,6 +651,127 @@ mod tests {
             fs::read(seed.join("namespaces/state.json")).unwrap(),
             b"seed"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_user_state_receives_only_missing_seed_files_once() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-existing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let seed = root.join("seed");
+        let user = root.join("user");
+        let data = root.join("data");
+        let namespace = "616d617465726173752e61757468656e7469636174696f6e";
+        fs::create_dir_all(seed.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir_all(user.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir(&data).unwrap();
+        fs::write(
+            seed.join("namespaces").join(namespace).join("state.json"),
+            br#"{"format_version":1,"revision":1,"values":{"authentication/v1":{"credential":"imported"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            user.join("namespaces").join(namespace).join("state.json"),
+            br#"{"format_version":1,"revision":2,"values":{"authentication/sessions/v1":{"sessions":[]}}}"#,
+        )
+        .unwrap();
+        let sid = current_sid();
+        let namespace_path = user.join("namespaces").join(namespace);
+        let expected = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{sid})");
+        make_permissive(&namespace_path);
+        assert!(validate_dacl(&namespace_path, &expected).is_err());
+        assert!(claim_pending_seed(&data, &sid).unwrap());
+        let held = amaterasu_package::RootLock::acquire(&user).unwrap();
+        assert!(super::apply_pending_seed(&seed, &user).is_err());
+        assert!(!user.join(".migration-seed-applied").exists());
+        drop(held);
+        super::apply_pending_seed(&seed, &user).unwrap();
+        assert!(user.join(".migration-seed-applied").exists());
+        let imported =
+            read_seed_namespace(&user.join("namespaces").join(namespace).join("state.json"))
+                .unwrap();
+        assert_eq!(imported.revision, 3);
+        assert!(imported.values.contains_key("authentication/v1"));
+        assert!(imported.values.contains_key("authentication/sessions/v1"));
+        validate_dacl(&namespace_path, &expected).unwrap();
+        validate_dacl(&namespace_path.join("state.json"), &expected).unwrap();
+        super::apply_pending_seed(&seed, &user).unwrap();
+        let imported =
+            read_seed_namespace(&user.join("namespaces").join(namespace).join("state.json"))
+                .unwrap();
+        assert_eq!(imported.revision, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_authentication_credential_wins_over_imported_seed() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-credential-wins-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let seed = root.join("seed");
+        let user = root.join("user");
+        let namespace = "616d617465726173752e61757468656e7469636174696f6e";
+        fs::create_dir_all(seed.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir_all(user.join("namespaces").join(namespace)).unwrap();
+        fs::write(
+            seed.join("namespaces").join(namespace).join("state.json"),
+            br#"{"format_version":1,"revision":1,"values":{"authentication/v1":{"credential":"imported"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            user.join("namespaces").join(namespace).join("state.json"),
+            br#"{"format_version":1,"revision":7,"values":{"authentication/v1":{"credential":"current"}}}"#,
+        )
+        .unwrap();
+        super::apply_pending_seed(&seed, &user).unwrap();
+        let current =
+            read_seed_namespace(&user.join("namespaces").join(namespace).join("state.json"))
+                .unwrap();
+        assert_eq!(current.values["authentication/v1"]["credential"], "current");
+        assert_eq!(current.revision, 7);
+        assert!(user.join(".migration-seed-applied").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_namespace_merge_preserves_existing_state_and_no_completion_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-state-root-namespace-limit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source_root = root.join("seed");
+        let destination_root = root.join("user");
+        let namespace = "616d617465726173752e61757468656e7469636174696f6e";
+        fs::create_dir_all(source_root.join("namespaces").join(namespace)).unwrap();
+        fs::create_dir_all(destination_root.join("namespaces").join(namespace)).unwrap();
+        let source = source_root
+            .join("namespaces")
+            .join(namespace)
+            .join("state.json");
+        let destination = destination_root
+            .join("namespaces")
+            .join(namespace)
+            .join("state.json");
+        let make_namespace = |prefix: &str| SeedNamespace {
+            format_version: 1,
+            revision: 1,
+            values: (0..80)
+                .map(|index| (format!("{prefix}-{index}"), Value::String("x".repeat(8000))))
+                .collect::<BTreeMap<_, _>>(),
+        };
+        amaterasu_package::write_json_atomically(&source, &make_namespace("seed")).unwrap();
+        amaterasu_package::write_json_atomically(&destination, &make_namespace("current")).unwrap();
+        let original = fs::read(&destination).unwrap();
+        assert!(super::apply_pending_seed(&source_root, &destination_root).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert!(!destination_root.join(".migration-seed-applied").exists());
         let _ = fs::remove_dir_all(root);
     }
 
