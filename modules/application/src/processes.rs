@@ -15,6 +15,63 @@ use std::time::{Duration, Instant};
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PREPARATION_SHUTDOWN: Duration = Duration::from_secs(8 * 2 * 30);
 
+fn spawn_detached_commands_with(
+    spec: &LaunchSpec,
+    mut spawn: impl FnMut(
+        &mut Command,
+        bool,
+        Option<&str>,
+        Option<&str>,
+    ) -> std::io::Result<DetachedChild>,
+) -> Vec<DetachedChild> {
+    let mut children = Vec::new();
+    for detached in &spec.detached {
+        let mut command = Command::new(&detached.executable);
+        command
+            .args(&detached.args)
+            .env_clear()
+            .envs(&detached.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(cwd) = detached.cwd.as_ref().or(spec.cwd.as_ref()) {
+            command.current_dir(cwd);
+        } else if let Some(cwd) = std::path::Path::new(&detached.executable)
+            .parent()
+            .filter(|directory| !directory.as_os_str().is_empty())
+        {
+            command.current_dir(cwd);
+        }
+
+        // Detached launchers are best-effort. Their failure cannot prevent the
+        // primary application or a later detached command from starting.
+        if let Ok(child) = spawn(
+            &mut command,
+            detached.elevated.unwrap_or(spec.elevated),
+            detached.stdout.as_deref(),
+            detached.stderr.as_deref(),
+        ) {
+            children.push(child);
+        }
+    }
+    children
+}
+
+fn check_detached_output_support(
+    spec: &LaunchSpec,
+    mut supported: impl FnMut(bool) -> std::io::Result<bool>,
+) -> Result<(), &'static str> {
+    for detached in &spec.detached {
+        if detached.stdout.is_some() || detached.stderr.is_some() {
+            let elevated = detached.elevated.unwrap_or(spec.elevated);
+            if !supported(elevated).map_err(|_| "detached_output_unavailable")? {
+                return Err("detached_output_unsupported");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 enum Completion {
     ExitedPending,
@@ -177,35 +234,10 @@ impl ProcessRecord {
     }
 
     fn spawn_detached_commands(&mut self) {
-        for detached in &self.spec.detached {
-            let mut command = Command::new(&detached.executable);
-            command
-                .args(&detached.args)
-                .env_clear()
-                .envs(&detached.environment)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if let Some(cwd) = detached.cwd.as_ref().or(self.spec.cwd.as_ref()) {
-                command.current_dir(cwd);
-            } else if let Some(cwd) = std::path::Path::new(&detached.executable)
-                .parent()
-                .filter(|directory| !directory.as_os_str().is_empty())
-            {
-                command.current_dir(cwd);
-            }
-
-            // The source treats these as best-effort launchers. Their spawn
-            // failure must not prevent the primary application from starting.
-            if let Ok(child) = DetachedChild::spawn_with_output(
-                &mut command,
-                self.spec.elevated,
-                detached.stdout.as_deref(),
-                detached.stderr.as_deref(),
-            ) {
-                self.detached_children.push(child);
-            }
-        }
+        self.detached_children.extend(spawn_detached_commands_with(
+            &self.spec,
+            DetachedChild::spawn_with_output,
+        ));
     }
 
     fn reap_detached_commands(&mut self) {
@@ -785,18 +817,15 @@ impl ProcessManager {
                     preparation: preparation.into_vec(),
                 };
                 spec.validate(&operation_id).map_err(|_| "invalid_launch")?;
-                if spec
-                    .detached
-                    .iter()
-                    .any(|command| command.stdout.is_some() || command.stderr.is_some())
-                    && !self
-                        .records
-                        .values()
-                        .any(|record| record.owner == caller && record.operation_id == operation_id)
-                    && !DetachedChild::output_redirection_supported(spec.elevated)
-                        .map_err(|_| "detached_output_unavailable")?
+                if !self
+                    .records
+                    .values()
+                    .any(|record| record.owner == caller && record.operation_id == operation_id)
                 {
-                    return Err("detached_output_unsupported");
+                    check_detached_output_support(
+                        &spec,
+                        DetachedChild::output_redirection_supported,
+                    )?;
                 }
                 self.launch(caller, operation_id, spec, detached_requests)
             }
@@ -1096,4 +1125,80 @@ impl Drop for ProcessManager {
 
 fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
+}
+
+#[cfg(test)]
+mod detached_elevation_tests {
+    use super::*;
+    use crate::commands::DetachedCommand;
+
+    fn launch_spec(elevated: bool, policies: &[Option<bool>]) -> LaunchSpec {
+        LaunchSpec {
+            executable: "primary".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            cwd: None,
+            preparation_cwd: None,
+            elevated,
+            auto_detach: false,
+            wait_all: true,
+            exit_timeout_seconds: 10,
+            steam_id: None,
+            steam_install_dir: None,
+            detached: policies
+                .iter()
+                .map(|policy| DetachedCommand {
+                    executable: "detached".into(),
+                    args: Vec::new(),
+                    environment: BTreeMap::new(),
+                    cwd: None,
+                    stdout: None,
+                    stderr: None,
+                    elevated: *policy,
+                })
+                .collect(),
+            preparation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detached_spawner_receives_inherited_and_explicit_elevation_per_child() {
+        let spec = launch_spec(true, &[None, Some(false), Some(true)]);
+        let mut forwarded = Vec::new();
+        let children = spawn_detached_commands_with(&spec, |_, elevated, _, _| {
+            forwarded.push(elevated);
+            Err(std::io::Error::other("mock spawn"))
+        });
+        assert!(children.is_empty());
+        assert_eq!(forwarded, [true, false, true]);
+        assert!(spec.elevated);
+
+        let mut forwarded = Vec::new();
+        spawn_detached_commands_with(
+            &launch_spec(false, &[None, Some(true)]),
+            |_, elevated, _, _| {
+                forwarded.push(elevated);
+                Err(std::io::Error::other("mock spawn"))
+            },
+        );
+        assert_eq!(forwarded, [false, true]);
+    }
+
+    #[test]
+    fn redirected_children_check_their_own_effective_elevation_before_spawn() {
+        let mut spec = launch_spec(false, &[Some(true), Some(false)]);
+        spec.detached[0].stdout = Some("output".into());
+        spec.detached[1].stderr = Some("error".into());
+        let mut checked = Vec::new();
+        check_detached_output_support(&spec, |elevated| {
+            checked.push(elevated);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(checked, [true, false]);
+        assert_eq!(
+            check_detached_output_support(&spec, |_| Ok(false)),
+            Err("detached_output_unsupported")
+        );
+    }
 }

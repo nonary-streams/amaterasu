@@ -560,6 +560,45 @@ fn detached_retry_rejects_changed_override_even_when_effective_environment_match
 }
 
 #[test]
+fn typed_detached_elevation_is_validated_and_part_of_retry_identity() {
+    let mut manager = ProcessManager::default();
+    let mut invalid = launch("detached-elevation-invalid", "sleep");
+    invalid["detached"] = json!([{
+        "command":"amaterasu-missing-detached-command",
+        "elevated":"yes"
+    }]);
+    assert_eq!(manager.handle("alice", invalid)["code"], "invalid_request");
+    assert_eq!(
+        manager.handle("alice", json!({"action":"list"}))["processes"],
+        json!([])
+    );
+
+    let mut request = launch("detached-elevation", "sleep");
+    request["elevated"] = json!(true);
+    request["detached"] = json!([{
+        "command":"amaterasu-missing-detached-command",
+        "elevated":false
+    }]);
+    let started = manager.handle("alice", request.clone());
+    assert_eq!(started["process"]["state"], "running", "{started}");
+    assert_eq!(manager.handle("alice", request.clone()), started);
+    request["detached"][0]["elevated"] = json!(true);
+    assert_eq!(
+        manager.handle("alice", request.clone())["code"],
+        "operation_conflict"
+    );
+    request["detached"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("elevated");
+    assert_eq!(
+        manager.handle("alice", request)["code"],
+        "operation_conflict"
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn auto_detach_retains_a_quick_successful_launcher_until_explicit_stop() {
     let directory = test_directory("auto-detach");
     let marker = directory.join("launcher-exited");

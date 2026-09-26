@@ -18,6 +18,7 @@ pub(crate) struct DetachedCommand {
     pub cwd: Option<String>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    pub elevated: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,6 +40,8 @@ pub(crate) struct DetachedCommandRequest {
     pub stdout: Option<String>,
     #[serde(default)]
     pub stderr: Option<String>,
+    #[serde(default)]
+    pub elevated: Option<bool>,
 }
 
 impl From<DetachedCommandInput> for DetachedCommandRequest {
@@ -50,6 +53,7 @@ impl From<DetachedCommandInput> for DetachedCommandRequest {
                 cwd: None,
                 stdout: None,
                 stderr: None,
+                elevated: None,
             },
             DetachedCommandInput::Typed(request) => request,
         }
@@ -108,6 +112,7 @@ pub(crate) fn prepare_detached_requests(
             command.cwd = request.cwd.clone();
             command.stdout = request.stdout.clone();
             command.stderr = request.stderr.clone();
+            command.elevated = request.elevated;
             Ok(command)
         })
         .collect()
@@ -139,6 +144,7 @@ pub(crate) fn parse_detached_commands(
                 cwd: None,
                 stdout: None,
                 stderr: None,
+                elevated: None,
             })
         })
         .collect()
@@ -372,6 +378,7 @@ mod tests {
             cwd: None,
             stdout: None,
             stderr: None,
+            elevated: None,
         }];
         let commands = prepare_detached_requests(&requests, &launch, &|name| {
             (name == "HOST").then(|| "host only".into())

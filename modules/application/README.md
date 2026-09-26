@@ -28,7 +28,7 @@ after `wait_all` is satisfied. A zero exit timeout skips graceful shutdown.
 Detached command strings use platform argv quoting, run best-effort before the
 primary executable, and are not attached to its process group or termination
 lifecycle. They inherit the app's explicit environment and working directory.
-The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path","stdout":"/absolute/out.log","stderr":"/absolute/err.log"}`;
+The typed form accepts `{"command":"...","environment":{"NAME":"value"},"cwd":"/absolute/path","stdout":"/absolute/out.log","stderr":"/absolute/err.log","elevated":false}`;
 `working_directory` is an alias for `cwd`. The per-command environment overlays
 the launch environment for that detached process only; its cwd overrides the
 launch cwd. The primary process and other detached commands keep their own
@@ -48,9 +48,13 @@ sessions, and temporary inheritable handles could leak to concurrent host
 spawns. Supporting that host requires a broker running as the selected user.
 Failure to obtain the active-user token returns `detached_output_unavailable`.
 A file-open or detached-command spawn failure remains best-effort and does not
-fail the main launch. Detached
-commands have no independent elevation field; they receive the same launch-level
-`elevated` flag as the primary application.
+fail the main launch. A typed command's optional `elevated` boolean overrides
+the launch-level flag for that detached child alone. Legacy strings and typed
+commands without the field inherit the launch flag. On a Windows SYSTEM host,
+`true` selects the active user's linked elevated token only when one exists;
+standard users keep their original token, and a missing active session fails
+the child launch without falling back to SYSTEM. Non-SYSTEM Windows and Unix
+hosts retain their current identity, so the flag does not elevate them.
 
 Launch may also contain up to eight ordered preparation steps:
 
@@ -163,7 +167,8 @@ yields `operation_conflict`. Defaulted empty args/environment/preparation/detach
 list, policy defaults, and absent/null cwd are normalized before comparison;
 legacy detached strings and typed objects with empty overrides have the same
 retry identity; `working_directory` and `cwd` also normalize to the same value.
-Changing a detached override or output path conflicts with the original operation. Host
+Changing a detached override, output path, or explicit elevation conflicts with
+the original operation. Host
 environment references resolved for the original request are retained on retry;
 paths are not canonicalized. Retries never
 rerun completed preparation or undo, and repeated termination of a terminal
@@ -257,8 +262,8 @@ and [Toolhelp snapshots](https://learn.microsoft.com/en-us/windows/win32/toolhel
 
 Vibeshine's `docs/app_examples.md` was used only as a behavioral reference for
 application launch and working-directory requirements. Source was not copied.
-Detached launchers are a bounded argv-only subset: per-command elevation and
-output capture or rotation remain parity gaps. Desktop pseudo-apps, URI
+Detached launchers are a bounded argv-only subset: output capture or rotation
+remain parity gaps. Desktop pseudo-apps, URI
 launch, and launcher-specific behavior also remain unimplemented.
 
 Tests invoke a controlled Rust test subprocess to verify actual launch, natural
