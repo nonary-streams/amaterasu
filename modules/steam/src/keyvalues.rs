@@ -30,6 +30,14 @@ pub fn parse(source: &str) -> Result<Value, String> {
 }
 
 pub fn parse_bounded(source: &str, max_bytes: usize) -> Result<Value, String> {
+    parse_bounded_with_token_limit(source, max_bytes, 8192)
+}
+
+pub fn parse_bounded_with_token_limit(
+    source: &str,
+    max_bytes: usize,
+    max_token_bytes: usize,
+) -> Result<Value, String> {
     if source.len() > max_bytes {
         return Err("KeyValues document exceeds its byte limit".into());
     }
@@ -37,6 +45,7 @@ pub fn parse_bounded(source: &str, max_bytes: usize) -> Result<Value, String> {
         source: source.trim_start_matches('\u{feff}').as_bytes(),
         position: 0,
         nodes: 0,
+        max_token_bytes: max_token_bytes.min(max_bytes),
     };
     parser.object(0, false)
 }
@@ -45,6 +54,7 @@ struct Parser<'a> {
     source: &'a [u8],
     position: usize,
     nodes: usize,
+    max_token_bytes: usize,
 }
 
 impl Parser<'_> {
@@ -138,8 +148,8 @@ impl Parser<'_> {
                     0 => return Err("NUL in manifest".into()),
                     _ => bytes.push(byte),
                 }
-                if bytes.len() > 8192 {
-                    return Err("token exceeds 8192 bytes".into());
+                if bytes.len() > self.max_token_bytes {
+                    return Err("token exceeds its byte limit".into());
                 }
             }
         } else {
@@ -152,8 +162,8 @@ impl Parser<'_> {
                 }
                 bytes.push(byte);
                 self.position += 1;
-                if bytes.len() > 8192 {
-                    return Err("token exceeds 8192 bytes".into());
+                if bytes.len() > self.max_token_bytes {
+                    return Err("token exceeds its byte limit".into());
                 }
             }
             if bytes.is_empty() {

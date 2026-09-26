@@ -16,6 +16,7 @@ const MAX_APPINFO_RECORD_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_APPINFO_RECORDS: usize = 2_000_000;
 const APPINFO_RECORDS_PER_TICK: usize = 256;
 const MAX_LOCALCONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LOCALCONFIG_TOKEN_BYTES: usize = 64 * 1024;
 const MAX_METADATA_ROOTS: usize = 32;
 const MAX_USER_ACCOUNTS: usize = 64;
 const MAX_LOCALCONFIG_TASKS: usize = 256;
@@ -397,7 +398,11 @@ fn read_localconfig(path: &Path, games: &BTreeMap<u32, Game>) -> Result<LocalCon
         return Err("Steam localconfig changed while it was read".into());
     }
     let source = std::str::from_utf8(&bytes).map_err(|_| "Steam localconfig is not UTF-8")?;
-    let document = keyvalues::parse_bounded(source, MAX_LOCALCONFIG_BYTES as usize)?;
+    let document = keyvalues::parse_bounded_with_token_limit(
+        source,
+        MAX_LOCALCONFIG_BYTES as usize,
+        MAX_LOCALCONFIG_TOKEN_BYTES,
+    )?;
     let apps = document
         .field("UserLocalConfigStore")?
         .field("Software")?
@@ -931,6 +936,37 @@ mod tests {
         assert_eq!(game.last_played, Some(1_800_000_000));
         assert!(scan.appinfo_complete);
         assert!(scan.history_complete);
+    }
+
+    #[test]
+    fn long_unrelated_localconfig_value_keeps_installed_history_available() {
+        let fixture = Fixture::new();
+        fixture.installed_manifest(42);
+        fixture.appinfo(&[(42, "game")]);
+        fixture.localconfig("100", &[(42, 1_800_000_000)]);
+        let localconfig = fixture.0.join("userdata/100/config/localconfig.vdf");
+        fs::write(
+            &localconfig,
+            format!(
+                "UserLocalConfigStore {{ Software {{ Valve {{ Steam {{ extra \"{}\" apps {{ 42 {{ LastPlayed 1800000000 }} }} }} }} }} }}",
+                "x".repeat(18_000)
+            ),
+        )
+        .unwrap();
+
+        let scan = scan_to_completion(fixture.steam_root());
+        assert!(scan.history_complete);
+        assert_eq!(scan.games[&42].last_played, Some(1_800_000_000));
+
+        fs::write(
+            &localconfig,
+            format!(
+                "UserLocalConfigStore {{ Software {{ Valve {{ Steam {{ extra \"{}\" apps {{ 42 {{ LastPlayed 1800000000 }} }} }} }} }} }}",
+                "x".repeat(MAX_LOCALCONFIG_TOKEN_BYTES + 1)
+            ),
+        )
+        .unwrap();
+        assert!(!scan_to_completion(fixture.steam_root()).history_complete);
     }
 
     #[test]
