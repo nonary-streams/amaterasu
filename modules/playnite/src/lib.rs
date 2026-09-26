@@ -186,6 +186,8 @@ struct PlayniteModule {
     configuration: ProductConfiguration,
     catalog: catalog_sync::CatalogSync,
     snapshot_worker: SnapshotWorker,
+    pending_unsolicited_snapshot: Option<connector::SnapshotEvent>,
+    sunshine_observed: Option<(Vec<discovery::ProcessImage>, bool, u64)>,
     settings_epoch: u64,
     observed_settings_epoch: u64,
     observed_settings: Option<ProductSettings>,
@@ -206,11 +208,14 @@ impl ManagedModule for PlayniteModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        connector::start_sunshine_actor();
         Ok(Self {
             runtime,
             configuration: ProductConfiguration::new(),
             catalog: catalog_sync::CatalogSync::default(),
             snapshot_worker: SnapshotWorker::default(),
+            pending_unsolicited_snapshot: None,
+            sunshine_observed: None,
             settings_epoch: 0,
             observed_settings_epoch: u64::MAX,
             observed_settings: None,
@@ -233,6 +238,7 @@ impl ManagedModule for PlayniteModule {
         self.observe_settings();
         self.launches.advance();
         self.refresh_discovery();
+        self.observe_sunshine_connection();
         self.fullscreen_launches
             .advance(Instant::now(), &self.last_discovery.processes);
         self.poll_snapshot();
@@ -240,6 +246,7 @@ impl ManagedModule for PlayniteModule {
         self.catalog
             .advance(&self.runtime, self.settings_epoch)
             .map_err(|error| format!("Playnite catalog import failed: {error}"))?;
+        self.poll_unsolicited_snapshot();
         self.fullscreen_entry_sync.advance(&self.runtime)?;
         if let Some(launchable_game_ids) = self.catalog.take_completed_launchable_game_ids()
             && can_publish_eligibility(self.catalog_processes.as_deref(), &self.last_discovery)
@@ -259,7 +266,27 @@ impl ManagedModule for PlayniteModule {
     }
 }
 
+impl Drop for PlayniteModule {
+    fn drop(&mut self) {
+        connector::stop_sunshine_actor();
+    }
+}
+
 impl PlayniteModule {
+    fn observe_sunshine_connection(&mut self) {
+        let enabled = self.configuration.ready() && self.configuration.settings().enabled;
+        let observed = (
+            self.last_discovery.processes.clone(),
+            enabled,
+            self.settings_epoch,
+        );
+        if self.sunshine_observed.as_ref() == Some(&observed) {
+            return;
+        }
+        connector::observe_sunshine_processes(&observed.0, observed.1, observed.2);
+        self.sunshine_observed = Some(observed);
+    }
+
     fn observe_settings(&mut self) {
         if !self.configuration.ready() || self.observed_settings_epoch == self.settings_epoch {
             return;
@@ -281,6 +308,9 @@ impl PlayniteModule {
         self.catalog
             .retain_for_settings_epoch(self.settings_epoch, same_catalog_policy);
         self.observed_settings = Some(settings.clone());
+        if !settings.enabled || !settings.auto_sync || !same_catalog_policy {
+            self.pending_unsolicited_snapshot = None;
+        }
         self.fullscreen_entry_sync
             .set_desired(cfg!(windows) && settings.enabled && settings.fullscreen_entry_enabled);
     }
@@ -305,6 +335,7 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.catalog.cancel_after_process_change();
+            self.pending_unsolicited_snapshot = None;
         }
     }
 
@@ -330,7 +361,9 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.catalog.cancel_after_process_change();
+            self.pending_unsolicited_snapshot = None;
         }
+        self.observe_sunshine_connection();
     }
 
     fn poll_snapshot(&mut self) {
@@ -368,6 +401,49 @@ impl PlayniteModule {
                     }
                     Err(error) => self.last_error = Some(error),
                 }
+            }
+            Err(error) => self.last_error = Some(error),
+        }
+    }
+
+    fn poll_unsolicited_snapshot(&mut self) {
+        if let Some(snapshot) = connector::take_unsolicited_snapshot() {
+            self.pending_unsolicited_snapshot = Some(snapshot);
+        }
+        if !self.configuration.ready() {
+            self.pending_unsolicited_snapshot = None;
+            return;
+        }
+        let Some(event) = self.pending_unsolicited_snapshot.as_ref() else {
+            return;
+        };
+        if !unsolicited_snapshot_is_current(
+            event,
+            self.configuration.settings(),
+            self.settings_epoch,
+            &self.last_discovery,
+        ) {
+            self.pending_unsolicited_snapshot = None;
+            return;
+        }
+        if self.catalog.busy() || self.snapshot_worker.busy() {
+            return;
+        }
+        let event = self.pending_unsolicited_snapshot.take().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |value| value.as_secs() as i64);
+        match self.catalog.start(
+            &event.snapshot,
+            self.configuration.settings(),
+            self.settings_epoch,
+            now,
+        ) {
+            Ok(()) => {
+                self.last_snapshot_games = event.snapshot.games.len();
+                self.catalog_processes = Some(event.processes);
+                self.next_auto_sync = Some(Instant::now() + AUTO_SYNC_INTERVAL);
+                self.last_error = None;
             }
             Err(error) => self.last_error = Some(error),
         }
@@ -744,6 +820,18 @@ fn snapshot_processes_match_instance(
     discovery: &discovery::Discovery,
 ) -> bool {
     discovery.running && snapshot_processes == discovery.processes
+}
+
+fn unsolicited_snapshot_is_current(
+    event: &connector::SnapshotEvent,
+    settings: &ProductSettings,
+    settings_epoch: u64,
+    discovery: &discovery::Discovery,
+) -> bool {
+    settings.enabled
+        && settings.auto_sync
+        && event.settings_epoch == settings_epoch
+        && snapshot_processes_match_instance(&event.processes, discovery)
 }
 
 fn settings_caller_is_authorized(caller: &str) -> bool {

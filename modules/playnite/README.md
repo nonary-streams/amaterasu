@@ -55,10 +55,14 @@ during enumeration, synchronization restarts before writing a snapshot. Cleanup
 is committed only after the provider completes that snapshot, and catalog CAS
 plus unchanged-entry checks preserve manual edits.
 
-With `enabled` and `auto_sync` both true, the provider starts a background
-snapshot when settings load or change, then schedules another attempt 30 seconds
-after each start; an active snapshot or catalog transaction can delay the next
-attempt. This polling also retries when Playnite is stopped or a snapshot fails.
+With `enabled` and `auto_sync` both true, one authenticated Sunshine-role
+connection receives the extension's initial and debounced library snapshots.
+Complete snapshots from the current Playnite process start catalog reconciliation;
+incomplete snapshots, disabled settings, and stale process identities cannot.
+Snapshot, launch, and stop commands share the same connection and reader.
+The provider also schedules a snapshot request every 30 seconds as a retry when
+an event is missed, Playnite is stopped, or a snapshot fails. An active snapshot
+or catalog transaction can delay the next attempt.
 Discovery of a newly started or restarted Playnite process requests an immediate
 retry, subject to an active snapshot or catalog transaction finishing first.
 Launch eligibility is tied to the discovered Playnite process IDs and paths.
@@ -75,12 +79,12 @@ eligibility from the current completed import, including when auto-sync is off;
 disabling the provider revokes it. Automatic selection policy changes revoke it
 when auto-sync is on. An in-flight import continues across operational settings
 changes but is canceled on provider disable, policy change, or process restart.
-Vibeshine instead requests a sync when its configuration is applied and
-otherwise reconciles snapshots sent by the Playnite extension, which coalesces
-library changes with a three-second debounce. The 30-second polling interval
-and retry behavior are known timing differences. The extension's shared
-Sunshine-role connection and single outbox require connector multiplexing
-before its unsolicited snapshots can safely replace polling.
+The extension coalesces library changes with a three-second debounce. Its
+single shared outbox can retain queued snapshot records across a pipe reconnect
+in the same Playnite process, and snapshots carry no request ID or connection
+generation. A fully queued older snapshot can precede the new initial snapshot;
+the periodic request eventually reconciles the latest library state. Exact
+per-connection freshness requires an extension protocol marker or queue flush.
 
 The typed GUID launch route uses the bounded extension connection and ticket
 protocol. Snapshot, launch, and stop requests use the extension's typed

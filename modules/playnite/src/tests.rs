@@ -437,6 +437,52 @@ fn in_flight_snapshot_cannot_restore_launches_after_disable_or_process_restart()
 }
 
 #[test]
+fn unsolicited_current_generation_snapshot_starts_reconciliation_only_while_enabled() {
+    let old_process = process(41, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let new_process = process(73, r"C:\Program Files\Playnite\Playnite.DesktopApp.exe");
+    let discovery = discovery::Discovery {
+        running: true,
+        processes: vec![old_process.clone()],
+        executable_paths: vec![old_process.path.clone()],
+    };
+    let snapshot = Snapshot {
+        games: vec![],
+        categories: vec![],
+        plugins: vec![],
+    };
+    let event = connector::SnapshotEvent {
+        snapshot: snapshot.clone(),
+        processes: vec![old_process],
+        settings_epoch: 7,
+    };
+    let mut settings = ProductSettings {
+        enabled: true,
+        auto_sync: true,
+        ..ProductSettings::default()
+    };
+    assert!(unsolicited_snapshot_is_current(
+        &event, &settings, 7, &discovery,
+    ));
+    let mut catalog = catalog_sync::CatalogSync::default();
+    catalog.start(&event.snapshot, &settings, 7, 0).unwrap();
+    assert!(catalog.busy());
+
+    settings.enabled = false;
+    assert!(!unsolicited_snapshot_is_current(
+        &event, &settings, 8, &discovery,
+    ));
+    settings.enabled = true;
+    let restarted = discovery::Discovery {
+        running: true,
+        processes: vec![new_process.clone()],
+        executable_paths: vec![new_process.path],
+    };
+    assert!(!unsolicited_snapshot_is_current(
+        &event, &settings, 7, &restarted,
+    ));
+}
+
+#[test]
 fn discovery_retries_automatic_sync_immediately_only_for_a_new_running_process() {
     let now = Instant::now();
     let next_attempt = Some(now + Duration::from_secs(30));

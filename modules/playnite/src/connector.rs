@@ -10,6 +10,8 @@ use crate::focus::{FocusPolicy, FocusRetry, FocusTarget};
 use crate::launch::{StopRequest, installation_roots, refresh_processes_for_install};
 use crate::snapshot::{Snapshot, SnapshotAssembler, valid_playnite_id};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+#[cfg(windows)]
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -272,46 +274,390 @@ fn connect_role(
 
 #[cfg(windows)]
 pub fn request_snapshot(expected_processes: &[ProcessImage]) -> Result<Snapshot, String> {
-    let (data_pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
-    data_pipe.write_all(&extension_command_line("snapshot", None)?)?;
-
-    let mut assembler = SnapshotAssembler::default();
-    let mut line = Vec::new();
-    let mut received = 0usize;
-    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
-    let mut buffer = [0u8; 8192];
-    while Instant::now() < deadline && received < MAX_TOTAL_BYTES {
-        let available = data_pipe.available()? as usize;
-        if available == 0 {
-            thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        let read_length = available.min(buffer.len());
-        let count = data_pipe.read_some(&mut buffer[..read_length])?;
-        received = received.saturating_add(count);
-        for byte in &buffer[..count] {
-            if *byte == b'\n' {
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                if let Some(result) = assembler.receive_line(&line) {
-                    return result.map_err(str::to_owned);
-                }
-                line.clear();
-            } else {
-                line.push(*byte);
-                if line.len() > crate::snapshot::MAX_LINE_BYTES {
-                    return Err("Playnite extension message exceeded the line limit".into());
-                }
-            }
-        }
-    }
-    Err("Playnite extension snapshot was incomplete or exceeded its byte limit".into())
+    let (reply, response) = mpsc::channel();
+    sunshine_actor_channels()
+        .ok_or("Playnite Sunshine connector is not running")?
+        .0
+        .send(SunshineCommand::Snapshot {
+            processes: expected_processes.to_vec(),
+            reply,
+        })
+        .map_err(|_| "Playnite Sunshine connector stopped".to_owned())?;
+    response
+        .recv_timeout(SNAPSHOT_TIMEOUT + CONNECT_TIMEOUT)
+        .map_err(|_| "Playnite extension snapshot timed out".to_owned())?
 }
 
 #[cfg(not(windows))]
 pub fn request_snapshot(_expected_processes: &[ProcessImage]) -> Result<Snapshot, String> {
     Err("Playnite integration is available only on Windows".into())
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotEvent {
+    pub(crate) snapshot: Snapshot,
+    pub(crate) processes: Vec<ProcessImage>,
+    pub(crate) settings_epoch: u64,
+}
+
+#[cfg(windows)]
+enum SunshineCommand {
+    Observe {
+        processes: Vec<ProcessImage>,
+        enabled: bool,
+        settings_epoch: u64,
+        reply: Sender<()>,
+    },
+    Snapshot {
+        processes: Vec<ProcessImage>,
+        reply: Sender<Result<Snapshot, String>>,
+    },
+    Send {
+        processes: Vec<ProcessImage>,
+        line: Vec<u8>,
+        command: String,
+        reply: Sender<Result<(), String>>,
+    },
+    Shutdown,
+}
+
+#[cfg(windows)]
+struct SunshineActor {
+    commands: Sender<SunshineCommand>,
+    snapshots: SharedSnapshots,
+    worker: thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+type SharedSnapshots = Arc<Mutex<Receiver<SnapshotEvent>>>;
+
+#[cfg(windows)]
+fn sunshine_actor_slot() -> &'static Mutex<Option<SunshineActor>> {
+    static ACTOR: OnceLock<Mutex<Option<SunshineActor>>> = OnceLock::new();
+    ACTOR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
+fn sunshine_actor_channels() -> Option<(Sender<SunshineCommand>, SharedSnapshots)> {
+    let actor = sunshine_actor_slot().lock().ok()?;
+    let actor = actor.as_ref()?;
+    Some((actor.commands.clone(), Arc::clone(&actor.snapshots)))
+}
+
+pub(crate) fn start_sunshine_actor() {
+    #[cfg(windows)]
+    if let Ok(mut slot) = sunshine_actor_slot().lock()
+        && slot.is_none()
+    {
+        let (commands, requests) = mpsc::channel();
+        let (snapshots, events) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || run_sunshine_actor(requests, snapshots));
+        *slot = Some(SunshineActor {
+            commands,
+            snapshots: Arc::new(Mutex::new(events)),
+            worker,
+        });
+    }
+}
+
+pub(crate) fn stop_sunshine_actor() {
+    #[cfg(windows)]
+    if let Ok(mut slot) = sunshine_actor_slot().lock()
+        && let Some(actor) = slot.take()
+    {
+        let _ = actor.commands.send(SunshineCommand::Shutdown);
+        let _ = actor.worker.join();
+    }
+}
+
+pub(crate) fn observe_sunshine_processes(
+    processes: &[ProcessImage],
+    enabled: bool,
+    settings_epoch: u64,
+) {
+    #[cfg(windows)]
+    {
+        let Some((commands, snapshots)) = sunshine_actor_channels() else {
+            return;
+        };
+        let (reply, observed) = mpsc::channel();
+        if commands
+            .send(SunshineCommand::Observe {
+                processes: processes.to_vec(),
+                enabled,
+                settings_epoch,
+                reply,
+            })
+            .is_ok()
+            && observed.recv_timeout(CONNECT_TIMEOUT).is_ok()
+            && let Ok(snapshots) = snapshots.lock()
+        {
+            while snapshots.try_recv().is_ok() {}
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (processes, enabled, settings_epoch);
+}
+
+pub(crate) fn take_unsolicited_snapshot() -> Option<SnapshotEvent> {
+    #[cfg(windows)]
+    {
+        let (_, snapshots) = sunshine_actor_channels()?;
+        let snapshots = snapshots.lock().ok()?;
+        let mut latest = None;
+        while let Ok(snapshot) = snapshots.try_recv() {
+            latest = Some(snapshot);
+        }
+        latest
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+struct SunshineState {
+    processes: Vec<ProcessImage>,
+    enabled: bool,
+    settings_epoch: u64,
+    pipe: Option<Pipe>,
+    server_process: Option<ProcessImage>,
+    assembler: SnapshotAssembler,
+    line: Vec<u8>,
+    received: usize,
+    pending_snapshot: Option<PendingSnapshot>,
+}
+
+#[cfg(windows)]
+struct PendingSnapshot {
+    reply: Sender<Result<Snapshot, String>>,
+    deadline: Instant,
+}
+
+#[cfg(windows)]
+impl SunshineState {
+    fn new() -> Self {
+        Self {
+            processes: Vec::new(),
+            enabled: false,
+            settings_epoch: 0,
+            pipe: None,
+            server_process: None,
+            assembler: SnapshotAssembler::default(),
+            line: Vec::new(),
+            received: 0,
+            pending_snapshot: None,
+        }
+    }
+
+    fn disconnect(&mut self, reason: &str) {
+        self.pipe = None;
+        self.server_process = None;
+        self.assembler = SnapshotAssembler::default();
+        self.line.clear();
+        self.received = 0;
+        if let Some(pending) = self.pending_snapshot.take() {
+            let _ = pending.reply.send(Err(reason.into()));
+        }
+    }
+
+    fn connect(&mut self) -> Result<bool, String> {
+        if self.pipe.is_some() {
+            return Ok(false);
+        }
+        let (pipe, server_process) = connect_role(&self.processes, "sunshine", None, None)?;
+        self.server_process = Some(server_process);
+        self.pipe = Some(pipe);
+        Ok(true)
+    }
+
+    fn verify_server(&self) -> Result<(), String> {
+        let pipe = self
+            .pipe
+            .as_ref()
+            .ok_or("Playnite Sunshine pipe is not connected")?;
+        let server = self
+            .server_process
+            .as_ref()
+            .ok_or("Playnite Sunshine server identity is missing")?;
+        if !self
+            .processes
+            .iter()
+            .any(|process| process.same_identity(server))
+            || validated_server_process(pipe, std::slice::from_ref(server))? != server.process_id
+        {
+            return Err("Playnite Sunshine server identity changed".into());
+        }
+        Ok(())
+    }
+
+    fn handle(&mut self, command: SunshineCommand) {
+        match command {
+            SunshineCommand::Observe {
+                processes,
+                enabled,
+                settings_epoch,
+                reply,
+            } => {
+                if self.processes != processes || self.enabled != enabled {
+                    self.disconnect("Playnite process or enabled state changed");
+                }
+                self.processes = processes;
+                self.enabled = enabled;
+                self.settings_epoch = settings_epoch;
+                let _ = reply.send(());
+            }
+            SunshineCommand::Snapshot { processes, reply } => {
+                if !self.enabled || self.processes != processes {
+                    let _ = reply.send(Err("Playnite snapshot instance changed".into()));
+                    return;
+                }
+                match self.connect() {
+                    Ok(new_connection) => {
+                        if !new_connection
+                            && let Some(pipe) = &self.pipe
+                            && let Err(error) =
+                                pipe.write_all(&extension_command_line("snapshot", None).unwrap())
+                        {
+                            self.disconnect(&error);
+                            let _ = reply.send(Err(error));
+                            return;
+                        }
+                        let pending = PendingSnapshot {
+                            reply,
+                            deadline: Instant::now() + SNAPSHOT_TIMEOUT,
+                        };
+                        if let Some(previous) = self.pending_snapshot.replace(pending) {
+                            let _ = previous
+                                .reply
+                                .send(Err("Playnite snapshot request superseded".into()));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            SunshineCommand::Send {
+                processes,
+                line,
+                command,
+                reply,
+            } => {
+                if self.processes != processes || (!self.enabled && command != "stop") {
+                    let _ = reply.send(Err("Playnite command instance changed".into()));
+                    return;
+                }
+                let result = self.connect().and_then(|_| {
+                    let pipe = self.pipe.as_ref().unwrap();
+                    self.verify_server()?;
+                    pipe.write_all(&line)
+                });
+                if result.is_err() {
+                    self.disconnect("Playnite Sunshine command connection failed");
+                }
+                let _ = reply.send(result);
+            }
+            SunshineCommand::Shutdown => self.disconnect("Playnite module stopped"),
+        }
+    }
+
+    fn read_available(&mut self, events: &mpsc::SyncSender<SnapshotEvent>) -> Result<(), String> {
+        let Some(pipe) = &self.pipe else {
+            return Ok(());
+        };
+        self.verify_server()?;
+        let available = pipe.available()? as usize;
+        if available == 0 {
+            return Ok(());
+        }
+        let mut buffer = [0u8; 8192];
+        let read_length = available.min(buffer.len());
+        let count = pipe.read_some(&mut buffer[..read_length])?;
+        self.consume_bytes(&buffer[..count], events)
+    }
+
+    fn consume_bytes(
+        &mut self,
+        bytes: &[u8],
+        events: &mpsc::SyncSender<SnapshotEvent>,
+    ) -> Result<(), String> {
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > MAX_TOTAL_BYTES {
+            return Err("Playnite extension snapshot exceeded its byte limit".into());
+        }
+        for byte in bytes {
+            if *byte == b'\n' {
+                if self.line.last() == Some(&b'\r') {
+                    self.line.pop();
+                }
+                if let Some(result) = self.assembler.receive_line(&self.line) {
+                    self.received = 0;
+                    let requested = self.pending_snapshot.take();
+                    if let Some(pending) = requested.as_ref() {
+                        let _ = pending.reply.send(result.clone().map_err(str::to_owned));
+                    }
+                    if self.enabled
+                        && requested.is_none()
+                        && let Ok(snapshot) = result
+                    {
+                        let _ = events.try_send(SnapshotEvent {
+                            snapshot,
+                            processes: self.processes.clone(),
+                            settings_epoch: self.settings_epoch,
+                        });
+                    }
+                }
+                self.line.clear();
+            } else {
+                self.line.push(*byte);
+                if self.line.len() > crate::snapshot::MAX_LINE_BYTES {
+                    return Err("Playnite extension message exceeded the line limit".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn run_sunshine_actor(
+    commands: Receiver<SunshineCommand>,
+    events: mpsc::SyncSender<SnapshotEvent>,
+) {
+    let mut state = SunshineState::new();
+    loop {
+        if state
+            .pending_snapshot
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+            && let Some(pending) = state.pending_snapshot.take()
+        {
+            let _ = pending
+                .reply
+                .send(Err("Playnite extension snapshot timed out".into()));
+        }
+        match commands.recv_timeout(Duration::from_millis(10)) {
+            Ok(SunshineCommand::Shutdown) => {
+                state.disconnect("Playnite module stopped");
+                return;
+            }
+            Ok(command) => state.handle(command),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        while let Ok(command) = commands.try_recv() {
+            if matches!(command, SunshineCommand::Shutdown) {
+                state.disconnect("Playnite module stopped");
+                return;
+            }
+            state.handle(command);
+        }
+        if let Err(error) = state.read_available(&events) {
+            state.disconnect(&error);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -628,8 +974,20 @@ fn send_command(
     command: &str,
     game_id: &str,
 ) -> Result<(), String> {
-    let (pipe, _) = connect_role(expected_processes, "sunshine", None, None)?;
-    pipe.write_all(&extension_command_line(command, Some(game_id))?)
+    let (reply, response) = mpsc::channel();
+    sunshine_actor_channels()
+        .ok_or("Playnite Sunshine connector is not running")?
+        .0
+        .send(SunshineCommand::Send {
+            processes: expected_processes.to_vec(),
+            line: extension_command_line(command, Some(game_id))?,
+            command: command.to_owned(),
+            reply,
+        })
+        .map_err(|_| "Playnite Sunshine connector stopped".to_owned())?;
+    response
+        .recv_timeout(CONNECT_TIMEOUT + CONNECT_TIMEOUT)
+        .map_err(|_| "Playnite extension command timed out".to_owned())?
 }
 
 #[cfg(any(windows, test))]
@@ -782,6 +1140,117 @@ mod tests {
     };
     use crate::focus::FocusTarget;
     use crate::launch::State;
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_transport_routes_requested_and_unsolicited_snapshots_around_other_messages() {
+        use super::{PendingSnapshot, SunshineState};
+        use crate::discovery::ProcessImage;
+        use std::sync::mpsc;
+
+        let process = ProcessImage {
+            process_id: 41,
+            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            creation_time: 410,
+        };
+        let mut state = SunshineState::new();
+        state.processes = vec![process.clone()];
+        state.enabled = true;
+        state.settings_epoch = 7;
+        let (events, received_events) = mpsc::sync_channel(1);
+        let (reply, received_reply) = mpsc::channel();
+        state.pending_snapshot = Some(PendingSnapshot {
+            reply,
+            deadline: std::time::Instant::now() + super::SNAPSHOT_TIMEOUT,
+        });
+        let snapshot = concat!(
+            "{\"type\":\"snapshotStart\"}\n",
+            "{\"type\":\"status\",\"status\":{\"name\":\"gameStarted\"}}\n",
+            "{\"type\":\"plugins\",\"payload\":[]}\n",
+            "{\"type\":\"commandResult\",\"command\":\"set-cover\"}\n",
+            "{\"type\":\"categories\",\"payload\":[]}\n",
+            "{\"type\":\"games\",\"payload\":[] }\n",
+            "{\"type\":\"snapshotComplete\",\"games\":0}\n"
+        );
+        state.consume_bytes(snapshot.as_bytes(), &events).unwrap();
+        assert!(received_reply.try_recv().unwrap().unwrap().games.is_empty());
+        assert!(received_events.try_recv().is_err());
+
+        state.consume_bytes(snapshot.as_bytes(), &events).unwrap();
+        let event = received_events.try_recv().unwrap();
+        assert!(event.snapshot.games.is_empty());
+        assert_eq!(event.processes, vec![process]);
+        assert_eq!(event.settings_epoch, 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_transport_discards_partial_snapshot_on_disable_and_process_restart() {
+        use super::{SunshineCommand, SunshineState};
+        use crate::discovery::ProcessImage;
+        use std::sync::mpsc;
+
+        let old = ProcessImage {
+            process_id: 41,
+            path: r"C:\Playnite\Playnite.DesktopApp.exe".into(),
+            creation_time: 410,
+        };
+        let new = ProcessImage {
+            process_id: 73,
+            path: old.path.clone(),
+            creation_time: 730,
+        };
+        let (events, received) = mpsc::sync_channel(1);
+        let mut state = SunshineState::new();
+        let (reply, _) = mpsc::channel();
+        state.handle(SunshineCommand::Observe {
+            processes: vec![old.clone()],
+            enabled: true,
+            settings_epoch: 7,
+            reply,
+        });
+        state
+            .consume_bytes(b"{\"type\":\"snapshotStart\"}\n", &events)
+            .unwrap();
+        let (reply, _) = mpsc::channel();
+        state.handle(SunshineCommand::Observe {
+            processes: vec![old],
+            enabled: false,
+            settings_epoch: 8,
+            reply,
+        });
+        state
+            .consume_bytes(b"{\"type\":\"snapshotComplete\",\"games\":0}\n", &events)
+            .unwrap();
+        assert!(received.try_recv().is_err());
+
+        let (reply, _) = mpsc::channel();
+        state.handle(SunshineCommand::Observe {
+            processes: vec![new.clone()],
+            enabled: true,
+            settings_epoch: 9,
+            reply,
+        });
+        state
+            .consume_bytes(b"{\"type\":\"snapshotComplete\",\"games\":0}\n", &events)
+            .unwrap();
+        assert!(received.try_recv().is_err());
+        assert_eq!(state.processes, vec![new]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sunshine_actor_joins_before_module_reload_and_can_restart() {
+        use super::{start_sunshine_actor, stop_sunshine_actor, sunshine_actor_channels};
+
+        start_sunshine_actor();
+        assert!(sunshine_actor_channels().is_some());
+        stop_sunshine_actor();
+        assert!(sunshine_actor_channels().is_none());
+        start_sunshine_actor();
+        assert!(sunshine_actor_channels().is_some());
+        stop_sunshine_actor();
+    }
 
     #[test]
     fn sunshine_commands_use_the_extension_dispatch_envelope() {
