@@ -920,7 +920,11 @@ fn session_expiry_boundaries_are_strict_across_restart() {
 #[test]
 fn administrator_session_and_refresh_rotation_survive_restart() {
     let mut state = StateHarness::new();
-    let mut pipeline = Pipeline::new(settings_with_ttls(120, 400));
+    let lutris_settings = Settings {
+        allowed_scopes: BTreeSet::from(["lutris.read".into()]),
+        ..settings_with_ttls(120, 400)
+    };
+    let mut pipeline = Pipeline::new(lutris_settings.clone());
     state.setup(&mut pipeline);
     let credential_document = state.stored.clone();
 
@@ -931,6 +935,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         100,
     );
     assert_eq!(login["ok"], true);
+    assert_eq!(login["scopes"], json!(["lutris.read"]));
     assert_eq!(state.revision, 2);
     assert_eq!(state.stored, credential_document);
     assert_eq!(state.session_revision, 1);
@@ -949,15 +954,24 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
             .contains(login["refresh_token"].as_str().unwrap())
     );
 
-    let mut restarted = Pipeline::new(settings_with_ttls(120, 400));
+    let mut restarted = Pipeline::new(lutris_settings.clone());
     assert_eq!(
         state.request(
             &mut restarted,
             "frontend",
-            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["catalog.read"]}),
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["lutris.read"]}),
             101,
         )["ok"],
         true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({"action":"verify","bearer":login["bearer"],"required_scopes":["lutris.write"]}),
+            101,
+        )["code"],
+        "unauthorized"
     );
 
     let rotated = state.request(
@@ -967,6 +981,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         220,
     );
     assert_eq!(rotated["ok"], true);
+    assert_eq!(rotated["scopes"], json!(["lutris.read"]));
     assert_eq!(rotated["refresh_expires_at"], 500);
     assert_eq!(state.revision, 3);
     assert_eq!(state.stored, credential_document);
@@ -980,15 +995,24 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         crate::crypto::token_digest(rotated["refresh_token"].as_str().unwrap())
     );
 
-    let mut restarted_again = Pipeline::new(settings_with_ttls(120, 400));
+    let mut restarted_again = Pipeline::new(lutris_settings.clone());
     assert_eq!(
         state.request(
             &mut restarted_again,
             "frontend",
-            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":["catalog.read"]}),
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":["lutris.read"]}),
             221,
         )["ok"],
         true
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted_again,
+            "frontend",
+            json!({"action":"verify","bearer":rotated["bearer"],"required_scopes":["lutris.write"]}),
+            221,
+        )["code"],
+        "unauthorized"
     );
     assert_eq!(
         state.request(
@@ -1023,7 +1047,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
             .as_array()
             .is_none_or(|sessions| sessions.is_empty())
     );
-    let mut after_logout = Pipeline::new(settings_with_ttls(120, 400));
+    let mut after_logout = Pipeline::new(lutris_settings);
     assert_eq!(
         state.request(
             &mut after_logout,
