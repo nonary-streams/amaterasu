@@ -426,6 +426,7 @@ pub(super) struct LinuxPenTouch {
     tracker: ContactTracker,
     pen_device: Option<Device>,
     touch_device: Option<Device>,
+    pen_write_failed: bool,
 }
 
 impl LinuxPenTouch {
@@ -434,6 +435,7 @@ impl LinuxPenTouch {
             tracker: ContactTracker::default(),
             pen_device: None,
             touch_device: None,
+            pen_write_failed: false,
         }
     }
 
@@ -446,10 +448,21 @@ impl LinuxPenTouch {
     }
 
     pub(super) fn inject(&mut self, path: &str, event: &Event) -> InputResult<()> {
+        if self.pen_write_failed {
+            // A failed frame can leave an arbitrary prefix in the kernel. The
+            // device must be removed before any more reports reach that pen.
+            destroy_device(&mut self.pen_device)?;
+            self.pen_write_failed = false;
+            if let Some(pen) = self.tracker.pen.as_mut() {
+                pen.contact.down_written = false;
+                pen.contact.native_write_attempted = false;
+            }
+        }
         let Self {
             tracker,
             pen_device,
             touch_device,
+            pen_write_failed,
         } = self;
         tracker.inject(event, |target, frame, attempted| {
             let device = match target {
@@ -479,7 +492,11 @@ impl LinuxPenTouch {
                 InputError::new("backend_inactive", "uinput device is not active")
             })?;
             *attempted = true;
-            device.emit(frame)
+            let result = device.emit(frame);
+            if target == Target::Pen && result.is_err() {
+                *pen_write_failed = true;
+            }
+            result
         })
     }
 
@@ -488,6 +505,7 @@ impl LinuxPenTouch {
             tracker,
             pen_device,
             touch_device,
+            pen_write_failed,
         } = self;
         // Send per-pointer terminal frames first. If a write fails, destroying
         // our owned devices still removes all contacts from those devices.
@@ -510,6 +528,7 @@ impl LinuxPenTouch {
         let pen_destroy = destroy_device(pen_device);
         if pen_destroy.is_ok() {
             tracker.clear_target(Target::Pen);
+            *pen_write_failed = false;
         }
         let touch_destroy = destroy_device(touch_device);
         if touch_destroy.is_ok() {
@@ -915,6 +934,58 @@ mod tests {
 
         backend.pen_touch.pen_device = None;
         assert!(!super::super::Backend::pen_touch_supported(&backend));
+    }
+
+    #[test]
+    fn failed_pen_report_discards_the_device_before_reusing_its_pointer() {
+        let mut pen_touch = LinuxPenTouch::new();
+        pen_touch.pen_device = Some(Device {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+            created: false,
+        });
+        let down = event(
+            PEN_POINTER_ID,
+            PenTouchDevice::Pen,
+            PenTouchPhase::Down,
+            10,
+            20,
+        );
+        assert!(pen_touch.inject("\0", &down).is_err());
+        assert!(pen_touch.pen_write_failed);
+        assert!(pen_touch.pen_device.is_some());
+        assert!(
+            pen_touch
+                .tracker
+                .pen
+                .as_ref()
+                .unwrap()
+                .contact
+                .native_write_attempted
+        );
+
+        // The terminal report needs no replacement device once the failed
+        // device has been removed. Its pointer can then be acquired again.
+        pen_touch
+            .inject("\0", &with_phase(&down, PenTouchPhase::Cancel))
+            .unwrap();
+        assert!(!pen_touch.pen_write_failed);
+        assert!(pen_touch.pen_device.is_none());
+        assert!(pen_touch.tracker.pen.is_none());
+
+        pen_touch.pen_device = Some(Device {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap(),
+            created: false,
+        });
+        pen_touch.inject("\0", &down).unwrap();
+        assert!(pen_touch.tracker.pen.as_ref().unwrap().contact.down_written);
+        pen_touch.stop().unwrap();
+        assert!(pen_touch.is_idle());
     }
 
     type RecordedFrame = (Target, Vec<(u16, u16, i32)>);
