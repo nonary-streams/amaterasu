@@ -17,7 +17,7 @@ use std::{
 
 type Transport = ModuleResult<Response>;
 
-fn display_admission_eligible(record: &crate::records::Record) -> bool {
+fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> bool {
     record.catalog_selection == CatalogSelection::Exported
         && record.preflight_ready
         && record.preflight_token.is_some()
@@ -27,7 +27,7 @@ fn display_admission_eligible(record: &crate::records::Record) -> bool {
             record.state == State::Starting
                 && record
                     .preflight_deadline
-                    .is_some_and(|deadline| Instant::now() < deadline)
+                    .is_some_and(|deadline| now < deadline)
         }
 }
 
@@ -624,7 +624,7 @@ impl Pipeline {
                 }) else {
                     return complete(send, request, error("display_admission_denied"));
                 };
-                if !display_admission_eligible(record)
+                if !display_admission_eligible(record, Instant::now())
                     || record.preflight_token.is_none()
                     || record.catalog_revision != Some(catalog_revision)
                     || record.application_display_overrides != application_display_overrides
@@ -699,10 +699,11 @@ impl Pipeline {
                 if caller != "rtsp" {
                     return complete(send, request, error("display_admission_denied"));
                 }
-                let verified = self.records.values.values().any(|record| {
-                    record.owner == "nvhttp"
+                let now = Instant::now();
+                let remaining_ms = self.records.values.values().find_map(|record| {
+                    let verified = record.owner == "nvhttp"
                         && record.operation_id == application_operation_id
-                        && display_admission_eligible(record)
+                        && display_admission_eligible(record, now)
                         && record.catalog_revision == Some(catalog_revision)
                         && record.display_admission.as_ref().is_some_and(|admission| {
                             admission.token == token
@@ -710,21 +711,35 @@ impl Pipeline {
                                 && admission.rtsp_operation_id == rtsp_operation_id
                                 && admission.request_sha256 == request_sha256
                                 && admission.snapshot == display_policy_snapshot
-                        })
+                        });
+                    if !verified {
+                        return None;
+                    }
+                    let remaining = if record.launch_started {
+                        None
+                    } else {
+                        let deadline = record.preflight_deadline?;
+                        Some(
+                            u64::try_from(deadline.duration_since(now).as_millis())
+                                .unwrap_or(120_000)
+                                .clamp(1, 120_000),
+                        )
+                    };
+                    Some(remaining)
                 });
-                if !verified {
+                let Some(remaining_ms) = remaining_ms else {
                     return complete(send, request, error("display_admission_denied"));
+                };
+                let mut response = serde_json::json!({
+                    "ok":true,
+                    "verified":true,
+                    "rtsp_operation_id":rtsp_operation_id,
+                    "request_sha256":request_sha256,
+                });
+                if let Some(remaining_ms) = remaining_ms {
+                    response["preflight_remaining_ms"] = serde_json::json!(remaining_ms);
                 }
-                complete(
-                    send,
-                    request,
-                    serde_json::json!({
-                        "ok":true,
-                        "verified":true,
-                        "rtsp_operation_id":rtsp_operation_id,
-                        "request_sha256":request_sha256,
-                    }),
-                )
+                complete(send, request, response)
             }
             Operation::Lookup { operation_id } => {
                 let response = self

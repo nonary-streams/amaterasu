@@ -1211,6 +1211,14 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         "certificate_id":"cd".repeat(32),
         "catalog_revision":preflight["catalog_revision"],
     });
+    let verified = harness.request(&mut pipeline, "rtsp", verify.clone());
+    assert_eq!(verified["verified"], true);
+    assert!(
+        verified["preflight_remaining_ms"]
+            .as_u64()
+            .is_some_and(|remaining| (1..=120_000).contains(&remaining)),
+        "{verified}"
+    );
     let record = pipeline
         .records
         .values
@@ -1226,6 +1234,11 @@ fn staged_display_admission_expires_or_stops_before_launch() {
         harness.request(&mut pipeline, "rtsp", verify.clone())["code"],
         "display_admission_denied"
     );
+    let mut launch = launch_export("expiring-app");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["frame_limiter_settings"] = frame_limiter_snapshot();
+    launch["display_admission_token"] = admission["display_admission_token"].clone();
+    assert_ne!(harness.request(&mut pipeline, "nvhttp", launch)["ok"], true);
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
 
@@ -1295,10 +1308,24 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
         "rtsp_operation_id":"legacy-display-rtsp",
         "request_sha256":"ab".repeat(32),
     });
-    assert_eq!(
-        harness.request(&mut pipeline, "nvhttp", prepare)["ok"],
-        true
+    let admission = harness.request(&mut pipeline, "nvhttp", prepare);
+    assert_eq!(admission["ok"], true);
+    let verified = harness.request(
+        &mut pipeline,
+        "rtsp",
+        json!({
+            "action":"verify_display_admission",
+            "token":admission["display_admission_token"],
+            "application_operation_id":"legacy-display-app",
+            "rtsp_operation_id":"legacy-display-rtsp",
+            "request_sha256":"ab".repeat(32),
+            "display_policy_snapshot":admission["display_policy_snapshot"],
+            "certificate_id":"cd".repeat(32),
+            "catalog_revision":preflight["catalog_revision"],
+        }),
     );
+    assert_eq!(verified["verified"], true);
+    assert!(verified.get("preflight_remaining_ms").is_none());
     assert_eq!(harness.request(&mut pipeline, "nvhttp", launch), started);
     assert_eq!(harness.processes.len(), 1);
 }
