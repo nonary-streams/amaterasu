@@ -324,9 +324,7 @@ fn restore_pending(
     }
 
     let current = default_endpoints(enumerator)?;
-    let restored = policy
-        .pending_restore_assignments(&current)
-        .is_some_and(|assignments| assignments.is_empty());
+    let restored = policy.pending_restore_complete(&current);
     policy.complete_restore(restored);
     Ok(restored)
 }

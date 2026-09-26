@@ -212,6 +212,21 @@ impl RoutePolicy {
         (active.references == 0).then(|| restore_assignments(active, current))
     }
 
+    /// An absent default cannot establish whether our selected endpoint has
+    /// relinquished a role. Keep its original endpoint until Windows reports
+    /// either our endpoint again or a different live choice.
+    pub fn pending_restore_complete(&self, current: &DefaultEndpoints) -> bool {
+        let Some(active) = self.active.as_ref().filter(|active| active.references == 0) else {
+            return false;
+        };
+        restore_assignments(active, current).is_empty()
+            && DefaultRole::ALL.into_iter().all(|role| {
+                !active.assigned_roles[role.index()]
+                    || active.original[role.index()].as_deref() == Some(&active.endpoint)
+                    || current[role.index()].is_some()
+            })
+    }
+
     /// A routed virtual sink remains selected while its capture is active.
     /// Preserve the initial snapshot for final restoration, even if another
     /// application changes a default role during the stream.
@@ -807,6 +822,43 @@ mod tests {
             Some(Vec::new())
         );
         policy.complete_restore(true);
+        assert_eq!(policy.endpoint_with_pending_restore(), None);
+    }
+
+    #[test]
+    fn missing_virtual_endpoint_keeps_restore_pending_until_role_recovers() {
+        let original = endpoints("render.console", "render.multimedia", "render.comms");
+        let mut policy = RoutePolicy::new();
+        assert!(matches!(
+            policy.acquire_with_tracking("render.virtual", &original, true),
+            Ok(AcquirePlan::Assign(_))
+        ));
+        policy
+            .record_assignment("render.virtual", DefaultRole::Console)
+            .unwrap();
+
+        let missing = [None, original[1].clone(), original[2].clone()];
+        assert_eq!(
+            policy.release("render.virtual", &missing),
+            Ok(ReleasePlan::Restore(Vec::new()))
+        );
+        assert!(!policy.pending_restore_complete(&missing));
+        policy.complete_restore(policy.pending_restore_complete(&missing));
+        assert_eq!(
+            policy.endpoint_with_pending_restore(),
+            Some("render.virtual")
+        );
+
+        let returned = endpoints("render.virtual", "render.multimedia", "render.comms");
+        assert_eq!(
+            policy.pending_restore_assignments(&returned),
+            Some(vec![RoleAssignment {
+                role: DefaultRole::Console,
+                endpoint: "render.console".into(),
+            }])
+        );
+        assert!(!policy.pending_restore_complete(&returned));
+        policy.complete_restore(policy.pending_restore_complete(&original));
         assert_eq!(policy.endpoint_with_pending_restore(), None);
     }
 }
