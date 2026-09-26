@@ -268,6 +268,70 @@ fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() 
 }
 
 #[test]
+fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
+    for (case, application_option, client_option, expected, mutating) in [
+        ("global", None, None, "ensure_active", true),
+        ("application", Some("ensure_primary"), None, "ensure_primary", true),
+        ("client", Some("ensure_primary"), Some("ensure_only_display"), "ensure_only_display", true),
+        ("client_disabled", Some("ensure_primary"), Some("disabled"), "disabled", false),
+        ("application_verify", Some("verify_only"), None, "verify_only", false),
+    ] {
+        let now = Instant::now();
+        let (mut controller, mut broker) = mutating_display_fixture("ensure_active", true);
+        broker.application_input_overrides =
+            application_option.map(|option| json!({"dd_configuration_option": option}));
+        let certificate = vec![46; 32];
+        let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+            .unwrap()
+            .with_paired_identity(
+                "client-46".into(),
+                fingerprint(&certificate),
+                ClientConfigOverrides {
+                    dd_configuration_option: client_option.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let stream = request(46);
+        assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none(), "{case}");
+        controller.set_global_display_policy(10, json!({"dd_configuration_option":"disabled"}));
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200, "{case}");
+
+        let open = opened_rtsp_payload(&broker);
+        let policy = &open["display_policy_snapshot"];
+        assert_eq!(policy["global_revision"], 9, "{case}");
+        assert_eq!(policy["catalog_revision"], 1, "{case}");
+        assert_eq!(policy["global_overrides"]["dd_configuration_option"], "ensure_active", "{case}");
+        assert_eq!(policy["effective_overrides"]["dd_configuration_option"], expected, "{case}");
+        assert_eq!(policy["application_overrides"].get("dd_configuration_option").cloned(),
+            application_option.map(|option| json!(option)), "{case}");
+        assert_eq!(policy["client_overrides"].get("dd_configuration_option").cloned(),
+            client_option.map(|option| json!(option)), "{case}");
+        let admission = broker.commands.iter().find_map(|command| match command {
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.launch/1" && payload["action"] == "prepare_display_admission" => Some(payload),
+            _ => None,
+        });
+        assert_eq!(admission.is_some(), mutating, "{case}");
+        if let Some(admission) = admission {
+            assert_eq!(admission["global_revision"], 9, "{case}");
+            assert_eq!(admission["catalog_revision"], 1, "{case}");
+            assert_eq!(admission["application_display_overrides"], policy["application_overrides"], "{case}");
+            assert_eq!(admission["client_display_overrides"], policy["client_overrides"], "{case}");
+            assert_eq!(open["display_request"]["mode_policy"]["configuration_option"], expected, "{case}");
+            assert_eq!(open["display_admission_token"], "ab".repeat(32), "{case}");
+        } else {
+            assert!(open["display_request"].is_null(), "{case}");
+        }
+        controller.reply_delivered(10, now);
+        assert_eq!(controller.launch(11, stream, paired, now).unwrap().body, reply.body, "{case}");
+        assert_eq!(broker.actions().iter().filter(|(service, action)|
+            *service == "amaterasu.rtsp/1" && *action == "open").count(), 1, "{case}");
+    }
+}
+
+#[test]
 fn active_target_allows_active_and_primary_options_in_full_topology() {
     for (option, two_displays) in [
         ("ensure_active", false),
