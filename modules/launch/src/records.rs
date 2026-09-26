@@ -144,9 +144,10 @@ impl Records {
             record.launch_started
                 || record.preflight_token.is_none()
                 || (record.state == State::Starting
-                    && record
-                        .preflight_deadline
-                        .is_some_and(|deadline| Instant::now() < deadline))
+                    && (!record.preflight_ready
+                        || record
+                            .preflight_deadline
+                            .is_some_and(|deadline| Instant::now() < deadline)))
         });
         let GlobalPreparation {
             structured_steps: global_preparation,

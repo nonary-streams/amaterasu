@@ -1642,6 +1642,54 @@ fn rtss_limit_type_stays_sparse_across_preflight_launch_and_status() {
 }
 
 #[test]
+fn unresolved_preflight_keeps_its_operation_until_catalog_issues_the_token() {
+    use crate::records::{CatalogSelection, GlobalPreparation, Records};
+
+    let mut records = Records::new().unwrap();
+    let (preflight_id, _) = records
+        .start(
+            "amaterasu.nvhttp",
+            "paired-client",
+            "slow-catalog".into(),
+            "app-0000000000000001".into(),
+            CatalogSelection::Exported,
+            GlobalPreparation::default(),
+        )
+        .unwrap();
+    records
+        .values
+        .get_mut(&preflight_id)
+        .unwrap()
+        .preflight_token = Some("token".into());
+    assert!(records.values[&preflight_id].preflight_deadline.is_none());
+
+    records
+        .start(
+            "amaterasu.nvhttp",
+            "paired-client",
+            "another-operation".into(),
+            "app-0000000000000001".into(),
+            CatalogSelection::Exported,
+            GlobalPreparation::default(),
+        )
+        .unwrap();
+    assert!(records.values.contains_key(&preflight_id));
+    assert_eq!(
+        records
+            .start(
+                "amaterasu.nvhttp",
+                "paired-client",
+                "slow-catalog".into(),
+                "app-0000000000000001".into(),
+                CatalogSelection::Exported,
+                GlobalPreparation::default(),
+            )
+            .unwrap(),
+        (preflight_id, false)
+    );
+}
+
+#[test]
 fn expired_preflight_token_cannot_launch_or_resurrect_after_catalog_change() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();

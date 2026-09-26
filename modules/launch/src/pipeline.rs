@@ -448,7 +448,6 @@ impl Pipeline {
                 Ok((id, true)) => {
                     let record = self.records.values.get_mut(&id).expect("preflight record");
                     record.preflight_token = Some(record.session_key.clone());
-                    record.preflight_deadline = Some(Instant::now() + Duration::from_secs(120));
                     self.job = Some(Workflow::launch(id, request, remaining_ms));
                     Ok(())
                 }
@@ -1014,6 +1013,9 @@ impl Pipeline {
                 };
                 record.catalog_revision = Some(revision);
                 if record.preflight_token.is_some() {
+                    // The caller can only use the token after this response. A slow Catalog
+                    // resolution must not spend the token's lifetime before it is issued.
+                    record.preflight_deadline = Some(Instant::now() + Duration::from_secs(120));
                     record.preflight_ready = true;
                     let response = record.preflight_response();
                     return complete(send, job.request.expect("preflight request"), response);
