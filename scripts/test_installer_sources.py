@@ -242,7 +242,9 @@ def test_playnite_extension_is_one_msi_owned_pair_under_program_files():
     assert len(components) == 1
     component = components[0]
     assert component.attrib["Id"] == "PlayniteExtensionFiles"
-    assert component.attrib["Guid"] == "*"
+    # WiX cannot auto-generate a stable GUID for two unversioned files in one component.
+    # Pin the component identity so the pair survives rollback and major upgrades together.
+    assert component.attrib["Guid"] == "{B3A04137-739B-4AC8-997F-54519CC18AE2}"
     assert component.attrib["Win64"] == "yes"
     files = component.findall("w:File", namespace)
     assert {item.attrib["Name"] for item in files} == set(PLAYNITE_HASHES)

@@ -266,7 +266,7 @@
       <!-- MSI owns both immutable connector files as one component. Standard
            component rollback and major-upgrade removal keep the pair together. -->
       <Directory Id="PLAYNITEEXTENSION" Name="playnite-extension">
-        <Component Id="PlayniteExtensionFiles" Guid="*" Win64="yes">
+        <Component Id="PlayniteExtensionFiles" Guid="{B3A04137-739B-4AC8-997F-54519CC18AE2}" Win64="yes">
           <File Id="PlayniteExtensionManifest" Name="extension.yaml"
                 Source="$(var.StageDir)\playnite-extension\extension.yaml" KeyPath="yes" />
           <File Id="PlayniteExtensionModule" Name="AmaterasuPlaynite.psm1"
