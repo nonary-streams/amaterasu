@@ -9,10 +9,13 @@ import os
 from pathlib import Path
 import random
 import socket
+import struct
+import subprocess
 import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import zlib
 
 from test_component_updates import CARGO, run
 from test_host_service import Console
@@ -21,9 +24,30 @@ from test_platform_modules import PlatformHarness, configure_steam_fixture
 ORIGIN = "http://127.0.0.1:3000"
 PASSWORD = "test-password-for-local-api-only"
 PAIRING_FIXTURES = Path(__file__).resolve().parents[1] / "modules" / "pairing" / "tests" / "fixtures"
-STEAM_ARTWORK = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="
-)
+
+def solid_portrait_png():
+    def chunk(name, data):
+        payload = name + data
+        return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
+
+    header = struct.pack(">IIBBBBB", 600, 900, 8, 2, 0, 0, 0)
+    row = b"\x00" + b"\xff\xff\xff" * 600
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(row * 900, 9)) + chunk(b"IEND", b""))
+
+
+STEAM_ARTWORK = solid_portrait_png()
+
+
+def stop_console(console):
+    if console.process.poll() is not None:
+        return
+    if not console.process.stdin.closed:
+        console.process.stdin.close()
+    try:
+        console.process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        console.close()
 
 
 def available_moonlight_port_pair():
@@ -199,14 +223,10 @@ def test_provider_override_route(api, administrator, fallback_id):
 
 
 def test_auth_and_crud(console, api):
-    setup = console.request("amaterasu.authentication/1", {
-        "action": "setup", "username": "administrator", "password": PASSWORD,
-    })
-    assert setup["ok"], setup
     identity = console.request("amaterasu.pairing/1", {
         "action": "import_identity",
-        "certificate_pem": (PAIRING_FIXTURES / "host-cert.pem").read_text(),
-        "private_key_pem": (PAIRING_FIXTURES / "host-key.pem").read_text(),
+        "certificate_pem": (PAIRING_FIXTURES / "host-cert.pem").read_bytes().decode(),
+        "private_key_pem": (PAIRING_FIXTURES / "host-key.pem").read_bytes().decode(),
     })
     assert identity["ok"], identity
     health = api.raw(
@@ -1289,10 +1309,6 @@ def main():
         initial_port = available_moonlight_port_pair()
         bootstrap_path = harness.root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
-        bootstrap["policy"]["settings"]["global"] = {
-            "min_log_level": "warning",
-            "log_path": "parity.log",
-        }
         bootstrap["policy"]["settings"]["amaterasu.management"] = {
             "enabled": True, "bind": "127.0.0.1:0", "allowed_origins": [ORIGIN],
         }
@@ -1311,9 +1327,44 @@ def main():
         }
         bootstrap_path.write_text(json.dumps(bootstrap))
         harness.stage(harness.package(1))
+        identity_directory = harness.root / "data" / "state" / "credentials"
+        identity_directory.mkdir(parents=True, exist_ok=True)
+        (identity_directory / "cacert.pem").write_bytes(
+            (PAIRING_FIXTURES / "host-cert.pem").read_bytes()
+        )
+        (identity_directory / "cakey.pem").write_bytes(
+            (PAIRING_FIXTURES / "host-key.pem").read_bytes()
+        )
         console = Console(harness)
         try:
             api = Api(console)
+            setup = console.request("amaterasu.authentication/1", {
+                "action": "setup", "username": "administrator", "password": PASSWORD,
+            })
+            assert setup["ok"], setup
+            configuration_token = console.request("amaterasu.authentication/1", {
+                "action": "issue_token",
+                "scopes": ["configuration.read", "configuration.write"],
+                "ttl_seconds": 3600,
+            })
+            assert configuration_token["ok"], configuration_token
+            status, host_configuration, _ = api.post(
+                "/v1/host-configuration/get", token=configuration_token["bearer"]
+            )
+            assert status == 200 and host_configuration["ok"], host_configuration
+            assert host_configuration["revision"] == 0, host_configuration
+            status, updated_host_configuration, _ = api.post(
+                "/v1/host-configuration/update",
+                {
+                    "expected_revision": host_configuration["revision"],
+                    **host_configuration["values"],
+                    "log_path": "parity.log",
+                    "min_log_level": "warning",
+                },
+                configuration_token["bearer"],
+            )
+            assert status == 200 and updated_host_configuration["ok"], updated_host_configuration
+            assert updated_host_configuration["revision"] == 1, updated_host_configuration
             deadline = time.monotonic() + 20
             while True:
                 logging_status = console.request("amaterasu.diagnostics/1", {
@@ -1338,7 +1389,7 @@ def main():
             test_http_framing(api)
             console.eof()
         finally:
-            console.close()
+            stop_console(console)
         log_files = list((harness.root / "data" / "state" / "logs").glob("parity*.log"))
         assert log_files, "configured diagnostics log path did not create a session file"
         log_text = "\n".join(path.read_text() for path in log_files)
@@ -1349,8 +1400,7 @@ def main():
             api = Api(console)
             status, host_settings, _ = api.post("/v1/nvhttp/settings", token=token["bearer"])
             assert status == 403, host_settings
-            # The administrator login session expires on worker restart; a new
-            # login confirms product settings survived without leaking access.
+            # A new login confirms stored credentials after the worker restart.
             status, relogged, _ = api.post("/v1/auth/login", {"username": "administrator", "password": PASSWORD})
             assert status == 200 and relogged["ok"], relogged
             status, auth_settings, _ = api.post("/v1/auth/settings", token=relogged["bearer"])
@@ -1432,7 +1482,8 @@ def main():
             for _ in range(160):
                 status, payload, _ = api.post("/v1/catalog/list", token=token["bearer"])
                 assert status == 200 and payload["ok"], payload
-            assert api.post("/v1/catalog/list", token=session)[0] == 403
+            status, resumed_session, _ = api.post("/v1/catalog/list", token=session)
+            assert status == 200 and resumed_session["ok"], resumed_session
             revoked = console.request("amaterasu.authentication/1", {"action": "revoke_token", "token_id": token["token_id"]})
             assert revoked["ok"], revoked
             assert api.post("/v1/catalog/list", token=token["bearer"])[0] == 403
@@ -1481,7 +1532,7 @@ def main():
             assert reset_host["bind_address"] == "127.0.0.1", reset_host
             console.eof()
         finally:
-            console.close()
+            stop_console(console)
     print("Passed: real HTTP login/authentication, route scopes, catalog FEC/lifecycle and global-preparation exclusion CAS and restart persistence, manual Playnite Fullscreen validation, token persistence/revocation,")
     print("provider-owned Playnite override CAS/replay/inheritance and restart persistence when an imported Playnite entry is available,")
     print("Moonlight hostname/port live rebind, capture backend/output, audio/virtual-sink and structured global-preparation policy persistence,")
@@ -1491,7 +1542,7 @@ def main():
     print("Lutris settings CAS, platform policy and restart persistence,")
     print("Playnite settings CAS, refresh policy, Windows Fullscreen entry ownership and restart persistence,")
     print("session history authorization, settings CAS, status, and restart persistence,")
-    print("session restart invalidation,")
+    print("administrator session restart persistence,")
     print("input policy CAS, controller switch, gamepad profile/status, Right Alt, repeat and Back timeout settings, legacy field omission and restart persistence, configured diagnostic log filtering, strict framing, Origin/Host checks, preflight and no secret-bearing errors.")
 
 
