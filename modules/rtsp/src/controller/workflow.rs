@@ -57,13 +57,17 @@ impl Controller {
                 record.close(Some("dependency_unavailable"));
                 self.schedule_lookup(record, job.caller, now);
             }
-            Phase::Arm => {
+            Phase::VerifyFrameLimiter | Phase::Arm => {
                 if let Some((connection, action_ticket)) = job.network {
                     self.fail_network_action(
                         record,
                         connection,
                         action_ticket,
-                        "dependency_unavailable",
+                        if job.phase == Phase::VerifyFrameLimiter {
+                            "frame_limiter_verification_unavailable"
+                        } else {
+                            "dependency_unavailable"
+                        },
                     );
                 } else {
                     record.close(Some("network_disconnected"));
@@ -92,10 +96,54 @@ impl Controller {
         match job.phase {
             Phase::Prepare => self.prepared(record, job, &payload, now, runtime),
             Phase::Find => self.found(record, job, &payload, now, runtime),
+            Phase::VerifyFrameLimiter => self.verified_frame_limiter(record, job, &payload, now),
             Phase::Arm => self.armed(record, job, &payload, now),
             Phase::Stop => self.stopped(record, job, &payload, runtime),
             Phase::Status => self.status_result(record, job, &payload, now, runtime),
         }
+    }
+
+    pub(super) fn verified_frame_limiter(
+        &mut self,
+        record: &mut Record,
+        job: Job,
+        payload: &Value,
+        now: u64,
+    ) {
+        let verified = payload["ok"] == true
+            && payload["verified"] == true
+            && payload["application_operation_id"].as_str()
+                == record.config.application_operation_id.as_deref()
+            && payload["app_id"].as_str() == record.config.app_id.as_deref()
+            && payload["catalog_revision"].as_u64() == record.config.catalog_revision
+            && payload.get("frame_limiter_settings")
+                == record.config.frame_limiter_settings.as_ref()
+            && payload["frame_limiter_executable_path"].as_str()
+                == record.config.frame_limiter_executable_path.as_deref()
+            && record.state == State::Ready
+            && now < record.expires;
+        let Some((connection, action_ticket)) = job.network else {
+            record.close(Some("network_disconnected"));
+            self.schedule_stop(record, job.caller, now);
+            return;
+        };
+        if !verified {
+            self.fail_network_action(
+                record,
+                connection,
+                action_ticket,
+                "frame_limiter_snapshot_denied",
+            );
+            return;
+        }
+        let Some(start) = record
+            .session
+            .and_then(|session| record.authenticated_start_payload(session))
+        else {
+            self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
+            return;
+        };
+        self.schedule_arm(record, start, connection, action_ticket, now);
     }
 
     pub(super) fn prepared(

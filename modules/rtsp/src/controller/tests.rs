@@ -748,6 +748,9 @@ fn stream_prepare_must_read_back_the_frozen_frame_limiter_snapshot() {
         let mut record = record(State::Preparing);
         record.config.frame_limiter_settings = Some(snapshot.clone());
         record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
+        record.config.application_operation_id = Some("launch-one".into());
+        record.config.app_id = Some("app-0000000000000001".into());
+        record.config.catalog_revision = Some(1);
         let job = Job {
             ticket: record.id,
             phase: Phase::Prepare,
@@ -1628,6 +1631,118 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
     assert!(!record.accept_announce(&announce));
     assert!(record.negotiated_encryption.is_none());
     assert!(record.authenticated_start_payload(23).is_none());
+}
+
+#[test]
+fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
+    let snapshot = json!({"version":1,"settings":{"frame_limiter_provider":"rtss"}});
+    for case in [
+        "exact",
+        "wrong_operation",
+        "wrong_app",
+        "wrong_revision",
+        "wrong_snapshot",
+        "wrong_path",
+        "unavailable",
+    ] {
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let mut record = record(State::Ready);
+        record.config.profile.bitrate_kbps = 20_000;
+        record.config.profile.packet_size = 1_392;
+        record.config.profile.packet_ms = 5;
+        record.config.profile.encrypt_video = false;
+        record.config.profile.encrypt_audio = false;
+        record.negotiated_encryption = Some(crate::model::EncryptionSnapshot {
+            video: true,
+            audio: false,
+        });
+        record.config.frame_limiter_settings = Some(snapshot.clone());
+        record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
+        record.config.application_operation_id = Some("launch-one".into());
+        record.config.app_id = Some("app-0000000000000001".into());
+        record.config.catalog_revision = Some(7);
+        let (negotiation, action_ticket) = pending_play(&record);
+        record.negotiation = Some(negotiation);
+        let ticket = record.id;
+        controller.schedule_frame_limiter_verification(&record, 999, action_ticket, 0);
+        controller.records.insert(ticket, record);
+        assert!(
+            controller
+                .job
+                .as_ref()
+                .is_some_and(|job| job.phase == Phase::VerifyFrameLimiter)
+        );
+
+        let mut reply = json!({
+            "ok":true,"verified":true,
+            "application_operation_id":"launch-one",
+            "app_id":"app-0000000000000001",
+            "catalog_revision":7,
+            "frame_limiter_settings":snapshot,
+            "frame_limiter_executable_path":"C:\\Games\\Example.exe",
+        });
+        match case {
+            "wrong_operation" => reply["application_operation_id"] = json!("other-launch"),
+            "wrong_app" => reply["app_id"] = json!("app-0000000000000002"),
+            "wrong_revision" => reply["catalog_revision"] = json!(8),
+            "wrong_snapshot" => reply["frame_limiter_settings"]["version"] = json!(2),
+            "wrong_path" => reply["frame_limiter_executable_path"] = json!("C:\\Games\\Other.exe"),
+            _ => {}
+        }
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(reply),
+            deny_launch: case == "unavailable",
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        let launch_request = endpoint.commands.iter().find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.launch/1" => Some(payload),
+            _ => None,
+        });
+        let launch_request = launch_request.expect("Launch verification precedes stream start");
+        assert_eq!(launch_request["action"], "verify_frame_limiter_snapshot");
+        assert_eq!(launch_request["app_id"], "app-0000000000000001");
+        assert_eq!(launch_request["catalog_revision"], 7);
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.stream-session/1"
+                    && payload["action"] == "start_when_authenticated")));
+
+        if case != "unavailable" {
+            controller.advance_job(&runtime, 2);
+        }
+        if case == "exact" {
+            assert!(
+                controller
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.phase == Phase::Arm)
+            );
+            controller.advance_job(&runtime, 3);
+            assert!(endpoint.commands.iter().any(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == "amaterasu.stream-session/1"
+                        && payload["action"] == "start_when_authenticated")));
+        } else {
+            assert!(controller.job.is_none());
+            assert!(controller.records[&ticket].state == State::Closing);
+            assert_eq!(
+                controller.records[&ticket].failure,
+                Some(if case == "unavailable" {
+                    "frame_limiter_verification_unavailable"
+                } else {
+                    "frame_limiter_snapshot_denied"
+                })
+            );
+            assert!(!endpoint.commands.iter().any(|command| matches!(command,
+                Command::Request { service, payload, .. }
+                    if service == "amaterasu.stream-session/1"
+                        && payload["action"] == "start_when_authenticated")));
+        }
+    }
 }
 
 #[test]

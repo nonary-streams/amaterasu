@@ -116,16 +116,16 @@ impl Controller {
                     self.records.insert(ticket, record);
                     return;
                 };
-                let deadline = record.begin_arm(now);
-                let call = Call::new(payload, self.operation_id(&record, "arm"), None);
-                self.job = Some(Job {
-                    ticket,
-                    phase: Phase::Arm,
-                    call,
-                    caller: None,
-                    network: Some((connection, action_ticket)),
-                    deadline,
-                });
+                if record.config.frame_limiter_settings.is_some() {
+                    self.schedule_frame_limiter_verification(
+                        &record,
+                        connection,
+                        action_ticket,
+                        now,
+                    );
+                } else {
+                    self.schedule_arm(&mut record, payload, connection, action_ticket, now);
+                }
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
@@ -153,6 +153,56 @@ impl Controller {
             }
         }
         self.records.insert(ticket, record);
+    }
+
+    pub(super) fn schedule_frame_limiter_verification(
+        &mut self,
+        record: &Record,
+        connection: u64,
+        action_ticket: u64,
+        now: u64,
+    ) {
+        let verification = json!({
+            "action":"verify_frame_limiter_snapshot",
+            "application_operation_id":record.config.application_operation_id,
+            "app_id":record.config.app_id,
+            "catalog_revision":record.config.catalog_revision,
+            "frame_limiter_settings":record.config.frame_limiter_settings,
+            "frame_limiter_executable_path":record.config.frame_limiter_executable_path,
+        });
+        let call = Call::for_service(
+            "amaterasu.launch/1",
+            verification,
+            self.operation_id(record, "verify-frame-limiter"),
+            None,
+        );
+        self.job = Some(Job {
+            ticket: record.id,
+            phase: Phase::VerifyFrameLimiter,
+            call,
+            caller: None,
+            network: Some((connection, action_ticket)),
+            deadline: now.saturating_add(PREPARE_BUDGET_MS),
+        });
+    }
+
+    pub(super) fn schedule_arm(
+        &mut self,
+        record: &mut Record,
+        payload: Value,
+        connection: u64,
+        action_ticket: u64,
+        now: u64,
+    ) {
+        let deadline = record.begin_arm(now);
+        self.job = Some(Job {
+            ticket: record.id,
+            phase: Phase::Arm,
+            call: Call::new(payload, self.operation_id(record, "arm"), None),
+            caller: None,
+            network: Some((connection, action_ticket)),
+            deadline,
+        });
     }
 
     pub(super) fn finish_immediate_action(

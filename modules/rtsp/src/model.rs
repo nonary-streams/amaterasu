@@ -441,6 +441,11 @@ pub struct Open {
     pub frame_limiter_settings: Option<serde_json::Value>,
     #[serde(default)]
     pub frame_limiter_executable_path: Option<String>,
+    /// Frozen Launch identity for verifying a limiter before stream activation.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub catalog_revision: Option<u64>,
     /// Full display configuration, admitted only after Launch verifies its
     /// frozen policy source and authenticated operation binding.
     #[serde(default)]
@@ -526,12 +531,37 @@ impl Open {
             return Err("invalid_frame_limiter_snapshot");
         }
         match (
+            &self.frame_limiter_settings,
+            &self.app_id,
+            self.catalog_revision,
+        ) {
+            (Some(_), Some(app_id), Some(_))
+                if valid_name(app_id)
+                    && self
+                        .application_operation_id
+                        .as_deref()
+                        .is_some_and(valid_name) => {}
+            (None, Some(app_id), Some(revision))
+                if self.display_request.is_some()
+                    && valid_name(app_id)
+                    && self
+                        .display_policy_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            snapshot["catalog_revision"].as_u64() == Some(revision)
+                        }) => {}
+            (None, None, None) => {}
+            _ => return Err("frame_limiter_unattested"),
+        }
+        match (
             &self.display_request,
             &self.display_admission_token,
             &self.application_operation_id,
             &self.display_policy_snapshot,
         ) {
-            (None, None, None, _) => {}
+            (None, None, _, _)
+                if self.frame_limiter_settings.is_some()
+                    || self.application_operation_id.is_none() => {}
             (Some(request), Some(token), Some(operation), Some(snapshot))
                 if valid_display_request(request)
                     && valid_display_policy_snapshot(snapshot)
@@ -1595,6 +1625,9 @@ mod tests {
     #[test]
     fn frozen_frame_limiter_snapshot_reaches_stream_preparation() {
         let mut value = open_json();
+        value["application_operation_id"] = json!("launch-one");
+        value["app_id"] = json!("app-0000000000000001");
+        value["catalog_revision"] = json!(1);
         value["frame_limiter_settings"] = json!({
             "version":1,
             "settings":{
@@ -1631,6 +1664,11 @@ mod tests {
             value["frame_limiter_executable_path"]
         );
 
+        let mut unbound = value.clone();
+        unbound.as_object_mut().unwrap().remove("app_id");
+        let unbound: Open = serde_json::from_value(unbound).unwrap();
+        assert_eq!(unbound.validate(false), Err("frame_limiter_unattested"));
+
         value["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
         let mismatched: Open = serde_json::from_value(value).unwrap();
         assert_eq!(
@@ -1647,6 +1685,9 @@ mod tests {
 
         for path in ["  ", "C:\\Games\\Bad\nName.exe"] {
             let mut invalid = open_json();
+            invalid["application_operation_id"] = json!("launch-one");
+            invalid["app_id"] = json!("app-0000000000000001");
+            invalid["catalog_revision"] = json!(1);
             invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
             invalid["frame_limiter_executable_path"] = json!(path);
             let invalid: Open = serde_json::from_value(invalid).unwrap();
@@ -1654,6 +1695,9 @@ mod tests {
         }
         for install_path in ["C:\\RTSS\\Bad\nName", &"x".repeat(4097)] {
             let mut invalid = open_json();
+            invalid["application_operation_id"] = json!("launch-one");
+            invalid["app_id"] = json!("app-0000000000000001");
+            invalid["catalog_revision"] = json!(1);
             invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
             invalid["frame_limiter_settings"]["settings"]["rtss_install_path"] =
                 json!(install_path);

@@ -108,6 +108,10 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
+        if config.frame_limiter_settings.is_some() && caller != "amaterasu.nvhttp" {
+            rpc::complete(runtime, request, error("frame_limiter_snapshot_denied"));
+            return;
+        }
         if config
             .history_activity_id
             .as_deref()

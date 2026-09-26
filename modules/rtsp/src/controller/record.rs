@@ -124,6 +124,7 @@ impl Record {
 pub(super) enum Phase {
     Prepare,
     Find,
+    VerifyFrameLimiter,
     Arm,
     Stop,
     Status,
