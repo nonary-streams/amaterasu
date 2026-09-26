@@ -292,8 +292,10 @@ queryable HDR on/off state of active paths. Active HDR can be restored; enforced
 wide-color-gamut state, indirect/virtual/wireless displays, and unsupported or
 incomplete path data remain outside this provider. Virtual-mode/virtual-refresh
 awareness, DPI scaling, color profiles, driver configuration, primary clone-group
-requests, virtual-display drivers, display-stack resets, topology settling and
-retry policy remain unimplemented. Existing clone sources can be remapped and
+requests, virtual-display drivers, display-stack resets, and broader topology
+transition retries remain unimplemented. After native apply or restore, bounded
+CCD readbacks wait for the exact requested state and reject foreign physical
+routes immediately. Existing clone sources can be remapped and
 restored while keeping each target's refresh, rotation and HDR state. A revisioned
 Apply can add one inactive physical target as a clone of an active source when its
 route is uniquely bound and journaled; detected route drift fails before native
@@ -316,7 +318,9 @@ effects, cancellation at acknowledgement/native boundaries, caller ownership,
 restart recovery, failed journal deletion, partial native failure/rollback, and
 external changes, HDR enable/disable/readback, unsupported and inactive targets,
 rollback, and legacy-journal safety. The Windows native source and strict Clippy
-pass on the development Windows host. **No test applies OS display changes on
+pass on the development Windows host. Deterministic native-translation tests
+cover delayed CCD convergence, a permanent mismatch, and changed target routes
+during restoration. **No test applies OS display changes on
 the developer desktop.** This is not an HDR hardware pass. Hardware acceptance
 must run an explicitly reviewed
 apply/restore/restart-recovery sequence on a disposable Windows test setup with
