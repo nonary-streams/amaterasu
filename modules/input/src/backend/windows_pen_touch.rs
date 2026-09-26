@@ -209,14 +209,18 @@ impl WindowsPenTouch {
             x: *x,
             y: *y,
             pressure: *pressure,
+            effective_pressure: None,
             contact_area_major: *contact_area_major,
             contact_area_minor: *contact_area_minor,
+            effective_contact_area: None,
             rotation_degrees: *rotation_degrees,
+            effective_rotation_degrees: None,
             pen_tool: *pen_tool,
             pen_buttons: *pen_buttons,
             effective_pen_tool: None,
             effective_pen_buttons: None,
             tilt: *tilt,
+            effective_tilt: None,
         };
         let frame = {
             let state_slot = self.device_state_slot_mut(*device);
@@ -234,6 +238,19 @@ impl WindowsPenTouch {
             contact.effective_pen_buttons = contact
                 .pen_buttons
                 .or_else(|| previous.and_then(|previous| previous.effective_pen_buttons));
+            contact.effective_pressure = contact
+                .pressure
+                .or_else(|| previous.and_then(|previous| previous.effective_pressure));
+            contact.effective_contact_area = contact
+                .contact_area_major
+                .zip(contact.contact_area_minor)
+                .or_else(|| previous.and_then(|previous| previous.effective_contact_area));
+            contact.effective_rotation_degrees = contact
+                .rotation_degrees
+                .or_else(|| previous.and_then(|previous| previous.effective_rotation_degrees));
+            contact.effective_tilt = contact
+                .tilt
+                .or_else(|| previous.and_then(|previous| previous.effective_tilt));
             state.contacts.insert(*pointer_id, contact);
             let frame = build_pointer_frame(
                 *device,
@@ -563,11 +580,16 @@ struct PointerContact {
     x: u16,
     y: u16,
     pressure: Option<f32>,
+    // A sparse move leaves the native pressure mask unset, but recreating a
+    // device must restore the last pressure explicitly reported for this ID.
+    effective_pressure: Option<f32>,
     contact_area_major: Option<f32>,
     contact_area_minor: Option<f32>,
+    effective_contact_area: Option<(f32, f32)>,
     rotation_degrees: Option<u16>,
-    // These fields preserve exactly what the latest event reported. None and
-    // Unknown mean the event did not update native tool/button state.
+    effective_rotation_degrees: Option<u16>,
+    // Raw fields preserve exactly what the latest event reported. None and
+    // Unknown omit native update masks; effective fields restore a new Down.
     pen_tool: Option<PenTool>,
     pen_buttons: Option<u8>,
     // Windows frames are rebuilt from scratch, so carry forward effective
@@ -575,6 +597,7 @@ struct PointerContact {
     effective_pen_tool: Option<PenTool>,
     effective_pen_buttons: Option<u8>,
     tilt: Option<u8>,
+    effective_tilt: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -697,6 +720,18 @@ fn pointer_info_for_contact(
         PenTouchPhase::Up => POINTER_FLAG_UP,
         PenTouchPhase::Cancel => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
     };
+    let rotation_degrees = if phase == PenTouchPhase::Down {
+        contact
+            .rotation_degrees
+            .or(contact.effective_rotation_degrees)
+    } else {
+        contact.rotation_degrees
+    };
+    let tilt = if phase == PenTouchPhase::Down {
+        contact.tilt.or(contact.effective_tilt)
+    } else {
+        contact.tilt
+    };
 
     let mut pointer = POINTER_TYPE_INFO::default();
     match device {
@@ -726,17 +761,22 @@ fn pointer_info_for_contact(
                 pen_info.penFlags |= PEN_FLAG_BARREL;
             }
 
+            let pressure = if phase == PenTouchPhase::Down {
+                contact.pressure.or(contact.effective_pressure)
+            } else {
+                contact.pressure
+            };
             if matches!(phase, PenTouchPhase::Down | PenTouchPhase::Move)
-                && let Some(pressure) = contact.pressure
+                && let Some(pressure) = pressure
             {
                 pen_info.penMask |= PEN_MASK_PRESSURE;
                 pen_info.pressure = pressure_to_native(pressure);
             }
-            if let Some(rotation) = contact.rotation_degrees {
+            if let Some(rotation) = rotation_degrees {
                 pen_info.penMask |= PEN_MASK_ROTATION;
                 pen_info.rotation = u32::from(rotation);
             }
-            if let Some((tilt_x, tilt_y)) = pen_tilt_axes(contact.tilt, contact.rotation_degrees) {
+            if let Some((tilt_x, tilt_y)) = pen_tilt_axes(tilt, rotation_degrees) {
                 pen_info.penMask |= PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
                 pen_info.tiltX = tilt_x.round() as i32;
                 pen_info.tiltY = tilt_y.round() as i32;
@@ -762,27 +802,37 @@ fn pointer_info_for_contact(
             };
             touch_info.rcContactRaw = touch_info.rcContact;
             touch_info.pressure = 512;
+            let pressure = if phase == PenTouchPhase::Down {
+                contact.pressure.or(contact.effective_pressure)
+            } else {
+                contact.pressure
+            };
             if matches!(phase, PenTouchPhase::Down | PenTouchPhase::Move)
-                && let Some(pressure) = contact.pressure
+                && let Some(pressure) = pressure
             {
                 touch_info.touchMask |= TOUCH_MASK_PRESSURE;
                 touch_info.pressure = pressure_to_native(pressure);
             }
-            if let Some((major, minor)) = contact.contact_area_major.zip(contact.contact_area_minor)
-            {
+            let contact_area = contact.contact_area_major.zip(contact.contact_area_minor);
+            let contact_area = if phase == PenTouchPhase::Down {
+                contact_area.or(contact.effective_contact_area)
+            } else {
+                contact_area
+            };
+            if let Some((major, minor)) = contact_area {
                 let bounds = contact_rectangle(
                     screen_x,
                     screen_y,
                     major,
                     minor,
-                    contact.rotation_degrees,
+                    rotation_degrees,
                     virtual_desktop,
                 );
                 touch_info.rcContact = bounds;
                 touch_info.rcContactRaw = bounds;
                 touch_info.touchMask |= TOUCH_MASK_CONTACTAREA;
             }
-            if let Some(rotation) = contact.rotation_degrees {
+            if let Some(rotation) = rotation_degrees {
                 touch_info.orientation = u32::from(rotation);
                 touch_info.touchMask |= TOUCH_MASK_ORIENTATION;
             }
@@ -2024,6 +2074,145 @@ mod tests {
                 PenTouchPhase::Down => unreachable!(),
             }
             backend.stop().unwrap();
+        }
+    }
+
+    #[test]
+    fn recreated_pointer_down_restores_explicit_metadata_after_sparse_move() {
+        for (device, pointer_id) in [
+            (PenTouchDevice::Pen, PEN_POINTER_ID),
+            (PenTouchDevice::Touch, 7),
+        ] {
+            let (mut backend, state) = backend();
+            let mut down = event(pointer_id, device, PenTouchPhase::Down, 32768, 32768);
+            if let Event::PenTouch {
+                pressure,
+                contact_area_major,
+                contact_area_minor,
+                rotation_degrees,
+                tilt,
+                ..
+            } = &mut down
+            {
+                *pressure = Some(0.75);
+                *rotation_degrees = Some(90);
+                if device == PenTouchDevice::Pen {
+                    *tilt = Some(45);
+                } else {
+                    *contact_area_major = Some(0.02);
+                    *contact_area_minor = Some(0.01);
+                }
+            }
+            backend.inject(&down).unwrap();
+            let mut changed = event(pointer_id, device, PenTouchPhase::Move, 32768, 32768);
+            if let Event::PenTouch {
+                pressure,
+                contact_area_major,
+                contact_area_minor,
+                rotation_degrees,
+                tilt,
+                ..
+            } = &mut changed
+            {
+                *pressure = Some(0.5);
+                *rotation_degrees = Some(180);
+                if device == PenTouchDevice::Pen {
+                    *tilt = Some(30);
+                } else {
+                    *contact_area_major = Some(0.01);
+                    *contact_area_minor = Some(0.005);
+                }
+            }
+            backend.inject(&changed).unwrap();
+            let sparse_move = event(pointer_id, device, PenTouchPhase::Move, 33000, 33000);
+            backend.inject(&sparse_move).unwrap();
+            {
+                let fake = state.borrow();
+                let sparse = &fake.frames[2].1[0];
+                if device == PenTouchDevice::Pen {
+                    let sparse = pen_info(sparse);
+                    assert_eq!(sparse.penMask, PEN_MASK_NONE);
+                } else {
+                    let sparse = touch_info(sparse);
+                    assert_eq!(sparse.touchMask, TOUCH_MASK_NONE);
+                }
+            }
+
+            {
+                let mut fake = state.borrow_mut();
+                fake.fail_next_injection = true;
+                fake.lose_handle_on_next_failure = true;
+            }
+            assert_eq!(
+                backend.inject(&sparse_move).unwrap_err().code,
+                "injection_failed"
+            );
+            assert!(backend.device_state(device).unwrap().recovery_required);
+            backend.inject(&sparse_move).unwrap();
+            {
+                let fake = state.borrow();
+                assert_eq!(fake.destroyed, [1]);
+                assert_eq!(fake.created.len(), 2);
+                assert_eq!(fake.frames.len(), 5);
+                let replay = &fake.frames[3].1[0];
+                if device == PenTouchDevice::Pen {
+                    let replay = pen_info(replay);
+                    let changed = pen_info(&fake.frames[1].1[0]);
+                    assert_ne!(replay.pointerInfo.pointerFlags & POINTER_FLAG_DOWN, 0);
+                    assert_eq!(replay.pressure, 512);
+                    assert_eq!(replay.rotation, 180);
+                    assert_eq!((replay.tiltX, replay.tiltY), (changed.tiltX, changed.tiltY));
+                    assert_eq!(
+                        replay.penMask,
+                        PEN_MASK_PRESSURE | PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y
+                    );
+                } else {
+                    let replay = touch_info(replay);
+                    let changed = touch_info(&fake.frames[1].1[0]);
+                    assert_ne!(replay.pointerInfo.pointerFlags & POINTER_FLAG_DOWN, 0);
+                    assert_eq!(replay.pressure, 512);
+                    assert_eq!(replay.orientation, 180);
+                    assert_eq!(
+                        replay.touchMask,
+                        TOUCH_MASK_PRESSURE | TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION
+                    );
+                    assert!(replay.rcContact.right > replay.rcContact.left);
+                    assert!(replay.rcContact.bottom > replay.rcContact.top);
+                    assert_eq!(
+                        replay.rcContact.right - replay.rcContact.left,
+                        changed.rcContact.right - changed.rcContact.left
+                    );
+                    assert_eq!(
+                        replay.rcContact.bottom - replay.rcContact.top,
+                        changed.rcContact.bottom - changed.rcContact.top
+                    );
+                }
+            }
+            backend
+                .inject(&event(pointer_id, device, PenTouchPhase::Up, 33100, 33100))
+                .unwrap();
+            backend.stop().unwrap();
+            assert_eq!(state.borrow().destroyed, [1, 2]);
+            backend.start().unwrap();
+            backend
+                .inject(&event(
+                    pointer_id,
+                    device,
+                    PenTouchPhase::Down,
+                    33200,
+                    33200,
+                ))
+                .unwrap();
+            let fake = state.borrow();
+            let fresh = &fake.frames.last().unwrap().1[0];
+            if device == PenTouchDevice::Pen {
+                assert_eq!(pen_info(fresh).penMask, PEN_MASK_NONE);
+            } else {
+                assert_eq!(touch_info(fresh).touchMask, TOUCH_MASK_NONE);
+            }
+            drop(fake);
+            backend.stop().unwrap();
+            assert_eq!(state.borrow().destroyed, [1, 2, 3]);
         }
     }
 
