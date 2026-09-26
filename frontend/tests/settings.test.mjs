@@ -481,11 +481,12 @@ test("host logging form refreshes its revision after an ambiguous persisted save
         stored = { ...stored, revision: stored.revision + 1,
           values: { ...stored.values, log_path: body.log_path, min_log_level: body.min_log_level } };
         if (submittedRevisions.length === 1) failReadback = true;
-        return stored;
+        return submittedRevisions.length === 1 ? stored : { ...stored,
+          logging: { saved_revision: stored.revision, applied_revision: stored.revision,
+            status: "applied" } };
       }
       if (route === "diagnostics/refresh_logging")
-        return { ok: true, requested_revision: body.minimum_revision,
-          logging_configuration_revision: null, ready: true };
+        throw new Error("synchronous apply must not request a refresh");
       throw new Error(`unavailable: ${route}`);
     },
   } });
@@ -502,6 +503,8 @@ test("host logging form refreshes its revision after an ambiguous persisted save
   await new Promise(setImmediate);
   assert.deepEqual(submittedRevisions, [6, 7]);
   assert.match(hostLoggingArea.textContent, /Revision 8/);
+  assert.match(notices.at(-1), /diagnostics.read permission/);
+  assert.doesNotMatch(notices.at(-1), /refresh could not be scheduled/);
 });
 
 test("diagnostics status distinguishes saved, pending, unavailable and newer logging revisions", () => {
@@ -592,6 +595,65 @@ test("signed host logging save confirms readback and reader adoption after resta
   assert.match(describe(7, denied.diagnostics), /diagnostics.read permission/);
   assert.doesNotMatch([loaded, saved, openFailure, writeFailure, recovered, disabled, malformed, failedRequest, denied]
     .map(({ settings, diagnostics }) => describe(settings.revision, diagnostics)).join(" "), /logs\/new\.log|secret|password/);
+});
+
+test("synchronous logging application skips refresh and still checks sink health", async () => {
+  let stored = hostConfiguration();
+  let sink = { state: "healthy", failure: null };
+  let statusFails = false;
+  const calls = [];
+  const api = { async post(route, body) {
+    calls.push(route);
+    if (route === "host-configuration/update") {
+      assert.equal(body.expected_revision, stored.revision);
+      stored = { ...stored, revision: stored.revision + 1,
+        values: { ...stored.values, log_path: body.log_path, min_log_level: body.min_log_level } };
+      return { ...stored, logging: { saved_revision: stored.revision,
+        applied_revision: stored.revision, status: "applied" } };
+    }
+    if (route === "host-configuration/get") return stored;
+    if (route === "diagnostics/status") {
+      if (statusFails) throw new Error("status unavailable");
+      return { ok: true, ready: true, logging_configuration_revision: stored.revision,
+        logging_sink: sink };
+    }
+    throw new Error(`unexpected route: ${route}`);
+  } };
+  const applied = await context.Amaterasu.saveHostLoggingState(api, stored, "warning", "logs/applied.log");
+  assert.equal(applied.settings.revision, 7);
+  assert.equal(applied.appliedSynchronously, true);
+  assert.equal(applied.refreshScheduled, false);
+  assert.match(context.Amaterasu.diagnosticsLoggingDescription(7, applied.diagnostics), /disk logging is healthy/);
+  assert.deepEqual(calls, ["host-configuration/update", "host-configuration/get", "diagnostics/status"]);
+
+  sink = { state: "failed", failure: "write" };
+  const failedSink = await context.Amaterasu.saveHostLoggingState(api, stored, "info", "logs/failed.log");
+  assert.equal(failedSink.appliedSynchronously, true);
+  assert.match(context.Amaterasu.diagnosticsLoggingDescription(8, failedSink.diagnostics), /writing the disk log failed/);
+  assert.doesNotMatch(context.Amaterasu.diagnosticsLoggingDescription(8, failedSink.diagnostics), /disk logging is healthy/);
+
+  statusFails = true;
+  const unknownSink = await context.Amaterasu.saveHostLoggingState(api, stored, "error", "logs/unknown.log");
+  assert.equal(unknownSink.appliedSynchronously, true);
+  assert.match(context.Amaterasu.diagnosticsLoggingDescription(9, unknownSink.diagnostics), /status request failed/);
+  assert.equal(calls.includes("diagnostics/refresh_logging"), false);
+});
+
+test("malformed synchronous logging confirmation cannot authorize an applied claim", async () => {
+  const updated = { ...hostConfiguration(7), values: { ...hostConfiguration().values,
+    log_path: "logs/next.log" } };
+  const applied = { saved_revision: 7, applied_revision: 7, status: "applied" };
+  for (const logging of [null, {}, { ...applied, saved_revision: 6 },
+    { ...applied, applied_revision: 6 }, { ...applied, status: "scheduled" },
+    { ...applied, extra: true }]) {
+    const calls = [];
+    await assert.rejects(context.Amaterasu.saveHostLoggingSettings({ async post(route) {
+      calls.push(route);
+      return { ...updated, logging };
+    } }, hostConfiguration(), "product_default", "logs/next.log"),
+    /application confirmation is invalid/);
+    assert.deepEqual(calls, ["host-configuration/update"]);
+  }
 });
 
 test("failed logging refresh or status keeps the confirmed save pending or unknown", async () => {

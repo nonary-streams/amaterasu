@@ -261,6 +261,7 @@ namespace Amaterasu {
       min_log_level: HostLogLevel;
     };
     effective: { log_path: string; min_log_level: HostLogLevel };
+    logging?: { saved_revision: number; applied_revision: number; status: "applied" };
   }
   export interface DiagnosticsLoggingStatus {
     ok: true;

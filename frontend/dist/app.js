@@ -2479,6 +2479,17 @@ var Amaterasu;
             !hostLogLevels.includes(effective.min_log_level) ||
             !hostLogLevels.includes(values.min_log_level))
             throw new Error("Effective host logging settings are invalid.");
+        if (Object.hasOwn(document, "logging")) {
+            const logging = document.logging;
+            if (!logging || typeof logging !== "object" || Array.isArray(logging))
+                throw new Error("Host logging application confirmation is invalid.");
+            const confirmation = logging;
+            if (Object.keys(confirmation).sort().join(",") !== "applied_revision,saved_revision,status" ||
+                confirmation.saved_revision !== document.revision ||
+                confirmation.applied_revision !== document.revision ||
+                confirmation.status !== "applied")
+                throw new Error("Host logging application confirmation is invalid.");
+        }
         return document;
     }
     Amaterasu.parseHostConfigurationReply = parseHostConfigurationReply;
@@ -2494,7 +2505,7 @@ var Amaterasu;
         const saved = parseHostConfigurationReply(await api.post("host-configuration/get"));
         if (!confirmsHostLoggingUpdate(saved, current, logging))
             throw new Error("Host logging settings could not be confirmed after saving. Refresh and check the current values.");
-        return saved;
+        return updated.logging ? { ...saved, logging: updated.logging } : saved;
     }
     Amaterasu.saveHostLoggingSettings = saveHostLoggingSettings;
     function confirmsHostLoggingUpdate(reply, current, logging) {
@@ -2566,22 +2577,25 @@ var Amaterasu;
     }
     async function saveHostLoggingState(api, current, level, path) {
         const settings = await saveHostLoggingSettings(api, current, level, path);
+        const appliedSynchronously = settings.logging?.status === "applied";
         let refreshScheduled = false;
-        try {
-            const reply = await api.post("diagnostics/refresh_logging", {
-                minimum_revision: settings.revision,
-            });
-            if (reply && typeof reply === "object" && !Array.isArray(reply)) {
-                const response = reply;
-                const applied = response.logging_configuration_revision;
-                refreshScheduled = response.ok === true && response.requested_revision === settings.revision &&
-                    typeof response.ready === "boolean" &&
-                    (applied === null || (Number.isSafeInteger(applied) && applied > 0));
+        if (!appliedSynchronously) {
+            try {
+                const reply = await api.post("diagnostics/refresh_logging", {
+                    minimum_revision: settings.revision,
+                });
+                if (reply && typeof reply === "object" && !Array.isArray(reply)) {
+                    const response = reply;
+                    const applied = response.logging_configuration_revision;
+                    refreshScheduled = response.ok === true && response.requested_revision === settings.revision &&
+                        typeof response.ready === "boolean" &&
+                        (applied === null || (Number.isSafeInteger(applied) && applied > 0));
+                }
+            }
+            catch {
             }
         }
-        catch {
-        }
-        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api), refreshScheduled };
+        return { settings, diagnostics: await readDiagnosticsLoggingStatus(api), refreshScheduled, appliedSynchronously };
     }
     Amaterasu.saveHostLoggingState = saveHostLoggingState;
     function diagnosticsLoggingDescription(savedRevision, result) {
@@ -3745,7 +3759,7 @@ var Amaterasu;
                     });
                 });
                 refresh.disabled = !context.api.allows("diagnostics.read");
-                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records after the reader refreshes its policy."), Amaterasu.el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`), Amaterasu.el("p", "muted", "The diagnostics reader applies saved changes asynchronously. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
+                form.append(Amaterasu.field("Minimum log level", level, "Product default uses the release channel's policy. Diagnostic records below this level are filtered."), Amaterasu.field("Log path", path, "A relative path stays beneath the private host state root. The setting applies to diagnostic records when diagnostics confirms the policy."), Amaterasu.el("p", "muted", `Effective host policy: ${settings.effective.min_log_level} · ${settings.effective.log_path}`), Amaterasu.el("p", "muted", "The host confirms logging application during save when supported; the diagnostics status checks disk delivery. Older hosts may apply saved changes asynchronously. Other host and native logs do not use this sink; a host restart may be required for their separate logging policies."), applicationStatus, refresh, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(`Revision ${settings.revision}`)));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -3755,7 +3769,7 @@ var Amaterasu;
                         try {
                             const saved = await saveHostLoggingState(context.api, settings, level.value, path.value);
                             const description = diagnosticsLoggingDescription(saved.settings.revision, saved.diagnostics);
-                            context.notify(saved.refreshScheduled
+                            context.notify(saved.appliedSynchronously || saved.refreshScheduled
                                 ? description
                                 : `Diagnostics refresh could not be scheduled. ${description}`);
                         }
