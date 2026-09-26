@@ -882,6 +882,30 @@ fn invalid_typed_detached_override_rejects_before_any_process_is_spawned() {
 }
 
 #[test]
+fn merged_detached_environment_limit_rejects_before_primary_spawn() {
+    let directory = test_directory("merged-detached-environment");
+    let marker = directory.join("primary-marker");
+    let mut request = launch("merged-detached-environment", "capture-env-cwd");
+    request["environment"]["AMATERASU_TEST_MARKER"] = json!(marker);
+    request["environment"]["AMATERASU_TEST_VALUE"] = json!("primary");
+    for index in 0..30 {
+        request["environment"][format!("FILLER_{index}")] = json!("x");
+    }
+    request["detached"] = json!([{
+        "command": detached_command_for_current_test_with_arguments(&[]),
+        "environment": {"EXTRA_KEY":"x"}
+    }]);
+    let mut manager = ProcessManager::default();
+    assert_eq!(manager.handle("alice", request)["code"], "invalid_launch");
+    assert!(!marker.exists());
+    assert_eq!(
+        manager.handle("alice", json!({"action":"list"}))["processes"],
+        json!([])
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn wait_all_keeps_the_app_running_for_live_process_group_members() {
     let directory = test_directory("wait-all");
     let mut manager = ProcessManager::default();

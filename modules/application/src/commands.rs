@@ -84,6 +84,7 @@ pub(crate) fn prepare_detached_requests(
                     .retain(|existing, _| !existing.eq_ignore_ascii_case(key));
                 command.environment.insert(key.clone(), value.clone());
             }
+            validate_environment(&command.environment)?;
             command.cwd = request.cwd.clone();
             Ok(command)
         })

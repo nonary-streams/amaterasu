@@ -174,8 +174,9 @@ Limits, measured in UTF-8 bytes unless otherwise stated:
   `auto_detach` are booleans.
 - `detached`: up to 16 command strings or typed objects, each command at most
   2,048 printable bytes, with up to 64 parsed arguments and 8,192 argument
-  bytes combined. Each typed environment has the same bounds as launch
-  environment; each typed cwd must be an absolute path of 1–1,024 bytes.
+  bytes combined. Each typed environment and its merged launch environment
+  must each stay within the launch environment bounds; each typed cwd must be
+  an absolute path of 1–1,024 bytes.
 - Args: at most 64, each at most 1,024 bytes, 8,192 bytes combined, no NUL.
 - Environment: at most 32 keys, keys of 1–128 ASCII alphanumeric/underscore
   bytes, values at most 1,024 bytes without NUL, 4,096 key/value bytes combined.
