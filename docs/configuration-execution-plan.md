@@ -227,10 +227,12 @@ displays those chunks with revision and size checks. This covers local artwork
 discovery and browser display. A fixed official Steam CDN portrait can now be
 fetched when no local artwork exists, through a single bounded worker and
 revision-checked signed reads. The transfer accepts the reference's 16 MiB
-remote image limit; cached images do not survive restart, and
-low-resolution local art is not replaced with converted remote art as in the
-reference. Local discovery now ranks bounded portrait candidates by parsed
-resolution across configured Steam roots.
+remote image limit. The provider has a bounded persistent cache with recovery
+for interrupted writes, but the host has not yet supplied its trusted private
+cache root; packaged restart persistence remains unqualified. Low-resolution
+local art is not yet replaced with converted remote art as in the reference.
+Local discovery ranks bounded portrait candidates by parsed resolution across
+configured Steam roots.
 Platform qualification remains pending. Manual catalog entries can preserve explicit
 Steam ID and install-directory metadata. On Linux, a launch snapshots a
 baseline of same-user processes and associates new process identities only
