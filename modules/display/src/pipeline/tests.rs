@@ -76,6 +76,106 @@ fn cloned_snapshot() -> Snapshot {
 }
 
 #[test]
+fn revision_tracks_clone_path_priority_without_tracking_independent_path_order() {
+    let baseline = cloned_snapshot();
+    let initial = baseline.revision().unwrap();
+    let mut swapped_clone = baseline.clone();
+    swapped_clone.paths.swap(0, 1);
+    assert_ne!(initial, swapped_clone.revision().unwrap());
+
+    let mut with_independent = baseline;
+    let mut third = two_display_snapshot().paths.remove(1);
+    third.id = "monitor.three".into();
+    third.source_address.id = 4;
+    third.target_address.id = 5;
+    with_independent.paths.push(third);
+    let before = with_independent.revision().unwrap();
+    let mut independent_swapped = with_independent.clone();
+    independent_swapped.paths.swap(0, 2);
+    assert_ne!(before, independent_swapped.revision().unwrap());
+    let mut independent_only = two_display_snapshot();
+    let independent_revision = independent_only.revision().unwrap();
+    independent_only.paths.swap(0, 1);
+    assert_eq!(independent_revision, independent_only.revision().unwrap());
+
+    let mut two_independent_before_clone = with_independent.clone();
+    let mut fourth = two_display_snapshot().paths.remove(1);
+    fourth.id = "monitor.four".into();
+    fourth.source_address.id = 6;
+    fourth.target_address.id = 7;
+    fourth.source.x = 3840;
+    two_independent_before_clone.paths.insert(0, fourth);
+    two_independent_before_clone.paths.rotate_right(1);
+    let stable = two_independent_before_clone.revision().unwrap();
+    two_independent_before_clone.paths.swap(0, 1);
+    assert_eq!(stable, two_independent_before_clone.revision().unwrap());
+}
+
+#[test]
+fn stale_clone_priority_revision_rejects_before_journal_and_native_effect() {
+    let baseline = cloned_snapshot();
+    let old_revision = json!(baseline.revision().unwrap());
+    let mut changed = baseline.clone();
+    changed.paths.swap(0, 1);
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(changed.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut selected = configuration();
+    selected["displays"][0]["id"] = json!("monitor.two");
+    let rejected = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request("ensure_primary", "monitor.two", selected, &old_revision),
+    );
+    assert_eq!(rejected["error"]["code"], "topology_changed");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(pipeline.platform.prepared_configuration.is_none());
+
+    let rejected_plain = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"apply", "configuration":changed.configuration().unwrap(),
+            "expected_topology_revision":old_revision}),
+    );
+    assert_eq!(rejected_plain["error"]["code"], "topology_changed");
+    assert!(state.journal.is_none());
+    assert!(pipeline.platform.effects.is_empty());
+
+    let independent = two_display_snapshot();
+    let revision = json!(independent.revision().unwrap());
+    let mut reordered = independent.clone();
+    reordered.paths.swap(0, 1);
+    let mut independent_pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(reordered.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let accepted = state.run(
+        &mut independent_pipeline,
+        "owner",
+        json!({"action":"apply", "configuration":reordered.configuration().unwrap(),
+            "expected_topology_revision":revision}),
+    );
+    assert_eq!(accepted["applied"], true, "{accepted}");
+    let restored = state.run(
+        &mut independent_pipeline,
+        "owner",
+        json!({"action":"restore","lease":accepted["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+}
+
+#[test]
 fn clone_configuration_preserves_target_state_and_rejects_false_clone() {
     let mut baseline = cloned_snapshot();
     baseline.paths[1].refresh = Rational {

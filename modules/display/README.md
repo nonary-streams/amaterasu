@@ -111,7 +111,11 @@ Moonlight gate.
 `topology_revision` from a validated active-path set. It rejects incomplete
 paths and ambiguous monitor IDs. Pass that revision as
 `expected_topology_revision` on Apply to require the same active topology at
-durable prepare and the native apply boundary. A revisioned Apply selects only
+durable prepare and the native apply boundary. The token covers the active CCD
+state, including clone path priority. Reordering independent
+nonclone paths does not invalidate the token. Clients should request a fresh
+snapshot after updating the provider; older clone tokens remain valid recovery
+journal data but cannot authorize a new Apply. A revisioned Apply selects
 exactly the currently active ID set, so an omitted monitor cannot be disabled
 by a partial policy. Legacy Apply still permits validated inactive target
 activation. Hotplug or display changes return `topology_changed` before the

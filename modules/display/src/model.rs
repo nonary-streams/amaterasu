@@ -498,8 +498,40 @@ impl Snapshot {
         self.validate()?;
         let mut paths = self.paths.clone();
         paths.sort_by_key(|path| path.id.to_lowercase());
-        let bytes = serde_json::to_vec(&paths)
+        let mut bytes = serde_json::to_vec(&paths)
             .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?;
+        // Independent CCD paths may be reported in a different order without
+        // changing the desktop. Clone path order is meaningful priority, so
+        // bind it (and its position relative to independent paths) into CAS.
+        let is_clone = |path: &DisplayPath| {
+            self.paths
+                .iter()
+                .filter(|peer| peer.source_address == path.source_address)
+                .count()
+                > 1
+        };
+        let clone_priority: Vec<_> = self
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| is_clone(path))
+            .map(|(index, path)| {
+                let mut independent_before: Vec<_> = self.paths[..index]
+                    .iter()
+                    .filter(|earlier| !is_clone(earlier))
+                    .map(|earlier| earlier.id.to_lowercase())
+                    .collect();
+                independent_before.sort();
+                (path.id.to_lowercase(), independent_before)
+            })
+            .collect();
+        if !clone_priority.is_empty() {
+            bytes.extend_from_slice(b"|clone-priority-v1|");
+            bytes.extend(
+                serde_json::to_vec(&clone_priority)
+                    .map_err(|error| DisplayError::new("invalid_snapshot", error.to_string()))?,
+            );
+        }
         // Two independent noncryptographic lanes make a compact opaque CCD state token.
         let mut a = 0xcbf29ce484222325_u64;
         let mut b = 0x84222325cbf29ce4_u64;
