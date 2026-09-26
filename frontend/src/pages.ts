@@ -155,10 +155,12 @@ namespace Amaterasu {
       return ["History storage is unavailable; recording and recorded session reads cannot run."];
     const lines = [status.configuration_ready
       ? status.effective_enabled === status.enabled
-        ? status.effective_enabled ? "History recording is active." : "History recording is disabled."
+        ? status.effective_enabled
+          ? "Recording is enabled for new streams."
+          : "Recording is disabled for new streams."
         : status.enabled
-          ? "History recording is pending; the enable change takes effect after active streams end."
-          : "History recording remains active; the disable change takes effect after active streams end."
+          ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."
+          : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
       : "History configuration is not ready; recording is not confirmed."];
     lines.push(`${status.active_streams} active streams · ${status.sessions} stored sessions · ${status.samples} samples · ${status.events} events · ${status.live_bytes} live bytes.`);
     lines.push(`Last retention pass deleted ${status.last_prune.sessions_deleted} sessions; ${status.last_prune.live_bytes} live bytes against ${status.last_prune.size_limit_bytes === 0 ? "no size limit" : `${status.last_prune.size_limit_bytes} byte limit`}.`);

@@ -171,17 +171,16 @@ namespace Amaterasu {
       return "Saved history settings confirmed. History configuration is not ready; recording is not confirmed.";
     if (runtime.enabled !== settings.settings.enabled)
       return "Saved history settings confirmed. Runtime has not yet reported the saved recording policy.";
-    if (runtime.degraded)
-      return runtime.effective_enabled !== runtime.enabled
-        ? "Saved history settings confirmed. History runtime is degraded and the recording change is deferred until active streams end."
-        : "Saved history settings confirmed. History runtime is degraded; recording health is not confirmed.";
-    if (runtime.effective_enabled !== runtime.enabled)
-      return runtime.enabled
-        ? "Saved history settings confirmed. Recording enable change is deferred until active streams end."
-        : "Saved history settings confirmed. Recording disable change is deferred until active streams end.";
-    return runtime.effective_enabled
-      ? "Saved history settings confirmed. History recording is active."
-      : "Saved history settings confirmed. History recording is disabled.";
+    const policy = runtime.effective_enabled !== runtime.enabled
+      ? runtime.enabled
+        ? "Recording enable is deferred until active streams end; new streams still use the disabled policy."
+        : "Recording disable is deferred until active streams end; new streams still use the enabled policy."
+      : runtime.effective_enabled
+        ? "Recording is enabled for new streams."
+        : "Recording is disabled for new streams.";
+    return runtime.degraded
+      ? `Saved history settings confirmed. ${policy} History runtime is degraded; check failed operations and retention status.`
+      : `Saved history settings confirmed. ${policy}`;
   }
 
   export async function saveAuthTokenLifetimes(
@@ -2784,12 +2783,6 @@ namespace Amaterasu {
           size,
           "Zero disables size pruning. Active sessions are never deleted to meet this limit.",
         );
-        const updateVisibility = (): void => {
-          ttlField.hidden = !enabled.checked;
-          sizeField.hidden = !enabled.checked;
-        };
-        enabled.addEventListener("change", updateVisibility);
-        updateVisibility();
         const status = el(
           "p",
           "muted",
@@ -2802,8 +2795,9 @@ namespace Amaterasu {
           field(
             "Record session history",
             enabled,
-            "Changes to recording during an active stream take effect after streams end.",
+            "If streams are active, recording changes wait until all of them end. New streams started while a change is pending use the previous recording policy.",
           ),
+          el("p", "muted", "Retention changes apply immediately to stored ended sessions, including while recording is disabled."),
           ttlField,
           sizeField,
           status,

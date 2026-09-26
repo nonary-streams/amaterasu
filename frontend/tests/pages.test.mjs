@@ -114,14 +114,15 @@ function historyStatus(overrides = {}) {
 test("history runtime status reports readiness, deferred settings, failures and retention", () => {
   const parse = pages.parseHistoryRuntimeStatus;
   const describe = (reply) => pages.historyRuntimeDescription(parse(reply)).join(" ");
-  assert.match(describe(historyStatus()), /recording is active/);
+  assert.match(describe(historyStatus()), /Recording is enabled for new streams/);
   assert.match(describe(historyStatus()), /4 stored sessions/);
   assert.match(describe(historyStatus()), /deleted 2 sessions/);
-  assert.match(describe(historyStatus({ enabled: false, effective_enabled: true })), /disable change takes effect after active streams end/);
-  assert.match(describe(historyStatus({ enabled: true, effective_enabled: false })), /enable change takes effect after active streams end/);
+  assert.match(describe(historyStatus({ enabled: false, effective_enabled: true })), /disable is deferred until active streams end; new streams still use the enabled policy/);
+  assert.match(describe(historyStatus({ enabled: true, effective_enabled: false })), /enable is deferred until active streams end; new streams still use the disabled policy/);
   assert.match(describe(historyStatus({ configuration_ready: false, degraded: true })), /configuration is not ready/);
   assert.match(describe(historyStatus({ available: false, configuration_ready: false })), /storage is unavailable/);
   assert.match(describe(historyStatus({ degraded: true, failed_operations: 3 })), /3 history storage operations have failed/);
+  assert.doesNotMatch(describe(historyStatus({ degraded: true, failed_operations: 3 })), /successfully recorded|writes are healthy/);
   assert.match(describe(historyStatus({ degraded: true, last_prune: {
     ...historyStatus().status.last_prune, size_limit_bytes: 1024, size_limit_unmet: true,
   } })), /size limit remains unmet/);

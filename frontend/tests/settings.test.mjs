@@ -576,7 +576,7 @@ test("history editor ignores stale loads and errors after a newer load or save b
   assert.equal((await reloaded).settings.revision, 9);
 });
 
-test("history editor confirms durable save and separately reads signed runtime on save and reload", async () => {
+test("history editor confirms deferred toggles, immediate retention and durable restart readback", async () => {
   let stored = { ok: true, revision: 4, settings: { enabled: false, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: false };
   let runtime = {
     ok: true,
@@ -592,8 +592,14 @@ test("history editor confirms durable save and separately reads signed runtime o
     calls.push([route, ordinary(body ?? {})]);
     if (route === "history/settings_update") {
       assert.equal(body.expected_revision, stored.revision);
-      stored = { ...stored, revision: stored.revision + 1, settings: body.settings, effective_enabled: false };
-      runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
+      const effective = runtime.status.active_streams === 0
+        ? body.settings.enabled : runtime.status.effective_enabled;
+      stored = { ...stored, revision: stored.revision + 1, settings: body.settings,
+        effective_enabled: effective };
+      runtime = { ...runtime, status: { ...runtime.status, enabled: body.settings.enabled,
+        effective_enabled: effective,
+        last_prune: { ...runtime.status.last_prune,
+          size_limit_bytes: body.settings.db_size_limit_mb * 1048576 } } };
       return stored;
     }
     return route === "history/settings_get" ? stored : runtime;
@@ -602,18 +608,50 @@ test("history editor confirms durable save and separately reads signed runtime o
   const initial = await context.Amaterasu.readHistorySettingsState(api);
   assert.deepEqual(calls, [["history/settings_get", {}], ["history/history_status", {}]]);
   assert.equal(initial.runtime?.available, true);
-  assert.match(context.Amaterasu.historySettingsRuntimeDescription(initial.settings, initial.runtime), /recording is disabled/);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(initial.settings, initial.runtime), /Recording is disabled for new streams/);
   const saved = await context.Amaterasu.saveHistorySettingsState(api, initial.settings, true, 14, 20);
   assert.equal(saved.settings.revision, 5);
-  assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime), /deferred until active streams end/);
+  assert.equal(saved.settings.effective_enabled, false);
+  assert.equal(saved.runtime.effective_enabled, false);
+  assert.equal(saved.runtime.last_prune.size_limit_bytes, 20 * 1048576);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings, saved.runtime), /enable is deferred until active streams end; new streams still use the disabled policy/);
   assert.deepEqual(calls.map(([route]) => route), [
     "history/settings_get", "history/history_status", "history/settings_update",
     "history/settings_get", "history/history_status",
   ]);
+  // A newly started stream joins the old cohort and does not apply the saved toggle.
+  runtime = { ...runtime, status: { ...runtime.status, active_streams: 2 } };
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(saved.settings,
+    context.Amaterasu.parseHistoryRuntimeStatus(runtime)), /still use the disabled policy/);
   runtime = { ...runtime, status: { ...runtime.status, effective_enabled: true, active_streams: 0 } };
+  stored = { ...stored, effective_enabled: true };
   const reloaded = await context.Amaterasu.readHistorySettingsState(api);
-  assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /recording is active/);
-  runtime = { ...runtime, status: { ...runtime.status, enabled: false } };
+  assert.equal(reloaded.settings.effective_enabled, true);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(reloaded.settings, reloaded.runtime), /Recording is enabled for new streams/);
+  runtime = { ...runtime, status: { ...runtime.status, active_streams: 1 } };
+  const disabled = await context.Amaterasu.saveHistorySettingsState(api, reloaded.settings, false, 7, 10);
+  assert.equal(disabled.settings.revision, 6);
+  assert.equal(disabled.settings.effective_enabled, true);
+  assert.equal(disabled.runtime.last_prune.size_limit_bytes, 10 * 1048576);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(disabled.settings, disabled.runtime), /disable is deferred until active streams end; new streams still use the enabled policy/);
+  runtime = { ...runtime, status: { ...runtime.status, active_streams: 2 } };
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(disabled.settings,
+    context.Amaterasu.parseHistoryRuntimeStatus(runtime)), /still use the enabled policy/);
+  runtime = { ...runtime, status: { ...runtime.status, effective_enabled: false, active_streams: 0 } };
+  stored = { ...stored, effective_enabled: false };
+  const drained = await context.Amaterasu.readHistorySettingsState(api);
+  assert.equal(drained.settings.effective_enabled, false);
+  assert.match(context.Amaterasu.historySettingsRuntimeDescription(drained.settings, drained.runtime), /Recording is disabled for new streams/);
+  const retention = await context.Amaterasu.saveHistorySettingsState(api, drained.settings, false, 3, 5);
+  assert.equal(retention.settings.revision, 7);
+  assert.equal(retention.settings.effective_enabled, false);
+  assert.equal(retention.runtime.last_prune.size_limit_bytes, 5 * 1048576);
+  assert.deepEqual(calls.filter(([route]) => route === "history/settings_update"), [
+    ["history/settings_update", { settings: { enabled: true, ttl_days: 14, db_size_limit_mb: 20 }, expected_revision: 4 }],
+    ["history/settings_update", { settings: { enabled: false, ttl_days: 7, db_size_limit_mb: 10 }, expected_revision: 5 }],
+    ["history/settings_update", { settings: { enabled: false, ttl_days: 3, db_size_limit_mb: 5 }, expected_revision: 6 }],
+  ]);
+  runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
   const pending = await context.Amaterasu.readHistorySettingsState(api);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(pending.settings, pending.runtime), /has not yet reported/);
   runtime = { ...runtime, status: { ...runtime.status, enabled: true } };
@@ -624,10 +662,11 @@ test("history editor confirms durable save and separately reads signed runtime o
   runtime = { ...runtime, status: { ...runtime.status, available: false, effective_enabled: false } };
   const unavailable = await context.Amaterasu.readHistorySettingsState(api);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(unavailable.settings, unavailable.runtime), /storage is unavailable/);
-  assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(unavailable.settings, unavailable.runtime), /recording is active/);
-  runtime = { ...runtime, status: { ...runtime.status, available: true, degraded: true } };
+  assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(unavailable.settings, unavailable.runtime), /Recording is enabled for new streams/);
+  runtime = { ...runtime, status: { ...runtime.status, available: true, enabled: false, degraded: true } };
   const degraded = await context.Amaterasu.readHistorySettingsState(api);
   assert.match(context.Amaterasu.historySettingsRuntimeDescription(degraded.settings, degraded.runtime), /degraded/);
+  assert.doesNotMatch(context.Amaterasu.historySettingsRuntimeDescription(degraded.settings, degraded.runtime), /writes are healthy|successfully recorded/);
   runtime = { ...runtime, status: { ...runtime.status, available: "true" } };
   const malformed = await context.Amaterasu.readHistorySettingsState(api);
   assert.equal(malformed.runtime, null);
@@ -637,6 +676,105 @@ test("history editor confirms durable save and separately reads signed runtime o
     return stored;
   } });
   assert.equal(rejected.runtime, null);
+});
+
+test("history form keeps retention controls visible and saves them while recording is disabled", async () => {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.children = [];
+      this.listeners = new Map();
+      this.isConnected = false;
+      this.value = "";
+    }
+    setConnected(value) {
+      this.isConnected = value;
+      for (const child of this.children) child?.setConnected?.(value);
+    }
+    append(...children) {
+      for (const child of children) {
+        if (child == null) continue;
+        this.children.push(child);
+        child?.setConnected?.(this.isConnected);
+      }
+    }
+    replaceChildren(...children) {
+      for (const child of this.children) child?.setConnected?.(false);
+      this.children = [];
+      this.append(...children);
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    setAttribute() {}
+    reportValidity() { return true; }
+    get valueAsNumber() { return Number(this.value); }
+    get textContent() {
+      return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
+    }
+    set textContent(value) { this.replaceChildren(value); }
+    fire(name, event) { this.listeners.get(name)?.(event); }
+  }
+  const find = (node, predicate) => {
+    if (predicate(node)) return node;
+    for (const child of node.children ?? []) {
+      if (typeof child === "string") continue;
+      const result = find(child, predicate);
+      if (result) return result;
+    }
+    return null;
+  };
+  const dom = vm.createContext({ TextEncoder, URL, Error,
+    document: { createElement: (name) => new Element(name) } });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
+  }
+  dom.ApiError = class ApiError extends Error {};
+  const content = new Element("main");
+  content.setConnected(true);
+  let stored = { ok: true, revision: 4,
+    settings: { enabled: false, ttl_days: 30, db_size_limit_mb: 50 }, effective_enabled: false };
+  const updates = [];
+  dom.Amaterasu.renderSettings({ content, notify() {}, api: {
+    allows: (scope) => scope === "configuration.write",
+    async post(route, body) {
+      if (route === "history/settings_get") return stored;
+      if (route === "history/history_status") throw new Error("status unavailable");
+      if (route === "history/settings_update") {
+        updates.push(ordinary(body));
+        stored = { ...stored, revision: stored.revision + 1, settings: body.settings };
+        return stored;
+      }
+      throw new Error(`unavailable: ${route}`);
+    },
+  } });
+  await new Promise(setImmediate);
+  const historyArea = content.children[9];
+  const form = find(historyArea, (node) => node.tagName === "form");
+  assert.ok(form);
+  const enabled = find(form, (node) => node.name === "session_history_enabled");
+  const ttl = find(form, (node) => node.name === "session_history_ttl_days");
+  const size = find(form, (node) => node.name === "session_history_db_size_limit_mb");
+  assert.equal(enabled.checked, false);
+  for (const control of [ttl, size]) {
+    assert.ok(control);
+    assert.equal(control.required, true);
+    assert.notEqual(find(form, (node) => node.children?.includes(control)).hidden, true);
+  }
+  enabled.checked = true;
+  enabled.fire("change");
+  enabled.checked = false;
+  enabled.fire("change");
+  assert.notEqual(find(form, (node) => node.children?.includes(ttl)).hidden, true);
+  assert.notEqual(find(form, (node) => node.children?.includes(size)).hidden, true);
+  assert.match(form.textContent, /New streams started while a change is pending use the previous recording policy/);
+  assert.match(form.textContent, /Retention changes apply immediately to stored ended sessions/);
+  ttl.value = "7";
+  size.value = "10";
+  form.fire("submit", { preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.deepEqual(updates, [{ settings: { enabled: false, ttl_days: 7, db_size_limit_mb: 10 }, expected_revision: 4 }]);
+  assert.equal(stored.revision, 5);
+  assert.equal(find(historyArea, (node) => node.name === "session_history_ttl_days").value, "7");
 });
 
 test("virtual sink selector editor preserves unset and explicit empty distinctly", () => {
