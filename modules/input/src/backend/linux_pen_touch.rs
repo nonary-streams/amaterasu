@@ -448,7 +448,16 @@ impl LinuxPenTouch {
     }
 
     pub(super) fn inject(&mut self, path: &str, event: &Event) -> InputResult<()> {
-        if self.pen_write_failed {
+        event.validate()?;
+        if self.pen_write_failed
+            && matches!(
+                event,
+                Event::PenTouch {
+                    device: PenTouchDevice::Pen,
+                    ..
+                }
+            )
+        {
             // A failed frame can leave an arbitrary prefix in the kernel. The
             // device must be removed before any more reports reach that pen.
             destroy_device(&mut self.pen_device)?;
@@ -965,6 +974,41 @@ mod tests {
                 .contact
                 .native_write_attempted
         );
+
+        let malformed_pen = event(2, PenTouchDevice::Pen, PenTouchPhase::Move, 10, 20);
+        assert!(pen_touch.inject("\0", &malformed_pen).is_err());
+        assert!(pen_touch.pen_device.is_some());
+        assert!(pen_touch.pen_write_failed);
+
+        pen_touch.touch_device = Some(Device {
+            file: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .unwrap(),
+            created: false,
+        });
+        let touch_down = event(42, PenTouchDevice::Touch, PenTouchPhase::Down, 30, 40);
+        pen_touch.inject("\0", &touch_down).unwrap();
+        assert!(pen_touch.pen_write_failed);
+        assert!(pen_touch.pen_device.is_some());
+        pen_touch
+            .inject("\0", &with_phase(&touch_down, PenTouchPhase::Up))
+            .unwrap();
+
+        // Simulate a failed UI_DEV_DESTROY. Pen cleanup retains its descriptor,
+        // while another touch report can still use the independent device.
+        pen_touch.pen_device.as_mut().unwrap().created = true;
+        assert!(
+            pen_touch
+                .inject("\0", &with_phase(&down, PenTouchPhase::Cancel))
+                .is_err()
+        );
+        assert!(pen_touch.pen_write_failed);
+        pen_touch.inject("\0", &touch_down).unwrap();
+        pen_touch
+            .inject("\0", &with_phase(&touch_down, PenTouchPhase::Up))
+            .unwrap();
+        pen_touch.pen_device.as_mut().unwrap().created = false;
 
         // The terminal report needs no replacement device once the failed
         // device has been removed. Its pointer can then be acquired again.
