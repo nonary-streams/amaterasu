@@ -1120,6 +1120,47 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
     {
         return Err("display_mutation_unavailable");
     }
+    if record.display_match_inactive {
+        if option != "ensure_active"
+            || displays.len() >= 16
+            || !client_mode_override
+                && matches!(refresh_rate_option, Some("auto" | "prefer_highest"))
+            || !(320..=16_384).contains(&record.physical_display_mode.width)
+            || !(200..=16_384).contains(&record.physical_display_mode.height)
+            || displays.iter().any(|display| {
+                display["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(selected))
+            })
+        {
+            return Err("display_mutation_unavailable");
+        }
+        let right = displays
+            .iter()
+            .try_fold(0_i64, |right, display| {
+                let x = display["x"].as_i64()?;
+                let width = i64::try_from(display["width"].as_u64()?).ok()?;
+                Some(right.max(x.checked_add(width)?))
+            })
+            .ok_or("display_snapshot_unavailable")?;
+        let x = i32::try_from(right).map_err(|_| "display_mutation_unavailable")?;
+        if x > 65_536 {
+            return Err("display_mutation_unavailable");
+        }
+        displays.push(json!({
+            "id":selected,
+            "width":record.physical_display_mode.width,
+            "height":record.physical_display_mode.height,
+            "refresh":{
+                "numerator":record.physical_display_mode.refresh_millihz,
+                "denominator":1000,
+            },
+            "x":x,
+            "y":0,
+            "rotation":"identity",
+            "hdr_enabled":null,
+        }));
+    }
     let selected_display = displays
         .iter_mut()
         .find(|display| display["id"].as_str() == Some(selected))
@@ -1227,38 +1268,59 @@ fn display_enumeration(
     if payload["ok"] != true {
         return Err("display_enumeration_unavailable");
     }
-    let source = capture_source(record)?;
+    let source = capture_source(record)?.to_owned();
     let entries = payload["entries"]
         .as_array()
         .filter(|entries| entries.len() <= 32)
         .ok_or("invalid_display_enumeration")?;
     let mut match_id = record.display_match_id.clone();
+    let mut match_inactive = record.display_match_inactive;
     for entry in entries {
         let id = entry["id"]
             .as_str()
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
             .ok_or("invalid_display_enumeration")?;
+        if record
+            .display_enumerated_ids
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(id))
+        {
+            return Err("ambiguous_display_identity");
+        }
+        record.display_enumerated_ids.push(id.to_owned());
         let entry_source = entry["source"]
             .as_str()
             .ok_or("invalid_display_enumeration")?;
         let active = entry["active"]
             .as_bool()
             .ok_or("invalid_display_enumeration")?;
-        if entry_source.eq_ignore_ascii_case(source) {
+        if entry_source.eq_ignore_ascii_case(&source) {
             let snapshot_id = record
                 .display_snapshot_ids
                 .iter()
                 .find(|known| known.eq_ignore_ascii_case(id));
-            if !active || snapshot_id.is_none() {
-                return Err("inactive_capture_output");
-            }
             if match_id.is_some() {
                 return Err("ambiguous_capture_output");
             }
-            match_id = snapshot_id.cloned();
+            if active {
+                match_id = Some(snapshot_id.ok_or("capture_output_not_in_snapshot")?.clone());
+            } else {
+                let option = record
+                    .display_policy_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot["effective_overrides"]["dd_configuration_option"].as_str()
+                    });
+                if option != Some("ensure_active") || snapshot_id.is_some() {
+                    return Err("inactive_capture_output");
+                }
+                match_id = Some(id.to_owned());
+                match_inactive = true;
+            }
         }
     }
     record.display_match_id = match_id;
+    record.display_match_inactive = match_inactive;
     match payload.get("next_offset") {
         None | Some(Value::Null) if record.display_match_id.is_some() => Ok(None),
         None | Some(Value::Null) => Err("capture_output_not_found"),

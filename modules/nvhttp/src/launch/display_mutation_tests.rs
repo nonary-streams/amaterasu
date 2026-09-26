@@ -41,6 +41,96 @@ fn mutating_display_fixture(option: &str, two_displays: bool) -> (Controller, Br
     (controller, broker)
 }
 
+fn inactive_display_fixture(option: &str) -> (Controller, Broker) {
+    let (controller, mut broker) = mutating_display_fixture(option, true);
+    broker.display_snapshot_ids.pop();
+    broker.display_snapshot_configuration.as_mut().unwrap()["displays"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    broker.display_entries[1]["id"] = json!("Monitor.Two");
+    broker.display_entries[1]["active"] = json!(false);
+    (controller, broker)
+}
+
+#[test]
+fn inactive_ensure_active_attests_appended_target_without_changing_active_display() {
+    let now = Instant::now();
+    let (mut controller, mut broker) = inactive_display_fixture("ensure_active");
+    let paired = peer_with_display_mode(52, "1920x1080x59.94").unwrap();
+    let mut stream = request(52);
+    stream.fps = 120;
+    assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    let request = &open["display_request"];
+    assert_eq!(open["profile"]["fps"], 120);
+    assert_eq!(request["configuration"]["displays"].as_array().unwrap().len(), 2);
+    assert_eq!(request["configuration"]["displays"][0]["id"], "monitor.one");
+    assert_eq!(request["configuration"]["displays"][0]["x"], 0);
+    assert_eq!(request["configuration"]["displays"][0]["width"], 1600);
+    assert_eq!(request["configuration"]["displays"][1]["id"], "Monitor.Two");
+    assert_eq!(request["configuration"]["displays"][1]["x"], 1600);
+    assert_eq!(request["configuration"]["displays"][1]["refresh"], json!({"numerator":59940,"denominator":1000}));
+    assert_eq!(request["configuration"]["displays"][1]["hdr_enabled"], Value::Null);
+    assert_eq!(request["mode_policy"]["display_id"], "Monitor.Two");
+    assert_eq!(request["mode_policy"]["configuration_option"], "ensure_active");
+    assert_eq!(open["display_admission_token"], "ab".repeat(32));
+    controller.reply_delivered(10, now);
+    assert_eq!(controller.launch(11, stream, paired, now).unwrap().body, reply.body);
+    assert_eq!(broker.actions().iter().filter(|(service, action)|
+        *service == "amaterasu.rtsp/1" && *action == "open").count(), 1);
+}
+
+#[test]
+fn inactive_stream_mode_fallback_requires_static_refresh_policy() {
+    let now = Instant::now();
+    let (mut controller, mut broker) = inactive_display_fixture("ensure_active");
+    controller.set_global_display_policy(9, json!({
+        "dd_configuration_option":"ensure_active",
+        "dd_refresh_rate_option":"disabled",
+        "dd_hdr_option":"disabled",
+    }));
+    assert!(controller.launch(10, request(54), peer(54), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let display_request = &opened_rtsp_payload(&broker)["display_request"];
+    assert_eq!(display_request["configuration"]["displays"][1]["width"], 1280);
+    assert_eq!(display_request["configuration"]["displays"][1]["height"], 720);
+    assert_eq!(display_request["configuration"]["displays"][1]["refresh"], json!({"numerator":60000,"denominator":1000}));
+    assert_eq!(display_request["mode_policy"]["context"]["client_display_mode_override"], false);
+}
+
+#[test]
+fn inactive_route_fails_closed_on_drift_ambiguity_and_other_options() {
+    for case in ["ensure_primary", "ensure_only_display", "verify_only", "revision", "bytes", "ambiguous", "duplicate_id", "missing", "auto_without_mode", "position_out_of_range"] {
+        let now = Instant::now();
+        let option = if matches!(case, "revision" | "bytes" | "ambiguous" | "duplicate_id" | "missing" | "auto_without_mode" | "position_out_of_range") {
+            "ensure_active"
+        } else {
+            case
+        };
+        let (mut controller, mut broker) = inactive_display_fixture(option);
+        match case {
+            "revision" => broker.display_revision_drift = true,
+            "bytes" => broker.display_configuration_drift = true,
+            "ambiguous" => broker.display_entries.push(json!({"id":"monitor.other","source":"\\\\.\\DISPLAY2","active":false})),
+            "duplicate_id" => broker.display_entries.push(json!({"id":"monitor.two","source":"\\\\.\\DISPLAY3","active":false})),
+            "missing" => { broker.display_entries.pop(); },
+            "position_out_of_range" => broker.display_snapshot_configuration.as_mut().unwrap()["displays"][0]["x"] = json!(65_536),
+            _ => {},
+        }
+        assert!(controller.launch(10, request(53), peer(53), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200, "{case}");
+        assert!(!broker.actions().iter().any(|(service, action)|
+            *service == "amaterasu.launch/1" && *action == "launch_export"), "{case}");
+        assert!(!broker.actions().iter().any(|(service, action)|
+            *service == "amaterasu.rtsp/1" && *action == "open"), "{case}");
+    }
+}
+
 #[test]
 fn selected_two_monitor_mutation_attests_full_topology_and_physical_5994_mode() {
     let now = Instant::now();
