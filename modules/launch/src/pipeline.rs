@@ -17,6 +17,20 @@ use std::{
 
 type Transport = ModuleResult<Response>;
 
+fn display_admission_eligible(record: &crate::records::Record) -> bool {
+    record.catalog_selection == CatalogSelection::Exported
+        && record.preflight_ready
+        && record.preflight_token.is_some()
+        && if record.launch_started {
+            record.state == State::Active
+        } else {
+            record.state == State::Starting
+                && record
+                    .preflight_deadline
+                    .is_some_and(|deadline| Instant::now() < deadline)
+        }
+}
+
 fn display_policy_snapshot(
     global_revision: Option<u64>,
     global_overrides: &BTreeMap<String, Value>,
@@ -473,6 +487,7 @@ impl Pipeline {
                 global_preparation,
                 legacy_global_preparation,
                 preflight_token,
+                display_admission_token,
                 frame_limiter_settings,
                 client_frame_limiter_overrides,
                 application_display_overrides,
@@ -523,7 +538,7 @@ impl Pipeline {
                     },
                 ) {
                     Ok((id, true)) => {
-                        if preflight_token.is_some() {
+                        if preflight_token.is_some() || display_admission_token.is_some() {
                             self.records.values.remove(&id);
                             return complete(send, request, error("preflight_not_found"));
                         }
@@ -550,6 +565,15 @@ impl Pipeline {
                                 request,
                                 error("application_display_policy_mismatch"),
                             );
+                        }
+                        match (
+                            &record.display_admission,
+                            display_admission_token.as_deref(),
+                        ) {
+                            (Some(admission), Some(token)) if admission.token == token => {}
+                            (Some(admission), None) if !admission.launch_token_required => {}
+                            (None, None) => {}
+                            _ => return complete(send, request, error("display_admission_denied")),
                         }
                         if let Some(settings) = &frame_limiter_settings
                             && !snapshot_matches_application_policy(
@@ -600,9 +624,7 @@ impl Pipeline {
                 }) else {
                     return complete(send, request, error("display_admission_denied"));
                 };
-                if record.state != State::Active
-                    || !record.launch_started
-                    || record.catalog_selection != CatalogSelection::Exported
+                if !display_admission_eligible(record)
                     || record.preflight_token.is_none()
                     || record.catalog_revision != Some(catalog_revision)
                     || record.application_display_overrides != application_display_overrides
@@ -646,6 +668,7 @@ impl Pipeline {
                 };
                 record.display_admission = Some(DisplayAdmission {
                     token: token.clone(),
+                    launch_token_required: !record.launch_started,
                     certificate_id,
                     rtsp_operation_id: rtsp_operation_id.clone(),
                     request_sha256: request_sha256.clone(),
@@ -679,7 +702,7 @@ impl Pipeline {
                 let verified = self.records.values.values().any(|record| {
                     record.owner == "nvhttp"
                         && record.operation_id == application_operation_id
-                        && record.state == State::Active
+                        && display_admission_eligible(record)
                         && record.catalog_revision == Some(catalog_revision)
                         && record.display_admission.as_ref().is_some_and(|admission| {
                             admission.token == token

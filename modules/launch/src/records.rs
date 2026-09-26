@@ -96,6 +96,7 @@ pub struct Record {
 
 pub struct DisplayAdmission {
     pub token: String,
+    pub launch_token_required: bool,
     pub certificate_id: String,
     pub rtsp_operation_id: String,
     pub request_sha256: String,

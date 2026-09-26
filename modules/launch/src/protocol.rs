@@ -40,6 +40,8 @@ pub enum Operation {
         #[serde(default)]
         preflight_token: Option<String>,
         #[serde(default)]
+        display_admission_token: Option<String>,
+        #[serde(default)]
         global_preparation: Vec<PreparationStep>,
         #[serde(default)]
         legacy_global_preparation: Vec<LegacyPreparationCommand>,
@@ -165,6 +167,14 @@ impl Operation {
             }
             Self::List { limit, .. } if !(1..=16).contains(limit) => return Err("invalid_limit"),
             _ => {}
+        }
+        if let Self::LaunchExport {
+            display_admission_token: Some(token),
+            ..
+        } = self
+            && !valid_sha256(token)
+        {
+            return Err("invalid_request");
         }
         Ok(())
     }
