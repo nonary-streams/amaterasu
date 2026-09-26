@@ -3,11 +3,13 @@
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use crate::configuration::release_terminal_child_result;
 
 const SERVICE: &str = "amaterasu.catalog/1";
 const TIMEOUT_MS: u64 = 30_000;
+const RESULT_GRACE: Duration = Duration::from_secs(5);
 const PAGE_SIZE: usize = 32;
 const MAX_STEAM_IDS: usize = 20_000;
 const MAX_CATALOG_CURSOR_BYTES: usize = 256;
@@ -15,7 +17,7 @@ const MAX_CATALOG_CURSOR_BYTES: usize = 256;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Submit { operation_id: String },
-    Waiting { request: u64 },
+    Waiting { request: u64, deadline: Instant },
     Delay { ticks: u8 },
 }
 
@@ -48,6 +50,14 @@ impl SteamCatalogRead {
     }
 
     pub fn advance(&mut self, runtime: &RuntimeClient) -> ModuleResult<Progress> {
+        self.advance_with(Instant::now(), |command| runtime.send(command))
+    }
+
+    fn advance_with(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<Progress> {
         match self.call.clone() {
             Call::Delay { ticks } if ticks > 1 => {
                 self.call = Call::Delay { ticks: ticks - 1 };
@@ -59,7 +69,7 @@ impl SteamCatalogRead {
                 };
                 Ok(Progress::Pending)
             }
-            Call::Submit { operation_id } => match runtime.send(Command::Request {
+            Call::Submit { operation_id } => match send(Command::Request {
                 service: SERVICE.into(),
                 payload: self.request_payload(),
                 timeout_ms: TIMEOUT_MS,
@@ -67,7 +77,10 @@ impl SteamCatalogRead {
                 parent: None,
             }) {
                 Ok(Response::Accepted { id }) => {
-                    self.call = Call::Waiting { request: id };
+                    self.call = Call::Waiting {
+                        request: id,
+                        deadline: now + Duration::from_millis(TIMEOUT_MS) + RESULT_GRACE,
+                    };
                     Ok(Progress::Pending)
                 }
                 Ok(Response::Result { payload }) => Ok(self.consume_page(payload)),
@@ -82,14 +95,17 @@ impl SteamCatalogRead {
                     Ok(Progress::Pending)
                 }
             },
-            Call::Waiting { request } => {
-                let response = match runtime.send(Command::TakeResult { request }) {
+            Call::Waiting { request, deadline } => {
+                if now >= deadline {
+                    return Ok(Progress::Failed("Steam-ID catalog result timed out".into()));
+                }
+                let response = match send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => return Ok(Progress::Pending),
                     Ok(response) => response,
                     Err(_) => return Ok(Progress::Pending),
                 };
                 let Some(response) = release_terminal_child_result(request, response, |request| {
-                    runtime.send(Command::ReleaseResult { request })
+                    send(Command::ReleaseResult { request })
                 }) else {
                     return Ok(Progress::Pending);
                 };
@@ -233,6 +249,44 @@ impl Default for SteamCatalogRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_child_result_fails_instead_of_blocking_future_scans() {
+        let mut read = SteamCatalogRead::new();
+        let started = Instant::now();
+        assert_eq!(
+            read.advance_with(started, |command| match command {
+                Command::Request { .. } => Ok(Response::Accepted { id: 17 }),
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .unwrap(),
+            Progress::Pending
+        );
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(20), |command| match command {
+                Command::TakeResult { request: 17 } => Ok(Response::Pending),
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .unwrap(),
+            Progress::Pending
+        );
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(30), |command| match command {
+                Command::TakeResult { request: 17 } => Err("transient transport error".into()),
+                other => panic!("unexpected command: {other:?}"),
+            })
+            .unwrap(),
+            Progress::Pending
+        );
+        assert_eq!(
+            read.advance_with(started + Duration::from_secs(35), |_| {
+                panic!("expired child result must not be polled")
+            })
+            .unwrap(),
+            Progress::Failed("Steam-ID catalog result timed out".into())
+        );
+        assert!(matches!(SteamCatalogRead::new().call, Call::Submit { .. }));
+    }
 
     #[test]
     fn export_requests_pin_lexical_pages_and_deduplicate_steam_ids() {
